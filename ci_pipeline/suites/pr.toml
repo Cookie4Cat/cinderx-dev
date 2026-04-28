@@ -1,0 +1,17 @@
+fail_fast = true
+
+[target]
+python = "3.14"
+arch = "arm64"
+system = "Linux"
+
+[[jobs]]
+name = "setup_release"
+command = "mkdir -p \"{run_dir}/wheelhouse\" && \"$CINDERX_TEST_PYTHON\" -m pip wheel --no-build-isolation --no-deps -w \"{run_dir}/wheelhouse\" . && rm -rf \"{run_dir}/venv\" && \"$CINDERX_TEST_PYTHON\" -m venv \"{run_dir}/venv\" && \"{run_dir}/venv/bin/python\" -m pip install --upgrade pip pytest && \"{run_dir}/venv/bin/python\" -m pip install --no-index --find-links=\"{run_dir}/wheelhouse\" cinderx"
+[jobs.env]
+CINDERX_INCLUDE_TEST_PACKAGE_DATA = "1"
+ENABLE_XXCLASSLOADER = "1"
+
+[[jobs]]
+name = "test_cinderx_release"
+command = "\"{run_dir}/venv/bin/python\" cinderx/TestScripts/TestScriptsKunpeng/test_cinderx_runner.py --python \"{run_dir}/venv/bin/python\" --log-dir \"{run_dir}/logs/test_cinderx_release\" --json-summary-file \"{run_dir}/test_cinderx_release.json\""
