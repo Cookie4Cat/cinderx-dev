@@ -1,0 +1,142 @@
+# Copyright (c) Meta Platforms, Inc. and affiliates.
+
+# pyre-strict
+
+import sys
+import tracemalloc
+import types
+import unittest
+
+from cinderx.test_support import passIf
+
+try:
+    # pyre-ignore[21]: can't find _testcapi
+    import _testcapi
+except ImportError:
+    _testcapi: None | types.ModuleType = None
+
+import cinderx.jit
+
+EMPTY_STRING_SIZE = sys.getsizeof(b"")
+INVALID_NFRAME = (-1, 2**30)
+
+
+def get_frames(nframe: int, lineno_delta: int) -> tuple[tuple[str, int], ...]:
+    frames: list[tuple[str, int]] = []
+    frame = sys._getframe(1)
+    for _ in range(nframe):
+        code = frame.f_code
+        lineno = frame.f_lineno + lineno_delta
+        frames.append((code.co_filename, lineno))
+        lineno_delta = 0
+        frame = frame.f_back
+        if frame is None:
+            break
+    return tuple(frames)
+
+
+def allocate_bytes(size: int) -> tuple[bytes, tracemalloc.Traceback]:
+    nframe = tracemalloc.get_traceback_limit()
+    bytes_len = size - EMPTY_STRING_SIZE
+    frames = get_frames(nframe, 1)
+    data = b"x" * bytes_len
+    return data, tracemalloc.Traceback(frames, min(len(frames), nframe))
+
+
+def create_snapshots() -> tuple[tracemalloc.Snapshot, tracemalloc.Snapshot]:
+    traceback_limit = 2
+
+    # _tracemalloc._get_traces() returns a list of (domain, size,
+    # traceback_frames) tuples. traceback_frames is a tuple of (filename,
+    # line_number) tuples.
+    raw_traces = [
+        (0, 10, (("a.py", 2), ("b.py", 4)), 3),
+        (0, 10, (("a.py", 2), ("b.py", 4)), 3),
+        (0, 10, (("a.py", 2), ("b.py", 4)), 3),
+        (1, 2, (("a.py", 5), ("b.py", 4)), 3),
+        (2, 66, (("b.py", 1),), 1),
+        (3, 7, (("<unknown>", 0),), 1),
+    ]
+    snapshot = tracemalloc.Snapshot(raw_traces, traceback_limit)
+
+    raw_traces2 = [
+        (0, 10, (("a.py", 2), ("b.py", 4)), 3),
+        (0, 10, (("a.py", 2), ("b.py", 4)), 3),
+        (0, 10, (("a.py", 2), ("b.py", 4)), 3),
+        (2, 2, (("a.py", 5), ("b.py", 4)), 3),
+        (2, 5000, (("a.py", 5), ("b.py", 4)), 3),
+        (4, 400, (("c.py", 578),), 1),
+    ]
+    snapshot2 = tracemalloc.Snapshot(raw_traces2, traceback_limit)
+
+    return (snapshot, snapshot2)
+
+
+def frame(filename: str, lineno: int) -> object:
+    # pyrefly: ignore [missing-attribute]
+    # pyre-ignore[16]: `tracemalloc` has no attribute `_Frame`.
+    return tracemalloc._Frame((filename, lineno))
+
+
+def traceback(*frames: tuple[str, int]) -> tracemalloc.Traceback:
+    return tracemalloc.Traceback(frames)
+
+
+def traceback_lineno(filename: str, lineno: int) -> tracemalloc.Traceback:
+    return traceback((filename, lineno))
+
+
+def traceback_filename(filename: str) -> tracemalloc.Traceback:
+    return traceback_lineno(filename, 0)
+
+
+class CinderX_TestTracemallocEnabled(unittest.TestCase):
+    def setUp(self) -> None:
+        if tracemalloc.is_tracing():
+            self.skipTest("tracemalloc must be stopped before the test")
+
+        tracemalloc.start(1)
+
+    def tearDown(self) -> None:
+        tracemalloc.stop()
+
+    @passIf(
+        cinderx.jit.is_inline_cache_stats_collection_enabled(),
+        "#TASK(T150421262): Traced memory does not work well with JIT's inline cache stats collection.",
+    )
+    def test_get_traced_memory(self) -> None:
+        # Python allocates some internals objects, so the test must tolerate
+        # a small difference between the expected size and the real usage. The
+        # JIT can increase this maximum amount.
+        max_error = 8500 if cinderx.jit.is_enabled() else 2048
+
+        # allocate one object
+        obj_size = 1024 * 1024
+        tracemalloc.clear_traces()
+        obj, obj_traceback = allocate_bytes(obj_size)
+        size, peak_size = tracemalloc.get_traced_memory()
+        self.assertGreaterEqual(size, obj_size)
+        self.assertGreaterEqual(peak_size, size)
+
+        self.assertLessEqual(size - obj_size, max_error)
+        self.assertLessEqual(peak_size - size, max_error)
+
+        # destroy the object
+        obj = None
+        size2, peak_size2 = tracemalloc.get_traced_memory()
+        self.assertLess(size2, size)
+        self.assertGreaterEqual(size - size2, obj_size - max_error)
+        self.assertGreaterEqual(peak_size2, peak_size)
+
+        # clear_traces() must reset traced memory counters
+        tracemalloc.clear_traces()
+        self.assertEqual(tracemalloc.get_traced_memory(), (0, 0))
+
+        # allocate another object
+        obj, obj_traceback = allocate_bytes(obj_size)
+        size, peak_size = tracemalloc.get_traced_memory()
+        self.assertGreaterEqual(size, obj_size)
+
+        # stop() also resets traced memory counters
+        tracemalloc.stop()
+        self.assertEqual(tracemalloc.get_traced_memory(), (0, 0))

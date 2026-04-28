@@ -1,0 +1,6 @@
+t"{int}"
+t"{int}abc"
+t"abc{int}abc"
+t"{int}{int}"
+t"abc{int}{int}abc"
+t"abc{int}{int!r}abc"

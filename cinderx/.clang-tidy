@@ -1,0 +1,41 @@
+InheritParentConfig: true
+
+# Explaining why some of our options are set:
+#
+# * Disabling enum value exhaustiveness checking.  This lint fires even when
+#   there's a default label set.  In CinderX we have some enums with many many
+#   values and we have many switch statements where we don't want or need to
+#   handle all possible cases explicitly, we want to push them through the
+#   default case.
+#
+# * Tracking nullable returns requires depending on folly, which we don't do.
+#   It is also tedious as we would have to use this excessively due to Python
+#   often using null to propagate exceptions.
+#
+# * std::regex has known issues with stack overflows, but we only use it in
+#   tests and we don't do anything crazy with it.  It's more convenient to use
+#   it instead of pulling in a third party dependency like RE2.
+#
+# * Can't replace memcpy() with more secure forms as that requires internal
+#   libraries that don't exist externally.
+#
+# * The unused header check preprocesses source files first and it is limited
+#   to running with the current default value of PY_VERSION_HEX.  It will report
+#   false positives when it sees #includes that are only used in other Python
+#   versions.
+#
+# * The JIT converts between pointers and integers frequently, there's no way
+#   to avoid this.
+
+Checks: '
+-clang-diagnostic-switch-enum,
+-facebook-hte-BoostRegexRisky,
+-facebook-hte-GlibcRegexIsAwful,
+-facebook-hte-NullableReturn,
+-facebook-hte-RE2ImplicitConversion,
+-facebook-hte-StdRegexIsAwful,
+-facebook-security-vulnerable-memcpy,
+-facebook-unused-include-check,
+-performance-no-int-to-ptr,
+modernize-raw-string-literal,
+'

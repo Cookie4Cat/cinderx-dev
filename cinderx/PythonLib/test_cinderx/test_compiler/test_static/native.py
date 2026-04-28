@@ -1,0 +1,279 @@
+# Copyright (c) Meta Platforms, Inc. and affiliates.
+
+from .common import StaticTestBase
+
+
+class NativeDecoratorTests(StaticTestBase):
+    def test_native_no_lib(self) -> None:
+        codestr = """
+        from __static__ import native, int64
+
+        @native
+        def something(i: int64) -> int64:
+            return 1
+        """
+        self.type_error(
+            codestr, "@native decorator must specify the library to be loaded"
+        )
+
+    def test_native_kwarg(self) -> None:
+        codestr = """
+        from __static__ import native, int64
+
+        @native(x=1)
+        def something(i: int64) -> int64:
+            return 1
+        """
+        self.type_error(codestr, "@native decorator takes no keyword arguments")
+
+    def test_native_stararg(self) -> None:
+        codestr = """
+        from __static__ import native, int64
+
+        a = (1, 2)
+
+        @native(*a)
+        def something(i: int64) -> int64:
+            return 1
+        """
+        self.type_error(codestr, "@native decorator takes no starred arguments")
+
+    def test_native_multiple_arg(self) -> None:
+        codestr = """
+        from __static__ import native, int64
+
+        @native("so.so", 1)
+        def something(i: int64) -> int64:
+            return 1
+        """
+        self.type_error(
+            codestr,
+            "@native decorator accepts a single parameter, the path to .so file",
+        )
+
+    def test_native_no_arg(self) -> None:
+        codestr = """
+        from __static__ import native, int64
+
+        @native()
+        def something(i: int64) -> int64:
+            return 1
+        """
+        self.type_error(
+            codestr,
+            "@native decorator accepts a single parameter, the path to .so file",
+        )
+
+    def test_native_non_str_arg(self) -> None:
+        codestr = """
+        from __static__ import native, int64
+
+        @native(1)
+        def something(i: int64) -> int64:
+            return 1
+        """
+        self.type_error(
+            codestr,
+            r"type mismatch: Literal\[1] received for positional arg 'lib', expected str",
+        )
+
+    def test_native_decorate_class(self) -> None:
+        codestr = """
+        from __static__ import native
+
+        @native("so.so")
+        class Hi:
+            pass
+        """
+        self.type_error(codestr, "Cannot decorate a class with @native")
+
+    def test_native_decorate_async_fn(self) -> None:
+        codestr = """
+        from __static__ import native
+
+        @native("so.so")
+        async def something(j: int64) -> int64:
+            pass
+        """
+        self.type_error(codestr, "@native decorator cannot be used on async functions")
+
+    def test_native_decorate_method(self) -> None:
+        codestr = """
+        from __static__ import native
+
+        class Hi:
+            @native("so.so")
+            def fn(self):
+                pass
+        """
+        self.type_error(codestr, "Cannot decorate a method with @native")
+
+    def test_native_some_function_body(self) -> None:
+        codestr = """
+        from __static__ import native, int64
+
+        @native("so.so")
+        def something(i: int64) -> int64:
+            return 1
+        """
+
+        self.type_error(
+            codestr,
+            "@native callables cannot contain a function body, only 'pass' is allowed",
+        )
+
+    def test_native_valid_usage_in_nonstatic_module(self) -> None:
+        codestr = """
+        from __static__ import native, int64
+
+        @native("so.so")
+        def something(j: int64) -> int64:
+            pass
+        """
+
+        with self.in_strict_module(codestr) as mod:
+            with self.assertRaisesRegex(
+                RuntimeError,
+                "native callable 'something' can only be called from static modules",
+            ):
+                mod.something(1)
+
+    def test_native_usage_with_kwarg(self) -> None:
+        binding_codestr = """
+        from __static__ import native, int64, box, unbox
+
+        @native("libc.so.6")
+        def abs(i: int64, j: int64 = 4) -> int64:
+            pass
+        """
+        self.type_error(binding_codestr, "@native callables cannot contain kwargs")
+
+    def test_native_usage_with_posonly_arg(self) -> None:
+        binding_codestr = """
+        from __static__ import native, int64, box, unbox
+
+        @native("libc.so.6")
+        def abs(i: int64, /) -> int64:
+            pass
+        """
+        self.type_error(
+            binding_codestr, "@native callables cannot contain pos-only args"
+        )
+
+    def test_native_usage_with_kwonly_arg(self) -> None:
+        binding_codestr = """
+        from __static__ import native, int64, box, unbox
+
+        @native("libc.so.6")
+        def abs(i: int64, *, j: int64 = 33) -> int64:
+            pass
+        """
+        self.type_error(
+            binding_codestr, "@native callables cannot contain kw-only args"
+        )
+
+    def test_native_call_with_pyobject(self) -> None:
+        binding_codestr = """
+        from __static__ import native, int64, box, unbox
+
+        @native("libc.so.6")
+        def abs(i: int64) -> int64:
+            pass
+
+        def invoke_abs(i: int) -> int:
+            res = abs(i)
+            return box(res)
+        """
+        self.type_error(
+            binding_codestr,
+            "type mismatch: int received for positional arg 'i', expected int64",
+        )
+
+    def test_decorate_already_decorated_fn(self) -> None:
+        codestr = """
+        from __static__ import native
+        from typing import final
+
+        @native("so.so")
+        @final
+        def fn(self):
+            pass
+        """
+        self.type_error(
+            codestr, "@native decorator cannot be used with other decorators"
+        )
+
+    def test_decorate_native_fn(self) -> None:
+        codestr = """
+        from __static__ import native
+        from typing import final
+
+        @final
+        @native("so.so")
+        def fn():
+            pass
+        """
+        self.type_error(
+            codestr, "@native decorator cannot be used with other decorators"
+        )
+
+    def test_invoke_native_fn(self) -> None:
+        codestr = """
+        from __static__ import native, int64, box
+
+        @native("libc.so.6")
+        def labs(i: int64) -> int64:
+            pass
+
+        def invoke_abs(i: int) -> int:
+            j: int64 = int64(i)
+            return box(labs(j))
+        """
+
+        with self.in_strict_module(codestr) as mod:
+            self.assertEqual(mod.invoke_abs(-5), 5)
+
+    def test_invoke_native_fn_final_libname(self) -> None:
+        codestr = """
+        from __static__ import native, int64, box
+        from typing import Final
+
+        LIB_NAME: Final[str] = "libc.so.6"
+
+        @native(LIB_NAME)
+        def labs(i: int64) -> int64:
+            pass
+
+        def invoke_abs(i: int) -> int:
+            j: int64 = int64(i)
+            return box(labs(j))
+        """
+
+        with self.in_strict_module(codestr) as mod:
+            self.assertEqual(mod.invoke_abs(-5), 5)
+
+    def test_invoke_native_fn_multiple_args(self) -> None:
+        codestr = f"""
+        from __static__ import native, int32, box
+        from typing import Final
+
+        LIB_NAME: Final[str] = "libc.so.6"
+
+        @native(LIB_NAME)
+        def div(a: int32, b: int32) -> int32:
+            # This returns a div_t but that's okay as the ABI will put the
+            # numerator in RAX.
+            #
+            # There are no other C stdlib functions that take multiple arguments
+            # that are only integers.  Everything else takes pointers or
+            # doubles, and doubles aren't supported yet, TODO(T130985738).
+            pass
+
+        def invoke_div(i: int32, j: int32) -> int:
+            k: int32 = int32(i)
+            l: int32 = int32(j)
+            return box(div(k, l))
+        """
+
+        with self.in_strict_module(codestr) as mod:
+            self.assertEqual(mod.invoke_div(15, 3), 5)
