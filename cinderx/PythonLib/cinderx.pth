@@ -1,0 +1,1 @@
+import sys; exec("try: import cinderx\nexcept Exception: pass")

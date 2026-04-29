@@ -369,6 +369,17 @@ class BuildExt(build_ext):
         # pyre-ignore[16]: No pyre types for build_ext.
         self.extensions = other_extensions
         super().run()
+        
+        # Copy .pth file to build_lib root for auto-import on Python startup
+        pth_source = os.path.join(PYTHON_LIB_DIR, "cinderx.pth")
+        pth_dest = os.path.join(self.build_lib, "cinderx.pth")
+        if not os.path.isfile(pth_source):
+            raise FileNotFoundError(
+                f"Required file not found: {pth_source}. "
+                "Ensure cinderx.pth exists in the source directory."
+            )
+        print(f"Copying .pth file to {pth_dest}")
+        self.copy_file(pth_source, pth_dest, preserve_mode=False)
 
     def _run_cmake(self, extension: CMakeExtension) -> None:
         # pyre-ignore[16]: No pyre types for build_ext.
