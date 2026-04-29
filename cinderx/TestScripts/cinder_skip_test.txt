@@ -1,0 +1,122 @@
+#
+# CinderX test skips.
+#
+
+test.test_rlcompleter.TestRlcompleter.test_global_matches
+
+
+test.test__xxsubinterpreters.*
+test.test_ast.ModuleStateTests.test_subinterpreter
+test.test_atexit.SubinterpreterTest.*
+test.test_capi.SubinterpreterTest.*
+test.test_embed.AuditingTests.test_audit_subinterpreter
+test.test_embed.EmbeddingTests.test_subinterps_different_ids
+test.test_embed.EmbeddingTests.test_subinterps_distinct_state
+test.test_embed.EmbeddingTests.test_subinterps_main
+test.test_multibytecodec.Test_IncrementalEncoder.test_subinterp
+test.test_threading.SubinterpThreadingTests.*
+test_interpreters
+test.test_capi.CAPITest.test_getitem_with_error
+test.test_repl.TestInteractiveInterpreter.test_no_memory
+test__opcode
+test.test_dis.*.test_widths
+test.test_asyncgen.AsyncGenAsyncioTest.test_async_gen_asyncio_gc_aclose_09
+test.test_fork1.ForkTest.test_threaded_import_lock_fork
+test.test_gdb.PrettyPrintTests.test_frames
+test.test_generators.GeneratorTest.test_name
+test.test_inspect.TestSignatureBind.test_signature_bind_implicit_arg
+test.test_nntplib.NetworkedNNTP_SSLTests
+test.test_tracemalloc.TestTracemallocEnabled.test_get_traced_memory
+test.test_types.UnionTests.test_or_type_operator_reference_cycle
+test.test_trace.TestLineCounts.test_trace_list_comprehension
+test.test_dis.DisTests.test_bug_1333982
+test.test_dis.DisTests.test_disassemble_recursive
+test.test_dis.DisWithFileTests.test_bug_1333982
+test.test_dis.DisWithFileTests.test_disassemble_recursive
+
+# skip to fix T236042405
+test.test_httplib.test_local_bad_hostname
+test.test_httplib.test_local_good_hostname
+
+
+#
+# Skips added for 3.12+.
+#
+
+# All of these tests use sub-interpreters which are incompatible with CinderX.
+test.test_capi.test_misc.SubinterpreterTest.*
+test.test_capi.test_misc.TestPendingCalls.test_isolated_subinterpreter
+test.test_capi.test_getargs.Test_testcapi.test_gh_119213
+test.test_import.SubinterpImportTests.*
+test.test_int.IntStrDigitLimitsTests.test_int_max_str_digits_is_per_interpreter
+test.test_int.IntSubclassStrDigitLimitsTests.test_int_max_str_digits_is_per_interpreter
+test.test_exceptions.ExceptionTests.test_memory_error_in_subinterp
+test.test_syslog.Test.test_subinterpreter_closelog
+test.test_syslog.Test.test_subinterpreter_openlog
+test.test_syslog.Test.test_subinterpreter_syslog
+test.test_capi.test_misc.Test_testcapi.test_atexit
+test.test_capi.test_misc.TestThreadState.test_gilstate_matches_current
+test.test_capi.test_misc.Test_testcapi.test_current_tstate_matches
+test.test_ast.test_ast.ModuleStateTests.test_subinterpreter
+test.test_sys.SysModuleTest.test_subinterp_intern_dynamically_allocated
+test.test_sys.SysModuleTest.test_subinterp_intern_singleton
+test.test_sys.SysModuleTest.test_subinterp_intern_statically_allocated
+test.test_types.SubinterpreterTests.test_static_types_inherited_slots
+test.test_import.SinglephaseInitTests.test_basic_multiple_interpreters_deleted_no_reset
+test.test_import.SinglephaseInitTests.test_basic_multiple_interpreters_main_no_reset
+test.test_import.SinglephaseInitTests.test_basic_multiple_interpreters_reset_each
+test.test_importlib.test_util.IncompatibleExtensionModuleRestrictionsTests.test_complete_multi_phase_init_module
+test.test_importlib.test_util.IncompatibleExtensionModuleRestrictionsTests.test_incomplete_multi_phase_init_module
+test.test_importlib.test_util.IncompatibleExtensionModuleRestrictionsTests.test_single_phase_init_module
+test.test__xxinterpchannels.ChannelReleaseTests.test_by_unassociated_interp
+test.test__xxinterpchannels.ChannelReleaseTests.test_close_if_unassociated
+test.test__xxinterpchannels.ChannelReleaseTests.test_multiple_users
+test.test__xxinterpchannels.ChannelTests.*
+
+# Expects only _testcapi module to be loaded in error message
+test.test_capi.test_misc.CAPITest.test_getitem_with_error
+
+# This test unassigns a random type watcher ID which could be ours
+test.test_capi.test_watchers.TestTypeWatchers.test_clear_unassigned_watcher_id
+test.test_capi.test_watchers.TestTypeWatchers.test_unwatch_unassigned_watcher_id
+test.test_capi.test_watchers.TestTypeWatchers.test_watch_unassigned_watcher_id
+
+# This expects the watcher ID to be 1
+test.test_capi.test_watchers.TestTypeWatchers.test_error
+
+# subinterpreters not supported
+test.test__interpreters.*
+test.test__interpchannels.*
+test.test_crossinterp.*
+test.datetimetester.ExtensionModuleTests_Fast.test_concurrent_initialization_subinterpreter
+test.datetimetester.CapiTest_Fast.test_type_check_in_subinterp
+test.test_concurrent_futures.test_init.InterpreterPoolInitializerTest.*
+test.test_concurrent_futures.test_init.InterpreterPoolFailingInitializerTest.*
+test.test_concurrent_futures.test_as_completed.InterpreterPoolFailingInitializerTest.*
+test.test_concurrent_futures.test_as_completed.InterpreterPoolAsCompletedTest.*
+test.test_concurrent_futures.test_interpreter_pool.*
+test.test_capi.test_misc.InterpreterConfigTests.*
+test.test_capi.test_misc.InterpreterIDTests.*
+test.test_capi.test_getargs.ParseTupleAndKeywords_Test.test_gh_119213
+
+# Extra frame injected in the dumb terminal so we don't shutdown cleanly
+test.test_pyrepl.test_pyrepl.TestDumbTerminal.test_dumb_terminal_exits_cleanly
+
+# subinterpreters - our code extra makes these stateful
+test.test_code.CodeTest.test_stateless
+
+# These tests use ctypes and can get crashy at shutdown due to the freefunc being freed.
+test.test_code.CoExtra.*
+
+# We report the wrong abi version on debug builds due to our build system
+test.test_sysconfig.TestSysConfig.test_sysconfigdata_json
+test.test_sysconfig.TestSysConfig.test_EXT_SUFFIX_in_vars
+test.test_sysconfig.TestSysConfig.test_soabi
+
+# these esoteric tests fail on some versions
+test.test_subprocess.ProcessTestCase.test_executable_without_cwd
+test.test_subprocess.ProcessTestCaseNoPoll.test_executable_without_cwd
+
+# jemalloc creates a background thread which causes extra output to get
+# spewed to stderr on fork.
+test.test_perf_profiler.TestPerfTrampoline.test_trampoline_works_after_fork_with_many_code_objects

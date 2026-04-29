@@ -1,0 +1,106 @@
+// Copyright (c) Meta Platforms, Inc. and affiliates.
+
+#include "cinderx/Immortalize/immortalize.h"
+
+#include "cinderx/Common/code.h"
+#include "cinderx/Common/py-portability.h"
+#include "cinderx/Common/ref.h"
+#include "cinderx/Common/util.h"
+#include "cinderx/UpstreamBorrow/borrowed.h" // @donotremove
+
+#define FROM_GC(g) ((PyObject*)(((PyGC_Head*)g) + 1))
+#define GEN_HEAD(state, n) (&(state)->generations[n].head)
+using GCState = struct _gc_runtime_state;
+
+struct _gc_runtime_state* get_gc_state() {
+  return &PyInterpreterState_Get()->gc;
+}
+
+bool can_immortalize(PyObject* obj) {
+  if (obj == nullptr || _Py_IsImmortal(obj)) {
+    return false;
+  }
+
+  // Python 3.12 will assert that strings that are immortalized are also
+  // interned in debug builds.  This is purely a debug check, it's fine to do in
+  // optimized builds.
+  if constexpr (kPyDebug) {
+    return !PyUnicode_Check(obj);
+  }
+
+  return true;
+}
+
+bool immortalize(PyObject* obj) {
+  if (!can_immortalize(obj)) {
+    return false;
+  }
+
+  IMMORTALIZE(obj);
+
+  if (PyCode_Check(obj)) {
+    BorrowedRef<PyCodeObject> code{obj};
+    codeExtra(code);
+    IMMORTALIZE(code->co_localspluskinds);
+    IMMORTALIZE(code->co_localsplusnames);
+    IMMORTALIZE(code->co_consts);
+    IMMORTALIZE(code->co_names);
+    IMMORTALIZE(code->co_linetable);
+
+    // These are strings and we need to check if this is safe.
+    immortalize(code->co_filename);
+    immortalize(code->co_name);
+  }
+
+  /* Cache the hash value of unicode object to reduce Copy-on-writes */
+  if (PyUnicode_CheckExact(obj)) {
+    PyObject_Hash(obj);
+  }
+
+  if (PyType_Check(obj)) {
+    PyUnstable_Type_AssignVersionTag(reinterpret_cast<PyTypeObject*>(obj));
+  }
+
+  return true;
+}
+
+PyObject* immortalize_heap([[maybe_unused]] PyObject* mod) {
+#ifdef Py_GIL_DISABLED
+  PyErr_SetString(
+      PyExc_RuntimeError,
+      "Immortalizing the heap is not yet supported in FT Python");
+  return nullptr;
+#else
+  // TODO(T251571267): Low priority for now.
+  /* Remove any dead objects to avoid immortalizing them */
+  PyGC_Collect();
+
+  /* Move all instances into the permanent generation */
+  Ref<> gc_mod = Ref<>::steal(PyImport_ImportModule("gc"));
+  if (!gc_mod) {
+    return nullptr;
+  }
+  Ref<> freeze_result =
+      Ref<>::steal(PyObject_CallMethod(gc_mod, "freeze", nullptr));
+  if (!freeze_result) {
+    return nullptr;
+  }
+
+  /* Immortalize all instances in the permanent generation */
+  struct _gc_runtime_state* gcstate = get_gc_state();
+  PyGC_Head* list = &gcstate->permanent_generation.head;
+  for (PyGC_Head* gc = _PyGCHead_NEXT(list); gc != list;
+       gc = _PyGCHead_NEXT(gc)) {
+    immortalize(FROM_GC(gc));
+
+    auto immortalize_visitor = [](PyObject* obj, void*) {
+      immortalize(obj);
+      return 0;
+    };
+    Py_TYPE(FROM_GC(gc))
+        ->tp_traverse(FROM_GC(gc), immortalize_visitor, nullptr);
+  }
+#endif
+
+  Py_RETURN_NONE;
+}

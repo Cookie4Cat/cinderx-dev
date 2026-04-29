@@ -1,0 +1,248 @@
+// Copyright (c) Meta Platforms, Inc. and affiliates.
+
+#include "cinderx/Jit/code_patcher.h"
+
+#include "cinderx/Common/log.h"
+#include "cinderx/Common/util.h"
+#include "cinderx/Jit/codegen/arch/detection.h"
+
+#include <array>
+#include <cstring>
+#ifdef Py_GIL_DISABLED
+#include <atomic>
+#ifdef CINDER_X86_64
+#include <algorithm>
+#endif
+#endif
+
+namespace jit {
+
+namespace {
+
+static_assert(
+    sizeof(CodePatcher) == 24,
+    "CodePatcher should be kept small as there could be many per function");
+
+#if defined(CINDER_X86_64)
+// 5-byte nop - https://www.felixcloutier.com/x86/nop
+//
+// Asmjit supports multi-byte nops but for whatever reason we can't get it to
+// emit the 5-byte version.
+constexpr auto kJmpNopBytes =
+    std::to_array<uint8_t>({0x0f, 0x1f, 0x44, 0x00, 0x00});
+#elif defined(CINDER_AARCH64)
+constexpr auto kJmpNopBytes = std::to_array<uint8_t>({0x1f, 0x20, 0x03, 0xd5});
+#else
+CINDER_UNSUPPORTED
+constexpr auto kJmpNopBytes = std::to_array<uint8_t>({0x00});
+#endif
+
+// Compute a signed 32-bit jump displacement.
+int32_t jumpDisplacement(uintptr_t from, uintptr_t to) {
+  auto disp = static_cast<intptr_t>(to - from);
+
+#if defined(CINDER_X86_64)
+  disp -= kJmpNopBytes.size();
+#endif
+
+  JIT_CHECK(
+      fitsSignedInt<32>(disp),
+      "Can't encode jump from {:#x} to {:#x} as relative",
+      from,
+      to);
+  return static_cast<int32_t>(disp);
+}
+
+// Given the starting address and displacement operand of a jump instruction,
+// resolve it to a target address.
+uintptr_t resolveDisplacement(uintptr_t from, int32_t displacement) {
+  auto disp =
+      from + static_cast<uintptr_t>(static_cast<intptr_t>(displacement));
+
+#if defined(CINDER_X86_64)
+  disp += kJmpNopBytes.size();
+#endif
+
+  return disp;
+}
+
+} // namespace
+
+void CodePatcher::link(uintptr_t patchpoint, std::span<const uint8_t> data) {
+  JIT_CHECK(!isLinked(), "Trying to re-link a patcher");
+
+  patchpoint_ = reinterpret_cast<uint8_t*>(patchpoint);
+
+  JIT_CHECK(
+      data.size() <= data_.size(),
+      "Trying to link a patch point with {} bytes of data but only {} are "
+      "supported",
+      data.size(),
+      data_.size());
+
+  std::memcpy(data_.data(), data.data(), data.size());
+  flags_.data_len = data.size();
+
+  onLink();
+}
+
+void CodePatcher::patch() {
+  JIT_CHECK(isLinked(), "Trying to patch a patcher that isn't linked");
+  JIT_DLOG("Patching DeoptPatchPoint at {}", static_cast<void*>(patchpoint_));
+
+  swap();
+
+  flags_.is_patched = true;
+  onPatch();
+}
+
+void CodePatcher::unpatch() {
+  JIT_CHECK(isLinked(), "Trying to unpatch a patcher that isn't linked");
+  JIT_DLOG("Unpatching DeoptPatchPoint at {}", static_cast<void*>(patchpoint_));
+
+  swap();
+
+  flags_.is_patched = false;
+  onUnpatch();
+}
+
+bool CodePatcher::isLinked() const {
+  return patchpoint_ != nullptr;
+}
+
+bool CodePatcher::isPatched() const {
+  return flags_.is_patched;
+}
+
+uint8_t* CodePatcher::patchpoint() const {
+  return patchpoint_;
+}
+
+std::span<const uint8_t> CodePatcher::storedBytes() const {
+  return std::span{data_.data(), flags_.data_len};
+}
+
+void CodePatcher::swap() {
+#ifdef Py_GIL_DISABLED
+  SwapLockGuard lock{*this};
+#endif
+
+#if defined(CINDER_X86_64) && defined(Py_GIL_DISABLED)
+  // On x86 the patchpoint is up to 7 bytes (aligned to 8 bytes by the code
+  // generator). However, we work with 8 bytes here as that should be an
+  // atomically writable size on x86.
+  static_assert(sizeof(uint64_t) >= sizeof(data_));
+  static_assert(std::atomic_ref<uint64_t>::is_always_lock_free == true);
+  JIT_CHECK(
+      reinterpret_cast<uintptr_t>(patchpoint_) % 8 == 0, "Not 8-byte aligned");
+  uint64_t qword;
+  std::memcpy(&qword, patchpoint_, sizeof(qword));
+
+  auto* qword_bytes = reinterpret_cast<uint8_t*>(&qword);
+  std::swap_ranges(qword_bytes, qword_bytes + flags_.data_len, data_.data());
+
+  std::atomic_ref<uint64_t>{*reinterpret_cast<uint64_t*>(patchpoint_)}.store(
+      qword, std::memory_order_relaxed);
+#else
+  decltype(data_) temp;
+  std::memcpy(temp.data(), patchpoint_, flags_.data_len);
+  std::memcpy(patchpoint_, data_.data(), flags_.data_len);
+  std::memcpy(data_.data(), temp.data(), flags_.data_len);
+#endif
+
+#ifdef Py_GIL_DISABLED
+  // Flush CPU caches, including the instruction cache, so all cores will see
+  // the update. Note for x86 this is a no-op as caches are coherent.
+  __builtin___clear_cache(
+      reinterpret_cast<char*>(patchpoint_),
+      reinterpret_cast<char*>(patchpoint_) + flags_.data_len);
+#endif
+}
+
+#ifdef Py_GIL_DISABLED
+// We use a custom spin-lock implementation as I'm not aware of a generic way of
+// implementing a lock where the mutex is bit-packed with other data. This
+// should be fine as the critical section is a short, slow-path, and should
+// only happen very rarely.
+CodePatcher::SwapLockGuard::SwapLockGuard(CodePatcher& patcher)
+    : patcher_(patcher) {
+  std::atomic_ref<uint8_t> ref{patcher_.flags_byte_};
+  while (true) {
+    uint8_t expected = ref.load(std::memory_order_relaxed);
+    if (!(expected & lockBit()) &&
+        ref.compare_exchange_weak(
+            expected,
+            expected | lockBit(),
+            std::memory_order_acquire,
+            std::memory_order_relaxed)) {
+      return;
+    }
+  }
+}
+
+CodePatcher::SwapLockGuard::~SwapLockGuard() {
+  std::atomic_ref<uint8_t>{patcher_.flags_byte_}.fetch_and(
+      static_cast<uint8_t>(~lockBit()), std::memory_order_release);
+}
+#endif
+
+JumpPatcher::JumpPatcher() {
+  // Initializes to a nop.
+  std::memcpy(data_.data(), kJmpNopBytes.data(), kJmpNopBytes.size());
+  flags_.data_len = kJmpNopBytes.size();
+}
+
+void JumpPatcher::linkJump(uintptr_t patchpoint, uintptr_t jump_target) {
+  auto disp = jumpDisplacement(patchpoint, jump_target);
+  std::array<uint8_t, kJmpNopBytes.size()> buf{};
+
+#if defined(CINDER_X86_64)
+  // 32 bit relative jump - https://www.felixcloutier.com/x86/jmp
+  buf[0] = 0xe9;
+  std::memcpy(buf.data() + 1, &disp, sizeof(disp));
+#elif defined(CINDER_AARCH64)
+  JIT_CHECK(
+      disp % 4 == 0, "Jump displacement must be a multiple of 4, got {}", disp);
+
+  disp /= 4;
+  JIT_CHECK(fitsSignedInt<26>(disp), "Not enough bits to encode relative jump");
+
+  uint32_t insn = 0x14000000 | (static_cast<uint32_t>(disp) & 0x03ffffff);
+  std::memcpy(buf.data(), &insn, sizeof(uint32_t));
+#else
+  (void)disp;
+  CINDER_UNSUPPORTED
+#endif
+
+  link(patchpoint, buf);
+}
+
+uint8_t* JumpPatcher::jumpTarget() const {
+  JIT_CHECK(
+      isLinked(), "Can't compute jump target before JumpPatcher is linked");
+
+  std::span<const uint8_t> bytes = storedBytes();
+  JIT_CHECK(
+      bytes.size() == kJmpNopBytes.size(),
+      "Must have linked a {}-byte jump instruction into a JumpPatcher",
+      kJmpNopBytes.size());
+
+  int32_t disp = 0;
+
+#if defined(CINDER_X86_64)
+  std::memcpy(&disp, bytes.data() + 1, bytes.size() - 1);
+#elif defined(CINDER_AARCH64)
+  uint32_t insn = 0;
+  std::memcpy(&insn, bytes.data(), bytes.size());
+  // Extract 26-bit immediate and sign-extend to 32 bits.
+  disp = static_cast<int32_t>(insn << 6) >> 6;
+  disp *= 4;
+#else
+  CINDER_UNSUPPORTED
+#endif
+
+  return reinterpret_cast<uint8_t*>(
+      resolveDisplacement(reinterpret_cast<uintptr_t>(patchpoint_), disp));
+}
+
+} // namespace jit
