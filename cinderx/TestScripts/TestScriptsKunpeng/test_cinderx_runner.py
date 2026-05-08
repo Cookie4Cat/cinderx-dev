@@ -94,7 +94,10 @@ SUITES.extend(
                 INSTRUMENTATION_FILTER,
             ],
             "allow_oss": True,
-            "env": {"PYTHONJITSUPPORTINSTRUMENTATION": "1"},
+            "env": {
+                "PYTHONJITSUPPORTINSTRUMENTATION": "1",
+                "PYTHON_JIT": "0",
+            },
         },
         {
             "name": "test_frame_evaluator_clean_slate",

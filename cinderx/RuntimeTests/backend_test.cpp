@@ -681,6 +681,26 @@ TEST_F(BackendTest, MoveSequenceOpt2Test) {
   [RBP - 16]:Object = Move RAX:Object
         RAX:Object = Add RSI:Object, [RBP - 16]:Object
   */
+#if defined(CINDER_AARCH64)
+  ASSERT_EQ(bb->getNumInstrs(), 3);
+  auto& instrs = bb->instructions();
+
+  auto iter = instrs.begin();
+
+  ASSERT_EQ((*(iter++))->opcode(), Instruction::kMove);
+  auto stack_load = (*(iter++)).get();
+  ASSERT_EQ(stack_load->opcode(), Instruction::kMove);
+  ASSERT_TRUE(stack_load->output()->isReg());
+  ASSERT_NE(
+      stack_load->output()->getPhyRegister(), arch::reg_general_return_loc);
+
+  auto add = (*iter).get();
+  ASSERT_EQ(add->opcode(), Instruction::kAdd);
+  ASSERT_TRUE(add->getInput(1)->isReg());
+  ASSERT_EQ(
+      add->getInput(1)->getPhyRegister(),
+      stack_load->output()->getPhyRegister());
+#else
   ASSERT_EQ(bb->getNumInstrs(), 2);
   auto& instrs = bb->instructions();
 
@@ -689,6 +709,7 @@ TEST_F(BackendTest, MoveSequenceOpt2Test) {
   ASSERT_EQ((*(iter++))->opcode(), Instruction::kMove);
   ASSERT_EQ((*iter)->opcode(), Instruction::kAdd);
   ASSERT_EQ((*iter)->getInput(1)->type(), OperandBase::kStack);
+#endif
 }
 
 TEST_F(BackendTest, CastTest) {

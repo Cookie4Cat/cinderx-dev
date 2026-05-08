@@ -10,6 +10,18 @@
 #include "cinderx/Jit/hir/ssa.h"
 #include "cinderx/Jit/pyjit.h"
 
+#include <regex>
+
+namespace {
+
+std::string normalizeToolchainPrivateSymbols(std::string hir) {
+  static const std::regex lto_priv_suffix{
+      R"(([A-Za-z_][A-Za-z0-9_]*)\.lto_priv\.[0-9]+(@0x[0-9a-fA-F]+))"};
+  return std::regex_replace(hir, lto_priv_suffix, "$1$2");
+}
+
+} // namespace
+
 std::unique_ptr<jit::hir::Function> RuntimeTest::buildHIR(
     BorrowedRef<PyFunctionObject> func) {
   // Force preloading dependent functions to test the inliner.
@@ -67,6 +79,7 @@ void HIRTest::TestBody() {
     ASSERT_TRUE(checkFunc(*irfunc, std::cout));
   }
   HIRPrinter printer;
-  auto hir = printer.ToString(*irfunc.get());
-  EXPECT_EQ(hir, expected_hir_);
+  auto hir = normalizeToolchainPrivateSymbols(printer.ToString(*irfunc.get()));
+  auto expected_hir = normalizeToolchainPrivateSymbols(expected_hir_);
+  EXPECT_EQ(hir, expected_hir);
 }

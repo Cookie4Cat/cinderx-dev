@@ -59,6 +59,12 @@ class RuntimeTest : public ::testing::Test {
     ASSERT_TRUE(Py_IsInitialized());
 
     auto mod_state = cinderx::getModuleState();
+    if (mod_state == nullptr) {
+      auto cinderx_module = Ref<>::steal(PyImport_ImportModule("_cinderx"));
+      ASSERT_NE(cinderx_module, nullptr)
+          << "Could not import _cinderx to initialize module state";
+      mod_state = cinderx::getModuleState();
+    }
     ASSERT_NE(mod_state, nullptr) << "Could not load the CinderX module state, "
                                      "CinderX has not initialized properly";
 
