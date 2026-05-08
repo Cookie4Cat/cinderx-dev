@@ -270,6 +270,9 @@ def skip_module_if_oss() -> None:
     (e.g. Meta Python's Lazy Imports).
     """
 
+    if os.environ.get("CINDERX_TEST_ALLOW_OSS_IMPORTS") == "1":
+        return
+
     if is_oss():
         raise unittest.SkipTest("Module not compatible with OSS imports")
 
