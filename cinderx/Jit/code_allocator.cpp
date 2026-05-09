@@ -70,6 +70,15 @@ bool setHugePages([[maybe_unused]] void* ptr, [[maybe_unused]] size_t size) {
   return false;
 }
 
+void flushInstructionCache(
+    [[maybe_unused]] void* ptr,
+    [[maybe_unused]] size_t size) {
+#if defined(CINDER_AARCH64)
+  auto start = static_cast<char*>(ptr);
+  __builtin___clear_cache(start, start + size);
+#endif
+}
+
 } // namespace
 
 ICodeAllocator* CodeAllocator::make() {
@@ -255,10 +264,12 @@ AllocateResult CodeAllocatorCinder::addSplitCode(asmjit::CodeHolder* code) {
     CodeSection cs = codeSectionFromName(section->name());
     if (cs == CodeSection::kCold) {
       std::memcpy(cold_alloc_, section->data(), buffer_size);
+      flushInstructionCache(cold_alloc_, buffer_size);
       cold_alloc_ += buffer_size;
       cold_alloc_free_ -= buffer_size;
     } else {
       std::memcpy(hot_alloc_, section->data(), buffer_size);
+      flushInstructionCache(hot_alloc_, buffer_size);
       hot_alloc_ += buffer_size;
       hot_alloc_free_ -= buffer_size;
     }
@@ -305,6 +316,7 @@ AllocateResult CodeAllocatorCinder::addCode(asmjit::CodeHolder* code) {
   }
 
   void* addr = hot_alloc_;
+  flushInstructionCache(addr, actual_code_size);
 
   hot_alloc_ += actual_code_size;
   hot_alloc_free_ -= actual_code_size;

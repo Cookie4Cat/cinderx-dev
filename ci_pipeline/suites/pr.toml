@@ -13,5 +13,11 @@ CINDERX_INCLUDE_TEST_PACKAGE_DATA = "1"
 ENABLE_XXCLASSLOADER = "1"
 
 [[jobs]]
+name = "runtime_tests"
+kind = "runtime_tests"
+[jobs.env]
+ENABLE_XXCLASSLOADER = "1"
+
+[[jobs]]
 name = "test_cinderx_release"
 command = "\"{run_dir}/venv/bin/python\" cinderx/TestScripts/TestScriptsKunpeng/test_cinderx_runner.py --python \"{run_dir}/venv/bin/python\" --log-dir \"{run_dir}/logs/test_cinderx_release\" --json-summary-file \"{run_dir}/test_cinderx_release.json\""

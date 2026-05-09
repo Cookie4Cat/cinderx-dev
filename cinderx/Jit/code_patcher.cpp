@@ -150,7 +150,7 @@ void CodePatcher::swap() {
   std::memcpy(data_.data(), temp.data(), flags_.data_len);
 #endif
 
-#ifdef Py_GIL_DISABLED
+#if defined(CINDER_AARCH64) || defined(Py_GIL_DISABLED)
   // Flush CPU caches, including the instruction cache, so all cores will see
   // the update. Note for x86 this is a no-op as caches are coherent.
   __builtin___clear_cache(

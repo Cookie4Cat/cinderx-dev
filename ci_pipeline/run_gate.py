@@ -10,6 +10,7 @@ import os
 from pathlib import Path
 import platform
 import re
+import shlex
 import shutil
 import subprocess
 import sys
@@ -143,11 +144,157 @@ def merged_env(job: dict[str, Any]) -> dict[str, str]:
     return env
 
 
-def command_for_job(job: dict[str, Any], run_dir: Path, prelude: str) -> str:
-    command = str(job["command"]).format(
-        repo=REPO_ROOT,
-        run_dir=run_dir,
+def cmake_value(value: object) -> str:
+    if isinstance(value, bool):
+        return "1" if value else "0"
+    if isinstance(value, int):
+        return str(value)
+    if isinstance(value, str):
+        return value
+    raise ValueError(f"unsupported CMake option value: {value!r}")
+
+
+def cinderx_test_python_info(env: dict[str, str]) -> dict[str, Any]:
+    code = (
+        "import json, os, sys, sysconfig; "
+        "print(json.dumps({"
+        "'py_version': f'{sys.version_info.major}.{sys.version_info.minor}', "
+        "'python_root': os.path.join(sysconfig.get_path('include'), '..', '..'), "
+        "'meta_python': '+meta' in sys.version, "
+        "'linux': sys.platform == 'linux', "
+        "'mac': sys.platform == 'darwin'"
+        "}))"
     )
+    completed = subprocess.run(
+        [env["CINDERX_TEST_PYTHON"], "-c", code],
+        cwd=REPO_ROOT,
+        env=env,
+        check=True,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        text=True,
+    )
+    return json.loads(completed.stdout)
+
+
+def runtime_tests_cmake_options(env: dict[str, str]) -> list[str]:
+    info = cinderx_test_python_info(env)
+    py_version = str(info["py_version"])
+    meta_python = bool(info["meta_python"])
+    linux = bool(info["linux"])
+    mac = bool(info["mac"])
+    meta_312 = meta_python and py_version == "3.12"
+    is_314plus = py_version in {"3.14", "3.15"}
+
+    options: dict[str, str] = {
+        "PY_VERSION": py_version,
+        "Python_ROOT_DIR": str(info["python_root"]),
+    }
+
+    def set_option(var: str, default: object) -> None:
+        options[var] = env.get(var, cmake_value(default))
+
+    set_option("META_PYTHON", meta_python)
+    set_option("ENABLE_ADAPTIVE_STATIC_PYTHON", meta_312)
+    set_option("ENABLE_DISASSEMBLER", True)
+    set_option("ENABLE_ELF_READER", linux)
+    set_option("ENABLE_EVAL_HOOK", meta_312)
+    set_option("ENABLE_FUNC_EVENT_MODIFY_QUALNAME", meta_312)
+    set_option("ENABLE_GENERATOR_AWAITER", meta_312)
+    set_option("ENABLE_INTERPRETER_LOOP", meta_312 or is_314plus)
+    set_option("ENABLE_LAZY_IMPORTS", meta_312)
+    set_option("ENABLE_LIGHTWEIGHT_FRAMES", meta_312)
+    set_option("ENABLE_PARALLEL_GC", meta_312)
+    set_option("ENABLE_PEP523_HOOK", meta_312 or is_314plus)
+    set_option("ENABLE_PERF_TRAMPOLINE", meta_312)
+    set_option("ENABLE_SYMBOLIZER", linux)
+    set_option("ENABLE_USDT", linux)
+    set_option("ENABLE_XXCLASSLOADER", False)
+    set_option("ENABLE_ZLIB", linux or mac)
+
+    return [f"-D{name}={value}" for name, value in options.items()]
+
+
+def shell_join(args: list[str]) -> str:
+    return " ".join(shlex.quote(str(arg)) for arg in args)
+
+
+def runtime_tests_command(
+    job: dict[str, Any],
+    run_dir: Path,
+    env: dict[str, str],
+) -> str:
+    build_dir = run_dir / "runtime-tests-build"
+    build_type = env.get("CMAKE_BUILD_TYPE", "RelWithDebInfo")
+    verbose_makefile = env.get("CMAKE_VERBOSE_MAKEFILE", "OFF")
+    parallelism = env.get("CINDERX_TEST_JOBS", str(os.cpu_count() or 2))
+
+    cmake_args = [
+        "cmake",
+        "-S",
+        str(REPO_ROOT),
+        "-B",
+        str(build_dir),
+        f"-DCMAKE_BUILD_TYPE={build_type}",
+        f"-DCMAKE_VERBOSE_MAKEFILE:BOOL={verbose_makefile}",
+        "-DENABLE_RUNTIME_TESTS=ON",
+        (
+            "-DENABLE_LTO=ON"
+            if env.get("CINDERX_ENABLE_LTO") is not None
+            else "-DENABLE_LTO=OFF"
+        ),
+        *runtime_tests_cmake_options(env),
+    ]
+    if env.get("CC"):
+        cmake_args.append(f"-DCMAKE_C_COMPILER={env['CC']}")
+    if env.get("CXX"):
+        cmake_args.append(f"-DCMAKE_CXX_COMPILER={env['CXX']}")
+
+    build_args = [
+        "cmake",
+        "--build",
+        str(build_dir),
+        "--target",
+        str(job.get("target", "runtime_tests")),
+        "--config",
+        build_type,
+        "--parallel",
+        parallelism,
+    ]
+    ctest_command = (
+        f"cd {shlex.quote(str(build_dir))} && "
+        f"{shell_join(['ctest', '--output-on-failure', '-C', build_type])}"
+    )
+
+    return " && ".join(
+        [
+            shell_join(["rm", "-rf", str(build_dir)]),
+            shell_join(cmake_args),
+            shell_join(build_args),
+            ctest_command,
+        ]
+    )
+
+
+def command_for_job(
+    job: dict[str, Any],
+    run_dir: Path,
+    prelude: str,
+    env: dict[str, str],
+) -> str:
+    kind = str(job.get("kind", "command"))
+    if kind == "command":
+        command = str(job["command"]).format(
+            repo=REPO_ROOT,
+            run_dir=run_dir,
+        )
+    elif kind == "runtime_tests":
+        command = runtime_tests_command(job, run_dir, env)
+    else:
+        raise ValueError(
+            f"unknown job kind for {job.get('name', '<unnamed>')}: {kind}"
+        )
+
     if not prelude:
         return command
     return f"set -euo pipefail; {prelude}; {command}"
@@ -211,18 +358,36 @@ def parse_pytest_summary(log_path: Path) -> dict[str, int] | None:
 
 def run_job(job: dict[str, Any], run_dir: Path, prelude: str) -> dict[str, Any]:
     name = str(job["name"])
-    command = command_for_job(job, run_dir, prelude)
     log_path = run_dir / "logs" / f"{name}.log"
 
     started = _datetime.datetime.now().isoformat(timespec="seconds")
     print(f"[ RUN      ] {name}", flush=True)
+    env = merged_env(job)
+    try:
+        command = command_for_job(job, run_dir, prelude, env)
+    except Exception as exc:
+        finished = _datetime.datetime.now().isoformat(timespec="seconds")
+        with log_path.open("w", encoding="utf-8") as log_file:
+            log_file.write(f"failed to prepare job command: {exc}\n")
+        print(f"[  FAILED ] {name} ({log_path})", flush=True)
+        return {
+            "name": name,
+            "status": "failed",
+            "returncode": 1,
+            "command": None,
+            "log": str(log_path.relative_to(REPO_ROOT)),
+            "started": started,
+            "finished": finished,
+            "test_counts": None,
+        }
+
     with log_path.open("w", encoding="utf-8") as log_file:
         log_file.write(f"$ {command}\n\n")
         log_file.flush()
         completed = subprocess.run(
             command,
             cwd=REPO_ROOT,
-            env=merged_env(job),
+            env=env,
             executable="/bin/bash" if os.name != "nt" else None,
             shell=True,
             stdout=log_file,
