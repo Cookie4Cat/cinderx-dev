@@ -37,6 +37,15 @@ COUNT_KEY_ALIASES = {
     "failures": "failed",
     "failure": "failed",
 }
+COVERAGE_TOOLS = ("gcov", "lcov", "genhtml")
+
+# Minimum coverage percentages enforced by --coverage after final lcov filters.
+# Tune these values when the accepted project baseline changes.
+COVERAGE_MIN_PERCENT = {
+    "line": 60.0,
+    "function": 70.0,
+    "branch": 35.0,
+}
 
 
 def load_suite(name: str) -> dict[str, Any]:
@@ -136,12 +145,69 @@ def configure_toolchain(env: dict[str, str]) -> None:
             env["CXX"] = cxx
 
 
-def merged_env(job: dict[str, Any]) -> dict[str, str]:
+def merged_env(job: dict[str, Any], coverage: bool = False) -> dict[str, str]:
     env = os.environ.copy()
     configure_toolchain(env)
+    if coverage:
+        env["CINDERX_ENABLE_COVERAGE"] = "1"
     for key, value in job.get("env", {}).items():
         env[str(key)] = str(value)
     return env
+
+
+def coverage_tool_paths() -> dict[str, str]:
+    paths: dict[str, str] = {}
+    missing = []
+    for tool in COVERAGE_TOOLS:
+        path = shutil.which(tool)
+        if path:
+            paths[tool] = path
+        else:
+            missing.append(tool)
+    if missing:
+        raise RuntimeError(
+            "coverage mode requires missing tool(s): " + ", ".join(missing)
+        )
+    return paths
+
+
+def lcov_version(tool_path: str) -> tuple[int, int] | None:
+    try:
+        completed = subprocess.run(
+            [tool_path, "--version"],
+            check=False,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.STDOUT,
+            text=True,
+        )
+    except OSError:
+        return None
+    match = re.search(r"LCOV version\s+([0-9]+)(?:\.([0-9]+))?", completed.stdout)
+    if not match:
+        return None
+    major = int(match.group(1))
+    minor = int(match.group(2) or 0)
+    return major, minor
+
+
+def lcov_is_v2_or_newer(tool_path: str) -> bool:
+    version = lcov_version(tool_path)
+    return bool(version and version[0] >= 2)
+
+
+def lcov_branch_coverage_args(lcov_v2_or_newer: bool) -> list[str]:
+    if lcov_v2_or_newer:
+        return ["--rc", "branch_coverage=1"]
+    return ["--rc", "lcov_branch_coverage=1"]
+
+
+def lcov_ignore_errors_args(
+    lcov_v2_or_newer: bool,
+    errors: tuple[str, ...],
+) -> list[str]:
+    if not lcov_v2_or_newer or not errors:
+        return []
+    return ["--ignore-errors", ",".join(errors)]
 
 
 def cmake_value(value: object) -> str:
@@ -219,6 +285,25 @@ def shell_join(args: list[str]) -> str:
     return " ".join(shlex.quote(str(arg)) for arg in args)
 
 
+def coverage_clean_native_build_command() -> str:
+    return (
+        "if [ -d build ]; then "
+        "find build -mindepth 1 -maxdepth 1 "
+        "! -name testgate ! -name fbcode_builder "
+        "-exec rm -rf {} +; "
+        "fi && rm -rf scratch cinderx.egg-info"
+    )
+
+
+def clean_stale_runtime_test_builds(run_dir: Path) -> None:
+    if not ARTIFACT_ROOT.exists():
+        return
+    for entry in ARTIFACT_ROOT.iterdir():
+        stale_runtime_build = entry / "runtime-tests-build"
+        if entry.is_dir() and entry != run_dir and stale_runtime_build.exists():
+            shutil.rmtree(stale_runtime_build)
+
+
 def runtime_tests_command(
     job: dict[str, Any],
     run_dir: Path,
@@ -245,6 +330,8 @@ def runtime_tests_command(
         ),
         *runtime_tests_cmake_options(env),
     ]
+    if env.get("CINDERX_ENABLE_COVERAGE") == "1":
+        cmake_args.append("-DENABLE_COVERAGE=ON")
     if env.get("CC"):
         cmake_args.append(f"-DCMAKE_C_COMPILER={env['CC']}")
     if env.get("CXX"):
@@ -281,6 +368,7 @@ def command_for_job(
     run_dir: Path,
     prelude: str,
     env: dict[str, str],
+    coverage: bool = False,
 ) -> str:
     kind = str(job.get("kind", "command"))
     if kind == "command":
@@ -288,6 +376,8 @@ def command_for_job(
             repo=REPO_ROOT,
             run_dir=run_dir,
         )
+        if coverage and str(job.get("name")) == "setup_release":
+            command = f"{coverage_clean_native_build_command()} && {command}"
     elif kind == "runtime_tests":
         command = runtime_tests_command(job, run_dir, env)
     else:
@@ -356,15 +446,20 @@ def parse_pytest_summary(log_path: Path) -> dict[str, int] | None:
     return counts if found else None
 
 
-def run_job(job: dict[str, Any], run_dir: Path, prelude: str) -> dict[str, Any]:
+def run_job(
+    job: dict[str, Any],
+    run_dir: Path,
+    prelude: str,
+    coverage: bool = False,
+) -> dict[str, Any]:
     name = str(job["name"])
     log_path = run_dir / "logs" / f"{name}.log"
 
     started = _datetime.datetime.now().isoformat(timespec="seconds")
     print(f"[ RUN      ] {name}", flush=True)
-    env = merged_env(job)
+    env = merged_env(job, coverage)
     try:
-        command = command_for_job(job, run_dir, prelude, env)
+        command = command_for_job(job, run_dir, prelude, env, coverage)
     except Exception as exc:
         finished = _datetime.datetime.now().isoformat(timespec="seconds")
         with log_path.open("w", encoding="utf-8") as log_file:
@@ -422,14 +517,344 @@ def run_job(job: dict[str, Any], run_dir: Path, prelude: str) -> dict[str, Any]:
     }
 
 
-def write_summary(run_dir: Path, suite_name: str, results: list[dict[str, Any]]) -> Path:
+def relative_to_repo(path: Path) -> str:
+    try:
+        return str(path.relative_to(REPO_ROOT))
+    except ValueError:
+        return str(path)
+
+
+def parse_lcov_summary_metrics(text: str) -> dict[str, str]:
+    metrics = {}
+    labels = {
+        "lines": "line",
+        "functions": "function",
+        "branches": "branch",
+    }
+    for genhtml_label, summary_label in labels.items():
+        match = re.search(rf"{genhtml_label}\.+:\s*([^\n]+)", text)
+        if match:
+            metrics[summary_label] = match.group(1).strip()
+    return metrics
+
+
+def format_coverage_metric(hit: int, total: int, units: str) -> str:
+    percent = 100.0 if total == 0 else hit * 100.0 / total
+    return f"{percent:.1f}% ({hit} of {total} {units})"
+
+
+def parse_lcov_tracefile_metrics(info_path: Path) -> dict[str, str]:
+    totals = {
+        "line": 0,
+        "function": 0,
+        "branch": 0,
+    }
+    hits = {
+        "line": 0,
+        "function": 0,
+        "branch": 0,
+    }
+    fields = {
+        "LF": ("line", totals),
+        "LH": ("line", hits),
+        "FNF": ("function", totals),
+        "FNH": ("function", hits),
+        "BRF": ("branch", totals),
+        "BRH": ("branch", hits),
+    }
+    seen_totals: set[str] = set()
+
+    try:
+        with info_path.open(encoding="utf-8", errors="replace") as info_file:
+            for line in info_file:
+                key, separator, value = line.partition(":")
+                if not separator:
+                    continue
+                field = fields.get(key)
+                if field is None:
+                    continue
+                metric, bucket = field
+                try:
+                    bucket[metric] += int(value.strip())
+                    if bucket is totals:
+                        seen_totals.add(metric)
+                except ValueError:
+                    continue
+    except OSError:
+        return {}
+
+    if not seen_totals:
+        return {}
+
+    metrics = {}
+    if "line" in seen_totals:
+        metrics["line"] = format_coverage_metric(
+            hits["line"],
+            totals["line"],
+            "lines",
+        )
+    if "function" in seen_totals:
+        metrics["function"] = format_coverage_metric(
+            hits["function"],
+            totals["function"],
+            "functions",
+        )
+    if "branch" in seen_totals:
+        metrics["branch"] = format_coverage_metric(
+            hits["branch"],
+            totals["branch"],
+            "branches",
+        )
+    return metrics
+
+
+def parse_coverage_percent(value: str | None) -> float | None:
+    if not value:
+        return None
+    match = re.match(r"\s*([0-9]+(?:\.[0-9]+)?)%", value)
+    if not match:
+        return None
+    return float(match.group(1))
+
+
+def coverage_threshold_failures(
+    metrics: dict[str, str],
+) -> list[dict[str, Any]]:
+    failures = []
+    for metric, minimum in COVERAGE_MIN_PERCENT.items():
+        value = metrics.get(metric)
+        actual = parse_coverage_percent(value)
+        if actual is None:
+            failures.append(
+                {
+                    "metric": metric,
+                    "minimum": minimum,
+                    "actual": None,
+                    "value": value or "missing",
+                }
+            )
+        elif actual < minimum:
+            failures.append(
+                {
+                    "metric": metric,
+                    "minimum": minimum,
+                    "actual": actual,
+                    "value": value,
+                }
+            )
+    return failures
+
+
+def format_coverage_threshold_failure(failure: dict[str, Any]) -> str:
+    metric = failure["metric"]
+    minimum = failure["minimum"]
+    actual = failure["actual"]
+    value = failure["value"]
+    if actual is None:
+        return f"{metric}: missing coverage metric, minimum {minimum:.1f}%"
+    return f"{metric}: {value} is below minimum {minimum:.1f}%"
+
+
+def write_coverage_threshold_report(
+    metrics: dict[str, str],
+    failures: list[dict[str, Any]],
+    log_path: Path,
+) -> None:
+    failed_metrics = {failure["metric"] for failure in failures}
+    with log_path.open("a", encoding="utf-8") as log_file:
+        log_file.write("\n[thresholds]\n")
+        for metric, minimum in COVERAGE_MIN_PERCENT.items():
+            value = metrics.get(metric)
+            actual = parse_coverage_percent(value)
+            if actual is None:
+                log_file.write(
+                    f"{metric}: missing, minimum {minimum:.1f}% [FAILED]\n"
+                )
+                continue
+            status = "FAILED" if metric in failed_metrics else "OK"
+            log_file.write(
+                f"{metric}: {value}, minimum {minimum:.1f}% [{status}]\n"
+            )
+
+
+def run_logged_step(step: str, args: list[str], cwd: Path, log_path: Path) -> int:
+    with log_path.open("a", encoding="utf-8") as log_file:
+        log_file.write(f"\n[{step}]\n")
+        log_file.write("$ " + shell_join(args) + "\n\n")
+        log_file.flush()
+        completed = subprocess.run(
+            args,
+            cwd=cwd,
+            stdout=log_file,
+            stderr=subprocess.STDOUT,
+            text=True,
+        )
+        log_file.write(f"\nexit code: {completed.returncode}\n")
+    return completed.returncode
+
+
+def collect_lcov_summary_metrics(
+    coverage_info: Path,
+    log_path: Path,
+) -> dict[str, str]:
+    metrics = parse_lcov_tracefile_metrics(coverage_info)
+    with log_path.open("a", encoding="utf-8") as log_file:
+        log_file.write("\n[summary]\n")
+        log_file.write(f"source: {coverage_info}\n\n")
+        if metrics:
+            log_file.write("Summary coverage rate:\n")
+            for label, metric in (
+                ("lines", "line"),
+                ("functions", "function"),
+                ("branches", "branch"),
+            ):
+                value = metrics.get(metric, "missing")
+                log_file.write(f"  {label.ljust(12, '.')}: {value}\n")
+        else:
+            log_file.write("Unable to parse coverage metrics from tracefile.\n")
+    return metrics
+
+
+def generate_coverage_report(
+    run_dir: Path,
+    tool_paths: dict[str, str],
+) -> dict[str, Any]:
+    coverage_dir = run_dir / "coverage"
+    html_dir = coverage_dir / "html"
+    raw_info = coverage_dir / "coverage.raw.info"
+    coverage_info = coverage_dir / "coverage.info"
+    log_path = run_dir / "logs" / "coverage.log"
+
+    coverage_dir.mkdir(parents=True, exist_ok=True)
+    html_dir.mkdir(parents=True, exist_ok=True)
+    log_path.write_text("", encoding="utf-8")
+
+    result: dict[str, Any] = {
+        "enabled": True,
+        "status": "failed",
+        "info": relative_to_repo(coverage_info),
+        "html_index": relative_to_repo(html_dir / "index.html"),
+        "log": relative_to_repo(log_path),
+        "tools": tool_paths,
+        "thresholds": COVERAGE_MIN_PERCENT,
+    }
+
+    lcov_v2_or_newer = lcov_is_v2_or_newer(tool_paths["lcov"])
+    common_lcov_args = lcov_branch_coverage_args(lcov_v2_or_newer)
+    capture_args = [
+        tool_paths["lcov"],
+        "--capture",
+        "--directory",
+        str(REPO_ROOT),
+        "--output-file",
+        str(raw_info),
+        "--gcov-tool",
+        tool_paths["gcov"],
+        "--no-external",
+        *lcov_ignore_errors_args(
+            lcov_v2_or_newer,
+            ("mismatch", "inconsistent"),
+        ),
+        *common_lcov_args,
+    ]
+    remove_args = [
+        tool_paths["lcov"],
+        "--remove",
+        str(raw_info),
+        "*/cinderx/ThirdParty/*",
+        "*/cinderx/RuntimeTests/*",
+        "*/cinderx/TestScripts/*",
+        "*/cinderx/PythonLib/test_cinderx/*",
+        "*/_deps/*",
+        "*/scratch/*",
+        "*/build/*",
+        *lcov_ignore_errors_args(
+            lcov_v2_or_newer,
+            ("inconsistent", "unused"),
+        ),
+        "--output-file",
+        str(coverage_info),
+        *common_lcov_args,
+    ]
+    genhtml_args = [
+        tool_paths["genhtml"],
+        str(coverage_info),
+        "--output-directory",
+        str(html_dir),
+        "--branch-coverage",
+        *lcov_ignore_errors_args(
+            lcov_v2_or_newer,
+            ("inconsistent", "corrupt"),
+        ),
+        "--title",
+        f"CinderX coverage {run_dir.name}",
+    ]
+    steps = [
+        ("capture", capture_args),
+        ("filter", remove_args),
+        ("html", genhtml_args),
+    ]
+    for step, args in steps:
+        print(f"[ COVERAGE ] {step}", flush=True)
+        returncode = run_logged_step(step, args, REPO_ROOT, log_path)
+        if returncode != 0:
+            result.update(
+                {
+                    "failed_step": step,
+                    "returncode": returncode,
+                }
+            )
+            print(f"[  FAILED ] coverage {step} ({log_path})", flush=True)
+            return result
+
+    metrics = collect_lcov_summary_metrics(
+        coverage_info,
+        log_path,
+    )
+    result["metrics"] = metrics
+    threshold_failures = coverage_threshold_failures(metrics)
+    print("[ COVERAGE ] thresholds", flush=True)
+    write_coverage_threshold_report(metrics, threshold_failures, log_path)
+    if threshold_failures:
+        result.update(
+            {
+                "failed_step": "thresholds",
+                "threshold_failures": threshold_failures,
+            }
+        )
+        print(f"[  FAILED ] coverage thresholds ({log_path})", flush=True)
+        for failure in threshold_failures:
+            print(
+                f"  - {format_coverage_threshold_failure(failure)}",
+                flush=True,
+            )
+        return result
+
+    result["status"] = "passed"
+    print("[       OK ] coverage thresholds", flush=True)
+    print(f"[       OK ] coverage html ({html_dir / 'index.html'})", flush=True)
+    return result
+
+
+def write_summary(
+    run_dir: Path,
+    suite_name: str,
+    results: list[dict[str, Any]],
+    coverage: dict[str, Any] | None = None,
+) -> Path:
     failed = [result for result in results if result["returncode"] != 0]
+    coverage_failed = bool(
+        coverage
+        and coverage.get("enabled")
+        and coverage.get("status") == "failed"
+    )
     summary = {
         "suite": suite_name,
-        "status": "failed" if failed else "passed",
+        "status": "failed" if failed or coverage_failed else "passed",
         "repo": str(REPO_ROOT),
         "head": git_head(),
         "results": results,
+        "coverage": coverage or {"enabled": False},
     }
     summary_path = run_dir / "summary.json"
     summary_path.write_text(json.dumps(summary, indent=2) + "\n", encoding="utf-8")
@@ -474,6 +899,14 @@ def main(argv: list[str]) -> int:
             "suite target"
         ),
     )
+    parser.add_argument(
+        "--coverage",
+        action="store_true",
+        help=(
+            "build native C/C++ code with GCC coverage instrumentation and "
+            "write lcov/genhtml reports under the run artifact directory"
+        ),
+    )
     args = parser.parse_args(argv)
 
     suite = load_suite(args.suite)
@@ -497,8 +930,19 @@ def main(argv: list[str]) -> int:
             print(job["name"])
         return 0
 
+    coverage_tools: dict[str, str] | None = None
+    if args.coverage:
+        try:
+            coverage_tools = coverage_tool_paths()
+        except RuntimeError as exc:
+            print(f"error: {exc}", file=sys.stderr)
+            return 2
+
     run_dir = make_run_dir(args.suite)
     print(f"artifact directory: {run_dir}", flush=True)
+    if args.coverage:
+        clean_stale_runtime_test_builds(run_dir)
+        print("coverage: enabled (GCC/gcov + lcov/genhtml)", flush=True)
 
     results = []
     prelude = str(suite.get("prelude", ""))
@@ -508,12 +952,17 @@ def main(argv: list[str]) -> int:
         prelude = args.prelude
     fail_fast = bool(suite.get("fail_fast", True))
     for job in jobs:
-        result = run_job(job, run_dir, prelude)
+        result = run_job(job, run_dir, prelude, args.coverage)
         results.append(result)
         if fail_fast and result["returncode"] != 0:
             break
 
-    summary_path = write_summary(run_dir, args.suite, results)
+    coverage_result: dict[str, Any] = {"enabled": False}
+    if args.coverage:
+        assert coverage_tools is not None
+        coverage_result = generate_coverage_report(run_dir, coverage_tools)
+
+    summary_path = write_summary(run_dir, args.suite, results, coverage_result)
     print(f"summary: {summary_path}", flush=True)
 
     # Aggregate test-level counts from all jobs that had pytest output
@@ -543,6 +992,13 @@ def main(argv: list[str]) -> int:
         print("failed jobs:", flush=True)
         for result in failed:
             print(f"  - {result['name']} ({result['log']})", flush=True)
+        return 1
+
+    if coverage_result.get("status") == "failed":
+        print(
+            f"coverage failed: {coverage_result.get('log', 'see coverage log')}",
+            flush=True,
+        )
         return 1
 
     return 0

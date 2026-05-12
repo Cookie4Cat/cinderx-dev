@@ -19,6 +19,7 @@ set(PROJECT_SOURCE_DIR ${PROJECT_SOURCE_DIR}/cinderx)
 
 option(ENABLE_PGO_GENERATE "Build with PGO profile generation" OFF)
 option(ENABLE_PGO_USE "Build with PGO profile use" OFF)
+option(ENABLE_COVERAGE "Build with GCC coverage instrumentation" OFF)
 set(PGO_PROFILE_FILE "" CACHE STRING "Path to PGO profile data")
 
 if (${CMAKE_SYSTEM_NAME} MATCHES "Darwin")
@@ -75,6 +76,14 @@ set(CMAKE_CXX_FLAGS "${CMAKE_CXX_FLAGS} ${SHARED_FLAGS}")
 
 option(ENABLE_LTO "Enable Link-Time Optimization (full)" OFF)
 
+if(ENABLE_COVERAGE AND ENABLE_LTO)
+  message(FATAL_ERROR "ENABLE_COVERAGE cannot be combined with ENABLE_LTO")
+endif()
+
+if(ENABLE_COVERAGE AND (ENABLE_PGO_GENERATE OR ENABLE_PGO_USE))
+  message(FATAL_ERROR "ENABLE_COVERAGE cannot be combined with PGO")
+endif()
+
 if(ENABLE_LTO)
   # Only support Linux
   if(MACOS)
@@ -114,6 +123,28 @@ if(ENABLE_LTO)
   set(CMAKE_SHARED_LINKER_FLAGS "${CMAKE_SHARED_LINKER_FLAGS} ${LTO_LINKER_FLAGS}")
   set(CMAKE_MODULE_LINKER_FLAGS "${CMAKE_MODULE_LINKER_FLAGS} ${LTO_LINKER_FLAGS}")
   set(CMAKE_EXE_LINKER_FLAGS "${CMAKE_EXE_LINKER_FLAGS} ${LTO_LINKER_FLAGS}")
+endif()
+
+##############################################################################
+# Apply coverage flags if enabled
+
+if(ENABLE_COVERAGE)
+  if(NOT CMAKE_CXX_COMPILER_ID MATCHES "GNU")
+    message(FATAL_ERROR "ENABLE_COVERAGE only supports GCC/gcov")
+  endif()
+
+  find_program(GCOV_EXECUTABLE gcov REQUIRED)
+  message(STATUS "Coverage: Enabled with ${GCOV_EXECUTABLE}")
+
+  foreach(lang C CXX)
+    set(CMAKE_${lang}_FLAGS "${CMAKE_${lang}_FLAGS} --coverage -O0 -g -fno-lto")
+    foreach(config DEBUG RELEASE RELWITHDEBINFO MINSIZEREL)
+      set(CMAKE_${lang}_FLAGS_${config} "${CMAKE_${lang}_FLAGS_${config}} -O0 -g")
+    endforeach()
+  endforeach()
+  set(CMAKE_SHARED_LINKER_FLAGS "${CMAKE_SHARED_LINKER_FLAGS} --coverage -fno-lto")
+  set(CMAKE_MODULE_LINKER_FLAGS "${CMAKE_MODULE_LINKER_FLAGS} --coverage -fno-lto")
+  set(CMAKE_EXE_LINKER_FLAGS "${CMAKE_EXE_LINKER_FLAGS} --coverage -fno-lto")
 endif()
 
 ##############################################################################

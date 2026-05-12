@@ -1,0 +1,2 @@
+# RuntimeTests test data files require LF line endings
+cinderx/RuntimeTests/hir_tests/*.txt text eol=lf
