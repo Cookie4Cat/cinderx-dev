@@ -2,21 +2,71 @@
 
 Chinese documentation: [README_CN.md](README_CN.md)
 
-Local merge gate for ARM64 CPython 3.14 CinderX JIT work on top of
+Local merge gates for ARM64 CPython 3.14 CinderX JIT work on top of
 `meta/main`.
 
+## PR Coverage Gate
+
+The PR gate is intended to run with native C/C++ coverage enabled:
+
 ```bash
-python3.14 ci_pipeline/run_gate.py pr
+python3.14 ci_pipeline/run_gate.py pr --coverage
 ```
 
-On the ARM64 server, run the same command inside the checkout, using the desired
-CPython 3.14 interpreter. Logs and `summary.json` are written under
-`build/testgate/`.
+The `pr` suite builds a test wheel, installs it into an isolated venv, and runs:
 
-The `pr` suite builds a test wheel, installs it into an isolated venv, and
-currently runs:
+- `runtime_tests`: native RuntimeTests built and run through CMake with coverage
+  instrumentation.
+- `test_cinderx_release`: CinderX Python tests from the fresh non-coverage
+  wheel.
 
-- `test_cinderx_release`: CinderX Python tests from the fresh wheel.
+Coverage mode only instruments jobs that opt into coverage. Today that is
+`runtime_tests`; `setup_release` and `test_cinderx_release` stay on the normal
+release wheel path. After the suite jobs finish, the gate captures and renders
+GCC coverage data with `gcov`, `lcov`, and `genhtml`. The coverage build
+explicitly disables LTO with `-fno-lto`, because coverage artifacts must be
+consumable by the active GCC/gcov toolchain.
+
+Coverage artifacts are written under the run directory:
+
+- `coverage/coverage.info`: final filtered lcov tracefile.
+- `coverage/html/index.html`: browsable HTML report.
+- `logs/coverage.log`: capture, filter, HTML, summary, and threshold logs.
+- `summary.json`: machine-readable gate summary, including coverage metrics,
+  thresholds, and coverage status.
+
+The final report is intended to measure CinderX native project code. It filters
+out third-party code, runtime test sources, test scripts, Python test packages,
+build directories, `scratch`, and FetchContent `_deps` sources.
+
+Coverage thresholds are configured in `COVERAGE_MIN_PERCENT` near the top of
+`ci_pipeline/run_gate.py`. They are calibrated for the current runtime-only
+coverage scope.
+
+## Daily Lib/test Gate
+
+The daily gate runs CPython `Lib/test` without coverage instrumentation:
+
+```bash
+python3.14 ci_pipeline/run_gate.py daily
+```
+
+The `daily` suite builds a test wheel, installs it into an isolated venv, and
+runs:
+
+- `lib_test_adaptive_aware_24`: CPython `Lib/test` with the CinderX frame
+  evaluator and `compile_after_n_calls(24)`, using the Kunpeng dispatcher to
+  reuse workers and reduce process startup overhead.
+
+The Lib/test runner uses the official skip/JIT ignore metadata under
+`cinderx/TestScripts/`, then applies the Kunpeng daily debt file
+`cinderx/TestScripts/TestScriptsKunpeng/lib_test_daily_ignore_tests.txt`.
+That file is kept separate from the official metadata and currently excludes
+CPython internal optimizer tests that are not a CinderX frame-eval/JIT
+compatibility target. The runner also removes proxy environment variables from
+Lib/test subprocesses so CI proxy settings do not change network-test behavior.
+
+## Common Notes
 
 The test wheel enables `CINDERX_INCLUDE_TEST_PACKAGE_DATA=1` so gate-only
 package data stays out of normal release wheels.
@@ -27,40 +77,6 @@ Known exclusions:
 
 Future work: add compiler side-by-side coverage for
 `test_compiler_sbs_stdlib_0.py` through `test_compiler_sbs_stdlib_9.py`.
-
-## Coverage Gate
-
-Run the same suite with native C/C++ coverage enabled:
-
-```bash
-python3.14 ci_pipeline/run_gate.py pr --coverage
-```
-
-Coverage mode runs the normal `pr` jobs first, then captures and renders GCC
-coverage data with `gcov`, `lcov`, and `genhtml`. The coverage build explicitly
-disables LTO with `-fno-lto`, because coverage artifacts must be consumable by
-the active GCC/gcov toolchain.
-
-Coverage artifacts are written under the run directory:
-
-- `coverage/coverage.info`: final filtered lcov tracefile.
-- `coverage/html/index.html`: browsable HTML report.
-- `logs/coverage.log`: capture, filter, HTML, summary, and threshold logs.
-- `summary.json`: machine-readable gate summary, including
-  `coverage.metrics`, `coverage.thresholds`, and coverage status.
-
-The final report is intended to measure CinderX native project code. It filters
-out third-party code, runtime test sources, test scripts, Python test packages,
-build directories, `scratch`, and FetchContent `_deps` sources.
-
-The coverage gate enforces line, function, and branch coverage thresholds from
-`COVERAGE_MIN_PERCENT` near the top of `ci_pipeline/run_gate.py`. If any metric
-falls below the configured minimum, the coverage step fails and the overall gate
-returns a non-zero exit code.
-
-`summary.json` coverage metrics are parsed from the final filtered
-`coverage.info` tracefile, not from the first summary printed in
-`coverage.log`.
 
 LCOV compatibility is handled at runtime:
 

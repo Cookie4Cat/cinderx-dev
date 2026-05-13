@@ -1,0 +1,11 @@
+# Kunpeng Lib/test daily gate debt.
+#
+# This file is intentionally separate from the official cinder_jit_ignore_tests*
+# metadata. Entries here describe local gate exclusions that should not be
+# applied to upstream test runners.
+
+# CPython tier-2/uops optimizer tests exercise CPython executor internals.
+# They are not a CinderX compatibility target for the frame-eval + JIT daily
+# gate, and can crash when run under CinderX frame evaluation on CPython builds
+# where the experimental optimizer is available.
+test.test_capi.test_opt.*
