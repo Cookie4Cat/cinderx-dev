@@ -419,6 +419,12 @@ class BuildExt(build_ext):
         else:
             cmake_args.append("-DENABLE_LTO=OFF")
 
+        if os.environ.get("CINDERX_ENABLE_COVERAGE") == "1":
+            cmake_args.append("-DENABLE_COVERAGE=ON")
+            print("Building with GCC coverage instrumentation")
+        else:
+            cmake_args.append("-DENABLE_COVERAGE=OFF")
+
         options: dict[str, str] = {}
 
         def set_option(var: str, default: object) -> None:
