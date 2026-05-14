@@ -18,9 +18,16 @@ def find_repo_root() -> Path:
 
 REPO_ROOT = find_repo_root()
 TEST_CINDERX_DIR = REPO_ROOT / "cinderx" / "PythonLib" / "test_cinderx"
+KUNPENG_TEST_CINDERX_DIR = TEST_CINDERX_DIR / "test_kunpeng"
 ALL_TEST_CINDERX = [
     str(path.relative_to(REPO_ROOT)) for path in sorted(TEST_CINDERX_DIR.glob("test*.py"))
 ]
+if KUNPENG_TEST_CINDERX_DIR.exists():
+    # Keep Kunpeng-specific test discovery flat and explicit.
+    ALL_TEST_CINDERX.extend(
+        str(path.relative_to(REPO_ROOT))
+        for path in sorted(KUNPENG_TEST_CINDERX_DIR.glob("test*.py"))
+    )
 COUNT_KEYS = ("passed", "failed", "error", "skipped", "deselected")
 COUNT_KEY_ALIASES = {
     "errors": "error",
