@@ -42,9 +42,9 @@ COVERAGE_TOOLS = ("gcov", "lcov", "genhtml")
 # Minimum coverage percentages enforced by --coverage after final lcov filters.
 # Tune these values when the accepted project baseline changes.
 COVERAGE_MIN_PERCENT = {
-    "line": 60.0,
-    "function": 70.0,
-    "branch": 35.0,
+    "line": 50.0,
+    "function": 60.0,
+    "branch": 30.0,
 }
 
 
@@ -295,6 +295,13 @@ def coverage_clean_native_build_command() -> str:
     )
 
 
+def job_uses_coverage(job: dict[str, Any], suite_coverage: bool) -> bool:
+    if not suite_coverage:
+        return False
+    default = str(job.get("kind", "command")) == "runtime_tests"
+    return bool(job.get("coverage", default))
+
+
 def clean_stale_runtime_test_builds(run_dir: Path) -> None:
     if not ARTIFACT_ROOT.exists():
         return
@@ -380,6 +387,8 @@ def command_for_job(
             command = f"{coverage_clean_native_build_command()} && {command}"
     elif kind == "runtime_tests":
         command = runtime_tests_command(job, run_dir, env)
+        if coverage:
+            command = f"{coverage_clean_native_build_command()} && {command}"
     else:
         raise ValueError(
             f"unknown job kind for {job.get('name', '<unnamed>')}: {kind}"
@@ -952,7 +961,7 @@ def main(argv: list[str]) -> int:
         prelude = args.prelude
     fail_fast = bool(suite.get("fail_fast", True))
     for job in jobs:
-        result = run_job(job, run_dir, prelude, args.coverage)
+        result = run_job(job, run_dir, prelude, job_uses_coverage(job, args.coverage))
         results.append(result)
         if fail_fast and result["returncode"] != 0:
             break

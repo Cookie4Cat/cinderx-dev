@@ -13,12 +13,5 @@ CINDERX_INCLUDE_TEST_PACKAGE_DATA = "1"
 ENABLE_XXCLASSLOADER = "1"
 
 [[jobs]]
-name = "runtime_tests"
-kind = "runtime_tests"
-coverage = true
-[jobs.env]
-ENABLE_XXCLASSLOADER = "1"
-
-[[jobs]]
-name = "test_cinderx_release"
-command = "\"{run_dir}/venv/bin/python\" cinderx/TestScripts/TestScriptsKunpeng/test_cinderx_runner.py --python \"{run_dir}/venv/bin/python\" --log-dir \"{run_dir}/logs/test_cinderx_release\" --json-summary-file \"{run_dir}/test_cinderx_release.json\""
+name = "lib_test_adaptive_aware_24"
+command = "\"{run_dir}/venv/bin/python\" cinderx/TestScripts/TestScriptsKunpeng/lib_test_runner.py --mode frame-eval-adaptive-aware --adaptive-compile-after 24 --runner dispatcher --num-workers auto --worker-timeout 1200 --worker-respawn-interval 10 --test-list-file \"{run_dir}/lib_test_adaptive_aware_24_tests.txt\" --json-summary-file \"{run_dir}/lib_test_adaptive_aware_24.json\""
