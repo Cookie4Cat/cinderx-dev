@@ -1,1 +1,1 @@
-import sys; exec("try: import cinderx\nexcept Exception: pass")
+import _cinderx_auto

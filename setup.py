@@ -381,6 +381,16 @@ class BuildExt(build_ext):
         print(f"Copying .pth file to {pth_dest}")
         self.copy_file(pth_source, pth_dest, preserve_mode=False)
 
+        auto_source = os.path.join(PYTHON_LIB_DIR, "_cinderx_auto.py")
+        auto_dest = os.path.join(self.build_lib, "_cinderx_auto.py")
+        if not os.path.isfile(auto_source):
+            raise FileNotFoundError(
+                f"Required file not found: {auto_source}. "
+                "Ensure _cinderx_auto.py exists in the source directory."
+            )
+        print(f"Copying _cinderx_auto.py to {auto_dest}")
+        self.copy_file(auto_source, auto_dest, preserve_mode=False)
+
     def _run_cmake(self, extension: CMakeExtension) -> None:
         # pyre-ignore[16]: No pyre types for build_ext.
         build_dir = self.build_temp

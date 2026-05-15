@@ -31,6 +31,7 @@ TESTGATE_DIR = REPO_ROOT / "ci_pipeline"
 SUITES_DIR = TESTGATE_DIR / "suites"
 ARTIFACT_ROOT = REPO_ROOT / "build" / "testgate"
 ALLOW_TARGET_MISMATCH_ENV = "CINDERX_TESTGATE_ALLOW_TARGET_MISMATCH"
+AUTO_IMPORT_ENABLE_ENV = "CINDERX_PLUGIN_ENABLE"
 COUNT_KEYS = ("passed", "failed", "error", "skipped", "deselected")
 COUNT_KEY_ALIASES = {
     "errors": "error",
@@ -150,6 +151,7 @@ def merged_env(job: dict[str, Any], coverage: bool = False) -> dict[str, str]:
     configure_toolchain(env)
     if coverage:
         env["CINDERX_ENABLE_COVERAGE"] = "1"
+        env[AUTO_IMPORT_ENABLE_ENV] = "1"
     for key, value in job.get("env", {}).items():
         env[str(key)] = str(value)
     return env
@@ -995,6 +997,28 @@ def main(argv: list[str]) -> int:
     if has_test_counts:
         total_tests = totals["passed"] + totals["failed"] + totals["error"] + totals["skipped"]
         print(f"Tests: {total_tests} collected, {totals['passed']} passed, {totals['failed']} failed, {totals['error']} error, {totals['skipped']} skipped, {totals['deselected']} deselected", flush=True)
+    if coverage_result.get("enabled"):
+        print("Coverage:", flush=True)
+        print("", flush=True)
+        metrics = coverage_result.get("metrics") or {}
+        metric_parts = [
+            f"{label} {metrics[key]}"
+            for key, label in (
+                ("line", "line"),
+                ("function", "function"),
+                ("branch", "branch"),
+            )
+            if key in metrics
+        ]
+        if metric_parts:
+            print(f"    metrics: {', '.join(metric_parts)}", flush=True)
+        html_index = coverage_result.get("html_index")
+        if html_index:
+            print(f"    html: {html_index}", flush=True)
+        log = coverage_result.get("log")
+        if log:
+            print(f"    log: {log}", flush=True)
+        print("", flush=True)
     print(f"{'=' * 60}", flush=True)
 
     if failed:
