@@ -13,6 +13,7 @@ def test_installed_cinderx_auto_imports_and_jits(tmp_path):
     for name in ("CINDERX_DISABLE", "CINDERX_JIT_DISABLE", "PYTHONJITDISABLE"):
         env.pop(name, None)
 
+    env["CINDERX_PLUGIN_ENABLE"] = "1"
     env["PYTHONJITALL"] = "1"
 
     completed = subprocess.run(
