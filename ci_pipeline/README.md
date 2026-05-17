@@ -57,14 +57,20 @@ runs:
 - `lib_test_adaptive_aware_24`: CPython `Lib/test` with the CinderX frame
   evaluator and `compile_after_n_calls(24)`, using the Kunpeng dispatcher to
   reuse workers and reduce process startup overhead.
+- `lib_test_official_skip_ok_26`: a Kunpeng-only explicit run of 26 modules
+  that are still present in official module-level skip metadata but passed
+  under the same frame-eval/adaptive-aware mode on ARM64 CPython 3.14.
 
 The Lib/test runner uses the official skip/JIT ignore metadata under
 `cinderx/TestScripts/`, then applies the Kunpeng daily debt file
 `cinderx/TestScripts/TestScriptsKunpeng/lib_test_daily_ignore_tests.txt`.
 That file is kept separate from the official metadata and currently excludes
 CPython internal optimizer tests that are not a CinderX frame-eval/JIT
-compatibility target. The runner also removes proxy environment variables from
-Lib/test subprocesses so CI proxy settings do not change network-test behavior.
+compatibility target. The 26 additional modules are listed separately in
+`cinderx/TestScripts/TestScriptsKunpeng/lib_test_daily_official_skip_ok_26.txt`;
+the official skip files are not modified. The runner also removes proxy
+environment variables from Lib/test subprocesses so CI proxy settings do not
+change network-test behavior.
 
 ## Common Notes
 
@@ -74,9 +80,18 @@ package data stays out of normal release wheels.
 Known exclusions:
 
 - `test_jit_support_instrumentation.py` is filtered to ARM64-supported cases.
+- `test_compiler_sbs_stdlib_0.py` through
+  `test_compiler_sbs_stdlib_9.py` are tracked as Kunpeng `test_cinderx`
+  debt outside the main gate. This suite is a large compiler bytecode parity
+  corpus; the current performance-optimization work does not target compiler
+  code generation, exception tables, or line tables. It collected 2,621 items
+  on 2026-05-17, and a bounded `--maxfail=50` run stopped at
+  `50 failed, 33 passed`, so it is intentionally deferred until compiler
+  parity work is in scope.
 
-Future work: add compiler side-by-side coverage for
-`test_compiler_sbs_stdlib_0.py` through `test_compiler_sbs_stdlib_9.py`.
+Future work: when compiler parity becomes in scope, turn the SBS stdlib debt
+into an explicit expected-failure or ignore baseline, then start running it
+continuously.
 
 LCOV compatibility is handled at runtime:
 

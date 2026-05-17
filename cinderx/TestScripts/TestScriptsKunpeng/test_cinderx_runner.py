@@ -17,6 +17,7 @@ def find_repo_root() -> Path:
     raise RuntimeError("could not find repository root")
 
 REPO_ROOT = find_repo_root()
+KUNPENG_TEST_SCRIPT_DIR = Path(__file__).resolve().parent
 TEST_CINDERX_DIR = REPO_ROOT / "cinderx" / "PythonLib" / "test_cinderx"
 KUNPENG_TEST_CINDERX_DIR = TEST_CINDERX_DIR / "test_kunpeng"
 ALL_TEST_CINDERX = [
@@ -43,11 +44,55 @@ INSTRUMENTATION_FILTER = (
     "test_suspended_generator_deopted_on_instrumentation_attach or "
     "test_multiple_suspended_generators_all_deopted"
 )
+KNOWN_SKIP_PLUGIN = "test_cinderx_known_skips"
 
 SUITES = [
     {
         "name": "all_test_cinderx",
         "args": ["-m", "pytest", *ALL_TEST_CINDERX],
+    },
+    {
+        "name": "test_static_tests",
+        "args": [
+            "-m",
+            "pytest",
+            "-vv",
+            "-rs",
+            "--import-mode=importlib",
+            "cinderx/PythonLib/test_cinderx/test___static__/test_enum.py",
+            "cinderx/PythonLib/test_cinderx/test___static__/test_native_utils.py",
+            "cinderx/PythonLib/test_cinderx/test___static__/tests.py",
+        ],
+        "allow_oss": True,
+    },
+    {
+        "name": "test_compiler",
+        "args": [
+            "-m",
+            "pytest",
+            "-vv",
+            "-rs",
+            "--import-mode=importlib",
+            "-p",
+            KNOWN_SKIP_PLUGIN,
+            "cinderx/PythonLib/test_cinderx/test_compiler",
+            "--ignore=cinderx/PythonLib/test_cinderx/test_compiler/test_sbs_stdlib.py",
+        ],
+        "allow_oss": True,
+    },
+    {
+        "name": "test_cpython_overrides",
+        "args": [
+            "-m",
+            "pytest",
+            "-vv",
+            "-rs",
+            "--import-mode=importlib",
+            "-p",
+            KNOWN_SKIP_PLUGIN,
+            "cinderx/PythonLib/test_cinderx/test_cpython_overrides",
+        ],
+        "allow_oss": True,
     },
     {
         "name": "test_cinderjit",
@@ -169,6 +214,14 @@ def run_suite(suite: dict, python: str, log_dir: Path) -> dict:
     name = suite["name"]
     log_path = log_dir / f"{name}.log"
     env = os.environ.copy()
+    env["PYTHONPATH"] = os.pathsep.join(
+        path
+        for path in [
+            str(KUNPENG_TEST_SCRIPT_DIR),
+            env.get("PYTHONPATH", ""),
+        ]
+        if path
+    )
     if suite.get("allow_oss"):
         env["CINDERX_TEST_ALLOW_OSS_IMPORTS"] = "1"
     env.update(suite.get("env", {}))
