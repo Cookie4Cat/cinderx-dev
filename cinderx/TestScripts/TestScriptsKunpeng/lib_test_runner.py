@@ -369,6 +369,14 @@ def main(argv: list[str]) -> int:
         "--test-from-file",
         help="read tests from this file instead of discovering Lib/test",
     )
+    parser.add_argument(
+        "--include-skipped-modules",
+        action="store_true",
+        help=(
+            "when --test or --test-from-file is used, keep tests that are "
+            "listed in module-level skip metadata"
+        ),
+    )
     parser.add_argument("--num-workers", default=None)
     parser.add_argument("--worker-timeout", type=int, default=20 * 60)
     parser.add_argument(
@@ -413,11 +421,15 @@ def main(argv: list[str]) -> int:
 
     skip_files, skip_modules, skip_patterns = load_skip_metadata()
     tests = normalize_tests(args.test)
+    explicit_tests = tests is not None or args.test_from_file is not None
+    if args.include_skipped_modules and not explicit_tests:
+        parser.error("--include-skipped-modules requires --test or --test-from-file")
     if tests is None and args.test_from_file:
         tests = normalize_tests(read_test_file(Path(args.test_from_file)))
     if tests is None:
         tests = discover_lib_tests(skip_modules)
-    tests = [test for test in tests if test not in skip_modules]
+    if not args.include_skipped_modules:
+        tests = [test for test in tests if test not in skip_modules]
 
     test_list_path = Path(args.test_list_file).resolve()
     write_lines(test_list_path, tests)
@@ -514,6 +526,7 @@ def main(argv: list[str]) -> int:
         "proxy_env_unset": list(PROXY_ENV_VARS),
         "test_count": len(tests),
         "tests": tests,
+        "include_skipped_modules": args.include_skipped_modules,
         "parallel_test_count": len(parallel_tests),
         "parallel_test_list_file": str(parallel_test_list_path),
         "single_process_tests": single_process_tests,

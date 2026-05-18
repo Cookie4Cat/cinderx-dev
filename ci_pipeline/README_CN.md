@@ -50,13 +50,19 @@ python3.14 ci_pipeline/run_gate.py daily
 - `lib_test_adaptive_aware_24`: 使用 CinderX frame evaluator 和
   `compile_after_n_calls(24)` 运行 CPython `Lib/test`，并通过 Kunpeng
   dispatcher 复用 worker，降低进程启动开销。
+- `lib_test_official_skip_ok_26`: Kunpeng 单独显式运行 26 个模块。这些模块
+  仍然保留在官方 module-level skip metadata 里，但已经在 ARM64 CPython 3.14
+  的 frame-eval/adaptive-aware 模式下验证通过。
 
 Lib/test runner 会先使用 `cinderx/TestScripts/` 下的官方 skip/JIT ignore
 metadata，然后追加 Kunpeng daily 债务文件
 `cinderx/TestScripts/TestScriptsKunpeng/lib_test_daily_ignore_tests.txt`。
 这个文件和官方 metadata 分开维护，当前只用于排除不属于 CinderX
-frame-eval/JIT 兼容性目标的 CPython 内部 optimizer 测试。runner 还会从
-Lib/test 子进程环境中清理代理变量，避免 CI 代理设置影响网络相关测试行为。
+frame-eval/JIT 兼容性目标的 CPython 内部 optimizer 测试。26 个新增接入模块
+单独记录在
+`cinderx/TestScripts/TestScriptsKunpeng/lib_test_daily_official_skip_ok_26.txt`；
+官方 skip 文件保持不变。runner 还会从 Lib/test 子进程环境中清理代理变量，
+避免 CI 代理设置影响网络相关测试行为。
 
 ## 通用说明
 
@@ -66,9 +72,16 @@ package data 进入普通发布版本 wheel。
 已知排除：
 
 - `test_jit_support_instrumentation.py` 仅运行 ARM64 支持的用例。
+- `test_compiler_sbs_stdlib_0.py` 到
+  `test_compiler_sbs_stdlib_9.py` 暂记为 Kunpeng `test_cinderx` 主 gate
+  之外的债务。这组测试是大规模 compiler bytecode parity corpus；当前性能优化
+  阶段不涉及 compiler code generation、exception table 或 line table。
+  这组用例在 2026-05-17 collect 到 2,621 个 item，`--maxfail=50` 样本
+  跑到 `50 failed, 33 passed` 后停止，所以先明确延后，等 compiler parity
+  进入工作范围后再处理。
 
-后续工作：增加 `test_compiler_sbs_stdlib_0.py` 到
-`test_compiler_sbs_stdlib_9.py` 的 compiler side-by-side 覆盖。
+后续工作：当 compiler parity 进入工作范围后，把 SBS stdlib 债务整理成明确的
+expected-failure 或 ignore baseline，再纳入持续运行。
 
 LCOV 兼容逻辑会在运行时根据版本选择参数：
 

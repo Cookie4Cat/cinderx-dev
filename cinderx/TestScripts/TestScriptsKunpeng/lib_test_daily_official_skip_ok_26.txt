@@ -1,0 +1,36 @@
+# Kunpeng daily additions from official module-level skip metadata.
+#
+# Keep this list separate from cinderx/TestScripts/* skip files. These modules
+# are still skipped by the official metadata, but the Kunpeng daily gate runs
+# them explicitly because they passed under frame-eval-adaptive-aware mode on
+# ARM64 CPython 3.14.
+#
+# Probe baseline:
+#   2026-05-18, compile_after_n_calls(24), dispatcher, worker respawn interval 1
+
+test.test__opcode
+test.test_bdb
+test.test_builtin
+test.test_compile
+test.test_decimal
+test.test_inspect.test_inspect
+test.test_ioctl
+test.test_multiprocessing_fork.test_manager
+test.test_multiprocessing_fork.test_misc
+test.test_multiprocessing_fork.test_processes
+test.test_multiprocessing_fork.test_threads
+test.test_multiprocessing_forkserver.test_manager
+test.test_multiprocessing_forkserver.test_misc
+test.test_multiprocessing_forkserver.test_processes
+test.test_multiprocessing_forkserver.test_threads
+test.test_multiprocessing_spawn.test_manager
+test.test_multiprocessing_spawn.test_misc
+test.test_multiprocessing_spawn.test_processes
+test.test_multiprocessing_spawn.test_threads
+test.test_pdb
+test.test_rlcompleter
+test.test_signal
+test.test_socket
+test.test_sys_setprofile
+test.test_trace
+test.test_unicodedata
