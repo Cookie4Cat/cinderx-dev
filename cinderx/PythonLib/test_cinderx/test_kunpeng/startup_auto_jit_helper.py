@@ -1,3 +1,4 @@
+import os
 import sys
 
 
@@ -12,10 +13,16 @@ for value in range(5):
 cinderx = sys.modules.get("cinderx")
 cinderjit = sys.modules.get("cinderjit")
 
-assert cinderx is not None, "cinderx was not auto-loaded"
-assert cinderjit is not None, "cinderjit was not auto-loaded"
-assert cinderx.is_initialized(), "cinderx was not initialized"
-assert cinderjit.is_enabled(), "cinderx JIT is not enabled"
-assert cinderjit.is_jit_compiled(auto_jit_target), "auto_jit_target was not compiled"
-assert cinderjit.get_compiled_size(auto_jit_target) > 0
+assert "_cinderx_auto" in sys.modules, "_cinderx_auto startup hook was not loaded"
+
+if os.environ.get("CINDERX_PLUGIN_ENABLE", "0") == "1":
+    assert cinderx is not None, "cinderx was not auto-loaded"
+    assert cinderjit is not None, "cinderjit was not auto-loaded"
+    assert cinderx.is_initialized(), "cinderx was not initialized"
+    assert cinderjit.is_enabled(), "cinderx JIT is not enabled"
+    assert cinderjit.is_jit_compiled(auto_jit_target), "auto_jit_target was not compiled"
+    assert cinderjit.get_compiled_size(auto_jit_target) > 0
+else:
+    assert cinderx is None, "cinderx was auto-loaded"
+    assert cinderjit is None, "cinderjit was auto-loaded"
 assert result == 5

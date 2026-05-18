@@ -6,16 +6,17 @@ import sys
 HELPER = Path(__file__).with_name("startup_auto_jit_helper.py")
 
 
-def test_installed_cinderx_auto_imports_and_jits(tmp_path):
-    """Requires cinderx to be installed into the tested interpreter."""
+def _startup_auto_jit_env():
     env = os.environ.copy()
     env.pop("PYTHONPATH", None)
     for name in ("CINDERX_DISABLE", "CINDERX_JIT_DISABLE", "PYTHONJITDISABLE"):
         env.pop(name, None)
 
-    env["CINDERX_PLUGIN_ENABLE"] = "1"
     env["PYTHONJITALL"] = "1"
+    return env
 
+
+def _run_startup_auto_jit_helper(tmp_path, env, failure_message):
     completed = subprocess.run(
         [sys.executable, str(HELPER)],
         # Keep the child away from the source tree so startup must use the
@@ -27,8 +28,48 @@ def test_installed_cinderx_auto_imports_and_jits(tmp_path):
         timeout=60,
     )
     assert completed.returncode == 0, (
-        "installed cinderx auto-import JIT subprocess failed\n"
+        f"{failure_message}\n"
         f"stdout:\n{completed.stdout}\n"
         f"stderr:\n{completed.stderr}"
     )
     assert "Traceback" not in completed.stderr
+
+
+def test_installed_cinderx_auto_imports_and_jits(tmp_path):
+    """Requires cinderx to be installed into the tested interpreter."""
+    env = _startup_auto_jit_env()
+    env["CINDERX_PLUGIN_ENABLE"] = "1"
+
+    _run_startup_auto_jit_helper(
+        tmp_path, env, "installed cinderx auto-import JIT subprocess failed"
+    )
+
+
+def test_installed_cinderx_auto_import_disabled_when_plugin_env_unset(tmp_path):
+    """Requires cinderx to be installed into the tested interpreter."""
+    env = _startup_auto_jit_env()
+    env.pop("CINDERX_PLUGIN_ENABLE", None)
+
+    _run_startup_auto_jit_helper(
+        tmp_path,
+        env,
+        (
+            "installed cinderx auto-import subprocess should be disabled when "
+            "CINDERX_PLUGIN_ENABLE is unset"
+        ),
+    )
+
+
+def test_installed_cinderx_auto_import_disabled_when_plugin_env_zero(tmp_path):
+    """Requires cinderx to be installed into the tested interpreter."""
+    env = _startup_auto_jit_env()
+    env["CINDERX_PLUGIN_ENABLE"] = "0"
+
+    _run_startup_auto_jit_helper(
+        tmp_path,
+        env,
+        (
+            "installed cinderx auto-import subprocess should be disabled when "
+            "CINDERX_PLUGIN_ENABLE is 0"
+        ),
+    )
