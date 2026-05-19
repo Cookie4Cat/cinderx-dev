@@ -73,6 +73,64 @@ loader 当前只按 CPython implementation 和 micro version 选择 native：
 非 CPython 3.14 -> ImportError
 ```
 
+## 源码基点和 offset shim 排除
+
+本 POC 的目标是验证 fat wheel 路线本身，因此基于 offset shim 之前的源码开发，
+不引入 `py314-compat.h` 或手写 private runtime offset。
+
+本地分支：
+
+```text
+branch: guo/cp314-fat-wheel-poc
+base: 247a60bb91e41a0f86d52e43a2ff8a4c6a8fa86c
+```
+
+服务器构建源码位于：
+
+```text
+/tmp/cinderx-fat-wheel-20260519-024339/src
+```
+
+该目录是构建用源码拷贝，不保留 `.git`，所以不能在服务器目录里直接
+`git rev-parse` 证明 exact commit。但已确认该源码拷贝中不存在：
+
+```text
+cinderx/Common/py314-compat.h
+```
+
+也没有搜到 offset shim 典型符号：
+
+```text
+py314-compat
+Ci_Py314
+runtime_micro
+_PyRuntime +
+```
+
+fat wheel 中的 `cinderx/_native/fat_wheel.json` 记录了每个 native variant
+来自哪个 ordinary wheel，例如 host fat wheel 来自：
+
+```text
+/tmp/cinderx-fat-wheel-20260519-024339/wheels/py3140/...
+/tmp/cinderx-fat-wheel-20260519-024339/wheels/py3141/...
+/tmp/cinderx-fat-wheel-20260519-024339/wheels/py3142/...
+/tmp/cinderx-fat-wheel-20260519-024339/wheels/py3143/...
+```
+
+manylinux fat wheel 来自：
+
+```text
+/tmp/cinderx-fat-wheel-20260519-024339/manylinux-repaired/py3140/...
+/tmp/cinderx-fat-wheel-20260519-024339/manylinux-repaired/py3141/...
+/tmp/cinderx-fat-wheel-20260519-024339/manylinux-repaired/py3142/...
+/tmp/cinderx-fat-wheel-20260519-024339/manylinux-repaired/py3143/...
+```
+
+结论：服务器上这批 fat wheel 是由四个 ordinary wheel repack 得到的，ordinary
+wheel 的源码不包含 offset shim。后续产品化时应把源码 commit、dirty status 和
+builder/runtime `sysconfig` 摘要写入 provenance，避免后续只能靠目录和符号搜索
+回溯产物来源。
+
 ## 服务器验证目录
 
 服务器别名：
@@ -277,6 +335,12 @@ wheel 的默认打包选项。正式发布 wheel 应使用默认值，即不打�
    - 同一个 fat wheel 安装到 3.14.0/1/2/3 tail-call off runtime。
    - 每个 runtime 跑 import/init/JIT smoke、test_cinderx、Lib/test。
    - 3.14.4 必须明确 ImportError。
+
+5. provenance:
+   - fat_wheel.json 记录源码 commit、dirty status。
+   - fat_wheel.json 记录每个 ordinary wheel 的 builder Python 路径。
+   - fat_wheel.json 记录关键 build-time sysconfig 值。
+   - 测试 summary 记录 runtime sysconfig 值，便于对照。
 ```
 
 如果未来确实要支持 tail-call on runtime，可以扩展成二维 fat wheel：
