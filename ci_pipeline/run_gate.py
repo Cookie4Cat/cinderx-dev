@@ -47,6 +47,12 @@ COVERAGE_MIN_PERCENT = {
     "function": 60.0,
     "branch": 30.0,
 }
+PIPELINES = {
+    "pr": (
+        ("runtime", True),
+        ("cinderx_inner", False),
+    ),
+}
 
 
 def load_suite(name: str) -> dict[str, Any]:
@@ -889,96 +895,59 @@ def git_head() -> str | None:
     return completed.stdout.strip()
 
 
-def main(argv: list[str]) -> int:
-    parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("suite", help="suite name, for example: pr")
-    parser.add_argument(
-        "--prelude",
-        help=(
-            "shell snippet to run before each job; overrides the suite prelude. "
-            "Use an empty string to disable it."
-        ),
-    )
-    parser.add_argument(
-        "--list",
-        action="store_true",
-        help="list jobs without running them",
-    )
-    parser.add_argument(
-        "--allow-target-mismatch",
-        action="store_true",
-        help=(
-            "continue even if the current Python/platform does not match the "
-            "suite target"
-        ),
-    )
-    parser.add_argument(
-        "--coverage",
-        action="store_true",
-        help=(
-            "build native C/C++ code with GCC coverage instrumentation and "
-            "write lcov/genhtml reports under the run artifact directory"
-        ),
-    )
-    args = parser.parse_args(argv)
-
-    suite = load_suite(args.suite)
+def check_suite_target(
+    suite_name: str,
+    suite: dict[str, Any],
+    args: argparse.Namespace,
+) -> int:
     target_warnings = check_target(suite.get("target", {}))
     for warning in target_warnings:
-        print(f"warning: {warning}", file=sys.stderr)
-    if target_warnings:
-        if not allow_target_mismatch(args):
-            print(
-                "error: target environment mismatch; pass "
-                "--allow-target-mismatch or set "
-                f"{ALLOW_TARGET_MISMATCH_ENV}=1 to continue",
-                file=sys.stderr,
-            )
-            return 2
-        print("warning: target mismatch override enabled", file=sys.stderr)
-
-    jobs = suite["jobs"]
-    if args.list:
-        for job in jobs:
-            print(job["name"])
+        print(f"warning [{suite_name}]: {warning}", file=sys.stderr)
+    if not target_warnings:
         return 0
+    if allow_target_mismatch(args):
+        print("warning: target mismatch override enabled", file=sys.stderr)
+        return 0
+    print(
+        "error: target environment mismatch; pass "
+        "--allow-target-mismatch or set "
+        f"{ALLOW_TARGET_MISMATCH_ENV}=1 to continue",
+        file=sys.stderr,
+    )
+    return 2
 
-    coverage_tools: dict[str, str] | None = None
-    if args.coverage:
-        try:
-            coverage_tools = coverage_tool_paths()
-        except RuntimeError as exc:
-            print(f"error: {exc}", file=sys.stderr)
-            return 2
 
-    run_dir = make_run_dir(args.suite)
-    print(f"artifact directory: {run_dir}", flush=True)
-    if args.coverage:
-        clean_stale_runtime_test_builds(run_dir)
-        print("coverage: enabled (GCC/gcov + lcov/genhtml)", flush=True)
-
-    results = []
+def suite_prelude(suite: dict[str, Any], args: argparse.Namespace) -> str:
     prelude = str(suite.get("prelude", ""))
     if "CINDERX_TESTGATE_PRELUDE" in os.environ:
         prelude = os.environ["CINDERX_TESTGATE_PRELUDE"]
     if args.prelude is not None:
         prelude = args.prelude
+    return prelude
+
+
+def run_suite_jobs(
+    suite: dict[str, Any],
+    run_dir: Path,
+    args: argparse.Namespace,
+    coverage: bool,
+) -> list[dict[str, Any]]:
+    results = []
+    prelude = suite_prelude(suite, args)
     fail_fast = bool(suite.get("fail_fast", True))
-    for job in jobs:
-        result = run_job(job, run_dir, prelude, job_uses_coverage(job, args.coverage))
+    for job in suite["jobs"]:
+        result = run_job(job, run_dir, prelude, job_uses_coverage(job, coverage))
         results.append(result)
         if fail_fast and result["returncode"] != 0:
             break
+    return results
 
-    coverage_result: dict[str, Any] = {"enabled": False}
-    if args.coverage:
-        assert coverage_tools is not None
-        coverage_result = generate_coverage_report(run_dir, coverage_tools)
 
-    summary_path = write_summary(run_dir, args.suite, results, coverage_result)
-    print(f"summary: {summary_path}", flush=True)
-
-    # Aggregate test-level counts from all jobs that had pytest output
+def print_run_summary(
+    jobs: list[dict[str, Any]],
+    results: list[dict[str, Any]],
+    coverage_result: dict[str, Any],
+) -> int:
     totals = {key: 0 for key in COUNT_KEYS}
     has_test_counts = False
     for r in results:
@@ -995,10 +964,24 @@ def main(argv: list[str]) -> int:
     skipped_jobs = total_jobs - ran_jobs
 
     print(f"\n{'=' * 60}", flush=True)
-    print(f"Jobs:  {ran_jobs}/{total_jobs} ran, {passed_jobs} passed, {len(failed)} failed, {skipped_jobs} skipped", flush=True)
+    print(
+        f"Jobs:  {ran_jobs}/{total_jobs} ran, {passed_jobs} passed, "
+        f"{len(failed)} failed, {skipped_jobs} skipped",
+        flush=True,
+    )
     if has_test_counts:
-        total_tests = totals["passed"] + totals["failed"] + totals["error"] + totals["skipped"]
-        print(f"Tests: {total_tests} collected, {totals['passed']} passed, {totals['failed']} failed, {totals['error']} error, {totals['skipped']} skipped, {totals['deselected']} deselected", flush=True)
+        total_tests = (
+            totals["passed"]
+            + totals["failed"]
+            + totals["error"]
+            + totals["skipped"]
+        )
+        print(
+            f"Tests: {total_tests} collected, {totals['passed']} passed, "
+            f"{totals['failed']} failed, {totals['error']} error, "
+            f"{totals['skipped']} skipped, {totals['deselected']} deselected",
+            flush=True,
+        )
     if coverage_result.get("enabled"):
         print("Coverage:", flush=True)
         print("", flush=True)
@@ -1037,6 +1020,158 @@ def main(argv: list[str]) -> int:
         return 1
 
     return 0
+
+
+def run_suite_command(
+    suite_name: str,
+    args: argparse.Namespace,
+) -> int:
+    suite = load_suite(suite_name)
+    target_status = check_suite_target(suite_name, suite, args)
+    if target_status != 0:
+        return target_status
+
+    jobs = suite["jobs"]
+    if args.list:
+        for job in jobs:
+            print(job["name"])
+        return 0
+
+    coverage_tools: dict[str, str] | None = None
+    if args.coverage:
+        try:
+            coverage_tools = coverage_tool_paths()
+        except RuntimeError as exc:
+            print(f"error: {exc}", file=sys.stderr)
+            return 2
+
+    run_dir = make_run_dir(suite_name)
+    print(f"artifact directory: {run_dir}", flush=True)
+    if args.coverage:
+        clean_stale_runtime_test_builds(run_dir)
+        print("coverage: enabled (GCC/gcov + lcov/genhtml)", flush=True)
+
+    results = run_suite_jobs(suite, run_dir, args, args.coverage)
+
+    coverage_result: dict[str, Any] = {"enabled": False}
+    if args.coverage:
+        assert coverage_tools is not None
+        coverage_result = generate_coverage_report(run_dir, coverage_tools)
+
+    summary_path = write_summary(run_dir, suite_name, results, coverage_result)
+    print(f"summary: {summary_path}", flush=True)
+    return print_run_summary(jobs, results, coverage_result)
+
+
+def run_pipeline_command(
+    pipeline_name: str,
+    args: argparse.Namespace,
+) -> int:
+    pipeline = PIPELINES[pipeline_name]
+    loaded_suites: list[tuple[str, bool, dict[str, Any]]] = []
+    for suite_name, pass_coverage in pipeline:
+        suite = load_suite(suite_name)
+        target_status = check_suite_target(suite_name, suite, args)
+        if target_status != 0:
+            return target_status
+        loaded_suites.append((suite_name, pass_coverage, suite))
+
+    jobs = [
+        job
+        for _, _, suite in loaded_suites
+        for job in suite["jobs"]
+    ]
+    if args.list:
+        for job in jobs:
+            print(job["name"])
+        return 0
+
+    coverage_tools: dict[str, str] | None = None
+    if args.coverage:
+        try:
+            coverage_tools = coverage_tool_paths()
+        except RuntimeError as exc:
+            print(f"error: {exc}", file=sys.stderr)
+            return 2
+
+    run_dir = make_run_dir(pipeline_name)
+    print(f"artifact directory: {run_dir}", flush=True)
+    if args.coverage:
+        clean_stale_runtime_test_builds(run_dir)
+        print("coverage: enabled (GCC/gcov + lcov/genhtml)", flush=True)
+
+    results: list[dict[str, Any]] = []
+    coverage_result: dict[str, Any] = {"enabled": False}
+    for _, pass_coverage, suite in loaded_suites:
+        suite_coverage = args.coverage and pass_coverage
+        suite_results = run_suite_jobs(
+            suite,
+            run_dir,
+            args,
+            suite_coverage,
+        )
+        results.extend(suite_results)
+        if any(result["returncode"] != 0 for result in suite_results):
+            break
+        if suite_coverage:
+            assert coverage_tools is not None
+            coverage_result = generate_coverage_report(run_dir, coverage_tools)
+            if coverage_result.get("status") == "failed":
+                break
+
+    summary_path = write_summary(run_dir, pipeline_name, results, coverage_result)
+    print(f"summary: {summary_path}", flush=True)
+    return print_run_summary(jobs, results, coverage_result)
+
+
+def main(argv: list[str]) -> int:
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument(
+        "pipeline",
+        nargs="?",
+        choices=sorted(PIPELINES),
+        help="pipeline name, for example: pr",
+    )
+    parser.add_argument(
+        "--suite",
+        help="run a single suite by name, for example: runtime",
+    )
+    parser.add_argument(
+        "--prelude",
+        help=(
+            "shell snippet to run before each job; overrides the suite prelude. "
+            "Use an empty string to disable it."
+        ),
+    )
+    parser.add_argument(
+        "--list",
+        action="store_true",
+        help="list jobs without running them",
+    )
+    parser.add_argument(
+        "--allow-target-mismatch",
+        action="store_true",
+        help=(
+            "continue even if the current Python/platform does not match the "
+            "suite target"
+        ),
+    )
+    parser.add_argument(
+        "--coverage",
+        action="store_true",
+        help=(
+            "build native C/C++ code with GCC coverage instrumentation and "
+            "write lcov/genhtml reports under the run artifact directory"
+        ),
+    )
+    args = parser.parse_args(argv)
+
+    if bool(args.pipeline) == bool(args.suite):
+        parser.error("pass exactly one of a pipeline name or --suite")
+
+    if args.suite:
+        return run_suite_command(args.suite, args)
+    return run_pipeline_command(args.pipeline, args)
 
 
 if __name__ == "__main__":

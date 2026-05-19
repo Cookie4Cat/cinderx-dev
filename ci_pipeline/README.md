@@ -13,19 +13,20 @@ The PR gate is intended to run with native C/C++ coverage enabled:
 python3.14 ci_pipeline/run_gate.py pr --coverage
 ```
 
-The `pr` suite builds a test wheel, installs it into an isolated venv, and runs:
+The `pr` pipeline runs the split local suites in order:
 
 - `runtime_tests`: native RuntimeTests built and run through CMake with coverage
   instrumentation.
 - `test_cinderx_release`: CinderX Python tests from the fresh non-coverage
   wheel.
 
-Coverage mode only instruments jobs that opt into coverage. Today that is
-`runtime_tests`; `setup_release` and `test_cinderx_release` stay on the normal
-release wheel path. After the suite jobs finish, the gate captures and renders
-GCC coverage data with `gcov`, `lcov`, and `genhtml`. The coverage build
-explicitly disables LTO with `-fno-lto`, because coverage artifacts must be
-consumable by the active GCC/gcov toolchain.
+Coverage mode is passed through to the `runtime` suite only. The
+`cinderx_inner` suite builds and installs the normal release wheel, then runs
+`test_cinderx_release`. After the `runtime` suite finishes, the gate captures
+and renders GCC coverage data with `gcov`, `lcov`, and `genhtml`; if coverage
+post-processing fails, the pipeline stops before `cinderx_inner`. The coverage
+build explicitly disables LTO with `-fno-lto`, because coverage artifacts must
+be consumable by the active GCC/gcov toolchain.
 
 Coverage artifacts are written under the run directory:
 
@@ -48,7 +49,7 @@ coverage scope.
 The daily gate runs CPython `Lib/test` without coverage instrumentation:
 
 ```bash
-python3.14 ci_pipeline/run_gate.py daily
+python3.14 ci_pipeline/run_gate.py --suite daily
 ```
 
 The `daily` suite builds a test wheel, installs it into an isolated venv, and
@@ -73,6 +74,14 @@ environment variables from Lib/test subprocesses so CI proxy settings do not
 change network-test behavior.
 
 ## Common Notes
+
+Pipelines are invoked by name, for example `ci_pipeline/run_gate.py pr`.
+Individual suites must be invoked with `--suite`, for example:
+
+```bash
+python3.14 ci_pipeline/run_gate.py --suite runtime --coverage
+python3.14 ci_pipeline/run_gate.py --suite cinderx_inner
+```
 
 The test wheel enables `CINDERX_INCLUDE_TEST_PACKAGE_DATA=1` so gate-only
 package data stays out of normal release wheels.

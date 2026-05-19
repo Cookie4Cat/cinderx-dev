@@ -13,14 +13,15 @@ PR 门禁推荐以 native C/C++ 覆盖率模式运行：
 python3.14 ci_pipeline/run_gate.py pr --coverage
 ```
 
-`pr` suite 会构建测试 wheel，安装到隔离 venv，然后运行：
+`pr` pipeline 会按顺序运行拆分后的本地 suite：
 
 - `runtime_tests`: 使用 CMake 构建并运行带覆盖率插桩的 native RuntimeTests。
 - `test_cinderx_release`: 使用新构建的非覆盖率 wheel 运行 CinderX Python 测试。
 
-覆盖率模式只会对明确参与覆盖率的 job 插桩。当前只有 `runtime_tests`；
-`setup_release` 和 `test_cinderx_release` 保持普通 release wheel 路径。suite
-jobs 结束后，门禁会使用 `gcov`、`lcov` 和 `genhtml` 采集并生成 GCC 覆盖率报告。
+覆盖率模式只会透传给 `runtime` suite。`cinderx_inner` suite 会构建并安装普通
+release wheel，然后运行 `test_cinderx_release`。`runtime` suite 结束后，门禁会使用
+`gcov`、`lcov` 和 `genhtml` 采集并生成 GCC 覆盖率报告；如果覆盖率后处理失败，
+pipeline 会在进入 `cinderx_inner` 前停止。
 覆盖率构建会显式禁用 LTO，因为覆盖率产物需要由当前 GCC/gcov 工具链读取。
 
 覆盖率产物会写入本次运行目录：
@@ -42,7 +43,7 @@ jobs 结束后，门禁会使用 `gcov`、`lcov` 和 `genhtml` 采集并生成 G
 日构建门禁运行不带覆盖率插桩的 CPython `Lib/test`：
 
 ```bash
-python3.14 ci_pipeline/run_gate.py daily
+python3.14 ci_pipeline/run_gate.py --suite daily
 ```
 
 `daily` suite 会构建测试 wheel，安装到隔离 venv，然后运行：
@@ -65,6 +66,14 @@ frame-eval/JIT 兼容性目标的 CPython 内部 optimizer 测试。26 个新增
 避免 CI 代理设置影响网络相关测试行为。
 
 ## 通用说明
+
+pipeline 通过名称调用，例如 `ci_pipeline/run_gate.py pr`。单独运行 suite 必须使用
+`--suite`，例如：
+
+```bash
+python3.14 ci_pipeline/run_gate.py --suite runtime --coverage
+python3.14 ci_pipeline/run_gate.py --suite cinderx_inner
+```
 
 测试 wheel 会启用 `CINDERX_INCLUDE_TEST_PACKAGE_DATA=1`，从而避免门禁专用的
 package data 进入普通发布版本 wheel。

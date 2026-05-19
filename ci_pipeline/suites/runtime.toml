@@ -1,0 +1,13 @@
+fail_fast = true
+
+[target]
+python = "3.14"
+arch = "arm64"
+system = "Linux"
+
+[[jobs]]
+name = "runtime_tests"
+kind = "runtime_tests"
+coverage = true
+[jobs.env]
+ENABLE_XXCLASSLOADER = "1"
