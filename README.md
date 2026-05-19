@@ -7,6 +7,8 @@
 CinderX is a Python extension that improves the performance of the Python
 runtime.
 
+> 中文文档请参阅 [README\_CN.md](README_CN.md)
+
 ## Status
 
 CinderX is under active development.  It is used in production at Meta for
@@ -97,12 +99,12 @@ CinderX is MIT licensed, see the LICENSE file.
 
 ## Terms of Use
 
-https://opensource.fb.com/legal/terms
+<https://opensource.fb.com/legal/terms>
 
 ## Privacy Policy
 
-https://opensource.fb.com/legal/privacy
+<https://opensource.fb.com/legal/privacy>
 
----
+***
 
 Copyright © 2025 Meta Platforms, Inc.
