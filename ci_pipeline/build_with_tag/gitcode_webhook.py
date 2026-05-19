@@ -2,6 +2,7 @@
 import argparse
 import json
 import os
+import re
 import shlex
 import shutil
 import socket
@@ -48,6 +49,11 @@ BUILD_COMMAND = env(
 RELEASE_STATUS = env("GITCODE_RELEASE_STATUS", "latest")
 STRICT_RELEASE_CREATE = env_bool("GITCODE_STRICT_RELEASE_CREATE", False)
 HTTP_TIMEOUT = int(env("CINDERX_WEBHOOK_HTTP_TIMEOUT", "120"))
+RELEASE_TAG_RE = re.compile(
+    r"^v(?P<major>0|[1-9]\d*)\.(?P<minor>0|[1-9]\d*)\.(?P<patch>0|[1-9]\d*)"
+    r"(?:-(?P<prerelease>alpha|beta|rc)\.(?P<pre_num>0|[1-9]\d*))?$"
+)
+PRERELEASE_ORDER = {"alpha": 0, "beta": 1, "rc": 2}
 
 
 def log_line(fp, msg):
@@ -85,6 +91,46 @@ def run_cmd(args, cwd, log, env_overrides=None, timeout=None):
         raise
     if code != 0:
         raise RuntimeError(f"command failed with exit code {code}: {' '.join(args)}")
+
+
+def check_output(args, cwd):
+    return subprocess.check_output(
+        args,
+        cwd=str(cwd),
+        text=True,
+        encoding="utf-8",
+        errors="replace",
+    ).strip()
+
+
+def validate_release_tag(tag):
+    match = RELEASE_TAG_RE.fullmatch(tag)
+    if not match:
+        raise RuntimeError(
+            "invalid release tag: "
+            f"{tag}; expected v<MAJOR>.<MINOR>.<PATCH> or "
+            "v<MAJOR>.<MINOR>.<PATCH>-<alpha|beta|rc>.<N>"
+        )
+    return match
+
+
+def release_tag_key(tag):
+    match = validate_release_tag(tag)
+    prerelease = match.group("prerelease")
+    pre_num = match.group("pre_num")
+    if prerelease:
+        release_rank = 0
+        pre_key = (PRERELEASE_ORDER[prerelease], int(pre_num))
+    else:
+        release_rank = 1
+        pre_key = (len(PRERELEASE_ORDER), 0)
+    return (
+        int(match.group("major")),
+        int(match.group("minor")),
+        int(match.group("patch")),
+        release_rank,
+        *pre_key,
+    )
 
 
 def make_git_env():
@@ -128,7 +174,7 @@ def checkout_tag(tag, sha, log):
     run_cmd(["git", "fetch", "--force", "--tags", "origin", refspec], REPO_DIR, log, git_env)
     run_cmd(["git", "checkout", "--force", f"refs/tags/{tag}"], REPO_DIR, log, git_env)
     run_cmd(["git", "clean", "-ffdx"], REPO_DIR, log, git_env)
-    checked_sha = subprocess.check_output(["git", "rev-parse", "HEAD"], cwd=str(REPO_DIR), text=True).strip()
+    checked_sha = check_output(["git", "rev-parse", "HEAD"], REPO_DIR)
     log_line(log, f"checked out {tag} at {checked_sha}")
     if sha and sha != ZERO_SHA and checked_sha != sha:
         log_line(log, f"warning: webhook sha {sha} differs from checked out sha {checked_sha}")
@@ -170,16 +216,134 @@ def release_exists(tag):
         return False
 
 
+def previous_release_tag(current_tag, log):
+    current_key = release_tag_key(current_tag)
+    try:
+        tags = check_output(
+            ["git", "tag", "--merged", "HEAD"],
+            REPO_DIR,
+        ).splitlines()
+    except subprocess.CalledProcessError as exc:
+        log_line(log, f"warning: failed to list previous tags: {exc}")
+        return ""
+    candidates = []
+    for tag in tags:
+        tag = tag.strip()
+        if not tag or tag == current_tag or not RELEASE_TAG_RE.fullmatch(tag):
+            continue
+        tag_key = release_tag_key(tag)
+        if tag_key < current_key:
+            candidates.append((tag_key, tag))
+    if not candidates:
+        return ""
+    return max(candidates)[1]
+
+
+def git_log_entries(previous_tag, log):
+    if not previous_tag:
+        output = check_output(
+            ["git", "log", "--pretty=format:%h %s", "--no-merges", "-20"],
+            REPO_DIR,
+        )
+        return [line for line in output.splitlines() if line.strip()]
+
+    rev_range = f"{previous_tag}..HEAD"
+    try:
+        output = check_output(
+            ["git", "log", "--pretty=format:%h %s", "--no-merges", rev_range],
+            REPO_DIR,
+        )
+    except subprocess.CalledProcessError as exc:
+        log_line(log, f"warning: failed to collect changelog from {rev_range}: {exc}")
+        return []
+    return [line for line in output.splitlines() if line.strip()]
+
+
+def categorize_change(line):
+    text = line.lower()
+    if any(token in text for token in ("特性", "feature", "feat")):
+        return "features"
+    if any(token in text for token in ("修复", "fix", "bug")):
+        return "fixes"
+    if any(token in text for token in ("性能", "perf")):
+        return "performance"
+    return "chores"
+
+
+def format_section(title, entries):
+    lines = [f"## {title}"]
+    if entries:
+        lines.extend(f"- {entry}" for entry in entries)
+    else:
+        lines.append("- 暂无")
+    return "\n".join(lines)
+
+
+def build_release_body(tag, sha, log):
+    match = validate_release_tag(tag)
+    previous_tag = previous_release_tag(tag, log)
+    entries = git_log_entries(previous_tag, log)
+    grouped = {
+        "features": [],
+        "fixes": [],
+        "performance": [],
+        "chores": [],
+    }
+    for entry in entries:
+        grouped[categorize_change(entry)].append(entry)
+
+    today = time.strftime("%Y-%m-%d")
+    compare_from = previous_tag or "recent commits"
+    body = [
+        f"# {tag} ({today})",
+        "",
+        format_section("新功能 (Features)", grouped["features"]),
+        "",
+        format_section("修复 (Bug Fixes)", grouped["fixes"]),
+        "",
+        format_section("性能优化 (Performance)", grouped["performance"]),
+        "",
+        format_section("其他变更 (Chores)", grouped["chores"]),
+        "",
+        "## 安装与部署",
+        "- Python: CPython 3.14",
+        "- Wheel: 请在本 Release 附件中下载对应 `.whl`",
+        f"- 构建命令: `{BUILD_COMMAND}`",
+        "",
+        "## 完整变更日志",
+        f"Changes since `{compare_from}`:",
+    ]
+    body.extend(f"- {entry}" for entry in entries)
+    if not entries:
+        body.append("- 暂无")
+    if match.group("prerelease"):
+        body.extend(
+            [
+                "",
+                "## 预发布说明",
+                "This is a pre-release version.",
+                "",
+                "## 已知问题",
+                "- 暂无",
+            ]
+        )
+    body.extend(
+        [
+            "",
+            "## 构建信息",
+            f"- Commit: `{sha}`",
+            f"- Builder: `{socket.gethostname()}`",
+        ]
+    )
+    return "\n".join(body) + "\n"
+
+
 def create_release(tag, sha, log):
+    validate_release_tag(tag)
     body = {
         "tag_name": tag,
-        "name": tag,
-        "body": (
-            f"Automated CinderX wheel build for tag `{tag}`.\n\n"
-            f"- Commit: `{sha}`\n"
-            f"- Builder: `{socket.gethostname()}`\n"
-            f"- Build command: `{BUILD_COMMAND}`\n"
-        ),
+        "name": f"CinderX {tag}",
+        "body": build_release_body(tag, sha, log),
         "target_commitish": sha,
         "release_status": RELEASE_STATUS,
     }
@@ -219,6 +383,7 @@ def upload_asset(tag, file_path, log):
 
 
 def build_and_publish(tag, sha):
+    validate_release_tag(tag)
     LOG_DIR.mkdir(parents=True, exist_ok=True)
     STATE_DIR.mkdir(parents=True, exist_ok=True)
     RUN_DIR.mkdir(parents=True, exist_ok=True)
