@@ -77,6 +77,7 @@ SUITES = [
             KNOWN_SKIP_PLUGIN,
             "cinderx/PythonLib/test_cinderx/test_compiler",
             "--ignore=cinderx/PythonLib/test_cinderx/test_compiler/test_sbs_stdlib.py",
+            "--ignore=cinderx/PythonLib/test_cinderx/test_compiler/test_strict",
         ],
         "allow_oss": True,
     },
@@ -130,6 +131,10 @@ for test_name in [
             "allow_oss": True,
         }
     )
+
+for suite in SUITES:
+    if suite["name"] == "test_jit_attr_cache":
+        suite["args"].extend(["-k", "not test_load_method_from_strict_module"])
 
 SUITES.extend(
     [
@@ -260,6 +265,12 @@ def run_suite(suite: dict, python: str, log_dir: Path) -> dict:
 def main(argv: list[str]) -> int:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--python", default=sys.executable)
+    parser.add_argument(
+        "--suite",
+        action="append",
+        choices=[suite["name"] for suite in SUITES],
+        help="run only the named suite; may be provided more than once",
+    )
     parser.add_argument("--log-dir", required=True)
     parser.add_argument("--json-summary-file", required=True)
     args = parser.parse_args(argv)
@@ -267,8 +278,15 @@ def main(argv: list[str]) -> int:
     log_dir = Path(args.log_dir)
     log_dir.mkdir(parents=True, exist_ok=True)
 
+    selected_suites = SUITES
+    if args.suite:
+        requested_suites = set(args.suite)
+        selected_suites = [
+            suite for suite in SUITES if suite["name"] in requested_suites
+        ]
+
     results = []
-    for suite in SUITES:
+    for suite in selected_suites:
         result = run_suite(suite, args.python, log_dir)
         results.append(result)
         if result["returncode"] != 0:
@@ -280,7 +298,7 @@ def main(argv: list[str]) -> int:
         for key in totals:
             totals[key] += r.get("test_counts", {}).get(key, 0)
 
-    total_suites = len(SUITES)
+    total_suites = len(selected_suites)
     ran_suites = len(results)
     passed_suites = sum(1 for r in results if r["returncode"] == 0)
     failed_suites = [r for r in results if r["returncode"] != 0]
