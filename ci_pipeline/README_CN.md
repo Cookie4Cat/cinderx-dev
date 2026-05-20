@@ -80,6 +80,50 @@ python3.14 ci_pipeline/run_gate.py --suite wheel_compat_negative
 测试 wheel 会启用 `CINDERX_INCLUDE_TEST_PACKAGE_DATA=1`，避免门禁专用 package
 data 进入普通发布 wheel。
 
+## 预置依赖 / 离线模式
+
+现在可以把 `run_gate` 需要的外部依赖提前准备到环境里，门禁执行时不再临时下载。
+
+对于 CMake `FetchContent` 依赖，使用：
+
+- `CINDERX_DEPS_ROOT`：预置源码根目录
+- `CINDERX_FETCHCONTENT_OFFLINE=1`：开启后如果缺少本地源码则直接失败，不再联网 clone
+
+`CINDERX_DEPS_ROOT` 下面约定的子目录为：
+
+- `fmt`
+- `parallel-hashmap`
+- `usdt`
+- `capstone`
+- `googletest`
+
+如果某个依赖不想放在统一目录下，也可以分别指定：
+
+- `CINDERX_FMT_SOURCE_DIR`
+- `CINDERX_PARALLEL_HASHMAP_SOURCE_DIR`
+- `CINDERX_USDT_SOURCE_DIR`
+- `CINDERX_CAPSTONE_SOURCE_DIR`
+- `CINDERX_GOOGLETEST_SOURCE_DIR`
+
+对于 suite venv 里的 Python 包引导，使用：
+
+- `CINDERX_PIP_WHEELHOUSE`：本地 wheelhouse，至少包含 `pip`、`pytest` 以及
+  pytest 的传递依赖
+- `CINDERX_PIP_OFFLINE=1`：要求 `pip` 只从本地 wheelhouse 安装
+
+`CINDERX_OFFLINE=1` 是一个便捷开关，会同时开启
+`CINDERX_FETCHCONTENT_OFFLINE=1` 和 `CINDERX_PIP_OFFLINE=1`。
+
+示例：
+
+```bash
+export CINDERX_DEPS_ROOT=/opt/cinderx-deps
+export CINDERX_PIP_WHEELHOUSE=/opt/cinderx-pydeps
+export CINDERX_OFFLINE=1
+
+python3.14 ci_pipeline/run_gate.py pr --coverage
+```
+
 覆盖率阈值定义在 `ci_pipeline/run_gate.py` 顶部附近的
 `COVERAGE_MIN_PERCENT`，当前按 runtime-only 覆盖范围校准。
 

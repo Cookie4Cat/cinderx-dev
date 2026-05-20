@@ -198,8 +198,43 @@ def first_executable(candidates: list[str], extra_globs: list[str]) -> str | Non
     return None
 
 
+def env_truthy(value: str | None) -> bool:
+    if value is None:
+        return False
+    return value.strip().lower() in {"1", "on", "true", "yes"}
+
+
+def configure_prepared_dependencies(env: dict[str, str]) -> None:
+    env.setdefault("PIP_DISABLE_PIP_VERSION_CHECK", "1")
+
+    if env_truthy(env.get("CINDERX_OFFLINE")):
+        env.setdefault("CINDERX_FETCHCONTENT_OFFLINE", "1")
+        env.setdefault("CINDERX_PIP_OFFLINE", "1")
+
+    wheelhouse = env.get("CINDERX_PIP_WHEELHOUSE")
+    if wheelhouse:
+        wheelhouse_path = Path(wheelhouse).expanduser()
+        if not wheelhouse_path.exists():
+            raise FileNotFoundError(
+                f"CINDERX_PIP_WHEELHOUSE does not exist: {wheelhouse_path}"
+            )
+        existing_find_links = env.get("PIP_FIND_LINKS", "").strip()
+        env["PIP_FIND_LINKS"] = (
+            f"{wheelhouse_path} {existing_find_links}".strip()
+        )
+
+    if env_truthy(env.get("CINDERX_PIP_OFFLINE")):
+        if not env.get("PIP_FIND_LINKS"):
+            raise ValueError(
+                "CINDERX_PIP_OFFLINE=1 requires CINDERX_PIP_WHEELHOUSE or "
+                "PIP_FIND_LINKS to be set"
+            )
+        env.setdefault("PIP_NO_INDEX", "1")
+
+
 def configure_toolchain(env: dict[str, str]) -> None:
     env.setdefault("CINDERX_TEST_PYTHON", sys.executable)
+    configure_prepared_dependencies(env)
 
     if "CC" not in env:
         cc = first_executable(

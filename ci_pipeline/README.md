@@ -85,6 +85,53 @@ python3.14 ci_pipeline/run_gate.py --suite wheel_compat_negative
 The test wheel enables `CINDERX_INCLUDE_TEST_PACKAGE_DATA=1` so gate-only
 package data stays out of normal release wheels.
 
+## Prepared Dependencies / Offline Mode
+
+`run_gate` can now run against dependencies prepared ahead of time in the
+environment instead of downloading them during the gate.
+
+For CMake `FetchContent` dependencies, set:
+
+- `CINDERX_DEPS_ROOT`: root directory containing checked-out source trees
+- `CINDERX_FETCHCONTENT_OFFLINE=1`: fail fast instead of cloning from the
+  network
+
+Expected subdirectories under `CINDERX_DEPS_ROOT`:
+
+- `fmt`
+- `parallel-hashmap`
+- `usdt`
+- `capstone`
+- `googletest`
+
+You can also override individual source trees with:
+
+- `CINDERX_FMT_SOURCE_DIR`
+- `CINDERX_PARALLEL_HASHMAP_SOURCE_DIR`
+- `CINDERX_USDT_SOURCE_DIR`
+- `CINDERX_CAPSTONE_SOURCE_DIR`
+- `CINDERX_GOOGLETEST_SOURCE_DIR`
+
+For Python package bootstrap in suite venvs, set:
+
+- `CINDERX_PIP_WHEELHOUSE`: local wheelhouse containing `pip`, `pytest`, and
+  pytest's transitive dependencies
+- `CINDERX_PIP_OFFLINE=1`: require `pip` installs to use the local wheelhouse
+  only
+
+`CINDERX_OFFLINE=1` is a convenience switch that enables both
+`CINDERX_FETCHCONTENT_OFFLINE=1` and `CINDERX_PIP_OFFLINE=1`.
+
+Example:
+
+```bash
+export CINDERX_DEPS_ROOT=/opt/cinderx-deps
+export CINDERX_PIP_WHEELHOUSE=/opt/cinderx-pydeps
+export CINDERX_OFFLINE=1
+
+python3.14 ci_pipeline/run_gate.py pr --coverage
+```
+
 Coverage thresholds are configured in `COVERAGE_MIN_PERCENT` near the top of
 `ci_pipeline/run_gate.py`. They are calibrated for the current runtime-only
 coverage scope.
