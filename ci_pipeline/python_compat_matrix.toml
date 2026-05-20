@@ -1,0 +1,29 @@
+[[supported]]
+name = "cp3140"
+python = "/opt/cpython/3.14.0/bin/python3.14"
+version = "3.14.0"
+
+[[supported]]
+name = "cp3141"
+python = "/opt/cpython/3.14.1/bin/python3.14"
+version = "3.14.1"
+
+[[supported]]
+name = "cp3142"
+python = "/opt/cpython/3.14.2/bin/python3.14"
+version = "3.14.2"
+
+[[supported]]
+name = "cp3143"
+python = "/opt/cpython/3.14.3/bin/python3.14"
+version = "3.14.3"
+
+[[unsupported]]
+name = "cp3144"
+python = "/opt/cpython/3.14.4/bin/python3.14"
+version = "3.14.4"
+
+[[unsupported]]
+name = "cp311"
+python = "/usr/bin/python3.11"
+version = "3.11"

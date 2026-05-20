@@ -24,83 +24,77 @@ Coverage mode is passed through to the `runtime` suite only. The
 `cinderx_inner` suite builds and installs the normal release wheel, then runs
 `test_cinderx_release`. After the `runtime` suite finishes, the gate captures
 and renders GCC coverage data with `gcov`, `lcov`, and `genhtml`; if coverage
-post-processing fails, the pipeline stops before `cinderx_inner`. The coverage
-build explicitly disables LTO with `-fno-lto`, because coverage artifacts must
-be consumable by the active GCC/gcov toolchain.
+post-processing fails, the pipeline stops before `cinderx_inner`.
 
-Coverage artifacts are written under the run directory:
+## Daily Compat Gate
 
-- `coverage/coverage.info`: final filtered lcov tracefile.
-- `coverage/html/index.html`: browsable HTML report.
-- `logs/coverage.log`: capture, filter, HTML, summary, and threshold logs.
-- `summary.json`: machine-readable gate summary, including coverage metrics,
-  thresholds, and coverage status.
-
-The final report is intended to measure CinderX native project code. It filters
-out third-party code, runtime test sources, test scripts, Python test packages,
-build directories, `scratch`, and FetchContent `_deps` sources.
-
-Coverage thresholds are configured in `COVERAGE_MIN_PERCENT` near the top of
-`ci_pipeline/run_gate.py`. They are calibrated for the current runtime-only
-coverage scope.
-
-## Daily Lib/test Gate
-
-The daily gate runs CPython `Lib/test` without coverage instrumentation:
+The daily gate reuses the PR pipeline front half, then fans out compat jobs:
 
 ```bash
-python3.14 ci_pipeline/run_gate.py --suite daily
+CINDERX_TEST_WHEEL=/path/to/cinderx.whl \
+python3.14 ci_pipeline/run_gate.py daily
 ```
 
-The `daily` suite builds a test wheel, installs it into an isolated venv, and
-runs:
+The `daily` pipeline runs in this order:
 
-- `lib_test_adaptive_aware_24`: CPython `Lib/test` with the CinderX frame
-  evaluator and `compile_after_n_calls(24)`, using the Kunpeng dispatcher to
-  reuse workers and reduce process startup overhead.
-- `lib_test_official_skip_ok_26`: a Kunpeng-only explicit run of 26 modules
-  that are still present in official module-level skip metadata but passed
-  under the same frame-eval/adaptive-aware mode on ARM64 CPython 3.14.
+- `runtime`
+- `cinderx_inner`
+- `wheel_compat_<name>` entries from `ci_pipeline/python_compat_matrix.toml`
+- `wheel_compat_negative_<name>` entries from the same matrix file
 
-The Lib/test runner uses the official skip/JIT ignore metadata under
-`cinderx/TestScripts/`, then applies the Kunpeng daily debt file
-`cinderx/TestScripts/TestScriptsKunpeng/lib_test_daily_ignore_tests.txt`.
-That file is kept separate from the official metadata and currently excludes
-CPython internal optimizer tests that are not a CinderX frame-eval/JIT
-compatibility target. The 26 additional modules are listed separately in
-`cinderx/TestScripts/TestScriptsKunpeng/lib_test_daily_official_skip_ok_26.txt`;
-the official skip files are not modified. The runner also removes proxy
-environment variables from Lib/test subprocesses so CI proxy settings do not
-change network-test behavior.
+The compat wheel is not built by `daily`; callers must pass it in through
+`CINDERX_TEST_WHEEL`. Supported and unsupported Python entries are configured in
+`ci_pipeline/python_compat_matrix.toml`, and each entry must define:
 
-## Common Notes
+- `name`
+- `python`
+- `version`
 
-Pipelines are invoked by name, for example `ci_pipeline/run_gate.py pr`.
-Individual suites must be invoked with `--suite`, for example:
+Each compat entry gets its own nested run directory, venv, logs, and
+`summary.json`. The top-level daily summary flattens the matrix into one job per
+Python version.
+
+## Standalone Suites
+
+Pipelines are invoked by name:
+
+```bash
+python3.14 ci_pipeline/run_gate.py pr --coverage
+python3.14 ci_pipeline/run_gate.py daily
+```
+
+Individual suites must be invoked with `--suite`:
 
 ```bash
 python3.14 ci_pipeline/run_gate.py --suite runtime --coverage
 python3.14 ci_pipeline/run_gate.py --suite cinderx_inner
+python3.14 ci_pipeline/run_gate.py --suite wheel_compat
+python3.14 ci_pipeline/run_gate.py --suite wheel_compat_negative
 ```
+
+`wheel_compat` expects:
+
+- `CINDERX_TEST_PYTHON`
+- `CINDERX_TEST_WHEEL`
+
+`wheel_compat_negative` expects:
+
+- `CINDERX_TEST_WHEEL`
+- `CINDERX_UNSUPPORTED_TEST_PYTHON`
 
 The test wheel enables `CINDERX_INCLUDE_TEST_PACKAGE_DATA=1` so gate-only
 package data stays out of normal release wheels.
+
+Coverage thresholds are configured in `COVERAGE_MIN_PERCENT` near the top of
+`ci_pipeline/run_gate.py`. They are calibrated for the current runtime-only
+coverage scope.
 
 Known exclusions:
 
 - `test_jit_support_instrumentation.py` is filtered to ARM64-supported cases.
 - `test_compiler_sbs_stdlib_0.py` through
   `test_compiler_sbs_stdlib_9.py` are tracked as Kunpeng `test_cinderx`
-  debt outside the main gate. This suite is a large compiler bytecode parity
-  corpus; the current performance-optimization work does not target compiler
-  code generation, exception tables, or line tables. It collected 2,621 items
-  on 2026-05-17, and a bounded `--maxfail=50` run stopped at
-  `50 failed, 33 passed`, so it is intentionally deferred until compiler
-  parity work is in scope.
-
-Future work: when compiler parity becomes in scope, turn the SBS stdlib debt
-into an explicit expected-failure or ignore baseline, then start running it
-continuously.
+  debt outside the main gate.
 
 LCOV compatibility is handled at runtime:
 
