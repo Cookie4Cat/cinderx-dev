@@ -17,6 +17,7 @@
 | 版本 | 日期 | 作者 | 修改概要 |
 |------|------|------|---------|
 | V1.0 | 2026-05-20 | Claude Code | 初版 |
+| V1.1 | 2026-05-21 | Claude Code | 修复 Codex rescue 审查问题：BackedgeEntry 结构对齐功能设计（uint8_t state + 固定数组）；setCurrentFrame 时序修正为两处（prepareForDeopt + resumeInInterpreter）；typeModified 不重置 OSR 状态的理由澄清；resetOSRState 异常安全；codeDestroyed 与 freefunc 非直接调用关系澄清；验证清单 inline 改为 kNormal 无 inliner 断言；Mermaid deopt 图拆分 setCurrentFrame 两阶段 |
 
 ## Keywords 关键词
 
@@ -67,7 +68,9 @@ OSR, deopt, reifyFrame, releaseRefs, funcModified, resetOSRState, BackedgeCounte
 
 **子模块 A：OSR deopt 路径复用** — OSR JIT 代码与正常 JIT 代码共享完全相同的 deopt 路径。不需要修改任何现有 deopt 代码（`prepareForDeopt`、`reifyFrame`、`releaseRefs`、`resumeInInterpreter`）。实现工作为验证性测试。
 
-**子模块 B：编译失效清理** — 在 `funcModified()` 路径中新增 `resetOSRState()` 调用，重置回边计数器和编译状态。`codeDestroyed()` 路径依赖 code extra 析构函数自动清理，无需修改。`typeModified()` 路径通过 guard deopt 机制自动处理，无需修改。
+**子模块 B：编译失效清理** — 在 `funcModified()` 路径中新增 `resetOSRState()` 调用，重置回边计数器和编译状态。`codeDestroyed()` 路径依赖 code extra 析构函数自动清理，无需修改。`typeModified()` 路径通过 guard deopt 机制自动处理，不需要重置 OSR 计数器/编译状态。
+
+**关于 `typeModified` 与 `FailedPermanent` 重置**：功能设计文档（function-design.md:1228）提到"code 修改/类型修改时"调用 `resetOSRState()`，但 MVP 仅在 `funcModified()` 路径实现重置。理由：源码中 `notifyTypeModified()`（context.cpp:401-425）仅处理 inline cache 失效和类型 deopt patcher，不涉及编译缓存/计数器清理。类型修改不会使 OSR 编译结果失效（OSR 编译基于字节码不变量，非类型特化），因此 `FailedPermanent` 状态在类型修改后保持不变是正确的。功能设计文档中的"类型修改"描述适用于 Phase 2 的类型特化 OSR 场景。
 
 ## 关键算法与流程
 
@@ -87,8 +90,9 @@ JIT guard 失败
               live slot → mem.readOwned() + Ci_STACK_STEAL（盲写，不 DECREF 旧值）
           → reifyStack(frame, meta, frame_meta, mem)：恢复操作数栈
       → releaseRefs(deopt_meta, mem)：对 kOwned live_values 执行 DECREF
-      → setCurrentFrame(tstate, frame->previous)
+      → setCurrentFrame(tstate, frame)：恢复帧指针（gen_asm.cpp:177）
   → resumeInInterpreter(frame, code_runtime, deopt_idx, ...)
+      → setCurrentFrame(tstate, frame->previous)：切换到 caller 帧（gen_asm.cpp:318）
       → _PyEval_EvalFrame(tstate, frame, err_occurred)
           → 解释器运行到函数结束
           → RETURN_VALUE / exit_unwind → _PyEval_FrameClearAndPop
@@ -139,15 +143,15 @@ OSR 进入后 JIT 代码执行到函数结束，走正常 return 路径。JIT ep
   → stage1 trampoline push deopt_idx
   → stage2 trampoline save CodeRuntime + epilogue
   → 全局 deopt trampoline save 寄存器
-  → prepareForDeopt: reifyFrame + releaseRefs + setCurrentFrame(previous)
-  → resumeInInterpreter → _PyEval_EvalFrame
+  → prepareForDeopt: reifyFrame + releaseRefs + setCurrentFrame(frame)（gen_asm.cpp:177）
+  → resumeInInterpreter: setCurrentFrame(previous)（gen_asm.cpp:318）→ _PyEval_EvalFrame
   → 解释器从 guard 点字节码位置继续执行到函数结束
   → RETURN_VALUE/exit_unwind → PopFrame
   → epilogue 返回 PyObject* 或 NULL
   → performOSR 返回 rc=1（正常完成）或 rc=-1（异常）
 ```
 
-**时序约束**：`setCurrentFrame(tstate, frame->previous)` 在 `resumeInInterpreter` 中、`_PyEval_EvalFrame` 调用前执行（gen_asm.cpp:318），将帧管理权交给解释器。此时 F 仍是 datastack 上的有效帧（未被释放），但不再是 `tstate->current_frame`。
+**时序约束**：`setCurrentFrame` 在两处执行——`prepareForDeopt` 设置 `setCurrentFrame(tstate, frame)` 恢复帧指针（gen_asm.cpp:177），`resumeInInterpreter` 设置 `setCurrentFrame(tstate, frame->previous)` 切换到 caller 帧（gen_asm.cpp:318），在 `_PyEval_EvalFrame` 调用前执行。此时 F 仍是 datastack 上的有效帧（未被释放），但不再是 `tstate->current_frame`。
 
 #### 流程 3：`funcModified` 触发 OSR 状态重置
 
@@ -179,9 +183,11 @@ guard deopt 可能在以下情况下带异常返回：
 
 **OSR 无需特殊处理**：异常路径与正常 JIT deopt 完全一致。
 
-#### 异常流程 2：`resetOSRState` 对 null counters
+#### 异常流程 2：`resetOSRState` 对 null counters 及异常安全
 
 `funcModified` 调用时，旧 code 对象可能没有 OSR 状态（该函数从未触发 OSR 编译）。`resetOSRState` 通过 `Ci_GetBackedgeCounters` 获取 null 指针后直接返回，幂等安全。
+
+**异常安全**：`Ci_GetBackedgeCounters` 内部通过 `PyUnstable_Code_GetExtra` 获取 code extra（code.cpp:213-215）。现有 CinderX 模式中，如果 code extra 获取失败会打印警告并清除 pending exception。`resetOSRState` 实现必须保证：(1) 不泄漏 pending exception（调用前/后 PyErr 状态不变）；(2) 对 `Ci_GetBackedgeCounters` 返回 nullptr 的所有路径均安全返回。
 
 #### 异常流程 3：deopt 过程中 `reifyFrame` 内存分配失败
 
@@ -206,12 +212,16 @@ guard deopt 可能在以下情况下带异常返回：
 
 ```cpp
 // cinderx/Jit/osr.h — 功能项 1 新增
+// 与功能设计说明书功能项 1 保持一致（function-design.md:413-431）
 
 struct BackedgeEntry {
-  uint32_t source_index;  // 回边源字节码索引（code-unit）
-  uint32_t target_index;  // 循环头字节码索引（code-unit）
-  uint32_t count;         // 回边执行计数
-  uint32_t state;         // 0=Idle, 1=Counting, 2=Compiling, 3=FailedPermanent
+  uint32_t source_index;       // 回边源指令的 code-unit 索引
+  uint32_t target_index;       // 循环头目标的 code-unit 索引
+  uint32_t count;              // 回边执行计数（free-threading 下用 atomic）
+  uint8_t state;               // 热度状态：1=Counting, 3=FailedPermanent
+  uint8_t _pad[3];             // 对齐填充
+  // 注意：BackedgeEntry 不包含编译状态（Compiling/Compiled），
+  // 编译状态由独立的 OSRCompileState 管理（见功能项 2）
 };
 
 struct OSRCompileState {
@@ -221,14 +231,13 @@ struct OSRCompileState {
 };
 
 struct BackedgeCounters {
-  uint32_t num_entries;         // BackedgeEntry 数组长度
-  uint32_t num_compile_states;  // OSRCompileState 数组长度
-  BackedgeEntry entries[];      // 柔性数组：entries + compile_states
-  // compile_states 紧跟 entries 之后
+  BackedgeEntry entries[CI_OSR_MAX_BACKEDGES];       // 固定数组（非柔性数组）
+  uint32_t num_compile_states;
+  OSRCompileState compile_states[CI_OSR_MAX_COMPILE_KEYS];  // 编译状态固定数组
 };
 ```
 
-`BackedgeCounters` 通过 `PyUnstable_Eval_RequestCodeExtraIndex` 注册的 code extra index 旁挂在 `PyCodeObject` 上。析构函数 `backedgeCountersFreefunc` 使用 `PyMem_Free`（所有字段为值类型或 uintptr_t identity，无 PyObject* 强引用）。
+`BackedgeCounters` 通过 `PyUnstable_Eval_RequestCodeExtraIndex` 注册的 code extra index 旁挂在 `PyCodeObject` 上。释放机制：`codeDestroyed()`（`_cinderx-lib.cpp:516-522` 触发，`pyjit.cpp:3657-3671` 执行）仅清除 JIT 注册表；`BackedgeCounters` 的内存在同一 code dealloc 流程中由 CPython 的 code extra 析构机制调用 `backedgeCountersFreefunc`（`PyMem_Free`）释放。两者在同一 code 对象析构流程中自动触发，但不是直接调用关系。
 
 #### DeoptMetadata（现有，OSR 只读使用）
 
@@ -291,7 +300,8 @@ PyCodeObject* code
 flowchart LR
     subgraph "子模块 A：deopt 复用验证"
         T["OSR JIT guard 失败"]
-        T --> D["现有 deopt 路径<br/>prepareForDeopt → reifyFrame<br/>→ releaseRefs → resumeInInterpreter"]
+        T --> PFD["prepareForDeopt<br/>reifyFrame + releaseRefs<br/>+ setCurrentFrame(frame)"]
+        PFD --> RI["resumeInInterpreter<br/>setCurrentFrame(previous)<br/>+ _PyEval_EvalFrame"]
     end
 
     subgraph "子模块 B：编译失效清理"
@@ -450,7 +460,7 @@ void codeDestroyed(BorrowedRef<PyCodeObject> code) {
 | `reifyLocalsplus` 兼容性 | OSR 进入后触发 guard deopt，检查 locals 值 | 所有 local slots 被正确恢复（dead slots 为 NULL，live slots 为正确值） |
 | `releaseRefs` 引用平衡 | 引用计数审计：OSR 进入前/deopt 后对象引用计数 | kOwned live-in 引用计数闭合 |
 | `resumeInInterpreter` 正确性 | OSR deopt 后解释器从 guard 点继续执行 | 结果与纯解释器一致 |
-| 嵌套帧 deopt | OSR JIT 代码中内联调用后 guard 失败 | 所有内联帧正确 reify，结果正确 |
+| 嵌套帧 deopt | kNormal 模式下确认无 inline_depth > 0（`pyjit.cpp:721-732` 禁用 inliner）| kNormal 下 deopt 仅处理单层帧，无内联 reify 需求 |
 | 异常传播 | OSR deopt 带 DeoptReason::kRaise | 异常正确传播到调用者 |
 
 # DFX分析

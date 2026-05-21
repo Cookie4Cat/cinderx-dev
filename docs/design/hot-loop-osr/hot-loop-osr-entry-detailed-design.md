@@ -17,6 +17,9 @@
 | 版本 | 日期 | 作者 | 修改概要 |
 |------|------|------|---------|
 | V1.0 | 2026-05-21 | Claude Code | 初版，基于源码验证编写 |
+| V1.1 | 2026-05-21 | Claude Code | 修复 Codex 审查三项问题：(1) stub store 宽度 32→64 位；(2) deferred_decrefs 改动态分配 + preflight 完整性校验；(3) NULL live-in 防护从 Phase 2 提升为 MVP 必须实现 |
+| V1.2 | 2026-05-21 | Claude Code | 修复 Codex 二次审查两项问题：(1) OSR_STUB_SCRATCH_REGS 寄存器保留策略，regalloc 排除 X9-X12；(2) preflight 检查移至 instr_ptr 修改之前，保证 rc=0 帧不变契约 |
+| V1.3 | 2026-05-21 | Claude Code | 修复 Codex rescue 审查问题：新增 1.2.4 live-in INCREF 与 refcount_insertion 交互；修正 regalloc 生效点为 markDisallowedRegisters；容量改用 distinct localsplus 计算；堆分配移至 instr_ptr 前；架构扩展接口；stub 生成时机精确到 gen_asm.cpp 行号；Mermaid 补全 rc=0/deopt 边 |
 
 ## Keywords 关键词
 
@@ -120,14 +123,16 @@ OSR, performOSR, OSRState, OSRMetadata, OSRLiveIn, NativeGenerator, OSR entry st
 ```
 Ci_OSR_TryOSR(tstate, frame, instr, oparg, &result)
   └─▶ performOSR(tstate, frame, osr_meta, compiled, &result)
-        ├─ [0] 前置校验：获取 entry_fn，null → return 0
-        ├─ [0.5] 设置 frame->instr_ptr 到 loop header
+        ├─ [0] 前置校验（帧完全不变，仅读操作）：
+        │       ├─ 获取 entry_fn，null → return 0
+        │       └─ preflight：live-in 非 NULL + 索引合法，失败 → return 0
+        ├─ [0.5] 设置 frame->instr_ptr 到 loop header（首次帧修改，此后不再 return 0）
         ├─ [1] 收集非 live-in slots → deferred_decrefs[]（steal，不 DECREF）
         ├─ [2] osr_entry_fn(&OSRState{tstate, frame, osr_meta})
         │       ├─ stub prologue: stp fp/lr; mov fp, sp; sub sp, sp, #total_size
         │       ├─ stub: 保存 callee-saved（仅 resume_saved_regs 中的）
         │       ├─ stub: 设置 Environ VReg（tstate → tstate_location 等）
-        │       ├─ stub: steal live-in（从 F->localsplus[i] 读取 + AND ~Py_TAG_REFCNT + 写 JIT PhyLocation + str PyStackRef_NULL）
+        │       ├─ stub: steal live-in（从 F->localsplus[i] 读取 + AND ~Py_TAG_REFCNT + 写 JIT PhyLocation + str PyStackRef_NULL 64-bit）
         │       └─ stub: b .loop_header_N（跳 JIT 代码）
         │              ↓ JIT 执行（正常/deopt/异常三路返回）
         ├─ [3] 延迟 DECREF：释放 deferred_decrefs[]（异常时用 PyErr_Get/Set 保护）
@@ -150,9 +155,8 @@ int performOSR(
     PyObject** out_result)
 {
   // [0] 前置校验（此时帧完全不变）
-  //   获取 entry point——如果为 null，帧不修改，安全 return 0
-  //   osr_meta->entryPoint(compiled) = compiled->codeBuffer().data()
-  //                                    + osr_meta->entry_point_offset
+  //   所有可能 return 0 的检查必须在此处完成——
+  //   rc=0 契约要求帧完全不变（instr_ptr / localsplus / 帧链均不修改）
   using OsrEntryFn = PyObject*(*)(OSRState*);
   OsrEntryFn entry_fn =
       reinterpret_cast<OsrEntryFn>(osr_meta->entryPoint(*compiled));
@@ -160,8 +164,57 @@ int performOSR(
     return 0;  // 帧完全未修改
   }
 
+  // ── Preflight 校验（帧仍未修改）──
+  //   检查所有 live-in slot 非 NULL，以及 localsplus_index 在合法范围内。
+  //   必须在修改 instr_ptr 或 localsplus 之前完成，否则 return 0 路径会违反
+  //   "帧完全不变"的 rc=0 契约。
+  int num_nlocalsplus = _PyFrame_GetCode(frame)->co_nlocalsplus;
+  for (const auto& li : osr_meta->live_ins) {
+    if (li.localsplus_index >= 0) {
+      if (li.localsplus_index >= num_nlocalsplus) {
+        return 0;  // 索引越界，元数据不一致，拒绝 OSR
+      }
+      if (PyStackRef_IsNull(frame->localsplus[li.localsplus_index])) {
+        return 0;  // live-in 为 NULL（未绑定 local），拒绝 OSR
+      }
+    }
+  }
+  // 至此：entry_fn 有效 + 所有 live-in 非 NULL + 索引合法
+  // 后续代码不再有 return 0 路径（只有 return 1 或 return -1）
+
+  // [0.75] 预分配所有堆内存（在修改帧状态之前）
+  //   理由：std::vector 分配失败时无法恢复已修改的帧状态（instr_ptr/localsplus）。
+  //   源码参考：code.cpp:213-214 的 code extra 分配也显式处理 nullptr。
+  //   将所有可能失败的分配集中在此处，确保 instr_ptr 修改后无需 return 0。
+
+  // 构建 is_live_in 位集合（按 localsplus_index 索引）
+  //   大小由 co_nlocalsplus 决定，保证遍历覆盖全部 [0, nlocalsplus)
+  //   使用 std::vector<bool> 动态分配，避免固定上限导致的部分迁移
+  std::vector<bool> is_live_in_set(num_nlocalsplus, false);
+  // 计算独立的 localsplus live-in 数量（排除 stack live-in 和重复索引）
+  //   live_ins 中可能包含 stack_index != -1 的栈上 live-in（Phase 2），
+  //   以及 localsplus_index 相同的多个条目（phi 节点）。
+  //   只计数唯一的 localsplus_index 以正确估算容量。
+  int distinct_localsplus_live_in = 0;
+  for (const auto& li : osr_meta->live_ins) {
+    if (li.localsplus_index >= 0 && li.localsplus_index < num_nlocalsplus) {
+      if (!is_live_in_set[li.localsplus_index]) {
+        is_live_in_set[li.localsplus_index] = true;
+        distinct_localsplus_live_in++;
+      }
+    }
+  }
+
+  // 动态分配 deferred_decrefs：大小 = nlocalsplus - distinct_localsplus_live_in
+  //   保证所有非 live-in slot 都能被收集，不存在截断风险
+  //   使用 distinct 计数而非 live_ins.size()，避免栈上 live-in 或重复映射导致越界
+  int non_live_in_count = num_nlocalsplus - distinct_localsplus_live_in;
+  std::vector<PyObject*> deferred_decrefs(
+      non_live_in_count > 0 ? non_live_in_count : 0);
+
   // [0.5] 设置 frame->instr_ptr 到 loop header 字节码位置
   //   目的：stub 执行期间及 deopt 观察时，frame 显示正确的字节码位置
+  //   安全：此时已通过所有 preflight 检查 + 堆分配完成，不存在 return 0 路径
   //   code_start = PyBytes_AS_STRING(frame->f_executable.bits & ~Py_TAG_REFCNT)
   //              = 等效于 _PyFrame_GetCode(frame) 指向的字节码起始地址
   //   osr_meta->target_offset 是 BCOffset（字节单位），与 _Py_CODEUNIT* 步长一致
@@ -175,34 +228,11 @@ int performOSR(
   //   注意：PyStackRef_NULL_BITS = Py_TAG_REFCNT = 1（非 GIL 版本）
   //
   //   live-in 集合由 osr_meta->live_ins[] 中 localsplus_index != -1 的条目确定
-  //   最多 co_nlocalsplus 个 slot，不使用 VLA（大函数有栈溢出风险）
-  //   → 用固定大小上限（512 slots）的栈数组或动态分配
-  int num_nlocalsplus = _PyFrame_GetCode(frame)->co_nlocalsplus;
-
-  // 构建 is_live_in 位集合（按 localsplus_index 索引）
-  std::bitset<512> is_live_in_set;
-  for (const auto& li : osr_meta->live_ins) {
-    if (li.localsplus_index >= 0) {
-      is_live_in_set.set(li.localsplus_index);
-    }
-  }
-
-  // 收集非 live-in slots：untag + steal
-  //   PyStackRef_AsPyObjectSteal(ref):
-  //     if (ref.bits & Py_TAG_REFCNT) == 0:  // mortal 对象
-  //       return (PyObject*)ref.bits          // 直接返回裸指针（owned）
-  //     else:                                 // immortal/NULL
-  //       return Py_NewRef(BITS_TO_PTR_MASKED(ref))  // INCREF 后返回
-  //   注意 NULL 情况：PyStackRef_IsNull(ref) <=> ref.bits == Py_TAG_REFCNT(=1)
-  //                  PyStackRef_AsPyObjectSteal(NULL_REF) 返回 nullptr（Py_NewRef(nullptr) 是 UB，需先检查）
-  //   正确做法：先检查 IsNull，再调用 Steal
-
-  static constexpr int kMaxDeferredDecref = 512;
-  PyObject* deferred_decrefs[kMaxDeferredDecref];
+  //   最多 co_nlocalsplus 个 slot
   int n_deferred = 0;
 
-  for (int i = 0; i < num_nlocalsplus && n_deferred < kMaxDeferredDecref; i++) {
-    if (is_live_in_set.test(i)) {
+  for (int i = 0; i < num_nlocalsplus; i++) {
+    if (is_live_in_set[i]) {
       continue;  // live-in 槽由 stub 处理（steal + 写 PyStackRef_NULL）
     }
     _PyStackRef slot = frame->localsplus[i];
@@ -288,9 +318,36 @@ osr_entry_stub_N:
     // ... 按 CALLEE_SAVE_REGS 顺序（translateSetupFrame 的 gp_regs 遍历顺序）
 
 // ──────────────────────────────────────────────────────────────
-// 步骤 2：使用 caller-saved 临时寄存器处理 OSRState 解引用
-//   使用 x9/x10/x11（caller-saved，stub 内无 bl → 始终有效）
+// 步骤 2：使用 stub 保留寄存器处理 OSRState 解引用
+//
+//   Stub 保留寄存器集合（OSR_STUB_SCRATCH_REGS）：
+//     X9, X10, X11, X12
+//
+//   **寄存器保留策略**：
+//   这四个寄存器在 OSR 编译的 regalloc 阶段被排除在可分配集合之外
+//   （等同于 DISALLOWED_REGISTERS 的处理方式），确保 regalloc 永远不会
+//   将 Environ VReg 或 live-in 的 PhyLocation 目标分配到这些寄存器。
+//   因此 stub 可以安全地使用它们作为临时寄存器，不存在自踩风险。
+//
 //   不使用 x19-x28（callee-saved，可能超出 JIT body 的 epilogue 恢复范围）
+//   架构 scratch x13/x14 已在 DISALLOWED 中（regalloc 不分配），可安全用于
+//   load/and 等临时操作（伪汇编中 ldr x13, str x13 等），但不能作为 Environ/live-in
+//   目标寄存器
+//
+//   **实现位置**：在 regalloc 的 `markDisallowedRegisters()`（regalloc.cpp:34-42）
+//   中扩展 disallowed 集合。该函数在 regalloc 线性扫描阶段读取
+//   DISALLOWED_REGISTERS 常量并标记寄存器为不可用。
+//   OSR 编译路径需将该函数改为接受参数化的 disallowed 集合：
+//     void markDisallowedRegisters(std::vector<LIRLocation>& locs,
+//                                  PhyRegisterSet extra_disallowed = {});
+//   OSR 编译时传入 extra_disallowed = OSR_STUB_SCRATCH_REGS。
+//   注意：`computeFrameInfo()` 在 regalloc 完成后才运行（gen_asm.cpp:1185），
+//   不能在那里设置寄存器保留——必须发生在 regalloc 之前或期间。
+//
+//   **tradeoff**：OSR 编译的函数少 4 个 caller-saved GP 寄存器（X9-X12），
+//   但 aarch64 有 28 个可分配 GP 寄存器（减去 DISALLOWED 7 个 + stub 4 个，
+//   仍有 17 个），对绝大多数函数无影响。若 regalloc 因寄存器不足失败，
+//   OSR entry 会被自然拒绝（entry_point_offset = -1），回退到解释器执行。
 // ──────────────────────────────────────────────────────────────
 // x0 = OSRState* = state（函数入参）
     mov     x9, x0                  // x9 = state*
@@ -310,6 +367,10 @@ osr_entry_stub_N:
 //     is_register() → mov Xdst, Xsrc
 //     is_memory()   → str Xsrc, [fp, #loc]（loc 是 FP 相对偏移，负值）
 //
+//   **安全保证**：由于 OSR_STUB_SCRATCH_REGS 在 regalloc 中被排除，
+//   tstate_location / func_location / frame_location 的目标寄存器
+//   不可能是 X9/X10/X11/X12，因此写入不会覆盖 stub 的临时值。
+//
 //   func = F->f_funcobj（需要从帧读取）
 //     F->f_funcobj 是 _PyStackRef（bits 字段），需要 AND ~Py_TAG_REFCNT 提取 PyObject*
 //     等效：PyStackRef_AsPyObjectBorrow(F->f_funcobj) = BITS_TO_PTR_MASKED
@@ -325,6 +386,7 @@ osr_entry_stub_N:
 
 // 设置 asm_func（示例：func_location = X20）
 //   从 F->f_funcobj 提取 PyObject*（AND ~Py_TAG_REFCNT）
+//   这里 x9 可安全重用：OSRState 解引用已完成，x9 不再需要
     ldr     x9, [x11, #<offsetof(_PyInterpreterFrame, f_funcobj)>]
     and     x20, x9, #~1            // 剥离 Py_TAG_REFCNT 标记位
 
@@ -339,25 +401,35 @@ osr_entry_stub_N:
 //        is_register() → mov Xdst, Xval
 //        is_memory()   → str Xval, [fp, #loc]
 //     4. 写 PyStackRef_NULL（= Py_TAG_REFCNT = 1）到 F->localsplus[i]
-//        str Wone, [x11, #<localsplus_offset + i*8>]
+//        str Xone, [x11, #<localsplus_offset + i*8>]（必须 64 位写入！）
 //        注意：PyStackRef_NULL.bits = 1（NOT 0），必须显式写 1
 //              不能用 str xzr（零寄存器），否则 PyStackRef_IsNull 检查失败
+//              不能用 str w10（32 位），_PyStackRef 是 8 字节 union，
+//              32 位 store 残留高 4 字节 → PyStackRef_IsNull(bits==1) 失败
+//
+//   **安全保证**：由于 OSR_STUB_SCRATCH_REGS 在 regalloc 中被排除，
+//   li.destination 的目标寄存器不可能是 X9/X10/X11/X12。
+//   Stub 的 localsplus 基地址（x9）和 NULL 常量（x10）不会被 live-in 写入覆盖。
 // ──────────────────────────────────────────────────────────────
 
 // 预加载 localsplus 基地址和 PyStackRef_NULL 常量
     add     x9, x11, #<offsetof(_PyInterpreterFrame, localsplus)>
-    mov     w10, #1                 // PyStackRef_NULL_BITS = Py_TAG_REFCNT = 1
+    mov     x10, #1                 // PyStackRef_NULL_BITS = Py_TAG_REFCNT = 1
+                                    // 注意：必须用 64 位 x10 而非 w10
+                                    // _PyStackRef 是 8 字节 union（uintptr_t bits）
+                                    // 32 位 str w10 只覆盖低 4 字节，高 4 字节残留
+                                    // 后续 PyStackRef_IsNull(bits == 1) 检查失败 → UAF
 
 // 示例：li[0] = {localsplus_index=0, destination=X21, ref_kind=kOwned}
     ldr     x13, [x9, #0]           // 读取 localsplus[0].bits（_PyStackRef）
     and     x21, x13, #~1           // AND ~Py_TAG_REFCNT → PyObject*（steal）
-    str     w10, [x9, #0]           // localsplus[0] = PyStackRef_NULL（bits=1）
+    str     x10, [x9, #0]           // localsplus[0] = PyStackRef_NULL（64-bit 写入 bits=1）
 
 // 示例：li[1] = {localsplus_index=1, destination=StackSlot(-16), ref_kind=kOwned}
     ldr     x13, [x9, #8]           // 读取 localsplus[1].bits
     and     x13, x13, #~1           // AND ~Py_TAG_REFCNT
     str     x13, [fp, #-16]         // 写入栈槽 FP-16
-    str     w10, [x9, #8]           // localsplus[1] = PyStackRef_NULL
+    str     x10, [x9, #8]           // localsplus[1] = PyStackRef_NULL（64-bit 写入）
 
 // ──────────────────────────────────────────────────────────────
 // 步骤 5：跳转到 loop header 的 JIT 代码
@@ -398,15 +470,46 @@ NULL：          bits = 1                        // PyStackRef_NULL_BITS = 1
 
 **三种 slot 状态的处理**：
 
-| slot 状态 | bits | AND ~1 结果 | steal 后写入 localsplus |
-|-----------|------|------------|------------------------|
-| mortal PyObject* | `(uintptr_t)obj` | `obj`（正确） | `PyStackRef_NULL`（bits=1） |
-| immortal PyObject* | `(uintptr_t)obj \| 1` | `obj`（正确） | `PyStackRef_NULL`（bits=1） |
-| NULL | `1` | `0`（nullptr） | `PyStackRef_NULL`（bits=1，不变） |
+| slot 状态 | bits | AND ~1 结果 | steal 后写入 localsplus | 是否允许 |
+|-----------|------|------------|------------------------|---------|
+| mortal PyObject* | `(uintptr_t)obj` | `obj`（正确） | `PyStackRef_NULL`（bits=1） | 允许 |
+| immortal PyObject* | `(uintptr_t)obj \| 1` | `obj`（正确） | `PyStackRef_NULL`（bits=1） | 允许 |
+| NULL | `1` | `0`（nullptr） | — | **拒绝进入 OSR** |
 
-NULL 情况：`AND ~1` 结果为 0，即 `nullptr`。JIT `refcount_insertion` 对 kOwned live-in 执行 INCREF——对 `nullptr` 执行 `Py_INCREF(nullptr)` 是 UB。因此 `extractOSRLiveIns`（阶段 2）在构建 OSRMetadata 时必须排除 slot 值可能为 NULL 的 live-in，或在 stub 中加 NULL 检查。MVP 的保守策略：`isOSREligible` 和 `markOSREntries` 已确保空操作数栈，循环头的 local 变量在进入 OSR 时必须有效，运行时 NULL local 的处理留作 Phase 2。
+**NULL live-in 防护（MVP 必须实现，不延迟到 Phase 2）**：
 
-**与 `performOSR` 收集非 live-in 的区别**：`performOSR` 使用 `PyStackRef_AsPyObjectSteal()`（mortal → 直接返回裸指针作为 owned ref；immortal/NULL → `Py_NewRef(BITS_TO_PTR_MASKED)` INCREF 再返回）。Stub 使用 `AND ~1` 纯取位操作，不 INCREF——因为 live-in 的 INCREF 由 JIT 侧的 `refcount_insertion` pass 统一完成（steal 后寄存器持有 borrowed ref，`refcount_insertion` INCREF 创建 owned ref）。两种转换路径互补，覆盖所有 slot 类型。
+NULL 情况：`AND ~1` 结果为 0，即 `nullptr`。JIT `refcount_insertion` 对 kOwned live-in 执行 INCREF——对 `nullptr` 执行 `Py_INCREF(nullptr)` 是 UB（CPython 3.14 断言 `_Py_REFCNT(obj) >= 0`，`_Py_INCREF_STAT` 追踪也会失败）。
+
+MVP 采用**两层防护**，确保 NULL live-in 不会进入 JIT 代码：
+
+1. **编译期**：`extractOSRLiveIns`（功能项 2）在构建 OSRMetadata 时，对 HIR 中需要 `LOAD_FAST_CHECK` 保护的变量（即可能未绑定的 local）设置 `reconstructible=false`，使整个 OSR entry 被永久拒绝。这通过分析 loop header 的 FrameState 中每个 local 的 definite-assignment 状态实现。
+
+2. **运行时 preflight**：`performOSR` 在步骤 [1] 修改任何 `localsplus` slot 之前，遍历 `osr_meta->live_ins`，检查每个 `localsplus_index >= 0` 的 slot 是否为 `PyStackRef_NULL`。发现任何 NULL slot 立即 `return 0`（帧完全不变，字节码处理程序走 fallthrough 路径继续解释执行）。这是编译期分析的最后一道运行时防线，覆盖：
+   - 编译期无法静态证明 definite-assignment 的边界情况
+   - 含 cell/freevar 的复杂作用域
+   - 通过 `del local_name` 在运行时置 NULL 的情况
+
+**与 `performOSR` 收集非 live-in 的区别**：`performOSR` 使用 `PyStackRef_AsPyObjectSteal()`（mortal → 直接返回裸指针作为 owned ref；immortal/NULL → `Py_NewRef(BITS_TO_PTR_MASKED)` INCREF 再返回）。Stub 使用 `AND ~1` 纯取位操作，不 INCREF——live-in 的 INCREF 由 JIT 侧的 `refcount_insertion` pass 在 loop header 入口处统一插入。两种转换路径互补，覆盖所有 slot 类型。
+
+### 1.2.4 live-in 引用所有权与 refcount_insertion 交互
+
+**问题**：stub 对 live-in 执行 `AND ~1` 后写入 JIT 物理位置，结果是 borrowed ref（无 INCREF）。但 JIT body 对 `kOwned` 寄存器期望持有 owned ref——函数退出或 deopt 时 `releaseRefs` 会 DECREF 这些值。如果 stub 不 INCREF，引用计数会泄漏。
+
+**解决方案**：依赖现有 `refcount_insertion` pass 自动在 OSR entry 处插入 INCREF，不需要 stub 或 `performOSR` 额外操作。工作原理如下：
+
+1. **HIR 层面**：OSR entry edge 是一条指向 loop header block 的 CFG 边（由 `markOSREntries` 创建）。Loop header 包含 phi 节点，OSR edge 为每个 phi 提供一个输入。
+
+2. **Phi 消除**：`RefcountInsertion::Run()` 首先调用 `PhiElimination{}.Run(func)` 消除 phi，建立统一的数据流。
+
+3. **数据流分析**（refcount_insertion.cpp:1294-1318）：pass 以 RPO 遍历所有 block，计算每个 block 的 `in_state`（live_regs 映射）。OSR entry edge 的贡献使 loop header 拥有多个前驱 → pass 使用合并的 in-state 处理 phi 解析。
+
+4. **变异阶段**（refcount_insertion.cpp:1323-1347）：pass 以 RPO 再次遍历 block。对 loop header block（多前驱），调用 `useInState(env, map_get(env.blocks, block).in)`（行 1330），将 live_regs 设为合并后的 in-state。然后 `processInstr()` 遍历每条指令，根据寄存器状态变化插入 `IncRef` / `DecRef` HIR 指令。
+
+5. **OSR entry 处**：loop header 的第一条指令之前，refcount pass 观察到 live-in 寄存器从 borrowed（stub 写入 `AND ~1` 的结果）变为 owned（block 内使用需要 owned ref），自动为每个 `kOwned` live-in 插入一条 `IncRef` 指令。这些 `IncRef` 经 regalloc 和 codegen 后生成真正的 `Py_INCREF` 调用。
+
+6. **与正常函数入口的对称性**：正常函数入口通过 `JITRT_AllocateAndLinkInterpreterFrame` 创建 owned ref（`PyStackRef_FromPyObjectNew` 内部 INCREF）。OSR 入口通过 stub 写入 borrowed ref + refcount pass 插入 INCREF 达到相同效果。两者最终在 JIT body 入口处持有相同的引用所有权状态。
+
+**编译期验证**：`extractOSRLiveIns` 必须将每个 live-in 的 `ref_kind` 设为 `kOwned`（MVP 不支持 kBorrowed，ADR-5），使 refcount pass 正确插入 INCREF。如果错误地设为 `kBorrowed`，pass 不会 INCREF → deopt `releaseRefs` 不 DECREF → 无泄漏（但 JIT body 可能对 kBorrowed 值做错误的 DECREF）。
 
 ### 1.2.4 Environ VReg 恢复逻辑
 
@@ -439,15 +542,22 @@ auto emit_set_environ = [&](arch::Gp value_reg, PhyLocation dest) {
 
 ### 1.2.5 NativeGenerator 中 OSR stub 的生成时机
 
-在 `NativeGenerator::generateCode()` 的汇编代码生成阶段，OSR stub 在以下时机生成：
+在 `NativeGenerator::generateCode()` 的汇编代码生成阶段（gen_asm.cpp:1313-1417），完整的生成顺序为：
 
-1. **函数入口代码生成完毕**（vectorcall entry + kSetupFrame + kOSREntry pseudo + HIR body）
-2. **Deopt exit 生成完毕**（generateDeoptExits）
-3. **OSR stubs 生成**：遍历 `irfunc_->osrEntries()`，为每个 OSR entry BasicBlock 调用 `generateOSREntryStub(osr_meta)`
+1. **`generateAssemblyBody()`**（gen_asm.cpp:1314）：主代码体（vectorcall entry + kSetupFrame + kOSREntry pseudo + HIR body）
+2. **Static entry point**（gen_asm.cpp:1325）：静态入口（如适用）
+3. **Correct argument count entry**（gen_asm.cpp:1335）：参数校验入口
+4. **`generateEpilogue()`**（gen_asm.cpp:1354）：epilogue 代码（hard_exit_label + callee-saved 恢复）
+5. **Static typecheck failure stub**（gen_asm.cpp:1357-1398）
+6. **Prologue exit stub**（gen_asm.cpp:1405-1408）
+7. **Boxed-return wrapper**（gen_asm.cpp:1412-1415）
+8. **`generateDeoptExits()`**（gen_asm.cpp:1417）：deopt exit 代码
+9. **OSR stubs 生成**（**新增**，在 deopt exits 之后、常量池之前）：遍历 `irfunc_->osrEntries()`，为每个 OSR entry BasicBlock 调用 `generateOSREntryStub(osr_meta)`
+10. **常量池 / asmjit finalize**：asmjit 的 `CodeHolder::finalize()` 解析所有前向引用（包括 OSR stub 的 `b .loop_header_N`），生成最终机器码
 
-`generateOSREntryStub` 在调用前记录当前代码偏移作为 `entry_point_offset` 写入 `OSRMetadata`，然后按上述汇编结构生成 stub 代码。所有 OSR stubs 共享同一 `CodeHolder`（与主函数代码在同一缓冲区），共享 `CodeRuntime`。
+**`entry_point_offset` 记录**：`generateOSREntryStub` 在调用前记录当前 asmjit cursor 的偏移作为 `entry_point_offset`，写入 `OSRMetadata`。此时 asmjit 尚未 finalize，偏移量是相对于 CodeHolder 缓冲区起始的内部偏移，finalize 后保持一致。
 
-**与 `.loop_header_N` 标签的绑定**：stub 末尾的 `b .loop_header_N` 需要跳转到 HIR loop header block 在 asmjit 中对应的 `asmjit::Label`，该 Label 由 `env_.block_label_map` 查找（`block_label_map[osr_entry_block]`）。asmjit 在 `finalize()` 时解析所有前向引用。
+**与 `.loop_header_N` 标签的绑定**：stub 末尾的 `b .loop_header_N` 需要跳转到 HIR loop header block 在 asmjit 中对应的 `asmjit::Label`，该 Label 在步骤 1 的 `generateAssemblyBody()` 中已创建（由 `env_.block_label_map` 查找）。OSR stub 的 `b` 指令使用 asmjit 前向引用，在步骤 10 的 `finalize()` 中解析。
 
 ### 1.2.6 OSRMetadata::entryPoint 实现
 
@@ -464,6 +574,77 @@ void* OSRMetadata::entryPoint(const CompiledFunction& cf) const {
 
 `codeBuffer()` 返回编译完成后的机器码缓冲区（`CompiledFunctionData::code` 字段，类型 `std::span<const std::byte>`）。`entry_point_offset` 是 stub 代码距缓冲区起始的字节偏移，由 `NativeGenerator` 在生成 stub 前确定。
 
+### 1.2.7 OSR stub 寄存器保留策略
+
+**问题背景**：Stub 使用 X9-X12 作为临时寄存器（保存 OSRState 字段、localsplus 基地址、PyStackRef_NULL 常量）。但 X9-X12 属于 `CALLER_SAVE_REGS`（aarch64.h:321），regalloc 可以将它们分配为 Environ VReg 或 live-in 的 PhyLocation 目标寄存器。如果某个 `tstate_location` 或 `li.destination` 落在 X9-X12，stub 的 `mov/str` 写入会覆盖自身还在使用的临时值 → 后续 live-in 读写错槽、localsplus 清零错误。
+
+**解决方案**：在 OSR 编译的 regalloc 阶段将 X9-X12 加入 `DISALLOWED` 集合，使 regalloc 不可能将这些寄存器分配为任何 VReg 的物理位置。
+
+```cpp
+// cinderx/Jit/codegen/arch/aarch64.h 新增
+
+// OSR stub 保留的临时寄存器（aarch64）
+constexpr PhyRegisterSet OSR_STUB_SCRATCH_REGS =
+    PhyRegisterSet(X9) | PhyRegisterSet(X10) |
+    PhyRegisterSet(X11) | PhyRegisterSet(X12);
+```
+
+**生效位置**：在 `markDisallowedRegisters()`（regalloc.cpp:34-42）中实现。当前该函数直接读取 `DISALLOWED_REGISTERS` 常量（行 35）。需改为接受参数化的额外 disallowed 集合：
+
+```cpp
+// regalloc.cpp 修改
+void markDisallowedRegisters(
+    std::vector<LIRLocation>& locs,
+    PhyRegisterSet extra_disallowed = {}) {   // 新增参数
+  auto disallowed_registers = DISALLOWED_REGISTERS | extra_disallowed;
+  while (!disallowed_registers.Empty()) {
+    auto reg = disallowed_registers.GetFirst();
+    disallowed_registers.RemoveFirst();
+    locs[reg.loc] = START_LOCATION;
+  }
+}
+
+// 调用侧（regalloc.cpp:796 附近）
+PhyRegisterSet extra;
+if (has_osr_entries) {
+  extra = OSR_STUB_SCRATCH_REGS;
+}
+markDisallowedRegisters(locs, extra);
+```
+
+**注意时序**：`markDisallowedRegisters` 在 regalloc 线性扫描期间执行（regalloc.cpp:796），而 `computeFrameInfo()` 在 regalloc 完成后才运行（gen_asm.cpp:1185）。因此寄存器保留必须在 regalloc 层面完成，不能依赖 codegen 后期的 `computeFrameInfo()`。
+
+**编译期验证**：`generateOSREntryStub` 在生成 stub 代码前，断言所有 PhyLocation 目标不在 `OSR_STUB_SCRATCH_REGS` 中：
+
+```cpp
+// generateOSREntryStub 中的防御性断言
+auto assert_not_stub_scratch = [](PhyLocation loc, const char* name) {
+  if (loc.is_register()) {
+    assert(!OSR_STUB_SCRATCH_REGS.Has(loc) &&
+           "Environ VReg / live-in destination conflicts with stub scratch register");
+  }
+};
+assert_not_stub_scratch(osr_meta->tstate_location, "tstate");
+assert_not_stub_scratch(osr_meta->func_location, "func");
+assert_not_stub_scratch(osr_meta->frame_location, "frame");
+for (const auto& li : osr_meta->live_ins) {
+  assert_not_stub_scratch(li.destination, "live-in");
+}
+```
+
+**tradeoff 分析**：OSR 编译的函数少 4 个 caller-saved GP 寄存器。aarch64 有 28 个可分配 GP 寄存器（`INIT_REGISTERS`），减去 `DISALLOWED`（7 个：X29/X30/XZR/X13/X14/X16/D16/D17）和 stub 保留（4 个：X9-X12），仍有 17 个可分配 GP 寄存器 + 全部浮点寄存器。对绝大多数 Python 函数无影响。若极端情况下 regalloc 因寄存器压力过大失败，OSR entry 会被自然拒绝（`entry_point_offset = -1`），函数回退到正常 JIT 执行（无 OSR 加速）。
+
+**对非 OSR 编译无影响**：`OSR_STUB_SCRATCH_REGS` 仅在 `has_osr_entries == true` 的函数中生效。普通 JIT 编译路径使用标准 `DISALLOWED_REGISTERS`，寄存器池不受影响。
+
+**架构扩展性**：当前定义针对 aarch64。Phase 2 增加 x86_64 支持时，应在 `arch.h`（非 arch-specific 头文件）定义统一的接口：
+
+```cpp
+// cinderx/Jit/codegen/arch.h（架构无关接口）
+PhyRegisterSet GetOSRStubScratchRegs();  // 由各 arch 实现
+```
+
+各架构在对应的 `arch/aarch64.h`、`arch/x86_64.h` 中实现，返回该架构 stub 使用的临时寄存器集合。`markDisallowedRegisters` 的 `extra_disallowed` 参数传递此集合。这避免在 regalloc 或 stub 生成代码中硬编码架构特定常量。
+
 ## 1.3 行为模型
 
 ### 1.3.1 正常流程
@@ -474,13 +655,13 @@ void* OSRMetadata::entryPoint(const CompiledFunction& cf) const {
 解释器 JUMP_BACKWARD_JIT 回边计数 ≥ 阈值
   → Ci_OSR_TryOSR(tstate, frame=F, instr, oparg, &result)
       → performOSR(tstate, F, osr_meta, compiled, &result)
-          [0] entry_fn = osr_meta->entryPoint(compiled)  // 非 NULL
-          [0.5] F->instr_ptr = loop_header 字节码位置
+          [0] 前置校验（帧不变）：entry_fn 非 NULL + live-in 全部非 NULL + 索引合法
+          [0.5] F->instr_ptr = loop_header 字节码位置（首次帧修改）
           [1] 收集非 live-in → deferred_decrefs[](steal)，F->localsplus[i] 置 NULL
           [2] result = entry_fn(&OSRState{tstate, F, osr_meta})
                 stub prologue: stp fp/lr; mov fp, sp; sub sp; 保存 callee-saved
                 stub: 设置 Environ VReg（tstate/frame/func → PhyLocation）
-                stub: steal live-in（read + AND ~1 + write PhyLocation + str NULL）
+                stub: steal live-in（read + AND ~1 + write PhyLocation + str PyStackRef_NULL 64-bit）
                 stub: b .loop_header_N
                 [JIT 热循环执行中...]
                 JIT epilogue: JITRT_UnlinkFrame → setCurrentFrame(tstate, F.previous)
@@ -537,17 +718,16 @@ JIT 代码在未触发 guard deopt 的情况下通过正常异常路径退出（
 
 字节码处理程序处理 rc=-1 时：`_Py_LeaveRecursiveCallPy(tstate)` → 恢复 `frame = tstate->current_frame`（= F.previous）→ 根据 `frame->owner` 判断是否顶层函数（见功能设计的三态返回约定）。
 
-#### 异常流程 2：entry_fn 为 nullptr（rc=0）
+#### 异常流程 2：entry_fn 为 nullptr 或 preflight 失败（rc=0）
 
-`osr_meta->entryPoint(compiled)` 返回 nullptr（`entry_point_offset < 0`，即编译时此 entry 被拒绝但 OSRMetadata 被保留的情况，实际应由 `getOSREntry` 过滤不到此处）。`performOSR` 帧完全未修改，返回 rc=0，字节码处理程序走 `osr_skip` fallthrough 路径。
+所有 rc=0 路径在步骤 [0] 中完成（`frame->instr_ptr` 修改之前），严格保证帧不变：
+- `osr_meta->entryPoint(compiled)` 返回 nullptr（`entry_point_offset < 0`，编译时此 entry 被拒绝）
+- live-in preflight 发现 `PyStackRef_NULL`（未绑定 local）
+- `localsplus_index` 越界（`>= co_nlocalsplus`，元数据不一致）
 
-#### 异常流程 3：非 live-in 收集超过上限（kMaxDeferredDecref=512）
+帧完全未修改，返回 rc=0，字节码处理程序走 `osr_skip` fallthrough 路径。
 
-当 `co_nlocalsplus` 超过 512（极端情况）时，`n_deferred` 达到上限，后续非 live-in slot 未被收集（未写 PyStackRef_NULL）。OSR 不应在此情况下执行 stub 调用，否则 F->localsplus 处于不一致状态（部分清零，部分未清零），deopt 路径 `reifyLocalsplus` 的盲写假设不成立 → UAF。
-
-**缓解措施**：`compileFunctionWithOSR` 的编译预算检查（`osrCompileBudgetCheck`）已拒绝 `co_nlocalsplus` 超过阈值（默认 1024 code units）的函数。实际上 512 上限远大于正常函数的 `nlocalsplus`。如需防御，在收集阶段溢出时中止 OSR（提前 return 0，在写任何 NULL 前检测）。
-
-#### 异常流程 4：`deferred_decrefs` 中的 DECREF 触发 finalizer 设置异常
+#### 异常流程 3：`deferred_decrefs` 中的 DECREF 触发 finalizer 设置异常
 
 在 `result == nullptr` 路径，步骤 [3] 调用 `Py_XDECREF` 可能触发对象 `__del__` → `PyErr_NoMemory()` 等，覆盖原始异常。`performOSR` 通过 `PyErr_GetRaisedException()` 保存原始异常，`Py_XDECREF` 执行完毕后 `PyErr_SetRaisedException()` 恢复。这与 CPython 的 `_PyEval_FrameClearAndPop` 中的异常保护模式对称。
 
@@ -674,6 +854,7 @@ flowchart TD
     subgraph "C++ 实现（osr.cpp）"
         PerfOSR["int performOSR(tstate, frame, osr_meta, compiled, out_result)"]
         GetEntry["OSRMetadata* getOSREntry(compiled, target_idx)"]
+        Preflight["Preflight：entry_fn ≠ null +<br/>live-in 全部非 NULL + 索引合法"]
     end
 
     subgraph "编译期（gen_asm.cpp）"
@@ -684,19 +865,28 @@ flowchart TD
         Stub["OSR entry stub<br/>osr_entry_fn(OSRState*)"]
         JIT["JIT 代码（loop header 起）"]
         Epilogue["JIT epilogue<br/>JITRT_UnlinkFrame + ret"]
+        Deopt["Deopt exit<br/>prepareForDeopt +<br/>resumeInInterpreter"]
     end
 
     TryOSR --> GetEntry
     TryOSR --> PerfOSR
-    PerfOSR --> |"entry_fn = osr_meta->entryPoint(cf)"| Stub
+    PerfOSR --> Preflight
+    Preflight --> |"通过：帧开始修改"| PerfOSR
+    Preflight --> |"失败：rc=0（帧不变）"| TryOSR
+    PerfOSR --> |"[0.5] instr_ptr + [1] 收集非 live-in"| Stub
     Stub --> JIT
-    JIT --> Epilogue
-    Epilogue --> |"返回 PyObject*"| PerfOSR
+    JIT --> |"正常"| Epilogue
+    JIT --> |"guard 失败"| Deopt
+    Deopt --> |"解释器执行完毕"| Epilogue
+    Epilogue --> |"返回 PyObject*（rc=1）"| PerfOSR
+    Epilogue --> |"返回 NULL（rc=-1）"| PerfOSR
     GenStub --> Stub
 
     style Stub fill:#ff9,stroke:#333
     style GenStub fill:#ff9,stroke:#333
     style PerfOSR fill:#ff9,stroke:#333
+    style Preflight fill:#f96,stroke:#333
+    style Deopt fill:#9cf,stroke:#333
 ```
 
 ### 1.5.2 接口定义
@@ -708,8 +898,11 @@ flowchart TD
 
 // 三态返回：1=完成（JIT epilogue 已 PopFrame），0=未尝试（帧不变），-1=异常（JIT epilogue 已 PopFrame）
 // 前提：tstate->current_frame == frame，frame 在 datastack 上，OSRMetadata 有效
-// 副作用：非 live-in slots 被清零（steal + deferred DECREF），live-in 由 stub steal
-//         frame->instr_ptr 被设置到 loop header 位置
+// rc=0 保证：帧完全不变（instr_ptr / localsplus / 帧链均未修改），
+//   所有可能 return 0 的检查（entry_fn null、live-in NULL、索引越界）
+//   在修改任何帧状态之前完成
+// 副作用（仅 rc=1 或 rc=-1）：非 live-in slots 被清零（steal + deferred DECREF），
+//   live-in 由 stub steal，frame->instr_ptr 被设置到 loop header 位置
 int performOSR(
     PyThreadState* tstate,
     _PyInterpreterFrame* frame,
@@ -762,7 +955,7 @@ void fillOSRLiveInLocations(const lir::Function& lir_func,
 **stub 内部合同**：
 - 建立与 `resume_frame_total_size` / `resume_header_and_spill_size` / `resume_saved_regs` 完全一致的 native 栈布局
 - 设置所有 Environ VReg 到 `osr_meta` 记录的物理位置
-- 对每个 `live_ins[i]`：从 `F->localsplus[localsplus_index]` steal（AND ~1 + 写 destination + str PyStackRef_NULL），无 DECREF，无 bl 调用
+- 对每个 `live_ins[i]`：从 `F->localsplus[localsplus_index]` steal（AND ~1 + 写 destination + str PyStackRef_NULL 64-bit），无 DECREF，无 bl 调用
 - 跳转到 loop header（`b`，不是 `bl`）
 
 **返回值合同**：
@@ -783,11 +976,12 @@ void fillOSRLiveInLocations(const lir::Function& lir_func,
 | stub 栈布局与 JIT prologue 不一致 | epilogue 恢复错误 callee-saved → 寄存器值损坏 → UAF / crash | `resume_*` 字段计算错误或 stub 生成未完全复制 | Debug 构建断言 / ASAN | `resume_*` 三字段从同一 `computeFrameInfo()` 结果写入 OSRMetadata，stub 生成用相同字段 |
 | live-in destination 错误 | JIT body 读取错误值 → 语义错误 | `fillOSRLiveInLocations` 与 regalloc 不一致 | Debug 构建：OSR 进入后立即触发 deopt，比较帧状态 | kOSREntry LIR operand 经 regalloc 后与正常 VReg 用同一路径确定 PhyLocation |
 | non-live-in slot 未清零 | deopt `reifyLocalsplus` 盲写泄漏解释器引用 | performOSR 收集循环遗漏 slot | ASAN refcount 追踪 | 遍历 `[0, co_nlocalsplus)` 全部 slot，依据 `is_live_in_set` 过滤 |
-| PyStackRef_NULL 写入错误值 | `PyStackRef_IsNull` 检查失败，或解引用 NULL | stub 用 `str xzr`（=0）而非显式写 1 | Debug 构建 `PyStackRef_CheckValid` 断言 | 用 `mov w10, #1; str w10, [base, offset]` 写 bits=1 |
+| PyStackRef_NULL 写入错误值 | `PyStackRef_IsNull` 检查失败，或解引用 NULL | stub 用 `str xzr`（=0）或 32 位 `str w10`（只写低 4 字节，高 4 字节残留）而非 64 位 `str x10` | Debug 构建 `PyStackRef_CheckValid` 断言；ASAN 检测损坏 bits 被误认为对象指针 | 用 `mov x10, #1; str x10, [base, offset]` 写完整 8 字节 bits=1 |
 | deferred_decrefs 异常未保护 | 当前 Python 异常被 finalizer 覆盖 | result==NULL 时未保存/恢复异常 | Python 异常类型不符合预期 | `PyErr_GetRaisedException()` 保存 → DECREF 循环 → `PyErr_SetRaisedException()` 恢复 |
 | 循环头有非空操作数栈 | stub steal 遗漏栈上值 → deopt 恢复操作数栈不一致 | `isOSREligible` 检查失效 | `frame->stackpointer != _PyFrame_Stackbase(frame)` 运行时断言 | `isOSREligible` 拒绝 `stackpointer != _PyFrame_Stackbase(frame)`（pycore_interpframe.h:101） |
 | frame->instr_ptr 未设置 | 调试器/tracing 显示错误行号 | performOSR [0.5] 步骤遗漏 | sys._getframe().f_lineno 验证 | performOSR 在调用 stub 前设置 instr_ptr |
 | kBorrowed live-in 进入 OSR | deopt releaseRefs 不释放 kBorrowed → 内存泄漏 | `extractOSRLiveIns` 未正确拒绝 kBorrowed | ASAN refcount 追踪 | extractOSRLiveIns 对 kBorrowed 设 `reconstructible=false`，整个 entry 被拒绝（ADR-5） |
+| stub 临时寄存器与 regalloc 目标冲突 | stub 覆盖自身临时值（tstate/frame/localsplus_base/NULL_const）→ live-in 读写错槽 → 崩溃/UAF | regalloc 将 Environ VReg 或 live-in destination 分配到 X9-X12（stub 保留的临时寄存器） | `generateOSREntryStub` 中的 `assert_not_stub_scratch` 断言；Debug 构建验证 | regalloc 阶段将 `OSR_STUB_SCRATCH_REGS` 加入 disallowed 集合，从根源排除冲突 |
 
 ### 2.1.2 边界条件
 
@@ -795,7 +989,7 @@ void fillOSRLiveInLocations(const lir::Function& lir_func,
 |------|------|
 | `osr_meta->live_ins` 为空（无 live-in） | performOSR 收集全部 nlocalsplus 个 slot；stub 只做 prologue + Environ VReg + jmp，不 steal 任何值 |
 | `co_nlocalsplus == 0` | 收集循环立即退出，n_deferred=0；stub 无 steal 操作 |
-| 所有 slot 均为 PyStackRef_NULL | 收集循环跳过 NULL slot（`PyStackRef_IsNull` 检查），n_deferred=0；stub AND ~1 得到 nullptr（需确保此 live-in 值在运行时非 NULL，由 `extractOSRLiveIns` 保证 reconstructible） |
+| 所有 slot 均为 PyStackRef_NULL | 收集循环跳过 NULL slot（`PyStackRef_IsNull` 检查），n_deferred=0；但 preflight 检查发现 live-in 为 NULL → return 0（拒绝 OSR） |
 | stub 内 jmp 到 loop_header 时 FP 相关访问越界 | 由 `resume_frame_total_size` 保证 native 栈足够大，与 JIT body 的 spill 假设一致 |
 
 ## 2.2 可服务性分析
@@ -839,7 +1033,8 @@ void fillOSRLiveInLocations(const lir::Function& lir_func,
 | OSR 运行时 | `cinderx/Jit/osr.h`（新增） | `OSRState`、`OSRLiveIn`、`OSRMetadata` 结构定义；`performOSR` 声明 |
 | OSR 运行时 | `cinderx/Jit/osr.cpp`（新增） | `performOSR` 实现；`OSRMetadata::entryPoint` 实现 |
 | Codegen | `cinderx/Jit/codegen/gen_asm.h` | `NativeGenerator` 新增 `generateOSREntryStub` 私有方法 |
-| Codegen | `cinderx/Jit/codegen/gen_asm.cpp` | `generateCode()` 中新增 OSR stub 生成循环；`generateOSREntryStub` 实现（prologue + Environ VReg + steal + jmp）；`fillOSRLiveInLocations` 实现 |
+| Codegen | `cinderx/Jit/codegen/gen_asm.cpp` | `generateCode()` 中新增 OSR stub 生成循环；`generateOSREntryStub` 实现（prologue + Environ VReg + steal + jmp）；`fillOSRLiveInLocations` 实现；stub scratch 寄存器防御性断言 |
+| Regalloc | `cinderx/Jit/codegen/arch/aarch64.h` | 新增 `OSR_STUB_SCRATCH_REGS` 常量（X9-X12），OSR 编译时加入 disallowed 集合 |
 | HIR Function | `cinderx/Jit/hir/function.h` | 新增 `markOSREntries()`、`isOSREntry()`、`extractOSRLiveIns()`（由功能项 2 定义，本功能项消费） |
 | CodeRuntime | `cinderx/Jit/code_runtime.h` | 新增 `addOSRMetadata()`、`osrMetadatas()`、`hasOSREntries()`、`osr_metadatas_`（由功能项 2 定义，本功能项消费） |
 | CompiledFunction | `cinderx/Jit/compiled_function.h` | `CompiledFunctionData` 新增 `has_osr_entries` 标记（由功能项 2 定义，本功能项消费） |
@@ -854,12 +1049,14 @@ void fillOSRLiveInLocations(const lir::Function& lir_func,
 |---------|------|----------|
 | SR-OSR-009 | `OSRState` 结构定义（tstate + frame + osr_meta，kNormal 简化版） | `osr.h` |
 | SR-OSR-010 | `performOSR()` 四步算法：前置校验 + 收集非 live-in（deferred DECREF）+ 调用 stub + 延迟 DECREF + 三态返回 | `osr.cpp` |
-| SR-OSR-011 | `generateOSREntryStub`：prologue（stp fp/lr + mov fp/sp + sub sp）+ callee-saved 保存（按 `resume_saved_regs`）+ Environ VReg 恢复（PhyLocation 分派）+ live-in steal（AND ~Py_TAG_REFCNT + str PyStackRef_NULL）+ b .loop_header | `gen_asm.cpp` |
+| SR-OSR-011 | `generateOSREntryStub`：prologue（stp fp/lr + mov fp/sp + sub sp）+ callee-saved 保存（按 `resume_saved_regs`）+ Environ VReg 恢复（PhyLocation 分派）+ live-in steal（AND ~Py_TAG_REFCNT + str PyStackRef_NULL 64-bit）+ b .loop_header | `gen_asm.cpp` |
 | SR-OSR-012 | `fillOSRLiveInLocations`：regalloc 后从 kOSREntry LIR operand 回填 `OSRLiveIn::destination` | `autogen.cpp` 或 `gen_asm.cpp` |
 | SR-OSR-013 | live-in 引用计数管理：steal 语义（performOSR 收集延迟 DECREF；stub AND ~1 无 DECREF；JIT refcount_insertion INCREF；deopt releaseRefs DECREF） | `osr.cpp`, `gen_asm.cpp` |
 | SR-OSR-014 | `OSRMetadata` 存储在 `CodeRuntime::osr_metadatas_`，与 `DeoptMetadata` 对称 | `code_runtime.h`, `osr.h` |
 | SR-OSR-015 | `OSRMetadata::entry_point_offset` per-backedge 存储 + `OSRMetadata::entryPoint()` 实现 | `osr.h`, `osr.cpp` |
 | SR-OSR-016 | OSR deopt 路径验证：确认 OSR 进入的 JIT 代码与正常 kNormal JIT 代码共享相同的 deopt 路径（不需要修改 deopt 代码） | `gen_asm.cpp`, `deopt.cpp`（验证测试） |
+| SR-OSR-017 | `OSR_STUB_SCRATCH_REGS`（X9-X12）寄存器保留：regalloc 阶段排除 stub 临时寄存器 + `generateOSREntryStub` 防御性断言 | `aarch64.h`, `regalloc.cpp`, `gen_asm.cpp` |
+| SR-OSR-018 | `performOSR` preflight 时序：所有可能 return 0 的检查（entry_fn null、live-in NULL）必须在修改 `frame->instr_ptr` 之前完成，保证 rc=0 帧不变契约 | `osr.cpp` |
 
 ---
 
