@@ -32,6 +32,15 @@ SOURCE_DIR = "cinderx"
 PYTHON_LIB_DIR = "cinderx/PythonLib"
 
 MIN_GCC_VERSION = 13
+CINDERX_LOCAL_DEPS_ENV = "CINDERX_LOCAL_DEPS"
+
+
+def normalize_local_deps_dir(value: str | None) -> str | None:
+    if value is None:
+        return None
+    if value == "":
+        raise ValueError("--local must not be empty")
+    return os.path.abspath(os.path.expanduser(value))
 
 
 def compute_package_version() -> str:
@@ -138,14 +147,34 @@ def compute_py_version() -> str:
 
 
 class BuildCommand(build):
+    user_options = build.user_options + [
+        (
+            "local=",
+            None,
+            "Use the specified local dependency cache directory for CMake deps",
+        ),
+    ]
+
     # Don't use the setuptools default under "build/" as this clashes with
     # "build/fbcode_builder/" (auto-added to the OSS view of CinderX).
     def initialize_options(self):
         build.initialize_options(self)
         self.build_base = "scratch"
+        self.local = None
+
+    def finalize_options(self) -> None:
+        build.finalize_options(self)
+        self.local = normalize_local_deps_dir(self.local)
+
+    def _apply_local_to_build_ext(self) -> "BuildExt":
+        build_ext_cmd = self.get_finalized_command("build_ext")
+        if self.local:
+            build_ext_cmd.local = self.local
+        return build_ext_cmd
 
     def run(self) -> None:
         enable_pgo = os.environ.get("CINDERX_ENABLE_PGO", None) is not None
+        self._apply_local_to_build_ext()
 
         if enable_pgo:
             self._run_with_pgo()
@@ -164,7 +193,7 @@ class BuildCommand(build):
 
         print_section("PGO STAGE 1/3: Building with profile generation instrumentation")
 
-        stage1_build_ext_cmd = self.get_finalized_command("build_ext")
+        stage1_build_ext_cmd = self._apply_local_to_build_ext()
         stage1_build_ext_cmd.cinderx_pgo_stage = PgoStage.GENERATE
 
         # Run normal build process (BuildPy + BuildExt)
@@ -301,6 +330,7 @@ if __name__ == "__main__":
         stage3_build_ext_cmd.build_temp = self.build_temp
         stage3_build_ext_cmd.inplace = False
         stage3_build_ext_cmd.force = True
+        stage3_build_ext_cmd.local = self.local
         stage3_build_ext_cmd.cinderx_pgo_stage = PgoStage.USE
         if is_clang:
             stage3_build_ext_cmd.cinderx_pgo_profile_path = clang_merged_profile
@@ -346,10 +376,29 @@ class CMakeExtension(Extension):
 
 
 class BuildExt(build_ext):
+    user_options = build_ext.user_options + [
+        (
+            "local=",
+            None,
+            "Use the specified local dependency cache directory for CMake deps",
+        ),
+    ]
+
     def __init__(self, distribution: Distribution) -> None:
         super().__init__(distribution)
         self.cinderx_pgo_stage = PgoStage.DISABLED
         self.cinderx_pgo_profile_path: str | None = None
+
+    def initialize_options(self) -> None:
+        build_ext.initialize_options(self)
+        self.local = None
+
+    def finalize_options(self) -> None:
+        build_ext.finalize_options(self)
+        local = self.local
+        if local is None:
+            local = os.environ.get(CINDERX_LOCAL_DEPS_ENV)
+        self.local = normalize_local_deps_dir(local)
 
     def run(self) -> None:
         # Partition into CMake extensions and everything else.
@@ -411,6 +460,8 @@ class BuildExt(build_ext):
             f"-DCMAKE_CXX_COMPILER={cxx}",
             f"-DCMAKE_VERBOSE_MAKEFILE:BOOL={verbose_makefile}",
         ]
+        if self.local:
+            cmake_args.append(f"-DCINDERX_LOCAL_DEPS_DIR={self.local}")
 
         if self.cinderx_pgo_stage == PgoStage.GENERATE:
             cmake_args.append("-DENABLE_PGO_GENERATE=ON")
