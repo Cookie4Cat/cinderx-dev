@@ -17,10 +17,10 @@ python3.14 ci_pipeline/run_gate.py pr --coverage
 - `runtime_tests`：使用 CMake 构建并运行带覆盖率插桩的 native RuntimeTests
 - `test_cinderx_release`：使用新构建的非覆盖率 release wheel 运行 CinderX Python 测试
 
-覆盖率只透传给 `runtime` suite。`cinderx_inner` 负责构建并安装普通 release
+覆盖率只透传给 `runtime` suite。`cinderx_local` 负责构建并安装普通 release
 wheel，然后运行 `test_cinderx_release`。`runtime` 结束后会立即执行 `gcov`、
 `lcov`、`genhtml` 的覆盖率后处理；如果覆盖率后处理失败，pipeline 会在进入
-`cinderx_inner` 前停止。
+`cinderx_local` 前停止。
 
 ## Daily 兼容性门禁
 
@@ -34,12 +34,13 @@ python3.14 ci_pipeline/run_gate.py daily
 `daily` 的执行顺序是：
 
 - `runtime`
-- `cinderx_inner`
+- `cinderx_local`，并启用本地 wheel 的 Lib/test
 - `ci_pipeline/python_compat_matrix.toml` 中的 `wheel_compat_<name>`
 - 同一文件中的 `wheel_compat_negative_<name>`
 
-`daily` 不负责构建 compat wheel，调用方必须通过 `CINDERX_TEST_WHEEL` 传入。
-支持与不支持的 Python 版本统一配置在
+`daily` 会给 `cinderx_local` 开启 `CINDERX_LOCAL_RUN_LIBTEST`，用本地构建的 release
+wheel 跑 Lib/test。`daily` 不负责构建外部 compat wheel，调用方必须通过
+`CINDERX_TEST_WHEEL` 传入。支持与不支持的 Python 版本统一配置在
 `ci_pipeline/python_compat_matrix.toml`，每个条目必须显式包含：
 
 - `name`
@@ -62,10 +63,14 @@ python3.14 ci_pipeline/run_gate.py daily
 
 ```bash
 python3.14 ci_pipeline/run_gate.py --suite runtime --coverage
-python3.14 ci_pipeline/run_gate.py --suite cinderx_inner
+python3.14 ci_pipeline/run_gate.py --suite cinderx_local
 python3.14 ci_pipeline/run_gate.py --suite wheel_compat
 python3.14 ci_pipeline/run_gate.py --suite wheel_compat_negative
 ```
+
+`cinderx_local` 默认只构建本地 release wheel 并运行 CinderX Python 测试。设置
+`CINDERX_LOCAL_RUN_LIBTEST=1` 后会额外运行本地 wheel 的 Lib/test；`daily`
+pipeline 会自动打开这个开关。
 
 `wheel_compat` 需要：
 
@@ -80,16 +85,19 @@ python3.14 ci_pipeline/run_gate.py --suite wheel_compat_negative
 测试 wheel 会启用 `CINDERX_INCLUDE_TEST_PACKAGE_DATA=1`，避免门禁专用 package
 data 进入普通发布 wheel。
 
-## 预置依赖 / 离线模式
+## 依赖缓存 / pip 离线模式
 
-现在可以把 `run_gate` 需要的外部依赖提前准备到环境里，门禁执行时不再临时下载。
+`run_gate` 使用 PR 27 引入的 CMake FetchContent 依赖缓存。本地 suite 默认把缓存放在源码仓旁边：
 
-对于 CMake `FetchContent` 依赖，使用：
+```text
+{repo}/../cinderx-local-deps
+```
 
-- `CINDERX_DEPS_ROOT`：预置源码根目录
-- `CINDERX_FETCHCONTENT_OFFLINE=1`：开启后如果缺少本地源码则直接失败，不再联网 clone
+可以通过下面的环境变量覆盖：
 
-`CINDERX_DEPS_ROOT` 下面约定的子目录为：
+- `CINDERX_LOCAL_DEPS`：CMake FetchContent 依赖的本地缓存目录
+
+缓存覆盖的依赖包括：
 
 - `fmt`
 - `parallel-hashmap`
@@ -97,13 +105,7 @@ data 进入普通发布 wheel。
 - `capstone`
 - `googletest`
 
-如果某个依赖不想放在统一目录下，也可以分别指定：
-
-- `CINDERX_FMT_SOURCE_DIR`
-- `CINDERX_PARALLEL_HASHMAP_SOURCE_DIR`
-- `CINDERX_USDT_SOURCE_DIR`
-- `CINDERX_CAPSTONE_SOURCE_DIR`
-- `CINDERX_GOOGLETEST_SOURCE_DIR`
+如果缓存中的依赖缺失，或者 remote/tag/commit 不匹配，CMake 会刷新对应依赖目录。
 
 对于 suite venv 里的 Python 包引导，使用：
 
@@ -111,15 +113,12 @@ data 进入普通发布 wheel。
   pytest 的传递依赖
 - `CINDERX_PIP_OFFLINE=1`：要求 `pip` 只从本地 wheelhouse 安装
 
-`CINDERX_OFFLINE=1` 是一个便捷开关，会同时开启
-`CINDERX_FETCHCONTENT_OFFLINE=1` 和 `CINDERX_PIP_OFFLINE=1`。
-
 示例：
 
 ```bash
-export CINDERX_DEPS_ROOT=/opt/cinderx-deps
+export CINDERX_LOCAL_DEPS=/opt/cinderx-local-deps
 export CINDERX_PIP_WHEELHOUSE=/opt/cinderx-pydeps
-export CINDERX_OFFLINE=1
+export CINDERX_PIP_OFFLINE=1
 
 python3.14 ci_pipeline/run_gate.py pr --coverage
 ```

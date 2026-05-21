@@ -21,10 +21,10 @@ The `pr` pipeline runs the split local suites in order:
   wheel.
 
 Coverage mode is passed through to the `runtime` suite only. The
-`cinderx_inner` suite builds and installs the normal release wheel, then runs
+`cinderx_local` suite builds and installs the normal release wheel, then runs
 `test_cinderx_release`. After the `runtime` suite finishes, the gate captures
 and renders GCC coverage data with `gcov`, `lcov`, and `genhtml`; if coverage
-post-processing fails, the pipeline stops before `cinderx_inner`.
+post-processing fails, the pipeline stops before `cinderx_local`.
 
 ## Daily Compat Gate
 
@@ -38,13 +38,15 @@ python3.14 ci_pipeline/run_gate.py daily
 The `daily` pipeline runs in this order:
 
 - `runtime`
-- `cinderx_inner`
+- `cinderx_local` with local-wheel Lib/test enabled
 - `wheel_compat_<name>` entries from `ci_pipeline/python_compat_matrix.toml`
 - `wheel_compat_negative_<name>` entries from the same matrix file
 
-The compat wheel is not built by `daily`; callers must pass it in through
-`CINDERX_TEST_WHEEL`. Supported and unsupported Python entries are configured in
-`ci_pipeline/python_compat_matrix.toml`, and each entry must define:
+The `daily` pipeline runs Lib/test against the locally built release wheel by
+enabling `CINDERX_LOCAL_RUN_LIBTEST` for `cinderx_local`. The external compat
+wheel is not built by `daily`; callers must pass it in through
+`CINDERX_TEST_WHEEL`. Supported and unsupported Python entries are configured
+in `ci_pipeline/python_compat_matrix.toml`, and each entry must define:
 
 - `name`
 - `python`
@@ -67,10 +69,14 @@ Individual suites must be invoked with `--suite`:
 
 ```bash
 python3.14 ci_pipeline/run_gate.py --suite runtime --coverage
-python3.14 ci_pipeline/run_gate.py --suite cinderx_inner
+python3.14 ci_pipeline/run_gate.py --suite cinderx_local
 python3.14 ci_pipeline/run_gate.py --suite wheel_compat
 python3.14 ci_pipeline/run_gate.py --suite wheel_compat_negative
 ```
+
+`cinderx_local` normally runs only the local release wheel build and CinderX
+Python tests. Set `CINDERX_LOCAL_RUN_LIBTEST=1` to include the local-wheel
+Lib/test jobs, which is what the `daily` pipeline does.
 
 `wheel_compat` expects:
 
@@ -85,18 +91,21 @@ python3.14 ci_pipeline/run_gate.py --suite wheel_compat_negative
 The test wheel enables `CINDERX_INCLUDE_TEST_PACKAGE_DATA=1` so gate-only
 package data stays out of normal release wheels.
 
-## Prepared Dependencies / Offline Mode
+## Dependency Cache And Pip Offline Mode
 
-`run_gate` can now run against dependencies prepared ahead of time in the
-environment instead of downloading them during the gate.
+`run_gate` uses the CMake FetchContent dependency cache added by PR 27. The
+local suites set a default cache path next to the source tree:
 
-For CMake `FetchContent` dependencies, set:
+```text
+{repo}/../cinderx-local-deps
+```
 
-- `CINDERX_DEPS_ROOT`: root directory containing checked-out source trees
-- `CINDERX_FETCHCONTENT_OFFLINE=1`: fail fast instead of cloning from the
-  network
+Override it with:
 
-Expected subdirectories under `CINDERX_DEPS_ROOT`:
+- `CINDERX_LOCAL_DEPS`: local cache directory for CMake FetchContent
+  dependencies
+
+The cache covers:
 
 - `fmt`
 - `parallel-hashmap`
@@ -104,13 +113,8 @@ Expected subdirectories under `CINDERX_DEPS_ROOT`:
 - `capstone`
 - `googletest`
 
-You can also override individual source trees with:
-
-- `CINDERX_FMT_SOURCE_DIR`
-- `CINDERX_PARALLEL_HASHMAP_SOURCE_DIR`
-- `CINDERX_USDT_SOURCE_DIR`
-- `CINDERX_CAPSTONE_SOURCE_DIR`
-- `CINDERX_GOOGLETEST_SOURCE_DIR`
+If a cached dependency is missing or does not match the expected remote and
+tag/commit, CMake refreshes that dependency in the cache.
 
 For Python package bootstrap in suite venvs, set:
 
@@ -119,15 +123,12 @@ For Python package bootstrap in suite venvs, set:
 - `CINDERX_PIP_OFFLINE=1`: require `pip` installs to use the local wheelhouse
   only
 
-`CINDERX_OFFLINE=1` is a convenience switch that enables both
-`CINDERX_FETCHCONTENT_OFFLINE=1` and `CINDERX_PIP_OFFLINE=1`.
-
 Example:
 
 ```bash
-export CINDERX_DEPS_ROOT=/opt/cinderx-deps
+export CINDERX_LOCAL_DEPS=/opt/cinderx-local-deps
 export CINDERX_PIP_WHEELHOUSE=/opt/cinderx-pydeps
-export CINDERX_OFFLINE=1
+export CINDERX_PIP_OFFLINE=1
 
 python3.14 ci_pipeline/run_gate.py pr --coverage
 ```

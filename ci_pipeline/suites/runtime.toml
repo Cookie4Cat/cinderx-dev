@@ -10,4 +10,5 @@ name = "runtime_tests"
 kind = "runtime_tests"
 coverage = true
 [jobs.env]
+CINDERX_LOCAL_DEPS = "{repo}/../cinderx-local-deps"
 ENABLE_XXCLASSLOADER = "1"

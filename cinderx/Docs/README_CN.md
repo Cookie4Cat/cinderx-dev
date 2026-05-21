@@ -13,7 +13,7 @@
 
 ## 开发者构建说明
 
-CinderX 的 CMake 构建会通过 `FetchContent` 获取部分第三方依赖。为了减少构建阶段对 GitHub 网络的依赖，开发者可以指定一个本地依赖缓存目录。启用后，构建会优先校验并复用缓存中的依赖；依赖缺失、远端不匹配或版本不正确时，只会删除并重新拉取对应的依赖子目录。
+CinderX 的 CMake 构建会通过 `FetchContent` 获取部分第三方依赖。为了减少构建阶段对 GitHub 网络的依赖，可以通过本地依赖缓存目录复用这些源码。启用后，构建会优先校验缓存中的依赖；依赖缺失、远端不匹配或版本不正确时，会刷新对应依赖子目录。
 
 当前纳入本地缓存的依赖包括：
 
@@ -41,25 +41,24 @@ python3.14 setup.py build --local=/path/to/cinderx-local-deps
 `pip` 无法直接传递 `--local`，需要使用环境变量：
 
 ```bash
-# 以pip install 为例
 CINDERX_LOCAL_DEPS=/path/to/cinderx-local-deps \
 python3.14 -m pip install .
 ```
 
-
 ### 本地 gate 默认路径
 
-`ci_pipeline` 的 `pr` 和 `daily` suite 已配置默认缓存目录：
+`ci_pipeline` 的本地构建 suite 默认使用源码仓平行路径下的缓存目录：
 
 ```text
 <repo_path>/../cinderx-local-deps
 ```
 
-因此运行以下命令时会自动使用源码仓平行路径下的缓存目录：
+运行下面的本地门禁时会自动使用该路径：
 
 ```bash
 python3.14 ci_pipeline/run_gate.py pr --coverage
 ```
+
 ---
 
 ## 性能测试

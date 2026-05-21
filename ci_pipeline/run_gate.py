@@ -52,11 +52,11 @@ COVERAGE_MIN_PERCENT = {
 PIPELINES = {
     "pr": (
         ("runtime", True),
-        ("cinderx_inner", False),
+        ("cinderx_local", False),
     ),
     "daily": (
         ("runtime", True),
-        ("cinderx_inner", False),
+        ("cinderx_local", False, {"CINDERX_LOCAL_RUN_LIBTEST": "1"}),
     ),
 }
 DAILY_COMPAT_GROUPS = (
@@ -204,12 +204,8 @@ def env_truthy(value: str | None) -> bool:
     return value.strip().lower() in {"1", "on", "true", "yes"}
 
 
-def configure_prepared_dependencies(env: dict[str, str]) -> None:
+def configure_pip_dependencies(env: dict[str, str]) -> None:
     env.setdefault("PIP_DISABLE_PIP_VERSION_CHECK", "1")
-
-    if env_truthy(env.get("CINDERX_OFFLINE")):
-        env.setdefault("CINDERX_FETCHCONTENT_OFFLINE", "1")
-        env.setdefault("CINDERX_PIP_OFFLINE", "1")
 
     wheelhouse = env.get("CINDERX_PIP_WHEELHOUSE")
     if wheelhouse:
@@ -234,7 +230,7 @@ def configure_prepared_dependencies(env: dict[str, str]) -> None:
 
 def configure_toolchain(env: dict[str, str]) -> None:
     env.setdefault("CINDERX_TEST_PYTHON", sys.executable)
-    configure_prepared_dependencies(env)
+    configure_pip_dependencies(env)
 
     if "CC" not in env:
         cc = first_executable(
@@ -415,6 +411,28 @@ def job_uses_coverage(job: dict[str, Any], suite_coverage: bool) -> bool:
         return False
     default = str(job.get("kind", "command")) == "runtime_tests"
     return bool(job.get("coverage", default))
+
+
+def truthy_env_value(value: object) -> bool:
+    return str(value).strip().lower() in {"1", "true", "yes", "on"}
+
+
+def job_enabled(job: dict[str, Any]) -> bool:
+    enabled_by_env = str(job.get("enabled_by_env", "")).strip()
+    if not enabled_by_env:
+        return True
+
+    job_env = {
+        str(key): str(value)
+        for key, value in job.get("env", {}).items()
+    }
+    return truthy_env_value(
+        job_env.get(enabled_by_env, os.environ.get(enabled_by_env, ""))
+    )
+
+
+def suite_enabled_jobs(suite: dict[str, Any]) -> list[dict[str, Any]]:
+    return [job for job in suite["jobs"] if job_enabled(job)]
 
 
 def clean_stale_runtime_test_builds(run_dir: Path) -> None:
@@ -1097,7 +1115,7 @@ def run_suite_jobs(
     results = []
     prelude = suite_prelude(suite, args)
     fail_fast = bool(suite.get("fail_fast", True))
-    for job in suite["jobs"]:
+    for job in suite_enabled_jobs(suite):
         result = run_job(job, run_dir, prelude, job_uses_coverage(job, coverage))
         results.append(result)
         if fail_fast and result["returncode"] != 0:
@@ -1313,7 +1331,7 @@ def run_suite_command(
     if target_status != 0:
         return target_status
 
-    jobs = suite["jobs"]
+    jobs = suite_enabled_jobs(suite)
     if args.list:
         for job in jobs:
             print(job["name"])
@@ -1351,17 +1369,22 @@ def run_pipeline_command(
 ) -> int:
     pipeline = PIPELINES[pipeline_name]
     loaded_suites: list[tuple[str, bool, dict[str, Any]]] = []
-    for suite_name, pass_coverage in pipeline:
+    for suite_invocation in pipeline:
+        suite_name = suite_invocation[0]
+        pass_coverage = bool(suite_invocation[1])
+        env_overrides = suite_invocation[2] if len(suite_invocation) > 2 else {}
         suite = load_suite(suite_name)
         target_status = check_suite_target(suite_name, suite, args)
         if target_status != 0:
             return target_status
+        if env_overrides:
+            suite = clone_suite_with_env_overrides(suite, env_overrides)
         loaded_suites.append((suite_name, pass_coverage, suite))
 
     jobs = [
         job
         for _, _, suite in loaded_suites
-        for job in suite["jobs"]
+        for job in suite_enabled_jobs(suite)
     ]
     if pipeline_name == "daily":
         jobs.extend(daily_compat_jobs())
