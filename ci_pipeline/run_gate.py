@@ -153,7 +153,7 @@ def merged_env(job: dict[str, Any], coverage: bool = False) -> dict[str, str]:
         env["CINDERX_ENABLE_COVERAGE"] = "1"
         env[AUTO_IMPORT_ENABLE_ENV] = "1"
     for key, value in job.get("env", {}).items():
-        env[str(key)] = str(value)
+        env[str(key)] = str(value).replace("{repo}", str(REPO_ROOT))
     return env
 
 
@@ -341,6 +341,8 @@ def runtime_tests_command(
     ]
     if env.get("CINDERX_ENABLE_COVERAGE") == "1":
         cmake_args.append("-DENABLE_COVERAGE=ON")
+    if env.get("CINDERX_LOCAL_DEPS"):
+        cmake_args.append(f"-DCINDERX_LOCAL_DEPS_DIR={env['CINDERX_LOCAL_DEPS']}")
     if env.get("CC"):
         cmake_args.append(f"-DCMAKE_C_COMPILER={env['CC']}")
     if env.get("CXX"):

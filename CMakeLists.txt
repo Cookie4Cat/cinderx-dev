@@ -196,6 +196,101 @@ option(ENABLE_RUNTIME_TESTS "Build RuntimeTests with CMake" OFF)
 
 include(FetchContent)
 
+set(CINDERX_LOCAL_DEPS_DIR "" CACHE PATH "Local cache directory for CMake FetchContent dependencies")
+
+function(cinderx_local_dep_matches NAME REPOSITORY TAG LOCAL_DIR OUT_VAR)
+  set(matches FALSE)
+
+  if(IS_DIRECTORY "${LOCAL_DIR}/.git")
+    execute_process(
+      COMMAND "${CINDERX_GIT_EXECUTABLE}" -C "${LOCAL_DIR}" remote get-url origin
+      RESULT_VARIABLE remote_result
+      OUTPUT_VARIABLE remote_url
+      ERROR_QUIET
+      OUTPUT_STRIP_TRAILING_WHITESPACE)
+
+    if(remote_result EQUAL 0 AND remote_url STREQUAL REPOSITORY)
+      execute_process(
+        COMMAND "${CINDERX_GIT_EXECUTABLE}" -C "${LOCAL_DIR}" rev-parse HEAD
+        RESULT_VARIABLE current_result
+        OUTPUT_VARIABLE current_commit
+        ERROR_QUIET
+        OUTPUT_STRIP_TRAILING_WHITESPACE)
+
+      if(current_result EQUAL 0)
+        if("${TAG}" MATCHES "^[0-9a-fA-F]{40}$")
+          string(TOLOWER "${TAG}" expected_commit)
+          string(TOLOWER "${current_commit}" current_commit)
+          if(current_commit STREQUAL expected_commit)
+            set(matches TRUE)
+          endif()
+        else()
+          execute_process(
+            COMMAND "${CINDERX_GIT_EXECUTABLE}" -C "${LOCAL_DIR}" rev-parse "${TAG}^{commit}"
+            RESULT_VARIABLE expected_result
+            OUTPUT_VARIABLE expected_commit
+            ERROR_QUIET
+            OUTPUT_STRIP_TRAILING_WHITESPACE)
+          if(expected_result EQUAL 0 AND current_commit STREQUAL expected_commit)
+            set(matches TRUE)
+          endif()
+        endif()
+      endif()
+    endif()
+  endif()
+
+  set(${OUT_VAR} ${matches} PARENT_SCOPE)
+endfunction()
+
+function(cinderx_declare_dependency NAME REPOSITORY TAG)
+  # 本地构建
+  if(CINDERX_LOCAL_DEPS_DIR)
+    if(NOT CINDERX_GIT_EXECUTABLE)
+      find_program(CINDERX_GIT_EXECUTABLE git REQUIRED)
+    endif()
+
+    get_filename_component(local_deps_root "${CINDERX_LOCAL_DEPS_DIR}" ABSOLUTE)
+    file(MAKE_DIRECTORY "${local_deps_root}")
+    set(local_dir "${local_deps_root}/${NAME}")
+    # 缓存校验
+    cinderx_local_dep_matches(
+      "${NAME}"
+      "${REPOSITORY}"
+      "${TAG}"
+      "${local_dir}"
+      local_dep_matches)
+
+    if(NOT local_dep_matches)
+      message(STATUS "Refreshing local dependency ${NAME} in ${local_dir}")
+      file(REMOVE_RECURSE "${local_dir}")
+      execute_process(
+        COMMAND "${CINDERX_GIT_EXECUTABLE}" clone "${REPOSITORY}" "${local_dir}"
+        RESULT_VARIABLE clone_result)
+      if(NOT clone_result EQUAL 0)
+        message(FATAL_ERROR "Failed to clone ${NAME} from ${REPOSITORY} into ${local_dir}")
+      endif()
+
+      execute_process(
+        COMMAND "${CINDERX_GIT_EXECUTABLE}" -C "${local_dir}" checkout --detach "${TAG}"
+        RESULT_VARIABLE checkout_result)
+      if(NOT checkout_result EQUAL 0)
+        message(FATAL_ERROR "Failed to checkout ${NAME} at ${TAG} in ${local_dir}")
+      endif()
+    else()
+      message(STATUS "Using local dependency ${NAME} from ${local_dir}")
+    endif()
+
+    FetchContent_Declare(${NAME} SOURCE_DIR "${local_dir}")
+  else()
+  # 网络构建
+    FetchContent_Declare(
+      ${NAME}
+      GIT_REPOSITORY "${REPOSITORY}"
+      GIT_TAG "${TAG}"
+    )
+  endif()
+endfunction()
+
 ########################################
 # python
 
@@ -225,30 +320,30 @@ endif()
 ########################################
 # fmt
 
-FetchContent_Declare(
+cinderx_declare_dependency(
   fmt
-  GIT_REPOSITORY https://github.com/fmtlib/fmt
-  GIT_TAG 11.2.0 # 2025-May-03
+  https://github.com/fmtlib/fmt
+  11.2.0 # 2025-May-03
 )
 FetchContent_MakeAvailable(fmt)
 
 ########################################
 # parallel-hashmap
 
-FetchContent_Declare(
+cinderx_declare_dependency(
   parallel-hashmap
-  GIT_REPOSITORY https://github.com/greg7mdp/parallel-hashmap
-  GIT_TAG 896f1a03e429c45d9fe9638e892fc1da73befadd # 2025-Apr-11
+  https://github.com/greg7mdp/parallel-hashmap
+  896f1a03e429c45d9fe9638e892fc1da73befadd # 2025-Apr-11
 )
 FetchContent_MakeAvailable(parallel-hashmap)
 
 ########################################
 # usdt
 
-FetchContent_Declare(
+cinderx_declare_dependency(
   usdt
-  GIT_REPOSITORY https://github.com/libbpf/usdt
-  GIT_TAG f4ea2f524efa80d062f4d586d78daafb83dc7d24 # 2025-Apr-24
+  https://github.com/libbpf/usdt
+  f4ea2f524efa80d062f4d586d78daafb83dc7d24 # 2025-Apr-24
 )
 FetchContent_MakeAvailable(usdt)
 
@@ -273,10 +368,10 @@ endif()
 # capstone (optional, for JIT disassembly)
 
 if (${ENABLE_DISASSEMBLER})
-  FetchContent_Declare(
+  cinderx_declare_dependency(
     capstone
-    GIT_REPOSITORY https://github.com/capstone-engine/capstone
-    GIT_TAG 5.0.7
+    https://github.com/capstone-engine/capstone
+    5.0.7
   )
   set(CAPSTONE_BUILD_TESTS OFF CACHE BOOL "" FORCE)
   set(CAPSTONE_BUILD_CSTOOL OFF CACHE BOOL "" FORCE)
