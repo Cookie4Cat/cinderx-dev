@@ -245,6 +245,14 @@ def env_for_mode(startup_dir: Path, marker_file: Path) -> dict[str, str]:
     for name in PROXY_ENV_VARS:
         env.pop(name, None)
 
+    # Isolate stdlib test temp files per gate run so concurrent wheel_compat
+    # variants do not race on shared names under /tmp (for example test_filecmp).
+    temp_root = startup_dir.parent / f"{startup_dir.stem}_tmp"
+    temp_root.mkdir(parents=True, exist_ok=True)
+    env["TMPDIR"] = str(temp_root)
+    env["TEMP"] = str(temp_root)
+    env["TMP"] = str(temp_root)
+
     site_packages = site.getsitepackages()[0]
     pythonpath_entries = [str(startup_dir), site_packages]
     if pythonpath := env.get("PYTHONPATH"):
