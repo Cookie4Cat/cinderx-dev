@@ -169,6 +169,45 @@ def load_python_compat_matrix() -> dict[str, list[dict[str, str]]]:
     return matrix
 
 
+def python_version_for_matrix_entry(entry: dict[str, str]) -> str:
+    command = [
+        entry["python"],
+        "-c",
+        (
+            "import sys; "
+            "print('.'.join(map(str, sys.version_info[:3])))"
+        ),
+    ]
+    completed = subprocess.run(
+        command,
+        check=False,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        text=True,
+    )
+    if completed.returncode != 0:
+        output = (completed.stderr or completed.stdout).strip()
+        detail = f": {output}" if output else ""
+        raise RuntimeError(
+            f"failed to execute Python for matrix entry {entry['name']} "
+            f"({entry['python']}){detail}"
+        )
+    return completed.stdout.strip()
+
+
+def validate_python_compat_matrix(matrix: dict[str, list[dict[str, str]]]) -> None:
+    for group, entries in matrix.items():
+        for entry in entries:
+            actual = python_version_for_matrix_entry(entry)
+            expected = entry["version"]
+            if actual != expected:
+                raise RuntimeError(
+                    f"{PYTHON_COMPAT_MATRIX} entry {group}.{entry['name']} "
+                    f"points to Python {actual}, expected {expected}: "
+                    f"{entry['python']}"
+                )
+
+
 def compat_job_name(suite_name: str, entry: dict[str, str]) -> str:
     return f"{suite_name}_{entry['name']}"
 
@@ -1434,6 +1473,7 @@ def run_pipeline_command(
         try:
             require_daily_compat_wheel()
             matrix = load_python_compat_matrix()
+            validate_python_compat_matrix(matrix)
         except (RuntimeError, OSError, ValueError) as exc:
             print(f"error: {exc}", file=sys.stderr)
             return 2
