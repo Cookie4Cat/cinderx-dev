@@ -1927,11 +1927,12 @@ void JITRT_BatchDecref(PyObject** args, int nargs) {
 
 Py_ssize_t JITRT_CheckSequenceBounds(PyObject* s, Py_ssize_t i) {
   JIT_DCHECK(!PyErr_Occurred(), "called with error set");
+  Py_ssize_t original_i = i;
   i = i < 0 ? i + Py_SIZE(s) : i;
   if (i < 0 || i >= Py_SIZE(s)) {
     // If the access is out of bounds then call the runtime lookup function just
     // to make sure we get a consistent exceptions between interpreter + JIT.
-    Ref<> i_obj = Ref<>::steal(PyLong_FromSsize_t(i));
+    Ref<> i_obj = Ref<>::steal(PyLong_FromSsize_t(original_i));
     if (i_obj == nullptr) {
       return -1;
     }
