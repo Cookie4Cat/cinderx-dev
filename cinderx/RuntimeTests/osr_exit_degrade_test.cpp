@@ -742,18 +742,15 @@ class OSRDeoptTest : public RuntimeTest {
  protected:
   void SetUp() override {
     RuntimeTest::SetUp();
-    // TODO(T-OSR-001): osr_enabled and osr_backedge_threshold fields are
-    // added to jit::Config by Feature Item 1 (OSR Detection). Until then,
-    // these lines will not compile — guard with CINDERX_OSR_HEADERS_AVAILABLE
-    // when that feature lands.
     jit::getMutableConfig().osr_enabled = true;
-    // Use a very low backedge threshold so OSR triggers quickly.
     jit::getMutableConfig().osr_backedge_threshold = 10;
+    jit::syncOSRFlags();
   }
 
   void TearDown() override {
     jit::getMutableConfig().osr_enabled = false;
     jit::getMutableConfig().osr_backedge_threshold = 2000;
+    jit::syncOSRFlags();
     RuntimeTest::TearDown();
   }
 };

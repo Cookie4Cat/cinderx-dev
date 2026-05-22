@@ -250,7 +250,7 @@ TEST_F(PerformOSRTest, EntryPointNull_Returns0_FrameUnchanged) {
   // Strategy: compile a function, create an OSRMetadata with entry_point_offset=-1,
   // create a CompiledFunction, and call performOSR.
   // Expected: rc=0, frame->instr_ptr unchanged, localsplus unchanged.
-  // TODO(T-OSR-003): Implement with real CompiledFunction.
+  GTEST_SKIP() << "Requires Feature Item 2 compilation pipeline";
 }
 
 // TC-B02 (SR-OSR-010/018): Live-in slot is PyStackRef_NULL → rc=0.
@@ -262,7 +262,7 @@ TEST_F(PerformOSRTest, EntryPointNull_Returns0_FrameUnchanged) {
 // TODO(T-OSR-003): Requires compilation pipeline to set up OSRMetadata
 // with live-in mappings.
 TEST_F(PerformOSRTest, LiveInNull_Returns0_Preflight) {
-  // TODO(T-OSR-003): Create frame with a NULL slot that maps to a live-in.
+  GTEST_SKIP() << "Requires Feature Item 2 compilation pipeline";
 }
 
 // TC-B03 (SR-OSR-010/018): localsplus_index >= co_nlocalsplus → rc=0.
@@ -272,7 +272,7 @@ TEST_F(PerformOSRTest, LiveInNull_Returns0_Preflight) {
 //
 // TODO(T-OSR-003): Requires compilation pipeline.
 TEST_F(PerformOSRTest, LiveInIndexOOB_Returns0_Preflight) {
-  // TODO(T-OSR-003): Create OSRMetadata with localsplus_index out of bounds.
+  GTEST_SKIP() << "Requires Feature Item 2 compilation pipeline";
 }
 
 // TC-B04 (SR-OSR-010/018): Non-empty operand stack → rc=0.
@@ -284,7 +284,7 @@ TEST_F(PerformOSRTest, LiveInIndexOOB_Returns0_Preflight) {
 //
 // TODO(T-OSR-003): Requires compilation pipeline.
 TEST_F(PerformOSRTest, StackNotEmpty_Returns0_Preflight) {
-  // TODO(T-OSR-003): Create frame with stackpointer != Stackbase.
+  GTEST_SKIP() << "Requires Feature Item 2 compilation pipeline";
 }
 
 // TC-B05 (SR-OSR-018): rc=0 path does not modify frame->instr_ptr.
@@ -295,7 +295,7 @@ TEST_F(PerformOSRTest, StackNotEmpty_Returns0_Preflight) {
 //
 // TODO(T-OSR-003): Requires compilation pipeline.
 TEST_F(PerformOSRTest, Rc0_NoInstrPtrModification) {
-  // TODO(T-OSR-003): Record instr_ptr before, call performOSR (rc=0 path),
+  GTEST_SKIP() << "Requires Feature Item 2 compilation pipeline";
   // verify instr_ptr identical.
 }
 
@@ -306,7 +306,7 @@ TEST_F(PerformOSRTest, Rc0_NoInstrPtrModification) {
 //
 // TODO(T-OSR-003): Requires compilation pipeline.
 TEST_F(PerformOSRTest, Rc0_NoLocalsplusModification) {
-  // TODO(T-OSR-003): Snapshot localsplus before, call performOSR (rc=0),
+  GTEST_SKIP() << "Requires Feature Item 2 compilation pipeline";
   // compare after.
 }
 
@@ -317,7 +317,7 @@ TEST_F(PerformOSRTest, Rc0_NoLocalsplusModification) {
 //
 // TODO(T-OSR-003): Requires compilation pipeline.
 TEST_F(PerformOSRTest, Rc0_NoFrameChainModification) {
-  // TODO(T-OSR-003): Verify tstate->current_frame unchanged.
+  GTEST_SKIP() << "Requires Feature Item 2 compilation pipeline";
 }
 
 // TC-B08 (SR-OSR-010/018): frame->instr_ptr set to loop header before stub.
@@ -329,7 +329,7 @@ TEST_F(PerformOSRTest, Rc0_NoFrameChainModification) {
 //
 // TODO(T-OSR-003): Requires compilation pipeline.
 TEST_F(PerformOSRTest, InstrPtrSetBeforeStubCall) {
-  // TODO(T-OSR-003): Verify instr_ptr points to loop header bytecodes.
+  GTEST_SKIP() << "Requires Feature Item 2 compilation pipeline";
 }
 
 // TC-B09 (SR-OSR-013): Non-live-in slots cleared to PyStackRef_NULL.
@@ -341,9 +341,7 @@ TEST_F(PerformOSRTest, InstrPtrSetBeforeStubCall) {
 //
 // TODO(T-OSR-003): Requires compilation pipeline.
 TEST_F(PerformOSRTest, NonLiveInSlots_ClearedToNull) {
-  // TODO(T-OSR-003): Create frame with known localsplus values,
-  // define live-in set, verify non-live-in slots are PyStackRef_NULL
-  // after performOSR.
+  GTEST_SKIP() << "Requires Feature Item 2 compilation pipeline";
 }
 
 // TC-B10 (SR-OSR-013): Deferred DECREFs executed after stub returns.
@@ -354,8 +352,7 @@ TEST_F(PerformOSRTest, NonLiveInSlots_ClearedToNull) {
 //
 // TODO(T-OSR-003): Requires compilation pipeline.
 TEST_F(PerformOSRTest, DeferredDecrefs_AfterStubReturn) {
-  // TODO(T-OSR-003): Create objects with known refcounts in non-live-in
-  // slots, verify refcounts decremented after performOSR returns.
+  GTEST_SKIP() << "Requires Feature Item 2 compilation pipeline";
 }
 
 // TC-B11 (SR-OSR-013): Exception state preserved through deferred DECREF.
@@ -367,8 +364,7 @@ TEST_F(PerformOSRTest, DeferredDecrefs_AfterStubReturn) {
 //
 // TODO(T-OSR-003): Requires compilation pipeline.
 TEST_F(PerformOSRTest, ExceptionStatePreserved_DuringDECREF) {
-  // TODO(T-OSR-003): Trigger exception path, verify PyErr intact after
-  // deferred DECREFs.
+  GTEST_SKIP() << "Requires Feature Item 2 compilation pipeline";
 }
 
 #endif // CINDERX_OSR_HEADERS_AVAILABLE
@@ -398,8 +394,7 @@ class OSRStubTest : public RuntimeTest {};
 //
 // TODO(T-OSR-002): Requires Feature Item 2 compilation pipeline.
 TEST_F(OSRStubTest, StubPrologue_MatchesNormalLayout) {
-  // TODO(T-OSR-002): Compile function with OSR entry, extract OSRMetadata,
-  // verify resume_* fields match normal JIT prologue FrameInfo.
+  GTEST_SKIP() << "Requires Feature Item 2 compilation pipeline";
 }
 
 // TC-C02 (SR-OSR-011): Environ VRegs set correctly.
@@ -409,8 +404,7 @@ TEST_F(OSRStubTest, StubPrologue_MatchesNormalLayout) {
 //
 // TODO(T-OSR-002): Requires Feature Item 2 compilation pipeline.
 TEST_F(OSRStubTest, EnvironVRegs_SetCorrectly) {
-  // TODO(T-OSR-002): Compile function, verify tstate_location/func_location/
-  // frame_location are valid PhyLocations.
+  GTEST_SKIP() << "Requires Feature Item 2 compilation pipeline";
 }
 
 // TC-C03 (SR-OSR-012): Stub writes PyStackRef_NULL (bits=1), not zero.
@@ -422,8 +416,7 @@ TEST_F(OSRStubTest, EnvironVRegs_SetCorrectly) {
 //
 // TODO(T-OSR-002): Requires Feature Item 2 to generate stub machine code.
 TEST_F(OSRStubTest, LiveInSteal_WritesPyStackRefNull) {
-  // TODO(T-OSR-002): Inspect generated stub to verify PyStackRef_NULL
-  // writes use 64-bit stores with value 1.
+  GTEST_SKIP() << "Requires Feature Item 2 compilation pipeline";
 }
 
 // TC-C04 (SR-OSR-012): Live-in steal uses 64-bit store.
@@ -434,8 +427,7 @@ TEST_F(OSRStubTest, LiveInSteal_WritesPyStackRefNull) {
 //
 // TODO(T-OSR-002): Requires Feature Item 2 to generate stub machine code.
 TEST_F(OSRStubTest, LiveInSteal_64BitStore) {
-  // TODO(T-OSR-002): Disassemble stub, verify all localsplus writes use
-  // 64-bit str instructions.
+  GTEST_SKIP() << "Requires Feature Item 2 compilation pipeline";
 }
 
 #endif // CINDERX_OSR_HEADERS_AVAILABLE
@@ -503,8 +495,7 @@ TEST_F(OSREntryDataTest, StubScratchRegs_SubsetOfCallerSave) {
 //
 // TODO(T-OSR-002): Requires Feature Item 2 compilation pipeline.
 TEST_F(OSRStubTest, OSRDeopt_SharesNormalPath) {
-  // TODO(T-OSR-002): Compile function with OSR entry, trigger deopt after
-  // OSR entry, verify reifyFrame correctly restores frame state.
+  GTEST_SKIP() << "Requires Feature Item 2 compilation pipeline";
 }
 
 #endif // CINDERX_OSR_HEADERS_AVAILABLE
@@ -526,8 +517,6 @@ TEST_F(OSRStubTest, OSRDeopt_SharesNormalPath) {
 // OSR integration test fixture — configures OSR with a low backedge threshold
 // so integration tests trigger OSR reliably. Matches the pattern used in
 // osr_exit_degrade_test.cpp's OSRDeoptTest fixture.
-// TODO(T-OSR-001): osr_enabled and osr_backedge_threshold fields are added to
-// jit::Config by Feature Item 1. Until then, these lines will not compile.
 // ---------------------------------------------------------------------------
 class OSRIntegrationTest : public RuntimeTest {
  protected:
@@ -535,11 +524,13 @@ class OSRIntegrationTest : public RuntimeTest {
     RuntimeTest::SetUp();
     jit::getMutableConfig().osr_enabled = true;
     jit::getMutableConfig().osr_backedge_threshold = 10;
+    jit::syncOSRFlags();
   }
 
   void TearDown() override {
     jit::getMutableConfig().osr_enabled = false;
     jit::getMutableConfig().osr_backedge_threshold = 2000;
+    jit::syncOSRFlags();
     RuntimeTest::TearDown();
   }
 };
