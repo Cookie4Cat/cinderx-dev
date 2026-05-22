@@ -113,6 +113,20 @@ const std::vector<DeoptMetadata>& CodeRuntime::deoptMetadatas() const {
   return deopt_metadatas_;
 }
 
+std::size_t CodeRuntime::addOSRMetadata(OSRMetadata&& osr_meta) {
+  ThreadedCompileSerialize guard;
+  osr_metadatas_.emplace_back(std::move(osr_meta));
+  return osr_metadatas_.size() - 1;
+}
+
+const std::vector<OSRMetadata>& CodeRuntime::osrMetadatas() const {
+  return osr_metadatas_;
+}
+
+bool CodeRuntime::hasOSREntries() const {
+  return !osr_metadatas_.empty();
+}
+
 const RuntimeFrameState* CodeRuntime::frameState() const {
   return &frame_state_;
 }

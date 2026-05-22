@@ -99,6 +99,8 @@ struct CompiledFunctionData {
   std::vector<std::unique_ptr<CodePatcher>> code_patchers;
   std::unique_ptr<hir::Function> irfunc;
   CodeRuntime* runtime{nullptr};
+  // Whether the compilation produced OSR entry stubs.
+  bool has_osr_entries{false};
 
   CompiledFunctionData() = default;
 };
