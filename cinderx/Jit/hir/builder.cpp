@@ -3939,17 +3939,24 @@ void HIRBuilder::emitUnpackSequence(
     CFG& cfg,
     TranslationContext& tc,
     const jit::BytecodeInstruction& bc_instr) {
+  enum class PreferredSequenceType {
+    kUnknown,
+    kTuple,
+    kList,
+  };
+
   auto& stack = tc.frame.stack;
   Register* seq = stack.top();
+  PreferredSequenceType preferred = PreferredSequenceType::kUnknown;
 
   if (getConfig().specialized_opcodes) {
     switch (bc_instr.specializedOpcode()) {
       case UNPACK_SEQUENCE_LIST:
-        tc.emit<GuardType>(seq, TListExact, seq, tc.frame);
+        preferred = PreferredSequenceType::kList;
         break;
       case UNPACK_SEQUENCE_TUPLE:
       case UNPACK_SEQUENCE_TWO_TUPLE:
-        tc.emit<GuardType>(seq, TTupleExact, seq, tc.frame);
+        preferred = PreferredSequenceType::kTuple;
         break;
       default:
         break;
@@ -3961,9 +3968,12 @@ void HIRBuilder::emitUnpackSequence(
   // Determine whether the slow path (iterator protocol) is needed.
   // When the type is statically known to be tuple or list (and list is
   // not disabled for free-threading), we can skip the slow path entirely.
-  bool needs_slow_path = !seq->isA(TTupleExact);
+  bool needs_slow_path =
+      preferred != PreferredSequenceType::kTuple && !seq->isA(TTupleExact);
 #ifndef Py_GIL_DISABLED
-  needs_slow_path = needs_slow_path && !seq->isA(TListExact);
+  needs_slow_path =
+      needs_slow_path && preferred != PreferredSequenceType::kList &&
+      !seq->isA(TListExact);
 #endif
 
   TranslationContext deopt_path{cfg.AllocateBlock(), tc.frame};
@@ -3974,7 +3984,7 @@ void HIRBuilder::emitUnpackSequence(
   deopt->setDescr("UNPACK_SEQUENCE");
 
   BasicBlock* fast_path = cfg.AllocateBlock();
-  BasicBlock* list_check_path = cfg.AllocateBlock();
+  BasicBlock* second_check_path = cfg.AllocateBlock();
   BasicBlock* list_fast_path = cfg.AllocateBlock();
   BasicBlock* tuple_fast_path = cfg.AllocateBlock();
   Register* list_mem = temps_.AllocateStack();
@@ -3986,6 +3996,8 @@ void HIRBuilder::emitUnpackSequence(
   // done_path where the items are pushed to the stack.
   BasicBlock* slow_path = needs_slow_path ? cfg.AllocateBlock() : nullptr;
   BasicBlock* done_path = needs_slow_path ? cfg.AllocateBlock() : nullptr;
+  BasicBlock* unpack_failure_path =
+      needs_slow_path ? slow_path : deopt_path.block;
   std::vector<Register*> items;
   if (needs_slow_path) {
     items.resize(count);
@@ -4002,21 +4014,43 @@ void HIRBuilder::emitUnpackSequence(
   } else if (seq->isA(TListExact)) {
 // TODO(T255264577). Enable this again. See P2169677587.
 #ifdef Py_GIL_DISABLED
-    tc.emit<Branch>(slow_path);
+    tc.emit<Branch>(unpack_failure_path);
 #else
     tc.emit<Branch>(list_fast_path);
 #endif
   } else {
-    tc.emit<CondBranchCheckType>(
-        seq, TTupleExact, tuple_fast_path, list_check_path);
-
-    tc.block = list_check_path;
+    auto emit_list_then_tuple = [&]() {
 // TODO(T255264577). Enable this again. See P2169677587.
 #ifdef Py_GIL_DISABLED
-    tc.emit<Branch>(slow_path);
+      tc.emit<CondBranchCheckType>(
+          seq, TTupleExact, tuple_fast_path, unpack_failure_path);
 #else
-    tc.emit<CondBranchCheckType>(seq, TListExact, list_fast_path, slow_path);
+      tc.emit<CondBranchCheckType>(
+          seq, TListExact, list_fast_path, second_check_path);
+      tc.block = second_check_path;
+      tc.emit<CondBranchCheckType>(
+          seq, TTupleExact, tuple_fast_path, unpack_failure_path);
 #endif
+    };
+
+    auto emit_tuple_then_list = [&]() {
+      tc.emit<CondBranchCheckType>(
+          seq, TTupleExact, tuple_fast_path, second_check_path);
+      tc.block = second_check_path;
+// TODO(T255264577). Enable this again. See P2169677587.
+#ifdef Py_GIL_DISABLED
+      tc.emit<Branch>(unpack_failure_path);
+#else
+      tc.emit<CondBranchCheckType>(
+          seq, TListExact, list_fast_path, unpack_failure_path);
+#endif
+    };
+
+    if (preferred == PreferredSequenceType::kList) {
+      emit_list_then_tuple();
+    } else {
+      emit_tuple_then_list();
+    }
   }
 
   tc.block = tuple_fast_path;
