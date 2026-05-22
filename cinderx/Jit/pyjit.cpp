@@ -3763,6 +3763,9 @@ void funcModified(BorrowedRef<PyFunctionObject> func) {
   // func->func_code and call scheduleCompile() to re-register with the new
   // code.
   unregisterFunctionCodes(func);
+  // Reset OSR state for the old code — must happen before func_code is
+  // updated by the caller.
+  resetOSRState(borrowed(func->func_code));
 }
 
 void typeDestroyed(BorrowedRef<PyTypeObject> type) {
