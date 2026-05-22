@@ -270,6 +270,36 @@ TEST_F(CmdLineTest, JITEnable) {
       0);
 }
 
+TEST_F(CmdLineTest, OSREnabledFlag) {
+  ASSERT_EQ(
+      try_flag_and_envvar_effect(
+          L"osr-enabled",
+          "CINDERX_OSR_ENABLED",
+          []() { getMutableConfig().osr_enabled = false; },
+          []() { ASSERT_TRUE(getConfig().osr_enabled); }),
+      0);
+}
+
+TEST_F(CmdLineTest, OSRBackedgeThresholdFlag) {
+  ASSERT_EQ(
+      try_flag_and_envvar_effect(
+          L"osr-backedge-threshold=7",
+          "CINDERX_OSR_BACKEDGE_THRESHOLD=7",
+          []() { getMutableConfig().osr_backedge_threshold = 2000; },
+          []() { ASSERT_EQ(getConfig().osr_backedge_threshold, 7); }),
+      0);
+}
+
+TEST_F(CmdLineTest, OSRCompileBudgetFlag) {
+  ASSERT_EQ(
+      try_flag_and_envvar_effect(
+          L"osr-compile-budget=17",
+          "CINDERX_OSR_COMPILE_BUDGET=17",
+          []() { getMutableConfig().osr_compile_budget_code_units = 1024; },
+          []() { ASSERT_EQ(getConfig().osr_compile_budget_code_units, 17); }),
+      0);
+}
+
 TEST_F(CmdLineTest, JITEnabledFlags_MultithreadCompile) {
   ASSERT_EQ(
       try_flag_and_envvar_effect(
