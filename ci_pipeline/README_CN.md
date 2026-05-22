@@ -1,94 +1,141 @@
 # CinderX 本地测试门禁
 
-英文文档: [README.md](README.md)
+英文文档：[README.md](README.md)
 
-这是用于 ARM64 CPython 3.14 CinderX JIT 工作流的本地合入门禁，基于
-`meta/main`。
+这里维护 ARM64 CPython 3.14 CinderX JIT 的本地门禁流程。
 
 ## PR 覆盖率门禁
 
-PR 门禁推荐以 native C/C++ 覆盖率模式运行：
+PR 门禁推荐带 native C/C++ 覆盖率运行：
 
 ```bash
 python3.14 ci_pipeline/run_gate.py pr --coverage
 ```
 
-`pr` suite 会构建测试 wheel，安装到隔离 venv，然后运行：
+`pr` pipeline 按顺序运行：
 
-- `runtime_tests`: 使用 CMake 构建并运行带覆盖率插桩的 native RuntimeTests。
-- `test_cinderx_release`: 使用新构建的非覆盖率 wheel 运行 CinderX Python 测试。
+- `runtime_tests`：使用 CMake 构建并运行带覆盖率插桩的 native RuntimeTests
+- `test_cinderx_release`：使用新构建的非覆盖率 release wheel 运行 CinderX Python 测试
 
-覆盖率模式只会对明确参与覆盖率的 job 插桩。当前只有 `runtime_tests`；
-`setup_release` 和 `test_cinderx_release` 保持普通 release wheel 路径。suite
-jobs 结束后，门禁会使用 `gcov`、`lcov` 和 `genhtml` 采集并生成 GCC 覆盖率报告。
-覆盖率构建会显式禁用 LTO，因为覆盖率产物需要由当前 GCC/gcov 工具链读取。
+覆盖率只透传给 `runtime` suite。`cinderx_local` 负责构建并安装普通 release
+wheel，然后运行 `test_cinderx_release`。`runtime` 结束后会立即执行 `gcov`、
+`lcov`、`genhtml` 的覆盖率后处理；如果覆盖率后处理失败，pipeline 会在进入
+`cinderx_local` 前停止。
 
-覆盖率产物会写入本次运行目录：
+## Daily 兼容性门禁
 
-- `coverage/coverage.info`: 最终过滤后的 lcov tracefile。
-- `coverage/html/index.html`: 可在浏览器中查看的 HTML 报告。
-- `logs/coverage.log`: capture、filter、HTML、summary 和阈值检查日志。
-- `summary.json`: 面向脚本读取的门禁摘要，包含覆盖率指标、阈值和状态。
-
-最终报告用于统计 CinderX native 项目代码。报告会过滤第三方代码、runtime test
-源码、测试脚本、Python 测试包、构建目录、`scratch` 和 FetchContent `_deps`
-源码。
-
-覆盖率阈值配置在 `ci_pipeline/run_gate.py` 顶部附近的
-`COVERAGE_MIN_PERCENT`，当前按 runtime-only 覆盖率范围校准。
-
-## Daily Lib/test 门禁
-
-日构建门禁运行不带覆盖率插桩的 CPython `Lib/test`：
+`daily` 会复用 `pr` 的前半段，然后展开多 Python 兼容性验证：
 
 ```bash
+CINDERX_TEST_WHEEL=/path/to/cinderx.whl \
 python3.14 ci_pipeline/run_gate.py daily
 ```
 
-`daily` suite 会构建测试 wheel，安装到隔离 venv，然后运行：
+`daily` 的执行顺序是：
 
-- `lib_test_adaptive_aware_24`: 使用 CinderX frame evaluator 和
-  `compile_after_n_calls(24)` 运行 CPython `Lib/test`，并通过 Kunpeng
-  dispatcher 复用 worker，降低进程启动开销。
-- `lib_test_official_skip_ok_26`: Kunpeng 单独显式运行 26 个模块。这些模块
-  仍然保留在官方 module-level skip metadata 里，但已经在 ARM64 CPython 3.14
-  的 frame-eval/adaptive-aware 模式下验证通过。
+- `runtime`
+- `cinderx_local`，并启用本地 wheel 的 Lib/test
+- `ci_pipeline/python_compat_matrix.toml` 中的 `wheel_compat_<name>`
+- 同一文件中的 `wheel_compat_negative_<name>`
 
-Lib/test runner 会先使用 `cinderx/TestScripts/` 下的官方 skip/JIT ignore
-metadata，然后追加 Kunpeng daily 债务文件
-`cinderx/TestScripts/TestScriptsKunpeng/lib_test_daily_ignore_tests.txt`。
-这个文件和官方 metadata 分开维护，当前只用于排除不属于 CinderX
-frame-eval/JIT 兼容性目标的 CPython 内部 optimizer 测试。26 个新增接入模块
-单独记录在
-`cinderx/TestScripts/TestScriptsKunpeng/lib_test_daily_official_skip_ok_26.txt`；
-官方 skip 文件保持不变。runner 还会从 Lib/test 子进程环境中清理代理变量，
-避免 CI 代理设置影响网络相关测试行为。
+`daily` 会给 `cinderx_local` 开启 `CINDERX_LOCAL_RUN_LIBTEST`，用本地构建的 release
+wheel 跑 Lib/test。`daily` 不负责构建外部 compat wheel，调用方必须通过
+`CINDERX_TEST_WHEEL` 传入。支持与不支持的 Python 版本统一配置在
+`ci_pipeline/python_compat_matrix.toml`，每个条目必须显式包含：
 
-## 通用说明
+- `name`
+- `python`
+- `version`
 
-测试 wheel 会启用 `CINDERX_INCLUDE_TEST_PACKAGE_DATA=1`，从而避免门禁专用的
-package data 进入普通发布版本 wheel。
+每个 compat 条目都会生成独立的子目录、venv、日志和 `summary.json`。顶层
+`daily` summary 会把每个 Python 版本直接作为一个独立 job 展示。
 
-已知排除：
+## 独立 Suite
 
-- `test_jit_support_instrumentation.py` 仅运行 ARM64 支持的用例。
-- `test_compiler_sbs_stdlib_0.py` 到
-  `test_compiler_sbs_stdlib_9.py` 暂记为 Kunpeng `test_cinderx` 主 gate
-  之外的债务。这组测试是大规模 compiler bytecode parity corpus；当前性能优化
-  阶段不涉及 compiler code generation、exception table 或 line table。
-  这组用例在 2026-05-17 collect 到 2,621 个 item，`--maxfail=50` 样本
-  跑到 `50 failed, 33 passed` 后停止，所以先明确延后，等 compiler parity
-  进入工作范围后再处理。
+pipeline 通过名称调用：
 
-后续工作：当 compiler parity 进入工作范围后，把 SBS stdlib 债务整理成明确的
-expected-failure 或 ignore baseline，再纳入持续运行。
+```bash
+python3.14 ci_pipeline/run_gate.py pr --coverage
+python3.14 ci_pipeline/run_gate.py daily
+```
 
-LCOV 兼容逻辑会在运行时根据版本选择参数：
+单独运行 suite 必须使用 `--suite`：
 
-- LCOV 1.x 使用 `lcov_branch_coverage=1`，并且不会传入 LCOV 2.x 才支持的
-  `--ignore-errors` 值。
-- LCOV 2.x 使用 `branch_coverage=1`，并在 capture、filter 和 HTML 生成阶段
-  将已知第三方/template 一致性问题降级处理。
+```bash
+python3.14 ci_pipeline/run_gate.py --suite runtime --coverage
+python3.14 ci_pipeline/run_gate.py --suite cinderx_local
+python3.14 ci_pipeline/run_gate.py --suite wheel_compat
+python3.14 ci_pipeline/run_gate.py --suite wheel_compat_negative
+```
 
-HIR runtime test fixture 文件需要保持 LF 换行。CRLF 会导致 delimiter 行在
-`runtime_tests` 阶段解析校验失败。
+`cinderx_local` 默认只构建本地 release wheel 并运行 CinderX Python 测试。设置
+`CINDERX_LOCAL_RUN_LIBTEST=1` 后会额外运行本地 wheel 的 Lib/test；`daily`
+pipeline 会自动打开这个开关。
+
+`wheel_compat` 需要：
+
+- `CINDERX_TEST_PYTHON`
+- `CINDERX_TEST_WHEEL`
+
+`wheel_compat_negative` 需要：
+
+- `CINDERX_TEST_WHEEL`
+- `CINDERX_UNSUPPORTED_TEST_PYTHON`
+
+测试 wheel 会启用 `CINDERX_INCLUDE_TEST_PACKAGE_DATA=1`，避免门禁专用 package
+data 进入普通发布 wheel。
+
+## 依赖缓存 / pip 离线模式
+
+`run_gate` 使用 PR 27 引入的 CMake FetchContent 依赖缓存。本地 suite 默认把缓存放在源码仓旁边：
+
+```text
+{repo}/../cinderx-local-deps
+```
+
+可以通过下面的环境变量覆盖：
+
+- `CINDERX_LOCAL_DEPS`：CMake FetchContent 依赖的本地缓存目录
+
+缓存覆盖的依赖包括：
+
+- `fmt`
+- `parallel-hashmap`
+- `usdt`
+- `capstone`
+- `googletest`
+
+如果缓存中的依赖缺失，或者 remote/tag/commit 不匹配，CMake 会刷新对应依赖目录。
+
+对于 suite venv 里的 Python 包引导，使用：
+
+- `CINDERX_PIP_WHEELHOUSE`：本地 wheelhouse，至少包含 `pip`、`pytest` 以及
+  pytest 的传递依赖
+- `CINDERX_PIP_OFFLINE=1`：要求 `pip` 只从本地 wheelhouse 安装
+
+示例：
+
+```bash
+export CINDERX_LOCAL_DEPS=/opt/cinderx-local-deps
+export CINDERX_PIP_WHEELHOUSE=/opt/cinderx-pydeps
+export CINDERX_PIP_OFFLINE=1
+
+python3.14 ci_pipeline/run_gate.py pr --coverage
+```
+
+覆盖率阈值定义在 `ci_pipeline/run_gate.py` 顶部附近的
+`COVERAGE_MIN_PERCENT`，当前按 runtime-only 覆盖范围校准。
+
+已知排除项：
+
+- `test_jit_support_instrumentation.py` 仅运行 ARM64 支持的用例
+- `test_compiler_sbs_stdlib_0.py` 到 `test_compiler_sbs_stdlib_9.py` 仍作为
+  Kunpeng `test_cinderx` 债务，暂不纳入主门禁
+
+LCOV 兼容逻辑会在运行时按版本自动选择参数：
+
+- LCOV 1.x 使用 `lcov_branch_coverage=1`
+- LCOV 2.x 使用 `branch_coverage=1`
+
+请保持 HIR runtime test fixture 文件使用 LF 换行；CRLF 会导致
+`runtime_tests` 里的分隔符校验失败。

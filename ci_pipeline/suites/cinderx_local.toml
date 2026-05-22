@@ -14,9 +14,15 @@ CINDERX_LOCAL_DEPS = "{repo}/../cinderx-local-deps"
 ENABLE_XXCLASSLOADER = "1"
 
 [[jobs]]
+name = "test_cinderx_release"
+command = "\"{run_dir}/venv/bin/python\" cinderx/TestScripts/TestScriptsKunpeng/test_cinderx_runner.py --python \"{run_dir}/venv/bin/python\" --log-dir \"{run_dir}/logs/test_cinderx_release\" --json-summary-file \"{run_dir}/test_cinderx_release.json\""
+
+[[jobs]]
 name = "lib_test_adaptive_aware_24"
+enabled_by_env = "CINDERX_LOCAL_RUN_LIBTEST"
 command = "\"{run_dir}/venv/bin/python\" cinderx/TestScripts/TestScriptsKunpeng/lib_test_runner.py --mode frame-eval-adaptive-aware --adaptive-compile-after 24 --runner dispatcher --num-workers auto --worker-timeout 1200 --worker-respawn-interval 10 --test-list-file \"{run_dir}/lib_test_adaptive_aware_24_tests.txt\" --json-summary-file \"{run_dir}/lib_test_adaptive_aware_24.json\""
 
 [[jobs]]
 name = "lib_test_official_skip_ok_26"
+enabled_by_env = "CINDERX_LOCAL_RUN_LIBTEST"
 command = "\"{run_dir}/venv/bin/python\" cinderx/TestScripts/TestScriptsKunpeng/lib_test_runner.py --mode frame-eval-adaptive-aware --adaptive-compile-after 24 --runner dispatcher --num-workers auto --worker-timeout 1200 --worker-respawn-interval 1 --test-from-file cinderx/TestScripts/TestScriptsKunpeng/lib_test_daily_official_skip_ok_26.txt --include-skipped-modules --test-list-file \"{run_dir}/lib_test_official_skip_ok_26_tests.txt\" --json-summary-file \"{run_dir}/lib_test_official_skip_ok_26.json\""

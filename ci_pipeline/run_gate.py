@@ -4,6 +4,7 @@
 from __future__ import annotations
 
 import argparse
+import concurrent.futures
 import datetime as _datetime
 import json
 import os
@@ -30,6 +31,7 @@ REPO_ROOT = find_repo_root()
 TESTGATE_DIR = REPO_ROOT / "ci_pipeline"
 SUITES_DIR = TESTGATE_DIR / "suites"
 ARTIFACT_ROOT = REPO_ROOT / "build" / "testgate"
+PYTHON_COMPAT_MATRIX = TESTGATE_DIR / "python_compat_matrix.toml"
 ALLOW_TARGET_MISMATCH_ENV = "CINDERX_TESTGATE_ALLOW_TARGET_MISMATCH"
 AUTO_IMPORT_ENABLE_ENV = "CINDERX_PLUGIN_ENABLE"
 COUNT_KEYS = ("passed", "failed", "error", "skipped", "deselected")
@@ -47,6 +49,20 @@ COVERAGE_MIN_PERCENT = {
     "function": 60.0,
     "branch": 30.0,
 }
+PIPELINES = {
+    "pr": (
+        ("runtime", True),
+        ("cinderx_local", False),
+    ),
+    "daily": (
+        ("runtime", True),
+        ("cinderx_local", False, {"CINDERX_LOCAL_RUN_LIBTEST": "1"}),
+    ),
+}
+DAILY_COMPAT_GROUPS = (
+    ("supported", "wheel_compat"),
+    ("unsupported", "wheel_compat_negative"),
+)
 
 
 def load_suite(name: str) -> dict[str, Any]:
@@ -99,13 +115,114 @@ def allow_target_mismatch(args: argparse.Namespace) -> bool:
 
 
 def timestamp() -> str:
-    return _datetime.datetime.now().strftime("%Y%m%d-%H%M%S")
+    return _datetime.datetime.now().strftime("%Y%m%d-%H%M%S-%f")
 
 
 def make_run_dir(suite_name: str) -> Path:
-    run_dir = ARTIFACT_ROOT / f"{suite_name}-{timestamp()}"
+    run_dir = ARTIFACT_ROOT / f"{suite_name}-{timestamp()}-{os.getpid()}"
     (run_dir / "logs").mkdir(parents=True, exist_ok=False)
     return run_dir
+
+
+def make_nested_run_dir(parent: Path, name: str) -> Path:
+    run_dir = parent / name
+    (run_dir / "logs").mkdir(parents=True, exist_ok=False)
+    return run_dir
+
+
+def available_suite_names() -> list[str]:
+    return sorted(path.stem for path in SUITES_DIR.glob("*.toml"))
+
+
+def load_python_compat_matrix() -> dict[str, list[dict[str, str]]]:
+    with PYTHON_COMPAT_MATRIX.open("rb") as matrix_file:
+        data = tomllib.load(matrix_file)
+
+    matrix: dict[str, list[dict[str, str]]] = {}
+    seen_names: set[str] = set()
+    for group in ("supported", "unsupported"):
+        entries = data.get(group, [])
+        if not isinstance(entries, list):
+            raise ValueError(f"{PYTHON_COMPAT_MATRIX} field {group} must be a list")
+        normalized_entries: list[dict[str, str]] = []
+        for entry in entries:
+            if not isinstance(entry, dict):
+                raise ValueError(
+                    f"{PYTHON_COMPAT_MATRIX} entry in {group} must be a table"
+                )
+            normalized = {}
+            for key in ("name", "python", "version"):
+                value = entry.get(key)
+                if not isinstance(value, str) or not value.strip():
+                    raise ValueError(
+                        f"{PYTHON_COMPAT_MATRIX} entry in {group} must define {key}"
+                    )
+                normalized[key] = value.strip()
+            if normalized["name"] in seen_names:
+                raise ValueError(
+                    f"{PYTHON_COMPAT_MATRIX} duplicate matrix entry name: "
+                    f"{normalized['name']}"
+                )
+            seen_names.add(normalized["name"])
+            normalized_entries.append(normalized)
+        matrix[group] = normalized_entries
+    return matrix
+
+
+def python_version_for_matrix_entry(entry: dict[str, str]) -> str:
+    command = [
+        entry["python"],
+        "-c",
+        (
+            "import sys; "
+            "print('.'.join(map(str, sys.version_info[:3])))"
+        ),
+    ]
+    completed = subprocess.run(
+        command,
+        check=False,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        text=True,
+    )
+    if completed.returncode != 0:
+        output = (completed.stderr or completed.stdout).strip()
+        detail = f": {output}" if output else ""
+        raise RuntimeError(
+            f"failed to execute Python for matrix entry {entry['name']} "
+            f"({entry['python']}){detail}"
+        )
+    return completed.stdout.strip()
+
+
+def validate_python_compat_matrix(matrix: dict[str, list[dict[str, str]]]) -> None:
+    for group, entries in matrix.items():
+        for entry in entries:
+            actual = python_version_for_matrix_entry(entry)
+            expected = entry["version"]
+            if actual != expected:
+                raise RuntimeError(
+                    f"{PYTHON_COMPAT_MATRIX} entry {group}.{entry['name']} "
+                    f"points to Python {actual}, expected {expected}: "
+                    f"{entry['python']}"
+                )
+
+
+def compat_job_name(suite_name: str, entry: dict[str, str]) -> str:
+    return f"{suite_name}_{entry['name']}"
+
+
+def compat_run_dir_name(suite_name: str, entry: dict[str, str]) -> str:
+    return f"{suite_name}-{entry['name']}"
+
+
+def daily_compat_jobs() -> list[dict[str, str]]:
+    matrix = load_python_compat_matrix()
+    jobs = []
+    for group, suite_name in DAILY_COMPAT_GROUPS:
+        for entry in matrix[group]:
+            jobs.append({"name": compat_job_name(suite_name, entry)})
+    return jobs
 
 
 def first_executable(candidates: list[str], extra_globs: list[str]) -> str | None:
@@ -120,8 +237,39 @@ def first_executable(candidates: list[str], extra_globs: list[str]) -> str | Non
     return None
 
 
+def env_truthy(value: str | None) -> bool:
+    if value is None:
+        return False
+    return value.strip().lower() in {"1", "on", "true", "yes"}
+
+
+def configure_pip_dependencies(env: dict[str, str]) -> None:
+    env.setdefault("PIP_DISABLE_PIP_VERSION_CHECK", "1")
+
+    wheelhouse = env.get("CINDERX_PIP_WHEELHOUSE")
+    if wheelhouse:
+        wheelhouse_path = Path(wheelhouse).expanduser()
+        if not wheelhouse_path.exists():
+            raise FileNotFoundError(
+                f"CINDERX_PIP_WHEELHOUSE does not exist: {wheelhouse_path}"
+            )
+        existing_find_links = env.get("PIP_FIND_LINKS", "").strip()
+        env["PIP_FIND_LINKS"] = (
+            f"{wheelhouse_path} {existing_find_links}".strip()
+        )
+
+    if env_truthy(env.get("CINDERX_PIP_OFFLINE")):
+        if not env.get("PIP_FIND_LINKS"):
+            raise ValueError(
+                "CINDERX_PIP_OFFLINE=1 requires CINDERX_PIP_WHEELHOUSE or "
+                "PIP_FIND_LINKS to be set"
+            )
+        env.setdefault("PIP_NO_INDEX", "1")
+
+
 def configure_toolchain(env: dict[str, str]) -> None:
     env.setdefault("CINDERX_TEST_PYTHON", sys.executable)
+    configure_pip_dependencies(env)
 
     if "CC" not in env:
         cc = first_executable(
@@ -302,6 +450,28 @@ def job_uses_coverage(job: dict[str, Any], suite_coverage: bool) -> bool:
         return False
     default = str(job.get("kind", "command")) == "runtime_tests"
     return bool(job.get("coverage", default))
+
+
+def truthy_env_value(value: object) -> bool:
+    return str(value).strip().lower() in {"1", "true", "yes", "on"}
+
+
+def job_enabled(job: dict[str, Any]) -> bool:
+    enabled_by_env = str(job.get("enabled_by_env", "")).strip()
+    if not enabled_by_env:
+        return True
+
+    job_env = {
+        str(key): str(value)
+        for key, value in job.get("env", {}).items()
+    }
+    return truthy_env_value(
+        job_env.get(enabled_by_env, os.environ.get(enabled_by_env, ""))
+    )
+
+
+def suite_enabled_jobs(suite: dict[str, Any]) -> list[dict[str, Any]]:
+    return [job for job in suite["jobs"] if job_enabled(job)]
 
 
 def clean_stale_runtime_test_builds(run_dir: Path) -> None:
@@ -535,6 +705,28 @@ def relative_to_repo(path: Path) -> str:
         return str(path.relative_to(REPO_ROOT))
     except ValueError:
         return str(path)
+
+
+def aggregate_test_counts(results: list[dict[str, Any]]) -> dict[str, int] | None:
+    totals = {key: 0 for key in COUNT_KEYS}
+    has_test_counts = False
+    for result in results:
+        test_counts = result.get("test_counts")
+        if test_counts:
+            has_test_counts = True
+            for key in totals:
+                totals[key] += test_counts.get(key, 0)
+    return totals if has_test_counts else None
+
+
+def format_test_counts(test_counts: dict[str, int] | None) -> str | None:
+    if not test_counts:
+        return None
+    parts = []
+    for key in COUNT_KEYS:
+        if test_counts[key]:
+            parts.append(f"{test_counts[key]} {key}")
+    return ", ".join(parts) if parts else "0 tests"
 
 
 def parse_lcov_summary_metrics(text: str) -> dict[str, str]:
@@ -889,104 +1081,220 @@ def git_head() -> str | None:
     return completed.stdout.strip()
 
 
-def main(argv: list[str]) -> int:
-    parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("suite", help="suite name, for example: pr")
-    parser.add_argument(
-        "--prelude",
-        help=(
-            "shell snippet to run before each job; overrides the suite prelude. "
-            "Use an empty string to disable it."
-        ),
-    )
-    parser.add_argument(
-        "--list",
-        action="store_true",
-        help="list jobs without running them",
-    )
-    parser.add_argument(
-        "--allow-target-mismatch",
-        action="store_true",
-        help=(
-            "continue even if the current Python/platform does not match the "
-            "suite target"
-        ),
-    )
-    parser.add_argument(
-        "--coverage",
-        action="store_true",
-        help=(
-            "build native C/C++ code with GCC coverage instrumentation and "
-            "write lcov/genhtml reports under the run artifact directory"
-        ),
-    )
-    args = parser.parse_args(argv)
-
-    suite = load_suite(args.suite)
+def check_suite_target(
+    suite_name: str,
+    suite: dict[str, Any],
+    args: argparse.Namespace,
+) -> int:
     target_warnings = check_target(suite.get("target", {}))
     for warning in target_warnings:
-        print(f"warning: {warning}", file=sys.stderr)
-    if target_warnings:
-        if not allow_target_mismatch(args):
-            print(
-                "error: target environment mismatch; pass "
-                "--allow-target-mismatch or set "
-                f"{ALLOW_TARGET_MISMATCH_ENV}=1 to continue",
-                file=sys.stderr,
-            )
-            return 2
-        print("warning: target mismatch override enabled", file=sys.stderr)
-
-    jobs = suite["jobs"]
-    if args.list:
-        for job in jobs:
-            print(job["name"])
+        print(f"warning [{suite_name}]: {warning}", file=sys.stderr)
+    if not target_warnings:
         return 0
+    if allow_target_mismatch(args):
+        print("warning: target mismatch override enabled", file=sys.stderr)
+        return 0
+    print(
+        "error: target environment mismatch; pass "
+        "--allow-target-mismatch or set "
+        f"{ALLOW_TARGET_MISMATCH_ENV}=1 to continue",
+        file=sys.stderr,
+    )
+    return 2
 
-    coverage_tools: dict[str, str] | None = None
-    if args.coverage:
-        try:
-            coverage_tools = coverage_tool_paths()
-        except RuntimeError as exc:
-            print(f"error: {exc}", file=sys.stderr)
-            return 2
 
-    run_dir = make_run_dir(args.suite)
-    print(f"artifact directory: {run_dir}", flush=True)
-    if args.coverage:
-        clean_stale_runtime_test_builds(run_dir)
-        print("coverage: enabled (GCC/gcov + lcov/genhtml)", flush=True)
+def require_daily_compat_wheel() -> str:
+    wheel = os.environ.get("CINDERX_TEST_WHEEL", "").strip()
+    if not wheel:
+        raise RuntimeError(
+            "daily compat fan-out requires CINDERX_TEST_WHEEL to point to the "
+            "compatibility wheel under test"
+        )
+    wheel_path = Path(wheel).expanduser()
+    if not wheel_path.is_file():
+        raise RuntimeError(f"CINDERX_TEST_WHEEL does not exist: {wheel_path}")
+    return str(wheel_path)
 
-    results = []
+
+def suite_prelude(suite: dict[str, Any], args: argparse.Namespace) -> str:
     prelude = str(suite.get("prelude", ""))
     if "CINDERX_TESTGATE_PRELUDE" in os.environ:
         prelude = os.environ["CINDERX_TESTGATE_PRELUDE"]
     if args.prelude is not None:
         prelude = args.prelude
+    return prelude
+
+
+def clone_suite_with_env_overrides(
+    suite: dict[str, Any],
+    env_overrides: dict[str, str],
+) -> dict[str, Any]:
+    cloned_jobs = []
+    for job in suite["jobs"]:
+        cloned_job = dict(job)
+        merged_job_env = {
+            str(key): str(value)
+            for key, value in job.get("env", {}).items()
+        }
+        merged_job_env.update(env_overrides)
+        if merged_job_env:
+            cloned_job["env"] = merged_job_env
+        cloned_jobs.append(cloned_job)
+    cloned_suite = dict(suite)
+    cloned_suite["jobs"] = cloned_jobs
+    return cloned_suite
+
+
+def run_suite_jobs(
+    suite: dict[str, Any],
+    run_dir: Path,
+    args: argparse.Namespace,
+    coverage: bool,
+) -> list[dict[str, Any]]:
+    results = []
+    prelude = suite_prelude(suite, args)
     fail_fast = bool(suite.get("fail_fast", True))
-    for job in jobs:
-        result = run_job(job, run_dir, prelude, job_uses_coverage(job, args.coverage))
+    for job in suite_enabled_jobs(suite):
+        result = run_job(job, run_dir, prelude, job_uses_coverage(job, coverage))
         results.append(result)
         if fail_fast and result["returncode"] != 0:
             break
+    return results
 
-    coverage_result: dict[str, Any] = {"enabled": False}
-    if args.coverage:
-        assert coverage_tools is not None
-        coverage_result = generate_coverage_report(run_dir, coverage_tools)
 
-    summary_path = write_summary(run_dir, args.suite, results, coverage_result)
-    print(f"summary: {summary_path}", flush=True)
+def run_matrix_suite_entry(
+    suite_name: str,
+    suite: dict[str, Any],
+    entry: dict[str, str],
+    root_run_dir: Path,
+    args: argparse.Namespace,
+) -> dict[str, Any]:
+    job_name = compat_job_name(suite_name, entry)
+    started = _datetime.datetime.now().isoformat(timespec="seconds")
+    print(
+        f"[ MATRIX   ] {job_name} ({entry['version']} -> {entry['python']})",
+        flush=True,
+    )
 
-    # Aggregate test-level counts from all jobs that had pytest output
-    totals = {key: 0 for key in COUNT_KEYS}
-    has_test_counts = False
-    for r in results:
-        tc = r.get("test_counts")
-        if tc:
-            has_test_counts = True
-            for key in totals:
-                totals[key] += tc.get(key, 0)
+    env_overrides = {"CINDERX_TEST_WHEEL": os.environ["CINDERX_TEST_WHEEL"]}
+    if suite_name == "wheel_compat":
+        env_overrides["CINDERX_TEST_PYTHON"] = entry["python"]
+    elif suite_name == "wheel_compat_negative":
+        env_overrides["CINDERX_UNSUPPORTED_TEST_PYTHON"] = entry["python"]
+
+    child_run_dir = make_nested_run_dir(root_run_dir, compat_run_dir_name(suite_name, entry))
+    child_suite = clone_suite_with_env_overrides(suite, env_overrides)
+    child_results = run_suite_jobs(child_suite, child_run_dir, args, False)
+    summary_path = write_summary(
+        child_run_dir,
+        job_name,
+        child_results,
+        {"enabled": False},
+    )
+
+    finished = _datetime.datetime.now().isoformat(timespec="seconds")
+    test_counts = aggregate_test_counts(child_results)
+    returncode = 1 if any(result["returncode"] != 0 for result in child_results) else 0
+    marker = "       OK" if returncode == 0 else "  FAILED"
+    counts_str = format_test_counts(test_counts)
+    suffix = f" [{counts_str}]" if counts_str else ""
+    print(f"[{marker} ] {job_name}{suffix} ({summary_path})", flush=True)
+    return {
+        "name": job_name,
+        "status": "passed" if returncode == 0 else "failed",
+        "returncode": returncode,
+        "command": None,
+        "log": relative_to_repo(summary_path),
+        "started": started,
+        "finished": finished,
+        "test_counts": test_counts,
+        "python": entry["python"],
+        "python_version": entry["version"],
+        "child_results": child_results,
+        "child_run_dir": relative_to_repo(child_run_dir),
+    }
+
+
+def run_daily_compat_group(
+    group: str,
+    suite_name: str,
+    entries: list[dict[str, str]],
+    root_run_dir: Path,
+    args: argparse.Namespace,
+) -> list[dict[str, Any]]:
+    if not entries:
+        return []
+
+    suite = load_suite(suite_name)
+    target_status = check_suite_target(suite_name, suite, args)
+    if target_status != 0:
+        return [
+            {
+                "name": compat_job_name(suite_name, entry),
+                "status": "failed",
+                "returncode": target_status,
+                "command": None,
+                "log": f"{suite_name} target mismatch",
+                "started": _datetime.datetime.now().isoformat(timespec="seconds"),
+                "finished": _datetime.datetime.now().isoformat(timespec="seconds"),
+                "test_counts": None,
+                "python": entry["python"],
+                "python_version": entry["version"],
+            }
+            for entry in entries
+        ]
+
+    print(
+        f"[ GROUP    ] {group} -> {suite_name} x {len(entries)}",
+        flush=True,
+    )
+    results_by_name: dict[str, dict[str, Any]] = {}
+    with concurrent.futures.ThreadPoolExecutor(max_workers=len(entries)) as executor:
+        futures = {
+            executor.submit(
+                run_matrix_suite_entry,
+                suite_name,
+                suite,
+                entry,
+                root_run_dir,
+                args,
+            ): entry
+            for entry in entries
+        }
+        for future in concurrent.futures.as_completed(futures):
+            entry = futures[future]
+            job_name = compat_job_name(suite_name, entry)
+            try:
+                results_by_name[job_name] = future.result()
+            except Exception as exc:
+                results_by_name[job_name] = {
+                    "name": job_name,
+                    "status": "failed",
+                    "returncode": 1,
+                    "command": None,
+                    "log": str(exc),
+                    "started": _datetime.datetime.now().isoformat(timespec="seconds"),
+                    "finished": _datetime.datetime.now().isoformat(timespec="seconds"),
+                    "test_counts": None,
+                    "python": entry["python"],
+                    "python_version": entry["version"],
+                }
+
+    return [
+        results_by_name[compat_job_name(suite_name, entry)]
+        for entry in entries
+    ]
+
+
+def print_run_summary(
+    jobs: list[dict[str, Any]],
+    results: list[dict[str, Any]],
+    coverage_result: dict[str, Any],
+) -> int:
+    totals = aggregate_test_counts(results)
+    has_test_counts = totals is not None
+    if totals is None:
+        totals = {key: 0 for key in COUNT_KEYS}
 
     total_jobs = len(jobs)
     ran_jobs = len(results)
@@ -995,10 +1303,24 @@ def main(argv: list[str]) -> int:
     skipped_jobs = total_jobs - ran_jobs
 
     print(f"\n{'=' * 60}", flush=True)
-    print(f"Jobs:  {ran_jobs}/{total_jobs} ran, {passed_jobs} passed, {len(failed)} failed, {skipped_jobs} skipped", flush=True)
+    print(
+        f"Jobs:  {ran_jobs}/{total_jobs} ran, {passed_jobs} passed, "
+        f"{len(failed)} failed, {skipped_jobs} skipped",
+        flush=True,
+    )
     if has_test_counts:
-        total_tests = totals["passed"] + totals["failed"] + totals["error"] + totals["skipped"]
-        print(f"Tests: {total_tests} collected, {totals['passed']} passed, {totals['failed']} failed, {totals['error']} error, {totals['skipped']} skipped, {totals['deselected']} deselected", flush=True)
+        total_tests = (
+            totals["passed"]
+            + totals["failed"]
+            + totals["error"]
+            + totals["skipped"]
+        )
+        print(
+            f"Tests: {total_tests} collected, {totals['passed']} passed, "
+            f"{totals['failed']} failed, {totals['error']} error, "
+            f"{totals['skipped']} skipped, {totals['deselected']} deselected",
+            flush=True,
+        )
     if coverage_result.get("enabled"):
         print("Coverage:", flush=True)
         print("", flush=True)
@@ -1037,6 +1359,195 @@ def main(argv: list[str]) -> int:
         return 1
 
     return 0
+
+
+def run_suite_command(
+    suite_name: str,
+    args: argparse.Namespace,
+) -> int:
+    suite = load_suite(suite_name)
+    target_status = check_suite_target(suite_name, suite, args)
+    if target_status != 0:
+        return target_status
+
+    jobs = suite_enabled_jobs(suite)
+    if args.list:
+        for job in jobs:
+            print(job["name"])
+        return 0
+
+    coverage_tools: dict[str, str] | None = None
+    if args.coverage:
+        try:
+            coverage_tools = coverage_tool_paths()
+        except RuntimeError as exc:
+            print(f"error: {exc}", file=sys.stderr)
+            return 2
+
+    run_dir = make_run_dir(suite_name)
+    print(f"artifact directory: {run_dir}", flush=True)
+    if args.coverage:
+        clean_stale_runtime_test_builds(run_dir)
+        print("coverage: enabled (GCC/gcov + lcov/genhtml)", flush=True)
+
+    results = run_suite_jobs(suite, run_dir, args, args.coverage)
+
+    coverage_result: dict[str, Any] = {"enabled": False}
+    if args.coverage:
+        assert coverage_tools is not None
+        coverage_result = generate_coverage_report(run_dir, coverage_tools)
+
+    summary_path = write_summary(run_dir, suite_name, results, coverage_result)
+    print(f"summary: {summary_path}", flush=True)
+    return print_run_summary(jobs, results, coverage_result)
+
+
+def run_pipeline_command(
+    pipeline_name: str,
+    args: argparse.Namespace,
+) -> int:
+    pipeline = PIPELINES[pipeline_name]
+    loaded_suites: list[tuple[str, bool, dict[str, Any]]] = []
+    for suite_invocation in pipeline:
+        suite_name = suite_invocation[0]
+        pass_coverage = bool(suite_invocation[1])
+        env_overrides = suite_invocation[2] if len(suite_invocation) > 2 else {}
+        suite = load_suite(suite_name)
+        target_status = check_suite_target(suite_name, suite, args)
+        if target_status != 0:
+            return target_status
+        if env_overrides:
+            suite = clone_suite_with_env_overrides(suite, env_overrides)
+        loaded_suites.append((suite_name, pass_coverage, suite))
+
+    jobs = [
+        job
+        for _, _, suite in loaded_suites
+        for job in suite_enabled_jobs(suite)
+    ]
+    if pipeline_name == "daily":
+        jobs.extend(daily_compat_jobs())
+    if args.list:
+        for job in jobs:
+            print(job["name"])
+        return 0
+
+    coverage_tools: dict[str, str] | None = None
+    if args.coverage:
+        try:
+            coverage_tools = coverage_tool_paths()
+        except RuntimeError as exc:
+            print(f"error: {exc}", file=sys.stderr)
+            return 2
+
+    run_dir = make_run_dir(pipeline_name)
+    print(f"artifact directory: {run_dir}", flush=True)
+    if args.coverage:
+        clean_stale_runtime_test_builds(run_dir)
+        print("coverage: enabled (GCC/gcov + lcov/genhtml)", flush=True)
+
+    results: list[dict[str, Any]] = []
+    coverage_result: dict[str, Any] = {"enabled": False}
+    for _, pass_coverage, suite in loaded_suites:
+        suite_coverage = args.coverage and pass_coverage
+        suite_results = run_suite_jobs(
+            suite,
+            run_dir,
+            args,
+            suite_coverage,
+        )
+        results.extend(suite_results)
+        if any(result["returncode"] != 0 for result in suite_results):
+            break
+        if suite_coverage:
+            assert coverage_tools is not None
+            coverage_result = generate_coverage_report(run_dir, coverage_tools)
+            if coverage_result.get("status") == "failed":
+                break
+
+    if (
+        pipeline_name == "daily"
+        and not any(result["returncode"] != 0 for result in results)
+        and coverage_result.get("status") != "failed"
+    ):
+        try:
+            require_daily_compat_wheel()
+            matrix = load_python_compat_matrix()
+            validate_python_compat_matrix(matrix)
+        except (RuntimeError, OSError, ValueError) as exc:
+            print(f"error: {exc}", file=sys.stderr)
+            return 2
+
+        for group, suite_name in DAILY_COMPAT_GROUPS:
+            results.extend(
+                run_daily_compat_group(
+                    group,
+                    suite_name,
+                    matrix[group],
+                    run_dir,
+                    args,
+                )
+            )
+
+    summary_path = write_summary(run_dir, pipeline_name, results, coverage_result)
+    print(f"summary: {summary_path}", flush=True)
+    return print_run_summary(jobs, results, coverage_result)
+
+
+def main(argv: list[str]) -> int:
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument(
+        "pipeline",
+        nargs="?",
+        choices=sorted(PIPELINES),
+        help="pipeline name, for example: pr",
+    )
+    parser.add_argument(
+        "--suite",
+        help="run a single suite by name, for example: runtime",
+    )
+    parser.add_argument(
+        "--prelude",
+        help=(
+            "shell snippet to run before each job; overrides the suite prelude. "
+            "Use an empty string to disable it."
+        ),
+    )
+    parser.add_argument(
+        "--list",
+        action="store_true",
+        help="list jobs without running them",
+    )
+    parser.add_argument(
+        "--allow-target-mismatch",
+        action="store_true",
+        help=(
+            "continue even if the current Python/platform does not match the "
+            "suite target"
+        ),
+    )
+    parser.add_argument(
+        "--coverage",
+        action="store_true",
+        help=(
+            "build native C/C++ code with GCC coverage instrumentation and "
+            "write lcov/genhtml reports under the run artifact directory"
+        ),
+    )
+    args = parser.parse_args(argv)
+
+    if bool(args.pipeline) == bool(args.suite):
+        parser.error("pass exactly one of a pipeline name or --suite")
+
+    try:
+        if args.suite:
+            if args.suite == "daily":
+                parser.error("daily is pipeline-only; use `ci_pipeline/run_gate.py daily`")
+            return run_suite_command(args.suite, args)
+        return run_pipeline_command(args.pipeline, args)
+    except (FileNotFoundError, ValueError, OSError) as exc:
+        print(f"error: {exc}", file=sys.stderr)
+        return 2
 
 
 if __name__ == "__main__":
