@@ -20,6 +20,7 @@
 | 日期 | 版本 | 修改描述 |
 | ---- | ---- | -------- |
 | 2026-05-21 | V1.0 | 初始版本，依据 `hot-loop-osr-function-design.md` 的功能项 2 拆分 OSR 编译详细设计 |
+| 2026-05-21 | V1.1 | 根据 OSR 编译详细设计评审修订：拆分 `osr_aware`/`has_osr_entries` 缓存语义，统一 live-in steal 所有权模型，明确 `OSREntry` metadata anchor 语义，允许空 live-in entry，收敛 codegen 责任边界 |
 
 ## 1.4 Keywords 关键词
 
@@ -27,7 +28,7 @@ OSR, On-Stack Replacement, JIT, HIR, LIR, Loop Header, Secondary Entry, FrameSta
 
 ## 1.5 Abstract 摘要
 
-本文档描述 CinderX JIT 热循环 OSR 能力中的 **OSR 编译模块**。该模块在热循环被检测到后，为热循环所在函数生成普通函数入口和 loop-header secondary entry 共存的 JIT 编译产物。模块复用现有 `Preloader -> Compiler::Compile -> HIR -> LIR -> regalloc -> NativeGenerator` 编译管线，通过 `Preloader` 传递 OSR 入口偏移，在 HIR loop header 处插入 OSR entry 锚点，提取可从解释器帧恢复的 live-in 集合，并在寄存器分配后生成 per-backedge OSR entry stub 和 `OSRMetadata`。OSR 编译模块不负责解释器回边计数，也不负责运行时帧迁移；它向 OSR 进入模块交付 `CompiledFunction`、`OSRMetadata[]` 和 `has_osr_entries` 标志。
+本文档描述 CinderX JIT 热循环 OSR 能力中的 **OSR 编译模块**。该模块在热循环被检测到后，为热循环所在函数生成普通函数入口和 loop-header secondary entry 共存的 JIT 编译产物。模块复用现有 `Preloader -> Compiler::Compile -> HIR -> LIR -> regalloc -> NativeGenerator` 编译管线，通过 `Preloader` 传递 OSR 入口偏移，在 HIR loop header 处插入 OSR entry 锚点，提取可从解释器帧恢复的 live-in 集合，并在寄存器分配后生成 per-backedge OSR entry stub 和 `OSRMetadata`。OSR 编译模块不负责解释器回边计数，也不负责运行时帧迁移；它向 OSR 进入模块交付 `CompiledFunction`、`OSRMetadata[]`、`osr_aware` 和 `has_osr_entries` 标志。
 
 ## 1.6 List of abbreviations 缩略语清单
 
@@ -73,6 +74,17 @@ OSR, On-Stack Replacement, JIT, HIR, LIR, Loop Header, Secondary Entry, FrameSta
 | stub 生成 | 生成 per-backedge OSR entry stub 的机器码，并记录 entry point offset |
 | 缓存策略 | 标识 OSR-aware 编译产物，避免旧缓存和不可进入回边导致重复编译 |
 
+本模块拥有以下文件级实现边界，供三人并行开发时划分职责：
+
+| 文件/区域 | 本模块职责 |
+| --------- | ---------- |
+| `cinderx/Jit/lir/generator.cpp` | HIR `OSREntry` 到 LIR `kOSREntry` pseudo instruction 的转换 |
+| `cinderx/Jit/lir/regalloc.cpp` | OSR stub scratch register 从 regalloc 可分配集合中排除 |
+| `cinderx/Jit/codegen/autogen.cpp` 或 `gen_asm.cpp` | post-regalloc `PhyLocation` 回填 |
+| `cinderx/Jit/codegen/gen_asm.cpp` | OSR entry stub 机器码生成与 `entry_point_offset` 写入 |
+
+功能项 3 只消费 stub ABI，负责 `performOSR` 运行时调用、非 live-in 清理、帧所有权和三态返回处理，不重复实现 codegen。
+
 本模块不负责：
 
 | 非职责 | 所属功能项 |
@@ -88,7 +100,7 @@ OSR, On-Stack Replacement, JIT, HIR, LIR, Loop Header, Secondary Entry, FrameSta
 2. **不改变 `Compiler::Compile()` 对外签名**：OSR 信息放入 `hir::Preloader`。
 3. **复用 deopt 元数据思想**：deopt 是 `JIT -> 解释器`，OSR 编译元数据描述反向的 `解释器 -> JIT`。
 4. **保守拒绝**：无法从 `FrameState` 安全恢复的 live-in 直接拒绝该 entry。
-5. **正常 JIT 行为兼容**：非 OSR 场景下 `Preloader::osrEntryTargetOffsets()` 为空，编译行为保持不变。
+5. **正常 JIT 行为兼容**：非 aarch64 或无回边函数的 `Preloader::osrEntryTargetOffsets()` 为空。aarch64 上，正常函数级 JIT 也可以是 OSR-aware：只要函数包含回边，`Preloader::makePreloader()` 默认注入回边目标；运行时 `Config::osr_enabled` / `osr_capable` 只控制是否计数和进入 OSR，不决定编译产物是否携带 OSR metadata。
 
 # 2. 上游文档引用
 
@@ -129,7 +141,7 @@ flowchart TD
     K --> L["extractOSRLiveIns"]
     L --> M["LIR + regalloc"]
     M --> N["NativeGenerator 生成 stub + OSRMetadata"]
-    N --> O["codeCompiled + has_osr_entries"]
+    N --> O["codeCompiled + osr_aware / has_osr_entries"]
     O --> D
 ```
 
@@ -149,7 +161,7 @@ OSR 编译需要三个插入点：
 
 | 插入点 | 位置 | 新增动作 |
 | ------ | ---- | -------- |
-| HIR 构建后、pass 前 | `compiler.cpp` 中 `buildHIR` 后 | `irfunc->markOSREntries(preloader.osrEntryTargetOffsets())` |
+| HIR 构建后、pass 前 | `compiler.cpp` 中 `buildHIR` 后 | `irfunc->markOSREntries(preloader.osrEntryTargetOffsets(), preloader.code())` |
 | refcount pass 后、LIR 前 | `runPasses` 后 | `irfunc->extractOSRLiveIns()`，得到稳定 live-in HIR register 列表 |
 | regalloc 后、机器码生成时 | `NativeGenerator::generateCode()` 附近 | 回填 `PhyLocation`，生成 OSR entry stub |
 
@@ -261,6 +273,12 @@ Result compileFunctionWithOSR(BorrowedRef<PyFunctionObject> func);
 Result compileFunctionWithOSR(BorrowedRef<PyFunctionObject> func) {
   JIT_CHECK(PyFunction_Check(func), "OSR only supports function frames");
 
+  auto clear_osr_exception = [] {
+    if (PyErr_Occurred()) {
+      PyErr_Clear();
+    }
+  };
+
   BorrowedRef<PyCodeObject> pinned_code{func->func_code};
 
   hir::IsolatedPreloaders ip;
@@ -268,15 +286,20 @@ Result compileFunctionWithOSR(BorrowedRef<PyFunctionObject> func) {
 
   hir::Preloader* preloader = preload(func);
   if (preloader == nullptr) {
-    PyErr_Clear();
+    clear_osr_exception();
     return Result::CANNOT_SPECIALIZE;
   }
 
   if (func->func_code != pinned_code) {
+    clear_osr_exception();
     return Result::CANNOT_SPECIALIZE;
   }
 
-  return compilePreloader(*preloader, func);
+  Result result = compilePreloader(*preloader, func);
+  if (result != Result::OK) {
+    clear_osr_exception();
+  }
+  return result;
 }
 ```
 
@@ -284,8 +307,10 @@ Result compileFunctionWithOSR(BorrowedRef<PyFunctionObject> func) {
 
 1. `preload(func)` 可能执行 Python 代码，所以必须 pin `func->func_code` 并在 preload 后 revalidate。
 2. OSR 从字节码处理程序触发，失败时应透明回退解释器；preload 失败产生的异常要清掉。
-3. 使用 `IsolatedPreloaders`，与 `compile_func()` 隔离递归 preload 状态的做法一致。
-4. 不单独传入某个 backedge offset。`Preloader::makePreloader()` 已收集该 code 的所有 OSR entry 目标。
+3. `compilePreloader()` / `compilePreloaderImpl()` 返回非 `OK` 时，如果存在 pending exception，也必须清除。OSR 触发点不是用户语义异常点，任何 preload、finalize 或编译失败都只能导致回退解释器。
+4. 使用 `IsolatedPreloaders`，与 `compile_func()` 隔离递归 preload 状态的做法一致。
+5. 不单独传入某个 backedge offset。`Preloader::makePreloader()` 已收集该 code 的所有 OSR entry 目标。
+6. OSR 编译入口只保证当前触发函数的 OSR-aware 编译；不会额外主动编译静态 callee。该限制只影响直接调用优化，不影响 OSR 正确性。
 
 ### 3.2.4 编译调度：`Ci_OSR_TryOSR` 中与编译相关的部分
 
@@ -335,7 +360,7 @@ cache_lookup:
     if (osr_meta != nullptr) {
       return performOSR(...);  // 功能项 3
     }
-    if (compiled->hasOSREntries()) {
+    if (compiled->osrAware()) {
       markFailedPermanentPerCode(counters, source_idx);
       return 0;
     }
@@ -366,6 +391,14 @@ cache_lookup:
 }
 ```
 
+缓存命中时必须按两个标志区分三种情况：
+
+| 编译产物状态 | 含义 | 运行时处理 |
+| ------------ | ---- | ---------- |
+| `osr_aware == false` | 旧缓存或非 OSR-aware 产物 | `uncompile(func)` 后重编译 |
+| `osr_aware == true && has_osr_entries == false` | 本次编译已尝试 OSR，但所有 entry 都被拒绝 | 标记当前 `source_index` 为 per-code `FailedPermanent`，不再重编译 |
+| `osr_aware == true && has_osr_entries == true` | 产物包含至少一个 OSR entry | 按 `target_offset` 查找 metadata；找不到目标 entry 时标记当前回边 `FailedPermanent` |
+
 ### 3.2.5 `Compiler::Compile()` 内部处理
 
 在 `hir::buildHIR(preloader)` 后、`runPasses` 前插入 OSR 标注：
@@ -375,7 +408,7 @@ std::unique_ptr<hir::Function> irfunc(hir::buildHIR(preloader));
 irfunc->reifier = ThreadedRef<>::create(preloader.reifier());
 
 if (!preloader.osrEntryTargetOffsets().empty()) {
-  irfunc->markOSREntries(preloader.osrEntryTargetOffsets());
+  irfunc->markOSREntries(preloader.osrEntryTargetOffsets(), preloader.code());
 }
 
 Compiler::runPasses(*irfunc, config);
@@ -411,12 +444,22 @@ class OSREntry : public DeoptBase {
 };
 ```
 
+`OSREntry` 是编译期 metadata anchor，不新增 HIR CFG 外部前驱，不改变普通函数入口或普通 JIT loop backedge 的控制流。它必须满足以下约束：
+
+1. 插入在 loop header block 的 `Snapshot` 之后，便于 `bindGuards()` 绑定 `FrameState`。
+2. 经 LIR 时降为 `kOSREntry` pseudo instruction。
+3. 不生成普通机器指令。
+4. 不作为 `DeoptReason`，不触发 deopt patcher。
+5. 不改变 DCE、CleanCFG 对正常控制流的判断。
+
 新增 `hir::Function` 字段和方法：
 
 ```cpp
 class Function {
  public:
-  void markOSREntries(const std::vector<BCOffset>& offsets);
+  void markOSREntries(
+      const std::vector<BCOffset>& offsets,
+      BorrowedRef<PyCodeObject> code);
   bool isOSREntry(const BasicBlock* block) const;
   bool hasOSREntries() const;
   void extractOSRLiveIns();
@@ -429,7 +472,9 @@ class Function {
 `markOSREntries()` 流程：
 
 ```cpp
-void Function::markOSREntries(const std::vector<BCOffset>& offsets) {
+void Function::markOSREntries(
+    const std::vector<BCOffset>& offsets,
+    BorrowedRef<PyCodeObject> code) {
   auto wanted = UnorderedSet<BCOffset>{offsets.begin(), offsets.end()};
 
   for (BasicBlock& block : cfg.blocks) {
@@ -444,7 +489,7 @@ void Function::markOSREntries(const std::vector<BCOffset>& offsets) {
       continue;
     }
 
-    if (!isEligibleOSREntry(*fs)) {
+    if (!isEligibleOSREntry(*fs, code)) {
       continue;
     }
 
@@ -465,6 +510,20 @@ void Function::markOSREntries(const std::vector<BCOffset>& offsets) {
 | `FrameState::block_stack` | 非空 | MVP 不恢复块栈状态 |
 | 已有 entry | 同一 offset 已标注 | 去重，避免重复 stub |
 
+异常保护区检查使用独立 helper，放在 `hir/function.cpp` 或 `osr.cpp` 中均可，但调用方必须以 `BCOffset` 为单位：
+
+```cpp
+bool isInExceptionProtectedRange(
+    BorrowedRef<PyCodeObject> code,
+    BCOffset target_offset);
+
+bool Function::isEligibleOSREntry(
+    const FrameState& fs,
+    BorrowedRef<PyCodeObject> code);
+```
+
+该 helper 解析 `co_exceptiontable` 的 protected range，覆盖 `[start_offset, start_offset + size)`，并在 `target_offset` 落入任一 protected range 时拒绝该 entry。
+
 OSREntry 插入位置必须在 loop header block 的 `Snapshot` 之后。`bindGuards()` 会用最近的 `Snapshot` 给 deopt-like 指令绑定 `FrameState`，然后删除 `Snapshot`。因此需要扩展 `bindGuards()` 的条件，使 `OSREntry` 也获得 `FrameState`：
 
 ```cpp
@@ -482,6 +541,8 @@ live-in 是从解释器帧切入 JIT loop header 时，JIT 代码马上需要读
 1. HIR/SSA 认为该 register 在 OSR entry 处活跃。
 2. 该 register 能从解释器帧 `localsplus[]` 中找到源 slot。
 3. 值类型和引用所有权可以安全转移。
+
+live-in 所有权契约：MVP 只允许 `RefKind::kOwned`。OSR stub 从 `F->localsplus[i]` 读取 `_PyStackRef.bits`、写 `PyStackRef_NULL` 到源 slot 后，源 slot 持有的解释器强引用被转移给 JIT destination。也就是说，destination 在进入 loop header 第一条 JIT 指令前已经按 `kOwned` 处理。OSR 边界本身不额外 `INCREF`。如果未来改为 borrowed + `INCREF` 模式，必须新增独立 ownership 字段，并重新设计 performOSR/stub 对被清空源 slot 原始强引用的处理，否则会泄漏。
 
 算法：
 
@@ -517,7 +578,7 @@ void Function::extractOSRLiveIns() {
       live_ins.push_back(live_in);
     }
 
-    if (!rejected && !live_ins.empty()) {
+    if (!rejected) {
       addOSRMetadataSkeleton(target_offset, std::move(live_ins));
     }
   }
@@ -547,7 +608,7 @@ MVP 拒绝条件：
 | `FrameState::stack` 非空 | 拒绝 entry |
 | `FrameState::parent != nullptr` | 拒绝 entry |
 
-注意：被拒绝的 entry 不应生成空 `OSRMetadata`。否则运行时可能找到一个 entry，但 stub 无 live-in 初始化，导致 JIT body 读取未初始化寄存器。
+注意：被拒绝的 entry 不应生成 `OSRMetadata`。空 live-in 与拒绝不同：如果 loop header 没有需要从 `localsplus[]` 恢复的 live-in，仍然生成 `OSRMetadata` 和 stub；stub 只建立 native 栈、设置 Environ VReg，然后跳到 loop header。
 
 ### 3.2.8 LIR、regalloc 与 `PhyLocation` 回填
 
@@ -572,6 +633,7 @@ flowchart LR
 2. `kOSREntry` 不生成正常机器指令，只用于保留 operand 和 metadata 关联。
 3. regalloc 后调用 `fillOSRLiveInLocations()`，读取每个 operand 的 `getPhyRegOrStackSlot()`，写回 `OSRMetadata.live_ins[i].destination`。
 4. `tstate_location`、`func_location`、`frame_location` 也需要在 regalloc 后从 `env_.asm_tstate`、`env_.asm_func`、`env_.asm_interpreter_frame` 的分配结果回填。
+5. aarch64 OSR 编译时，stub 使用的 scratch registers 必须在 regalloc 阶段排除。实现方式是在 `markDisallowedRegisters()` 中增加 `extra_disallowed` 参数，OSR-aware 编译传入 `OSR_STUB_SCRATCH_REGS`，保证 Environ VReg 和 live-in destination 不会被分配到 stub 临时寄存器。
 
 ### 3.2.9 OSR entry stub 生成
 
@@ -634,11 +696,13 @@ stub 禁止执行 C helper 调用和 `DECREF`。原因是 caller-saved 寄存器
 现有 `CompilationKey` 只包含 `(code, builtins, globals)`。如果一个函数先被普通函数级 JIT 编译，后续 OSR 触发时会命中旧缓存。为避免 “旧缓存没有 OSR entry”：
 
 1. aarch64 上 `Preloader::makePreloader()` 默认注入所有回边目标。
-2. 新编译产物设置 `CompiledFunctionData::has_osr_entries`。
+2. 新编译产物同时设置 `CompiledFunctionData::osr_aware` 和 `CompiledFunctionData::has_osr_entries`。
 3. `Ci_OSR_TryOSR()` 命中缓存时：
    - 若找到目标 `OSRMetadata`，直接交给功能项 3。
-   - 若 `has_osr_entries == true` 但找不到目标，说明该回边被编译期拒绝，标记 per-code `FailedPermanent`。
-   - 若 `has_osr_entries == false`，说明是旧缓存，执行 `uncompile(func)` 后重编译。
+   - 若 `osr_aware == true` 但找不到目标，说明该回边在 OSR-aware 编译中被拒绝，标记 per-code `FailedPermanent`。
+   - 若 `osr_aware == false`，说明是旧缓存或非 OSR-aware 产物，执行 `uncompile(func)` 后重编译。
+
+`has_osr_entries` 不能单独用于区分旧缓存和已拒绝 entry。OSR-aware 编译可能尝试了所有回边但因异常保护区、非 `kOwned` live-in、非空栈等原因生成 0 个 stub，此时 `has_osr_entries == false` 但不能再重编译。
 
 ### 3.2.11 编译预算
 
@@ -730,7 +794,10 @@ struct OSRLiveIn {
 | `value_kind` | live-in 值类型，MVP 仅接受 `kObject` |
 | `ref_kind` | 引用所有权，MVP 仅接受 `kOwned` |
 | `reconstructible` | 是否可从解释器帧恢复 |
+| `is_phi` | 是否来自 loop header phi 输出，用于 debug 和 dump |
 | `hir_reg` | 与 LIR operand 关联的 HIR register，编译结束后不再使用 |
+
+`ref_kind == kOwned` 表示 stub steal 后 `destination` 接收解释器源 slot 的强引用所有权。OSR 边界不额外 `INCREF`。
 
 #### 3.4.1.2 `OSRMetadata`
 
@@ -782,6 +849,7 @@ class CodeRuntime {
 ```cpp
 struct CompiledFunctionData {
   ...
+  bool osr_aware{false};
   bool has_osr_entries{false};
 };
 ```
@@ -789,14 +857,23 @@ struct CompiledFunctionData {
 `Compiler::Compile()` 组装 `CompiledFunctionData` 时设置：
 
 ```cpp
+compiled_data.osr_aware = !preloader.osrEntryTargetOffsets().empty();
 compiled_data.has_osr_entries = code_runtime->hasOSREntries();
 ```
 
 `CompiledFunction` 应提供只读访问器：
 
 ```cpp
+bool osrAware() const;
 bool hasOSREntries() const;
 ```
+
+字段语义：
+
+| 字段 | 含义 | 用途 |
+| ---- | ---- | ---- |
+| `osr_aware` | 本次编译是否尝试过 OSR entry 生成 | 区分旧缓存与 OSR-aware 但全部 entry 被拒绝的产物 |
+| `has_osr_entries` | 是否实际生成了至少一个 OSR entry stub | 快速判断当前产物是否携带可查询的 `OSRMetadata` |
 
 #### 3.4.1.5 `OSRCompileState`
 
@@ -861,6 +938,17 @@ const OSRMetadata* getOSREntry(
 bool osrCompileBudgetCheck(BorrowedRef<PyCodeObject> code);
 ```
 
+`getOSREntry()` 的边界转换必须显式完成，避免 code-unit 索引与字节偏移混用：
+
+```cpp
+const OSRMetadata* getOSREntry(
+    BorrowedRef<CompiledFunction> compiled,
+    BCIndex target_index) {
+  BCOffset target_offset = target_index.asOffset();
+  // 遍历 compiled->runtime()->osrMetadatas()，按 meta.target_offset 匹配。
+}
+```
+
 ```cpp
 // cinderx/Jit/hir/preload.h
 const std::vector<BCOffset>& Preloader::osrEntryTargetOffsets() const;
@@ -869,7 +957,9 @@ void Preloader::setOSREntryTargetOffsets(std::vector<BCOffset> offsets);
 
 ```cpp
 // cinderx/Jit/hir/function.h
-void Function::markOSREntries(const std::vector<BCOffset>& offsets);
+void Function::markOSREntries(
+    const std::vector<BCOffset>& offsets,
+    BorrowedRef<PyCodeObject> code);
 bool Function::hasOSREntries() const;
 void Function::extractOSRLiveIns();
 ```
@@ -912,10 +1002,12 @@ void* OSRMetadata::entryPoint(const CompiledFunction& cf) const;
 | `cinderx/Jit/hir/refcount_insertion.cpp` | `bindGuards()` 支持 `OSREntry` |
 | `cinderx/Jit/lir/instruction.*` | 增加 `kOSREntry` pseudo instruction |
 | `cinderx/Jit/lir/generator.cpp` | HIR `OSREntry` 到 LIR `kOSREntry` 的转换 |
+| `cinderx/Jit/lir/regalloc.cpp` | OSR-aware 编译时将 stub scratch registers 加入 disallowed 集合 |
+| `cinderx/Jit/codegen/arch/aarch64.h` | 定义 aarch64 `OSR_STUB_SCRATCH_REGS` |
 | `cinderx/Jit/codegen/autogen.cpp` | 回填 OSR live-in 的 post-regalloc location |
 | `cinderx/Jit/codegen/gen_asm.h/.cpp` | 生成 OSR entry stub，记录 `entry_point_offset` |
 | `cinderx/Jit/code_runtime.h/.cpp` | 存储 OSR metadata |
-| `cinderx/Jit/compiled_function.h/.cpp` | 增加 `has_osr_entries` |
+| `cinderx/Jit/compiled_function.h/.cpp` | 增加 `osr_aware` 与 `has_osr_entries` |
 
 ### 3.6.2 HIR verifier 和 printer
 
@@ -930,12 +1022,14 @@ void* OSRMetadata::entryPoint(const CompiledFunction& cf) const;
 | 测试层级 | 用例 |
 | -------- | ---- |
 | 单元测试 | `collectBackedgeTargetOffsets()` 处理 while、for、EXTENDED_ARG、重复目标 |
-| HIR 测试 | loop header 处插入 `OSREntry`；异常保护区 entry 被拒绝 |
-| metadata 测试 | `FrameState.localsplus` 可反查时生成 `OSRLiveIn`；borrowed/primitive/无源 slot 被拒绝 |
+| HIR 测试 | loop header 处插入 `OSREntry`；异常保护区 entry 被拒绝；`OSREntry` 不新增外部 CFG 前驱 |
+| 异常表测试 | loop header 在 `try` protected range 内、等于 protected range end、多条 exception table entry 的解析 |
+| metadata 测试 | `FrameState.localsplus` 可反查时生成 `OSRLiveIn`；borrowed/primitive/无源 slot 被拒绝；空 live-in entry 仍生成 metadata 和 stub |
 | LIR/regalloc 测试 | `kOSREntry` operand 经 regalloc 后回填到 `PhyLocation` |
-| codegen 测试 | aarch64 stub 包含 setup frame、Environ VReg 设置、live-in steal、branch loop header |
+| codegen 测试 | aarch64 stub 包含 setup frame、Environ VReg 设置、live-in steal、branch loop header；stub scratch registers 不会被分配给 Environ VReg 或 live-in destination |
 | 集成测试 | 热 while 循环触发 OSR 后结果与解释器一致 |
-| 回归测试 | 普通函数级 JIT 编译不含回边函数行为不变 |
+| 缓存测试 | `osr_aware=false` 旧缓存触发 uncompile + 重编译；`osr_aware=true && has_osr_entries=false` 标记回边 `FailedPermanent`，不重复重编译 |
+| 回归测试 | 普通函数级 JIT 编译不含回边函数行为不变；aarch64 有回边函数正常编译为 OSR-aware 产物但 OSR 关闭时不进入 OSR |
 
 # 4. DFX分析
 
@@ -943,9 +1037,10 @@ void* OSRMetadata::entryPoint(const CompiledFunction& cf) const;
 
 | 风险 | 影响 | 缓解 |
 | ---- | ---- | ---- |
-| 生成 entry 但 live-in 不完整 | JIT 读取未初始化值 | `allReconstructible()` 不通过则不生成 metadata |
+| 生成 entry 但 live-in 不完整 | JIT 读取未初始化值 | `allReconstructible()` 不通过则拒绝该 entry，不生成 metadata；空 live-in entry 是合法 entry |
 | `FrameState` 与 loop header 不匹配 | 从错误字节码位置进入 | 使用 `BCOffset` 匹配 `FrameState::instrOffset()`，保留 debug assert |
-| 旧缓存无 OSR entry | OSR 永远无法进入或无限重编译 | `has_osr_entries` 区分旧缓存和已拒绝 entry |
+| 旧缓存无 OSR entry | OSR 永远无法进入或无限重编译 | `osr_aware` 区分旧缓存和 OSR-aware 但全部 entry 被拒绝的产物，`has_osr_entries` 仅表示是否实际生成 stub |
+| live-in ownership 解释不一致 | 引用泄漏或 double-free | MVP 统一使用 stub steal 语义：源 slot 写 `PyStackRef_NULL` 后，解释器强引用转移为 JIT owned destination，OSR 边界不额外 `INCREF` |
 | preload 执行 Python 代码导致 code 改变 | 编译产物与运行帧不一致 | pin `func->func_code` 并 revalidate |
 | 编译重入 | 状态机重复编译或死循环 | `OSRCompileState::Compiling` 防重入，`ALREADY_SCHEDULED` 回 Idle |
 | stub 栈布局与正常 JIT 不一致 | deopt/epilogue 读取错误位置 | stub 使用 `FrameInfo` 同源字段：total size、header/spill、saved regs |
