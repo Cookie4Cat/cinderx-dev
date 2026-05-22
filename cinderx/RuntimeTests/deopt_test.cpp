@@ -815,3 +815,103 @@ TEST_F(DeoptTest, ValueKind) {
   EXPECT_EQ(deoptValueKind(TLong), ValueKind::kObject);
   EXPECT_EQ(deoptValueKind(TNullptr), ValueKind::kObject);
 }
+
+// test_520 deopt value coverage
+class DeoptValueKindTest : public RuntimeTest {};
+
+TEST_F(DeoptValueKindTest, BoolType) {
+  auto kind = jit::deoptValueKind(jit::hir::TCBool);
+  EXPECT_EQ(kind, jit::hir::ValueKind::kBool);
+}
+
+TEST_F(DeoptValueKindTest, DoubleType) {
+  auto kind = jit::deoptValueKind(jit::hir::TCDouble);
+  EXPECT_EQ(kind, jit::hir::ValueKind::kDouble);
+}
+
+TEST_F(DeoptValueKindTest, ObjectType) {
+  auto kind = jit::deoptValueKind(jit::hir::TObject);
+  EXPECT_EQ(kind, jit::hir::ValueKind::kObject);
+}
+
+TEST_F(DeoptValueKindTest, LongType) {
+  auto kind = jit::deoptValueKind(jit::hir::TLong);
+  EXPECT_EQ(kind, jit::hir::ValueKind::kObject);
+}
+
+TEST_F(DeoptValueKindTest, OptObjectType) {
+  auto kind = jit::deoptValueKind(jit::hir::TOptObject);
+  EXPECT_EQ(kind, jit::hir::ValueKind::kObject);
+}
+
+TEST_F(DeoptValueKindTest, UnicodeType) {
+  auto kind = jit::deoptValueKind(jit::hir::TUnicode);
+  EXPECT_EQ(kind, jit::hir::ValueKind::kObject);
+}
+
+TEST_F(DeoptValueKindTest, BytesType) {
+  auto kind = jit::deoptValueKind(jit::hir::TBytes);
+  EXPECT_EQ(kind, jit::hir::ValueKind::kObject);
+}
+
+TEST_F(DeoptValueKindTest, NoneType) {
+  auto kind = jit::deoptValueKind(jit::hir::TNoneType);
+  EXPECT_EQ(kind, jit::hir::ValueKind::kObject);
+}
+
+class DeoptReasonNameTest : public RuntimeTest {};
+
+TEST_F(DeoptReasonNameTest, GuardFailure) {
+  const char* name = jit::deoptReasonName(jit::DeoptReason::kGuardFailure);
+  EXPECT_STREQ(name, "GuardFailure");
+}
+
+TEST_F(DeoptReasonNameTest, YieldFrom) {
+  const char* name = jit::deoptReasonName(jit::DeoptReason::kYieldFrom);
+  EXPECT_STREQ(name, "YieldFrom");
+}
+
+TEST_F(DeoptReasonNameTest, Raise) {
+  const char* name = jit::deoptReasonName(jit::DeoptReason::kRaise);
+  EXPECT_STREQ(name, "Raise");
+}
+
+class LiveValueTest : public RuntimeTest {};
+
+TEST_F(LiveValueTest, SourceNameLoadMethod) {
+  EXPECT_STREQ(
+      jit::LiveValue::sourceName(jit::LiveValue::Source::kLoadMethod),
+      "LoadMethod");
+}
+
+TEST_F(LiveValueTest, SourceNameUnknown) {
+  EXPECT_STREQ(
+      jit::LiveValue::sourceName(jit::LiveValue::Source::kUnknown),
+      "Unknown");
+}
+
+TEST_F(LiveValueTest, IsLoadMethodResult) {
+  jit::LiveValue lv{
+      jit::codegen::PhyLocation{0},
+      jit::hir::RefKind::kBorrowed,
+      jit::hir::ValueKind::kObject,
+      jit::LiveValue::Source::kLoadMethod};
+  EXPECT_TRUE(lv.isLoadMethodResult());
+
+  jit::LiveValue lv2{
+      jit::codegen::PhyLocation{0},
+      jit::hir::RefKind::kBorrowed,
+      jit::hir::ValueKind::kObject,
+      jit::LiveValue::Source::kUnknown};
+  EXPECT_FALSE(lv2.isLoadMethodResult());
+}
+
+TEST_F(LiveValueTest, ToString) {
+  jit::LiveValue lv{
+      jit::codegen::PhyLocation{0},
+      jit::hir::RefKind::kBorrowed,
+      jit::hir::ValueKind::kObject,
+      jit::LiveValue::Source::kUnknown};
+  auto str = lv.toString();
+  EXPECT_FALSE(str.empty());
+}
