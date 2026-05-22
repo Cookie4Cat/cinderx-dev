@@ -21,6 +21,8 @@
 | ---- | ---- | -------- |
 | 2026-05-21 | V1.0 | 初始版本，依据 `hot-loop-osr-function-design.md` 的功能项 2 拆分 OSR 编译详细设计 |
 | 2026-05-21 | V1.1 | 根据 OSR 编译详细设计评审修订：拆分 `osr_aware`/`has_osr_entries` 缓存语义，统一 live-in steal 所有权模型，明确 `OSREntry` metadata anchor 语义，允许空 live-in entry，收敛 codegen 责任边界 |
+| 2026-05-21 | V1.2 | ce-doc-review 审查修复：(1) 顺序要求第 3 条补充 refcount_insertion 与 steal 语义交互说明，交叉引用功能项 3 详细设计文档；(2) namespace 前缀统一为 `codegen::`；(3) `getOSREntry` 参数类型从 BCIndex 改为 BCOffset；(4) `collectBackedgeTargetOffsets` 补充未特化时返回空向量说明 |
+| 2026-05-21 | V1.3 | ce-doc-review P2 修复：(1) 3.2.11 补充编译耗时经验基线建议（100/500/1024 code units）；(2) 3.4.1.5 OSRCompileState uintptr_t 身份风险标记为 MVP 已知限制 + Phase 2 dict version tag 缓解方案；(3) 3.2.1 collectBackedgeTargetOffsets 补充 over-collection 说明 + unspecialize 保证；(4) 3.2.8 regalloc 补充 stub 临时寄存器保留（X9/X12）；(5) 3.2.6 markOSREntries 补充 Snapshot 可用性保证和 HIR dump 验证建议；(6) OSRCompileState 权威定义交叉引用 |
 
 ## 1.4 Keywords 关键词
 
@@ -216,6 +218,8 @@ std::vector<BCOffset> collectBackedgeTargetOffsets(BorrowedRef<PyCodeObject> cod
 2. 使用 `BytecodeInstruction::getJumpTarget()`，避免重复实现 inline cache size、正向/反向跳转差异。
 3. 输出使用 `BCOffset`，因为 HIR block 和 `FrameState::cur_instr_offs` 使用字节偏移；解释器侧 `BackedgeEntry` 可以继续保存 `BCIndex`。
 4. 去重后保留稳定顺序，方便日志、测试和 metadata 输出稳定。
+5. **quicken 处理**：`BytecodeInstruction::opcode()` 内部已调用 `unspecialize()`（bytecode.cpp:97），通过 `_CiOpcode_Deopt[]` 表将 `JUMP_BACKWARD_JIT(175)` 映射回 `JUMP_BACKWARD`。因此检查 `op == JUMP_BACKWARD` 足以覆盖已 quicken 的回边，无需额外调用 `unspecialize()`。
+6. **over-collection 说明**：`collectBackedgeTargetOffsets` 收集所有 `JUMP_BACKWARD` 的跳转目标，可能包含非循环头的回边（如 `try/except` 的异常处理回跳，虽然 3.14 中通常用 `JUMP_BACKWARD_NO_INTERRUPT`）。这不影响正确性——`markOSREntries()` 在 HIR 层面过滤：只对存在于 `loop_headers` 集合中的 block（由 HIR builder 的 `insertRunPeriodicActivitesForLoop` 生成）标注 `OSREntry`。不在循环头的目标自然跳过。
 
 ### 3.2.2 `Preloader` 扩展与 OSR 偏移注入
 
@@ -356,7 +360,7 @@ int Ci_OSR_TryOSR(..., PyObject** out_result) {
 cache_lookup:
   auto compiled = jitCtx()->lookupCode(code, builtins, globals);
   if (compiled != nullptr) {
-    auto osr_meta = getOSREntry(compiled, target_idx);
+    auto osr_meta = getOSREntry(compiled, BCOffset(target_idx));
     if (osr_meta != nullptr) {
       return performOSR(...);  // 功能项 3
     }
@@ -422,6 +426,7 @@ if (irfunc->hasOSREntries()) {
 
 1. `markOSREntries()` 必须在 SSA/refcount 前执行，让后续 pass 能看到 `OSREntry` 锚点。
 2. `extractOSRLiveIns()` 必须在 `RefcountInsertion` 后执行，因为 `RefKind` 来自 refcount pass 填充的 `live_regs()`。
+3. `RefcountInsertion` 对 OSR live-in 的处理：stub 使用 steal 语义从解释器帧读取 live-in 并写入 `PyStackRef_NULL`（所有权转移），refcount_insertion 不应对 steal 产物插入额外的 INCREF——live-in 在 stub 中已经获得独立引用（`AND ~1` 剥离标记位后的 `PyObject*`），refcount_insertion 应将其视为已有 owned ref 的正常 JIT 值。详见功能项 3 详细设计文档 1.2.4 节"live-in steal 语义"。
 3. 代码生成阶段再回填 `PhyLocation`，因为寄存器/栈槽只有 regalloc 后才确定。
 
 ### 3.2.6 HIR entry 标注：`markOSREntries`
@@ -480,7 +485,7 @@ void Function::markOSREntries(
   for (BasicBlock& block : cfg.blocks) {
     Instr* first = block.GetFirstInstr();
     if (first == nullptr || !first->IsSnapshot()) {
-      continue;
+      continue;  // 跳过无 Snapshot 的 block——可能被 DCE 优化或非循环头
     }
 
     auto* snapshot = static_cast<Snapshot*>(first);
@@ -499,6 +504,8 @@ void Function::markOSREntries(
   }
 }
 ```
+
+**Snapshot 可用性保证**：算法要求 loop header block 的首条指令为 `Snapshot`。HIR builder 的 `buildCFG()` 为每个 basic block 起始插入 `Snapshot`（builder.cpp:1579 的 `loop_headers` 集合用于 `insertRunPeriodicActivitesForLoop`，后续 SSA pass 不删除首条 Snapshot）。如果某些 block 在优化后失去首条 Snapshot（极端情况），该 block 的 offset 会被自然跳过（`continue`），不会产生错误的 OSR entry。建议在原型阶段增加 HIR dump 验证点，确认 loop header block 始终包含 Snapshot。如果发现 Snapshot 缺失场景，可在 `markOSREntries` 中为无 Snapshot 的 loop header block 插入新 Snapshot（从 `FrameState` 池构造）。
 
 `isEligibleOSREntry()` 检查：
 
@@ -633,7 +640,7 @@ flowchart LR
 2. `kOSREntry` 不生成正常机器指令，只用于保留 operand 和 metadata 关联。
 3. regalloc 后调用 `fillOSRLiveInLocations()`，读取每个 operand 的 `getPhyRegOrStackSlot()`，写回 `OSRMetadata.live_ins[i].destination`。
 4. `tstate_location`、`func_location`、`frame_location` 也需要在 regalloc 后从 `env_.asm_tstate`、`env_.asm_func`、`env_.asm_interpreter_frame` 的分配结果回填。
-5. aarch64 OSR 编译时，stub 使用的 scratch registers 必须在 regalloc 阶段排除。实现方式是在 `markDisallowedRegisters()` 中增加 `extra_disallowed` 参数，OSR-aware 编译传入 `OSR_STUB_SCRATCH_REGS`，保证 Environ VReg 和 live-in destination 不会被分配到 stub 临时寄存器。
+5. **stub 临时寄存器保留**：OSR entry stub 使用 X9（持久状态/localsplus 基地址）和 X12（临时操作/NULL 常量）作为临时寄存器（aarch64）。regalloc 的 `markDisallowedRegisters()` 必须将 `OSR_STUB_SCRATCH_REGS(X9/X12)` 加入 disallowed 集合，防止这些寄存器被分配为 Environ VReg 或 live-in 的 PhyLocation 目标——否则 stub 写入会覆盖自身临时值。具体实现（参数化 `extra_disallowed`）和 tradeoff 分析见功能项 3 详细设计文档 1.2.8 节。
 
 ### 3.2.9 OSR entry stub 生成
 
@@ -718,6 +725,8 @@ stub 禁止执行 C helper 调用和 `DECREF`。原因是 caller-saved 寄存器
 | async generator | 沿用 `compilePreloaderImpl()` 禁止逻辑 | per-CompilationKey FailedPermanent |
 
 编译预算不是真正超时。同步编译一旦开始，不在中途取消。
+
+> **编译耗时经验基线**：MVP 阶段建议在验收测试中测量典型函数的 OSR 编译耗时，建立经验基线：(1) 小函数（~100 code units）预期 <5ms；(2) 中等函数（~500 code units）预期 <30ms；(3) 接近预算上限（~1000 code units）预期 <100ms。实际耗时受 HIR 复杂度、优化 pass 数量和 regalloc 压力影响，与 code units 非线性关系。如果实测耗时超出预期，应降低预算阈值。Phase 2 后台编译方案不受此限制。
 
 ## 3.3 行为模型
 
@@ -814,7 +823,7 @@ struct OSRMetadata {
 
   int32_t resume_frame_total_size{0};
   int32_t resume_header_and_spill_size{0};
-  jit::codegen::PhyRegisterSet resume_saved_regs{0};
+  codegen::PhyRegisterSet resume_saved_regs{0};
 
   void* entryPoint(const CompiledFunction& cf) const;
   bool allReconstructible() const;
@@ -885,11 +894,13 @@ struct OSRCompileState {
 };
 ```
 
+> 权威定义见功能设计说明书功能项 1（function-design.md:415-433）。本节为编译模块使用场景的局部说明。
+
 说明：
 
 1. 不持有 `PyObject*` 强引用，避免 `code -> co_extra -> globals -> function -> code` 不可回收环。
 2. 以 `builtins` 和 `globals` 身份区分 `CompilationKey`。
-3. 若未来进入生产化，应补充 dict version 校验或绑定现有 `CompilationKey` 生命周期。
+3. **已知 MVP 限制**（地址复用风险）：`uintptr_t` 存储的是地址身份而非引用，如果 dict 被 GC 回收后地址被复用（如 `importlib.reload()` 重载模块、`exec()`/`eval()` 频繁创建临时命名空间），旧 `OSRCompileState` 可能误匹配新 dict。MVP 中此风险可接受——builtins 通常是 `__builtins__`（进程级常量），globals 通常是模块 dict（生命周期与 code 对象绑定）。**Phase 2 缓解**：在 cache lookup 时校验 `dict->ma_version_tag`（开销极低，一次内存读取），或在 `OSRCompileState` 中增加 creation timestamp 自动失效。
 
 ### 3.4.2 数据流转
 
@@ -933,7 +944,7 @@ std::vector<BCOffset> collectBackedgeTargetOffsets(
 
 const OSRMetadata* getOSREntry(
     BorrowedRef<CompiledFunction> compiled,
-    BCIndex target_index);
+    BCOffset target_offset);
 
 bool osrCompileBudgetCheck(BorrowedRef<PyCodeObject> code);
 ```
