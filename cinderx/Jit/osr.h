@@ -8,6 +8,7 @@
 #include "cinderx/Common/util.h"
 
 #include <cstdint>
+#include <vector>
 
 namespace jit {
 
@@ -159,6 +160,8 @@ bool osrCompileBudgetCheck(PyCodeObject* code);
 // Sync OSR flags from jit::Config to C globals.
 // Called during initialize(), enable_jit_impl(), pause, resume, finalize.
 void syncOSRFlags();
+void initOSRCodeExtraIndex();
+void finiOSRCodeExtraIndex();
 
 // ---------------------------------------------------------------------------
 // OSR scratch registers for stub generation (aarch64, Feature Item 2)

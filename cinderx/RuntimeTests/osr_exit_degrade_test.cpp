@@ -79,6 +79,10 @@
 using jit::Compiler;
 using jit::getContext;
 
+namespace jit {
+void syncOSRFlags();
+} // namespace jit
+
 // ===========================================================================
 // Sub-module B: resetOSRState unit tests
 // ===========================================================================
@@ -1379,7 +1383,6 @@ assert result == 100, f"Expected 100, got {result}"
 
 # Replace func.__code__ — triggers funcModified.
 import types
-new_code = compile("return 42", "<test>", "eval")
 # Using a simple function code replacement.
 def replacement():
     return 99
@@ -1424,13 +1427,11 @@ def test():
 assert test() == 10
 
 for i in range(5):
-    def make_func(n):
-        def f():
-            return n
-        return f
-    new_f = make_func(i * 100)
-    test.__code__ = new_f.__code__
-    assert test() == i * 100
+    value = i * 100
+    def replacement():
+        return value
+    test.__code__ = replacement.__code__
+    assert test() == value
 )";
   runCode(src);
 }

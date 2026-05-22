@@ -97,6 +97,7 @@ class RuntimeTest : public ::testing::Test {
     ASSERT_EQ(jit::getConfig().state, jit::State::kNotInitialized);
     ASSERT_FALSE(jit::isJitUsable())
         << "JIT should be disabled with Py_FinalizeEx";
+    jit::getMutableConfig().force_init.reset();
 
     cinderx::ModuleState* mod_state = cinderx::getModuleState();
     ASSERT_EQ(mod_state, nullptr)

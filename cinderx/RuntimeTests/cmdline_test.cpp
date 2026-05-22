@@ -3,6 +3,7 @@
 #include <gtest/gtest.h>
 
 #include "cinderx/Jit/generators_rt.h"
+#include "cinderx/Jit/osr_capi.h"
 #include "cinderx/Jit/perf_jitdump.h"
 #include "cinderx/Jit/pyjit.h"
 #include "cinderx/RuntimeTests/fixtures.h"
@@ -277,6 +278,28 @@ TEST_F(CmdLineTest, OSREnabledFlag) {
           "CINDERX_OSR_ENABLED",
           []() { getMutableConfig().osr_enabled = false; },
           []() { ASSERT_TRUE(getConfig().osr_enabled); }),
+      0);
+}
+
+TEST_F(CmdLineTest, OSREnabledFlagSyncsRuntimeGate) {
+  ASSERT_EQ(
+      try_flag_and_envvar_effect(
+          L"osr-enabled",
+          "CINDERX_OSR_ENABLED",
+          []() {
+            getMutableConfig().osr_enabled = false;
+            getMutableConfig().osr_capable = false;
+            cinderx_osr_enabled = 0;
+            cinderx_osr_capable = 0;
+            cinderx_osr_state = 0;
+          },
+          []() {
+            ASSERT_TRUE(getConfig().osr_enabled);
+            ASSERT_TRUE(getConfig().osr_capable);
+            ASSERT_EQ(cinderx_osr_enabled, 1);
+            ASSERT_EQ(cinderx_osr_capable, 1);
+            ASSERT_EQ(cinderx_osr_state, 1);
+          }),
       0);
 }
 

@@ -4,8 +4,14 @@
 
 #include "cinderx/python.h"
 
+#include "pycore_pyatomic_ft_wrappers.h"
+
 #include <stdbool.h>
 #include <stdint.h>
+
+#if !defined(CINDER_AARCH64) && defined(__aarch64__)
+#define CINDER_AARCH64
+#endif
 
 #ifdef __cplusplus
 extern "C" {
@@ -102,8 +108,8 @@ uint8_t Ci_OSR_BackedgeGetState(const Ci_BackedgeEntry* entry);
 void Ci_OSR_BackedgeSetCount(Ci_BackedgeEntry* entry, uint32_t count);
 void Ci_OSR_BackedgeSetState(Ci_BackedgeEntry* entry, uint8_t state);
 
-// Atomically increment the backedge count and return the new value.
-// Uses _Py_atomic_add_int_relaxed under free-threading builds.
+// Increment the backedge count and return the new value. MVP OSR is disabled
+// under free-threading builds by Ci_OSR_IsEnabled(), so this is GIL-protected.
 uint32_t Ci_OSR_BackedgeIncrement(Ci_BackedgeEntry* entry);
 
 // Compute the loop-header target code-unit index from a backedge instruction.
@@ -154,6 +160,31 @@ int Ci_OSR_TryOSR(
     _Py_CODEUNIT* this_instr,
     uint32_t oparg,
     PyObject** out_result);
+
+// Uppercase wrappers are used by cinder-bytecodes.c so the cases generator
+// treats these as macros and does not inject its own stack spill/reload pairs.
+// The OSR bytecode block manages SAVE_SP()/LOAD_SP() manually because
+// Ci_OSR_TryOSR may consume the current frame before returning.
+#define CI_OSR_IS_ELIGIBLE(tstate, frame, code) \
+  Ci_OSR_IsEligible((tstate), (frame), (code))
+#define CI_OSR_COMPUTE_JUMP_TARGET_INDEX(code, source_idx, oparg) \
+  Ci_OSR_ComputeJumpTargetIndex((code), (source_idx), (oparg))
+#define CI_OSR_GET_OR_CREATE_BACKEDGE_COUNTERS(code) \
+  Ci_OSR_GetOrCreateBackedgeCounters((code))
+#define CI_OSR_BACKEDGE_COUNTERS_FIND_OR_CREATE(counters, source_idx, target_idx) \
+  Ci_OSR_BackedgeCountersFindOrCreate((counters), (source_idx), (target_idx))
+#define CI_OSR_BACKEDGE_GET_STATE(entry) \
+  Ci_OSR_BackedgeGetState((entry))
+#define CI_OSR_BACKEDGE_INCREMENT(entry) \
+  Ci_OSR_BackedgeIncrement((entry))
+#define CI_OSR_GET_BACKEDGE_THRESHOLD() \
+  Ci_OSR_GetBackedgeThreshold()
+#define CI_OSR_BACKEDGE_SET_COUNT(entry, count) \
+  Ci_OSR_BackedgeSetCount((entry), (count))
+#define CI_OSR_BACKEDGE_SET_STATE(entry, state) \
+  Ci_OSR_BackedgeSetState((entry), (state))
+#define CI_OSR_TRY_OSR(tstate, frame, this_instr, oparg, out_result) \
+  Ci_OSR_TryOSR((tstate), (frame), (this_instr), (oparg), (out_result))
 
 // ---------------------------------------------------------------------------
 // OSR state reset (Feature Item 4: OSR Exit and Degrade)

@@ -91,6 +91,7 @@ class ScopedJitConfig {
 
   ~ScopedJitConfig() {
     jit::getMutableConfig() = config_;
+    jit::syncOSRFlags();
   }
 
  private:
@@ -332,6 +333,7 @@ TEST(OSRGeneratedCodeTest, SpecializeJumpBackwardAlwaysRoutesToJit) {
   EXPECT_NE(
       jump_backward.find("this_instr->op.code = JUMP_BACKWARD_JIT"),
       std::string::npos);
+  EXPECT_EQ(jump_backward.find("ENABLE_SPECIALIZATION"), std::string::npos);
   EXPECT_EQ(jump_backward.find("JUMP_BACKWARD_NO_JIT"), std::string::npos);
   EXPECT_EQ(jump_backward.find("tstate->interp->jit ?"), std::string::npos);
 }
@@ -350,9 +352,14 @@ TEST(OSRGeneratedCodeTest, JitCaseRunsOSRBeforeTier2Optimizer) {
   ASSERT_NE(tier2, std::string::npos);
   EXPECT_LT(osr_check, tier2);
 
-  EXPECT_NE(jit_case.find("Ci_BackedgeIncrement"), std::string::npos);
-  EXPECT_NE(jit_case.find("Ci_ComputeJumpTargetIndex"), std::string::npos);
-  EXPECT_NE(jit_case.find("Ci_OSR_TryOSR"), std::string::npos);
+  EXPECT_NE(jit_case.find("CI_OSR_BACKEDGE_INCREMENT"), std::string::npos);
+  EXPECT_NE(
+      jit_case.find("CI_OSR_COMPUTE_JUMP_TARGET_INDEX"), std::string::npos);
+  EXPECT_NE(jit_case.find("CI_OSR_TRY_OSR"), std::string::npos);
+  EXPECT_EQ(
+      jit_case.find("stack_pointer = _PyFrame_GetStackPointer(frame);\n"
+                    "                                    if (osr_rc"),
+      std::string::npos);
   EXPECT_NE(jit_case.find("_Py_LeaveRecursiveCallPy"), std::string::npos);
 }
 
@@ -375,17 +382,17 @@ def second():
   BorrowedRef<PyCodeObject> first_code = codeFromFunc(first);
   BorrowedRef<PyCodeObject> second_code = codeFromFunc(second);
 
-  EXPECT_EQ(Ci_GetBackedgeCounters(first_code), nullptr);
-  EXPECT_EQ(Ci_GetBackedgeCounters(second_code), nullptr);
+  EXPECT_EQ(Ci_OSR_GetBackedgeCounters(first_code), nullptr);
+  EXPECT_EQ(Ci_OSR_GetBackedgeCounters(second_code), nullptr);
 
   Ci_BackedgeCounters* first_counters =
-      Ci_GetOrCreateBackedgeCounters(first_code);
+      Ci_OSR_GetOrCreateBackedgeCounters(first_code);
   ASSERT_NE(first_counters, nullptr);
-  EXPECT_EQ(Ci_GetBackedgeCounters(first_code), first_counters);
-  EXPECT_EQ(Ci_GetOrCreateBackedgeCounters(first_code), first_counters);
+  EXPECT_EQ(Ci_OSR_GetBackedgeCounters(first_code), first_counters);
+  EXPECT_EQ(Ci_OSR_GetOrCreateBackedgeCounters(first_code), first_counters);
 
   Ci_BackedgeCounters* second_counters =
-      Ci_GetOrCreateBackedgeCounters(second_code);
+      Ci_OSR_GetOrCreateBackedgeCounters(second_code);
   ASSERT_NE(second_counters, nullptr);
   EXPECT_NE(first_counters, second_counters);
 }
@@ -400,24 +407,24 @@ def test():
   ASSERT_NE(func, nullptr);
 
   Ci_BackedgeCounters* counters =
-      Ci_GetOrCreateBackedgeCounters(codeFromFunc(func));
+      Ci_OSR_GetOrCreateBackedgeCounters(codeFromFunc(func));
   ASSERT_NE(counters, nullptr);
 
   Ci_BackedgeEntry* entry =
-      Ci_BackedgeCountersFindOrCreate(counters, 12);
+      Ci_OSR_BackedgeCountersFindOrCreate(counters, 12, 4);
   ASSERT_NE(entry, nullptr);
-  EXPECT_EQ(Ci_BackedgeGetCount(entry), 0);
-  EXPECT_EQ(Ci_BackedgeGetState(entry), CI_OSR_BACKEDGE_COUNTING);
+  EXPECT_EQ(Ci_OSR_BackedgeGetCount(entry), 0);
+  EXPECT_EQ(Ci_OSR_BackedgeGetState(entry), CI_OSR_BACKEDGE_COUNTING);
 
-  EXPECT_EQ(Ci_BackedgeIncrement(entry), 1);
-  EXPECT_EQ(Ci_BackedgeIncrement(entry), 2);
-  EXPECT_EQ(Ci_BackedgeGetCount(entry), 2);
+  EXPECT_EQ(Ci_OSR_BackedgeIncrement(entry), 1);
+  EXPECT_EQ(Ci_OSR_BackedgeIncrement(entry), 2);
+  EXPECT_EQ(Ci_OSR_BackedgeGetCount(entry), 2);
 
-  Ci_BackedgeSetCount(entry, 99);
-  EXPECT_EQ(Ci_BackedgeGetCount(entry), 99);
-  Ci_BackedgeSetState(entry, CI_OSR_BACKEDGE_FAILED_PERMANENT);
+  Ci_OSR_BackedgeSetCount(entry, 99);
+  EXPECT_EQ(Ci_OSR_BackedgeGetCount(entry), 99);
+  Ci_OSR_BackedgeSetState(entry, CI_OSR_BACKEDGE_FAILED_PERMANENT);
   EXPECT_EQ(
-      Ci_BackedgeGetState(entry), CI_OSR_BACKEDGE_FAILED_PERMANENT);
+      Ci_OSR_BackedgeGetState(entry), CI_OSR_BACKEDGE_FAILED_PERMANENT);
 }
 
 TEST_F(OSRDetectionTest, BackedgeEntryLookupIsPerSourceIndex) {
@@ -430,21 +437,21 @@ def test():
   ASSERT_NE(func, nullptr);
 
   Ci_BackedgeCounters* counters =
-      Ci_GetOrCreateBackedgeCounters(codeFromFunc(func));
+      Ci_OSR_GetOrCreateBackedgeCounters(codeFromFunc(func));
   ASSERT_NE(counters, nullptr);
 
   Ci_BackedgeEntry* first =
-      Ci_BackedgeCountersFindOrCreate(counters, 12);
+      Ci_OSR_BackedgeCountersFindOrCreate(counters, 12, 4);
   ASSERT_NE(first, nullptr);
-  Ci_BackedgeSetCount(first, 5);
+  Ci_OSR_BackedgeSetCount(first, 5);
 
   Ci_BackedgeEntry* same_source =
-      Ci_BackedgeCountersFindOrCreate(counters, 12);
+      Ci_OSR_BackedgeCountersFindOrCreate(counters, 12, 4);
   EXPECT_EQ(same_source, first);
-  EXPECT_EQ(Ci_BackedgeGetCount(same_source), 5);
+  EXPECT_EQ(Ci_OSR_BackedgeGetCount(same_source), 5);
 
   Ci_BackedgeEntry* different_source =
-      Ci_BackedgeCountersFindOrCreate(counters, 14);
+      Ci_OSR_BackedgeCountersFindOrCreate(counters, 14, 6);
   ASSERT_NE(different_source, nullptr);
   EXPECT_NE(different_source, first);
 }
@@ -459,17 +466,17 @@ def test():
   ASSERT_NE(func, nullptr);
 
   Ci_BackedgeCounters* counters =
-      Ci_GetOrCreateBackedgeCounters(codeFromFunc(func));
+      Ci_OSR_GetOrCreateBackedgeCounters(codeFromFunc(func));
   ASSERT_NE(counters, nullptr);
 
   for (uint32_t i = 0; i < CI_OSR_MAX_BACKEDGES; i++) {
     ASSERT_NE(
-        Ci_BackedgeCountersFindOrCreate(counters, i * 2), nullptr);
+        Ci_OSR_BackedgeCountersFindOrCreate(counters, i * 2, i), nullptr);
   }
 
   EXPECT_EQ(
-      Ci_BackedgeCountersFindOrCreate(
-          counters, CI_OSR_MAX_BACKEDGES * 2),
+      Ci_OSR_BackedgeCountersFindOrCreate(
+          counters, CI_OSR_MAX_BACKEDGES * 2, CI_OSR_MAX_BACKEDGES),
       nullptr);
   EXPECT_FALSE(PyErr_Occurred());
 }
@@ -491,15 +498,19 @@ def test(n):
   Ref<> arg = Ref<>::steal(PyLong_FromLong(3));
   ASSERT_NE(arg, nullptr);
 
-  Ref<> result = Ref<>::steal(PyObject_CallOneArg(func.get(), arg.get()));
+  Ref<> result = Ref<>::steal(PyObject_CallOneArg(
+      reinterpret_cast<PyObject*>(func.get()), arg.get()));
 
   ASSERT_NE(result, nullptr);
   EXPECT_EQ(PyLong_AsLong(result.get()), 0);
   EXPECT_EQ(hook_state.calls, 0);
-  EXPECT_EQ(Ci_GetBackedgeCounters(codeFromFunc(func)), nullptr);
+  EXPECT_EQ(Ci_OSR_GetBackedgeCounters(codeFromFunc(func)), nullptr);
 }
 
 TEST_F(OSRDetectionTest, HotWhileLoopBelowThresholdDoesNotCallTryOSR) {
+  if (!isSupportedOSRBuild()) {
+    GTEST_SKIP() << "OSR hot-loop detection MVP only runs on supported builds";
+  }
   ScopedOSRFlags flags;
   ScopedOSRThreshold threshold{3};
   setOSRFlags(1, 1, kOSRRunningState);
@@ -520,6 +531,9 @@ result = test(2)
 }
 
 TEST_F(OSRDetectionTest, HotWhileLoopAtThresholdCallsTryOSRAndContinues) {
+  if (!isSupportedOSRBuild()) {
+    GTEST_SKIP() << "OSR hot-loop detection MVP only runs on supported builds";
+  }
   ScopedOSRFlags flags;
   ScopedOSRThreshold threshold{3};
   setOSRFlags(1, 1, kOSRRunningState);
@@ -541,6 +555,9 @@ result = test(3)
 }
 
 TEST_F(OSRDetectionTest, TryOSRReturnOnePushesResultToPythonCaller) {
+  if (!isSupportedOSRBuild()) {
+    GTEST_SKIP() << "OSR hot-loop detection MVP only runs on supported builds";
+  }
   ScopedOSRFlags flags;
   ScopedOSRThreshold threshold{1};
   setOSRFlags(1, 1, kOSRRunningState);
@@ -563,6 +580,9 @@ result = test(3)
 }
 
 TEST_F(OSRDetectionTest, TryOSRReturnMinusOnePropagatesToPythonCaller) {
+  if (!isSupportedOSRBuild()) {
+    GTEST_SKIP() << "OSR hot-loop detection MVP only runs on supported builds";
+  }
   ScopedOSRFlags flags;
   ScopedOSRThreshold threshold{1};
   setOSRFlags(1, 1, kOSRRunningState);
@@ -587,6 +607,9 @@ except RuntimeError as exc:
 }
 
 TEST_F(OSRDetectionTest, TryOSRReturnMinusOneFromEntryFrameReturnsNull) {
+  if (!isSupportedOSRBuild()) {
+    GTEST_SKIP() << "OSR hot-loop detection MVP only runs on supported builds";
+  }
   ScopedOSRFlags flags;
   ScopedOSRThreshold threshold{1};
   setOSRFlags(1, 1, kOSRRunningState);
@@ -605,7 +628,8 @@ def test(n):
   Ref<> arg = Ref<>::steal(PyLong_FromLong(3));
   ASSERT_NE(arg, nullptr);
 
-  Ref<> result = Ref<>::steal(PyObject_CallOneArg(func.get(), arg.get()));
+  Ref<> result = Ref<>::steal(PyObject_CallOneArg(
+      reinterpret_cast<PyObject*>(func.get()), arg.get()));
 
   EXPECT_EQ(result, nullptr);
   EXPECT_EQ(hook_state.calls, 1);
@@ -614,6 +638,9 @@ def test(n):
 }
 
 TEST_F(OSRDetectionTest, TryOSRClearingCountersDoesNotAffectCurrentLoop) {
+  if (!isSupportedOSRBuild()) {
+    GTEST_SKIP() << "OSR hot-loop detection MVP only runs on supported builds";
+  }
   ScopedOSRFlags flags;
   ScopedOSRThreshold threshold{1};
   setOSRFlags(1, 1, kOSRRunningState);
@@ -633,6 +660,30 @@ result = test(3)
 
   EXPECT_GE(hook_state.calls, 1);
   EXPECT_EQ(longFromGlobal(*this, "result"), 0);
+}
+
+TEST_F(OSRDetectionTest, HotForLoopDoesNotCallTryOSR) {
+  if (!isSupportedOSRBuild()) {
+    GTEST_SKIP() << "OSR hot-loop detection MVP only runs on supported builds";
+  }
+  ScopedOSRFlags flags;
+  ScopedOSRThreshold threshold{1};
+  setOSRFlags(1, 1, kOSRRunningState);
+  TryOSRHookState hook_state;
+  ScopedOSRTestHook hook{&hook_state};
+
+  runStockCode(R"(
+def test(n):
+  total = 0
+  for i in range(n):
+    total += i
+  return total
+
+result = test(4)
+)");
+
+  EXPECT_EQ(hook_state.calls, 0);
+  EXPECT_EQ(longFromGlobal(*this, "result"), 6);
 }
 
 TEST_F(OSRDetectionTest, ComputeJumpTargetMatchesBytecodeInstructionTarget) {
@@ -661,7 +712,7 @@ def test(n):
   uint32_t oparg = backward_jump->oparg();
 
   EXPECT_EQ(
-      Ci_ComputeJumpTargetIndex(code, source_idx, oparg), target_idx);
+      Ci_OSR_ComputeJumpTargetIndex(code, source_idx, oparg), target_idx);
 }
 
 TEST_F(
@@ -697,7 +748,7 @@ TEST_F(
 
   EXPECT_EQ(target_idx, 5);
   EXPECT_EQ(
-      Ci_ComputeJumpTargetIndex(code, source_idx, backward_jump->oparg()),
+      Ci_OSR_ComputeJumpTargetIndex(code, source_idx, backward_jump->oparg()),
       target_idx);
 }
 

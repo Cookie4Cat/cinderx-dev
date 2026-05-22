@@ -74,6 +74,10 @@
 using jit::Compiler;
 using jit::getContext;
 
+namespace jit {
+void syncOSRFlags();
+} // namespace jit
+
 // ===========================================================================
 // Sub-module A: OSRState & OSRMetadata data structure tests
 // ===========================================================================
