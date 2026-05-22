@@ -332,7 +332,13 @@ cases_generator 的 `analyzer.py:906-913` 仅在 `add_op()` 中处理 `override`
 
 `_SPECIALIZE_JUMP_BACKWARD` 在 `JUMP_BACKWARD` 首次执行时根据 `tstate->interp->jit` 选择路由目标。CPython 上游仅在 `#ifdef _Py_TIER2` 下设置 `interp->jit = true`（`pylifecycle.c:1348`），CinderX 不定义 `_Py_TIER2`，因此默认 `interp->jit = false`。
 
-**解决方案**：CinderX 的 `jit::initialize()`（`pyjit.cpp:3313`）和 `enable_jit_impl()` 都必须设置 `tstate->interp->jit = true`，使热回边正确路由到 `JUMP_BACKWARD_JIT`。`interp->jit` 只影响特化路由和 `_JIT` 块内的 opcode 检查，不影响 CinderX 的编译/执行管线。详见 [ADR-8](#adr-8-cinderx-必须设置-interp-jit)。
+**解决方案**（两处配套修改，均为**新增代码**）：
+
+1. **设置 `interp->jit = true`**：在 `jit::initialize()`（`pyjit.cpp`）和 `enable_jit_impl()` 中新增 `tstate->interp->jit = true`。当前 CinderX 源码中不存在此设置（因为 CinderX 不定义 `_Py_TIER2`，上游默认 `interp->jit = false`）。此设置确保已 quicken 的 `JUMP_BACKWARD_NO_JIT` opcode 在运行时检查时也能正确路由。
+
+2. **override `op(_SPECIALIZE_JUMP_BACKWARD)`**：覆盖上游特化逻辑，强制将 `JUMP_BACKWARD` 改写为 `JUMP_BACKWARD_JIT`（不依赖 `interp->jit`），确保**未来首次执行**的回边直接进入 JIT 路径。
+
+两处修改互补：override 处理未来首次执行的回边；`interp->jit=true` 处理历史已 quicken 的回边。`interp->jit` 只影响特化路由和 `_JIT` 块内的 opcode 检查，不影响 CinderX 的编译/执行管线。详见 [ADR-8](#adr-8-cinderx-必须设置-interp-jit)。
 
 ### 模块调用关系
 
@@ -744,8 +750,8 @@ int Ci_OSR_TryOSR(tstate, frame, backedge_instr, oparg, out_result);  // 三态:
 |------|------|---------|
 | OSR 公共 | `cinderx/Jit/osr.h`（新增） | BackedgeCounters 结构定义和 C 接口 |
 | 解释器 | `cinderx/Interpreter/3.14/cinder-bytecodes.c` | 两处 override：（1）`override op(_SPECIALIZE_JUMP_BACKWARD)` 强制路由到 `JUMP_BACKWARD_JIT`（不依赖 `interp->jit`）；（2）`override op(_JIT)` 在 Tier 2 逻辑之前插入 OSR 回边计数检查。`override` 注解仅对 `inst`/`op` 有效。`generated_cases.c.h` 为自动生成文件，不直接编辑 |
-| JIT 初始化 | `cinderx/Jit/pyjit.cpp:jit::initialize()` | 正常启动路径（`-X jit`）：设置 `tstate->interp->jit = true`（与 `Config::state = kRunning` 同步），同时设置 `osr_capable = true`。此路径在 `getMutableConfig() = Config{}` 重置后、`state = kRunning` 之前完成 |
-| JIT 重启用 | `cinderx/Jit/pyjit.cpp:enable_jit_impl()` | 运行期重新启用（`kPaused → kRunning`）：设置 `tstate->interp->jit = true`，但**不**设置 `osr_capable`（保持 false），因为可能有已 quicken 的 `JUMP_BACKWARD_NO_JIT` 回边 |
+| JIT 初始化 | `cinderx/Jit/pyjit.cpp:jit::initialize()` | 正常启动路径（`-X jit`）：**新增** `tstate->interp->jit = true`（当前源码中不存在此设置，需新增），与 `Config::state = kRunning` 同步，同时设置 `osr_capable = true`。此路径在 `getMutableConfig() = Config{}` 重置后、`state = kRunning` 之前完成 |
+| JIT 重启用 | `cinderx/Jit/pyjit.cpp:enable_jit_impl()` | 运行期重新启用（`kPaused → kRunning`）：**新增** `tstate->interp->jit = true`（同上，需新增），但**不**设置 `osr_capable`（保持 false），因为可能有已 quicken 的 `JUMP_BACKWARD_NO_JIT` 回边 |
 | 配置 | `cinderx/Jit/config.h` | `Config` 结构体新增 `osr_enabled`、`osr_capable`、`osr_backedge_threshold`、`osr_compile_warn_threshold_ms` |
 | 配置 | `cinderx/Jit/pyjit.cpp:initFlagProcessor()` | 注册 OSR 命令行选项 |
 

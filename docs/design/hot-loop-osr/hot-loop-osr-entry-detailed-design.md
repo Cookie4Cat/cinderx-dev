@@ -597,11 +597,11 @@ JIT body 通过两个机制管理 live-in 的引用计数：
 
 **因此，必须确保 `refcount_insertion` 不在 OSR entry 处为 steal 产生的 owned ref 插入多余的 INCREF。** 实现方式：在 `extractOSRLiveIns` 中，将每个 live-in 的 HIR `Register` 的初始 refcount 状态标记为 owned（而非 borrowed），使 refcount pass 知道这些值已经持有 owned ref，无需额外 INCREF。具体机制：
 
-1. **HIR 层面**：OSR entry edge 是一条指向 loop header block 的 CFG 边（由 `markOSREntries` 创建）。Loop header 包含 phi 节点，OSR edge 为每个 phi 提供一个输入。
+1. **HIR 层面**：`OSREntry` 是编译期 metadata anchor，插入在 loop header block 的 Snapshot 之后。它**不新增 HIR CFG 外部前驱**（compile-detailed-design 3.2.6），不改变普通函数入口或普通 JIT loop backedge 的控制流。`OSREntry` 继承 `DeoptBase`，通过 `bindGuards()` 获得与 Snapshot 相同的 `FrameState`（包括 `live_regs` 及其 `RefKind`）。
 
-2. **Phi 消除**：`RefcountInsertion::Run()` 首先调用 `PhiElimination{}.Run(func)` 消除 phi，建立统一的数据流。
+2. **Phi 消除**：`RefcountInsertion::Run()` 首先调用 `PhiElimination{}.Run(func)` 消除 phi，建立统一的数据流。Phi 消除后，loop header 入口处每个 live-in 有确定的 refcount 状态。
 
-3. **OSR entry 边的 refcount 状态**：OSR edge 为 phi 提供的输入值在 stub 执行后已经持有 owned ref（steal 语义）。Pass 的数据流分析（refcount_insertion.cpp:1294-1318）在计算 loop header 的 `in_state` 时，OSR edge 贡献的 live-in refcount 状态必须标记为 owned，而非 borrowed。
+3. **OSR entry 处的 refcount 状态**：`extractOSRLiveIns` 在 `refcount_insertion` pass 之后运行（编译流水线顺序：markOSREntries → runPasses[含 RefcountInsertion] → extractOSRLiveIns），读到的 `RefKind` 是 refcount pass 填充的最终结果。MVP 只接受 `kOwned`——这意味着该 live-in 在 loop header 处已经被 refcount_insertion 的数据流分析确认为 owned（由前序 guard/STORE_FAST 等产生），refcount pass **不会为已 owned 的值插入额外 INCREF**。Steal 语义与此一致：stub steal 获得的 ref 与 JIT 侧 refcount 分析的 owned 状态匹配，不会产生重复 INCREF。
 
 4. **与正常函数入口的对称性**：正常函数入口通过 `JITRT_AllocateAndLinkInterpreterFrame` 创建 owned ref（`PyStackRef_FromPyObjectNew` 内部 INCREF）。OSR 入口通过 stub steal 获得 owned ref（无 INCREF）。两者最终在 JIT body 入口处持有相同的引用所有权状态，但路径不同——正常入口 INCREF 创建新 ref，OSR steal 转移现有 ref。
 

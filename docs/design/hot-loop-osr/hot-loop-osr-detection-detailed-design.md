@@ -227,8 +227,8 @@ void syncOSRFlags() {
 
 | 调用点 | 行为 |
 |--------|------|
-| `jit::initialize()` 正常启动路径 | 设置 `interp->jit = true`，设置 `osr_capable = true`，调用 `syncOSRFlags()` |
-| `enable_jit_impl()` 运行期重启用 | 设置 `interp->jit = true`，但不设置 `osr_capable`，调用 `syncOSRFlags()` |
+| `jit::initialize()` 正常启动路径 | **新增** `interp->jit = true`（当前源码中不存在，需新增到 pyjit.cpp），设置 `osr_capable = true`，调用 `syncOSRFlags()` |
+| `enable_jit_impl()` 运行期重启用 | **新增** `interp->jit = true`（同上），但不设置 `osr_capable`，调用 `syncOSRFlags()` |
 | `pause` / `resume` / `finalize` | 更新 `cinderx_osr_state` |
 | flag 解析完成后 | 同步 `osr_enabled` 和阈值相关配置 |
 
