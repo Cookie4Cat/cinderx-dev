@@ -134,7 +134,10 @@ void resetOSRState(PyCodeObject* code);
 // Check if a frame is eligible for OSR at the current backedge.
 // Rejection conditions: generator, free-threading, non-kNormal, non-empty
 // operand stack, non-function frame, escaped frame.
-bool isOSREligible(_PyInterpreterFrame* frame, PyCodeObject* code);
+bool isOSREligible(
+    PyThreadState* tstate,
+    _PyInterpreterFrame* frame,
+    PyCodeObject* code);
 
 // Compile a function with OSR entry points for all backedge targets.
 // Uses standard preload() path + IsolatedPreloaders RAII protection.

@@ -60,48 +60,58 @@ static inline bool Ci_OSR_IsEnabled(void) {
 // reinterpret_cast to convert between these and jit:: types).
 // ---------------------------------------------------------------------------
 
-typedef struct BackedgeCounters_s Ci_BackedgeCounters;
-typedef struct BackedgeEntry_s Ci_BackedgeEntry;
+typedef struct Ci_BackedgeCounters Ci_BackedgeCounters;
+typedef struct Ci_BackedgeEntry Ci_BackedgeEntry;
 
 // ---------------------------------------------------------------------------
 // Backedge counter accessors (Feature Item 1: Hot Loop Detection)
 // ---------------------------------------------------------------------------
 
+// Maximum number of backedges tracked per code object.
+#ifndef CI_OSR_MAX_BACKEDGES
+#define CI_OSR_MAX_BACKEDGES 16
+#endif
+
+// Maximum number of CompilationKey states per code object.
+#ifndef CI_OSR_MAX_COMPILE_KEYS
+#define CI_OSR_MAX_COMPILE_KEYS 4
+#endif
+
 // Get the backedge counter table attached to a code object (may return NULL).
-Ci_BackedgeCounters* Ci_GetBackedgeCounters(PyCodeObject* code);
+Ci_BackedgeCounters* Ci_OSR_GetBackedgeCounters(PyCodeObject* code);
 
 // Get or create the backedge counter table for a code object.
 // Returns NULL on allocation failure.
-Ci_BackedgeCounters* Ci_GetOrCreateBackedgeCounters(PyCodeObject* code);
+Ci_BackedgeCounters* Ci_OSR_GetOrCreateBackedgeCounters(PyCodeObject* code);
 
 // Find or create a backedge entry for the given source instruction index.
 // New entries are initialized with state=Counting(1), count=0.
 // Returns NULL if the table is full (CI_OSR_MAX_BACKEDGES reached).
-Ci_BackedgeEntry* Ci_BackedgeCountersFindOrCreate(
+Ci_BackedgeEntry* Ci_OSR_BackedgeCountersFindOrCreate(
     Ci_BackedgeCounters* counters,
-    uint32_t source_idx);
+    uint32_t source_idx,
+    uint32_t target_idx);
 
 // BackedgeEntry state constants.
 #define CI_OSR_BACKEDGE_COUNTING  1
-#define CI_OSR_BACKEDGE_COMPILED  2
 #define CI_OSR_BACKEDGE_FAILED_PERMANENT  3
 
 // BackedgeEntry accessors.
-uint32_t Ci_BackedgeGetCount(const Ci_BackedgeEntry* entry);
-uint8_t Ci_BackedgeGetState(const Ci_BackedgeEntry* entry);
-void Ci_BackedgeSetCount(Ci_BackedgeEntry* entry, uint32_t count);
-void Ci_BackedgeSetState(Ci_BackedgeEntry* entry, uint8_t state);
+uint32_t Ci_OSR_BackedgeGetCount(const Ci_BackedgeEntry* entry);
+uint8_t Ci_OSR_BackedgeGetState(const Ci_BackedgeEntry* entry);
+void Ci_OSR_BackedgeSetCount(Ci_BackedgeEntry* entry, uint32_t count);
+void Ci_OSR_BackedgeSetState(Ci_BackedgeEntry* entry, uint8_t state);
 
 // Atomically increment the backedge count and return the new value.
 // Uses _Py_atomic_add_int_relaxed under free-threading builds.
-uint32_t Ci_BackedgeIncrement(Ci_BackedgeEntry* entry);
+uint32_t Ci_OSR_BackedgeIncrement(Ci_BackedgeEntry* entry);
 
 // Compute the loop-header target code-unit index from a backedge instruction.
 // target = source_idx + 1 + inlineCacheSize(code, source_idx) - oparg
-uint32_t Ci_ComputeJumpTargetIndex(
+uint32_t Ci_OSR_ComputeJumpTargetIndex(
     PyCodeObject* code,
     uint32_t source_idx,
-    int oparg);
+    uint32_t oparg);
 
 // ---------------------------------------------------------------------------
 // OSR eligibility and entry (Feature Items 1 + 3)
@@ -110,7 +120,10 @@ uint32_t Ci_ComputeJumpTargetIndex(
 // Check if a frame is eligible for OSR at the current backedge point.
 // Fast-path rejection for unsupported frame forms (generator, non-empty stack,
 // non-function frame, escaped frame, free-threading, non-kNormal mode).
-bool Ci_OSR_IsEligible(_PyInterpreterFrame* frame, PyCodeObject* code);
+bool Ci_OSR_IsEligible(
+    PyThreadState* tstate,
+    _PyInterpreterFrame* frame,
+    PyCodeObject* code);
 
 // Attempt OSR: compile (if needed) and enter JIT code from the loop header.
 //
@@ -139,7 +152,7 @@ int Ci_OSR_TryOSR(
     PyThreadState* tstate,
     _PyInterpreterFrame* frame,
     _Py_CODEUNIT* this_instr,
-    int oparg,
+    uint32_t oparg,
     PyObject** out_result);
 
 // ---------------------------------------------------------------------------
@@ -155,9 +168,16 @@ void Ci_OSR_ResetState(PyCodeObject* code);
 // Test hooks (for RuntimeTests only, not called from production code)
 // ---------------------------------------------------------------------------
 
-// Hook type for TryOSR testing. Receives opaque state pointer, returns
-// the same three-state value as Ci_OSR_TryOSR.
-typedef int (*TryOSRHook)(void* state);
+// Hook type for TryOSR testing. Receives the same call context as
+// Ci_OSR_TryOSR plus an opaque state pointer, and returns the same
+// three-state value as Ci_OSR_TryOSR.
+typedef int (*TryOSRHook)(
+    PyThreadState* tstate,
+    _PyInterpreterFrame* frame,
+    _Py_CODEUNIT* this_instr,
+    uint32_t oparg,
+    PyObject** out_result,
+    void* state);
 
 // Install/remove a test hook for Ci_OSR_TryOSR. When installed, the hook
 // is called instead of the real TryOSR implementation.
