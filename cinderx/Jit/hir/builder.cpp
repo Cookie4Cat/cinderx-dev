@@ -3445,9 +3445,14 @@ void HIRBuilder::emitLoadGlobal(
     }
     tc.emit<LoadGlobalCached>(
         result, code_, preloader_.builtins(), preloader_.globals(), name_idx);
-    auto guard_is = tc.emit<GuardIs>(result, value, result);
+    DeoptBase* guard;
+    if (PyLong_CheckExact(value.get())) {
+      guard = tc.emit<GuardType>(result, TLongExact, result);
+    } else {
+      guard = tc.emit<GuardIs>(result, value, result);
+    }
     BorrowedRef<> name = PyTuple_GET_ITEM(code_->co_names, name_idx);
-    guard_is->setDescr(fmt::format("LOAD_GLOBAL: {}", PyUnicode_AsUTF8(name)));
+    guard->setDescr(fmt::format("LOAD_GLOBAL: {}", PyUnicode_AsUTF8(name)));
     return true;
   };
 
