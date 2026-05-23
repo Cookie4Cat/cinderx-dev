@@ -39,6 +39,9 @@ class BytecodeInstruction {
   // This will never return an EXTENDED_ARG opcode, those get combined by the
   // BytecodeInstructionBlock into a single BytecodeInstruction.  The multi-byte
   // oparg will be return in one go from oparg().
+  // opcode() returns the unspecialized base opcode (e.g. BINARY_OP, not
+  // BINARY_OP_ADD_INT). Use specializedOpcode() to recover the specialized
+  // variant for guard selection.
   int opcode() const;
   int specializedOpcode() const;
   int oparg() const;

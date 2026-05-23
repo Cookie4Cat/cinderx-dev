@@ -710,6 +710,13 @@ FlagProcessor initFlagProcessor() {
       "JIT specialized opcodes or to fall back to their generic counterparts.");
 
   flag_processor.addOption(
+      "jit-backedge-gated-int-guards",
+      "PYTHONJITBACKEDGEGATEDINTGUARDS",
+      getMutableConfig().backedge_gated_int_guards,
+      "Only emit exact-int guards for specialized numeric opcodes in code "
+      "objects that contain a loop backedge.");
+
+  flag_processor.addOption(
       "jit-compact-long-guards",
       "PYTHONJITCOMPACTLONGGUARDS",
       getMutableConfig().compact_long_guards,
