@@ -321,7 +321,7 @@ void GenerateBoxedReturnWrapperBlocks(
 // Build post-regalloc LIR blocks for the deopt trampoline (stage 3).
 // This is a standalone code generator — it does not operate on a per-function
 // LIR function. It builds LIR blocks that:
-//   1. Save all GP registers (VariadicPush)
+//   1. Save registers needed by deopt (VariadicPush)
 //   2. Set up the deopt frame (kMove/kLea instructions)
 //   3. Call prepareForDeopt
 //   4. Clean up saved registers (kMove/kLea instructions)

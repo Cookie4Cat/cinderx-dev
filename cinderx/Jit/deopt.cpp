@@ -97,13 +97,15 @@ Ref<> MemoryView::readOwned(const LiveValue& value) const {
 
   switch (value.value_kind) {
     case jit::hir::ValueKind::kSigned: {
-      Py_ssize_t raw_signed = bit_cast<Py_ssize_t, uint64_t>(raw);
+      Py_ssize_t raw_signed = bit_cast<Py_ssize_t>(raw);
       return Ref<>::steal(PyLong_FromSsize_t(raw_signed));
     }
     case jit::hir::ValueKind::kUnsigned:
       return Ref<>::steal(PyLong_FromSize_t(raw));
-    case hir::ValueKind::kDouble:
-      return Ref<>::steal(PyFloat_FromDouble(raw));
+    case hir::ValueKind::kDouble: {
+      double raw_double = bit_cast<double>(raw);
+      return Ref<>::steal(PyFloat_FromDouble(raw_double));
+    }
     case jit::hir::ValueKind::kBool:
       return Ref<>::create(raw ? Py_True : Py_False);
     case jit::hir::ValueKind::kObject:
@@ -356,7 +358,7 @@ void reifyGeneratorFrame(
     const DeoptMetadata& meta,
     const DeoptFrameMetadata& frame_meta,
     const void* base) {
-  uint64_t regs[codegen::NUM_GP_REGS]{};
+  uint64_t regs[codegen::NUM_REGS]{};
   regs[codegen::arch::reg_frame_pointer_loc.loc] =
       reinterpret_cast<uint64_t>(base);
   constexpr bool force_deopt = false;
@@ -380,7 +382,7 @@ void releaseRefs(const DeoptMetadata& meta, const MemoryView& mem) {
 }
 
 void releaseRefs(const DeoptMetadata& meta, const void* base) {
-  uint64_t regs[codegen::NUM_GP_REGS]{};
+  uint64_t regs[codegen::NUM_REGS]{};
   regs[codegen::arch::reg_frame_pointer_loc.loc] =
       reinterpret_cast<uint64_t>(base);
   releaseRefs(meta, MemoryView{regs});

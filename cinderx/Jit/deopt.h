@@ -210,7 +210,7 @@ using CiPyFrameObjType = _PyInterpreterFrame;
 // DeoptMetadatas. It may be size_t(-1) to indicate that `meta` is transient
 // and not in Runtime's list.
 //
-// The `regs` argument contains the values of all general purpose registers,
+// The `regs` argument contains the values of all saved machine registers,
 // in the same order as they appear in `jit::codegen::PhyLocation`.
 //
 // After this function is called, ownership of all references specified by
