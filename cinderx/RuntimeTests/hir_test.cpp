@@ -30,6 +30,18 @@ HIRPrinter fullPrinter() {
   return HIRPrinter{}.setFullSnapshots(true);
 }
 
+size_t countOpcode(const Function& func, Opcode opcode) {
+  size_t count = 0;
+  for (const auto& block : func.cfg.blocks) {
+    for (const auto& instr : block) {
+      if (instr.opcode() == opcode) {
+        count++;
+      }
+    }
+  }
+  return count;
+}
+
 TEST(BasicBlockTest, CanAppendInstrs) {
   Environment env;
   BasicBlock block;
@@ -608,6 +620,101 @@ TEST_F(HIRBuildTest, GetLength) {
 )";
   EXPECT_EQ(fullPrinter().ToString(*(irfunc)), expected);
 }
+
+#ifndef Py_GIL_DISABLED
+TEST_F(HIRBuildTest, TupleSpecializedUnpackKeepsListFastPath) {
+  const char* src = R"(
+T = (1, 2, 3)
+
+def test(seq):
+    a, b, c = seq
+    return a + b + c
+)";
+
+  Ref<PyFunctionObject> func(compileAndGet(src, "test"));
+  ASSERT_NE(func.get(), nullptr);
+  Ref<> tuple(getGlobal("T"));
+  ASSERT_NE(tuple.get(), nullptr);
+
+  for (int i = 0; i < 100; i++) {
+    auto result = Ref<>::steal(PyObject_CallFunctionObjArgs(
+        reinterpret_cast<PyObject*>(func.get()), tuple.get(), nullptr));
+    ASSERT_NE(result.get(), nullptr);
+    ASSERT_TRUE(isIntEquals(result, 6));
+  }
+
+  std::unique_ptr<Function> irfunc(buildHIR(func));
+  ASSERT_NE(irfunc, nullptr);
+
+  EXPECT_EQ(countOpcode(*irfunc, Opcode::kUnpackSequence), 0);
+  EXPECT_EQ(countOpcode(*irfunc, Opcode::kReserveStack), 0);
+  EXPECT_EQ(countOpcode(*irfunc, Opcode::kCondBranchCheckType), 2);
+  EXPECT_EQ(countOpcode(*irfunc, Opcode::kLoadFieldAddress), 1);
+  EXPECT_EQ(countOpcode(*irfunc, Opcode::kLoadField), 1);
+}
+
+TEST_F(HIRBuildTest, ListSpecializedUnpackKeepsTupleFastPath) {
+  const char* src = R"(
+L = [1, 2, 3]
+
+def test(seq):
+    a, b, c = seq
+    return a + b + c
+)";
+
+  Ref<PyFunctionObject> func(compileAndGet(src, "test"));
+  ASSERT_NE(func.get(), nullptr);
+  Ref<> list(getGlobal("L"));
+  ASSERT_NE(list.get(), nullptr);
+
+  for (int i = 0; i < 100; i++) {
+    auto result = Ref<>::steal(PyObject_CallFunctionObjArgs(
+        reinterpret_cast<PyObject*>(func.get()), list.get(), nullptr));
+    ASSERT_NE(result.get(), nullptr);
+    ASSERT_TRUE(isIntEquals(result, 6));
+  }
+
+  std::unique_ptr<Function> irfunc(buildHIR(func));
+  ASSERT_NE(irfunc, nullptr);
+
+  EXPECT_EQ(countOpcode(*irfunc, Opcode::kUnpackSequence), 0);
+  EXPECT_EQ(countOpcode(*irfunc, Opcode::kReserveStack), 0);
+  EXPECT_EQ(countOpcode(*irfunc, Opcode::kCondBranchCheckType), 2);
+  EXPECT_EQ(countOpcode(*irfunc, Opcode::kLoadField), 1);
+  EXPECT_EQ(countOpcode(*irfunc, Opcode::kLoadFieldAddress), 1);
+}
+
+TEST_F(HIRBuildTest, TwoTupleSpecializedUnpackKeepsListFastPath) {
+  const char* src = R"(
+T = (1, 2)
+
+def test(seq):
+    a, b = seq
+    return a + b
+)";
+
+  Ref<PyFunctionObject> func(compileAndGet(src, "test"));
+  ASSERT_NE(func.get(), nullptr);
+  Ref<> tuple(getGlobal("T"));
+  ASSERT_NE(tuple.get(), nullptr);
+
+  for (int i = 0; i < 100; i++) {
+    auto result = Ref<>::steal(PyObject_CallFunctionObjArgs(
+        reinterpret_cast<PyObject*>(func.get()), tuple.get(), nullptr));
+    ASSERT_NE(result.get(), nullptr);
+    ASSERT_TRUE(isIntEquals(result, 3));
+  }
+
+  std::unique_ptr<Function> irfunc(buildHIR(func));
+  ASSERT_NE(irfunc, nullptr);
+
+  EXPECT_EQ(countOpcode(*irfunc, Opcode::kUnpackSequence), 0);
+  EXPECT_EQ(countOpcode(*irfunc, Opcode::kReserveStack), 0);
+  EXPECT_EQ(countOpcode(*irfunc, Opcode::kCondBranchCheckType), 2);
+  EXPECT_EQ(countOpcode(*irfunc, Opcode::kLoadFieldAddress), 1);
+  EXPECT_EQ(countOpcode(*irfunc, Opcode::kLoadField), 1);
+}
+#endif
 
 #if PY_VERSION_HEX < 0x030E0000
 TEST_F(HIRBuildTest, LoadAssertionError) {
