@@ -553,6 +553,8 @@ class HIRBuilder {
   // Tracks the most recent constant read from a KW_NAMES opcode.
   Register* kwnames_{nullptr};
 
+  bool code_has_backedge_{false};
+
   OperandStack static_method_stack_;
 };
 

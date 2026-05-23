@@ -5,6 +5,9 @@
 #include <gtest/gtest.h>
 #include <string>
 
+#include <vector>
+
+#include "cinderx/Common/code.h"
 #include "cinderx/Common/ref.h"
 #include "cinderx/Interpreter/cinder_opcode.h"
 #include "cinderx/Jit/compiler.h"
@@ -592,6 +595,35 @@ class HIRBuildTest : public RuntimeTest {
 
     return buildHIR(func);
   }
+
+  std::unique_ptr<Function> build_specialized_source(
+      const char* src,
+      int specialized_opcode,
+      int backedge_opcode = 0) {
+    Ref<PyFunctionObject> func(compileAndGet(src, "test"));
+    PyCodeObject* code = reinterpret_cast<PyCodeObject*>(func->func_code);
+
+    replaceFirstOpcode(
+        code, unspecialize(specialized_opcode), specialized_opcode);
+    if (backedge_opcode != 0) {
+      replaceFirstOpcode(code, JUMP_BACKWARD, backedge_opcode);
+    }
+
+    return buildHIR(func);
+  }
+
+ private:
+  void replaceFirstOpcode(PyCodeObject* code, int from_opcode, int to_opcode) {
+    for (size_t i = 0, n = countIndices(code); i < n; ++i) {
+      _Py_CODEUNIT* instr = codeUnit(code) + i;
+      if (_Py_OPCODE(*instr) == from_opcode) {
+        *instr = _Py_MAKE_CODEUNIT(to_opcode, _Py_OPARG(*instr));
+        return;
+      }
+    }
+
+    FAIL() << "Did not find opcode " << opcodeName(from_opcode);
+  }
 };
 
 TEST_F(HIRBuildTest, ExactIntGlobalLoadUsesGuardType) {
@@ -837,6 +869,80 @@ def test(seq):
   EXPECT_EQ(countOpcode(*irfunc, Opcode::kLoadFieldAddress), 1);
   EXPECT_EQ(countOpcode(*irfunc, Opcode::kLoadField), 1);
 }
+#endif
+
+#if PY_VERSION_HEX >= 0x030C0000
+TEST_F(HIRBuildTest, NoBackedgeSpecializedIntBinaryOpSkipsLongExactGuards) {
+  std::unique_ptr<Function> irfunc = build_specialized_source(
+      "def test(a, b):\n"
+      "    return a + b\n",
+      BINARY_OP_ADD_INT);
+
+  std::string hir = fullPrinter().ToString(*irfunc);
+  EXPECT_EQ(countSubstring(hir, "GuardType<LongExact>"), 0);
+}
+
+TEST_F(HIRBuildTest, BackedgeSpecializedIntBinaryOpKeepsLongExactGuards) {
+  std::unique_ptr<Function> irfunc = build_specialized_source(
+      "def test(a, b):\n"
+      "    while True:\n"
+      "        a + b\n",
+      BINARY_OP_ADD_INT);
+
+  std::string hir = fullPrinter().ToString(*irfunc);
+  EXPECT_EQ(countSubstring(hir, "GuardType<LongExact>"), 2);
+}
+
+TEST_F(HIRBuildTest, NoBackedgeSpecializedIntCompareSkipsLongExactGuards) {
+  std::unique_ptr<Function> irfunc = build_specialized_source(
+      "def test(a, b):\n"
+      "    return a < b\n",
+      COMPARE_OP_INT);
+
+  std::string hir = fullPrinter().ToString(*irfunc);
+  EXPECT_EQ(countSubstring(hir, "GuardType<LongExact>"), 0);
+}
+
+TEST_F(HIRBuildTest, BackedgeSpecializedIntCompareKeepsLongExactGuards) {
+  std::unique_ptr<Function> irfunc = build_specialized_source(
+      "def test(a, b):\n"
+      "    while True:\n"
+      "        a < b\n",
+      COMPARE_OP_INT);
+
+  std::string hir = fullPrinter().ToString(*irfunc);
+  EXPECT_EQ(countSubstring(hir, "GuardType<LongExact>"), 2);
+}
+
+#if PY_VERSION_HEX >= 0x030E0000
+TEST_F(
+    HIRBuildTest,
+    JumpBackwardJitOpcodeSpecializedIntBinaryOpKeepsLongExactGuards) {
+  std::unique_ptr<Function> irfunc = build_specialized_source(
+      "def test(a, b):\n"
+      "    while True:\n"
+      "        a + b\n",
+      BINARY_OP_ADD_INT,
+      JUMP_BACKWARD_JIT);
+
+  std::string hir = fullPrinter().ToString(*irfunc);
+  EXPECT_EQ(countSubstring(hir, "GuardType<LongExact>"), 2);
+}
+
+TEST_F(
+    HIRBuildTest,
+    JumpBackwardNoJitOpcodeSpecializedIntCompareKeepsLongExactGuards) {
+  std::unique_ptr<Function> irfunc = build_specialized_source(
+      "def test(a, b):\n"
+      "    while True:\n"
+      "        a < b\n",
+      COMPARE_OP_INT,
+      JUMP_BACKWARD_NO_JIT);
+
+  std::string hir = fullPrinter().ToString(*irfunc);
+  EXPECT_EQ(countSubstring(hir, "GuardType<LongExact>"), 2);
+}
+#endif
 #endif
 
 #if PY_VERSION_HEX < 0x030E0000

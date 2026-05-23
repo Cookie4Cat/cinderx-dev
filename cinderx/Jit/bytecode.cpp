@@ -118,6 +118,10 @@ bool BytecodeInstruction::isBranch() const {
     case JUMP_ABSOLUTE:
     case JUMP_BACKWARD:
     case JUMP_BACKWARD_NO_INTERRUPT:
+#if PY_VERSION_HEX >= 0x030E0000
+    case JUMP_BACKWARD_JIT:
+    case JUMP_BACKWARD_NO_JIT:
+#endif
     case JUMP_FORWARD:
     case JUMP_IF_FALSE_OR_POP:
     case JUMP_IF_NONZERO_OR_POP:
@@ -168,7 +172,11 @@ BCOffset BytecodeInstruction::getJumpTarget() const {
   }
 
   int delta = oparg();
-  if (opcode() == JUMP_BACKWARD || opcode() == JUMP_BACKWARD_NO_INTERRUPT) {
+  if (opcode() == JUMP_BACKWARD || opcode() == JUMP_BACKWARD_NO_INTERRUPT
+#if PY_VERSION_HEX >= 0x030E0000
+      || opcode() == JUMP_BACKWARD_JIT || opcode() == JUMP_BACKWARD_NO_JIT
+#endif
+  ) {
     delta = -delta;
   }
   BCIndex target = BCIndex{nextInstrOffset()} + delta;
