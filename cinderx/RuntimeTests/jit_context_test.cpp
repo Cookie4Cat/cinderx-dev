@@ -60,7 +60,6 @@ foo = "hello"
   ASSERT_EQ(result, Py_None);
 }
 
-// test_520 JIT context and pyjit coverage
 class JITConfigTest : public RuntimeTest {};
 
 
@@ -638,7 +637,6 @@ def func_b():
   EXPECT_TRUE(jit_ctx_->didCompile(func_b));
 }
 
-// test_520 additional JIT runtime coverage
 class JITPyjitApiTest : public RuntimeTest {
  public:
   void SetUp() override {
@@ -1427,7 +1425,6 @@ def func():
   ASSERT_NE(frame_state->globals(), nullptr);
 }
 
-// test_520 JIT generator runtime coverage
 class JITGeneratorTest : public RuntimeTest {
  public:
   void SetUp() override {
