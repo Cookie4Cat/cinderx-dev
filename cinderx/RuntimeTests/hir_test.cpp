@@ -7,6 +7,7 @@
 
 #include "cinderx/Common/ref.h"
 #include "cinderx/Interpreter/cinder_opcode.h"
+#include "cinderx/Jit/bytecode.h"
 #include "cinderx/Jit/compiler.h"
 #include "cinderx/Jit/hir/builder.h"
 #include "cinderx/Jit/hir/hir.h"
@@ -15,6 +16,7 @@
 #include "cinderx/Jit/hir/printer.h"
 #include "cinderx/Jit/hir/refcount_insertion.h"
 #include "cinderx/Jit/hir/ssa.h"
+#include "cinderx/Jit/pyjit.h"
 #include "cinderx/RuntimeTests/fixtures.h"
 
 extern "C" {
@@ -50,6 +52,16 @@ size_t countOpcode(const Function& func, Opcode opcode) {
     }
   }
   return count;
+}
+
+bool hasSpecializedOpcode(BorrowedRef<PyFunctionObject> func, int opcode) {
+  BorrowedRef<PyCodeObject> code{func->func_code};
+  for (const auto& instr : BytecodeInstructionBlock{code}) {
+    if (instr.specializedOpcode() == opcode) {
+      return true;
+    }
+  }
+  return false;
 }
 
 TEST(BasicBlockTest, CanAppendInstrs) {
@@ -836,6 +848,227 @@ def test(seq):
   EXPECT_EQ(countOpcode(*irfunc, Opcode::kCondBranchCheckType), 2);
   EXPECT_EQ(countOpcode(*irfunc, Opcode::kLoadFieldAddress), 1);
   EXPECT_EQ(countOpcode(*irfunc, Opcode::kLoadField), 1);
+}
+
+TEST_F(HIRBuildTest, SlotSpecializedLoadAndStoreUseFieldOps) {
+  const char* src = R"(
+class SlotValue:
+    __slots__ = ("value",)
+
+obj = SlotValue()
+obj.value = 0
+
+def test(obj):
+    obj.value = obj.value + 1
+    return obj.value
+)";
+
+  Ref<PyFunctionObject> func(compileAndGet(src, "test"));
+  ASSERT_NE(func.get(), nullptr);
+  Ref<> obj(getGlobal("obj"));
+  ASSERT_NE(obj.get(), nullptr);
+
+  for (int i = 0; i < 100; i++) {
+    auto result = Ref<>::steal(PyObject_CallFunctionObjArgs(
+        reinterpret_cast<PyObject*>(func.get()), obj.get(), nullptr));
+    ASSERT_NE(result.get(), nullptr);
+    ASSERT_TRUE(isIntEquals(result, i + 1));
+  }
+  ASSERT_TRUE(hasSpecializedOpcode(func, LOAD_ATTR_SLOT));
+  ASSERT_TRUE(hasSpecializedOpcode(func, STORE_ATTR_SLOT));
+
+  std::unique_ptr<Function> irfunc(buildHIR(func));
+  ASSERT_NE(irfunc, nullptr);
+
+  std::string hir = fullPrinter().ToString(*irfunc);
+  EXPECT_EQ(countOpcode(*irfunc, Opcode::kLoadAttr), 0) << hir;
+  EXPECT_EQ(countOpcode(*irfunc, Opcode::kLoadAttrCached), 0) << hir;
+  EXPECT_EQ(countOpcode(*irfunc, Opcode::kStoreAttr), 0) << hir;
+  EXPECT_EQ(countOpcode(*irfunc, Opcode::kStoreAttrCached), 0) << hir;
+  EXPECT_GE(countOpcode(*irfunc, Opcode::kLoadField), 3) << hir;
+  EXPECT_GE(countOpcode(*irfunc, Opcode::kStoreField), 1) << hir;
+  EXPECT_GE(countOpcode(*irfunc, Opcode::kGuard), 3) << hir;
+}
+
+TEST_F(HIRBuildTest, SlotSpecializedLoadMethodUsesFieldOps) {
+  const char* src = R"(
+def target():
+    return 42
+
+class SlotCallable:
+    __slots__ = ("fn",)
+
+obj = SlotCallable()
+obj.fn = target
+
+def test(obj):
+    return obj.fn()
+)";
+
+  Ref<PyFunctionObject> func(compileAndGet(src, "test"));
+  ASSERT_NE(func.get(), nullptr);
+  Ref<> obj(getGlobal("obj"));
+  ASSERT_NE(obj.get(), nullptr);
+
+  for (int i = 0; i < 100; i++) {
+    auto result = Ref<>::steal(PyObject_CallFunctionObjArgs(
+        reinterpret_cast<PyObject*>(func.get()), obj.get(), nullptr));
+    ASSERT_NE(result.get(), nullptr);
+    ASSERT_TRUE(isIntEquals(result, 42));
+  }
+  ASSERT_TRUE(hasSpecializedOpcode(func, LOAD_ATTR_SLOT));
+
+  std::unique_ptr<Function> irfunc(buildHIR(func));
+  ASSERT_NE(irfunc, nullptr);
+
+  std::string hir = fullPrinter().ToString(*irfunc);
+  EXPECT_EQ(countOpcode(*irfunc, Opcode::kLoadAttr), 0) << hir;
+  EXPECT_EQ(countOpcode(*irfunc, Opcode::kLoadAttrCached), 0) << hir;
+  EXPECT_EQ(countOpcode(*irfunc, Opcode::kLoadMethod), 0) << hir;
+  EXPECT_GE(countOpcode(*irfunc, Opcode::kLoadField), 1) << hir;
+  EXPECT_GE(countOpcode(*irfunc, Opcode::kGuard), 1) << hir;
+}
+
+TEST_F(HIRBuildTest, MemberDescriptorStoreSimplifiesToStoreField) {
+  const char* src = R"(
+class SlotValue:
+    __slots__ = ("value",)
+
+obj = SlotValue()
+obj.value = 0
+
+def test(value):
+    obj.value = value
+    return obj.value
+)";
+
+  Ref<PyFunctionObject> func(compileAndGet(src, "test"));
+  ASSERT_NE(func.get(), nullptr);
+
+  std::unique_ptr<Function> irfunc(buildHIR(func));
+  ASSERT_NE(irfunc, nullptr);
+  Compiler::runPasses(*irfunc, PassConfig::kSimplify);
+
+  std::string hir = fullPrinter().ToString(*irfunc);
+  EXPECT_EQ(countOpcode(*irfunc, Opcode::kStoreAttr), 0) << hir;
+  EXPECT_EQ(countOpcode(*irfunc, Opcode::kStoreAttrCached), 0) << hir;
+  EXPECT_GE(countOpcode(*irfunc, Opcode::kStoreField), 1) << hir;
+  EXPECT_GE(countOpcode(*irfunc, Opcode::kLoadField), 1) << hir;
+}
+
+TEST_F(HIRBuildTest, ReadonlyMemberDescriptorStoreStaysGeneric) {
+  const char* src = R"(
+def test(value):
+    test.__globals__ = value
+)";
+
+  Ref<PyFunctionObject> func(compileAndGet(src, "test"));
+  ASSERT_NE(func.get(), nullptr);
+
+  std::unique_ptr<Function> irfunc(buildHIR(func));
+  ASSERT_NE(irfunc, nullptr);
+  Compiler::runPasses(*irfunc, PassConfig::kSimplify);
+
+  std::string hir = fullPrinter().ToString(*irfunc);
+  EXPECT_EQ(countOpcode(*irfunc, Opcode::kStoreField), 0) << hir;
+  EXPECT_EQ(countOpcode(*irfunc, Opcode::kStoreAttr), 0) << hir;
+  EXPECT_GE(countOpcode(*irfunc, Opcode::kStoreAttrCached), 1) << hir;
+}
+
+TEST_F(HIRBuildTest, SlotLoadTypeVersionGuardFallsBackAfterDescriptorChange) {
+  const char* src = R"(
+class SlotValue:
+    __slots__ = ("value",)
+
+obj = SlotValue()
+obj.value = 1
+
+def test(obj):
+    return obj.value
+
+def replace_descriptor():
+    SlotValue.value = property(lambda self: 99)
+)";
+
+  Ref<PyFunctionObject> func(compileAndGet(src, "test"));
+  ASSERT_NE(func.get(), nullptr);
+  Ref<> obj(getGlobal("obj"));
+  ASSERT_NE(obj.get(), nullptr);
+  Ref<PyFunctionObject> replace_descriptor(getGlobal("replace_descriptor"));
+  ASSERT_NE(replace_descriptor.get(), nullptr);
+
+  for (int i = 0; i < 100; i++) {
+    auto result = Ref<>::steal(PyObject_CallFunctionObjArgs(
+        reinterpret_cast<PyObject*>(func.get()), obj.get(), nullptr));
+    ASSERT_NE(result.get(), nullptr);
+    ASSERT_TRUE(isIntEquals(result, 1));
+  }
+  ASSERT_TRUE(hasSpecializedOpcode(func, LOAD_ATTR_SLOT));
+  ASSERT_EQ(jit::compileFunction(func), jit::Result::OK);
+
+  auto replace_result = Ref<>::steal(PyObject_CallFunctionObjArgs(
+      reinterpret_cast<PyObject*>(replace_descriptor.get()), nullptr));
+  ASSERT_NE(replace_result.get(), nullptr);
+
+  auto result = Ref<>::steal(PyObject_CallFunctionObjArgs(
+      reinterpret_cast<PyObject*>(func.get()), obj.get(), nullptr));
+  ASSERT_NE(result.get(), nullptr);
+  ASSERT_TRUE(isIntEquals(result, 99));
+}
+
+TEST_F(HIRBuildTest, SlotStoreTypeVersionGuardFallsBackAfterDescriptorChange) {
+  const char* src = R"(
+events = []
+
+class SlotValue:
+    __slots__ = ("value",)
+
+obj = SlotValue()
+obj.value = 1
+
+def test(obj, value):
+    obj.value = value
+    return "done"
+
+def replace_descriptor():
+    SlotValue.value = property(lambda self: 99, lambda self, value: events.append(value))
+)";
+
+  Ref<PyFunctionObject> func(compileAndGet(src, "test"));
+  ASSERT_NE(func.get(), nullptr);
+  Ref<> obj(getGlobal("obj"));
+  ASSERT_NE(obj.get(), nullptr);
+  Ref<> events(getGlobal("events"));
+  ASSERT_NE(events.get(), nullptr);
+  ASSERT_TRUE(PyList_Check(events.get()));
+  Ref<PyFunctionObject> replace_descriptor(getGlobal("replace_descriptor"));
+  ASSERT_NE(replace_descriptor.get(), nullptr);
+
+  for (int i = 0; i < 100; i++) {
+    auto value = Ref<>::steal(PyLong_FromLong(i));
+    ASSERT_NE(value.get(), nullptr);
+    auto result = Ref<>::steal(PyObject_CallFunctionObjArgs(
+        reinterpret_cast<PyObject*>(func.get()),
+        obj.get(),
+        value.get(),
+        nullptr));
+    ASSERT_NE(result.get(), nullptr);
+  }
+  ASSERT_TRUE(hasSpecializedOpcode(func, STORE_ATTR_SLOT));
+  ASSERT_EQ(jit::compileFunction(func), jit::Result::OK);
+
+  auto replace_result = Ref<>::steal(PyObject_CallFunctionObjArgs(
+      reinterpret_cast<PyObject*>(replace_descriptor.get()), nullptr));
+  ASSERT_NE(replace_result.get(), nullptr);
+
+  auto value = Ref<>::steal(PyLong_FromLong(42));
+  ASSERT_NE(value.get(), nullptr);
+  auto result = Ref<>::steal(PyObject_CallFunctionObjArgs(
+      reinterpret_cast<PyObject*>(func.get()), obj.get(), value.get(), nullptr));
+  ASSERT_NE(result.get(), nullptr);
+  ASSERT_TRUE(PyUnicode_Check(result.get()));
+  EXPECT_EQ(PyList_GET_SIZE(events.get()), 1);
+  ASSERT_TRUE(isIntEquals(PyList_GET_ITEM(events.get(), 0), 42));
 }
 #endif
 
