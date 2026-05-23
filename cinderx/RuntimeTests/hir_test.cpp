@@ -3,6 +3,7 @@
 #include "cinderx/python.h"
 
 #include <gtest/gtest.h>
+#include <string>
 
 #include "cinderx/Common/ref.h"
 #include "cinderx/Interpreter/cinder_opcode.h"
@@ -1317,6 +1318,65 @@ TEST_F(HIRBuildTest, ListToTuple) {
 #endif
   EXPECT_EQ(fullPrinter().ToString(*(irfunc)), expected);
 }
+
+#ifdef BINARY_OP_SUBSCR_DICT
+TEST_F(HIRBuildTest, BinaryOpSubscrDictSpecializationGuards) {
+  const char* src = R"(
+def test(container, key):
+    return container[key]
+
+for _ in range(100):
+    test({"a": "b"}, "a")
+)";
+  Ref<PyFunctionObject> func(compileAndGet(src, "test"));
+  ASSERT_NE(func.get(), nullptr);
+
+  std::unique_ptr<Function> irfunc(buildHIR(func));
+  const std::string hir = fullPrinter().ToString(*irfunc);
+  EXPECT_NE(hir.find("GuardType<DictExact>"), std::string::npos) << hir;
+  EXPECT_NE(hir.find("BinaryOp<Subscript>"), std::string::npos) << hir;
+}
+#endif
+
+#ifdef BINARY_OP_SUBSCR_LIST_INT
+TEST_F(HIRBuildTest, BinaryOpSubscrListIntSpecializationGuards) {
+  const char* src = R"(
+def test(container, index):
+    return container[index]
+
+for _ in range(100):
+    test(["a", "b"], 0)
+)";
+  Ref<PyFunctionObject> func(compileAndGet(src, "test"));
+  ASSERT_NE(func.get(), nullptr);
+
+  std::unique_ptr<Function> irfunc(buildHIR(func));
+  const std::string hir = fullPrinter().ToString(*irfunc);
+  EXPECT_NE(hir.find("GuardType<ListExact>"), std::string::npos) << hir;
+  EXPECT_NE(hir.find("GuardType<LongExact>"), std::string::npos) << hir;
+  EXPECT_NE(hir.find("BinaryOp<Subscript>"), std::string::npos) << hir;
+}
+#endif
+
+#ifdef BINARY_OP_SUBSCR_TUPLE_INT
+TEST_F(HIRBuildTest, BinaryOpSubscrTupleIntSpecializationGuards) {
+  const char* src = R"(
+def test(container, index):
+    return container[index]
+
+for _ in range(100):
+    test(("a", "b"), 0)
+)";
+  Ref<PyFunctionObject> func(compileAndGet(src, "test"));
+  ASSERT_NE(func.get(), nullptr);
+
+  std::unique_ptr<Function> irfunc(buildHIR(func));
+  const std::string hir = fullPrinter().ToString(*irfunc);
+  EXPECT_NE(hir.find("GuardType<TupleExact>"), std::string::npos) << hir;
+  EXPECT_NE(hir.find("GuardType<LongExact>"), std::string::npos) << hir;
+  EXPECT_NE(hir.find("BinaryOp<Subscript>"), std::string::npos) << hir;
+}
+#endif
 
 TEST_F(HIRBuildTest, LoadFastAndClear) {
   uint8_t bc[] = {
