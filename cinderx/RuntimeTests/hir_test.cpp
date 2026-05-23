@@ -30,6 +30,16 @@ HIRPrinter fullPrinter() {
   return HIRPrinter{}.setFullSnapshots(true);
 }
 
+size_t countSubstring(const std::string& haystack, const std::string& needle) {
+  size_t count = 0;
+  size_t pos = 0;
+  while ((pos = haystack.find(needle, pos)) != std::string::npos) {
+    ++count;
+    pos += needle.size();
+  }
+  return count;
+}
+
 size_t countOpcode(const Function& func, Opcode opcode) {
   size_t count = 0;
   for (const auto& block : func.cfg.blocks) {
@@ -583,6 +593,119 @@ class HIRBuildTest : public RuntimeTest {
     return buildHIR(func);
   }
 };
+
+TEST_F(HIRBuildTest, ExactIntGlobalLoadUsesGuardType) {
+  const char* src = R"(
+G = 257
+
+def test():
+    return G
+)";
+  std::unique_ptr<Function> irfunc;
+  ASSERT_NO_FATAL_FAILURE(CompileToHIR(src, "test", irfunc));
+  ASSERT_NE(irfunc, nullptr);
+
+  std::string hir = fullPrinter().ToString(*irfunc);
+  EXPECT_EQ(countSubstring(hir, "GuardType<LongExact>"), 1) << hir;
+  EXPECT_EQ(countSubstring(hir, "GuardIs<"), 0) << hir;
+}
+
+TEST_F(HIRBuildTest, ImmortalExactIntGlobalLoadUsesGuardType) {
+  const char* src = R"(
+G = 24
+
+def test():
+    return G
+)";
+  std::unique_ptr<Function> irfunc;
+  ASSERT_NO_FATAL_FAILURE(CompileToHIR(src, "test", irfunc));
+  ASSERT_NE(irfunc, nullptr);
+
+  std::string hir = fullPrinter().ToString(*irfunc);
+  EXPECT_EQ(countSubstring(hir, "GuardType<LongExact>"), 1) << hir;
+  EXPECT_EQ(countSubstring(hir, "GuardIs<"), 0) << hir;
+}
+
+TEST_F(HIRBuildTest, NonExactIntGlobalLoadKeepsGuardIs) {
+  const char* src = R"(
+G = True
+
+def test():
+    return G
+)";
+  std::unique_ptr<Function> irfunc;
+  ASSERT_NO_FATAL_FAILURE(CompileToHIR(src, "test", irfunc));
+  ASSERT_NE(irfunc, nullptr);
+
+  std::string hir = fullPrinter().ToString(*irfunc);
+  EXPECT_EQ(countSubstring(hir, "GuardType<LongExact>"), 0) << hir;
+  EXPECT_EQ(countSubstring(hir, "GuardIs<"), 1) << hir;
+}
+
+TEST_F(HIRBuildTest, IntSubclassGlobalLoadKeepsGuardIs) {
+  const char* src = R"(
+class MyInt(int):
+    pass
+
+G = MyInt(257)
+
+def test():
+    return G
+)";
+  std::unique_ptr<Function> irfunc;
+  ASSERT_NO_FATAL_FAILURE(CompileToHIR(src, "test", irfunc));
+  ASSERT_NE(irfunc, nullptr);
+
+  std::string hir = fullPrinter().ToString(*irfunc);
+  EXPECT_EQ(countSubstring(hir, "GuardType<LongExact>"), 0) << hir;
+  EXPECT_EQ(countSubstring(hir, "GuardIs<"), 1) << hir;
+}
+
+TEST_F(HIRBuildTest, FloatGlobalLoadKeepsGuardIs) {
+  const char* src = R"(
+G = 1.5
+
+def test():
+    return G
+)";
+  std::unique_ptr<Function> irfunc;
+  ASSERT_NO_FATAL_FAILURE(CompileToHIR(src, "test", irfunc));
+  ASSERT_NE(irfunc, nullptr);
+
+  std::string hir = fullPrinter().ToString(*irfunc);
+  EXPECT_EQ(countSubstring(hir, "GuardType<LongExact>"), 0) << hir;
+  EXPECT_EQ(countSubstring(hir, "GuardIs<"), 1) << hir;
+}
+
+TEST_F(HIRBuildTest, UnicodeGlobalLoadKeepsGuardIs) {
+  const char* src = R"(
+G = "foo"
+
+def test():
+    return G
+)";
+  std::unique_ptr<Function> irfunc;
+  ASSERT_NO_FATAL_FAILURE(CompileToHIR(src, "test", irfunc));
+  ASSERT_NE(irfunc, nullptr);
+
+  std::string hir = fullPrinter().ToString(*irfunc);
+  EXPECT_EQ(countSubstring(hir, "GuardType<LongExact>"), 0) << hir;
+  EXPECT_EQ(countSubstring(hir, "GuardIs<"), 1) << hir;
+}
+
+TEST_F(HIRBuildTest, BuiltinFunctionGlobalLoadKeepsGuardIs) {
+  const char* src = R"(
+def test():
+    return len
+)";
+  std::unique_ptr<Function> irfunc;
+  ASSERT_NO_FATAL_FAILURE(CompileToHIR(src, "test", irfunc));
+  ASSERT_NE(irfunc, nullptr);
+
+  std::string hir = fullPrinter().ToString(*irfunc);
+  EXPECT_EQ(countSubstring(hir, "GuardType<LongExact>"), 0) << hir;
+  EXPECT_EQ(countSubstring(hir, "GuardIs<"), 1) << hir;
+}
 
 TEST_F(HIRBuildTest, GetLength) {
   //  0 LOAD_FAST  0
