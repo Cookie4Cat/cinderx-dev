@@ -45,9 +45,9 @@ COVERAGE_TOOLS = ("gcov", "lcov", "genhtml")
 # Minimum coverage percentages enforced by --coverage after final lcov filters.
 # Tune these values when the accepted project baseline changes.
 COVERAGE_MIN_PERCENT = {
-    "line": 50.0,
+    "line": 70.0,
     "function": 60.0,
-    "branch": 30.0,
+    "branch": 40.0,
 }
 PIPELINES = {
     "pr": (
