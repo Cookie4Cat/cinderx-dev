@@ -132,6 +132,212 @@ fun test {
   }
 }
 --- Test Name ---
+SimplifyTupleSubscriptUsesGuardTypes
+--- Input ---
+# HIR
+fun test {
+  bb 0 {
+    v0 = LoadArg<0; "x">
+    v1 = LoadArg<1; "y">
+    v2 = GuardType<TupleExact> v0
+    v3 = GuardType<LongExact> v1
+    v4 = BinaryOp<Subscript> v2 v3 {
+      FrameState {
+        CurInstrOffset 6
+        Locals<2> v0 v1
+      }
+    }
+    v5 = Assign v4
+    v6 = LoadConst<NoneType>
+    Return v6
+  }
+}
+--- Expected 3.12 ---
+fun test {
+  bb 0 {
+    v0:Object = LoadArg<0>
+    v1:Object = LoadArg<1>
+    v2:TupleExact = GuardType<TupleExact> v0 {
+      FrameState {
+        CurInstrOffset -2
+      }
+    }
+    v3:LongExact = GuardType<LongExact> v1 {
+      FrameState {
+        CurInstrOffset -2
+      }
+    }
+    UseType<TupleExact> v2
+    UseType<LongExact> v3
+    v7:CInt64 = IndexUnbox<IndexError> v3
+    v8:CInt64 = IsNegativeAndErrOccurred v7 {
+      FrameState {
+        CurInstrOffset 6
+        Locals<2> v0 v1
+      }
+    }
+    v9:CInt64 = CheckSequenceBounds v2 v7 {
+      FrameState {
+        CurInstrOffset 6
+        Locals<2> v0 v1
+      }
+    }
+    v10:Object = LoadArrayItem<Offset[24]> v2 v9 v2
+    v6:NoneType = LoadConst<NoneType>
+    Return v6
+  }
+}
+--- Expected 3.14 ---
+fun test {
+  bb 0 {
+    v0:Object = LoadArg<0>
+    v1:Object = LoadArg<1>
+    v2:TupleExact = GuardType<TupleExact> v0 {
+      FrameState {
+        CurInstrOffset -2
+      }
+    }
+    v3:LongExact = GuardType<LongExact> v1 {
+      FrameState {
+        CurInstrOffset -2
+      }
+    }
+    UseType<TupleExact> v2
+    UseType<LongExact> v3
+    v7:CInt64 = IndexUnbox<IndexError> v3
+    v8:CInt64 = IsNegativeAndErrOccurred v7 {
+      FrameState {
+        CurInstrOffset 6
+        Locals<2> v0 v1
+      }
+    }
+    v9:CInt64 = CheckSequenceBounds v2 v7 {
+      FrameState {
+        CurInstrOffset 6
+        Locals<2> v0 v1
+      }
+    }
+    v10:Object = LoadArrayItem<Offset[32]> v2 v9 v2
+    v6:NoneType = LoadConst<NoneType>
+    Return v6
+  }
+}
+--- Expected 3.15 ---
+fun test {
+  bb 0 {
+    v0:Object = LoadArg<0>
+    v1:Object = LoadArg<1>
+    v2:TupleExact = GuardType<TupleExact> v0 {
+      FrameState {
+        CurInstrOffset -2
+      }
+    }
+    v3:LongExact = GuardType<LongExact> v1 {
+      FrameState {
+        CurInstrOffset -2
+      }
+    }
+    UseType<TupleExact> v2
+    UseType<LongExact> v3
+    v7:CInt64 = IndexUnbox<IndexError> v3
+    v8:CInt64 = IsNegativeAndErrOccurred v7 {
+      FrameState {
+        CurInstrOffset 6
+        Locals<2> v0 v1
+      }
+    }
+    v9:CInt64 = CheckSequenceBounds v2 v7 {
+      FrameState {
+        CurInstrOffset 6
+        Locals<2> v0 v1
+      }
+    }
+    v10:Object = LoadArrayItem<Offset[32]> v2 v9 v2
+    v6:NoneType = LoadConst<NoneType>
+    Return v6
+  }
+}
+--- Test Name ---
+SimplifyDictSubscriptUsesGuardTypes
+--- Input ---
+# HIR
+fun test {
+  bb 0 {
+    v0 = LoadArg<0; "x">
+    v1 = LoadArg<1; "y">
+    v2 = GuardType<DictExact> v0
+    v3 = BinaryOp<Subscript> v2 v1 {
+      FrameState {
+        CurInstrOffset 6
+        Locals<2> v0 v1
+      }
+    }
+    v4 = Assign v3
+    v5 = LoadConst<NoneType>
+    Return v5
+  }
+}
+--- Expected 3.12 ---
+fun test {
+  bb 0 {
+    v0:Object = LoadArg<0>
+    v1:Object = LoadArg<1>
+    v2:DictExact = GuardType<DictExact> v0 {
+      FrameState {
+        CurInstrOffset -2
+      }
+    }
+    v6:Object = DictSubscr v2 v1 {
+      FrameState {
+        CurInstrOffset 6
+        Locals<2> v0 v1
+      }
+    }
+    v5:NoneType = LoadConst<NoneType>
+    Return v5
+  }
+}
+--- Expected 3.14 ---
+fun test {
+  bb 0 {
+    v0:Object = LoadArg<0>
+    v1:Object = LoadArg<1>
+    v2:DictExact = GuardType<DictExact> v0 {
+      FrameState {
+        CurInstrOffset -2
+      }
+    }
+    v6:Object = DictSubscr v2 v1 {
+      FrameState {
+        CurInstrOffset 6
+        Locals<2> v0 v1
+      }
+    }
+    v5:NoneType = LoadConst<NoneType>
+    Return v5
+  }
+}
+--- Expected 3.15 ---
+fun test {
+  bb 0 {
+    v0:Object = LoadArg<0>
+    v1:Object = LoadArg<1>
+    v2:DictExact = GuardType<DictExact> v0 {
+      FrameState {
+        CurInstrOffset -2
+      }
+    }
+    v6:Object = DictSubscr v2 v1 {
+      FrameState {
+        CurInstrOffset 6
+        Locals<2> v0 v1
+      }
+    }
+    v5:NoneType = LoadConst<NoneType>
+    Return v5
+  }
+}
+--- Test Name ---
 IsTruthyUsesGuardTypes
 --- Input ---
 # HIR

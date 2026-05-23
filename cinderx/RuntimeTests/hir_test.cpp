@@ -3,6 +3,7 @@
 #include "cinderx/python.h"
 
 #include <gtest/gtest.h>
+#include <string>
 
 #include "cinderx/Common/ref.h"
 #include "cinderx/Interpreter/cinder_opcode.h"
@@ -35,6 +36,18 @@ size_t countSubstring(const std::string& haystack, const std::string& needle) {
   while ((pos = haystack.find(needle, pos)) != std::string::npos) {
     ++count;
     pos += needle.size();
+  }
+  return count;
+}
+
+size_t countOpcode(const Function& func, Opcode opcode) {
+  size_t count = 0;
+  for (const auto& block : func.cfg.blocks) {
+    for (const auto& instr : block) {
+      if (instr.opcode() == opcode) {
+        count++;
+      }
+    }
   }
   return count;
 }
@@ -730,6 +743,101 @@ TEST_F(HIRBuildTest, GetLength) {
 )";
   EXPECT_EQ(fullPrinter().ToString(*(irfunc)), expected);
 }
+
+#ifndef Py_GIL_DISABLED
+TEST_F(HIRBuildTest, TupleSpecializedUnpackKeepsListFastPath) {
+  const char* src = R"(
+T = (1, 2, 3)
+
+def test(seq):
+    a, b, c = seq
+    return a + b + c
+)";
+
+  Ref<PyFunctionObject> func(compileAndGet(src, "test"));
+  ASSERT_NE(func.get(), nullptr);
+  Ref<> tuple(getGlobal("T"));
+  ASSERT_NE(tuple.get(), nullptr);
+
+  for (int i = 0; i < 100; i++) {
+    auto result = Ref<>::steal(PyObject_CallFunctionObjArgs(
+        reinterpret_cast<PyObject*>(func.get()), tuple.get(), nullptr));
+    ASSERT_NE(result.get(), nullptr);
+    ASSERT_TRUE(isIntEquals(result, 6));
+  }
+
+  std::unique_ptr<Function> irfunc(buildHIR(func));
+  ASSERT_NE(irfunc, nullptr);
+
+  EXPECT_EQ(countOpcode(*irfunc, Opcode::kUnpackSequence), 0);
+  EXPECT_EQ(countOpcode(*irfunc, Opcode::kReserveStack), 0);
+  EXPECT_EQ(countOpcode(*irfunc, Opcode::kCondBranchCheckType), 2);
+  EXPECT_EQ(countOpcode(*irfunc, Opcode::kLoadFieldAddress), 1);
+  EXPECT_EQ(countOpcode(*irfunc, Opcode::kLoadField), 1);
+}
+
+TEST_F(HIRBuildTest, ListSpecializedUnpackKeepsTupleFastPath) {
+  const char* src = R"(
+L = [1, 2, 3]
+
+def test(seq):
+    a, b, c = seq
+    return a + b + c
+)";
+
+  Ref<PyFunctionObject> func(compileAndGet(src, "test"));
+  ASSERT_NE(func.get(), nullptr);
+  Ref<> list(getGlobal("L"));
+  ASSERT_NE(list.get(), nullptr);
+
+  for (int i = 0; i < 100; i++) {
+    auto result = Ref<>::steal(PyObject_CallFunctionObjArgs(
+        reinterpret_cast<PyObject*>(func.get()), list.get(), nullptr));
+    ASSERT_NE(result.get(), nullptr);
+    ASSERT_TRUE(isIntEquals(result, 6));
+  }
+
+  std::unique_ptr<Function> irfunc(buildHIR(func));
+  ASSERT_NE(irfunc, nullptr);
+
+  EXPECT_EQ(countOpcode(*irfunc, Opcode::kUnpackSequence), 0);
+  EXPECT_EQ(countOpcode(*irfunc, Opcode::kReserveStack), 0);
+  EXPECT_EQ(countOpcode(*irfunc, Opcode::kCondBranchCheckType), 2);
+  EXPECT_EQ(countOpcode(*irfunc, Opcode::kLoadField), 1);
+  EXPECT_EQ(countOpcode(*irfunc, Opcode::kLoadFieldAddress), 1);
+}
+
+TEST_F(HIRBuildTest, TwoTupleSpecializedUnpackKeepsListFastPath) {
+  const char* src = R"(
+T = (1, 2)
+
+def test(seq):
+    a, b = seq
+    return a + b
+)";
+
+  Ref<PyFunctionObject> func(compileAndGet(src, "test"));
+  ASSERT_NE(func.get(), nullptr);
+  Ref<> tuple(getGlobal("T"));
+  ASSERT_NE(tuple.get(), nullptr);
+
+  for (int i = 0; i < 100; i++) {
+    auto result = Ref<>::steal(PyObject_CallFunctionObjArgs(
+        reinterpret_cast<PyObject*>(func.get()), tuple.get(), nullptr));
+    ASSERT_NE(result.get(), nullptr);
+    ASSERT_TRUE(isIntEquals(result, 3));
+  }
+
+  std::unique_ptr<Function> irfunc(buildHIR(func));
+  ASSERT_NE(irfunc, nullptr);
+
+  EXPECT_EQ(countOpcode(*irfunc, Opcode::kUnpackSequence), 0);
+  EXPECT_EQ(countOpcode(*irfunc, Opcode::kReserveStack), 0);
+  EXPECT_EQ(countOpcode(*irfunc, Opcode::kCondBranchCheckType), 2);
+  EXPECT_EQ(countOpcode(*irfunc, Opcode::kLoadFieldAddress), 1);
+  EXPECT_EQ(countOpcode(*irfunc, Opcode::kLoadField), 1);
+}
+#endif
 
 #if PY_VERSION_HEX < 0x030E0000
 TEST_F(HIRBuildTest, LoadAssertionError) {
@@ -1441,6 +1549,65 @@ TEST_F(HIRBuildTest, ListToTuple) {
   EXPECT_EQ(fullPrinter().ToString(*(irfunc)), expected);
 }
 
+#ifdef BINARY_OP_SUBSCR_DICT
+TEST_F(HIRBuildTest, BinaryOpSubscrDictSpecializationGuards) {
+  const char* src = R"(
+def test(container, key):
+    return container[key]
+
+for _ in range(100):
+    test({"a": "b"}, "a")
+)";
+  Ref<PyFunctionObject> func(compileAndGet(src, "test"));
+  ASSERT_NE(func.get(), nullptr);
+
+  std::unique_ptr<Function> irfunc(buildHIR(func));
+  const std::string hir = fullPrinter().ToString(*irfunc);
+  EXPECT_NE(hir.find("GuardType<DictExact>"), std::string::npos) << hir;
+  EXPECT_NE(hir.find("BinaryOp<Subscript>"), std::string::npos) << hir;
+}
+#endif
+
+#ifdef BINARY_OP_SUBSCR_LIST_INT
+TEST_F(HIRBuildTest, BinaryOpSubscrListIntSpecializationGuards) {
+  const char* src = R"(
+def test(container, index):
+    return container[index]
+
+for _ in range(100):
+    test(["a", "b"], 0)
+)";
+  Ref<PyFunctionObject> func(compileAndGet(src, "test"));
+  ASSERT_NE(func.get(), nullptr);
+
+  std::unique_ptr<Function> irfunc(buildHIR(func));
+  const std::string hir = fullPrinter().ToString(*irfunc);
+  EXPECT_NE(hir.find("GuardType<ListExact>"), std::string::npos) << hir;
+  EXPECT_NE(hir.find("GuardType<LongExact>"), std::string::npos) << hir;
+  EXPECT_NE(hir.find("BinaryOp<Subscript>"), std::string::npos) << hir;
+}
+#endif
+
+#ifdef BINARY_OP_SUBSCR_TUPLE_INT
+TEST_F(HIRBuildTest, BinaryOpSubscrTupleIntSpecializationGuards) {
+  const char* src = R"(
+def test(container, index):
+    return container[index]
+
+for _ in range(100):
+    test(("a", "b"), 0)
+)";
+  Ref<PyFunctionObject> func(compileAndGet(src, "test"));
+  ASSERT_NE(func.get(), nullptr);
+
+  std::unique_ptr<Function> irfunc(buildHIR(func));
+  const std::string hir = fullPrinter().ToString(*irfunc);
+  EXPECT_NE(hir.find("GuardType<TupleExact>"), std::string::npos) << hir;
+  EXPECT_NE(hir.find("GuardType<LongExact>"), std::string::npos) << hir;
+  EXPECT_NE(hir.find("BinaryOp<Subscript>"), std::string::npos) << hir;
+}
+#endif
+
 TEST_F(HIRBuildTest, LoadFastAndClear) {
   uint8_t bc[] = {
       LOAD_FAST_AND_CLEAR, 1, LOAD_FAST_CHECK, 0, POP_TOP, 0, RETURN_VALUE, 0};
@@ -1504,4 +1671,477 @@ def test():
   EXPECT_FALSE(found_at_quiescent_state)
       << "AtQuiescentState should not be present in non-free-threaded builds";
 #endif
+}
+
+class HIRBuilderExtendedTest : public RuntimeTest {
+ public:
+  void SetUp() override {
+    RuntimeTest::SetUp();
+    jit_ctx_ = std::make_unique<jit::CompilerContext<jit::Compiler>>();
+    ASSERT_NE(jit_ctx_, nullptr);
+  }
+
+  void TearDown() override {
+    jit_ctx_.reset();
+    RuntimeTest::TearDown();
+  }
+
+  std::unique_ptr<jit::CompilerContext<jit::Compiler>> jit_ctx_;
+};
+
+TEST_F(HIRBuilderExtendedTest, BuildSimpleFunc) {
+  const char* py_src = R"(
+def func():
+    return 1
+)";
+
+  Ref<PyFunctionObject> func(compileAndGet(py_src, "func"));
+  ASSERT_NE(func, nullptr);
+
+  auto irfunc = buildHIR(func);
+  ASSERT_NE(irfunc, nullptr);
+
+  EXPECT_FALSE(irfunc->cfg.GetRPOTraversal().empty());
+}
+
+TEST_F(HIRBuilderExtendedTest, BuildFuncWithAdd) {
+  const char* py_src = R"(
+def add(a, b):
+    return a + b
+)";
+
+  Ref<PyFunctionObject> func(compileAndGet(py_src, "add"));
+  ASSERT_NE(func, nullptr);
+
+  auto irfunc = buildHIR(func);
+  ASSERT_NE(irfunc, nullptr);
+}
+
+TEST_F(HIRBuilderExtendedTest, BuildFuncWithCompare) {
+  const char* py_src = R"(
+def cmp(a, b):
+    return a > b
+)";
+
+  Ref<PyFunctionObject> func(compileAndGet(py_src, "cmp"));
+  ASSERT_NE(func, nullptr);
+
+  auto irfunc = buildHIR(func);
+  ASSERT_NE(irfunc, nullptr);
+}
+
+TEST_F(HIRBuilderExtendedTest, BuildFuncWithIf) {
+  const char* py_src = R"(
+def branch(x):
+    if x > 0:
+        return 1
+    return 0
+)";
+
+  Ref<PyFunctionObject> func(compileAndGet(py_src, "branch"));
+  ASSERT_NE(func, nullptr);
+
+  auto irfunc = buildHIR(func);
+  ASSERT_NE(irfunc, nullptr);
+
+  auto traversal = irfunc->cfg.GetRPOTraversal();
+  EXPECT_GE(traversal.size(), 2);
+}
+
+TEST_F(HIRBuilderExtendedTest, BuildFuncWithLoop) {
+  const char* py_src = R"(
+def loop(n):
+    total = 0
+    for i in range(n):
+        total += i
+    return total
+)";
+
+  Ref<PyFunctionObject> func(compileAndGet(py_src, "loop"));
+  ASSERT_NE(func, nullptr);
+
+  auto irfunc = buildHIR(func);
+  ASSERT_NE(irfunc, nullptr);
+}
+
+TEST_F(HIRBuilderExtendedTest, BuildFuncWithAttrAccess) {
+  const char* py_src = R"(
+class MyClass:
+    x = 10
+
+def get_x():
+    return MyClass.x
+)";
+
+  Ref<PyFunctionObject> func(compileAndGet(py_src, "get_x"));
+  ASSERT_NE(func, nullptr);
+
+  auto irfunc = buildHIR(func);
+  ASSERT_NE(irfunc, nullptr);
+}
+
+TEST_F(HIRBuilderExtendedTest, BuildFuncWithMethodCall) {
+  const char* py_src = R"(
+def call_method():
+    return [1, 2, 3].append(4)
+)";
+
+  Ref<PyFunctionObject> func(compileAndGet(py_src, "call_method"));
+  ASSERT_NE(func, nullptr);
+
+  auto irfunc = buildHIR(func);
+  ASSERT_NE(irfunc, nullptr);
+}
+
+TEST_F(HIRBuilderExtendedTest, BuildFuncWithTuple) {
+  const char* py_src = R"(
+def make_tuple():
+    return (1, 2, 3)
+)";
+
+  Ref<PyFunctionObject> func(compileAndGet(py_src, "make_tuple"));
+  ASSERT_NE(func, nullptr);
+
+  auto irfunc = buildHIR(func);
+  ASSERT_NE(irfunc, nullptr);
+}
+
+TEST_F(HIRBuilderExtendedTest, BuildFuncWithList) {
+  const char* py_src = R"(
+def make_list():
+    return [1, 2, 3]
+)";
+
+  Ref<PyFunctionObject> func(compileAndGet(py_src, "make_list"));
+  ASSERT_NE(func, nullptr);
+
+  auto irfunc = buildHIR(func);
+  ASSERT_NE(irfunc, nullptr);
+}
+
+TEST_F(HIRBuilderExtendedTest, BuildFuncWithDict) {
+  const char* py_src = R"(
+def make_dict():
+    return {"a": 1, "b": 2}
+)";
+
+  Ref<PyFunctionObject> func(compileAndGet(py_src, "make_dict"));
+  ASSERT_NE(func, nullptr);
+
+  auto irfunc = buildHIR(func);
+  ASSERT_NE(irfunc, nullptr);
+}
+
+TEST_F(HIRBuilderExtendedTest, BuildFuncWithSubscript) {
+  const char* py_src = R"(
+def get_item(lst, idx):
+    return lst[idx]
+)";
+
+  Ref<PyFunctionObject> func(compileAndGet(py_src, "get_item"));
+  ASSERT_NE(func, nullptr);
+
+  auto irfunc = buildHIR(func);
+  ASSERT_NE(irfunc, nullptr);
+}
+
+TEST_F(HIRBuilderExtendedTest, BuildFuncWithUnaryOp) {
+  const char* py_src = R"(
+def negate(x):
+    return -x
+)";
+
+  Ref<PyFunctionObject> func(compileAndGet(py_src, "negate"));
+  ASSERT_NE(func, nullptr);
+
+  auto irfunc = buildHIR(func);
+  ASSERT_NE(irfunc, nullptr);
+}
+
+TEST_F(HIRBuilderExtendedTest, BuildFuncWithNotOp) {
+  const char* py_src = R"(
+def not_op(x):
+    return not x
+)";
+
+  Ref<PyFunctionObject> func(compileAndGet(py_src, "not_op"));
+  ASSERT_NE(func, nullptr);
+
+  auto irfunc = buildHIR(func);
+  ASSERT_NE(irfunc, nullptr);
+}
+
+TEST_F(HIRBuilderExtendedTest, BuildFuncWithBoolOp) {
+  const char* py_src = R"(
+def bool_and(a, b):
+    return a and b
+)";
+
+  Ref<PyFunctionObject> func(compileAndGet(py_src, "bool_and"));
+  ASSERT_NE(func, nullptr);
+
+  auto irfunc = buildHIR(func);
+  ASSERT_NE(irfunc, nullptr);
+}
+
+TEST_F(HIRBuilderExtendedTest, BuildFuncWithTryExcept) {
+  const char* py_src = R"(
+def try_except():
+    try:
+        return 1
+    except:
+        return 0
+)";
+
+  Ref<PyFunctionObject> func(compileAndGet(py_src, "try_except"));
+  ASSERT_NE(func, nullptr);
+
+  auto irfunc = buildHIR(func);
+  ASSERT_NE(irfunc, nullptr);
+}
+
+TEST_F(HIRBuilderExtendedTest, BuildGeneratorFunc) {
+  const char* py_src = R"(
+def gen():
+    yield 1
+    yield 2
+)";
+
+  Ref<PyFunctionObject> func(compileAndGet(py_src, "gen"));
+  ASSERT_NE(func, nullptr);
+
+  auto irfunc = buildHIR(func);
+  ASSERT_NE(irfunc, nullptr);
+}
+
+TEST_F(HIRBuilderExtendedTest, BuildFuncWithGlobalAccess) {
+  const char* py_src = R"(
+GLOBAL_VAR = 42
+
+def read_global():
+    return GLOBAL_VAR
+)";
+
+  Ref<PyFunctionObject> func(compileAndGet(py_src, "read_global"));
+  ASSERT_NE(func, nullptr);
+
+  auto irfunc = buildHIR(func);
+  ASSERT_NE(irfunc, nullptr);
+}
+
+TEST_F(HIRBuilderExtendedTest, BuildFuncWithClosure) {
+  const char* py_src = R"(
+def outer():
+    x = 10
+    def inner():
+        return x
+    return inner()
+)";
+
+  Ref<PyFunctionObject> func(compileAndGet(py_src, "outer"));
+  ASSERT_NE(func, nullptr);
+
+  auto irfunc = buildHIR(func);
+  ASSERT_NE(irfunc, nullptr);
+}
+
+TEST_F(HIRBuilderExtendedTest, BuildFuncWithIsOperator) {
+  const char* py_src = R"(
+def is_none(x):
+    return x is None
+)";
+
+  Ref<PyFunctionObject> func(compileAndGet(py_src, "is_none"));
+  ASSERT_NE(func, nullptr);
+
+  auto irfunc = buildHIR(func);
+  ASSERT_NE(irfunc, nullptr);
+}
+
+TEST_F(HIRBuilderExtendedTest, BuildFuncWithInOperator) {
+  const char* py_src = R"(
+def contains(lst, val):
+    return val in lst
+)";
+
+  Ref<PyFunctionObject> func(compileAndGet(py_src, "contains"));
+  ASSERT_NE(func, nullptr);
+
+  auto irfunc = buildHIR(func);
+  ASSERT_NE(irfunc, nullptr);
+}
+
+TEST_F(HIRBuilderExtendedTest, BuildFuncWithFString) {
+  const char* py_src = R"(
+def greet(name):
+    return f"hello {name}"
+)";
+
+  Ref<PyFunctionObject> func(compileAndGet(py_src, "greet"));
+  ASSERT_NE(func, nullptr);
+
+  auto irfunc = buildHIR(func);
+  ASSERT_NE(irfunc, nullptr);
+}
+
+TEST_F(HIRBuilderExtendedTest, BuildFuncWithStarExpr) {
+  const char* py_src = R"(
+def spread():
+    return [*range(3)]
+)";
+
+  Ref<PyFunctionObject> func(compileAndGet(py_src, "spread"));
+  ASSERT_NE(func, nullptr);
+
+  auto irfunc = buildHIR(func);
+  ASSERT_NE(irfunc, nullptr);
+}
+
+TEST_F(HIRBuilderExtendedTest, BuildFuncWithAugAssign) {
+  const char* py_src = R"(
+def aug_assign(x):
+    x += 1
+    x -= 1
+    x *= 2
+    return x
+)";
+
+  Ref<PyFunctionObject> func(compileAndGet(py_src, "aug_assign"));
+  ASSERT_NE(func, nullptr);
+
+  auto irfunc = buildHIR(func);
+  ASSERT_NE(irfunc, nullptr);
+}
+
+TEST_F(HIRBuilderExtendedTest, BuildFuncWithDelete) {
+  const char* py_src = R"(
+def delete_var():
+    x = 1
+    del x
+)";
+
+  Ref<PyFunctionObject> func(compileAndGet(py_src, "delete_var"));
+  ASSERT_NE(func, nullptr);
+
+  auto irfunc = buildHIR(func);
+  ASSERT_NE(irfunc, nullptr);
+}
+
+TEST_F(HIRBuilderExtendedTest, BuildFuncWithAssert) {
+  const char* py_src = R"(
+def assert_true():
+    assert True
+)";
+
+  Ref<PyFunctionObject> func(compileAndGet(py_src, "assert_true"));
+  ASSERT_NE(func, nullptr);
+
+  auto irfunc = buildHIR(func);
+  ASSERT_NE(irfunc, nullptr);
+}
+
+TEST_F(HIRBuilderExtendedTest, BuildFuncWithRaise) {
+  const char* py_src = R"(
+def raise_error():
+    raise ValueError("error")
+)";
+
+  Ref<PyFunctionObject> func(compileAndGet(py_src, "raise_error"));
+  ASSERT_NE(func, nullptr);
+
+  auto irfunc = buildHIR(func);
+  ASSERT_NE(irfunc, nullptr);
+}
+
+TEST_F(HIRBuilderExtendedTest, BuildFuncWithWhileLoop) {
+  const char* py_src = R"(
+def while_loop(n):
+    i = 0
+    while i < n:
+        i += 1
+    return i
+)";
+
+  Ref<PyFunctionObject> func(compileAndGet(py_src, "while_loop"));
+  ASSERT_NE(func, nullptr);
+
+  auto irfunc = buildHIR(func);
+  ASSERT_NE(irfunc, nullptr);
+}
+
+TEST_F(HIRBuilderExtendedTest, BuildFuncWithBreakContinue) {
+  const char* py_src = R"(
+def break_continue():
+    for i in range(10):
+        if i == 3:
+            continue
+        if i == 7:
+            break
+    return i
+)";
+
+  Ref<PyFunctionObject> func(compileAndGet(py_src, "break_continue"));
+  ASSERT_NE(func, nullptr);
+
+  auto irfunc = buildHIR(func);
+  ASSERT_NE(irfunc, nullptr);
+}
+
+TEST_F(HIRBuilderExtendedTest, BuildFuncWithSetLiteral) {
+  const char* py_src = R"(
+def make_set():
+    return {1, 2, 3}
+)";
+
+  Ref<PyFunctionObject> func(compileAndGet(py_src, "make_set"));
+  ASSERT_NE(func, nullptr);
+
+  auto irfunc = buildHIR(func);
+  ASSERT_NE(irfunc, nullptr);
+}
+
+TEST_F(HIRBuilderExtendedTest, BuildFuncWithSlice) {
+  const char* py_src = R"(
+def slice_list(lst):
+    return lst[1:3]
+)";
+
+  Ref<PyFunctionObject> func(compileAndGet(py_src, "slice_list"));
+  ASSERT_NE(func, nullptr);
+
+  auto irfunc = buildHIR(func);
+  ASSERT_NE(irfunc, nullptr);
+}
+
+TEST_F(HIRBuilderExtendedTest, BuildFuncWithWalrus) {
+  const char* py_src = R"(
+def walrus(lst):
+    if (n := len(lst)) > 0:
+        return n
+    return 0
+)";
+
+  Ref<PyFunctionObject> func(compileAndGet(py_src, "walrus"));
+  ASSERT_NE(func, nullptr);
+
+  auto irfunc = buildHIR(func);
+  ASSERT_NE(irfunc, nullptr);
+}
+
+TEST_F(HIRBuilderExtendedTest, BuildFuncWithMultipleReturns) {
+  const char* py_src = R"(
+def multi_ret(x):
+    if x > 0:
+        return 1
+    elif x < 0:
+        return -1
+    else:
+        return 0
+)";
+
+  Ref<PyFunctionObject> func(compileAndGet(py_src, "multi_ret"));
+  ASSERT_NE(func, nullptr);
+
+  auto irfunc = buildHIR(func);
+  ASSERT_NE(irfunc, nullptr);
 }
