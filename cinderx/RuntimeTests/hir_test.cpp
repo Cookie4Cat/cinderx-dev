@@ -1383,7 +1383,6 @@ def test():
 #endif
 }
 
-// test_520 HIR builder extended coverage
 class HIRBuilderExtendedTest : public RuntimeTest {
  public:
   void SetUp() override {

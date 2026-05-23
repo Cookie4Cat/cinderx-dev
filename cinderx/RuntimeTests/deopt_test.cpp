@@ -816,7 +816,6 @@ TEST_F(DeoptTest, ValueKind) {
   EXPECT_EQ(deoptValueKind(TNullptr), ValueKind::kObject);
 }
 
-// test_520 deopt value coverage
 class DeoptValueKindTest : public RuntimeTest {};
 
 TEST_F(DeoptValueKindTest, BoolType) {

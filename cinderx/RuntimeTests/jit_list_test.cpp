@@ -121,7 +121,6 @@ TEST_F(WildcardJITListTest, Lookup) {
   EXPECT_FALSE(jitlist->lookupName(bar, foo_evaluate));
 }
 
-// test_520 JIT list extended coverage
 #include <cstdio>
 #include <fstream>
 #include <string>
