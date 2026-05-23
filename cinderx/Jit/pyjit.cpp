@@ -533,6 +533,11 @@ FlagProcessor initFlagProcessor() {
       "jit-dynamic-comparison-elim",
       "PYTHONJITDYNAMICCOMPARISIONELIM");
   HIR_OPTIMIZATION_OPTION(
+      "float accumulator promotion",
+      float_accumulator_promotion,
+      "jit-float-accumulator-promotion",
+      "PYTHONJITFLOATACCUMULATORPROMOTION");
+  HIR_OPTIMIZATION_OPTION(
       "guard type removal",
       guard_type_removal,
       "jit-guard-type-removal",

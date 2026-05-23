@@ -41,6 +41,7 @@ struct HIROptimizations {
   bool clean_cfg{true};
   bool dead_code_elim{true};
   bool dynamic_comparison_elim{true};
+  bool float_accumulator_promotion{true};
   bool guard_type_removal{true};
   bool inliner{true};
   bool insert_update_prev_instr{true};

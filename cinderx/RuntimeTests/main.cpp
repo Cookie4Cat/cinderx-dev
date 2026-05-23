@@ -12,6 +12,7 @@
 #include "cinderx/Jit/hir/copy_propagation.h"
 #include "cinderx/Jit/hir/dead_code_elimination.h"
 #include "cinderx/Jit/hir/dynamic_comparison_elimination.h"
+#include "cinderx/Jit/hir/float_accumulator_promotion.h"
 #include "cinderx/Jit/hir/guard_removal.h"
 #include "cinderx/Jit/hir/inliner.h"
 #include "cinderx/Jit/hir/insert_update_prev_instr.h"
@@ -66,6 +67,7 @@ class TestPassRegistry {
     addPass(jit::hir::PhiElimination::Factory);
     addPass(jit::hir::InlineFunctionCalls::Factory);
     addPass(jit::hir::Simplify::Factory);
+    addPass(jit::hir::FloatAccumulatorPromotion::Factory);
     addPass(jit::hir::DeadCodeElimination::Factory);
     addPass(jit::hir::GuardTypeRemoval::Factory);
     addPass(jit::hir::BeginInlinedFunctionElimination::Factory);
@@ -239,6 +241,7 @@ int main(int argc, char* argv[]) {
   register_test("super_access_static_test.txt", RuntimeTest::kStaticCompiler);
   register_test("super_access_test.txt");
   register_test("simplify_test.txt");
+  register_test("float_accumulator_promotion_test.txt");
   register_test("simplify_uses_guard_types.txt");
   register_test("simplify_static_test.txt", RuntimeTest::kStaticCompiler);
   register_test("dead_code_elimination_test.txt");

@@ -11,6 +11,7 @@
 #include "cinderx/Jit/hir/clean_cfg.h"
 #include "cinderx/Jit/hir/dead_code_elimination.h"
 #include "cinderx/Jit/hir/dynamic_comparison_elimination.h"
+#include "cinderx/Jit/hir/float_accumulator_promotion.h"
 #include "cinderx/Jit/hir/guard_removal.h"
 #include "cinderx/Jit/hir/hir_stats.h"
 #include "cinderx/Jit/hir/inliner.h"
@@ -85,8 +86,14 @@ void Compiler::runPasses(
       runPass(pass, irfunc, callback);
     }
   };
+  auto runSimplifyAndFloatAccumulatorPromotion = [&]() {
+    runPassIf(hir::Simplify{}, PassConfig::kSimplify);
+    runPassIf(
+        hir::FloatAccumulatorPromotion{},
+        PassConfig::kFloatAccumulatorPromotion);
+  };
 
-  runPassIf(hir::Simplify{}, PassConfig::kSimplify);
+  runSimplifyAndFloatAccumulatorPromotion();
   runPassIf(
       hir::DynamicComparisonElimination{}, PassConfig::kDynamicComparisonElim);
   runPassIf(hir::GuardTypeRemoval{}, PassConfig::kGuardTypeRemoval);
@@ -95,7 +102,7 @@ void Compiler::runPasses(
   if (config & PassConfig::kInliner) {
     runPass(jit::hir::InlineFunctionCalls{}, irfunc, callback);
 
-    runPassIf(hir::Simplify{}, PassConfig::kSimplify);
+    runSimplifyAndFloatAccumulatorPromotion();
     runPassIf(
         hir::BeginInlinedFunctionElimination{},
         PassConfig::kBeginInlinedFunctionElim);
@@ -103,7 +110,7 @@ void Compiler::runPasses(
 
   runPassIf(
       hir::BuiltinLoadMethodElimination{}, PassConfig::kBuiltinLoadMethodElim);
-  runPassIf(hir::Simplify{}, PassConfig::kSimplify);
+  runSimplifyAndFloatAccumulatorPromotion();
   runPassIf(hir::CleanCFG{}, PassConfig::kCleanCFG);
   runPassIf(hir::DeadCodeElimination{}, PassConfig::kDeadCodeElim);
   runPassIf(hir::CleanCFG{}, PassConfig::kCleanCFG);
@@ -152,6 +159,8 @@ PassConfig createConfig() {
   set(hir_opts.builtin_load_method_elim, PassConfig::kBuiltinLoadMethodElim);
   set(hir_opts.clean_cfg, PassConfig::kCleanCFG);
   set(hir_opts.dynamic_comparison_elim, PassConfig::kDynamicComparisonElim);
+  set(hir_opts.float_accumulator_promotion,
+      PassConfig::kFloatAccumulatorPromotion);
   set(hir_opts.guard_type_removal, PassConfig::kGuardTypeRemoval);
   // Inliner currently depends on code objects being stable.
   set(hir_opts.inliner && getConfig().stable_frame, PassConfig::kInliner);
