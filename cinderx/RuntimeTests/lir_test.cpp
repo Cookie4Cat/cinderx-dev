@@ -84,6 +84,126 @@ class LIRGeneratorTest : public RuntimeTest {
   }
 };
 
+TEST_F(LIRGeneratorTest, BroadPythonTranslationCoverage) {
+  const char* snippets[] = {
+      R"(
+def f(a, b):
+  c = a + b
+  d = a - b
+  e = a * b
+  return (c, d, e, a / b, a // b, a % b)
+)",
+      R"(
+def f(flag, left, right):
+  if flag:
+    value = left
+  else:
+    value = right
+  return value.attr
+)",
+      R"(
+def f(seq):
+  total = 0
+  for item in seq:
+    if item:
+      total += item
+    else:
+      total -= 1
+  return total
+)",
+      R"(
+def f(seq, mapping, key):
+  first = seq[0]
+  mapping[key] = first
+  return mapping.get(key, 0)
+)",
+      R"(
+def f(obj, value):
+  obj.field = value
+  return obj.field
+)",
+      R"(
+def f(a, b, c):
+  return (a and b) or (not c)
+)",
+      R"(
+def f(fn, arg):
+  return fn(arg, arg + 1, named=arg + 2)
+)",
+      R"(
+def f(items):
+  return [x + 1 for x in items if x > 0]
+)",
+      R"(
+def f(value):
+  try:
+    return 10 // value
+  except ZeroDivisionError:
+    return -1
+)",
+      R"(
+def f(obj):
+  return isinstance(obj, int), type(obj), len(obj)
+)",
+  };
+
+  for (const char* src : snippets) {
+    Ref<PyObject> pyfunc(compileAndGet(src, "f"));
+    ASSERT_NE(pyfunc.get(), nullptr) << "Failed compiling func";
+    auto lir_str = getLIRString(pyfunc.get());
+    ASSERT_FALSE(lir_str.empty());
+  }
+}
+
+TEST_F(LIRGeneratorTest, BroadStaticTranslationCoverage) {
+  const char* snippets[] = {
+      R"(
+from __static__ import int64
+
+def f(a: int64, b: int64) -> int64:
+  c: int64 = a + b
+  d: int64 = a * b
+  return c - d
+)",
+      R"(
+from __static__ import int64
+
+def f(limit: int64) -> int64:
+  total: int64 = 0
+  i: int64 = 0
+  while i < limit:
+    total += i
+    i += 1
+  return total
+)",
+      R"(
+from __static__ import int64, box
+
+def f(value: int64) -> int:
+  return box(value + 1)
+)",
+      R"(
+from __static__ import double, box
+
+def f(left: double, right: double) -> float:
+  return box((left * right) + (left / right))
+)",
+      R"(
+from __static__ import CheckedList
+
+def f(values: CheckedList[int]) -> int:
+  return values[0] + len(values)
+)",
+  };
+
+  for (const char* src : snippets) {
+    Ref<PyObject> pyfunc(compileStaticAndGet(src, "f"));
+    ASSERT_NE(pyfunc.get(), nullptr) << "Failed compiling func";
+    auto lir_str = getLIRString(pyfunc.get());
+    ASSERT_FALSE(lir_str.empty());
+  }
+}
+
 TEST_F(LIRGeneratorTest, StaticLoadInteger) {
   const char* pycode = R"(
 from __static__ import int64
