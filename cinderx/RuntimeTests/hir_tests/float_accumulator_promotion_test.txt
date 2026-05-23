@@ -1,0 +1,314 @@
+--- Test Suite Name ---
+FloatAccumulatorPromotionTest
+--- Passes ---
+FloatAccumulatorPromotion
+--- Test Name ---
+PromotesZeroEntryValueForFloatAccumulatorGuard
+--- Input ---
+# HIR
+fun test {
+  bb 0 {
+    v0 = LoadConst<ImmortalLongExact[0]>
+    Branch<1>
+  }
+  bb 1 {
+    v1 = Phi<0, 2> v0 v4
+    v2 = GuardType<FloatExact> v1
+    v3 = LoadConst<NoneType>
+    CondBranch<2, 3> v3
+  }
+  bb 2 {
+    v4 = LoadConst<MortalFloatExact[1.5]>
+    Branch<1>
+  }
+  bb 3 {
+    Return v2
+  }
+}
+--- Expected 3.14 ---
+fun test {
+  bb 0 {
+    v0:ImmortalLongExact[0] = LoadConst<ImmortalLongExact[0]>
+    v5:MortalFloatExact[0] = LoadConst<MortalFloatExact[0]>
+    Branch<1>
+  }
+
+  bb 1 (preds 0, 2) {
+    v1:{FloatExact|LongExact} = Phi<0, 2> v0 v4
+    v6:MortalFloatExact = Phi<0, 2> v5 v4
+    v3:NoneType = LoadConst<NoneType>
+    CondBranch<2, 3> v3
+  }
+
+  bb 2 (preds 1) {
+    v4:MortalFloatExact[1.5] = LoadConst<MortalFloatExact[1.5]>
+    Branch<1>
+  }
+
+  bb 3 (preds 1) {
+    Return v6
+  }
+}
+--- Test Name ---
+PreservesOriginalPhiForEmptyLoopReturn
+--- Input ---
+# HIR
+fun test {
+  bb 0 {
+    v0 = LoadConst<ImmortalLongExact[0]>
+    Branch<1>
+  }
+  bb 1 {
+    v1 = Phi<0, 2> v0 v4
+    v2 = GuardType<FloatExact> v1
+    v3 = LoadConst<NoneType>
+    CondBranch<2, 3> v3
+  }
+  bb 2 {
+    v4 = LoadConst<MortalFloatExact[1.5]>
+    Branch<1>
+  }
+  bb 3 {
+    Return v1
+  }
+}
+--- Expected 3.14 ---
+fun test {
+  bb 0 {
+    v0:ImmortalLongExact[0] = LoadConst<ImmortalLongExact[0]>
+    v5:MortalFloatExact[0] = LoadConst<MortalFloatExact[0]>
+    Branch<1>
+  }
+
+  bb 1 (preds 0, 2) {
+    v1:{FloatExact|LongExact} = Phi<0, 2> v0 v4
+    v6:MortalFloatExact = Phi<0, 2> v5 v4
+    v3:NoneType = LoadConst<NoneType>
+    CondBranch<2, 3> v3
+  }
+
+  bb 2 (preds 1) {
+    v4:MortalFloatExact[1.5] = LoadConst<MortalFloatExact[1.5]>
+    Branch<1>
+  }
+
+  bb 3 (preds 1) {
+    Return v1
+  }
+}
+--- Test Name ---
+DoesNotPromoteNonZeroIntEntryValue
+--- Input ---
+# HIR
+fun test {
+  bb 0 {
+    v0 = LoadConst<ImmortalLongExact[5]>
+    Branch<1>
+  }
+  bb 1 {
+    v1 = Phi<0, 2> v0 v4
+    v2 = GuardType<FloatExact> v1
+    v3 = LoadConst<NoneType>
+    CondBranch<2, 3> v3
+  }
+  bb 2 {
+    v4 = LoadConst<MortalFloatExact[1.5]>
+    Branch<1>
+  }
+  bb 3 {
+    Return v2
+  }
+}
+--- Expected 3.14 ---
+fun test {
+  bb 0 {
+    v0:ImmortalLongExact[5] = LoadConst<ImmortalLongExact[5]>
+    Branch<1>
+  }
+
+  bb 1 (preds 0, 2) {
+    v1:{FloatExact|LongExact} = Phi<0, 2> v0 v4
+    v2:FloatExact = GuardType<FloatExact> v1 {
+      FrameState {
+        CurInstrOffset -2
+      }
+    }
+    v3:NoneType = LoadConst<NoneType>
+    CondBranch<2, 3> v3
+  }
+
+  bb 2 (preds 1) {
+    v4:MortalFloatExact[1.5] = LoadConst<MortalFloatExact[1.5]>
+    Branch<1>
+  }
+
+  bb 3 (preds 1) {
+    Return v2
+  }
+}
+--- Test Name ---
+DoesNotPromoteNonFloatGuardTarget
+--- Input ---
+# HIR
+fun test {
+  bb 0 {
+    v0 = LoadConst<ImmortalLongExact[0]>
+    Branch<1>
+  }
+  bb 1 {
+    v1 = Phi<0, 2> v0 v4
+    v2 = GuardType<LongExact> v1
+    v3 = LoadConst<NoneType>
+    CondBranch<2, 3> v3
+  }
+  bb 2 {
+    v4 = LoadConst<MortalFloatExact[1.5]>
+    Branch<1>
+  }
+  bb 3 {
+    Return v2
+  }
+}
+--- Expected 3.14 ---
+fun test {
+  bb 0 {
+    v0:ImmortalLongExact[0] = LoadConst<ImmortalLongExact[0]>
+    Branch<1>
+  }
+
+  bb 1 (preds 0, 2) {
+    v1:{FloatExact|LongExact} = Phi<0, 2> v0 v4
+    v2:LongExact = GuardType<LongExact> v1 {
+      FrameState {
+        CurInstrOffset -2
+      }
+    }
+    v3:NoneType = LoadConst<NoneType>
+    CondBranch<2, 3> v3
+  }
+
+  bb 2 (preds 1) {
+    v4:MortalFloatExact[1.5] = LoadConst<MortalFloatExact[1.5]>
+    Branch<1>
+  }
+
+  bb 3 (preds 1) {
+    Return v2
+  }
+}
+--- Test Name ---
+DoesNotPromoteFloatUserInput
+--- Input ---
+# HIR
+fun test {
+  bb 0 {
+    v6 = LoadArg<0>
+    v0 = LoadConst<ImmortalLongExact[0]>
+    Branch<1>
+  }
+  bb 1 {
+    v1 = Phi<0, 2> v0 v4
+    v2 = GuardType<FloatExact> v1
+    v3 = LoadConst<NoneType>
+    CondBranch<2, 3> v3
+  }
+  bb 2 {
+    v4 = RefineType<MortalFloatUser> v6
+    Branch<1>
+  }
+  bb 3 {
+    Return v2
+  }
+}
+--- Expected 3.14 ---
+fun test {
+  bb 0 {
+    v6:Object = LoadArg<0>
+    v0:ImmortalLongExact[0] = LoadConst<ImmortalLongExact[0]>
+    Branch<1>
+  }
+
+  bb 1 (preds 0, 2) {
+    v1:{FloatUser|LongExact} = Phi<0, 2> v0 v4
+    v2:Bottom = GuardType<FloatExact> v1 {
+      FrameState {
+        CurInstrOffset -2
+      }
+    }
+    v3:NoneType = LoadConst<NoneType>
+    CondBranch<2, 3> v3
+  }
+
+  bb 2 (preds 1) {
+    v4:MortalFloatUser = RefineType<MortalFloatUser> v6
+    Branch<1>
+  }
+
+  bb 3 (preds 1) {
+    Return v2
+  }
+}
+--- Test Name ---
+DoesNotPromoteThreeWayPhiWithThirdType
+--- Input ---
+# HIR
+fun test {
+  bb 0 {
+    v6 = LoadArg<0>
+    v7 = LoadArg<1>
+    v0 = LoadConst<ImmortalLongExact[0]>
+    CondBranch<1, 3> v6
+  }
+  bb 1 {
+    v1 = Phi<0, 2, 3> v0 v4 v5
+    v2 = GuardType<FloatExact> v1
+    v3 = LoadConst<NoneType>
+    CondBranch<2, 4> v3
+  }
+  bb 2 {
+    v4 = LoadConst<MortalFloatExact[1.5]>
+    Branch<1>
+  }
+  bb 3 {
+    v5 = RefineType<UnicodeExact> v7
+    Branch<1>
+  }
+  bb 4 {
+    Return v2
+  }
+}
+--- Expected 3.14 ---
+fun test {
+  bb 0 {
+    v6:Object = LoadArg<0>
+    v7:Object = LoadArg<1>
+    v0:ImmortalLongExact[0] = LoadConst<ImmortalLongExact[0]>
+    CondBranch<1, 3> v6
+  }
+
+  bb 3 (preds 0) {
+    v5:UnicodeExact = RefineType<UnicodeExact> v7
+    Branch<1>
+  }
+
+  bb 1 (preds 0, 2, 3) {
+    v1:{FloatExact|LongExact|UnicodeExact} = Phi<0, 2, 3> v0 v4 v5
+    v2:FloatExact = GuardType<FloatExact> v1 {
+      FrameState {
+        CurInstrOffset -2
+      }
+    }
+    v3:NoneType = LoadConst<NoneType>
+    CondBranch<2, 4> v3
+  }
+
+  bb 2 (preds 1) {
+    v4:MortalFloatExact[1.5] = LoadConst<MortalFloatExact[1.5]>
+    Branch<1>
+  }
+
+  bb 4 (preds 1) {
+    Return v2
+  }
+}
+--- End ---
