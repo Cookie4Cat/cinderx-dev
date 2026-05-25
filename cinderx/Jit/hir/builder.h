@@ -172,6 +172,11 @@ class HIRBuilder {
   void emitLoadAttr(
       TranslationContext& tc,
       const jit::BytecodeInstruction& bc_instr);
+  void emitSlotTypeVersionGuard(
+      TranslationContext& tc,
+      Register* receiver,
+      uint32_t type_version,
+      const char* descr);
   void emitLoadMethod(TranslationContext& tc, int name_idx);
   void emitLoadMethodOrAttrSuper(
       CFG& cfg,
