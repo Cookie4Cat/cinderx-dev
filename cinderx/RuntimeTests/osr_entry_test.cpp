@@ -3,8 +3,8 @@
 // Feature Item 3: OSR Entry (Frame State Migration) Test Suite
 //
 // Design references:
-//   - docs/design/hot-loop-osr/hot-loop-osr-function-design.md V7.0 (Feature Item 3)
-//   - docs/design/hot-loop-osr/hot-loop-osr-entry-detailed-design.md V1.6
+//   - docs/design/hot-loop-osr/【功能设计】基于热循环的OSR能力.md V7.0 (Feature Item 3)
+//   - docs/design/hot-loop-osr/【详细设计】OSR进入（帧状态迁移）.md V1.6
 //
 // Sub-module A: OSRState & OSRMetadata data structures
 //   Tests construct and verify OSR data structures.
@@ -38,6 +38,13 @@
 
 #include <gtest/gtest.h>
 
+#include <algorithm>
+#include <cstdint>
+#include <cstring>
+#include <span>
+#include <utility>
+#include <vector>
+
 #include "cinderx/python.h"
 
 // clang-format off
@@ -45,9 +52,11 @@
 // clang-format on
 
 #include "cinderx/Common/ref.h"
+#include "cinderx/Jit/compiled_function.h"
 #include "cinderx/Jit/compiler.h"
 #include "cinderx/Jit/context.h"
 #include "cinderx/RuntimeTests/fixtures.h"
+#include "cinderx/module_state.h"
 
 // ---------------------------------------------------------------------------
 // Header availability detection.
@@ -56,7 +65,7 @@
 // and always include them).
 // ---------------------------------------------------------------------------
 #ifndef CINDERX_OSR_HEADERS_AVAILABLE
-#define CINDERX_OSR_HEADERS_AVAILABLE 0
+#define CINDERX_OSR_HEADERS_AVAILABLE 1
 #endif
 
 #if CINDERX_OSR_HEADERS_AVAILABLE
@@ -77,6 +86,268 @@ using jit::getContext;
 namespace jit {
 void syncOSRFlags();
 } // namespace jit
+
+#if CINDERX_OSR_HEADERS_AVAILABLE
+using jit::BCOffset;
+using jit::CompilationKey;
+using jit::CompiledFunction;
+using jit::CompiledFunctionData;
+using jit::CompilerContext;
+using jit::OSRLiveIn;
+using jit::OSRMetadata;
+using jit::OSRState;
+using jit::collectBackedgeTargetOffsets;
+using jit::codegen::OSR_STUB_SCRATCH_REGS;
+using jit::codegen::PhyRegisterSet;
+namespace arch = jit::codegen;
+
+namespace {
+
+using OsrEntryFn = PyObject* (*)(OSRState*);
+
+struct StubObservation {
+  bool called{false};
+  _Py_CODEUNIT* instr_ptr{nullptr};
+  bool non_live_slot_was_null{false};
+  bool live_slot_was_null{false};
+  Py_ssize_t observed_refcnt{-1};
+};
+
+StubObservation g_stub_observation;
+int g_live_slot_index{-1};
+int g_non_live_slot_index{-1};
+PyObject* g_observed_refcnt_obj{nullptr};
+int g_dealloc_sets_error_count{0};
+
+void resetStubObservation() {
+  g_stub_observation = StubObservation{};
+  g_live_slot_index = -1;
+  g_non_live_slot_index = -1;
+  g_observed_refcnt_obj = nullptr;
+  g_dealloc_sets_error_count = 0;
+}
+
+PyObject* observingReturnStub(OSRState* state) {
+  g_stub_observation.called = true;
+  g_stub_observation.instr_ptr = state->frame->instr_ptr;
+  if (g_non_live_slot_index >= 0) {
+    g_stub_observation.non_live_slot_was_null =
+        PyStackRef_IsNull(state->frame->localsplus[g_non_live_slot_index]);
+  }
+  if (g_live_slot_index >= 0) {
+    g_stub_observation.live_slot_was_null =
+        PyStackRef_IsNull(state->frame->localsplus[g_live_slot_index]);
+  }
+  if (g_observed_refcnt_obj != nullptr) {
+    g_stub_observation.observed_refcnt = Py_REFCNT(g_observed_refcnt_obj);
+  }
+  return Py_NewRef(Py_None);
+}
+
+PyObject* observingExceptionStub(OSRState* state) {
+  g_stub_observation.called = true;
+  g_stub_observation.instr_ptr = state->frame->instr_ptr;
+  PyErr_SetString(PyExc_ValueError, "osr test stub failed");
+  return nullptr;
+}
+
+void deallocSetsError(PyObject* self) {
+  g_dealloc_sets_error_count++;
+  PyErr_SetString(PyExc_RuntimeError, "dealloc clobbered exception");
+  Py_TYPE(self)->tp_free(self);
+}
+
+Ref<> makeDeallocSetsErrorObject() {
+  PyType_Slot slots[] = {
+      {Py_tp_dealloc, reinterpret_cast<void*>(deallocSetsError)},
+      {Py_tp_new, reinterpret_cast<void*>(PyType_GenericNew)},
+      {0, nullptr},
+  };
+  PyType_Spec spec{
+      "runtime_tests.DeallocSetsError",
+      sizeof(PyObject),
+      0,
+      Py_TPFLAGS_DEFAULT,
+      slots,
+  };
+  auto type = Ref<>::steal(PyType_FromSpec(&spec));
+  if (type == nullptr) {
+    return nullptr;
+  }
+  return Ref<>::steal(PyObject_CallNoArgs(type));
+}
+
+Ref<CompiledFunction> makeStubCompiledFunction(OsrEntryFn stub) {
+  CompiledFunctionData data;
+  data.code = std::span<const std::byte>(
+      reinterpret_cast<const std::byte*>(reinterpret_cast<uintptr_t>(stub)),
+      1);
+  return CompiledFunction::create(std::move(data), true);
+}
+
+OSRMetadata makeMetadata(BCOffset target_offset) {
+  OSRMetadata metadata;
+  metadata.target_offset = target_offset;
+  metadata.entry_point_offset = 0;
+  return metadata;
+}
+
+OSRLiveIn makeLiveIn(int localsplus_index) {
+  OSRLiveIn live_in;
+  live_in.localsplus_index = localsplus_index;
+  live_in.stack_index = -1;
+  live_in.destination = arch::X0;
+  live_in.reconstructible = true;
+  return live_in;
+}
+
+BorrowedRef<PyCodeObject> codeFromFunc(BorrowedRef<PyFunctionObject> func) {
+  return reinterpret_cast<PyCodeObject*>(PyFunction_GET_CODE(func));
+}
+
+class InterpreterFrameHolder {
+ public:
+  explicit InterpreterFrameHolder(BorrowedRef<PyFunctionObject> func)
+      : tstate_{PyThreadState_Get()},
+        previous_{currentFrame(tstate_)},
+        func_{func},
+        code_{codeFromFunc(func)} {
+    frame_ = Cix_PyThreadState_PushFrame(tstate_, jit::jitFrameGetSize(code_));
+    JIT_CHECK(frame_ != nullptr, "failed to push test interpreter frame");
+    jit::jitFrameInit(
+        tstate_,
+        frame_,
+        func_,
+        code_,
+        0,
+        FRAME_OWNED_BY_THREAD,
+        previous_,
+        jit::makeFrameReifier(code_));
+    setCurrentFrame(tstate_, frame_);
+    frame_->instr_ptr = _PyCode_CODE(code_);
+    frame_->stackpointer = _PyFrame_Stackbase(frame_);
+  }
+
+  ~InterpreterFrameHolder() {
+    if (frame_ == nullptr) {
+      return;
+    }
+    if (currentFrame(tstate_) == frame_) {
+      setCurrentFrame(tstate_, frame_->previous);
+    }
+    jit::jitFrameClearExceptCode(frame_);
+    Cix_PyThreadState_PopFrame(tstate_, frame_);
+  }
+
+  _PyInterpreterFrame* get() const {
+    return frame_;
+  }
+
+  void setLocalNewRef(int index, BorrowedRef<> value) {
+    PyStackRef_CLOSE(frame_->localsplus[index]);
+    frame_->localsplus[index] = PyStackRef_FromPyObjectNew(value);
+  }
+
+  void setLocalSteal(int index, PyObject* value) {
+    PyStackRef_CLOSE(frame_->localsplus[index]);
+    frame_->localsplus[index] = PyStackRef_FromPyObjectSteal(value);
+  }
+
+ private:
+  PyThreadState* tstate_;
+  _PyInterpreterFrame* previous_;
+  BorrowedRef<PyFunctionObject> func_;
+  BorrowedRef<PyCodeObject> code_;
+  _PyInterpreterFrame* frame_{nullptr};
+};
+
+Ref<PyFunctionObject> compileSingleLoop(RuntimeTest& test) {
+  return Ref<PyFunctionObject>(test.compileAndGet(
+      R"(
+def test():
+    live = 1
+    dead = []
+    while live < 4:
+        live += 1
+    return live
+)",
+      "test"));
+}
+
+BCOffset firstBackedgeTarget(BorrowedRef<PyCodeObject> code) {
+  auto targets = collectBackedgeTargetOffsets(code);
+  JIT_CHECK(!targets.empty(), "test function must have a backedge");
+  return targets.front();
+}
+
+int performWithMetadata(
+    PyThreadState* tstate,
+    _PyInterpreterFrame* frame,
+    const OSRMetadata& metadata,
+    BorrowedRef<CompiledFunction> compiled,
+    PyObject** out_result) {
+  return jit::performOSR(tstate, frame, &metadata, compiled.get(), out_result);
+}
+
+#if defined(__aarch64__)
+
+Ref<CompiledFunction> compileToCompiledFunction(
+    BorrowedRef<PyFunctionObject> func) {
+  auto data = Compiler().Compile(func);
+  if (!data.has_value()) {
+    return nullptr;
+  }
+
+  CompilationKey key{
+      codeFromFunc(func), func->func_builtins, func->func_globals};
+  auto* jit_ctx = reinterpret_cast<CompilerContext<Compiler>*>(
+      cinderx::getModuleState()->jit_context.get());
+  return jit_ctx->makeCompiledFunction(func, key, std::move(*data));
+}
+
+uint32_t loadInstructionWord(const std::byte* code) {
+  uint32_t word;
+  std::memcpy(&word, code, sizeof(word));
+  return word;
+}
+
+bool codeContainsWord(
+    std::span<const std::byte> code,
+    std::size_t start,
+    uint32_t expected,
+    std::size_t max_bytes = 256) {
+  std::size_t end = std::min(code.size(), start + max_bytes);
+  for (std::size_t offset = start; offset + sizeof(uint32_t) <= end;
+       offset += sizeof(uint32_t)) {
+    if (loadInstructionWord(code.data() + offset) == expected) {
+      return true;
+    }
+  }
+  return false;
+}
+
+uint32_t strX12FromX9UnsignedOffset(int32_t byte_offset) {
+  JIT_CHECK(byte_offset % 8 == 0, "64-bit STR immediate must be 8-byte scaled");
+  return 0xF9000000u | (static_cast<uint32_t>(byte_offset / 8) << 10) |
+      (9u << 5) | 12u;
+}
+
+uint32_t strW12FromX9UnsignedOffset(int32_t byte_offset) {
+  JIT_CHECK(byte_offset % 4 == 0, "32-bit STR immediate must be 4-byte scaled");
+  return 0xB9000000u | (static_cast<uint32_t>(byte_offset / 4) << 10) |
+      (9u << 5) | 12u;
+}
+
+int32_t localsplusOffsetForTest(int localsplus_index) {
+  return static_cast<int32_t>(
+      offsetof(_PyInterpreterFrame, localsplus) +
+      localsplus_index * sizeof(_PyStackRef));
+}
+
+#endif // __aarch64__
+
+} // namespace
+#endif
 
 // ===========================================================================
 // Sub-module A: OSRState & OSRMetadata data structure tests
@@ -201,15 +472,17 @@ TEST_F(OSREntryDataTest, OSRMetadata_AllReconstructible) {
   OSRLiveIn li1;
   li1.localsplus_index = 0;
   li1.reconstructible = true;
-  meta.live_ins.push_back(li1);
-  EXPECT_TRUE(meta.allReconstructible());
+  OSRMetadata reconstructible_meta;
+  reconstructible_meta.live_ins = {li1};
+  EXPECT_TRUE(reconstructible_meta.allReconstructible());
 
   // Add a non-reconstructible live-in.
   OSRLiveIn li2;
   li2.localsplus_index = 1;
   li2.reconstructible = false;
-  meta.live_ins.push_back(li2);
-  EXPECT_FALSE(meta.allReconstructible());
+  OSRMetadata mixed_meta;
+  mixed_meta.live_ins = {li1, li2};
+  EXPECT_FALSE(mixed_meta.allReconstructible());
 }
 
 #endif // CINDERX_OSR_HEADERS_AVAILABLE
@@ -251,10 +524,34 @@ def test():
 // a CompiledFunction with an OSRMetadata whose entry_point_offset < 0.
 // Placeholder until then.
 TEST_F(PerformOSRTest, EntryPointNull_Returns0_FrameUnchanged) {
-  // Strategy: compile a function, create an OSRMetadata with entry_point_offset=-1,
-  // create a CompiledFunction, and call performOSR.
-  // Expected: rc=0, frame->instr_ptr unchanged, localsplus unchanged.
-  GTEST_SKIP() << "Requires Feature Item 2 compilation pipeline";
+  resetStubObservation();
+  Ref<PyFunctionObject> func = compileSingleLoop(*this);
+  ASSERT_NE(func, nullptr);
+  InterpreterFrameHolder frame_holder(func);
+  auto frame = frame_holder.get();
+  auto live = Ref<>::steal(PyLong_FromLong(1));
+  ASSERT_NE(live, nullptr);
+  frame_holder.setLocalNewRef(0, live);
+
+  auto compiled = makeStubCompiledFunction(observingReturnStub);
+  ASSERT_NE(compiled, nullptr);
+  OSRMetadata metadata = makeMetadata(firstBackedgeTarget(codeFromFunc(func)));
+  metadata.entry_point_offset = -1;
+  metadata.live_ins = {makeLiveIn(0)};
+
+  _Py_CODEUNIT* before_instr = frame->instr_ptr;
+  uintptr_t before_local = frame->localsplus[0].bits;
+  PyObject* result = nullptr;
+
+  EXPECT_EQ(
+      performWithMetadata(
+          PyThreadState_Get(), frame, metadata, compiled, &result),
+      0);
+  EXPECT_FALSE(g_stub_observation.called);
+  EXPECT_EQ(frame->instr_ptr, before_instr);
+  EXPECT_EQ(frame->localsplus[0].bits, before_local);
+  EXPECT_EQ(currentFrame(PyThreadState_Get()), frame);
+  EXPECT_EQ(result, nullptr);
 }
 
 // TC-B02 (SR-OSR-010/018): Live-in slot is PyStackRef_NULL → rc=0.
@@ -266,7 +563,24 @@ TEST_F(PerformOSRTest, EntryPointNull_Returns0_FrameUnchanged) {
 // TODO(T-OSR-003): Requires compilation pipeline to set up OSRMetadata
 // with live-in mappings.
 TEST_F(PerformOSRTest, LiveInNull_Returns0_Preflight) {
-  GTEST_SKIP() << "Requires Feature Item 2 compilation pipeline";
+  resetStubObservation();
+  Ref<PyFunctionObject> func = compileSingleLoop(*this);
+  ASSERT_NE(func, nullptr);
+  InterpreterFrameHolder frame_holder(func);
+  auto frame = frame_holder.get();
+
+  auto compiled = makeStubCompiledFunction(observingReturnStub);
+  ASSERT_NE(compiled, nullptr);
+  OSRMetadata metadata = makeMetadata(firstBackedgeTarget(codeFromFunc(func)));
+  metadata.live_ins = {makeLiveIn(0)};
+  PyObject* result = nullptr;
+
+  EXPECT_EQ(
+      performWithMetadata(
+          PyThreadState_Get(), frame, metadata, compiled, &result),
+      0);
+  EXPECT_FALSE(g_stub_observation.called);
+  EXPECT_EQ(result, nullptr);
 }
 
 // TC-B03 (SR-OSR-010/018): localsplus_index >= co_nlocalsplus → rc=0.
@@ -276,7 +590,24 @@ TEST_F(PerformOSRTest, LiveInNull_Returns0_Preflight) {
 //
 // TODO(T-OSR-003): Requires compilation pipeline.
 TEST_F(PerformOSRTest, LiveInIndexOOB_Returns0_Preflight) {
-  GTEST_SKIP() << "Requires Feature Item 2 compilation pipeline";
+  resetStubObservation();
+  Ref<PyFunctionObject> func = compileSingleLoop(*this);
+  ASSERT_NE(func, nullptr);
+  InterpreterFrameHolder frame_holder(func);
+  auto frame = frame_holder.get();
+
+  auto compiled = makeStubCompiledFunction(observingReturnStub);
+  ASSERT_NE(compiled, nullptr);
+  OSRMetadata metadata = makeMetadata(firstBackedgeTarget(codeFromFunc(func)));
+  metadata.live_ins = {makeLiveIn(codeFromFunc(func)->co_nlocalsplus)};
+  PyObject* result = nullptr;
+
+  EXPECT_EQ(
+      performWithMetadata(
+          PyThreadState_Get(), frame, metadata, compiled, &result),
+      0);
+  EXPECT_FALSE(g_stub_observation.called);
+  EXPECT_EQ(result, nullptr);
 }
 
 // TC-B04 (SR-OSR-010/018): Non-empty operand stack → rc=0.
@@ -288,7 +619,35 @@ TEST_F(PerformOSRTest, LiveInIndexOOB_Returns0_Preflight) {
 //
 // TODO(T-OSR-003): Requires compilation pipeline.
 TEST_F(PerformOSRTest, StackNotEmpty_Returns0_Preflight) {
-  GTEST_SKIP() << "Requires Feature Item 2 compilation pipeline";
+  resetStubObservation();
+  Ref<PyFunctionObject> func = compileSingleLoop(*this);
+  ASSERT_NE(func, nullptr);
+  InterpreterFrameHolder frame_holder(func);
+  auto frame = frame_holder.get();
+  auto live = Ref<>::steal(PyLong_FromLong(1));
+  ASSERT_NE(live, nullptr);
+  frame_holder.setLocalNewRef(0, live);
+
+  _PyStackRef* stackbase = _PyFrame_Stackbase(frame);
+  stackbase[0] = PyStackRef_FromPyObjectNew(Py_None);
+  frame->stackpointer = stackbase + 1;
+
+  auto compiled = makeStubCompiledFunction(observingReturnStub);
+  ASSERT_NE(compiled, nullptr);
+  OSRMetadata metadata = makeMetadata(firstBackedgeTarget(codeFromFunc(func)));
+  metadata.live_ins = {makeLiveIn(0)};
+  PyObject* result = nullptr;
+
+  EXPECT_EQ(
+      performWithMetadata(
+          PyThreadState_Get(), frame, metadata, compiled, &result),
+      0);
+  EXPECT_FALSE(g_stub_observation.called);
+  EXPECT_EQ(result, nullptr);
+
+  PyStackRef_CLOSE(stackbase[0]);
+  stackbase[0] = PyStackRef_NULL;
+  frame->stackpointer = stackbase;
 }
 
 // TC-B05 (SR-OSR-018): rc=0 path does not modify frame->instr_ptr.
@@ -299,8 +658,23 @@ TEST_F(PerformOSRTest, StackNotEmpty_Returns0_Preflight) {
 //
 // TODO(T-OSR-003): Requires compilation pipeline.
 TEST_F(PerformOSRTest, Rc0_NoInstrPtrModification) {
-  GTEST_SKIP() << "Requires Feature Item 2 compilation pipeline";
-  // verify instr_ptr identical.
+  resetStubObservation();
+  Ref<PyFunctionObject> func = compileSingleLoop(*this);
+  ASSERT_NE(func, nullptr);
+  InterpreterFrameHolder frame_holder(func);
+  auto frame = frame_holder.get();
+  auto compiled = makeStubCompiledFunction(observingReturnStub);
+  ASSERT_NE(compiled, nullptr);
+  OSRMetadata metadata = makeMetadata(firstBackedgeTarget(codeFromFunc(func)));
+  metadata.live_ins = {makeLiveIn(0)};
+  _Py_CODEUNIT* before_instr = frame->instr_ptr;
+  PyObject* result = nullptr;
+
+  EXPECT_EQ(
+      performWithMetadata(
+          PyThreadState_Get(), frame, metadata, compiled, &result),
+      0);
+  EXPECT_EQ(frame->instr_ptr, before_instr);
 }
 
 // TC-B06 (SR-OSR-018): rc=0 path does not modify localsplus.
@@ -310,8 +684,33 @@ TEST_F(PerformOSRTest, Rc0_NoInstrPtrModification) {
 //
 // TODO(T-OSR-003): Requires compilation pipeline.
 TEST_F(PerformOSRTest, Rc0_NoLocalsplusModification) {
-  GTEST_SKIP() << "Requires Feature Item 2 compilation pipeline";
-  // compare after.
+  resetStubObservation();
+  Ref<PyFunctionObject> func = compileSingleLoop(*this);
+  ASSERT_NE(func, nullptr);
+  InterpreterFrameHolder frame_holder(func);
+  auto frame = frame_holder.get();
+  auto live = Ref<>::steal(PyLong_FromLong(1));
+  auto dead = Ref<>::steal(PyList_New(0));
+  ASSERT_NE(live, nullptr);
+  ASSERT_NE(dead, nullptr);
+  frame_holder.setLocalNewRef(0, live);
+  frame_holder.setLocalNewRef(1, dead);
+
+  auto compiled = makeStubCompiledFunction(observingReturnStub);
+  ASSERT_NE(compiled, nullptr);
+  OSRMetadata metadata = makeMetadata(firstBackedgeTarget(codeFromFunc(func)));
+  metadata.entry_point_offset = -1;
+  metadata.live_ins = {makeLiveIn(0)};
+  uintptr_t before_live = frame->localsplus[0].bits;
+  uintptr_t before_dead = frame->localsplus[1].bits;
+  PyObject* result = nullptr;
+
+  EXPECT_EQ(
+      performWithMetadata(
+          PyThreadState_Get(), frame, metadata, compiled, &result),
+      0);
+  EXPECT_EQ(frame->localsplus[0].bits, before_live);
+  EXPECT_EQ(frame->localsplus[1].bits, before_dead);
 }
 
 // TC-B07 (SR-OSR-018): rc=0 path does not modify frame chain.
@@ -321,7 +720,23 @@ TEST_F(PerformOSRTest, Rc0_NoLocalsplusModification) {
 //
 // TODO(T-OSR-003): Requires compilation pipeline.
 TEST_F(PerformOSRTest, Rc0_NoFrameChainModification) {
-  GTEST_SKIP() << "Requires Feature Item 2 compilation pipeline";
+  resetStubObservation();
+  Ref<PyFunctionObject> func = compileSingleLoop(*this);
+  ASSERT_NE(func, nullptr);
+  InterpreterFrameHolder frame_holder(func);
+  auto frame = frame_holder.get();
+
+  auto compiled = makeStubCompiledFunction(observingReturnStub);
+  ASSERT_NE(compiled, nullptr);
+  OSRMetadata metadata = makeMetadata(firstBackedgeTarget(codeFromFunc(func)));
+  metadata.entry_point_offset = -1;
+  PyObject* result = nullptr;
+
+  EXPECT_EQ(
+      performWithMetadata(
+          PyThreadState_Get(), frame, metadata, compiled, &result),
+      0);
+  EXPECT_EQ(currentFrame(PyThreadState_Get()), frame);
 }
 
 // TC-B08 (SR-OSR-010/018): frame->instr_ptr set to loop header before stub.
@@ -333,7 +748,31 @@ TEST_F(PerformOSRTest, Rc0_NoFrameChainModification) {
 //
 // TODO(T-OSR-003): Requires compilation pipeline.
 TEST_F(PerformOSRTest, InstrPtrSetBeforeStubCall) {
-  GTEST_SKIP() << "Requires Feature Item 2 compilation pipeline";
+  resetStubObservation();
+  Ref<PyFunctionObject> func = compileSingleLoop(*this);
+  ASSERT_NE(func, nullptr);
+  InterpreterFrameHolder frame_holder(func);
+  auto frame = frame_holder.get();
+  auto live = Ref<>::steal(PyLong_FromLong(1));
+  ASSERT_NE(live, nullptr);
+  frame_holder.setLocalNewRef(0, live);
+
+  auto target = firstBackedgeTarget(codeFromFunc(func));
+  auto compiled = makeStubCompiledFunction(observingReturnStub);
+  ASSERT_NE(compiled, nullptr);
+  OSRMetadata metadata = makeMetadata(target);
+  metadata.live_ins = {makeLiveIn(0)};
+  PyObject* result = nullptr;
+
+  EXPECT_EQ(
+      performWithMetadata(
+          PyThreadState_Get(), frame, metadata, compiled, &result),
+      1);
+  ASSERT_TRUE(g_stub_observation.called);
+  EXPECT_EQ(
+      g_stub_observation.instr_ptr,
+      _PyCode_CODE(codeFromFunc(func)) + target.value() / sizeof(_Py_CODEUNIT));
+  Py_XDECREF(result);
 }
 
 // TC-B09 (SR-OSR-013): Non-live-in slots cleared to PyStackRef_NULL.
@@ -345,7 +784,35 @@ TEST_F(PerformOSRTest, InstrPtrSetBeforeStubCall) {
 //
 // TODO(T-OSR-003): Requires compilation pipeline.
 TEST_F(PerformOSRTest, NonLiveInSlots_ClearedToNull) {
-  GTEST_SKIP() << "Requires Feature Item 2 compilation pipeline";
+  resetStubObservation();
+  Ref<PyFunctionObject> func = compileSingleLoop(*this);
+  ASSERT_NE(func, nullptr);
+  InterpreterFrameHolder frame_holder(func);
+  auto frame = frame_holder.get();
+  auto live = Ref<>::steal(PyLong_FromLong(1));
+  auto dead = Ref<>::steal(PyList_New(0));
+  ASSERT_NE(live, nullptr);
+  ASSERT_NE(dead, nullptr);
+  frame_holder.setLocalNewRef(0, live);
+  frame_holder.setLocalNewRef(1, dead);
+  g_live_slot_index = 0;
+  g_non_live_slot_index = 1;
+
+  auto compiled = makeStubCompiledFunction(observingReturnStub);
+  ASSERT_NE(compiled, nullptr);
+  OSRMetadata metadata = makeMetadata(firstBackedgeTarget(codeFromFunc(func)));
+  metadata.live_ins = {makeLiveIn(0)};
+  PyObject* result = nullptr;
+
+  EXPECT_EQ(
+      performWithMetadata(
+          PyThreadState_Get(), frame, metadata, compiled, &result),
+      1);
+  ASSERT_TRUE(g_stub_observation.called);
+  EXPECT_TRUE(g_stub_observation.non_live_slot_was_null);
+  EXPECT_FALSE(g_stub_observation.live_slot_was_null);
+  EXPECT_TRUE(PyStackRef_IsNull(frame->localsplus[1]));
+  Py_XDECREF(result);
 }
 
 // TC-B10 (SR-OSR-013): Deferred DECREFs executed after stub returns.
@@ -356,7 +823,33 @@ TEST_F(PerformOSRTest, NonLiveInSlots_ClearedToNull) {
 //
 // TODO(T-OSR-003): Requires compilation pipeline.
 TEST_F(PerformOSRTest, DeferredDecrefs_AfterStubReturn) {
-  GTEST_SKIP() << "Requires Feature Item 2 compilation pipeline";
+  resetStubObservation();
+  Ref<PyFunctionObject> func = compileSingleLoop(*this);
+  ASSERT_NE(func, nullptr);
+  InterpreterFrameHolder frame_holder(func);
+  auto frame = frame_holder.get();
+  auto live = Ref<>::steal(PyLong_FromLong(1));
+  auto dead = Ref<>::steal(PyList_New(0));
+  ASSERT_NE(live, nullptr);
+  ASSERT_NE(dead, nullptr);
+  frame_holder.setLocalNewRef(0, live);
+  frame_holder.setLocalNewRef(1, dead);
+  g_observed_refcnt_obj = dead;
+  Py_ssize_t before_refcnt = Py_REFCNT(dead);
+
+  auto compiled = makeStubCompiledFunction(observingReturnStub);
+  ASSERT_NE(compiled, nullptr);
+  OSRMetadata metadata = makeMetadata(firstBackedgeTarget(codeFromFunc(func)));
+  metadata.live_ins = {makeLiveIn(0)};
+  PyObject* result = nullptr;
+
+  EXPECT_EQ(
+      performWithMetadata(
+          PyThreadState_Get(), frame, metadata, compiled, &result),
+      1);
+  EXPECT_EQ(g_stub_observation.observed_refcnt, before_refcnt);
+  EXPECT_EQ(Py_REFCNT(dead), before_refcnt - 1);
+  Py_XDECREF(result);
 }
 
 // TC-B11 (SR-OSR-013): Exception state preserved through deferred DECREF.
@@ -368,7 +861,33 @@ TEST_F(PerformOSRTest, DeferredDecrefs_AfterStubReturn) {
 //
 // TODO(T-OSR-003): Requires compilation pipeline.
 TEST_F(PerformOSRTest, ExceptionStatePreserved_DuringDECREF) {
-  GTEST_SKIP() << "Requires Feature Item 2 compilation pipeline";
+  resetStubObservation();
+  Ref<PyFunctionObject> func = compileSingleLoop(*this);
+  ASSERT_NE(func, nullptr);
+  InterpreterFrameHolder frame_holder(func);
+  auto frame = frame_holder.get();
+  auto live = Ref<>::steal(PyLong_FromLong(1));
+  ASSERT_NE(live, nullptr);
+  frame_holder.setLocalNewRef(0, live);
+
+  auto finalizer = makeDeallocSetsErrorObject();
+  ASSERT_NE(finalizer, nullptr);
+  frame_holder.setLocalSteal(1, finalizer.release());
+
+  auto compiled = makeStubCompiledFunction(observingExceptionStub);
+  ASSERT_NE(compiled, nullptr);
+  OSRMetadata metadata = makeMetadata(firstBackedgeTarget(codeFromFunc(func)));
+  metadata.live_ins = {makeLiveIn(0)};
+  PyObject* result = nullptr;
+
+  EXPECT_EQ(
+      performWithMetadata(
+          PyThreadState_Get(), frame, metadata, compiled, &result),
+      -1);
+  EXPECT_EQ(result, nullptr);
+  EXPECT_EQ(g_dealloc_sets_error_count, 1);
+  EXPECT_TRUE(PyErr_ExceptionMatches(PyExc_ValueError));
+  PyErr_Clear();
 }
 
 #endif // CINDERX_OSR_HEADERS_AVAILABLE
@@ -386,7 +905,24 @@ TEST_F(PerformOSRTest, ExceptionStatePreserved_DuringDECREF) {
 
 #if CINDERX_OSR_HEADERS_AVAILABLE
 
-class OSRStubTest : public RuntimeTest {};
+class OSRStubTest : public RuntimeTest {
+ protected:
+  void SetUp() override {
+    RuntimeTest::SetUp();
+    previous_osr_enabled_ = jit::getConfig().osr_enabled;
+    jit::getMutableConfig().osr_enabled = true;
+    jit::syncOSRFlags();
+  }
+
+  void TearDown() override {
+    jit::getMutableConfig().osr_enabled = previous_osr_enabled_;
+    jit::syncOSRFlags();
+    RuntimeTest::TearDown();
+  }
+
+ private:
+  bool previous_osr_enabled_{false};
+};
 
 // TC-C01 (SR-OSR-011): Stub prologue matches kNormal JIT prologue layout.
 //
@@ -398,7 +934,26 @@ class OSRStubTest : public RuntimeTest {};
 //
 // TODO(T-OSR-002): Requires Feature Item 2 compilation pipeline.
 TEST_F(OSRStubTest, StubPrologue_MatchesNormalLayout) {
-  GTEST_SKIP() << "Requires Feature Item 2 compilation pipeline";
+#if defined(__aarch64__)
+  Ref<PyFunctionObject> func = compileSingleLoop(*this);
+  ASSERT_NE(func, nullptr);
+  Ref<CompiledFunction> compiled = compileToCompiledFunction(func);
+  ASSERT_NE(compiled, nullptr);
+  const auto& metadatas = compiled->runtime()->osrMetadatas();
+  ASSERT_EQ(metadatas.size(), 1);
+  const OSRMetadata& metadata = metadatas.front();
+  ASSERT_GE(metadata.entry_point_offset, 0);
+  EXPECT_GT(metadata.resume_frame_total_size, 0);
+  EXPECT_GT(metadata.resume_header_and_spill_size, 0);
+
+  const std::byte* entry =
+      static_cast<const std::byte*>(metadata.entryPoint(*compiled.get()));
+  ASSERT_NE(entry, nullptr);
+  EXPECT_EQ(loadInstructionWord(entry), 0xA9BF7BFDu); // stp fp, lr, [sp,#-16]!
+  EXPECT_EQ(loadInstructionWord(entry + 4), 0x910003FDu); // mov fp, sp
+#else
+  GTEST_SKIP() << "OSR entry stubs are implemented for aarch64";
+#endif
 }
 
 // TC-C02 (SR-OSR-011): Environ VRegs set correctly.
@@ -408,7 +963,24 @@ TEST_F(OSRStubTest, StubPrologue_MatchesNormalLayout) {
 //
 // TODO(T-OSR-002): Requires Feature Item 2 compilation pipeline.
 TEST_F(OSRStubTest, EnvironVRegs_SetCorrectly) {
-  GTEST_SKIP() << "Requires Feature Item 2 compilation pipeline";
+#if defined(__aarch64__)
+  Ref<PyFunctionObject> func = compileSingleLoop(*this);
+  ASSERT_NE(func, nullptr);
+  Ref<CompiledFunction> compiled = compileToCompiledFunction(func);
+  ASSERT_NE(compiled, nullptr);
+  const auto& metadatas = compiled->runtime()->osrMetadatas();
+  ASSERT_EQ(metadatas.size(), 1);
+  const OSRMetadata& metadata = metadatas.front();
+
+  EXPECT_NE(metadata.tstate_location.loc, arch::PhyLocation::REG_INVALID);
+  EXPECT_NE(metadata.func_location.loc, arch::PhyLocation::REG_INVALID);
+  EXPECT_NE(metadata.frame_location.loc, arch::PhyLocation::REG_INVALID);
+  EXPECT_FALSE(OSR_STUB_SCRATCH_REGS.Has(metadata.tstate_location));
+  EXPECT_FALSE(OSR_STUB_SCRATCH_REGS.Has(metadata.func_location));
+  EXPECT_FALSE(OSR_STUB_SCRATCH_REGS.Has(metadata.frame_location));
+#else
+  GTEST_SKIP() << "OSR entry stubs are implemented for aarch64";
+#endif
 }
 
 // TC-C03 (SR-OSR-012): Stub writes PyStackRef_NULL (bits=1), not zero.
@@ -420,7 +992,30 @@ TEST_F(OSRStubTest, EnvironVRegs_SetCorrectly) {
 //
 // TODO(T-OSR-002): Requires Feature Item 2 to generate stub machine code.
 TEST_F(OSRStubTest, LiveInSteal_WritesPyStackRefNull) {
-  GTEST_SKIP() << "Requires Feature Item 2 compilation pipeline";
+#if defined(__aarch64__)
+  Ref<PyFunctionObject> func = compileSingleLoop(*this);
+  ASSERT_NE(func, nullptr);
+  Ref<CompiledFunction> compiled = compileToCompiledFunction(func);
+  ASSERT_NE(compiled, nullptr);
+  const auto& metadatas = compiled->runtime()->osrMetadatas();
+  ASSERT_EQ(metadatas.size(), 1);
+  const OSRMetadata& metadata = metadatas.front();
+  ASSERT_FALSE(metadata.live_ins.empty());
+
+  auto code = compiled->codeBuffer();
+  std::size_t entry_offset = static_cast<std::size_t>(metadata.entry_point_offset);
+  EXPECT_TRUE(codeContainsWord(code, entry_offset, 0xD280002Cu))
+      << "expected mov x12, #1 before storing PyStackRef_NULL";
+  for (const OSRLiveIn& live_in : metadata.live_ins) {
+    int32_t slot_offset = localsplusOffsetForTest(live_in.localsplus_index);
+    EXPECT_TRUE(codeContainsWord(
+        code, entry_offset, strX12FromX9UnsignedOffset(slot_offset)))
+        << "expected 64-bit store of PyStackRef_NULL for localsplus index "
+        << live_in.localsplus_index;
+  }
+#else
+  GTEST_SKIP() << "OSR entry stubs are implemented for aarch64";
+#endif
 }
 
 // TC-C04 (SR-OSR-012): Live-in steal uses 64-bit store.
@@ -431,7 +1026,30 @@ TEST_F(OSRStubTest, LiveInSteal_WritesPyStackRefNull) {
 //
 // TODO(T-OSR-002): Requires Feature Item 2 to generate stub machine code.
 TEST_F(OSRStubTest, LiveInSteal_64BitStore) {
-  GTEST_SKIP() << "Requires Feature Item 2 compilation pipeline";
+#if defined(__aarch64__)
+  static_assert(sizeof(_PyStackRef) == 8, "OSR assumes 8-byte stack refs");
+  Ref<PyFunctionObject> func = compileSingleLoop(*this);
+  ASSERT_NE(func, nullptr);
+  Ref<CompiledFunction> compiled = compileToCompiledFunction(func);
+  ASSERT_NE(compiled, nullptr);
+  const auto& metadatas = compiled->runtime()->osrMetadatas();
+  ASSERT_EQ(metadatas.size(), 1);
+  const OSRMetadata& metadata = metadatas.front();
+  ASSERT_FALSE(metadata.live_ins.empty());
+
+  auto code = compiled->codeBuffer();
+  std::size_t entry_offset = static_cast<std::size_t>(metadata.entry_point_offset);
+  for (const OSRLiveIn& live_in : metadata.live_ins) {
+    int32_t slot_offset = localsplusOffsetForTest(live_in.localsplus_index);
+    EXPECT_TRUE(codeContainsWord(
+        code, entry_offset, strX12FromX9UnsignedOffset(slot_offset)));
+    EXPECT_FALSE(codeContainsWord(
+        code, entry_offset, strW12FromX9UnsignedOffset(slot_offset)))
+        << "OSR live-in steal must not use a 32-bit store";
+  }
+#else
+  GTEST_SKIP() << "OSR entry stubs are implemented for aarch64";
+#endif
 }
 
 #endif // CINDERX_OSR_HEADERS_AVAILABLE
@@ -499,7 +1117,19 @@ TEST_F(OSREntryDataTest, StubScratchRegs_SubsetOfCallerSave) {
 //
 // TODO(T-OSR-002): Requires Feature Item 2 compilation pipeline.
 TEST_F(OSRStubTest, OSRDeopt_SharesNormalPath) {
-  GTEST_SKIP() << "Requires Feature Item 2 compilation pipeline";
+#if defined(__aarch64__)
+  Ref<PyFunctionObject> func = compileSingleLoop(*this);
+  ASSERT_NE(func, nullptr);
+  Ref<CompiledFunction> compiled = compileToCompiledFunction(func);
+  ASSERT_NE(compiled, nullptr);
+  ASSERT_NE(compiled->runtime(), nullptr);
+  EXPECT_TRUE(compiled->hasOSREntries());
+  EXPECT_FALSE(compiled->runtime()->osrMetadatas().empty());
+  EXPECT_FALSE(compiled->runtime()->deoptMetadatas().empty())
+      << "OSR compiled functions should retain normal deopt metadata";
+#else
+  GTEST_SKIP() << "OSR entry stubs are implemented for aarch64";
+#endif
 }
 
 #endif // CINDERX_OSR_HEADERS_AVAILABLE
