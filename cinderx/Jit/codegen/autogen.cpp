@@ -1210,6 +1210,13 @@ void translateVariadicPush(Environ* env, const Instruction* instr) {
     as->push(x86::gpq(instr->getInput(n - i - 1)->getPhyRegister().loc));
   }
 #elif defined(CINDER_AARCH64)
+  bool save_vecd = n > 0 && instr->getInput(0)->isVecD();
+  for (size_t j = 0; j < n; j++) {
+    JIT_CHECK(
+        instr->getInput(j)->isVecD() == save_vecd,
+        "VariadicPush cannot mix GP and VecD registers");
+  }
+
   // First pair uses pre-index to allocate stack space for all pairs.
   // Remaining pairs use offset addressing within the allocated region.
   constexpr int bytes_per_store = 16;
@@ -1217,34 +1224,46 @@ void translateVariadicPush(Environ* env, const Instruction* instr) {
   int alloc = total_pairs * bytes_per_store;
   size_t i = 0;
 
+  auto stp = [&](size_t left, size_t right, const a64::Mem& mem) {
+    if (save_vecd) {
+      as->stp(
+          AutoTranslator::getVecD(instr->getInput(left)),
+          AutoTranslator::getVecD(instr->getInput(right)),
+          mem);
+    } else {
+      as->stp(
+          a64::x(instr->getInput(left)->getPhyRegister().loc),
+          a64::x(instr->getInput(right)->getPhyRegister().loc),
+          mem);
+    }
+  };
+
+  auto str = [&](size_t input, const a64::Mem& mem) {
+    if (save_vecd) {
+      as->str(AutoTranslator::getVecD(instr->getInput(input)), mem);
+    } else {
+      as->str(a64::x(instr->getInput(input)->getPhyRegister().loc), mem);
+    }
+  };
+
   // First pair: pre-index allocation
   if (n >= 2) {
-    as->stp(
-        a64::x(instr->getInput(0)->getPhyRegister().loc),
-        a64::x(instr->getInput(1)->getPhyRegister().loc),
-        a64::ptr_pre(a64::sp, -alloc));
+    stp(0, 1, a64::ptr_pre(a64::sp, -alloc));
     i = 2;
   } else if (n == 1) {
-    as->str(
-        a64::x(instr->getInput(0)->getPhyRegister().loc),
-        a64::ptr_pre(a64::sp, -alloc));
+    str(0, a64::ptr_pre(a64::sp, -alloc));
     i = 1;
   }
 
   // Remaining pairs at positive offsets from sp.
   int pair_idx = 1;
   while (i + 1 < n) {
-    as->stp(
-        a64::x(instr->getInput(i)->getPhyRegister().loc),
-        a64::x(instr->getInput(i + 1)->getPhyRegister().loc),
-        a64::ptr(a64::sp, pair_idx * bytes_per_store));
+    stp(i, i + 1, a64::ptr(a64::sp, pair_idx * bytes_per_store));
     i += 2;
     pair_idx++;
   }
   if (i < n) {
-    as->str(
-        a64::x(instr->getInput(i)->getPhyRegister().loc),
-        a64::ptr(a64::sp, pair_idx * bytes_per_store));
+    str(i, a64::ptr(a64::sp, pair_idx * bytes_per_store));
   }
 #else
   CINDER_UNSUPPORTED

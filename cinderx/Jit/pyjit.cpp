@@ -550,6 +550,16 @@ FlagProcessor initFlagProcessor() {
   HIR_OPTIMIZATION_OPTION(
       "phi elimination", phi_elim, "jit-phi-elim", "PYTHONJITPHIELIM");
   HIR_OPTIMIZATION_OPTION(
+      "PrimitiveBox rematerialization",
+      primitive_box_remat,
+      "jit-primitive-box-remat",
+      "PYTHONJITPRIMITIVEBOXREMAT");
+  HIR_OPTIMIZATION_OPTION(
+      "PrimitiveUnbox CSE",
+      primitive_unbox_cse,
+      "jit-primitive-unbox-cse",
+      "PYTHONJITPRIMITIVEUNBOXCSE");
+  HIR_OPTIMIZATION_OPTION(
       "simplify", simplify, "jit-simplify", "PYTHONJITSIMPLIFY");
 
   flag_processor.addOption(

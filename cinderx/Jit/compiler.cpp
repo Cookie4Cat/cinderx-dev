@@ -3,6 +3,7 @@
 #include "cinderx/Jit/compiler.h"
 
 #include "cinderx/Common/log.h"
+#include "cinderx/Jit/codegen/arch/detection.h"
 #include "cinderx/Jit/config.h"
 #include "cinderx/Jit/frame.h"
 #include "cinderx/Jit/hir/analysis.h"
@@ -18,6 +19,8 @@
 #include "cinderx/Jit/hir/insert_update_prev_instr.h"
 #include "cinderx/Jit/hir/phi_elimination.h"
 #include "cinderx/Jit/hir/printer.h"
+#include "cinderx/Jit/hir/primitive_box_remat.h"
+#include "cinderx/Jit/hir/primitive_unbox_cse.h"
 #include "cinderx/Jit/hir/refcount_insertion.h"
 #include "cinderx/Jit/hir/simplify.h"
 #include "cinderx/Jit/hir/ssa.h"
@@ -111,6 +114,15 @@ void Compiler::runPasses(
   runPassIf(
       hir::BuiltinLoadMethodElimination{}, PassConfig::kBuiltinLoadMethodElim);
   runSimplifyAndFloatAccumulatorPromotion();
+  // Simplify creates the CDouble PrimitiveBox shapes this pass rematerializes.
+  // PrimitiveUnboxCSE makes more of those boxes frame-state-only by merging
+  // repeated unboxes before remat looks at direct uses.
+  runPassIf(hir::PrimitiveUnboxCSE{}, PassConfig::kPrimitiveUnboxCSE);
+  // Deopt correctness also requires the backend trampoline to save FP
+  // registers in regs[]; that support is currently implemented for AArch64.
+#if defined(CINDER_AARCH64)
+  runPassIf(hir::PrimitiveBoxRemat{}, PassConfig::kPrimitiveBoxRemat);
+#endif
   runPassIf(hir::CleanCFG{}, PassConfig::kCleanCFG);
   runPassIf(hir::DeadCodeElimination{}, PassConfig::kDeadCodeElim);
   runPassIf(hir::CleanCFG{}, PassConfig::kCleanCFG);
@@ -166,6 +178,8 @@ PassConfig createConfig() {
   set(hir_opts.inliner && getConfig().stable_frame, PassConfig::kInliner);
   set(hir_opts.insert_update_prev_instr, PassConfig::kInsertUpdatePrevInstr);
   set(hir_opts.phi_elim, PassConfig::kPhiElim);
+  set(hir_opts.primitive_box_remat, PassConfig::kPrimitiveBoxRemat);
+  set(hir_opts.primitive_unbox_cse, PassConfig::kPrimitiveUnboxCSE);
   set(hir_opts.simplify, PassConfig::kSimplify);
 
   return static_cast<PassConfig>(result);

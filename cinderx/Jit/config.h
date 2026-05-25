@@ -46,6 +46,8 @@ struct HIROptimizations {
   bool inliner{true};
   bool insert_update_prev_instr{true};
   bool phi_elim{true};
+  bool primitive_box_remat{true};
+  bool primitive_unbox_cse{true};
   bool simplify{true};
 };
 

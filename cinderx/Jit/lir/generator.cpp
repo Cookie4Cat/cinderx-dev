@@ -4987,17 +4987,24 @@ void GenerateDeoptTrampolineBlocks(
 
   emitAnnotation(block, "Save registers");
 
-  // Stage 1: Save all GP registers via VariadicPush.
-  // Each architecture saves all GP registers except the deopt scratch register
-  // (already saved by the stage 2 stub).
+  // Stage 1: Save registers via VariadicPush.
+  // AArch64 saves FP registers as well so kDouble deopt values can be read from
+  // the same regs[] array as GP values, using PhyLocation numbering.
 #if defined(CINDER_X86_64)
   constexpr int kStage3SavedRegs = 15;
   constexpr int kStage2SavedRegs = 1; // r15
 #elif defined(CINDER_AARCH64)
-  constexpr int kStage3SavedRegs = 28;
+  constexpr int kStage3SavedGPRegs = 28;
   constexpr int kStage2SavedRegs = 2; // x28 + fp
+  constexpr int kAArch64ExtraGPSlots = codegen::NUM_GP_REGS -
+      kStage3SavedGPRegs;
+  static_assert(kAArch64ExtraGPSlots == 4); // x28, fp, lr, xzr
 #endif
 
+  constexpr auto sp_reg = codegen::arch::reg_stack_pointer_loc;
+  constexpr auto fp_reg = codegen::arch::reg_frame_pointer_loc;
+
+#if defined(CINDER_X86_64)
   auto* vpush = block->allocateInstr(Instruction::kVariadicPush, nullptr);
   // Push in descending order so the memory layout is ascending by PhyLocation.
   // r15 was already saved by stage 2.
@@ -5012,13 +5019,60 @@ void GenerateDeoptTrampolineBlocks(
   // cleanup_size skips all stage 3 regs; the stage 2 scratch reg is
   // loaded separately in stage 4.
   constexpr int cleanup_size = kStage3SavedRegs * kPointerSize;
+#elif defined(CINDER_AARCH64)
+  auto* vpush_fp = block->allocateInstr(Instruction::kVariadicPush, nullptr);
+  for (int i = codegen::VECD_REG_BASE; i < codegen::NUM_REGS; i++) {
+    vpush_fp->addOperands(PhyReg{PhyLocation{i}, OperandBase::kDouble});
+  }
+
+  block->allocateInstr(
+      Instruction::kLea,
+      nullptr,
+      OutPhyReg{sp_reg},
+      Ind(sp_reg, -kAArch64ExtraGPSlots * kPointerSize));
+
+  auto* vpush_gp = block->allocateInstr(Instruction::kVariadicPush, nullptr);
+  for (int i = 0; i < kStage3SavedGPRegs; i++) {
+    vpush_gp->addOperands(PhyReg{PhyLocation{i}});
+  }
+
+  constexpr int saved_regs_size = codegen::NUM_REGS * kPointerSize;
+  constexpr int frame_offset = saved_regs_size + 6 * kPointerSize;
+  constexpr int cleanup_size = saved_regs_size;
+  constexpr auto save_scratch_reg = codegen::ARGUMENT_REGS[3];
+
+  // Stage 2 saved x28/fp in metadata above the regs[] area. Copy them into
+  // their PhyLocation slots, and make the disallowed lr/xzr slots explicit.
+  block->allocateInstr(
+      Instruction::kMove,
+      nullptr,
+      OutPhyReg{save_scratch_reg},
+      Ind(sp_reg, saved_regs_size));
+  block->allocateInstr(
+      Instruction::kMove,
+      nullptr,
+      OutInd(sp_reg, 28 * kPointerSize),
+      PhyReg{save_scratch_reg});
+  block->allocateInstr(
+      Instruction::kMove,
+      nullptr,
+      OutPhyReg{save_scratch_reg},
+      Ind(sp_reg, saved_regs_size + kPointerSize));
+  block->allocateInstr(
+      Instruction::kMove,
+      nullptr,
+      OutInd(sp_reg, 29 * kPointerSize),
+      PhyReg{save_scratch_reg});
+  block->allocateInstr(
+      Instruction::kMove, nullptr, OutInd(sp_reg, 30 * kPointerSize), Imm{0});
+  block->allocateInstr(
+      Instruction::kMove, nullptr, OutInd(sp_reg, 31 * kPointerSize), Imm{0});
+#endif
 
   // Stage 2: Set up the deopt frame and shuffle deopt metadata.
   // All operations use arch-agnostic register refs via codegen::arch.
   emitAnnotation(block, "Shuffle rip, rbp, and deopt index");
 
-  constexpr auto sp_reg = codegen::arch::reg_stack_pointer_loc;
-  constexpr auto fp_reg = codegen::arch::reg_frame_pointer_loc;
   // The frame setup doubles as prepareForDeopt's call args: arg0 = &regs,
   // arg1 = code_rt, arg2 = deopt_idx.  saved_rip_reg is just a scratch.
   constexpr auto arg0_reg = codegen::ARGUMENT_REGS[0];
@@ -5104,7 +5158,7 @@ void GenerateDeoptTrampolineBlocks(
       Instruction::kMove,
       nullptr,
       OutPhyReg{scratch_deopt_reg},
-      Ind(sp_reg, cleanup_size));
+      Ind(sp_reg, codegen::arch::reg_scratch_deopt_loc.loc * kPointerSize));
   // Adjust SP past all saved registers (stage 3 regs + stage 2 regs).
   block->allocateInstr(
       Instruction::kLea,

@@ -311,6 +311,9 @@ constexpr PhyRegisterSet ALL_REGISTERS = ALL_GP_REGISTERS | ALL_VECD_REGISTERS;
 constexpr PhyRegisterSet DISALLOWED_REGISTERS = PhyRegisterSet(X29) /* FP */ |
     X30 /* LR */ | XZR /* zero */ | X13 /* scratch0 */ | X14 /* scratch1 */ |
     X16 /* IP0 */ | D16 /* fp_scratch0 */ | D17 /* fp_scratch1 */;
+static_assert(
+    DISALLOWED_REGISTERS.Has(X30),
+    "AArch64 deopt trampoline stores zero in the X30 save slot");
 
 constexpr PhyRegisterSet INIT_REGISTERS = ALL_REGISTERS - DISALLOWED_REGISTERS;
 
