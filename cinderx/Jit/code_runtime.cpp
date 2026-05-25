@@ -119,6 +119,18 @@ std::size_t CodeRuntime::addOSRMetadata(OSRMetadata&& osr_meta) {
   return osr_metadatas_.size() - 1;
 }
 
+OSRMetadata& CodeRuntime::getOSRMetadata(std::size_t id) {
+  return osr_metadatas_[id];
+}
+
+const OSRMetadata& CodeRuntime::getOSRMetadata(std::size_t id) const {
+  return osr_metadatas_[id];
+}
+
+std::vector<OSRMetadata>& CodeRuntime::osrMetadatas() {
+  return osr_metadatas_;
+}
+
 const std::vector<OSRMetadata>& CodeRuntime::osrMetadatas() const {
   return osr_metadatas_;
 }

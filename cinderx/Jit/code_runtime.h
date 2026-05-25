@@ -128,7 +128,11 @@ class alignas(16) CodeRuntime {
   // Returns the index of the newly added metadata.
   std::size_t addOSRMetadata(OSRMetadata&& osr_meta);
 
+  OSRMetadata& getOSRMetadata(std::size_t id);
+  const OSRMetadata& getOSRMetadata(std::size_t id) const;
+
   // Get all OSR metadatas.
+  std::vector<OSRMetadata>& osrMetadatas();
   const std::vector<OSRMetadata>& osrMetadatas() const;
 
   // Check if this CodeRuntime has any OSR entry stubs.

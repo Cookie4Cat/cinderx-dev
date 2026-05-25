@@ -3641,6 +3641,43 @@ Result compileFunction(BorrowedRef<PyFunctionObject> func) {
   return compile_func(func);
 }
 
+void uncompile(BorrowedRef<PyFunctionObject> func) {
+  deoptFuncImpl(func);
+  jitCtx()->forgetCode(func);
+}
+
+Result compileFunctionWithOSR(BorrowedRef<PyFunctionObject> func) {
+  FreeThreadedJITEntrypointGuard guard;
+  if (!isJitInitialized()) {
+    return Result::NOT_INITIALIZED;
+  }
+  if (isJitPaused()) {
+    return Result::PAUSED;
+  }
+  if (!isJitUsable()) {
+    return Result::UNKNOWN_ERROR;
+  }
+
+  JIT_CHECK(func != nullptr, "OSR only supports function frames");
+  BorrowedRef<PyCodeObject> pinned_code{func->func_code};
+  if (!osrCompileBudgetCheck(pinned_code)) {
+    return Result::CANNOT_SPECIALIZE;
+  }
+
+  hir::IsolatedPreloaders isolated_preloaders;
+  hir::Preloader* preloader = preload(func);
+  if (preloader == nullptr || func->func_code != pinned_code) {
+    PyErr_Clear();
+    return Result::CANNOT_SPECIALIZE;
+  }
+
+  Result result = compilePreloader(*preloader, func);
+  if (result != Result::OK && PyErr_Occurred()) {
+    PyErr_Clear();
+  }
+  return result;
+}
+
 std::vector<BorrowedRef<PyFunctionObject>> preloadFuncAndDeps(
     BorrowedRef<PyFunctionObject> func,
     bool forcePreload) {
@@ -3765,7 +3802,7 @@ void funcModified(BorrowedRef<PyFunctionObject> func) {
   unregisterFunctionCodes(func);
   // Reset OSR state for the old code — must happen before func_code is
   // updated by the caller.
-  resetOSRState(borrowed(func->func_code));
+  resetOSRState(reinterpret_cast<PyCodeObject*>(func->func_code));
 }
 
 void typeDestroyed(BorrowedRef<PyTypeObject> type) {

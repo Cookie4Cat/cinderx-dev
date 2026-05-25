@@ -11,6 +11,7 @@
 #include "cinderx/Jit/hir/function.h"
 #include "cinderx/Jit/hir/hir.h"
 #include "cinderx/Jit/hir/type.h"
+#include "cinderx/Jit/osr.h"
 #include "cinderx/StaticPython/typed-args-info.h"
 
 #include <map>
@@ -114,7 +115,13 @@ class Preloader {
         "Expecting Python exception only when preloading fails, preloading "
         "result: {}",
         success);
-    return success ? std::move(preloader) : nullptr;
+    if (!success) {
+      return nullptr;
+    }
+#if defined(CINDER_AARCH64)
+    preloader->setOSREntryTargetOffsets(collectBackedgeTargetOffsets(code));
+#endif
+    return preloader;
   }
 
   Type type(BorrowedRef<> descr) const;
@@ -197,6 +204,7 @@ class Preloader {
   const std::vector<BCOffset>& osrEntryTargetOffsets() const {
     return osr_entry_offsets_;
   }
+
   void setOSREntryTargetOffsets(std::vector<BCOffset> offsets) {
     osr_entry_offsets_ = std::move(offsets);
   }

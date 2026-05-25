@@ -56,6 +56,8 @@ bool scheduleJitCompile(BorrowedRef<PyFunctionObject> func);
  */
 Result compileFunction(BorrowedRef<PyFunctionObject> func);
 
+void uncompile(BorrowedRef<PyFunctionObject> func);
+
 /*
  * Preload a function, along with any functions that it calls that we might want
  * to compile afterwards as well.  This is to support inlining and faster

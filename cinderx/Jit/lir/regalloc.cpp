@@ -3,6 +3,7 @@
 #include "cinderx/Jit/lir/regalloc.h"
 
 #include "cinderx/Common/log.h"
+#include "cinderx/Jit/hir/function.h"
 #include "cinderx/Jit/lir/printer.h"
 #include "cinderx/module_state.h"
 
@@ -31,14 +32,26 @@ struct LiveRangeCompare {
   }
 };
 
-void markDisallowedRegisters(std::vector<LIRLocation>& locs) {
-  auto disallowed_registers = DISALLOWED_REGISTERS;
+void markDisallowedRegisters(
+    std::vector<LIRLocation>& locs,
+    PhyRegisterSet extra_disallowed = PhyRegisterSet()) {
+  auto disallowed_registers = DISALLOWED_REGISTERS | extra_disallowed;
   while (!disallowed_registers.Empty()) {
     auto reg = disallowed_registers.GetFirst();
     disallowed_registers.RemoveFirst();
 
     locs[reg.loc] = START_LOCATION;
   }
+}
+
+PhyRegisterSet extraDisallowedRegisters(const Function* func) {
+#if defined(CINDER_AARCH64)
+  const auto* hir_func = func->hirFunc();
+  if (hir_func != nullptr && hir_func->hasOSREntries()) {
+    return OSR_STUB_SCRATCH_REGS;
+  }
+#endif
+  return PhyRegisterSet();
 }
 
 // Check if an operand should be replaced with a new one by the register
@@ -793,7 +806,7 @@ bool LinearScanAllocator::tryAllocateFreeReg(
     }
   }
 
-  markDisallowedRegisters(freeUntilPos);
+  markDisallowedRegisters(freeUntilPos, extraDisallowedRegisters(func_));
 
   PhyLocation reg;
   LIRLocation regFreeUntil = START_LOCATION;
@@ -873,7 +886,7 @@ void LinearScanAllocator::allocateBlockedReg(
     reg_inactive_intervals[allocated_loc].push_back(interval);
   }
 
-  markDisallowedRegisters(nextUsePos);
+  markDisallowedRegisters(nextUsePos, extraDisallowedRegisters(func_));
 
   auto start = std::next(nextUsePos.begin(), is_fp ? VECD_REG_BASE : 0);
   auto end = std::prev(nextUsePos.end(), is_fp ? 0 : VECD_REG_BASE);

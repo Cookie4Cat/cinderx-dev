@@ -324,6 +324,46 @@ void syncOSRFlags() {
       &cinderx_osr_state, config.state == State::kRunning ? 1 : 0);
 }
 
+std::vector<BCOffset> collectBackedgeTargetOffsets(
+    BorrowedRef<PyCodeObject> code) {
+  std::vector<BCOffset> targets;
+  for (auto instr : BytecodeInstructionBlock{code}) {
+    if (instr.opcode() == JUMP_BACKWARD ||
+        instr.opcode() == JUMP_BACKWARD_NO_INTERRUPT) {
+      targets.emplace_back(instr.getJumpTarget());
+    }
+  }
+
+  std::sort(targets.begin(), targets.end());
+  targets.erase(std::unique(targets.begin(), targets.end()), targets.end());
+  if (targets.size() > CI_OSR_MAX_BACKEDGES) {
+    targets.resize(CI_OSR_MAX_BACKEDGES);
+  }
+  return targets;
+}
+
+bool osrCompileBudgetCheck(BorrowedRef<PyCodeObject> code) {
+  return Py_SIZE(code) <= getConfig().osr_compile_budget_code_units;
+}
+
+const OSRMetadata* getOSREntry(
+    BorrowedRef<CompiledFunction> compiled,
+    BCOffset target_offset) {
+  if (compiled == nullptr) {
+    return nullptr;
+  }
+  const CodeRuntime* runtime = compiled->runtime();
+  if (runtime == nullptr) {
+    return nullptr;
+  }
+  for (const OSRMetadata& metadata : runtime->osrMetadatas()) {
+    if (metadata.target_offset == target_offset) {
+      return &metadata;
+    }
+  }
+  return nullptr;
+}
+
 void* OSRMetadata::entryPoint(const CompiledFunction& cf) const {
   if (entry_point_offset < 0) {
     return nullptr;
@@ -372,7 +412,7 @@ int performOSR(
     return 0;
   }
 
-  int num_nlocalsplus = _PyFrame_GetCode(frame)->co_nlocalsplus;
+  Py_ssize_t num_nlocalsplus = _PyFrame_GetCode(frame)->co_nlocalsplus;
   for (const auto& li : osr_meta->live_ins) {
     if (li.localsplus_index >= 0) {
       if (li.localsplus_index >= num_nlocalsplus) {
@@ -387,11 +427,11 @@ int performOSR(
   // -- [0.75] Pre-allocate all heap memory before modifying frame state --
   std::vector<bool> is_live_in_set;
   std::vector<PyObject*> deferred_decrefs;
-  int distinct_localsplus_live_in = 0;
-  int non_live_in_count = 0;
+  Py_ssize_t distinct_localsplus_live_in = 0;
+  Py_ssize_t non_live_in_count = 0;
 
   try {
-    is_live_in_set.resize(num_nlocalsplus, false);
+    is_live_in_set.resize(static_cast<std::size_t>(num_nlocalsplus), false);
     for (const auto& li : osr_meta->live_ins) {
       if (li.localsplus_index >= 0 && li.localsplus_index < num_nlocalsplus) {
         if (!is_live_in_set[li.localsplus_index]) {
@@ -403,20 +443,24 @@ int performOSR(
 
     non_live_in_count = num_nlocalsplus - distinct_localsplus_live_in;
     if (non_live_in_count > 0) {
-      deferred_decrefs.resize(non_live_in_count);
+      deferred_decrefs.resize(static_cast<std::size_t>(non_live_in_count));
     }
   } catch (const std::bad_alloc&) {
     return 0;
   }
 
+  // From this point onward, the interpreter frame is committed to OSR: instr_ptr
+  // is moved to the loop header and localsplus ownership is transferred before
+  // entering the stub. The entry stub must not add recoverable failure paths
+  // after this point unless this frame mutation is moved later or made rollbackable.
   // -- [0.5] Set frame->instr_ptr to loop header bytecode position --
   _Py_CODEUNIT* code_start = _PyCode_CODE(_PyFrame_GetCode(frame));
   frame->instr_ptr =
       code_start + osr_meta->target_offset.value() / sizeof(_Py_CODEUNIT);
 
   // -- [1] Collect non-live-in slots -> deferred_decrefs[] (steal) --
-  int n_deferred = 0;
-  for (int i = 0; i < num_nlocalsplus; i++) {
+  Py_ssize_t n_deferred = 0;
+  for (Py_ssize_t i = 0; i < num_nlocalsplus; i++) {
     if (is_live_in_set[i]) {
       continue;
     }
@@ -436,7 +480,7 @@ int performOSR(
   if (result == nullptr) {
     saved_exc = PyErr_GetRaisedException();
   }
-  for (int i = 0; i < n_deferred; i++) {
+  for (Py_ssize_t i = 0; i < n_deferred; i++) {
     Py_XDECREF(deferred_decrefs[i]);
   }
   if (saved_exc != nullptr) {
@@ -449,78 +493,6 @@ int performOSR(
     return 1;
   }
   return -1;
-}
-
-std::vector<BCIndex> collectBackedgeTargetOffsets(PyCodeObject* code) {
-  std::vector<BCIndex> targets;
-  for (auto instr : BytecodeInstructionBlock{code}) {
-    if (instr.opcode() == JUMP_BACKWARD ||
-        instr.opcode() == JUMP_BACKWARD_NO_INTERRUPT) {
-      auto target = instr.getJumpTarget().asIndex();
-      if (std::find(targets.begin(), targets.end(), target) == targets.end()) {
-        targets.push_back(target);
-      }
-    }
-  }
-  return targets;
-}
-
-bool osrCompileBudgetCheck(PyCodeObject* code) {
-  return countIndices(code) <= getConfig().osr_compile_budget_code_units;
-}
-
-// ---------------------------------------------------------------------------
-// compileFunctionWithOSR — OSR compilation entry point
-// Feature Item 3
-// ---------------------------------------------------------------------------
-
-int compileFunctionWithOSR(PyFunctionObject* func) {
-  BorrowedRef<PyCodeObject> pinned_code = func->func_code;
-
-  auto targets = collectBackedgeTargetOffsets(pinned_code);
-  if (targets.empty()) {
-    return -1;
-  }
-
-  hir::IsolatedPreloaders ip;
-  auto preloader = hir::Preloader::makePreloader(borrowed(func));
-  if (preloader == nullptr) {
-    PyErr_Clear();
-    return -1;
-  }
-
-  if (func->func_code != pinned_code) {
-    return -1;
-  }
-
-  std::vector<BCOffset> offsets;
-  offsets.reserve(targets.size());
-  for (auto idx : targets) {
-    offsets.push_back(idx.asOffset());
-  }
-  preloader->setOSREntryTargetOffsets(std::move(offsets));
-
-  auto result = compilePreloaderImpl(*preloader, borrowed(func));
-  return result == Result::OK ? 0 : -1;
-}
-
-// ---------------------------------------------------------------------------
-// getOSREntry — lookup OSR entry by target index
-// Feature Item 3
-// ---------------------------------------------------------------------------
-
-OSRMetadata* getOSREntry(const CompiledFunction& cf, uint32_t target_index) {
-  CodeRuntime* runtime = cf.runtime();
-  if (runtime == nullptr) {
-    return nullptr;
-  }
-  for (auto& meta : runtime->osrMetadatas()) {
-    if (static_cast<uint32_t>(meta.target_offset.value() /
-                              sizeof(_Py_CODEUNIT)) == target_index) {
-      return &meta;
-    }
-  }
-  return nullptr;
 }
 
 } // namespace jit
@@ -600,14 +572,17 @@ int Ci_OSR_TryOSR(
     return rc;
   }
 
-  PyFunctionObject* func =
-      reinterpret_cast<PyFunctionObject*>(frame->f_funcobj);
+  PyFunctionObject* func = reinterpret_cast<PyFunctionObject*>(
+      PyStackRef_AsPyObjectBorrow(frame->f_funcobj));
   if (func == nullptr || !PyFunction_Check(func)) {
     return 0;
   }
 
   BorrowedRef<PyCodeObject> code = _PyFrame_GetCode(frame);
   _Py_CODEUNIT* code_start = _PyCode_CODE(code);
+  JIT_DCHECK(
+      this_instr >= code_start && this_instr < code_start + Py_SIZE(code),
+      "Ci_OSR_TryOSR: instruction pointer outside current code object");
   uint32_t source_idx = static_cast<uint32_t>(this_instr - code_start);
 
   // Get or create backedge counters
@@ -663,21 +638,21 @@ cache_lookup:;
   BorrowedRef<jit::CompiledFunction> compiled =
       ctx->lookupCode(code, builtins, globals);
   if (compiled != nullptr) {
-    jit::OSRMetadata* osr = jit::getOSREntry(*compiled, target_idx);
+    const jit::OSRMetadata* osr =
+        jit::getOSREntry(compiled, jit::BCIndex{target_idx}.asOffset());
     if (osr != nullptr) {
       return jit::performOSR(
-          tstate, frame, osr, &*compiled, out_result);
+          tstate, frame, osr, compiled.get(), out_result);
     }
 
     // Cache hit but no OSR entry for this backedge
-    if (compiled->runtime() != nullptr &&
-        compiled->runtime()->hasOSREntries()) {
+    if (compiled->osrAware()) {
       // OSR-aware compilation explicitly skipped this backedge
       markFailedPermanentPerCode(counters, source_idx);
       return 0;
     }
     // Old cache without OSR entries — uncompile and recompile
-    ctx->uncompile(func);
+    jit::uncompile(func);
   }
 
   // Allocate compile state slot
@@ -695,9 +670,9 @@ cache_lookup:;
 
   // Synchronous compilation (holds GIL)
   cs->state = kCompileStateCompiling;
-  int compile_result = jit::compileFunctionWithOSR(func);
+  jit::Result compile_result = jit::compileFunctionWithOSR(func);
 
-  if (compile_result < 0) {
+  if (compile_result != jit::Result::OK) {
     cs->state = kCompileStateFailedPermanent;
     return 0;
   }
@@ -710,12 +685,13 @@ cache_lookup:;
     return 0;
   }
 
-  jit::OSRMetadata* osr = jit::getOSREntry(*compiled, target_idx);
+  const jit::OSRMetadata* osr =
+      jit::getOSREntry(compiled, jit::BCIndex{target_idx}.asOffset());
   if (osr == nullptr) {
     return 0;
   }
 
-  return jit::performOSR(tstate, frame, osr, &*compiled, out_result);
+  return jit::performOSR(tstate, frame, osr, compiled.get(), out_result);
 }
 
 void Ci_OSR_ResetState(PyCodeObject* code) {

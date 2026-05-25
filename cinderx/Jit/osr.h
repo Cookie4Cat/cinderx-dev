@@ -5,6 +5,8 @@
 #include "cinderx/Jit/bytecode_offsets.h"
 #include "cinderx/Jit/codegen/arch.h"
 #include "cinderx/Jit/hir/register.h"
+#include "cinderx/Jit/pyjit_result.h"
+#include "cinderx/Common/ref.h"
 #include "cinderx/Common/util.h"
 
 #include <cstdint>
@@ -64,10 +66,11 @@ struct OSRLiveIn {
   int localsplus_index{-1};       // Source: f_localsplus[] index, -1 = not in localsplus
   int stack_index{-1};            // Source: operand stack index, -1 = not on stack
   codegen::PhyLocation destination; // Target: JIT physical location (filled after regalloc)
-  hir::ValueKind value_kind;      // Value type (MVP: kObject only)
-  hir::RefKind ref_kind;          // Reference type (MVP: kOwned only, see ADR-5)
+  hir::ValueKind value_kind{hir::ValueKind::kObject}; // Value type (MVP: kObject only)
+  hir::RefKind ref_kind{hir::RefKind::kOwned}; // Reference type (MVP: kOwned only, see ADR-5)
   bool reconstructible{true};     // Can rebuild from interpreter frame
   bool is_phi{false};             // Whether this is an SSA phi node
+  hir::Register* hir_reg{nullptr}; // Compilation-only source register
 };
 
 // Per-backedge OSR entry metadata. One instance per loop-header secondary
@@ -142,38 +145,28 @@ bool isOSREligible(
 
 // Compile a function with OSR entry points for all backedge targets.
 // Uses standard preload() path + IsolatedPreloaders RAII protection.
-// Returns OK on success, CANNOT_SPECIALIZE on failure.
-int compileFunctionWithOSR(PyFunctionObject* func);
+// Returns OK on success, CANNOT_SPECIALIZE on OSR-specific rejection.
+Result compileFunctionWithOSR(BorrowedRef<PyFunctionObject> func);
 
-// Look up an OSR entry by loop-header target index in a CompiledFunction.
+// Look up an OSR entry by loop-header target offset in a CompiledFunction.
 // Returns nullptr if no matching entry exists.
-OSRMetadata* getOSREntry(const CompiledFunction& cf, uint32_t target_index);
+const OSRMetadata* getOSREntry(
+    BorrowedRef<CompiledFunction> compiled,
+    BCOffset target_offset);
 
 // Collect all JUMP_BACKWARD jump targets from a code object.
-// Returns BCIndex vector (loop-header targets).
-std::vector<BCIndex> collectBackedgeTargetOffsets(PyCodeObject* code);
+// Returns bytecode offsets for loop-header candidates.
+std::vector<BCOffset> collectBackedgeTargetOffsets(
+    BorrowedRef<PyCodeObject> code);
 
 // Pre-compilation budget check based on static code features.
 // Returns false if the function is too large/complex for OSR compilation.
-bool osrCompileBudgetCheck(PyCodeObject* code);
+bool osrCompileBudgetCheck(BorrowedRef<PyCodeObject> code);
 
 // Sync OSR flags from jit::Config to C globals.
 // Called during initialize(), enable_jit_impl(), pause, resume, finalize.
 void syncOSRFlags();
 void initOSRCodeExtraIndex();
 void finiOSRCodeExtraIndex();
-
-// ---------------------------------------------------------------------------
-// OSR scratch registers for stub generation (aarch64, Feature Item 2)
-// ---------------------------------------------------------------------------
-
-#if defined(CINDER_AARCH64)
-// Scratch registers available for OSR entry stub internal use.
-// X10/X11 are excluded: X10=INITIAL_EXTRA_ARGS_REG, X11=INITIAL_TSTATE_REG.
-// These registers are marked as disallowed during OSR regalloc to prevent
-// conflicts with stub's temporary usage.
-#define OSR_STUB_SCRATCH_REGS \
-  (jit::codegen::PhyLocation::X9 | jit::codegen::PhyLocation::X12)
-#endif
 
 } // namespace jit
