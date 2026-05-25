@@ -1321,14 +1321,15 @@ Register* simplifyLoadAttrSplitDict(
   if (attr_idx == -1) {
     return nullptr;
   }
-  // T244151823: For now we deopt on the type keys changing and in that case,
-  // de-opt the whole function. Ideally we'd just skip to the slow-path in this
-  // case.
+  // T244151823: For now we deopt on the type changing and in that case, de-opt
+  // the whole function. Ideally we'd just skip to the slow-path in this case.
+  // PyType_Modified() can notify watchers before the class dict update is
+  // visible, so a narrower split-dict patcher can miss descriptor additions.
   Register* receiver = load_attr->GetOperand(0);
   auto patchpoint = env.emitInstr<DeoptPatchpoint>(
-      env.func.allocateCodePatcher<SplitDictDeoptPatcher>(type, name, keys));
+      env.func.allocateCodePatcher<TypeDeoptPatcher>(type));
   patchpoint->setGuiltyReg(receiver);
-  patchpoint->setDescr("SplitDictDeoptPatcher");
+  patchpoint->setDescr("split dict type modified");
   env.emit<UseType>(receiver, receiver->type());
 
   Register* inline_values_valid = env.emit<LoadField>(
@@ -1389,9 +1390,9 @@ Register* simplifyLoadAttrSplitDict(
 
   Register* receiver = load_attr->GetOperand(0);
   auto patchpoint = env.emitInstr<DeoptPatchpoint>(
-      env.func.allocateCodePatcher<SplitDictDeoptPatcher>(type, name, keys));
+      env.func.allocateCodePatcher<TypeDeoptPatcher>(type));
   patchpoint->setGuiltyReg(receiver);
-  patchpoint->setDescr("SplitDictDeoptPatcher");
+  patchpoint->setDescr("split dict type modified");
   env.emit<UseType>(receiver, receiver->type());
 
   // PyDictOrValues is stored at -3 per _PyObject_DictOrValuesPointer

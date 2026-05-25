@@ -11610,7 +11610,7 @@ fun jittestmodule:test {
     }
     Snapshot
     DeoptPatchpoint<Patcher 0xdeadbeef> {
-      Descr 'SplitDictDeoptPatcher'
+      Descr 'split dict type modified'
       GuiltyReg v9
     }
     UseType<MortalObjectUser[X:0xdeadbeef]> v9
@@ -11669,7 +11669,7 @@ fun jittestmodule:test {
     }
     Snapshot
     DeoptPatchpoint<Patcher 0xdeadbeef> {
-      Descr 'SplitDictDeoptPatcher'
+      Descr 'split dict type modified'
       GuiltyReg v9
     }
     UseType<MortalObjectUser[X:0xdeadbeef]> v9
@@ -11731,7 +11731,7 @@ fun jittestmodule:test {
     }
     Snapshot
     DeoptPatchpoint<Patcher 0xdeadbeef> {
-      Descr 'SplitDictDeoptPatcher'
+      Descr 'split dict type modified'
       GuiltyReg v9
     }
     UseType<MortalObjectUser[X:0xdeadbeef]> v9

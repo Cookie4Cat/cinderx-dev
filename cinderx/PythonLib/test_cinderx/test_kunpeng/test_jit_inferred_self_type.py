@@ -2,6 +2,9 @@
 
 # pyre-strict
 
+import dis
+import opcode
+import sys
 import unittest
 from typing import Any, Callable
 
@@ -131,6 +134,57 @@ class StaticMethodVector:
         return (self.x * other.x) + (self.y * other.y) + (self.z * other.z)
 
 
+def replace_bytecode(
+    func: Callable[..., Any],
+    ops: list[tuple[str, int]],
+    names: tuple[str, ...],
+) -> None:
+    code = bytearray()
+    for opname, arg in ops:
+        op = opcode.opmap[opname]
+        code.append(op)
+        code.append(arg)
+        inline_cache_entries = dis._inline_cache_entries
+        cache_count = (
+            inline_cache_entries.get(opname, 0)
+            if isinstance(inline_cache_entries, dict)
+            else inline_cache_entries[op]
+        )
+        for _ in range(cache_count):
+            code.append(opcode.opmap["CACHE"])
+            code.append(0)
+
+    func.__code__ = func.__code__.replace(
+        co_code=bytes(code),
+        co_names=names,
+        co_stacksize=2,
+    )
+
+
+class FusedSecondSelfVector:
+    x: float
+
+    def __init__(self, x: float) -> None:
+        self.x = x
+
+    def tuple_with_other(self, other: Any) -> tuple[Any, float]:
+        return (other, self.x)
+
+
+if sys.version_info >= (3, 14):
+    replace_bytecode(
+        FusedSecondSelfVector.tuple_with_other,
+        [
+            ("RESUME", 0),
+            ("LOAD_FAST_LOAD_FAST", 0x10),
+            ("LOAD_ATTR", 0),
+            ("BUILD_TUPLE", 2),
+            ("RETURN_VALUE", 0),
+        ],
+        ("x",),
+    )
+
+
 class CountingXDescriptor:
     def __get__(self, obj: Any, owner: type[Any]) -> float:
         obj.accesses += 1
@@ -227,6 +281,19 @@ class InferredSelfTypeTests(unittest.TestCase):
             32.0,
         )
 
+    def test_fused_load_second_self_gets_exact_self_assumption(self) -> None:
+        self.compile(FusedSecondSelfVector.tuple_with_other)
+        ops = cinderx.jit.get_function_hir_opcode_counts(
+            FusedSecondSelfVector.tuple_with_other
+        )
+        self.assertGreaterEqual(ops.get("GuardType", 0), 1)
+
+        checked = fail_if_deopt(FusedSecondSelfVector.tuple_with_other)
+        self.assertEqual(
+            checked(FusedSecondSelfVector(3.5), "other"),
+            ("other", 3.5),
+        )
+
     def test_exact_self_missing_instance_attr_preserves_attribute_error(
         self,
     ) -> None:
@@ -240,17 +307,17 @@ class InferredSelfTypeTests(unittest.TestCase):
         with self.assertRaises(AttributeError):
             RaytraceVector.dot(receiver, other)
 
-    def test_exact_self_preexisting_descriptor_lookup_preserved(self) -> None:
+    def test_exact_self_descriptor_replacement_preserves_lookup(self) -> None:
+        self.compile(RaytraceVector.dot)
+        ops = cinderx.jit.get_function_hir_opcode_counts(RaytraceVector.dot)
+        self.assertGreaterEqual(ops.get("GuardType", 0), 1)
+
+        receiver = RaytraceVector(1.0, 2.0, 3.0)
+        other = RaytraceVector(4.0, 5.0, 6.0)
+        receiver.accesses = 0
+        other.accesses = 0
         try:
             RaytraceVector.x = CountingXDescriptor()
-            self.compile(RaytraceVector.dot)
-            ops = cinderx.jit.get_function_hir_opcode_counts(RaytraceVector.dot)
-            self.assertGreaterEqual(ops.get("GuardType", 0), 1)
-
-            receiver = RaytraceVector(1.0, 2.0, 3.0)
-            other = RaytraceVector(4.0, 5.0, 6.0)
-            receiver.accesses = 0
-            other.accesses = 0
             self.assertEqual(RaytraceVector.dot(receiver, other), 128.0)
             self.assertEqual(receiver.accesses, 1)
             self.assertEqual(other.accesses, 1)

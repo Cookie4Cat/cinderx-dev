@@ -1228,6 +1228,53 @@ def replace_descriptor():
   ASSERT_TRUE(isIntEquals(result, 99));
 }
 
+TEST_F(HIRBuildTest, SplitDictLoadFallsBackAfterDescriptorChange) {
+  const char* src = R"(
+class Vector:
+    def __init__(self, x, y, z):
+        self.x = x
+        self.y = y
+        self.z = z
+
+    def dot(self, other):
+        return (self.x * other.x) + (self.y * other.y) + (self.z * other.z)
+
+receiver = Vector(1.0, 2.0, 3.0)
+other = Vector(4.0, 5.0, 6.0)
+
+def replace_descriptor():
+    Vector.x = property(lambda self: 10.0)
+)";
+
+  Ref<> klass(compileAndGet(src, "Vector"));
+  ASSERT_NE(klass, nullptr);
+  Ref<PyFunctionObject> method(
+      Ref<PyFunctionObject>::steal(PyObject_GetAttrString(klass, "dot")));
+  ASSERT_NE(method, nullptr);
+  ASSERT_TRUE(PyFunction_Check(method));
+  Ref<> receiver(getGlobal("receiver"));
+  ASSERT_NE(receiver, nullptr);
+  Ref<> other(getGlobal("other"));
+  ASSERT_NE(other, nullptr);
+  Ref<PyFunctionObject> replace_descriptor(getGlobal("replace_descriptor"));
+  ASSERT_NE(replace_descriptor, nullptr);
+
+  ASSERT_EQ(jit::compileFunction(method), jit::Result::OK);
+
+  auto replace_result = Ref<>::steal(PyObject_CallFunctionObjArgs(
+      reinterpret_cast<PyObject*>(replace_descriptor.get()), nullptr));
+  ASSERT_NE(replace_result, nullptr);
+
+  auto result = Ref<>::steal(PyObject_CallFunctionObjArgs(
+      reinterpret_cast<PyObject*>(method.get()),
+      receiver.get(),
+      other.get(),
+      nullptr));
+  ASSERT_NE(result, nullptr);
+  ASSERT_TRUE(PyFloat_CheckExact(result));
+  ASSERT_DOUBLE_EQ(PyFloat_AsDouble(result), 128.0);
+}
+
 TEST_F(HIRBuildTest, SlotStoreTypeVersionGuardFallsBackAfterDescriptorChange) {
   const char* src = R"(
 events = []

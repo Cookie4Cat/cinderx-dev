@@ -171,6 +171,11 @@ bool is_self_load(const BytecodeInstruction& instr) {
     case LOAD_FAST_BORROW:
     case LOAD_FAST_CHECK:
       return instr.oparg() == 0;
+    case LOAD_FAST_LOAD_FAST:
+    case LOAD_FAST_BORROW_LOAD_FAST_BORROW:
+      // These fused opcodes push the high-nibble local first and the
+      // low-nibble local second. A following LOAD_ATTR consumes the top value.
+      return (instr.oparg() & 0xf) == 0;
     default:
       return false;
   }
