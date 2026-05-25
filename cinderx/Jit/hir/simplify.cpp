@@ -882,6 +882,11 @@ Register* simplifyBinaryOp(Env& env, const BinaryOp* instr) {
         env.emit<UseType>(float_reg, TFloatExact);
         env.emit<UseType>(int_reg, int_reg->type());
         Register* unbox_float = env.emit<PrimitiveUnbox>(float_reg, TCDouble);
+        if (op == BinaryOpKind::kPower && long_val == 2) {
+          Register* result = env.emit<DoubleBinaryOp>(
+              BinaryOpKind::kMultiply, unbox_float, unbox_float);
+          return env.emit<PrimitiveBox>(result, TCDouble, *instr->frameState());
+        }
         Register* const_double =
             env.emit<LoadConst>(Type::fromCDouble(double_val));
         Register* unbox_left = int_on_right ? unbox_float : const_double;
@@ -897,6 +902,24 @@ Register* simplifyBinaryOp(Env& env, const BinaryOp* instr) {
             env.emit<DoubleBinaryOp>(op, unbox_left, unbox_right);
         return env.emit<PrimitiveBox>(result, TCDouble, *instr->frameState());
       }
+    }
+  }
+
+  if (op == BinaryOpKind::kPower && rhs->isA(TLongExact) &&
+      rhs->type().hasObjectSpec()) {
+    int overflow;
+    long long_val = PyLong_AsLongAndOverflow(
+        rhs->type().objectSpec(), &overflow);
+    if (!overflow && long_val == 2) {
+      Register* guarded_left =
+          env.emit<GuardType>(TFloatExact, lhs, *instr->frameState());
+      env.emit<UseType>(guarded_left, TFloatExact);
+      Register* unbox_left =
+          env.emit<PrimitiveUnbox>(guarded_left, TCDouble);
+      Register* result = env.emit<DoubleBinaryOp>(
+          BinaryOpKind::kMultiply, unbox_left, unbox_left);
+      return env.emit<PrimitiveBox>(
+          result, TCDouble, *instr->frameState());
     }
   }
 
@@ -1091,13 +1114,23 @@ Register* simplifyFloatBinaryOp(Env& env, const FloatBinaryOp* instr) {
   // into a call to sqrt().
   if (op == BinaryOpKind::kPower) {
     Type right_type = instr->right()->type();
-    if (right_type.hasObjectSpec() && PyFloat_Check(right_type.objectSpec()) &&
-        PyFloat_AS_DOUBLE(right_type.objectSpec()) == 0.5) {
-      Register* unbox_left = env.emit<PrimitiveUnbox>(instr->left(), TCDouble);
-      Register* half = env.emit<LoadConst>(Type::fromCDouble(0.5));
-      Register* result =
-          env.emit<DoubleBinaryOp>(BinaryOpKind::kPower, unbox_left, half);
-      return env.emit<PrimitiveBox>(result, TCDouble, *instr->frameState());
+    if (right_type.hasObjectSpec() && PyFloat_Check(right_type.objectSpec())) {
+      double val = PyFloat_AS_DOUBLE(right_type.objectSpec());
+      if (val == 0.5) {
+        Register* unbox_left =
+            env.emit<PrimitiveUnbox>(instr->left(), TCDouble);
+        Register* half = env.emit<LoadConst>(Type::fromCDouble(0.5));
+        Register* result =
+            env.emit<DoubleBinaryOp>(BinaryOpKind::kPower, unbox_left, half);
+        return env.emit<PrimitiveBox>(result, TCDouble, *instr->frameState());
+      }
+      if (val == 2.0) {
+        Register* unbox_left =
+            env.emit<PrimitiveUnbox>(instr->left(), TCDouble);
+        Register* result = env.emit<DoubleBinaryOp>(
+            BinaryOpKind::kMultiply, unbox_left, unbox_left);
+        return env.emit<PrimitiveBox>(result, TCDouble, *instr->frameState());
+      }
     }
   }
 
