@@ -6,19 +6,20 @@
 // and per-backedge OSR entry stub generation (OSRMetadata, live-in mapping).
 //
 // Design references:
-//   - docs/design/hot-loop-osr/hot-loop-osr-function-design.md (Feature Item 2)
+//   - docs/design/hot-loop-osr/【功能设计】基于热循环的OSR能力.md (Feature Item 2)
 //
-// Build note: This file requires CINDERX_OSR_HEADERS_AVAILABLE=1 to compile.
-// When the OSR headers are not available, all tests are disabled.
+// Feature Item 2 owns the OSR headers used by this test suite.
 
 #include <gtest/gtest.h>
 
+#include <memory>
 #include <optional>
 #include <string>
+#include <utility>
 #include <vector>
 
 #ifndef CINDERX_OSR_HEADERS_AVAILABLE
-#define CINDERX_OSR_HEADERS_AVAILABLE 0
+#define CINDERX_OSR_HEADERS_AVAILABLE 1
 #endif
 
 #if CINDERX_OSR_HEADERS_AVAILABLE
@@ -27,8 +28,11 @@
 
 #include "cinderx/Interpreter/cinder_opcode.h"
 #include "cinderx/Jit/bytecode.h"
+#include "cinderx/Jit/compiled_function.h"
 #include "cinderx/Jit/compiler.h"
+#include "cinderx/Jit/context.h"
 #include "cinderx/Jit/hir/hir.h"
+#include "cinderx/module_state.h"
 #include "cinderx/RuntimeTests/fixtures.h"
 
 using namespace jit;
@@ -37,6 +41,21 @@ using namespace jit::hir;
 namespace {
 
 class OSRCompileTest : public RuntimeTest {};
+
+class ScopedOSREnabled {
+ public:
+  explicit ScopedOSREnabled(bool enabled)
+      : previous_enabled_{getConfig().osr_enabled} {
+    getMutableConfig().osr_enabled = enabled;
+  }
+
+  ~ScopedOSREnabled() {
+    getMutableConfig().osr_enabled = previous_enabled_;
+  }
+
+ private:
+  bool previous_enabled_;
+};
 
 bool isBackwardJump(const BytecodeInstruction& instr) {
   return instr.opcode() == JUMP_BACKWARD ||
@@ -106,6 +125,40 @@ BasicBlock* blockWithEntrySnapshotAt(Function& func, BCOffset target_offset) {
     }
   }
   return nullptr;
+}
+
+#if defined(__aarch64__)
+
+Ref<CompiledFunction> compileToCompiledFunction(
+    BorrowedRef<PyFunctionObject> func) {
+  auto data = Compiler().Compile(func);
+  if (!data.has_value()) {
+    return nullptr;
+  }
+
+  CompilationKey key{
+      func->func_code, func->func_builtins, func->func_globals};
+  auto* jit_ctx = reinterpret_cast<CompilerContext<Compiler>*>(
+      cinderx::getModuleState()->jit_context.get());
+  return jit_ctx->makeCompiledFunction(func, key, std::move(*data));
+}
+
+bool isOSRStubScratchLocation(codegen::PhyLocation location) {
+  return location.is_register() &&
+      codegen::OSR_STUB_SCRATCH_REGS.Has(location);
+}
+
+#endif
+
+std::string largeOSRSource() {
+  std::string source = "def test(n):\n"
+                       "    i = 0\n"
+                       "    while i < n:\n";
+  for (int i = 0; i < 1100; ++i) {
+    source += "        i += 1\n";
+  }
+  source += "    return i\n";
+  return source;
 }
 
 } // namespace
@@ -427,14 +480,22 @@ def test(n):
   EXPECT_FALSE(irfunc->hasOSREntries());
 }
 
+TEST_F(OSRCompileTest, RejectsCompileBudgetPastCodeUnitLimit) {
+  std::string source = largeOSRSource();
+  Ref<PyFunctionObject> func(compileAndGet(source.c_str(), "test"));
+
+  EXPECT_FALSE(osrCompileBudgetCheck(func->func_code));
+}
+
 #if defined(__aarch64__)
 
 TEST_F(OSRCompileTest, CompileBuildsMetadataForLocalsplusLiveIns) {
+  ScopedOSREnabled enable_osr{true};
   Ref<PyFunctionObject> func(compileAndGet(
       R"(
-def test(n):
+def test():
     i = 0
-    while i < n:
+    while i < 10:
         i += 1
     return i
 )",
@@ -455,6 +516,9 @@ def test(n):
   EXPECT_TRUE(metadata.allReconstructible());
   EXPECT_FALSE(metadata.live_ins.empty());
   EXPECT_GE(metadata.entry_point_offset, 0);
+  EXPECT_NE(metadata.tstate_location.loc, codegen::PhyLocation::REG_INVALID);
+  EXPECT_NE(metadata.func_location.loc, codegen::PhyLocation::REG_INVALID);
+  EXPECT_NE(metadata.frame_location.loc, codegen::PhyLocation::REG_INVALID);
   for (const auto& live_in : metadata.live_ins) {
     EXPECT_GE(live_in.localsplus_index, 0);
     EXPECT_EQ(live_in.stack_index, -1);
@@ -463,7 +527,129 @@ def test(n):
   }
 }
 
+TEST_F(OSRCompileTest, GetOSREntryFindsCompiledTargetOffset) {
+  ScopedOSREnabled enable_osr{true};
+  Ref<PyFunctionObject> func(compileAndGet(
+      R"(
+def test():
+    i = 0
+    while i < 10:
+        i += 1
+    return i
+)",
+      "test"));
+  auto targets = collectBackedgeTargetOffsets(func->func_code);
+  ASSERT_EQ(targets.size(), 1);
+
+  Ref<CompiledFunction> compiled = compileToCompiledFunction(func);
+  ASSERT_NE(compiled, nullptr);
+
+  EXPECT_NE(getOSREntry(compiled, targets.front()), nullptr);
+  EXPECT_EQ(getOSREntry(compiled, targets.front() + 2), nullptr);
+}
+
+TEST_F(OSRCompileTest, CompileFunctionWithOSRPublishesQueryableEntry) {
+  ScopedOSREnabled enable_osr{true};
+  Ref<PyFunctionObject> func(compileAndGet(
+      R"(
+def test():
+    i = 0
+    while i < 10:
+        i += 1
+    return i
+)",
+      "test"));
+  auto targets = collectBackedgeTargetOffsets(func->func_code);
+  ASSERT_EQ(targets.size(), 1);
+
+  EXPECT_EQ(compileFunctionWithOSR(func), Result::OK);
+  auto* jit_ctx = reinterpret_cast<CompilerContext<Compiler>*>(
+      cinderx::getModuleState()->jit_context.get());
+  BorrowedRef<CompiledFunction> compiled = jit_ctx->lookupFunc(func);
+  ASSERT_NE(compiled, nullptr);
+  EXPECT_NE(getOSREntry(compiled, targets.front()), nullptr);
+}
+
+TEST_F(OSRCompileTest, OSREntryIsNotReplayable) {
+  std::unique_ptr<OSREntry> entry{OSREntry::create(BCOffset{0})};
+
+  EXPECT_FALSE(entry->isReplayable());
+}
+
+TEST_F(OSRCompileTest, CompileFunctionWithOSRRejectsBudgetOverflow) {
+  std::string source = largeOSRSource();
+  Ref<PyFunctionObject> func(compileAndGet(source.c_str(), "test"));
+
+  EXPECT_EQ(compileFunctionWithOSR(func), Result::CANNOT_SPECIALIZE);
+}
+
+TEST_F(OSRCompileTest, CompileWithoutBackedgeHasNoOSRMetadata) {
+  Ref<PyFunctionObject> func(compileAndGet(
+      R"(
+def test():
+    return 42
+)",
+      "test"));
+  EXPECT_TRUE(collectBackedgeTargetOffsets(func->func_code).empty());
+
+  auto compiled = Compiler().Compile(func);
+  ASSERT_TRUE(compiled.has_value());
+  EXPECT_FALSE(compiled->osr_aware);
+  EXPECT_FALSE(compiled->has_osr_entries);
+  ASSERT_NE(compiled->runtime, nullptr);
+  EXPECT_TRUE(compiled->runtime->osrMetadatas().empty());
+}
+
+TEST_F(OSRCompileTest, CompileWithBackedgeHasNoOSRMetadataWhenOSRDisabled) {
+  ScopedOSREnabled disable_osr{false};
+  Ref<PyFunctionObject> func(compileAndGet(
+      R"(
+def test():
+    i = 0
+    while i < 10:
+        i += 1
+    return i
+)",
+      "test"));
+  ASSERT_EQ(collectBackedgeTargetOffsets(func->func_code).size(), 1);
+
+  auto compiled = Compiler().Compile(func);
+  ASSERT_TRUE(compiled.has_value());
+  EXPECT_FALSE(compiled->osr_aware);
+  EXPECT_FALSE(compiled->has_osr_entries);
+  ASSERT_NE(compiled->runtime, nullptr);
+  EXPECT_TRUE(compiled->runtime->osrMetadatas().empty());
+}
+
+TEST_F(OSRCompileTest, OSRMetadataDoesNotUseStubScratchRegisters) {
+  ScopedOSREnabled enable_osr{true};
+  Ref<PyFunctionObject> func(compileAndGet(
+      R"(
+def test():
+    i = 0
+    while i < 10:
+        i += 1
+    return i
+)",
+      "test"));
+
+  auto compiled = Compiler().Compile(func);
+  ASSERT_TRUE(compiled.has_value());
+  ASSERT_NE(compiled->runtime, nullptr);
+  const auto& metadatas = compiled->runtime->osrMetadatas();
+  ASSERT_EQ(metadatas.size(), 1);
+
+  const auto& metadata = metadatas.front();
+  EXPECT_FALSE(isOSRStubScratchLocation(metadata.tstate_location));
+  EXPECT_FALSE(isOSRStubScratchLocation(metadata.func_location));
+  EXPECT_FALSE(isOSRStubScratchLocation(metadata.frame_location));
+  for (const auto& live_in : metadata.live_ins) {
+    EXPECT_FALSE(isOSRStubScratchLocation(live_in.destination));
+  }
+}
+
 TEST_F(OSRCompileTest, CompileBuildsMetadataAndStubForEmptyLiveIns) {
+  ScopedOSREnabled enable_osr{true};
   Ref<PyFunctionObject> func(compileAndGet(
       R"(
 def test():
@@ -482,6 +668,12 @@ def test():
   ASSERT_EQ(metadatas.size(), 1);
   EXPECT_TRUE(metadatas.front().live_ins.empty());
   EXPECT_GE(metadatas.front().entry_point_offset, 0);
+  EXPECT_NE(
+      metadatas.front().tstate_location.loc, codegen::PhyLocation::REG_INVALID);
+  EXPECT_NE(
+      metadatas.front().func_location.loc, codegen::PhyLocation::REG_INVALID);
+  EXPECT_NE(
+      metadatas.front().frame_location.loc, codegen::PhyLocation::REG_INVALID);
 }
 
 #endif // __aarch64__

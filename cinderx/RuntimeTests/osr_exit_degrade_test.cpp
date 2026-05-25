@@ -3,8 +3,8 @@
 // Feature Item 4: OSR Exit & Degrade Test Suite
 //
 // Design references:
-//   - docs/design/hot-loop-osr/hot-loop-osr-function-design.md V7.0 (Feature Item 4)
-//   - docs/design/hot-loop-osr/hot-loop-osr-exit-degrade-detailed-design.md V1.5
+//   - docs/design/hot-loop-osr/【功能设计】基于热循环的OSR能力.md V7.0 (Feature Item 4)
+//   - docs/design/hot-loop-osr/【详细设计】OSR退出与降级.md V1.5
 //
 // Sub-module A: OSR deopt path reuse verification
 //   OSR JIT code shares the same deopt path as normal JIT code.
@@ -45,6 +45,9 @@
 
 #include <gtest/gtest.h>
 
+#include <utility>
+#include <vector>
+
 #include "cinderx/python.h"
 
 // clang-format off
@@ -63,7 +66,7 @@
 // and always include them).
 // ---------------------------------------------------------------------------
 #ifndef CINDERX_OSR_HEADERS_AVAILABLE
-#define CINDERX_OSR_HEADERS_AVAILABLE 0
+#define CINDERX_OSR_HEADERS_AVAILABLE 1
 #endif
 
 #if CINDERX_OSR_HEADERS_AVAILABLE
@@ -83,6 +86,25 @@ namespace jit {
 void syncOSRFlags();
 } // namespace jit
 
+#if CINDERX_OSR_HEADERS_AVAILABLE
+using jit::BackedgeCounters;
+using jit::BackedgeEntry;
+
+static int setFunctionCode(
+    BorrowedRef<PyFunctionObject> func,
+    BorrowedRef<PyCodeObject> code) {
+  return PyObject_SetAttrString(func.getObj(), "__code__", code.getObj());
+}
+
+static BackedgeCounters* asBackedgeCounters(Ci_BackedgeCounters* counters) {
+  return reinterpret_cast<BackedgeCounters*>(counters);
+}
+
+static Ci_BackedgeCounters* asCBackedgeCounters(BackedgeCounters* counters) {
+  return reinterpret_cast<Ci_BackedgeCounters*>(counters);
+}
+#endif
+
 // ===========================================================================
 // Sub-module B: resetOSRState unit tests
 // ===========================================================================
@@ -101,18 +123,17 @@ void syncOSRFlags();
 static BackedgeCounters* attachCountersToCode(
     BorrowedRef<PyCodeObject> code,
     std::vector<std::pair<uint32_t, uint32_t>> backedges) {
-  BackedgeCounters* counters = Ci_GetOrCreateBackedgeCounters(code);
+  BackedgeCounters* counters =
+      asBackedgeCounters(Ci_OSR_GetOrCreateBackedgeCounters(code));
   EXPECT_NE(counters, nullptr);
   if (counters == nullptr) {
     return nullptr;
   }
   for (auto& [src, tgt] : backedges) {
-    BackedgeEntry* entry =
-        Ci_BackedgeCountersFindOrCreate(counters, src);
+    BackedgeEntry* entry = reinterpret_cast<BackedgeEntry*>(
+        Ci_OSR_BackedgeCountersFindOrCreate(
+            asCBackedgeCounters(counters), src, tgt));
     EXPECT_NE(entry, nullptr);
-    if (entry != nullptr) {
-      entry->target_index = tgt;
-    }
   }
   return counters;
 }
@@ -159,14 +180,15 @@ def test():
   ASSERT_NE(code, nullptr);
 
   // The code object has no BackedgeCounters (no while loops).
-  BackedgeCounters* counters = Ci_GetBackedgeCounters(code);
+  BackedgeCounters* counters =
+      asBackedgeCounters(Ci_OSR_GetBackedgeCounters(code));
   EXPECT_EQ(counters, nullptr);
 
   // resetOSRState should not crash.
   ASSERT_NO_FATAL_FAILURE(jit::resetOSRState(code));
 
   // Still no counters after reset.
-  counters = Ci_GetBackedgeCounters(code);
+  counters = asBackedgeCounters(Ci_OSR_GetBackedgeCounters(code));
   EXPECT_EQ(counters, nullptr);
 }
 
@@ -422,8 +444,7 @@ class OSRFuncModifiedTest : public RuntimeTest {
       PyTuple_SET_ITEM(
           py_args, i, PyLong_FromLong(args[i])); // steals ref on success
     }
-    auto result = Ref<>::steal(
-        PyObject_CallObject(reinterpret_cast<PyObject*>(func), py_args));
+    auto result = Ref<>::steal(PyObject_CallObject(func.getObj(), py_args));
     Py_DECREF(py_args);
     return result;
   }
@@ -463,10 +484,7 @@ def replacement():
   ASSERT_NE(new_func, nullptr);
 
   // Replace func.__code__ — triggers funcModified → resetOSRState(old_code).
-  ASSERT_EQ(
-      PyFunction_SetCode(
-          func, reinterpret_cast<PyObject*>(new_func->func_code)),
-      0);
+  ASSERT_EQ(setFunctionCode(func, new_func->func_code), 0);
 
   // Verify old code's OSR state was reset.
   EXPECT_EQ(counters->entries[0].count, 0u);
@@ -499,13 +517,11 @@ def replacement():
   Ref<PyFunctionObject> new_func(compileAndGet(new_src, "replacement"));
   ASSERT_NE(new_func, nullptr);
 
-  ASSERT_EQ(
-      PyFunction_SetCode(
-          func, reinterpret_cast<PyObject*>(new_func->func_code)),
-      0);
+  ASSERT_EQ(setFunctionCode(func, new_func->func_code), 0);
 
   // Counters still accessible (code object still alive, memory not freed).
-  BackedgeCounters* after = Ci_GetBackedgeCounters(old_code);
+  BackedgeCounters* after =
+      asBackedgeCounters(Ci_OSR_GetBackedgeCounters(old_code));
   EXPECT_NE(after, nullptr);
   EXPECT_EQ(after, counters);
 }
@@ -535,10 +551,7 @@ def test():
   Ref<PyFunctionObject> new_func(compileAndGet(new_src, "r"));
   ASSERT_NE(new_func, nullptr);
 
-  ASSERT_EQ(
-      PyFunction_SetCode(
-          func, reinterpret_cast<PyObject*>(new_func->func_code)),
-      0);
+  ASSERT_EQ(setFunctionCode(func, new_func->func_code), 0);
 
   // FailedPermanent should be reset to Counting.
   EXPECT_EQ(counters->entries[0].state, 1u);
@@ -556,17 +569,14 @@ def test():
 
   // No while loop → no BackedgeCounters.
   Ref<PyCodeObject> old_code(Ref<>::create(func->func_code));
-  EXPECT_EQ(Ci_GetBackedgeCounters(old_code), nullptr);
+  EXPECT_EQ(asBackedgeCounters(Ci_OSR_GetBackedgeCounters(old_code)), nullptr);
 
   const char* new_src = "def r(): return 0";
   Ref<PyFunctionObject> new_func(compileAndGet(new_src, "r"));
   ASSERT_NE(new_func, nullptr);
 
   // Should not crash.
-  ASSERT_EQ(
-      PyFunction_SetCode(
-          func, reinterpret_cast<PyObject*>(new_func->func_code)),
-      0);
+  ASSERT_EQ(setFunctionCode(func, new_func->func_code), 0);
 }
 
 // TC-I05: funcModified clears compile_states (uintptr_t identity, no DECREF).
@@ -599,10 +609,7 @@ def test():
   Ref<PyFunctionObject> new_func(compileAndGet(new_src, "r"));
   ASSERT_NE(new_func, nullptr);
 
-  ASSERT_EQ(
-      PyFunction_SetCode(
-          func, reinterpret_cast<PyObject*>(new_func->func_code)),
-      0);
+  ASSERT_EQ(setFunctionCode(func, new_func->func_code), 0);
 
   // compile_states cleared, but identity pointers not DECREF'd (correct).
   EXPECT_EQ(counters->num_compile_states, 0u);
@@ -627,8 +634,7 @@ def test():
   ASSERT_NE(func, nullptr);
 
   // Force JIT compilation by calling the function.
-  auto result = Ref<>::steal(
-      PyObject_CallNoArgs(reinterpret_cast<PyObject*>(func)));
+  auto result = Ref<>::steal(PyObject_CallNoArgs(func.getObj()));
   ASSERT_NE(result, nullptr);
 
   Ref<PyCodeObject> old_code(Ref<>::create(func->func_code));
@@ -636,7 +642,7 @@ def test():
   // Check that a CompiledFunction exists for this code.
   auto* ctx = jit::getContext();
   ASSERT_NE(ctx, nullptr);
-  auto* compiled = ctx->lookupCode(
+  auto compiled = ctx->lookupCode(
       old_code,
       reinterpret_cast<PyDictObject*>(PyEval_GetBuiltins()),
       reinterpret_cast<PyDictObject*>(
@@ -653,15 +659,12 @@ def test():
   Ref<PyFunctionObject> new_func(compileAndGet(new_src, "r"));
   ASSERT_NE(new_func, nullptr);
 
-  ASSERT_EQ(
-      PyFunction_SetCode(
-          func, reinterpret_cast<PyObject*>(new_func->func_code)),
-      0);
+  ASSERT_EQ(setFunctionCode(func, new_func->func_code), 0);
 
   // After funcModified, counters are reset but the CompiledFunction
   // for old_code should still be in the cache (not deleted).
   EXPECT_EQ(counters->entries[0].count, 0u);
-  auto* compiled_after = ctx->lookupCode(
+  auto compiled_after = ctx->lookupCode(
       old_code,
       reinterpret_cast<PyDictObject*>(PyEval_GetBuiltins()),
       reinterpret_cast<PyDictObject*>(
@@ -712,10 +715,7 @@ def replacement():
   new_counters->entries[0].count = 999;
 
   // Replace func.__code__ — triggers funcModified → resetOSRState(old_code).
-  ASSERT_EQ(
-      PyFunction_SetCode(
-          func, reinterpret_cast<PyObject*>(new_func->func_code)),
-      0);
+  ASSERT_EQ(setFunctionCode(func, new_func->func_code), 0);
 
   // Old code counters should be reset.
   EXPECT_EQ(old_counters->entries[0].count, 0u);
@@ -782,8 +782,8 @@ def test(n):
 
   auto arg = Ref<>::steal(PyLong_FromLong(100));
   PyObject* args[] = {arg.get()};
-  auto result = Ref<>::steal(
-      PyObject_Vectorcall(reinterpret_cast<PyObject*>(func), args, 1, nullptr));
+  auto result =
+      Ref<>::steal(PyObject_Vectorcall(func.getObj(), args, 1, nullptr));
 
   ASSERT_NE(result, nullptr) << "OSR execution returned NULL";
   ASSERT_TRUE(isIntEquals(result, 5050));
@@ -820,8 +820,7 @@ def test():
   Ref<PyFunctionObject> func(compileAndGet(src, "test"));
   ASSERT_NE(func, nullptr);
 
-  auto result = Ref<>::steal(
-      PyObject_CallNoArgs(reinterpret_cast<PyObject*>(func)));
+  auto result = Ref<>::steal(PyObject_CallNoArgs(func.getObj()));
   ASSERT_NE(result, nullptr);
   ASSERT_TRUE(isIntEquals(result, 5050));
 }
@@ -850,8 +849,7 @@ def test():
   Ref<PyFunctionObject> func(compileAndGet(src, "test"));
   ASSERT_NE(func, nullptr);
 
-  auto result = Ref<>::steal(
-      PyObject_CallNoArgs(reinterpret_cast<PyObject*>(func)));
+  auto result = Ref<>::steal(PyObject_CallNoArgs(func.getObj()));
   ASSERT_NE(result, nullptr);
   // d = 100 * (1 + 2 + 3) = 600
   ASSERT_TRUE(isIntEquals(result, 600));
@@ -877,8 +875,7 @@ def test():
   Ref<PyFunctionObject> func(compileAndGet(src, "test"));
   ASSERT_NE(func, nullptr);
 
-  auto result = Ref<>::steal(
-      PyObject_CallNoArgs(reinterpret_cast<PyObject*>(func)));
+  auto result = Ref<>::steal(PyObject_CallNoArgs(func.getObj()));
   ASSERT_EQ(result, nullptr) << "Expected exception but got a result";
 
   // PyErr_Occurred() returns a borrowed reference — do not wrap in Ref<>.
@@ -908,8 +905,7 @@ def test():
   Ref<PyFunctionObject> func(compileAndGet(src, "test"));
   ASSERT_NE(func, nullptr);
 
-  auto result = Ref<>::steal(
-      PyObject_CallNoArgs(reinterpret_cast<PyObject*>(func)));
+  auto result = Ref<>::steal(PyObject_CallNoArgs(func.getObj()));
   ASSERT_NE(result, nullptr);
   // sum(i*j for i in range(10) for j in range(10)) = 45 * 45 = 2025
   ASSERT_TRUE(isIntEquals(result, 2025));
@@ -935,8 +931,7 @@ def test():
   Ref<PyFunctionObject> func(compileAndGet(src, "test"));
   ASSERT_NE(func, nullptr);
 
-  auto result = Ref<>::steal(
-      PyObject_CallNoArgs(reinterpret_cast<PyObject*>(func)));
+  auto result = Ref<>::steal(PyObject_CallNoArgs(func.getObj()));
   ASSERT_NE(result, nullptr);
   ASSERT_TRUE(isIntEquals(result, 15));
 }
@@ -957,8 +952,7 @@ def test():
   Ref<PyFunctionObject> func(compileAndGet(src, "test"));
   ASSERT_NE(func, nullptr);
 
-  auto result = Ref<>::steal(
-      PyObject_CallNoArgs(reinterpret_cast<PyObject*>(func)));
+  auto result = Ref<>::steal(PyObject_CallNoArgs(func.getObj()));
   ASSERT_NE(result, nullptr);
   ASSERT_TRUE(isIntEquals(result, 100));
 }
@@ -983,8 +977,7 @@ def test():
   Ref<PyFunctionObject> func(compileAndGet(src, "test"));
   ASSERT_NE(func, nullptr);
 
-  auto result = Ref<>::steal(
-      PyObject_CallNoArgs(reinterpret_cast<PyObject*>(func)));
+  auto result = Ref<>::steal(PyObject_CallNoArgs(func.getObj()));
   ASSERT_NE(result, nullptr);
   ASSERT_TRUE(isIntEquals(result, 42));
 }
@@ -1005,8 +998,8 @@ def test(n):
   for (int n : {10, 50, 100, 200}) {
     auto arg = Ref<>::steal(PyLong_FromLong(n));
     PyObject* args[] = {arg.get()};
-    auto result = Ref<>::steal(
-        PyObject_Vectorcall(reinterpret_cast<PyObject*>(func), args, 1, nullptr));
+    auto result =
+        Ref<>::steal(PyObject_Vectorcall(func.getObj(), args, 1, nullptr));
 
     ASSERT_NE(result, nullptr) << "Failed for n=" << n;
     long expected = n * (n + 1) / 2;
@@ -1035,8 +1028,7 @@ def test():
   Ref<PyFunctionObject> func(compileAndGet(src, "test"));
   ASSERT_NE(func, nullptr);
 
-  auto result = Ref<>::steal(
-      PyObject_CallNoArgs(reinterpret_cast<PyObject*>(func)));
+  auto result = Ref<>::steal(PyObject_CallNoArgs(func.getObj()));
   ASSERT_NE(result, nullptr);
   // sum(2*i for i in range(50)) = 2 * 50*49/2 = 2450
   ASSERT_TRUE(isIntEquals(result, 2450));
@@ -1069,8 +1061,7 @@ def test():
   Ref<PyFunctionObject> func(compileAndGet(src, "test"));
   ASSERT_NE(func, nullptr);
 
-  auto result = Ref<>::steal(
-      PyObject_CallNoArgs(reinterpret_cast<PyObject*>(func)));
+  auto result = Ref<>::steal(PyObject_CallNoArgs(func.getObj()));
   ASSERT_NE(result, nullptr);
   // sum(0..99) = 4950
   ASSERT_TRUE(isIntEquals(result, 4950));
@@ -1113,8 +1104,7 @@ def test():
   Ref<PyFunctionObject> func(compileAndGet(src, "test"));
   ASSERT_NE(func, nullptr);
 
-  auto result = Ref<>::steal(
-      PyObject_CallNoArgs(reinterpret_cast<PyObject*>(func)));
+  auto result = Ref<>::steal(PyObject_CallNoArgs(func.getObj()));
   ASSERT_NE(result, nullptr);
   // total = 100 * (1 + 3 + 5) = 900, plus b + d = 2 + 4 = 906
   ASSERT_TRUE(isIntEquals(result, 906));
@@ -1144,8 +1134,7 @@ def test():
   Ref<PyFunctionObject> func(compileAndGet(src, "test"));
   ASSERT_NE(func, nullptr);
 
-  auto result = Ref<>::steal(
-      PyObject_CallNoArgs(reinterpret_cast<PyObject*>(func)));
+  auto result = Ref<>::steal(PyObject_CallNoArgs(func.getObj()));
   ASSERT_NE(result, nullptr);
   // Whether OSR triggers or not, the result must be correct.
   ASSERT_TRUE(isIntEquals(result, 100));
@@ -1179,8 +1168,7 @@ def test():
   Ref<PyFunctionObject> func(compileAndGet(src, "test"));
   ASSERT_NE(func, nullptr);
 
-  auto result = Ref<>::steal(
-      PyObject_CallNoArgs(reinterpret_cast<PyObject*>(func)));
+  auto result = Ref<>::steal(PyObject_CallNoArgs(func.getObj()));
   ASSERT_NE(result, nullptr);
   // sum(0..49) = 49*50/2 = 1225
   ASSERT_TRUE(isIntEquals(result, 1225));
@@ -1299,12 +1287,12 @@ def test():
   BackedgeCounters* counters =
       attachCountersToCode(code, {{8, 2}});
   ASSERT_NE(counters, nullptr);
-  EXPECT_EQ(Ci_GetBackedgeCounters(code), counters);
+  EXPECT_EQ(asBackedgeCounters(Ci_OSR_GetBackedgeCounters(code)), counters);
 
   // Remove "test" from globals_ so the function is freed, releasing
   // its reference to func_code.  After this, only the `code` Ref
   // holds a reference to the code object.
-  ASSERT_EQ(PyDict_DelItemString(globals_, "test"), 0);
+  ASSERT_NO_FATAL_FAILURE(runCode("del test"));
 
   // Release the code object — triggers codeDestroyed →
   // backedgeCountersFreefunc.
@@ -1342,10 +1330,7 @@ def test():
   const char* new_src = "def r(): return 0";
   Ref<PyFunctionObject> new_func(compileAndGet(new_src, "r"));
   ASSERT_NE(new_func, nullptr);
-  ASSERT_EQ(
-      PyFunction_SetCode(
-          func, reinterpret_cast<PyObject*>(new_func->func_code)),
-      0);
+  ASSERT_EQ(setFunctionCode(func, new_func->func_code), 0);
 
   // Verify reset happened.
   EXPECT_EQ(counters->entries[0].count, 0u);
