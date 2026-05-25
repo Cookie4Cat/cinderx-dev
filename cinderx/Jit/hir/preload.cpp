@@ -2,6 +2,7 @@
 
 #include "cinderx/Jit/hir/preload.h"
 
+#include "cinderx/Common/code.h"
 #include "cinderx/Common/dict.h"
 #include "cinderx/Common/extra-py-flags.h"
 #include "cinderx/Common/util.h"
@@ -12,6 +13,13 @@
 #include "cinderx/StaticPython/vtable_builder.h"
 #include "cinderx/module_state.h"
 
+#ifndef _WIN32
+#include <dlfcn.h>
+#endif
+
+#include <cstring>
+#include <string>
+#include <string_view>
 #include <utility>
 
 namespace jit::hir {
@@ -122,6 +130,125 @@ static std::unique_ptr<NativeTarget> resolve_native_target(
 
 PreloaderManager s_manager;
 thread_local PreloaderManager* tls_manager = nullptr;
+
+#if PY_VERSION_HEX >= 0x030C0000
+std::optional<bool> has_no_subclasses_via_api(PyTypeObject* type) {
+#ifndef _WIN32
+  using GetSubclassesFunc = PyObject* (*)(PyTypeObject*);
+  static auto get_subclasses = reinterpret_cast<GetSubclassesFunc>(
+      dlsym(RTLD_DEFAULT, "_PyType_GetSubclasses"));
+  if (get_subclasses == nullptr) {
+    return std::nullopt;
+  }
+
+  Ref<> subclasses = Ref<>::steal(get_subclasses(type));
+  if (subclasses == nullptr) {
+    PyErr_Clear();
+    return std::nullopt;
+  }
+  return PyList_Check(subclasses) && PyList_GET_SIZE(subclasses.get()) == 0;
+#else
+  return std::nullopt;
+#endif
+}
+#endif
+
+bool has_no_subclasses(PyTypeObject* type) {
+#if PY_VERSION_HEX >= 0x030C0000
+  if (auto result = has_no_subclasses_via_api(type)) {
+    return *result;
+  }
+#endif
+
+  PyObject* subclasses = reinterpret_cast<PyObject*>(type->tp_subclasses);
+  return subclasses == nullptr ||
+      (PyDict_Check(subclasses) && PyDict_Size(subclasses) == 0);
+}
+
+bool is_self_load(const BytecodeInstruction& instr) {
+  switch (instr.opcode()) {
+    case LOAD_FAST:
+    case LOAD_FAST_BORROW:
+    case LOAD_FAST_CHECK:
+      return instr.oparg() == 0;
+    default:
+      return false;
+  }
+}
+
+bool has_self_attr_load(BorrowedRef<PyCodeObject> code) {
+  bool previous_was_self = false;
+  for (const auto& instr : BytecodeInstructionBlock{code}) {
+    if ((instr.opcode() == LOAD_ATTR || instr.opcode() == LOAD_METHOD) &&
+        previous_was_self) {
+      return true;
+    }
+    previous_was_self = is_self_load(instr);
+  }
+  return false;
+}
+
+std::optional<OwnedType> infer_method_self_type_candidate(
+    BorrowedRef<PyCodeObject> code,
+    BorrowedRef<PyDictObject> globals) {
+  if (code->co_argcount < 1 || !PyUnicode_CheckExact(code->co_qualname)) {
+    return std::nullopt;
+  }
+  if (!has_self_attr_load(code)) {
+    return std::nullopt;
+  }
+
+  BorrowedRef<> arg0_name_obj{jit::getVarname(code, 0)};
+  if (!PyUnicode_CheckExact(arg0_name_obj)) {
+    return std::nullopt;
+  }
+  const char* arg0_name = PyUnicode_AsUTF8(arg0_name_obj);
+  if (arg0_name == nullptr || std::strcmp(arg0_name, "self") != 0) {
+    PyErr_Clear();
+    return std::nullopt;
+  }
+
+  const char* qualname = PyUnicode_AsUTF8(code->co_qualname);
+  if (qualname == nullptr) {
+    PyErr_Clear();
+    return std::nullopt;
+  }
+
+  std::string_view qualname_view{qualname};
+  std::size_t dot = qualname_view.find('.');
+  if (dot == std::string_view::npos || dot == 0 ||
+      qualname_view.rfind('.') != dot ||
+      qualname_view.find('<') != std::string_view::npos) {
+    return std::nullopt;
+  }
+
+  std::string owner_name{qualname_view.substr(0, dot)};
+  std::string method_name{qualname_view.substr(dot + 1)};
+  ThreadedCompileSerialize guard;
+  BorrowedRef<> owner_obj{PyDict_GetItemString(globals, owner_name.c_str())};
+  if (owner_obj == nullptr || !PyType_Check(owner_obj)) {
+    return std::nullopt;
+  }
+
+  auto owner_type = reinterpret_cast<PyTypeObject*>(owner_obj.get());
+  if (!(owner_type->tp_flags & Py_TPFLAGS_HEAPTYPE) ||
+      owner_type->tp_getattro != PyObject_GenericGetAttr ||
+      !has_no_subclasses(owner_type)) {
+    return std::nullopt;
+  }
+
+  BorrowedRef<> method_obj{
+      PyDict_GetItemString(owner_type->tp_dict, method_name.c_str())};
+  if (method_obj == nullptr || !PyFunction_Check(method_obj)) {
+    return std::nullopt;
+  }
+  auto method_func = reinterpret_cast<PyFunctionObject*>(method_obj.get());
+  if (reinterpret_cast<PyCodeObject*>(method_func->func_code) != code.get()) {
+    return std::nullopt;
+  }
+
+  return OwnedType{Ref<PyTypeObject>::create(owner_type), false, true};
+}
 
 } // namespace
 
@@ -257,6 +384,13 @@ Type Preloader::checkArgType(long local_idx) const {
   return map_get(check_arg_types_, local_idx, TObject);
 }
 
+std::optional<Type> Preloader::inferredSelfType() const {
+  if (!inferred_self_type_) {
+    return std::nullopt;
+  }
+  return inferred_self_type_->toHir();
+}
+
 PyObject** Preloader::getGlobalCache(BorrowedRef<> name_obj) const {
   JIT_DCHECK(
       canCacheGlobals(),
@@ -310,6 +444,10 @@ bool Preloader::preload() {
   bool is_static = code_->co_flags & CI_CO_STATICALLY_COMPILED;
   if (is_static && !preloadStatic()) {
     return false;
+  }
+
+  if (!is_static) {
+    inferred_self_type_ = infer_method_self_type_candidate(code_, globals_);
   }
 
   jit::BytecodeInstructionBlock bc_instrs{code_};

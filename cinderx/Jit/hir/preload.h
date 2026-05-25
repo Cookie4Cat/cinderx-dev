@@ -13,6 +13,7 @@
 #include "cinderx/StaticPython/typed-args-info.h"
 
 #include <map>
+#include <optional>
 #include <unordered_map>
 #include <utility>
 
@@ -139,6 +140,10 @@ class Preloader {
   // TObject
   Type checkArgType(long local_idx) const;
 
+  // Candidate exact type for the first "self" argument of an inferred
+  // instance method.
+  std::optional<Type> inferredSelfType() const;
+
   // get value for global at given name index
   BorrowedRef<> global(int name_idx) const;
 
@@ -234,6 +239,7 @@ class Preloader {
   // keyed by locals index
   std::unordered_map<long, Type> check_arg_types_;
   std::map<long, OwnedType> check_arg_pytypes_;
+  std::optional<OwnedType> inferred_self_type_;
   // keyed by name index, names borrowed from code object
   GlobalNamesMap global_names_;
   Type return_type_{TObject};

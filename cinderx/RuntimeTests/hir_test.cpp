@@ -705,6 +705,186 @@ def test():
   EXPECT_EQ(countSubstring(hir, "GuardIs<"), 1) << hir;
 }
 
+TEST_F(HIRBuildTest, InferredSelfGuardForPlainMethod) {
+  const char* src = R"(
+class Vec:
+    def dot(self, other):
+        return self.x * other.x
+)";
+  Ref<> klass(compileAndGet(src, "Vec"));
+  ASSERT_NE(klass, nullptr);
+  Ref<PyFunctionObject> method(
+      Ref<PyFunctionObject>::steal(PyObject_GetAttrString(klass, "dot")));
+  ASSERT_NE(method, nullptr);
+  ASSERT_TRUE(PyFunction_Check(method));
+
+  std::unique_ptr<Function> irfunc(buildHIR(method));
+  std::string hir = fullPrinter().ToString(*irfunc);
+  EXPECT_EQ(countSubstring(hir, "GuardType<ObjectUser[Vec:Exact]>"), 1)
+      << hir;
+}
+
+TEST_F(HIRBuildTest, InferredSelfGuardForRaytraceVectorDot) {
+  const char* src = R"(
+class Vector:
+    def dot(self, other):
+        return (self.x * other.x) + (self.y * other.y) + (self.z * other.z)
+)";
+  Ref<> klass(compileAndGet(src, "Vector"));
+  ASSERT_NE(klass, nullptr);
+  Ref<PyFunctionObject> method(
+      Ref<PyFunctionObject>::steal(PyObject_GetAttrString(klass, "dot")));
+  ASSERT_NE(method, nullptr);
+  ASSERT_TRUE(PyFunction_Check(method));
+
+  std::unique_ptr<Function> irfunc(buildHIR(method));
+  std::string hir = fullPrinter().ToString(*irfunc);
+  EXPECT_EQ(countSubstring(hir, "GuardType<ObjectUser[Vector:Exact]>"), 1)
+      << hir;
+  EXPECT_NE(hir.find("FrameState"), std::string::npos) << hir;
+}
+
+TEST_F(HIRBuildTest, InferredSelfGuardForSelfLoadMethod) {
+  const char* src = R"(
+class Vector:
+    def dot(self, other):
+        return (self.x * other.x) + (self.y * other.y) + (self.z * other.z)
+
+    def magnitude(self):
+        return self.dot(self)
+)";
+  Ref<> klass(compileAndGet(src, "Vector"));
+  ASSERT_NE(klass, nullptr);
+  Ref<PyFunctionObject> method(
+      Ref<PyFunctionObject>::steal(
+          PyObject_GetAttrString(klass, "magnitude")));
+  ASSERT_NE(method, nullptr);
+  ASSERT_TRUE(PyFunction_Check(method));
+
+  std::unique_ptr<Function> irfunc(buildHIR(method));
+  std::string hir = fullPrinter().ToString(*irfunc);
+  EXPECT_EQ(countSubstring(hir, "GuardType<ObjectUser[Vector:Exact]>"), 1)
+      << hir;
+}
+
+TEST_F(HIRBuildTest, InferredSelfGuardSkipsMethodWithoutSelfAttrLoad) {
+  const char* src = R"(
+class Vec:
+    def identity(self):
+        return self
+)";
+  Ref<> klass(compileAndGet(src, "Vec"));
+  ASSERT_NE(klass, nullptr);
+  Ref<PyFunctionObject> method(
+      Ref<PyFunctionObject>::steal(PyObject_GetAttrString(klass, "identity")));
+  ASSERT_NE(method, nullptr);
+  ASSERT_TRUE(PyFunction_Check(method));
+
+  std::unique_ptr<Function> irfunc(buildHIR(method));
+  std::string hir = fullPrinter().ToString(*irfunc);
+  EXPECT_EQ(countSubstring(hir, "GuardType<"), 0) << hir;
+}
+
+TEST_F(HIRBuildTest, InferredSelfGuardSkipsArgNotNamedSelf) {
+  const char* src = R"(
+class Vec:
+    def dot(this, other):
+        return this.x * other.x
+)";
+  Ref<> klass(compileAndGet(src, "Vec"));
+  ASSERT_NE(klass, nullptr);
+  Ref<PyFunctionObject> method(
+      Ref<PyFunctionObject>::steal(PyObject_GetAttrString(klass, "dot")));
+  ASSERT_NE(method, nullptr);
+  ASSERT_TRUE(PyFunction_Check(method));
+
+  std::unique_ptr<Function> irfunc(buildHIR(method));
+  std::string hir = fullPrinter().ToString(*irfunc);
+  EXPECT_EQ(countSubstring(hir, "GuardType<"), 0) << hir;
+}
+
+TEST_F(HIRBuildTest, InferredSelfGuardSkipsExistingSubclass) {
+  const char* src = R"(
+class Vec:
+    def dot(self, other):
+        return self.x * other.x
+
+class SubVec(Vec):
+    pass
+)";
+  Ref<> klass(compileAndGet(src, "Vec"));
+  ASSERT_NE(klass, nullptr);
+  Ref<PyFunctionObject> method(
+      Ref<PyFunctionObject>::steal(PyObject_GetAttrString(klass, "dot")));
+  ASSERT_NE(method, nullptr);
+  ASSERT_TRUE(PyFunction_Check(method));
+
+  std::unique_ptr<Function> irfunc(buildHIR(method));
+  std::string hir = fullPrinter().ToString(*irfunc);
+  EXPECT_EQ(countSubstring(hir, "GuardType<"), 0) << hir;
+}
+
+TEST_F(HIRBuildTest, InferredSelfGuardSkipsNestedQualname) {
+  const char* src = R"(
+class Outer:
+    class Vec:
+        def dot(self, other):
+            return self.x * other.x
+)";
+  Ref<> outer(compileAndGet(src, "Outer"));
+  ASSERT_NE(outer, nullptr);
+  Ref<> klass(Ref<>::steal(PyObject_GetAttrString(outer, "Vec")));
+  ASSERT_NE(klass, nullptr);
+  Ref<PyFunctionObject> method(
+      Ref<PyFunctionObject>::steal(PyObject_GetAttrString(klass, "dot")));
+  ASSERT_NE(method, nullptr);
+  ASSERT_TRUE(PyFunction_Check(method));
+
+  std::unique_ptr<Function> irfunc(buildHIR(method));
+  std::string hir = fullPrinter().ToString(*irfunc);
+  EXPECT_EQ(countSubstring(hir, "GuardType<"), 0) << hir;
+}
+
+TEST_F(HIRBuildTest, InferredSelfGuardSkipsCustomGetattribute) {
+  const char* src = R"(
+class Vec:
+    def __getattribute__(self, name):
+        return object.__getattribute__(self, name)
+
+    def dot(self, other):
+        return self.x * other.x
+)";
+  Ref<> klass(compileAndGet(src, "Vec"));
+  ASSERT_NE(klass, nullptr);
+  Ref<PyFunctionObject> method(
+      Ref<PyFunctionObject>::steal(PyObject_GetAttrString(klass, "dot")));
+  ASSERT_NE(method, nullptr);
+  ASSERT_TRUE(PyFunction_Check(method));
+
+  std::unique_ptr<Function> irfunc(buildHIR(method));
+  std::string hir = fullPrinter().ToString(*irfunc);
+  EXPECT_EQ(countSubstring(hir, "GuardType<"), 0) << hir;
+}
+
+TEST_F(HIRBuildTest, InferredSelfGuardSkipsStaticmethodDescriptor) {
+  const char* src = R"(
+class Vec:
+    @staticmethod
+    def dot(self, other):
+        return self.x * other.x
+)";
+  Ref<> klass(compileAndGet(src, "Vec"));
+  ASSERT_NE(klass, nullptr);
+  Ref<PyFunctionObject> method(
+      Ref<PyFunctionObject>::steal(PyObject_GetAttrString(klass, "dot")));
+  ASSERT_NE(method, nullptr);
+  ASSERT_TRUE(PyFunction_Check(method));
+
+  std::unique_ptr<Function> irfunc(buildHIR(method));
+  std::string hir = fullPrinter().ToString(*irfunc);
+  EXPECT_EQ(countSubstring(hir, "GuardType<"), 0) << hir;
+}
+
 TEST_F(HIRBuildTest, FloatGlobalLoadKeepsGuardIs) {
   const char* src = R"(
 G = 1.5
