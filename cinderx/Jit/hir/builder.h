@@ -251,6 +251,10 @@ class HIRBuilder {
       const jit::BytecodeInstruction& bc_instr);
   void emitBinarySlice(TranslationContext& tc);
   void emitStoreSlice(TranslationContext& tc);
+  bool tryEmitListPrefixReverseAssign(
+      TranslationContext& tc,
+      jit::BytecodeInstructionBlock::Iterator& bc_it,
+      const jit::BytecodeInstructionBlock::Iterator& bc_end);
   void emitStoreSubscr(
       TranslationContext& tc,
       const jit::BytecodeInstruction& bc_instr);

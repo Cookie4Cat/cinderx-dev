@@ -45,6 +45,7 @@ struct HIROptimizations {
   bool guard_type_removal{true};
   bool inliner{true};
   bool insert_update_prev_instr{true};
+  bool list_prefix_reverse_assign{true};
   bool phi_elim{true};
   bool simplify{true};
 };

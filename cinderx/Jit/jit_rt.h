@@ -139,6 +139,22 @@ PyObject* JITRT_LoadGlobalFromThreadState(
 PyObject* JITRT_LoadGlobalsDict(PyThreadState* tstate);
 
 /*
+ * Fast path for `list[:k + 1] = list[k::-1]`.
+ *
+ * Inputs are borrowed references.  The fast path only handles exact list,
+ * exact int, and non-negative indices; it swaps list items in place without
+ * stealing or creating references.  Non-exact lists, non-exact ints, negative
+ * indices, and free-threading builds reconstruct the original Python operation:
+ * first evaluate `list[index::-1]`, then `index + 1`, then
+ * `list[:index + 1] = value`.
+ *
+ * The fallback may execute Python code through `PyObject_GetItem`,
+ * `PyNumber_Add`, and `PyObject_SetItem`.  Returns 0 on success and -1 with a
+ * Python exception set on error.
+ */
+int JITRT_ListPrefixReverseAssign(PyObject* list, PyObject* index);
+
+/*
  * Helper to perform a Python call with dynamically determined arguments.
  *
  * pargs will be a possibly empty tuple of positional arguments, kwargs will be

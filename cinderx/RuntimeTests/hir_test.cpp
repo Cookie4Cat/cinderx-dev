@@ -11,6 +11,7 @@
 #include "cinderx/Common/ref.h"
 #include "cinderx/Interpreter/cinder_opcode.h"
 #include "cinderx/Jit/compiler.h"
+#include "cinderx/Jit/config.h"
 #include "cinderx/Jit/hir/builder.h"
 #include "cinderx/Jit/hir/hir.h"
 #include "cinderx/Jit/hir/parser.h"
@@ -18,6 +19,7 @@
 #include "cinderx/Jit/hir/printer.h"
 #include "cinderx/Jit/hir/refcount_insertion.h"
 #include "cinderx/Jit/hir/ssa.h"
+#include "cinderx/Jit/jit_rt.h"
 #include "cinderx/RuntimeTests/fixtures.h"
 
 extern "C" {
@@ -48,6 +50,19 @@ size_t countOpcode(const Function& func, Opcode opcode) {
   for (const auto& block : func.cfg.blocks) {
     for (const auto& instr : block) {
       if (instr.opcode() == opcode) {
+        count++;
+      }
+    }
+  }
+  return count;
+}
+
+size_t countStaticCallsTo(const Function& func, void* addr) {
+  size_t count = 0;
+  for (const auto& block : func.cfg.blocks) {
+    for (const auto& instr : block) {
+      if (instr.IsCallStatic() &&
+          static_cast<const CallStatic&>(instr).addr() == addr) {
         count++;
       }
     }
@@ -738,6 +753,67 @@ def test():
   EXPECT_EQ(countSubstring(hir, "GuardType<LongExact>"), 0) << hir;
   EXPECT_EQ(countSubstring(hir, "GuardIs<"), 1) << hir;
 }
+
+#if PY_VERSION_HEX >= 0x030E0000 && PY_VERSION_HEX < 0x030F0000
+TEST_F(HIRBuildTest, ListPrefixReverseAssignEmitsRuntimeFastPath) {
+  const char* src = R"(
+def test(perm, k):
+    perm[: k + 1] = perm[k::-1]
+    return perm
+)";
+  std::unique_ptr<Function> irfunc;
+  ASSERT_NO_FATAL_FAILURE(CompileToHIR(src, "test", irfunc));
+  ASSERT_NE(irfunc, nullptr);
+
+  std::string hir = fullPrinter().ToString(*irfunc);
+  EXPECT_EQ(
+      countStaticCallsTo(
+          *irfunc, reinterpret_cast<void*>(JITRT_ListPrefixReverseAssign)),
+      1)
+      << hir;
+  EXPECT_EQ(countOpcode(*irfunc, Opcode::kBuildSlice), 0) << hir;
+  EXPECT_EQ(countOpcode(*irfunc, Opcode::kStoreSubscr), 0) << hir;
+}
+
+TEST_F(HIRBuildTest, ListPrefixReverseAssignRejectsNonPrefixStore) {
+  const char* src = R"(
+def test(perm, k):
+    perm[1 : k + 1] = perm[k::-1]
+    return perm
+)";
+  std::unique_ptr<Function> irfunc;
+  ASSERT_NO_FATAL_FAILURE(CompileToHIR(src, "test", irfunc));
+  ASSERT_NE(irfunc, nullptr);
+
+  std::string hir = fullPrinter().ToString(*irfunc);
+  EXPECT_GE(countOpcode(*irfunc, Opcode::kBuildSlice), 1) << hir;
+  EXPECT_GE(countOpcode(*irfunc, Opcode::kStoreSubscr), 1) << hir;
+}
+
+TEST_F(HIRBuildTest, ListPrefixReverseAssignCanBeDisabled) {
+  struct RestoreFlag {
+    bool old_value;
+    ~RestoreFlag() {
+      getMutableConfig().hir_opts.list_prefix_reverse_assign = old_value;
+    }
+  } restore{getConfig().hir_opts.list_prefix_reverse_assign};
+
+  getMutableConfig().hir_opts.list_prefix_reverse_assign = false;
+
+  const char* src = R"(
+def test(perm, k):
+    perm[: k + 1] = perm[k::-1]
+    return perm
+)";
+  std::unique_ptr<Function> irfunc;
+  ASSERT_NO_FATAL_FAILURE(CompileToHIR(src, "test", irfunc));
+  ASSERT_NE(irfunc, nullptr);
+
+  std::string hir = fullPrinter().ToString(*irfunc);
+  EXPECT_GE(countOpcode(*irfunc, Opcode::kBuildSlice), 1) << hir;
+  EXPECT_GE(countOpcode(*irfunc, Opcode::kStoreSubscr), 1) << hir;
+}
+#endif
 
 TEST_F(HIRBuildTest, GetLength) {
   //  0 LOAD_FAST  0
