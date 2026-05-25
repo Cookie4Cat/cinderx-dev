@@ -131,6 +131,15 @@ class StaticMethodVector:
         return (self.x * other.x) + (self.y * other.y) + (self.z * other.z)
 
 
+class CountingXDescriptor:
+    def __get__(self, obj: Any, owner: type[Any]) -> float:
+        obj.accesses += 1
+        return 10.0
+
+    def __set__(self, obj: Any, value: Any) -> None:
+        obj.__dict__["x"] = value
+
+
 @passIf(not cinderx.jit.is_enabled(), "Tests functionality on the JIT")
 class InferredSelfTypeTests(unittest.TestCase):
     def compile(self, func: Callable[..., Any]) -> None:
@@ -217,6 +226,36 @@ class InferredSelfTypeTests(unittest.TestCase):
             checked(VectorLike(1.0, 2.0, 3.0), VectorLike(4.0, 5.0, 6.0)),
             32.0,
         )
+
+    def test_exact_self_missing_instance_attr_preserves_attribute_error(
+        self,
+    ) -> None:
+        self.compile(RaytraceVector.dot)
+        ops = cinderx.jit.get_function_hir_opcode_counts(RaytraceVector.dot)
+        self.assertGreaterEqual(ops.get("GuardType", 0), 1)
+
+        receiver = RaytraceVector(1.0, 2.0, 3.0)
+        other = RaytraceVector(4.0, 5.0, 6.0)
+        del receiver.x
+        with self.assertRaises(AttributeError):
+            RaytraceVector.dot(receiver, other)
+
+    def test_exact_self_preexisting_descriptor_lookup_preserved(self) -> None:
+        try:
+            RaytraceVector.x = CountingXDescriptor()
+            self.compile(RaytraceVector.dot)
+            ops = cinderx.jit.get_function_hir_opcode_counts(RaytraceVector.dot)
+            self.assertGreaterEqual(ops.get("GuardType", 0), 1)
+
+            receiver = RaytraceVector(1.0, 2.0, 3.0)
+            other = RaytraceVector(4.0, 5.0, 6.0)
+            receiver.accesses = 0
+            other.accesses = 0
+            self.assertEqual(RaytraceVector.dot(receiver, other), 128.0)
+            self.assertEqual(receiver.accesses, 1)
+            self.assertEqual(other.accesses, 1)
+        finally:
+            del RaytraceVector.x
 
 
 if __name__ == "__main__":
