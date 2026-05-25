@@ -23,6 +23,7 @@ extern "C" {
 #include "cinderx/Jit/hir/annotation_index.h"
 #include "cinderx/Jit/hir/ssa.h"
 #include "cinderx/Jit/hir/type.h"
+#include "cinderx/Jit/threaded_compile.h"
 #include "cinderx/StaticPython/checked_dict.h"
 #include "cinderx/StaticPython/checked_list.h"
 #include "cinderx/StaticPython/classloader.h"
@@ -295,6 +296,97 @@ bool codeHasBackedge(BorrowedRef<PyCodeObject> code) {
 }
 
 } // namespace
+
+// Memory layout mirrors CPython arraymodule.c arrayobject and arraydescr.
+struct StdlibArrayDescr {
+  char typecode;
+  int itemsize;
+};
+
+struct StdlibArrayObject {
+  PyObject_VAR_HEAD
+  char* ob_item;
+  Py_ssize_t allocated;
+  const StdlibArrayDescr* ob_descr;
+  PyObject* weakreflist;
+  Py_ssize_t ob_exports;
+};
+
+// Get the array.array type object for fast path type guards.
+// Thread-safe, pre-cached, with runtime layout validation.
+PyTypeObject* getStdlibArrayType() {
+  RETURN_MULTITHREADED_COMPILE(nullptr);
+
+  static PyTypeObject* cached_type = nullptr;
+  if (cached_type != nullptr) {
+    return cached_type;
+  }
+
+  ThreadedCompileSerialize guard;
+
+  if (cached_type != nullptr) {
+    return cached_type;
+  }
+
+  BorrowedRef<> module = PyImport_ImportModule("array");
+  if (module == nullptr) {
+    PyErr_Clear();
+    return nullptr;
+  }
+
+  BorrowedRef<> array_type = PyObject_GetAttrString(module, "array");
+  if (array_type == nullptr) {
+    PyErr_Clear();
+    return nullptr;
+  }
+
+  if (!PyType_Check(array_type)) {
+    return nullptr;
+  }
+
+  auto* type = reinterpret_cast<PyTypeObject*>(array_type.get());
+
+  // Runtime layout validation: create a probe instance and verify offsets.
+  BorrowedRef<> probe_list = PyList_New(1);
+  if (probe_list == nullptr) {
+    PyErr_Clear();
+    return nullptr;
+  }
+  PyList_SET_ITEM(probe_list, 0, PyFloat_FromDouble(1.5));
+
+  BorrowedRef<> args = PyTuple_Pack(2, PyUnicode_InternFromString("d"), probe_list);
+  if (args == nullptr) {
+    PyErr_Clear();
+    return nullptr;
+  }
+
+  BorrowedRef<> probe = PyObject_CallObject(array_type, args);
+  if (probe == nullptr) {
+    PyErr_Clear();
+    return nullptr;
+  }
+
+  auto* arr = reinterpret_cast<StdlibArrayObject*>(probe.get());
+
+  // Verify ob_item points to valid double data
+  if (arr->ob_item == nullptr) {
+    return nullptr;
+  }
+
+  // Verify ob_descr->typecode == 'd'
+  if (arr->ob_descr == nullptr || arr->ob_descr->typecode != 'd') {
+    return nullptr;
+  }
+
+  // Verify we can actually read the stored value
+  double val = *reinterpret_cast<double*>(arr->ob_item);
+  if (val != 1.5) {
+    return nullptr;
+  }
+
+  cached_type = type;
+  return cached_type;
+}
 
 // Allocate a temp register that may be used for the stack. It should not be a
 // register that will be treated specially in the FrameState (e.g. tracked as
@@ -1228,7 +1320,7 @@ void HIRBuilder::translate(
           break;
         }
         case STORE_SUBSCR: {
-          emitStoreSubscr(tc, bc_instr);
+          emitStoreSubscr(irfunc.cfg, tc, bc_instr);
           break;
         }
         case BUILD_SLICE: {
@@ -3959,12 +4051,97 @@ void HIRBuilder::emitStoreSlice(TranslationContext& tc) {
 }
 
 void HIRBuilder::emitStoreSubscr(
+    CFG& cfg,
     TranslationContext& tc,
     const jit::BytecodeInstruction& bc_instr) {
   auto& stack = tc.frame.stack;
   Register* sub = stack.pop();
   Register* container = stack.pop();
   Register* value = stack.pop();
+
+  // Fast path for array.array('d') store
+  if (getConfig().specialized_opcodes &&
+      bc_instr.specializedOpcode() != STORE_SUBSCR_DICT) {
+    auto* array_type = getStdlibArrayType();
+    if (array_type != nullptr) {
+      // Set up blocks for fast/slow path branching
+      BasicBlock* fast_path = cfg.AllocateBlock();
+      BasicBlock* slow_path = cfg.AllocateBlock();
+      BasicBlock* done_path = cfg.AllocateBlock();
+
+      // Guard: container is array.array
+      Type array_type_guard = Type::fromTypeExact(array_type);
+      tc.frame.cur_instr_offs = bc_instr.baseOffset();
+      tc.emitSnapshot();
+      tc.emit<CondBranchCheckType>(
+          container, array_type_guard, fast_path, slow_path);
+
+      // --- Fast path ---
+      tc.block = fast_path;
+      tc.emitSnapshot();
+      tc.emit<RefineType>(container, array_type_guard, container);
+
+      // Guard: sub is LongExact
+      auto sub_guard = temps_.AllocateStack();
+      tc.emit<GuardType>(sub_guard, TLongExact, sub, tc.frame);
+      tc.emit<RefineType>(sub_guard, TLongExact, sub_guard);
+      Register* unboxed_idx = temps_.AllocateStack();
+      tc.emit<PrimitiveUnbox>(unboxed_idx, sub_guard, TCInt64);
+      Register* neg_check = temps_.AllocateStack();
+      tc.emit<IsNegativeAndErrOccurred>(neg_check, unboxed_idx, tc.frame);
+
+      // Guard: value is FloatExact
+      auto value_guard = temps_.AllocateStack();
+      tc.emit<GuardType>(value_guard, TFloatExact, value, tc.frame);
+      Register* unboxed_value = temps_.AllocateStack();
+      tc.emit<PrimitiveUnbox>(unboxed_value, value_guard, TCDouble);
+
+      // Check typecode == 'd'
+      auto descr = temps_.AllocateStack();
+      tc.emit<LoadField>(
+          descr,
+          container,
+          "ob_descr",
+          offsetof(StdlibArrayObject, ob_descr),
+          TCPtr);
+      auto typecode = temps_.AllocateStack();
+      tc.emit<LoadField>(
+          typecode, descr, "typecode", offsetof(StdlibArrayDescr, typecode), TCInt8);
+      auto expected_tc = temps_.AllocateStack();
+      tc.emit<LoadConst>(expected_tc, Type::fromCInt('d', TCInt8));
+      auto tc_match = temps_.AllocateStack();
+      tc.emit<PrimitiveCompare>(
+          tc_match, PrimitiveCompareOp::kEqual, typecode, expected_tc);
+
+      // Branch on typecode match
+      BasicBlock* tc_ok = cfg.AllocateBlock();
+      tc.emit<CondBranch>(tc_match, tc_ok, slow_path);
+
+      // typecode matched — bounds check + store
+      tc.block = tc_ok;
+      auto adjusted_idx = temps_.AllocateStack();
+      tc.emit<CheckSequenceBounds>(adjusted_idx, container, unboxed_idx, tc.frame);
+      auto ob_item = temps_.AllocateStack();
+      tc.emit<LoadField>(
+          ob_item,
+          container,
+          "ob_item",
+          offsetof(StdlibArrayObject, ob_item),
+          TCPtr);
+      tc.emit<StoreArrayItem>(
+          ob_item, adjusted_idx, unboxed_value, container, TCDouble);
+      tc.emit<Branch>(done_path);
+
+      // --- Slow path ---
+      tc.block = slow_path;
+      tc.emit<StoreSubscr>(container, sub, value, tc.frame);
+      tc.emit<Branch>(done_path);
+
+      // --- Done path ---
+      tc.block = done_path;
+      return;
+    }
+  }
 
   if (getConfig().specialized_opcodes &&
       bc_instr.specializedOpcode() == STORE_SUBSCR_DICT) {

@@ -2189,6 +2189,18 @@ Register* simplifyStoreSubscr(Env& env, const StoreSubscr* instr) {
     return nullptr;
   }
 
+  // PrimitiveBox rematerialization: when the value being stored comes from
+  // a PrimitiveBox in a different basic block, re-create the box in the
+  // current block to reduce cross-block register pressure.
+  Register* value = instr->GetOperand(2);
+  if (value->instr()->IsPrimitiveBox()) {
+    auto* box = static_cast<const PrimitiveBox*>(value->instr());
+    if (box->block() != instr->block()) {
+      env.emit<PrimitiveBox>(box->value(), box->type(), *instr->frameState());
+      return nullptr;
+    }
+  }
+
   return nullptr;
 }
 
