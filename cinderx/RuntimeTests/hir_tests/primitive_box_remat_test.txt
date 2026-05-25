@@ -1,0 +1,104 @@
+--- Test Suite Name ---
+PrimitiveBoxRematTest
+--- Passes ---
+PrimitiveBoxRemat
+--- Test Name ---
+ElidesFrameStateOnlyCDoubleBox
+--- Input ---
+# HIR
+fun test {
+  bb 0 {
+    v0 = LoadArg<0; "a">
+    v1 = RefineType<FloatExact> v0
+    v2 = PrimitiveUnbox<CDouble> v1
+    v3 = PrimitiveBox<CDouble> v2 {
+      FrameState {
+        CurInstrOffset 0
+        Locals<2> v0 v0
+      }
+    }
+    v4 = LoadAttr<0; "y"> v0 {
+      FrameState {
+        CurInstrOffset 2
+        Locals<2> v0 v3
+      }
+    }
+    UseType<FloatExact> v3
+    v5 = PrimitiveBox<CDouble> v2 {
+      FrameState {
+        CurInstrOffset 4
+        Locals<2> v0 v3
+      }
+    }
+    Return v5
+  }
+}
+--- Expected 3.14 ---
+fun test {
+  bb 0 {
+    v0:Object = LoadArg<0>
+    v1:FloatExact = RefineType<FloatExact> v0
+    v2:CDouble = PrimitiveUnbox<CDouble> v1
+    v4:Object = LoadAttr<0> v0 {
+      FrameState {
+        CurInstrOffset 2
+        Locals<2> v0 v2
+      }
+    }
+    v5:FloatExact = PrimitiveBox<CDouble> v2 {
+      FrameState {
+        CurInstrOffset 4
+        Locals<2> v0 v2
+      }
+    }
+    Return v5
+  }
+}
+--- Test Name ---
+KeepsCDoubleBoxWithRealConsumer
+--- Input ---
+# HIR
+fun test {
+  bb 0 {
+    v0 = LoadArg<0; "a">
+    v1 = RefineType<FloatExact> v0
+    v2 = PrimitiveUnbox<CDouble> v1
+    v3 = PrimitiveBox<CDouble> v2 {
+      FrameState {
+        CurInstrOffset 0
+        Locals<2> v0 v0
+      }
+    }
+    v4 = LoadAttr<0; "y"> v0 {
+      FrameState {
+        CurInstrOffset 2
+        Locals<2> v0 v3
+      }
+    }
+    UseType<FloatExact> v3
+    Return v3
+  }
+}
+--- Expected 3.14 ---
+fun test {
+  bb 0 {
+    v0:Object = LoadArg<0>
+    v1:FloatExact = RefineType<FloatExact> v0
+    v2:CDouble = PrimitiveUnbox<CDouble> v1
+    v3:FloatExact = PrimitiveBox<CDouble> v2 {
+      FrameState {
+        CurInstrOffset 0
+        Locals<2> v0 v0
+      }
+    }
+    v4:Object = LoadAttr<0> v0 {
+      FrameState {
+        CurInstrOffset 2
+        Locals<2> v0 v3
+      }
+    }
+    UseType<FloatExact> v3
+    Return v3
+  }
+}
+--- End ---

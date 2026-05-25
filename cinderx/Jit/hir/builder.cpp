@@ -2723,15 +2723,48 @@ void HIRBuilder::emitDeleteAttr(
   tc.emit<DeleteAttr>(receiver, bc_instr.oparg(), tc.frame);
 }
 
+void HIRBuilder::emitSlotTypeVersionGuard(
+    TranslationContext& tc,
+    Register* receiver,
+    uint32_t type_version,
+    const char* descr) {
+  Register* obj_type = temps_.AllocateStack();
+  tc.emit<LoadField>(
+      obj_type, receiver, "ob_type", offsetof(PyObject, ob_type), TType);
+
+  Register* version = temps_.AllocateStack();
+  tc.emit<LoadField>(
+      version,
+      obj_type,
+      "tp_version_tag",
+      offsetof(PyTypeObject, tp_version_tag),
+      TCUInt32);
+
+  Register* expected = temps_.AllocateStack();
+  tc.emit<LoadConst>(expected, Type::fromCUInt(type_version, TCUInt32));
+
+  Register* matches = temps_.AllocateStack();
+  tc.emit<PrimitiveCompare>(
+      matches, PrimitiveCompareOp::kEqual, version, expected);
+  auto* guard = tc.emit<Guard>(matches, tc.frame);
+  guard->setGuiltyReg(receiver);
+  guard->setDescr(descr);
+}
+
 void HIRBuilder::emitLoadAttr(
     TranslationContext& tc,
     const jit::BytecodeInstruction& bc_instr) {
   int oparg = bc_instr.oparg();
   int name_idx = loadAttrIndex(oparg);
-
-  // LOAD_METHOD has been merged into LOAD_ATTR, and the oparg tells you
-  // which one it should be.
-  if (oparg & 1) {
+  bool is_method = (oparg & 1) != 0;
+  int specialized_opcode = getConfig().specialized_opcodes
+      ? bc_instr.specializedOpcode()
+      : LOAD_ATTR;
+  bool slot_fast_path_enabled = specialized_opcode == LOAD_ATTR_SLOT;
+#ifdef Py_GIL_DISABLED
+  slot_fast_path_enabled = false;
+#endif
+  if (is_method && !slot_fast_path_enabled) {
     emitLoadMethod(tc, name_idx);
     return;
   }
@@ -2739,12 +2772,41 @@ void HIRBuilder::emitLoadAttr(
   Register* receiver = tc.frame.stack.pop();
 
   if (getConfig().specialized_opcodes) {
-    switch (bc_instr.specializedOpcode()) {
+    switch (specialized_opcode) {
       case LOAD_ATTR_MODULE: {
         Type type = Type::fromTypeExact(&PyModule_Type);
         tc.emit<GuardType>(receiver, type, receiver, tc.frame);
         break;
       }
+#ifndef Py_GIL_DISABLED
+      case LOAD_ATTR_SLOT: {
+        BorrowedRef<PyUnicodeObject> name =
+            PyTuple_GET_ITEM(code_->co_names, name_idx);
+        const char* field_name = PyUnicode_AsUTF8(name);
+        if (field_name == nullptr) {
+          PyErr_Clear();
+          field_name = "<unknown>";
+        }
+        emitSlotTypeVersionGuard(
+            tc, receiver, bc_instr.attrCacheTypeVersion(), "LOAD_ATTR_SLOT");
+        Register* result = temps_.AllocateStack();
+        tc.emit<LoadField>(
+            result,
+            receiver,
+            field_name,
+            bc_instr.attrCacheIndex(),
+            TOptObject);
+        auto* guard = tc.emit<Guard>(result, tc.frame);
+        guard->setGuiltyReg(receiver);
+        guard->setDescr("LOAD_ATTR_SLOT");
+        tc.emit<RefineType>(result, TObject, result);
+        tc.frame.stack.push(result);
+        if (is_method) {
+          emitPushNull(tc);
+        }
+        return;
+      }
+#endif
       default:
         break;
     }
@@ -3772,6 +3834,39 @@ void HIRBuilder::emitStoreAttr(
     const jit::BytecodeInstruction& bc_instr) {
   Register* receiver = tc.frame.stack.pop();
   Register* value = tc.frame.stack.pop();
+#ifndef Py_GIL_DISABLED
+  if (getConfig().specialized_opcodes &&
+      bc_instr.specializedOpcode() == STORE_ATTR_SLOT) {
+    // STORE_ATTR oparg is always the co_names index; unlike LOAD_ATTR it does
+    // not reserve a low bit for method-call stack shaping.
+    BorrowedRef<PyUnicodeObject> name =
+        PyTuple_GET_ITEM(code_->co_names, bc_instr.oparg());
+    const char* field_name = PyUnicode_AsUTF8(name);
+    if (field_name == nullptr) {
+      PyErr_Clear();
+      field_name = "<unknown>";
+    }
+    emitSlotTypeVersionGuard(
+        tc, receiver, bc_instr.attrCacheTypeVersion(), "STORE_ATTR_SLOT");
+    uint16_t field_offset = bc_instr.attrCacheIndex();
+    Register* previous = temps_.AllocateStack();
+    tc.emit<LoadField>(
+        previous,
+        receiver,
+        field_name,
+        field_offset,
+        TOptObject,
+        /* borrowed= */ false);
+    tc.emit<StoreField>(
+        receiver,
+        field_name,
+        field_offset,
+        value,
+        TOptObject,
+        previous);
+    return;
+  }
+#endif
   tc.emit<StoreAttr>(receiver, value, bc_instr.oparg(), tc.frame);
 }
 

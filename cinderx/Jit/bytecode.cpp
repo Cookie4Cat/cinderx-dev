@@ -2,7 +2,43 @@
 
 #include "cinderx/Jit/bytecode.h"
 
+extern "C" {
+#include "internal/pycore_code.h"
+}
+
+#include <cstddef>
+
 namespace jit {
+
+namespace {
+
+constexpr int kInlineCacheStartInstructionOffset = 1;
+
+constexpr int attrCacheInstructionOffset(std::size_t field_offset) {
+  return kInlineCacheStartInstructionOffset +
+      field_offset / sizeof(_Py_CODEUNIT);
+}
+
+static_assert(
+    offsetof(_PyAttrCache, version) % sizeof(_Py_CODEUNIT) == 0,
+    "_PyAttrCache::version must be code-unit aligned");
+static_assert(
+    offsetof(_PyAttrCache, index) % sizeof(_Py_CODEUNIT) == 0,
+    "_PyAttrCache::index must be code-unit aligned");
+
+constexpr int kAttrCacheTypeVersionInstructionOffset =
+    attrCacheInstructionOffset(offsetof(_PyAttrCache, version));
+constexpr int kAttrCacheIndexInstructionOffset =
+    attrCacheInstructionOffset(offsetof(_PyAttrCache, index));
+
+static_assert(
+    kAttrCacheTypeVersionInstructionOffset == 2,
+    "_PyAttrCache::version moved; update attr cache readers");
+static_assert(
+    kAttrCacheIndexInstructionOffset == 4,
+    "_PyAttrCache::index moved; update attr cache readers");
+
+} // namespace
 
 BCOffset BytecodeInstruction::baseOffset() const {
   return baseOffset_;
@@ -96,7 +132,9 @@ int BytecodeInstruction::specializedOpcode() const {
     case COMPARE_OP_FLOAT:
     case COMPARE_OP_INT:
     case COMPARE_OP_STR:
+    case LOAD_ATTR_SLOT:
     case LOAD_ATTR_MODULE:
+    case STORE_ATTR_SLOT:
     case STORE_SUBSCR_DICT:
     case UNPACK_SEQUENCE_LIST:
     case UNPACK_SEQUENCE_TUPLE:
@@ -110,6 +148,24 @@ int BytecodeInstruction::specializedOpcode() const {
 int BytecodeInstruction::oparg() const {
   calcOpcodeOffsetAndOparg();
   return extendedOparg_;
+}
+
+uint16_t BytecodeInstruction::cacheU16(int instruction_offset) const {
+  auto idx = opcodeIndex().value() + instruction_offset;
+  return read_u16(&codeUnit(code_)[idx].cache);
+}
+
+uint32_t BytecodeInstruction::cacheU32(int instruction_offset) const {
+  auto idx = opcodeIndex().value() + instruction_offset;
+  return read_u32(&codeUnit(code_)[idx].cache);
+}
+
+uint32_t BytecodeInstruction::attrCacheTypeVersion() const {
+  return cacheU32(kAttrCacheTypeVersionInstructionOffset);
+}
+
+uint16_t BytecodeInstruction::attrCacheIndex() const {
+  return cacheU16(kAttrCacheIndexInstructionOffset);
 }
 
 bool BytecodeInstruction::isBranch() const {

@@ -232,6 +232,64 @@ def test(a, b):
   ASSERT_EQ(PyLong_AsLong(result), 30);
 }
 
+TEST_F(ReifyFrameTest, MemoryViewReadOwnedMaterializesValueKinds) {
+  uint64_t regs[NUM_REGS]{};
+  MemoryView mem{regs};
+
+  regs[0] = bit_cast<uint64_t>(static_cast<Py_ssize_t>(-42));
+  LiveValue signed_val{
+      PhyLocation{0},
+      RefKind::kUncounted,
+      ValueKind::kSigned,
+      LiveValue::Source::kUnknown};
+  Ref<> signed_obj = mem.readOwned(signed_val);
+  ASSERT_NE(signed_obj, nullptr);
+  ASSERT_TRUE(PyLong_CheckExact(signed_obj));
+  ASSERT_EQ(PyLong_AsSsize_t(signed_obj), -42);
+
+  regs[1] = 123;
+  LiveValue unsigned_val{
+      PhyLocation{1},
+      RefKind::kUncounted,
+      ValueKind::kUnsigned,
+      LiveValue::Source::kUnknown};
+  Ref<> unsigned_obj = mem.readOwned(unsigned_val);
+  ASSERT_NE(unsigned_obj, nullptr);
+  ASSERT_TRUE(PyLong_CheckExact(unsigned_obj));
+  ASSERT_EQ(PyLong_AsSize_t(unsigned_obj), 123);
+
+  regs[2] = bit_cast<uint64_t>(3.125);
+  LiveValue double_val{
+      PhyLocation{2},
+      RefKind::kUncounted,
+      ValueKind::kDouble,
+      LiveValue::Source::kUnknown};
+  Ref<> double_obj = mem.readOwned(double_val);
+  ASSERT_NE(double_obj, nullptr);
+  ASSERT_TRUE(PyFloat_CheckExact(double_obj));
+  ASSERT_DOUBLE_EQ(PyFloat_AsDouble(double_obj), 3.125);
+
+  regs[3] = 1;
+  LiveValue bool_val{
+      PhyLocation{3},
+      RefKind::kUncounted,
+      ValueKind::kBool,
+      LiveValue::Source::kUnknown};
+  Ref<> bool_obj = mem.readOwned(bool_val);
+  ASSERT_EQ(bool_obj, Py_True);
+
+  auto object = Ref<>::steal(PyUnicode_FromString("deopt"));
+  ASSERT_NE(object, nullptr);
+  regs[4] = reinterpret_cast<uint64_t>(object.get());
+  LiveValue object_val{
+      PhyLocation{4},
+      RefKind::kBorrowed,
+      ValueKind::kObject,
+      LiveValue::Source::kUnknown};
+  Ref<> owned_object = mem.readOwned(object_val);
+  ASSERT_EQ(owned_object, object);
+}
+
 TEST_F(ReifyFrameTest, ReifyInLoop) {
   const char* src = R"(
 def test(num):
