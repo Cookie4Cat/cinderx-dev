@@ -328,13 +328,13 @@ PyTypeObject* getStdlibArrayType() {
     return cached_type;
   }
 
-  BorrowedRef<> module = PyImport_ImportModule("array");
+  auto module = Ref<>::steal(PyImport_ImportModule("array"));
   if (module == nullptr) {
     PyErr_Clear();
     return nullptr;
   }
 
-  BorrowedRef<> array_type = PyObject_GetAttrString(module, "array");
+  auto array_type = Ref<>::steal(PyObject_GetAttrString(module, "array"));
   if (array_type == nullptr) {
     PyErr_Clear();
     return nullptr;
@@ -347,20 +347,30 @@ PyTypeObject* getStdlibArrayType() {
   auto* type = reinterpret_cast<PyTypeObject*>(array_type.get());
 
   // Runtime layout validation: create a probe instance and verify offsets.
-  BorrowedRef<> probe_list = PyList_New(1);
+  auto probe_list = Ref<>::steal(PyList_New(1));
   if (probe_list == nullptr) {
     PyErr_Clear();
     return nullptr;
   }
-  PyList_SET_ITEM(probe_list, 0, PyFloat_FromDouble(1.5));
+  auto float_val = Ref<>::steal(PyFloat_FromDouble(1.5));
+  if (float_val == nullptr) {
+    PyErr_Clear();
+    return nullptr;
+  }
+  PyList_SET_ITEM(probe_list, 0, float_val.release());
 
-  BorrowedRef<> args = PyTuple_Pack(2, PyUnicode_InternFromString("d"), probe_list);
+  auto d_str = Ref<>::steal(PyUnicode_InternFromString("d"));
+  if (d_str == nullptr) {
+    PyErr_Clear();
+    return nullptr;
+  }
+  auto args = Ref<>::steal(PyTuple_Pack(2, d_str.get(), probe_list.get()));
   if (args == nullptr) {
     PyErr_Clear();
     return nullptr;
   }
 
-  BorrowedRef<> probe = PyObject_CallObject(array_type, args);
+  auto probe = Ref<>::steal(PyObject_CallObject(array_type, args));
   if (probe == nullptr) {
     PyErr_Clear();
     return nullptr;
