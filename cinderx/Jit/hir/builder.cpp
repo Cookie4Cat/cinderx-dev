@@ -566,6 +566,47 @@ std::unique_ptr<Function> HIRBuilder::buildHIR() {
 // check and see if there is any annotation to guard against.
 void HIRBuilder::emitTypeAnnotationGuards(TranslationContext& tc) {
   AnnotationIndex* index = preloader_.annotations();
+  bool first = true;
+
+  auto emit_arg_guard = [&](int arg_idx,
+                            Type type,
+                            bool needs_frame_state = false) {
+    // If we have a guard to emit, we need a snapshot for deopt.
+    //
+    // It's likely that no bytecode instructions have been compiled yet,
+    // meaning the instruction offset has not yet been set. Setting it to zero
+    // here ensures that deopt starts executing at the first instruction.
+    if (first) {
+      first = false;
+      tc.frame.cur_instr_offs = BCOffset(0);
+      tc.emitSnapshot();
+    }
+
+    auto arg = tc.frame.localsplus.at(arg_idx);
+    JIT_CHECK(arg != nullptr, "No register for argument {}", arg_idx);
+    if (needs_frame_state) {
+      tc.emit<GuardType>(arg, type, arg, tc.frame);
+    } else {
+      tc.emit<GuardType>(arg, type, arg);
+    }
+  };
+
+  auto emit_inferred_self_guard = [&]() {
+    auto inferred_self_type = preloader_.inferredSelfType();
+    if (!inferred_self_type) {
+      return;
+    }
+
+    auto arg = tc.frame.localsplus.at(0);
+    JIT_CHECK(arg != nullptr, "No register for argument 0");
+    if (arg->type() != TTop && arg->type() != TObject) {
+      return;
+    }
+
+    emit_arg_guard(0, *inferred_self_type, /*needs_frame_state=*/true);
+  };
+
+  emit_inferred_self_guard();
 
   // Bail out if there are no annotations.
   if (!index) {
@@ -573,7 +614,6 @@ void HIRBuilder::emitTypeAnnotationGuards(TranslationContext& tc) {
   }
 
   PyCodeObject* const code = tc.frame.code;
-  bool first = true;
 
   for (int arg_idx = 0; arg_idx < preloader_.numArgs(); arg_idx++) {
     PyObject* annotation = index->find(getVarname(code, arg_idx));
@@ -588,27 +628,9 @@ void HIRBuilder::emitTypeAnnotationGuards(TranslationContext& tc) {
       continue;
     }
 
-    // If we have an annotation that we are going to guard against, we need to
-    // emit a snapshot for the guard.
-    //
-    // It's likely that no bytecode instructions have been compiled yet, meaning
-    // the instruction offset has not yet been set. Setting it to zero here
-    // ensures that if we need to deopt that it starts executing the first
-    // instruction.
-    if (first) {
-      first = false;
-      tc.frame.cur_instr_offs = BCOffset(0);
-      tc.emitSnapshot();
-    }
-
-    // Now guard against the type of the argument.
-    auto arg = tc.frame.localsplus.at(arg_idx);
-    JIT_CHECK(arg != nullptr, "No register for argument {}", arg_idx);
-
     Type type =
         Type::fromTypeExact(reinterpret_cast<PyTypeObject*>(annotation));
-
-    tc.emit<GuardType>(arg, type, arg);
+    emit_arg_guard(arg_idx, type);
   }
 }
 
