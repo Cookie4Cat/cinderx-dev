@@ -1068,6 +1068,46 @@ LoadMethodResult JITRT_GetMethod(PyObject* obj, PyObject* name) {
   return {method, obj};
 }
 
+#if PY_VERSION_HEX >= 0x030E0000
+LoadMethodResult JITRT_LoadAttrMethodWithValues(
+    PyObject* obj,
+    int64_t type_version,
+    int64_t keys_version,
+    PyObject* descr,
+    PyObject* name) {
+  PyTypeObject* tp = Py_TYPE(obj);
+  if (tp->tp_version_tag != static_cast<uint32_t>(type_version)) {
+    return JITRT_GetMethod(obj, name);
+  }
+
+  if (!(tp->tp_flags & Py_TPFLAGS_INLINE_VALUES) ||
+      !PyType_HasFeature(tp, Py_TPFLAGS_HEAPTYPE)) {
+    return JITRT_GetMethod(obj, name);
+  }
+
+  PyDictValues* values = _PyObject_InlineValues(obj);
+  if (!values->valid) {
+    return JITRT_GetMethod(obj, name);
+  }
+
+  auto* heap_type = reinterpret_cast<PyHeapTypeObject*>(tp);
+  PyDictKeysObject* keys = heap_type->ht_cached_keys;
+  if (keys == nullptr ||
+      keys->dk_version != static_cast<uint32_t>(keys_version)) {
+    return JITRT_GetMethod(obj, name);
+  }
+
+  if (descr == nullptr ||
+      !PyType_HasFeature(Py_TYPE(descr), Py_TPFLAGS_METHOD_DESCRIPTOR)) {
+    return JITRT_GetMethod(obj, name);
+  }
+
+  Py_INCREF(descr);
+  Py_INCREF(obj);
+  return {descr, obj};
+}
+#endif
+
 static inline PyObject* super_lookup_method_or_attr(
     PyObject* global_super,
     PyTypeObject* type,

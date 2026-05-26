@@ -194,6 +194,15 @@ PyObject* JITRT_Vectorcall(
  */
 LoadMethodResult JITRT_GetMethod(PyObject* obj, PyObject* name);
 
+#if PY_VERSION_HEX >= 0x030E0000
+LoadMethodResult JITRT_LoadAttrMethodWithValues(
+    PyObject* obj,
+    int64_t type_version,
+    int64_t keys_version,
+    PyObject* descr,
+    PyObject* name);
+#endif
+
 /*
  * Perform an attribute lookup in a super class
  *
