@@ -119,6 +119,32 @@ def test_array_double_store_tuple_fallback():
         f((1, 2, 3), 0, 99)
 
 
+def test_array_double_store_int_value_coercion():
+    """Storing a bare int to array('d') falls back to slow path for coercion."""
+
+    def f(a, i, v):
+        a[i] = v
+
+    _compile_func(f, lambda: f(array("d", [1.0]), 0, 2.0))
+
+    arr = array("d", [0.0])
+    f(arr, 0, 42)
+    assert arr[0] == 42.0
+
+
+def test_array_double_store_non_d_typecode_fallback():
+    """Storing to array('i') falls back to slow path after 'd' warmup."""
+
+    def f(a, i, v):
+        a[i] = v
+
+    _compile_func(f, lambda: f(array("d", [1.0]), 0, 2.0))
+
+    arr_i = array("i", [1, 2, 3])
+    f(arr_i, 1, 99)
+    assert arr_i[1] == 99
+
+
 # ---------------------------------------------------------------------------
 # Bounds checking
 # ---------------------------------------------------------------------------
@@ -151,3 +177,44 @@ def test_array_double_store_loop():
     arr = array("d", [0.0, 0.0, 0.0])
     f(arr, 3, 7.5)
     assert list(arr) == [7.5, 7.5, 7.5]
+
+
+# ---------------------------------------------------------------------------
+# Slice subscript fallback (crash regression test)
+# ---------------------------------------------------------------------------
+
+
+def test_array_double_store_slice_subscript():
+    """Storing with a slice subscript does not crash (was SIGSEGV before fix).
+
+    The JIT fast path uses CondBranchCheckType for the index guard, which
+    routes non-int indices (slices) to the generic slow path rather than
+    deopting with a corrupted interpreter stack.
+    """
+
+    def f(a, src):
+        a[:] = src
+
+    _compile_func(f, lambda: f(array("d", [1.0, 2.0]), array("d", [3.0, 4.0])))
+
+    arr = array("d", [0.0, 0.0])
+    f(arr, array("d", [10.0, 20.0]))
+    assert list(arr) == [10.0, 20.0]
+
+
+def test_array_double_store_mixed_int_and_slice():
+    """Integer and slice subscripts can be used interchangeably."""
+
+    def f(a, use_slice, v):
+        if use_slice:
+            a[:] = v
+        else:
+            a[0] = v
+
+    _compile_func(f, lambda: f(array("d", [1.0]), False, 2.0))
+
+    arr = array("d", [0.0, 0.0])
+    f(arr, False, 5.0)
+    assert arr[0] == 5.0
+    f(arr, True, array("d", [99.0, 88.0]))
+    assert list(arr) == [99.0, 88.0]

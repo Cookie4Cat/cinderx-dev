@@ -313,20 +313,19 @@ struct StdlibArrayObject {
 };
 
 // Get the array.array type object for fast path type guards.
-// Thread-safe, pre-cached, with runtime layout validation.
+// Pre-cached with runtime layout validation. The cached value is readable
+// by any thread once initialized; only the initialization path requires
+// the GIL (and is skipped on worker threads).
 PyTypeObject* getStdlibArrayType() {
-  RETURN_MULTITHREADED_COMPILE(nullptr);
-
   static PyTypeObject* cached_type = nullptr;
   if (cached_type != nullptr) {
     return cached_type;
   }
 
-  ThreadedCompileSerialize guard;
-
-  if (cached_type != nullptr) {
-    return cached_type;
-  }
+  // Initialization needs the GIL (PyImport_ImportModule etc.).
+  // Worker threads skip initialization and return nullptr; the fast path
+  // is only available for functions compiled on the main thread.
+  RETURN_MULTITHREADED_COMPILE(nullptr);
 
   auto module = Ref<>::steal(PyImport_ImportModule("array"));
   if (module == nullptr) {
@@ -4066,6 +4065,52 @@ void HIRBuilder::emitStoreSlice(TranslationContext& tc) {
   tc.emit<StoreSubscr>(container, slice, values, tc.frame);
 }
 
+// Emit the index type guard: check sub is LongExact, unbox to CInt64,
+// and check for negative index. Returns the unboxed index register.
+// On type mismatch or negative index, branches to slow_path (deopt).
+Register* HIRBuilder::emitArrayIndexGuard(
+    CFG& cfg,
+    TranslationContext& tc,
+    Register* sub,
+    BasicBlock* slow_path) {
+  BasicBlock* idx_ok = cfg.AllocateBlock();
+  tc.emit<CondBranchCheckType>(sub, TLongExact, idx_ok, slow_path);
+  tc.block = idx_ok;
+  tc.emit<RefineType>(sub, TLongExact, sub);
+  Register* unboxed_idx = temps_.AllocateStack();
+  tc.emit<PrimitiveUnbox>(unboxed_idx, sub, TCInt64);
+  Register* neg_check = temps_.AllocateStack();
+  tc.emit<IsNegativeAndErrOccurred>(neg_check, unboxed_idx, tc.frame);
+  return unboxed_idx;
+}
+
+// Emit the typecode == 'd' check: load ob_descr->typecode, compare with
+// 'd', and branch. Returns the tc_ok block for the caller to continue.
+BasicBlock* HIRBuilder::emitArrayTypecodeCheck(
+    CFG& cfg,
+    TranslationContext& tc,
+    Register* container,
+    BasicBlock* slow_path) {
+  auto descr = temps_.AllocateStack();
+  tc.emit<LoadField>(
+      descr,
+      container,
+      "ob_descr",
+      offsetof(StdlibArrayObject, ob_descr),
+      TCPtr);
+  auto typecode = temps_.AllocateStack();
+  tc.emit<LoadField>(
+      typecode, descr, "typecode", offsetof(StdlibArrayDescr, typecode), TCInt8);
+  auto expected_tc = temps_.AllocateStack();
+  tc.emit<LoadConst>(expected_tc, Type::fromCInt('d', TCInt8));
+  auto tc_match = temps_.AllocateStack();
+  tc.emit<PrimitiveCompare>(
+      tc_match, PrimitiveCompareOp::kEqual, typecode, expected_tc);
+  BasicBlock* tc_ok = cfg.AllocateBlock();
+  tc.emit<CondBranch>(tc_match, tc_ok, slow_path);
+  return tc_ok;
+}
+
 void HIRBuilder::emitStoreSubscr(
     CFG& cfg,
     TranslationContext& tc,
@@ -4080,89 +4125,28 @@ void HIRBuilder::emitStoreSubscr(
       bc_instr.specializedOpcode() != STORE_SUBSCR_DICT) {
     auto* array_type = getStdlibArrayType();
     if (array_type != nullptr) {
-      // Set up blocks for fast/slow path branching
-      BasicBlock* fast_path = cfg.AllocateBlock();
       BasicBlock* slow_path = cfg.AllocateBlock();
       BasicBlock* done_path = cfg.AllocateBlock();
 
       // Guard: container is array.array
       Type array_type_guard = Type::fromTypeExact(array_type);
+      BasicBlock* fast_path = cfg.AllocateBlock();
       tc.frame.cur_instr_offs = bc_instr.baseOffset();
       tc.emitSnapshot();
       tc.emit<CondBranchCheckType>(
           container, array_type_guard, fast_path, slow_path);
 
-      // --- Fast path ---
       tc.block = fast_path;
       tc.emitSnapshot();
       tc.emit<RefineType>(container, array_type_guard, container);
 
-      // Route non-int indices (e.g. slices) to the generic store path rather
-      // than deopting. The operands were already popped from the abstract
-      // stack above, so a deopting guard here would restore a corrupted
-      // interpreter stack; a plain type-check branch avoids that entirely.
-      BasicBlock* idx_ok = cfg.AllocateBlock();
-      tc.emit<CondBranchCheckType>(sub, TLongExact, idx_ok, slow_path);
-      tc.block = idx_ok;
-      tc.emit<RefineType>(sub, TLongExact, sub);
-      Register* unboxed_idx = temps_.AllocateStack();
-      tc.emit<PrimitiveUnbox>(unboxed_idx, sub, TCInt64);
-      Register* neg_check = temps_.AllocateStack();
-      tc.emit<IsNegativeAndErrOccurred>(neg_check, unboxed_idx, tc.frame);
+      if (tryStoreSubscrArray(
+              cfg, tc, bc_instr, container, sub, value, slow_path, done_path)) {
+        tc.block = done_path;
+        return;
+      }
 
-      // Route non-float values to the generic store path (also handles
-      // int-to-double coercion that stock array assignment performs).
-      BasicBlock* val_ok = cfg.AllocateBlock();
-      tc.emit<CondBranchCheckType>(value, TFloatExact, val_ok, slow_path);
-      tc.block = val_ok;
-      tc.emit<RefineType>(value, TFloatExact, value);
-      Register* unboxed_value = temps_.AllocateStack();
-      tc.emit<PrimitiveUnbox>(unboxed_value, value, TCDouble);
-
-      // Check typecode == 'd'
-      auto descr = temps_.AllocateStack();
-      tc.emit<LoadField>(
-          descr,
-          container,
-          "ob_descr",
-          offsetof(StdlibArrayObject, ob_descr),
-          TCPtr);
-      auto typecode = temps_.AllocateStack();
-      tc.emit<LoadField>(
-          typecode, descr, "typecode", offsetof(StdlibArrayDescr, typecode), TCInt8);
-      auto expected_tc = temps_.AllocateStack();
-      tc.emit<LoadConst>(expected_tc, Type::fromCInt('d', TCInt8));
-      auto tc_match = temps_.AllocateStack();
-      tc.emit<PrimitiveCompare>(
-          tc_match, PrimitiveCompareOp::kEqual, typecode, expected_tc);
-
-      // Branch on typecode match
-      BasicBlock* tc_ok = cfg.AllocateBlock();
-      tc.emit<CondBranch>(tc_match, tc_ok, slow_path);
-
-      // typecode matched — bounds check + store
-      tc.block = tc_ok;
-      auto adjusted_idx = temps_.AllocateStack();
-      tc.emit<CheckSequenceBounds>(adjusted_idx, container, unboxed_idx, tc.frame);
-      auto ob_item = temps_.AllocateStack();
-      tc.emit<LoadField>(
-          ob_item,
-          container,
-          "ob_item",
-          offsetof(StdlibArrayObject, ob_item),
-          TCPtr);
-      tc.emit<StoreArrayItem>(
-          ob_item, adjusted_idx, unboxed_value, container, TCDouble);
-      tc.emit<Branch>(done_path);
-
-      // --- Slow path ---
-      tc.block = slow_path;
-      tc.emit<StoreSubscr>(container, sub, value, tc.frame);
-      tc.emit<Branch>(done_path);
-
-      // --- Done path ---
-      tc.block = done_path;
-      return;
+      // tryStoreSubscrArray returned false — fall through to generic path
     }
   }
 
@@ -4172,6 +4156,58 @@ void HIRBuilder::emitStoreSubscr(
   }
 
   tc.emit<StoreSubscr>(container, sub, value, tc.frame);
+}
+
+// Store fast path for array.array('d'). Container is already known to be
+// array.array via the outer guard. Emits the value type check, typecode
+// check, bounds check, and direct store. Returns true if the full fast
+// path was emitted; false if setup failed (caller should fall through to
+// the generic path).
+bool HIRBuilder::tryStoreSubscrArray(
+    CFG& cfg,
+    TranslationContext& tc,
+    const jit::BytecodeInstruction& /*bc_instr*/,
+    Register* container,
+    Register* sub,
+    Register* value,
+    BasicBlock* slow_path,
+    BasicBlock* done_path) {
+  // Route non-int indices (e.g. slices) to the generic store path.
+  Register* unboxed_idx = emitArrayIndexGuard(cfg, tc, sub, slow_path);
+
+  // Route non-float values to the generic store path (also handles
+  // int-to-double coercion that stock array assignment performs).
+  BasicBlock* val_ok = cfg.AllocateBlock();
+  tc.emit<CondBranchCheckType>(value, TFloatExact, val_ok, slow_path);
+  tc.block = val_ok;
+  tc.emit<RefineType>(value, TFloatExact, value);
+  Register* unboxed_value = temps_.AllocateStack();
+  tc.emit<PrimitiveUnbox>(unboxed_value, value, TCDouble);
+
+  // Check typecode == 'd'
+  BasicBlock* tc_ok = emitArrayTypecodeCheck(cfg, tc, container, slow_path);
+
+  // typecode matched — bounds check + store
+  tc.block = tc_ok;
+  auto adjusted_idx = temps_.AllocateStack();
+  tc.emit<CheckSequenceBounds>(adjusted_idx, container, unboxed_idx, tc.frame);
+  auto ob_item = temps_.AllocateStack();
+  tc.emit<LoadField>(
+      ob_item,
+      container,
+      "ob_item",
+      offsetof(StdlibArrayObject, ob_item),
+      TCPtr);
+  tc.emit<StoreArrayItem>(
+      ob_item, adjusted_idx, unboxed_value, container, TCDouble);
+  tc.emit<Branch>(done_path);
+
+  // --- Slow path ---
+  tc.block = slow_path;
+  tc.emit<StoreSubscr>(container, sub, value, tc.frame);
+  tc.emit<Branch>(done_path);
+
+  return true;
 }
 
 bool HIRBuilder::tryBinarySubscrArray(
@@ -4219,44 +4255,14 @@ bool HIRBuilder::tryBinarySubscrArray(
   tc.emitSnapshot();
   tc.emit<RefineType>(container, array_type_guard, container);
 
-  // Route non-int indices (e.g. slices) to the generic subscript path rather
-  // than deopting. The operands were already popped from the abstract stack
-  // above, so a deopting guard here would restore a corrupted interpreter
-  // stack; a plain type-check branch avoids that entirely.
-  BasicBlock* idx_ok = cfg.AllocateBlock();
-  tc.emit<CondBranchCheckType>(sub, TLongExact, idx_ok, slow_path);
-  tc.block = idx_ok;
-  tc.emit<RefineType>(sub, TLongExact, sub);
-  Register* unboxed_idx = temps_.AllocateStack();
-  tc.emit<PrimitiveUnbox>(unboxed_idx, sub, TCInt64);
-  Register* neg_check = temps_.AllocateStack();
-  tc.emit<IsNegativeAndErrOccurred>(neg_check, unboxed_idx, tc.frame);
+  // Route non-int indices (e.g. slices) to the generic subscript path.
+  Register* unboxed_idx = emitArrayIndexGuard(cfg, tc, sub, slow_path);
 
   // Check typecode == 'd'
-  auto descr = temps_.AllocateStack();
-  tc.emit<LoadField>(
-      descr,
-      container,
-      "ob_descr",
-      offsetof(StdlibArrayObject, ob_descr),
-      TCPtr);
-  auto typecode = temps_.AllocateStack();
-  tc.emit<LoadField>(
-      typecode, descr, "typecode", offsetof(StdlibArrayDescr, typecode), TCInt8);
-  auto expected_tc = temps_.AllocateStack();
-  tc.emit<LoadConst>(expected_tc, Type::fromCInt('d', TCInt8));
-  auto tc_match = temps_.AllocateStack();
-  tc.emit<PrimitiveCompare>(
-      tc_match, PrimitiveCompareOp::kEqual, typecode, expected_tc);
-
-  // Branch on typecode match
-  BasicBlock* tc_ok = cfg.AllocateBlock();
-  tc.emit<CondBranch>(tc_match, tc_ok, slow_path);
+  BasicBlock* tc_ok = emitArrayTypecodeCheck(cfg, tc, container, slow_path);
 
   // Shared result register written by both paths. The push happens once at
-  // done_path so the abstract stack depth stays consistent across the merge,
-  // and SSA construction inserts the merge Phi from the two reaching
-  // definitions (boxed fast-path load vs. slow-path BinaryOp result).
+  // done_path so the abstract stack depth stays consistent across the merge.
   Register* result = temps_.AllocateStack();
 
   // typecode matched — bounds check + load

@@ -169,3 +169,41 @@ def test_array_double_load_store_chain():
     src = array("d", [3.0, 5.0])
     f(dst, src, 2)
     assert list(dst) == [6.0, 10.0]
+
+
+# ---------------------------------------------------------------------------
+# Slice subscript fallback (crash regression test)
+# ---------------------------------------------------------------------------
+
+
+def test_array_double_load_slice_subscript():
+    """Loading with a slice subscript does not crash (was SIGSEGV before fix).
+
+    The JIT fast path uses CondBranchCheckType for the index guard, which
+    routes non-int indices (slices) to the generic slow path rather than
+    deopting with a corrupted interpreter stack.
+    """
+
+    def f(a):
+        return a[:]
+
+    _compile_func(f, lambda: f(array("d", [1.0, 2.0])))
+
+    arr = array("d", [10.0, 20.0, 30.0])
+    result = f(arr)
+    assert list(result) == [10.0, 20.0, 30.0]
+
+
+def test_array_double_load_mixed_int_and_slice():
+    """Integer and slice subscripts can be used interchangeably."""
+
+    def f(a, use_slice):
+        if use_slice:
+            return a[:]
+        return a[0]
+
+    _compile_func(f, lambda: f(array("d", [1.0, 2.0]), False))
+
+    arr = array("d", [10.0, 20.0])
+    assert f(arr, False) == 10.0
+    assert list(f(arr, True)) == [10.0, 20.0]
