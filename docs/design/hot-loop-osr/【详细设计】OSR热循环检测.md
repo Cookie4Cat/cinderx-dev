@@ -53,7 +53,7 @@ OSR, hot loop, JUMP_BACKWARD, JUMP_BACKWARD_JIT, _SPECIALIZE_JUMP_BACKWARD, _JIT
 
 本详细设计聚焦功能项 1 的实现层面，为开发人员提供可直接指导编码的数据结构、解释器伪代码、C/C++ 边界接口和测试建议。
 
-**上游文档**：《OSR 热循环功能设计说明书》（`hot-loop-osr-function-design.md`）的"功能项 1：热循环检测"章节，以及核心契约章节（三态返回约定、帧所有权模型）。
+**上游文档**：《OSR 热循环功能设计说明书》（`【功能设计】基于热循环的OSR能力.md`）的"功能项 1：热循环检测"章节，以及核心契约章节（三态返回约定、帧所有权模型）。
 
 **下游功能项**：功能项 2（OSR 编译）和功能项 3（OSR 进入）。功能项 1 仅触发 `Ci_OSR_TryOSR()`，不直接操作编译缓存、不生成 `OSRMetadata`、不调用 OSR entry stub。
 

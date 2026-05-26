@@ -19,7 +19,7 @@
 
 | 日期 | 版本 | 修改描述 |
 | ---- | ---- | -------- |
-| 2026-05-21 | V1.0 | 初始版本，依据 `hot-loop-osr-function-design.md` 的功能项 2 拆分 OSR 编译详细设计 |
+| 2026-05-21 | V1.0 | 初始版本，依据 `【功能设计】基于热循环的OSR能力.md` 的功能项 2 拆分 OSR 编译详细设计 |
 | 2026-05-21 | V1.1 | 根据 OSR 编译详细设计评审修订：拆分 `osr_aware`/`has_osr_entries` 缓存语义，统一 live-in steal 所有权模型，明确 `OSREntry` metadata anchor 语义，允许空 live-in entry，收敛 codegen 责任边界 |
 | 2026-05-21 | V1.2 | ce-doc-review 审查修复：(1) 顺序要求第 3 条补充 refcount_insertion 与 steal 语义交互说明，交叉引用功能项 3 详细设计文档；(2) namespace 前缀统一为 `codegen::`；(3) `getOSREntry` 参数类型从 BCIndex 改为 BCOffset；(4) `collectBackedgeTargetOffsets` 补充未特化时返回空向量说明 |
 | 2026-05-21 | V1.3 | ce-doc-review P2 修复：(1) 3.2.11 补充编译耗时经验基线建议（100/500/1024 code units）；(2) 3.4.1.5 OSRCompileState uintptr_t 身份风险标记为 MVP 已知限制 + Phase 2 dict version tag 缓解方案；(3) 3.2.1 collectBackedgeTargetOffsets 补充 over-collection 说明 + unspecialize 保证；(4) 3.2.8 regalloc 补充 stub 临时寄存器保留（X9/X12）；(5) 3.2.6 markOSREntries 补充 Snapshot 可用性保证和 HIR dump 验证建议；(6) OSRCompileState 权威定义交叉引用 |
@@ -108,7 +108,7 @@ OSR, On-Stack Replacement, JIT, HIR, LIR, Loop Header, Secondary Entry, FrameSta
 
 | 文档或源码 | 版本/位置 | 说明 |
 | ---------- | --------- | ---- |
-| `docs/design/hot-loop-osr/hot-loop-osr-function-design.md` | V7.0 | 上游功能设计，功能项 2 是本文档直接输入 |
+| `docs/design/hot-loop-osr/【功能设计】基于热循环的OSR能力.md` | V7.0 | 上游功能设计，功能项 2 是本文档直接输入 |
 | `cinderx/Jit/compiler.cpp` | `Compiler::Compile(const Preloader&)` | 当前 HIR 构建、pass、LIR/codegen 主链路 |
 | `cinderx/Jit/hir/preload.h` | `Preloader::makePreloader()` | OSR entry 偏移的传递载体 |
 | `cinderx/Jit/hir/builder.cpp` | `HIRBuilder::translate()` | 当前已有 `loop_headers` 集合，可用于匹配 loop header |
