@@ -424,7 +424,7 @@ int performOSR(
     }
   }
 
-  // -- [0.75] Pre-allocate all heap memory before modifying frame state --
+  // -- [1] Pre-allocate all heap memory before modifying frame state --
   std::vector<bool> is_live_in_set;
   std::vector<PyObject*> deferred_decrefs;
   Py_ssize_t distinct_localsplus_live_in = 0;
@@ -453,12 +453,12 @@ int performOSR(
   // is moved to the loop header and localsplus ownership is transferred before
   // entering the stub. The entry stub must not add recoverable failure paths
   // after this point unless this frame mutation is moved later or made rollbackable.
-  // -- [0.5] Set frame->instr_ptr to loop header bytecode position --
+  // -- [2] Set frame->instr_ptr to loop header bytecode position --
   _Py_CODEUNIT* code_start = _PyCode_CODE(_PyFrame_GetCode(frame));
   frame->instr_ptr =
       code_start + osr_meta->target_offset.value() / sizeof(_Py_CODEUNIT);
 
-  // -- [1] Collect non-live-in slots -> deferred_decrefs[] (steal) --
+  // -- [3] Collect non-live-in slots -> deferred_decrefs[] (steal) --
   Py_ssize_t n_deferred = 0;
   for (Py_ssize_t i = 0; i < num_nlocalsplus; i++) {
     if (is_live_in_set[i]) {
@@ -471,11 +471,11 @@ int performOSR(
     frame->localsplus[i] = PyStackRef_NULL;
   }
 
-  // -- [2] Call OSR entry stub --
+  // -- [4] Call OSR entry stub --
   OSRState state{tstate, frame, osr_meta};
   PyObject* result = entry_fn(&state);
 
-  // -- [3] Execute deferred DECREFs --
+  // -- [5] Execute deferred DECREFs --
   PyObject* saved_exc = nullptr;
   if (result == nullptr) {
     saved_exc = PyErr_GetRaisedException();
@@ -487,7 +487,7 @@ int performOSR(
     PyErr_SetRaisedException(saved_exc);
   }
 
-  // -- [4] Three-state return --
+  // -- [6] Three-state return --
   if (result != nullptr) {
     *out_result = result;
     return 1;
