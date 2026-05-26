@@ -12500,12 +12500,16 @@ fun test {
     UseType<ImmortalLongExact[2]> v2
     v5:CDouble = PrimitiveUnbox<CDouble> v3
     v6:CDouble = DoubleBinaryOp<Multiply> v5 v5
-    v7:FloatExact = PrimitiveBox<CDouble> v6 {
+    v7:CDouble[1.7976931348623157e+308] = LoadConst<CDouble[1.7976931348623157e+308]>
+    v8:CBool = PrimitiveCompare<LessThan> v6 v7
+    Guard v8 {
+    }
+    v9:FloatExact = PrimitiveBox<CDouble> v6 {
       FrameState {
         CurInstrOffset -2
       }
     }
-    Return v7
+    Return v9
   }
 }
 --- Expected 3.14 ---
@@ -12518,12 +12522,16 @@ fun test {
     UseType<ImmortalLongExact[2]> v2
     v5:CDouble = PrimitiveUnbox<CDouble> v3
     v6:CDouble = DoubleBinaryOp<Multiply> v5 v5
-    v7:FloatExact = PrimitiveBox<CDouble> v6 {
+    v7:CDouble[1.7976931348623157e+308] = LoadConst<CDouble[1.7976931348623157e+308]>
+    v8:CBool = PrimitiveCompare<LessThan> v6 v7
+    Guard v8 {
+    }
+    v9:FloatExact = PrimitiveBox<CDouble> v6 {
       FrameState {
         CurInstrOffset -2
       }
     }
-    Return v7
+    Return v9
   }
 }
 --- Expected 3.15 ---
@@ -12536,12 +12544,16 @@ fun test {
     UseType<ImmortalLongExact[2]> v2
     v5:CDouble = PrimitiveUnbox<CDouble> v3
     v6:CDouble = DoubleBinaryOp<Multiply> v5 v5
-    v7:FloatExact = PrimitiveBox<CDouble> v6 {
+    v7:CDouble[1.7976931348623157e+308] = LoadConst<CDouble[1.7976931348623157e+308]>
+    v8:CBool = PrimitiveCompare<LessThan> v6 v7
+    Guard v8 {
+    }
+    v9:FloatExact = PrimitiveBox<CDouble> v6 {
       FrameState {
         CurInstrOffset -2
       }
     }
-    Return v7
+    Return v9
   }
 }
 --- Test Name ---
@@ -12565,12 +12577,16 @@ fun test {
     v3:FloatExact = RefineType<FloatExact> v1
     v5:CDouble = PrimitiveUnbox<CDouble> v3
     v6:CDouble = DoubleBinaryOp<Multiply> v5 v5
-    v7:FloatExact = PrimitiveBox<CDouble> v6 {
+    v7:CDouble[1.7976931348623157e+308] = LoadConst<CDouble[1.7976931348623157e+308]>
+    v8:CBool = PrimitiveCompare<LessThan> v6 v7
+    Guard v8 {
+    }
+    v9:FloatExact = PrimitiveBox<CDouble> v6 {
       FrameState {
         CurInstrOffset -2
       }
     }
-    Return v7
+    Return v9
   }
 }
 --- Expected 3.14 ---
@@ -12581,12 +12597,16 @@ fun test {
     v3:FloatExact = RefineType<FloatExact> v1
     v5:CDouble = PrimitiveUnbox<CDouble> v3
     v6:CDouble = DoubleBinaryOp<Multiply> v5 v5
-    v7:FloatExact = PrimitiveBox<CDouble> v6 {
+    v7:CDouble[1.7976931348623157e+308] = LoadConst<CDouble[1.7976931348623157e+308]>
+    v8:CBool = PrimitiveCompare<LessThan> v6 v7
+    Guard v8 {
+    }
+    v9:FloatExact = PrimitiveBox<CDouble> v6 {
       FrameState {
         CurInstrOffset -2
       }
     }
-    Return v7
+    Return v9
   }
 }
 --- Expected 3.15 ---
@@ -12597,12 +12617,16 @@ fun test {
     v3:FloatExact = RefineType<FloatExact> v1
     v5:CDouble = PrimitiveUnbox<CDouble> v3
     v6:CDouble = DoubleBinaryOp<Multiply> v5 v5
-    v7:FloatExact = PrimitiveBox<CDouble> v6 {
+    v7:CDouble[1.7976931348623157e+308] = LoadConst<CDouble[1.7976931348623157e+308]>
+    v8:CBool = PrimitiveCompare<LessThan> v6 v7
+    Guard v8 {
+    }
+    v9:FloatExact = PrimitiveBox<CDouble> v6 {
       FrameState {
         CurInstrOffset -2
       }
     }
-    Return v7
+    Return v9
   }
 }
 --- Test Name ---
@@ -12631,12 +12655,16 @@ fun test {
     UseType<FloatExact> v5
     v6:CDouble = PrimitiveUnbox<CDouble> v5
     v7:CDouble = DoubleBinaryOp<Multiply> v6 v6
-    v8:FloatExact = PrimitiveBox<CDouble> v7 {
+    v8:CDouble[1.7976931348623157e+308] = LoadConst<CDouble[1.7976931348623157e+308]>
+    v9:CBool = PrimitiveCompare<LessThan> v7 v8
+    Guard v9 {
+    }
+    v10:FloatExact = PrimitiveBox<CDouble> v7 {
       FrameState {
         CurInstrOffset -2
       }
     }
-    Return v8
+    Return v10
   }
 }
 --- Expected 3.14 ---
@@ -12652,12 +12680,16 @@ fun test {
     UseType<FloatExact> v5
     v6:CDouble = PrimitiveUnbox<CDouble> v5
     v7:CDouble = DoubleBinaryOp<Multiply> v6 v6
-    v8:FloatExact = PrimitiveBox<CDouble> v7 {
+    v8:CDouble[1.7976931348623157e+308] = LoadConst<CDouble[1.7976931348623157e+308]>
+    v9:CBool = PrimitiveCompare<LessThan> v7 v8
+    Guard v9 {
+    }
+    v10:FloatExact = PrimitiveBox<CDouble> v7 {
       FrameState {
         CurInstrOffset -2
       }
     }
-    Return v8
+    Return v10
   }
 }
 --- Expected 3.15 ---
@@ -12673,12 +12705,16 @@ fun test {
     UseType<FloatExact> v5
     v6:CDouble = PrimitiveUnbox<CDouble> v5
     v7:CDouble = DoubleBinaryOp<Multiply> v6 v6
-    v8:FloatExact = PrimitiveBox<CDouble> v7 {
+    v8:CDouble[1.7976931348623157e+308] = LoadConst<CDouble[1.7976931348623157e+308]>
+    v9:CBool = PrimitiveCompare<LessThan> v7 v8
+    Guard v9 {
+    }
+    v10:FloatExact = PrimitiveBox<CDouble> v7 {
       FrameState {
         CurInstrOffset -2
       }
     }
-    Return v8
+    Return v10
   }
 }
 --- End ---

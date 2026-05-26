@@ -18,6 +18,8 @@
 #include "cinderx/Jit/threaded_compile.h"
 #include "cinderx/StaticPython/strictmoduleobject.h"
 
+#include <cfloat>
+
 #include <fmt/ostream.h>
 
 namespace jit::hir {
@@ -885,6 +887,11 @@ Register* simplifyBinaryOp(Env& env, const BinaryOp* instr) {
         if (op == BinaryOpKind::kPower && long_val == 2) {
           Register* result = env.emit<DoubleBinaryOp>(
               BinaryOpKind::kMultiply, unbox_float, unbox_float);
+          Register* max_double =
+              env.emit<LoadConst>(Type::fromCDouble(DBL_MAX));
+          Register* is_finite = env.emit<PrimitiveCompare>(
+              PrimitiveCompareOp::kLessThan, result, max_double);
+          env.emitInstr<Guard>(is_finite);
           return env.emit<PrimitiveBox>(result, TCDouble, *instr->frameState());
         }
         Register* const_double =
@@ -918,6 +925,11 @@ Register* simplifyBinaryOp(Env& env, const BinaryOp* instr) {
           env.emit<PrimitiveUnbox>(guarded_left, TCDouble);
       Register* result = env.emit<DoubleBinaryOp>(
           BinaryOpKind::kMultiply, unbox_left, unbox_left);
+      Register* max_double =
+          env.emit<LoadConst>(Type::fromCDouble(DBL_MAX));
+      Register* is_finite = env.emit<PrimitiveCompare>(
+          PrimitiveCompareOp::kLessThan, result, max_double);
+      env.emitInstr<Guard>(is_finite);
       return env.emit<PrimitiveBox>(
           result, TCDouble, *instr->frameState());
     }
@@ -1129,6 +1141,11 @@ Register* simplifyFloatBinaryOp(Env& env, const FloatBinaryOp* instr) {
             env.emit<PrimitiveUnbox>(instr->left(), TCDouble);
         Register* result = env.emit<DoubleBinaryOp>(
             BinaryOpKind::kMultiply, unbox_left, unbox_left);
+        Register* max_double =
+            env.emit<LoadConst>(Type::fromCDouble(DBL_MAX));
+        Register* is_finite = env.emit<PrimitiveCompare>(
+            PrimitiveCompareOp::kLessThan, result, max_double);
+        env.emitInstr<Guard>(is_finite);
         return env.emit<PrimitiveBox>(result, TCDouble, *instr->frameState());
       }
     }
