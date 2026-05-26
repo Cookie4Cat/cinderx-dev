@@ -207,6 +207,28 @@ TEST_F(CmdLineTest, BasicFlags) {
 
   ASSERT_EQ(
       try_flag_and_envvar_effect(
+          L"jit-list-prefix-reverse-assign",
+          "PYTHONJITLISTPREFIXREVERSEASSIGN",
+          []() {
+            getMutableConfig().hir_opts.list_prefix_reverse_assign = false;
+          },
+          []() { ASSERT_TRUE(getConfig().hir_opts.list_prefix_reverse_assign); }),
+      0);
+
+  ASSERT_EQ(
+      try_flag_and_envvar_effect(
+          L"jit-list-prefix-reverse-assign=0",
+          "PYTHONJITLISTPREFIXREVERSEASSIGN=0",
+          []() {
+            getMutableConfig().hir_opts.list_prefix_reverse_assign = true;
+          },
+          []() {
+            ASSERT_FALSE(getConfig().hir_opts.list_prefix_reverse_assign);
+          }),
+      0);
+
+  ASSERT_EQ(
+      try_flag_and_envvar_effect(
           L"jit-huge-pages=0",
           "PYTHONJITHUGEPAGES=0",
           []() {},

@@ -23,6 +23,7 @@ extern "C" {
 #include "cinderx/Jit/hir/annotation_index.h"
 #include "cinderx/Jit/hir/ssa.h"
 #include "cinderx/Jit/hir/type.h"
+#include "cinderx/Jit/jit_rt.h"
 #include "cinderx/StaticPython/checked_dict.h"
 #include "cinderx/StaticPython/checked_list.h"
 #include "cinderx/StaticPython/classloader.h"
@@ -1035,6 +1036,10 @@ void HIRBuilder::translate(
         }
         case LOAD_FAST_LOAD_FAST:
         case LOAD_FAST_BORROW_LOAD_FAST_BORROW: {
+          if (tryEmitListPrefixReverseAssign(tc, bc_it, bc_block.end())) {
+            prev_bc_instr = *bc_it;
+            break;
+          }
           emitLoadFastLoadFast(tc, bc_instr);
           break;
         }
@@ -3978,6 +3983,119 @@ void HIRBuilder::emitStoreSlice(TranslationContext& tc) {
   Register* container = stack.pop();
   Register* values = stack.pop();
   tc.emit<StoreSubscr>(container, slice, values, tc.frame);
+}
+
+bool HIRBuilder::tryEmitListPrefixReverseAssign(
+    TranslationContext& tc,
+    jit::BytecodeInstructionBlock::Iterator& bc_it,
+    const jit::BytecodeInstructionBlock::Iterator& bc_end) {
+#if PY_VERSION_HEX >= 0x030E0000 && PY_VERSION_HEX < 0x030F0000
+  if (!getConfig().hir_opts.list_prefix_reverse_assign) {
+    return false;
+  }
+
+  auto it = bc_it;
+  auto next = [&]() -> std::optional<BytecodeInstruction> {
+    if (it == bc_end) {
+      return std::nullopt;
+    }
+    BytecodeInstruction instr = *it;
+    ++it;
+    return instr;
+  };
+  auto const_obj = [&](const BytecodeInstruction& instr) -> PyObject* {
+    if (instr.opcode() != LOAD_CONST) {
+      return nullptr;
+    }
+    if (instr.oparg() < 0 ||
+        instr.oparg() >= PyTuple_GET_SIZE(code_->co_consts)) {
+      return nullptr;
+    }
+    return PyTuple_GET_ITEM(code_->co_consts, instr.oparg());
+  };
+  auto is_const = [&](const BytecodeInstruction& instr, PyObject* obj) {
+    return const_obj(instr) == obj;
+  };
+  auto is_const_long = [&](const BytecodeInstruction& instr, long value) {
+    PyObject* obj = const_obj(instr);
+    if (obj == nullptr || !PyLong_CheckExact(obj)) {
+      return false;
+    }
+    int overflow = 0;
+    long actual = PyLong_AsLongAndOverflow(obj, &overflow);
+    return overflow == 0 && actual == value;
+  };
+
+  auto first = next();
+  if (!first.has_value() ||
+      (first->opcode() != LOAD_FAST_BORROW_LOAD_FAST_BORROW &&
+       first->opcode() != LOAD_FAST_LOAD_FAST)) {
+    return false;
+  }
+  int container_idx = first->oparg() >> 4;
+  int index_idx = first->oparg() & 0xf;
+  size_t localsplus_size = tc.frame.localsplus.size();
+  if (container_idx >= localsplus_size || index_idx >= localsplus_size) {
+    return false;
+  }
+
+  auto rhs_stop = next();
+  auto rhs_step = next();
+  auto rhs_build_slice = next();
+  auto rhs_subscr = next();
+  auto lhs_container = next();
+  auto lhs_start = next();
+  auto lhs_index = next();
+  auto lhs_one = next();
+  auto lhs_add = next();
+  auto store_slice_it = it;
+  auto store_slice = next();
+  if (!rhs_stop || !rhs_step || !rhs_build_slice || !rhs_subscr ||
+      !lhs_container || !lhs_start || !lhs_index || !lhs_one || !lhs_add ||
+      !store_slice) {
+    return false;
+  }
+  if (!is_const(*rhs_stop, Py_None) || !is_const_long(*rhs_step, -1) ||
+      rhs_build_slice->opcode() != BUILD_SLICE || rhs_build_slice->oparg() != 3 ||
+      rhs_subscr->opcode() != BINARY_OP || rhs_subscr->oparg() != NB_SUBSCR ||
+      lhs_container->opcode() != LOAD_FAST_BORROW ||
+      lhs_container->oparg() != container_idx ||
+      !is_const(*lhs_start, Py_None) ||
+      lhs_index->opcode() != LOAD_FAST_BORROW ||
+      lhs_index->oparg() != index_idx ||
+      lhs_one->opcode() != LOAD_SMALL_INT || lhs_one->oparg() != 1 ||
+      lhs_add->opcode() != BINARY_OP || lhs_add->oparg() != NB_ADD ||
+      store_slice->opcode() != STORE_SLICE) {
+    return false;
+  }
+
+  Register* container = tc.frame.localsplus[container_idx];
+  Register* index = tc.frame.localsplus[index_idx];
+  if (container == nullptr || index == nullptr) {
+    return false;
+  }
+
+  auto output = temps_.AllocateStack();
+  tc.emit<CallStatic>(
+      2,
+      output,
+      reinterpret_cast<void*>(JITRT_ListPrefixReverseAssign),
+      TCInt32,
+      container,
+      index);
+  // The helper owns the entire folded operation.  On failure it has already
+  // performed any Python-visible work that the original bytecode prefix would
+  // have performed, then returns -1 with a Python exception set.  CheckNeg uses
+  // the frame state only for the exception edge; it must not resume the
+  // interpreter at this bytecode and replay the folded slice operations.
+  // RuntimeTests cover the may-raise fallback paths and assert that already
+  // executed Python side effects are not repeated.
+  tc.emit<CheckNeg>(output, output, tc.frame);
+  bc_it = store_slice_it;
+  return true;
+#else
+  return false;
+#endif
 }
 
 void HIRBuilder::emitStoreSubscr(

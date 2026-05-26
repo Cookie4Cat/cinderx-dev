@@ -548,6 +548,11 @@ FlagProcessor initFlagProcessor() {
       "jit-enable-hir-inliner",
       "PYTHONJITENABLEHIRINLINER");
   HIR_OPTIMIZATION_OPTION(
+      "list prefix reverse assign",
+      list_prefix_reverse_assign,
+      "jit-list-prefix-reverse-assign",
+      "PYTHONJITLISTPREFIXREVERSEASSIGN");
+  HIR_OPTIMIZATION_OPTION(
       "phi elimination", phi_elim, "jit-phi-elim", "PYTHONJITPHIELIM");
   HIR_OPTIMIZATION_OPTION(
       "PrimitiveBox rematerialization",

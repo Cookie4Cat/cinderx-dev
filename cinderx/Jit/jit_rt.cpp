@@ -857,6 +857,73 @@ PyObject* JITRT_LoadGlobalsDict(PyThreadState* tstate) {
   return rtfs.globals();
 }
 
+static int listPrefixReverseAssignFallback(PyObject* list, PyObject* index) {
+  Ref<> minus_one = Ref<>::steal(PyLong_FromLong(-1));
+  if (minus_one == nullptr) {
+    return -1;
+  }
+  Ref<> rhs_slice = Ref<>::steal(PySlice_New(index, Py_None, minus_one.get()));
+  if (rhs_slice == nullptr) {
+    return -1;
+  }
+  Ref<> rhs_value = Ref<>::steal(PyObject_GetItem(list, rhs_slice.get()));
+  if (rhs_value == nullptr) {
+    return -1;
+  }
+  Ref<> one = Ref<>::steal(PyLong_FromLong(1));
+  if (one == nullptr) {
+    return -1;
+  }
+  Ref<> lhs_stop = Ref<>::steal(PyNumber_Add(index, one.get()));
+  if (lhs_stop == nullptr) {
+    return -1;
+  }
+  Ref<> lhs_slice = Ref<>::steal(PySlice_New(Py_None, lhs_stop.get(), Py_None));
+  if (lhs_slice == nullptr) {
+    return -1;
+  }
+  return PyObject_SetItem(list, lhs_slice.get(), rhs_value.get());
+}
+
+int JITRT_ListPrefixReverseAssign(PyObject* list, PyObject* index) {
+  if (!PyList_CheckExact(list) || !PyLong_CheckExact(index)) {
+    return listPrefixReverseAssignFallback(list, index);
+  }
+
+  Py_ssize_t idx = PyNumber_AsSsize_t(index, nullptr);
+  if (idx == -1 && PyErr_Occurred()) {
+    return -1;
+  }
+
+#ifdef Py_GIL_DISABLED
+  return listPrefixReverseAssignFallback(list, index);
+#else
+  if (idx < 0) {
+    return listPrefixReverseAssignFallback(list, index);
+  }
+
+  Py_ssize_t size = PyList_GET_SIZE(list);
+  if (size <= 1) {
+    return 0;
+  }
+  if (idx >= size) {
+    idx = size - 1;
+  }
+
+  PyObject** items = reinterpret_cast<PyListObject*>(list)->ob_item;
+  Py_ssize_t lo = 0;
+  Py_ssize_t hi = idx;
+  while (lo < hi) {
+    PyObject* tmp = items[lo];
+    items[lo] = items[hi];
+    items[hi] = tmp;
+    ++lo;
+    --hi;
+  }
+  return 0;
+#endif
+}
+
 PyObject* JITRT_LoadFunctionIndirect(PyObject** func, PyObject* descr) {
   PyObject* res = *func;
   if (!res) {
