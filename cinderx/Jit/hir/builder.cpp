@@ -4165,6 +4165,18 @@ bool HIRBuilder::tryBinarySubscrArray(
     return false;
   }
 
+  // Only handle subscript operations (BINARY_SUBSCR or BINARY_OP with NB_SUBSCR)
+  auto opcode = bc_instr.opcode();
+  if (opcode != BINARY_SUBSCR) {
+#if PY_VERSION_HEX >= 0x030E0000
+    if (opcode != BINARY_OP || bc_instr.oparg() != NB_SUBSCR) {
+      return false;
+    }
+#else
+    return false;
+#endif
+  }
+
   auto* array_type = getStdlibArrayType();
   if (array_type == nullptr) {
     return false;

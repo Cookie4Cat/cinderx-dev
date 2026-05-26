@@ -7193,23 +7193,23 @@ fun jittestmodule:test {
 --- Expected 3.14 ---
 fun jittestmodule:test {
   bb 0 {
-    v10:Object = LoadArg<0; "x">
-    v11:Object = LoadArg<1; "y">
-    v12:Object = LoadArg<2; "z">
-    v13:Func = LoadCurrentFunc
+    v21:Object = LoadArg<0; "x">
+    v22:Object = LoadArg<1; "y">
+    v23:Object = LoadArg<2; "z">
+    v24:Func = LoadCurrentFunc
     LoadFrame
-    v14:Nullptr = LoadConst<Nullptr>
+    v25:Nullptr = LoadConst<Nullptr>
     Snapshot
-    v15:CInt64 = LoadEvalBreaker
-    CondBranch<2, 1> v15
+    v26:CInt64 = LoadEvalBreaker
+    CondBranch<2, 1> v26
   }
 
   bb 2 (preds 0) {
     Snapshot
-    v16:CInt32 = RunPeriodicTasks {
+    v27:CInt32 = RunPeriodicTasks {
       FrameState {
         CurInstrOffset 0
-        Locals<4> v10 v11 v12 v14
+        Locals<4> v21 v22 v23 v25
       }
     }
     Branch<1>
@@ -7217,26 +7217,28 @@ fun jittestmodule:test {
 
   bb 1 (preds 0, 2) {
     Snapshot
-    v21:MortalTupleExact = MakeTuple<3> v10 v11 v12 {
+    v32:MortalTupleExact = MakeTuple<3> v21 v22 v23 {
       FrameState {
         CurInstrOffset 6
-        Locals<4> v10 v11 v12 v14
-        Stack<3> v10 v11 v12
+        Locals<4> v21 v22 v23 v25
+        Stack<3> v21 v22 v23
       }
     }
     Snapshot
-    v23:ImmortalLongExact[1] = LoadConst<ImmortalLongExact[1]>
+    v34:ImmortalLongExact[1] = LoadConst<ImmortalLongExact[1]>
     Snapshot
-    UseType<TupleExact> v21
-    UseType<LongExact> v23
-    v29:CInt64[1] = LoadConst<CInt64[1]>
-    v30:CInt64[0] = LoadConst<CInt64[0]>
-    UseType<MortalTupleExact> v21
-    UseType<CInt64[1]> v29
-    UseType<TupleExact> v21
-    UseType<CInt64[1]> v29
     Snapshot
-    Return v11
+    UseType<MortalTupleExact> v32
+    UseType<TupleExact> v32
+    UseType<LongExact> v34
+    v65:CInt64[1] = LoadConst<CInt64[1]>
+    v66:CInt64[0] = LoadConst<CInt64[0]>
+    UseType<MortalTupleExact> v32
+    UseType<CInt64[1]> v65
+    UseType<TupleExact> v32
+    UseType<CInt64[1]> v65
+    Snapshot
+    Return v22
   }
 }
 --- Expected 3.15 ---
@@ -7348,23 +7350,23 @@ fun jittestmodule:test {
 --- Expected 3.14 ---
 fun jittestmodule:test {
   bb 0 {
-    v10:Object = LoadArg<0; "x">
-    v11:Object = LoadArg<1; "y">
-    v12:Object = LoadArg<2; "z">
-    v13:Func = LoadCurrentFunc
+    v21:Object = LoadArg<0; "x">
+    v22:Object = LoadArg<1; "y">
+    v23:Object = LoadArg<2; "z">
+    v24:Func = LoadCurrentFunc
     LoadFrame
-    v14:Nullptr = LoadConst<Nullptr>
+    v25:Nullptr = LoadConst<Nullptr>
     Snapshot
-    v15:CInt64 = LoadEvalBreaker
-    CondBranch<2, 1> v15
+    v26:CInt64 = LoadEvalBreaker
+    CondBranch<2, 1> v26
   }
 
   bb 2 (preds 0) {
     Snapshot
-    v16:CInt32 = RunPeriodicTasks {
+    v27:CInt32 = RunPeriodicTasks {
       FrameState {
         CurInstrOffset 0
-        Locals<4> v10 v11 v12 v14
+        Locals<4> v21 v22 v23 v25
       }
     }
     Branch<1>
@@ -7372,29 +7374,31 @@ fun jittestmodule:test {
 
   bb 1 (preds 0, 2) {
     Snapshot
-    v21:MortalTupleExact = MakeTuple<3> v10 v11 v12 {
+    v32:MortalTupleExact = MakeTuple<3> v21 v22 v23 {
       FrameState {
         CurInstrOffset 6
-        Locals<4> v10 v11 v12 v14
-        Stack<3> v10 v11 v12
+        Locals<4> v21 v22 v23 v25
+        Stack<3> v21 v22 v23
       }
     }
     Snapshot
-    v23:ImmortalLongExact[3] = LoadConst<ImmortalLongExact[3]>
+    v34:ImmortalLongExact[3] = LoadConst<ImmortalLongExact[3]>
     Snapshot
-    UseType<TupleExact> v21
-    UseType<LongExact> v23
-    v29:CInt64[3] = LoadConst<CInt64[3]>
-    v30:CInt64[0] = LoadConst<CInt64[0]>
-    v27:CInt64 = CheckSequenceBounds v21 v29 {
+    Snapshot
+    UseType<MortalTupleExact> v32
+    UseType<TupleExact> v32
+    UseType<LongExact> v34
+    v65:CInt64[3] = LoadConst<CInt64[3]>
+    v66:CInt64[0] = LoadConst<CInt64[0]>
+    v63:CInt64 = CheckSequenceBounds v32 v65 {
       FrameState {
         CurInstrOffset 14
-        Locals<4> v10 v11 v12 v21
+        Locals<4> v21 v22 v23 v32
       }
     }
-    v28:Object = LoadArrayItem<Offset[32]> v21 v27 v21
+    v64:Object = LoadArrayItem<Offset[32]> v32 v63 v32
     Snapshot
-    Return v28
+    Return v64
   }
 }
 --- Expected 3.15 ---
