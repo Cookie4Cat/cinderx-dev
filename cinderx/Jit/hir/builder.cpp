@@ -4087,20 +4087,27 @@ void HIRBuilder::emitStoreSubscr(
       tc.emitSnapshot();
       tc.emit<RefineType>(container, array_type_guard, container);
 
-      // Guard: sub is LongExact
-      auto sub_guard = temps_.AllocateStack();
-      tc.emit<GuardType>(sub_guard, TLongExact, sub, tc.frame);
-      tc.emit<RefineType>(sub_guard, TLongExact, sub_guard);
+      // Route non-int indices (e.g. slices) to the generic store path rather
+      // than deopting. The operands were already popped from the abstract
+      // stack above, so a deopting guard here would restore a corrupted
+      // interpreter stack; a plain type-check branch avoids that entirely.
+      BasicBlock* idx_ok = cfg.AllocateBlock();
+      tc.emit<CondBranchCheckType>(sub, TLongExact, idx_ok, slow_path);
+      tc.block = idx_ok;
+      tc.emit<RefineType>(sub, TLongExact, sub);
       Register* unboxed_idx = temps_.AllocateStack();
-      tc.emit<PrimitiveUnbox>(unboxed_idx, sub_guard, TCInt64);
+      tc.emit<PrimitiveUnbox>(unboxed_idx, sub, TCInt64);
       Register* neg_check = temps_.AllocateStack();
       tc.emit<IsNegativeAndErrOccurred>(neg_check, unboxed_idx, tc.frame);
 
-      // Guard: value is FloatExact
-      auto value_guard = temps_.AllocateStack();
-      tc.emit<GuardType>(value_guard, TFloatExact, value, tc.frame);
+      // Route non-float values to the generic store path (also handles
+      // int-to-double coercion that stock array assignment performs).
+      BasicBlock* val_ok = cfg.AllocateBlock();
+      tc.emit<CondBranchCheckType>(value, TFloatExact, val_ok, slow_path);
+      tc.block = val_ok;
+      tc.emit<RefineType>(value, TFloatExact, value);
       Register* unboxed_value = temps_.AllocateStack();
-      tc.emit<PrimitiveUnbox>(unboxed_value, value_guard, TCDouble);
+      tc.emit<PrimitiveUnbox>(unboxed_value, value, TCDouble);
 
       // Check typecode == 'd'
       auto descr = temps_.AllocateStack();
@@ -4202,12 +4209,16 @@ bool HIRBuilder::tryBinarySubscrArray(
   tc.emitSnapshot();
   tc.emit<RefineType>(container, array_type_guard, container);
 
-  // Guard: sub is LongExact
-  auto sub_guard = temps_.AllocateStack();
-  tc.emit<GuardType>(sub_guard, TLongExact, sub, tc.frame);
-  tc.emit<RefineType>(sub_guard, TLongExact, sub_guard);
+  // Route non-int indices (e.g. slices) to the generic subscript path rather
+  // than deopting. The operands were already popped from the abstract stack
+  // above, so a deopting guard here would restore a corrupted interpreter
+  // stack; a plain type-check branch avoids that entirely.
+  BasicBlock* idx_ok = cfg.AllocateBlock();
+  tc.emit<CondBranchCheckType>(sub, TLongExact, idx_ok, slow_path);
+  tc.block = idx_ok;
+  tc.emit<RefineType>(sub, TLongExact, sub);
   Register* unboxed_idx = temps_.AllocateStack();
-  tc.emit<PrimitiveUnbox>(unboxed_idx, sub_guard, TCInt64);
+  tc.emit<PrimitiveUnbox>(unboxed_idx, sub, TCInt64);
   Register* neg_check = temps_.AllocateStack();
   tc.emit<IsNegativeAndErrOccurred>(neg_check, unboxed_idx, tc.frame);
 
@@ -4232,6 +4243,12 @@ bool HIRBuilder::tryBinarySubscrArray(
   BasicBlock* tc_ok = cfg.AllocateBlock();
   tc.emit<CondBranch>(tc_match, tc_ok, slow_path);
 
+  // Shared result register written by both paths. The push happens once at
+  // done_path so the abstract stack depth stays consistent across the merge,
+  // and SSA construction inserts the merge Phi from the two reaching
+  // definitions (boxed fast-path load vs. slow-path BinaryOp result).
+  Register* result = temps_.AllocateStack();
+
   // typecode matched — bounds check + load
   tc.block = tc_ok;
   auto adjusted_idx = temps_.AllocateStack();
@@ -4245,21 +4262,17 @@ bool HIRBuilder::tryBinarySubscrArray(
       TCPtr);
   auto raw_double = temps_.AllocateStack();
   tc.emit<LoadArrayItem>(raw_double, ob_item, adjusted_idx, container, 0, TCDouble);
-  auto boxed_float = temps_.AllocateStack();
-  tc.emit<PrimitiveBox>(boxed_float, raw_double, TCDouble, tc.frame);
-  stack.push(boxed_float);
+  tc.emit<PrimitiveBox>(result, raw_double, TCDouble, tc.frame);
   tc.emit<Branch>(done_path);
 
   // --- Slow path ---
   tc.block = slow_path;
-  stack.pop(); // Undo fast_path's push
-  Register* result = temps_.AllocateStack();
   tc.emit<BinaryOp>(result, BinaryOpKind::kSubscript, container, sub, tc.frame);
-  stack.push(result);
   tc.emit<Branch>(done_path);
 
   // --- Done path ---
   tc.block = done_path;
+  stack.push(result);
 
   return true;
 }
