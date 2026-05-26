@@ -163,6 +163,21 @@ void fillLiveValueLocations(
 
 } // namespace
 
+void TranslateOSREntry(Environ* env, const Instruction* instr) {
+  std::size_t osr_idx = instr->getInput(0)->getConstant();
+  OSRMetadata& metadata = env->code_rt->getOSRMetadata(osr_idx);
+  JIT_CHECK(
+      metadata.live_ins.size() + 4 == instr->getNumInputs(),
+      "OSR metadata/live input mismatch");
+  metadata.tstate_location = instr->getInput(1)->getPhyRegOrStackSlot();
+  metadata.func_location = instr->getInput(2)->getPhyRegOrStackSlot();
+  metadata.frame_location = instr->getInput(3)->getPhyRegOrStackSlot();
+  for (std::size_t i = 4; i < instr->getNumInputs(); ++i) {
+    metadata.live_ins[i - 4].destination =
+        instr->getInput(i)->getPhyRegOrStackSlot();
+  }
+}
+
 // Translate GUARD instruction
 void TranslateGuard(Environ* env, const Instruction* instr) {
 #if defined(CINDER_X86_64)
@@ -2483,6 +2498,9 @@ void AutoTranslator::translateInstr(Environ* env, const Instruction* instr)
     case Instruction::kDeoptPatchpoint:
       TranslateDeoptPatchpoint(env, instr);
       return;
+    case Instruction::kOSREntry:
+      TranslateOSREntry(env, instr);
+      return;
     case Instruction::kLoadThreadState:
       translateLoadThreadState(env, instr);
       return;
@@ -2933,6 +2951,9 @@ void AutoTranslator::translateInstr(Environ* env, const Instruction* instr)
       return;
     case Instruction::kDeoptPatchpoint:
       TranslateDeoptPatchpoint(env, instr);
+      return;
+    case Instruction::kOSREntry:
+      TranslateOSREntry(env, instr);
       return;
     case Instruction::kLoadThreadState:
       translateLoadThreadState(env, instr);

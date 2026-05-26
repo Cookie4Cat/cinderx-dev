@@ -46,6 +46,7 @@
 
 
 #include "cinderx/module_c_state.h"
+#include "cinderx/Jit/osr_capi.h"
 
 #define USE_COMPUTED_GOTOS 0
 #include "ceval_macros.h"
@@ -152,6 +153,107 @@ dummy_func(
             // offset of interp->common_consts within PyInterpreterState.
             assert(oparg < NUM_COMMON_CONSTANTS);
             value = PyStackRef_FromPyObjectNew(Ci_common_consts[oparg]);
+        }
+
+        override tier1 op(_SPECIALIZE_JUMP_BACKWARD, (--)) {
+            if (this_instr->op.code == JUMP_BACKWARD) {
+                this_instr->op.code = JUMP_BACKWARD_JIT;
+                next_instr = this_instr;
+                DISPATCH_SAME_OPARG();
+            }
+        }
+
+        override tier1 op(_JIT, (--)) {
+            if (Ci_OSR_IsEnabled()) {
+                PyCodeObject* code = _PyFrame_GetCode(frame);
+                SAVE_SP();
+
+                if (CI_OSR_IS_ELIGIBLE(tstate, frame, code)) {
+                    uint32_t source_idx =
+                        (uint32_t)(this_instr - _PyCode_CODE(code));
+                    uint32_t target_idx =
+                        CI_OSR_COMPUTE_JUMP_TARGET_INDEX(
+                            code, source_idx, oparg);
+
+                    Ci_BackedgeCounters* counters =
+                        CI_OSR_GET_OR_CREATE_BACKEDGE_COUNTERS(code);
+                    if (counters != NULL) {
+                        Ci_BackedgeEntry* entry =
+                            CI_OSR_BACKEDGE_COUNTERS_FIND_OR_CREATE(
+                                counters, source_idx, target_idx);
+                        if (entry != NULL &&
+                            CI_OSR_BACKEDGE_GET_STATE(entry) ==
+                                CI_OSR_BACKEDGE_COUNTING) {
+                            uint32_t count = CI_OSR_BACKEDGE_INCREMENT(entry);
+                            if (count >= CI_OSR_GET_BACKEDGE_THRESHOLD()) {
+                                CI_OSR_BACKEDGE_SET_COUNT(entry, 0);
+                                CI_OSR_BACKEDGE_SET_STATE(
+                                    entry, CI_OSR_BACKEDGE_COUNTING);
+
+                                PyObject* osr_result = NULL;
+                                int osr_rc = CI_OSR_TRY_OSR(
+                                    tstate,
+                                    frame,
+                                    this_instr,
+                                    oparg,
+                                    &osr_result);
+
+                                if (osr_rc == 1) {
+                                    _Py_LeaveRecursiveCallPy(tstate);
+                                    frame = tstate->current_frame;
+                                    LOAD_SP();
+                                    LOAD_IP(frame->return_offset);
+                                    stack_pointer[0] =
+                                        PyStackRef_FromPyObjectSteal(osr_result);
+                                    stack_pointer++;
+                                    DISPATCH();
+                                }
+
+                                if (osr_rc == -1) {
+                                    _Py_LeaveRecursiveCallPy(tstate);
+                                    frame = tstate->current_frame;
+                                    if (frame->owner ==
+                                        FRAME_OWNED_BY_INTERPRETER) {
+                                        tstate->current_frame = frame->previous;
+                                        return NULL;
+                                    }
+                                    frame->return_offset = 0;
+                                    LOAD_SP();
+                                    next_instr = frame->instr_ptr;
+                                    goto error;
+                                }
+                            }
+                        }
+                    }
+                }
+
+                LOAD_SP();
+            }
+#ifdef _Py_TIER2
+            _Py_BackoffCounter counter = this_instr[1].counter;
+            if (backoff_counter_triggers(counter) &&
+                this_instr->op.code == JUMP_BACKWARD_JIT) {
+                _Py_CODEUNIT *start = this_instr;
+                while (oparg > 255) {
+                    oparg >>= 8;
+                    start--;
+                }
+                _PyExecutorObject *executor;
+                int optimized = _PyOptimizer_Optimize(frame, start, &executor, 0);
+                if (optimized <= 0) {
+                    this_instr[1].counter = restart_backoff_counter(counter);
+                    ERROR_IF(optimized < 0);
+                }
+                else {
+                    this_instr[1].counter = initial_jump_backoff_counter();
+                    assert(tstate->current_executor == NULL);
+                    GOTO_TIER_TWO(executor);
+                }
+            }
+            else {
+                ADVANCE_ADAPTIVE_COUNTER(this_instr[1].counter);
+            }
+#endif
         }
 
         override inst(LOAD_ATTR_GETATTRIBUTE_OVERRIDDEN, (unused/1, type_version/2, func_version/2, getattribute/4, owner -- unused)) {

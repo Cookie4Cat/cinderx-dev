@@ -6,6 +6,7 @@
 #include "cinderx/Jit/hir/cfg.h"
 #include "cinderx/Jit/hir/hir.h"
 #include "cinderx/Jit/jit_time_log.h"
+#include "cinderx/Jit/osr.h"
 #include "cinderx/Jit/type_deopt_patchers.h"
 #include "cinderx/StaticPython/typed-args-info.h"
 
@@ -86,6 +87,13 @@ class Function {
 
   bool canDeopt() const;
 
+  void markOSREntries(
+      const std::vector<BCOffset>& offsets,
+      BorrowedRef<PyCodeObject> code);
+  bool hasOSREntries() const;
+  void extractOSRLiveIns();
+  const OSRMetadata* osrMetadataFor(const OSREntry& entry) const;
+
   template <typename T, typename... Args>
   T* allocateCodePatcher(Args&&... args) {
     code_patchers.emplace_back(
@@ -104,6 +112,14 @@ class Function {
   ThreadedRef<> reifier;
 
  private:
+  bool isEligibleOSREntry(
+      const FrameState& fs,
+      BorrowedRef<PyCodeObject> code) const;
+  void refreshOSREntries();
+
+  UnorderedMap<BCOffset, OSREntry*> osr_entries_;
+  UnorderedMap<const OSREntry*, OSRMetadata> osr_metadata_;
+
   DISALLOW_COPY_AND_ASSIGN(Function);
 };
 

@@ -2,6 +2,8 @@
 
 #include "cinderx/Jit/hir/function.h"
 
+#include <algorithm>
+
 namespace jit::hir {
 
 // Be intentional about HIR structure sizes.  There's no hard limit on what
@@ -10,7 +12,7 @@ namespace jit::hir {
 // Ignore it for libc++ and Windows for now though, too tricky to track multiple
 // implementations.
 #if !defined(_LIBCPP_VERSION) && !defined(WIN32)
-static_assert(sizeof(Function) == 48 * kPointerSize);
+static_assert(sizeof(Function) == 60 * kPointerSize);
 static_assert(sizeof(CFG) == 5 * kPointerSize);
 static_assert(sizeof(BasicBlock) == 20 * kPointerSize);
 static_assert(sizeof(Instr) == 6 * kPointerSize);
@@ -80,6 +82,160 @@ bool Function::canDeopt() const {
     }
   }
   return false;
+}
+
+namespace {
+
+const unsigned char* parseExceptionTableVarint(
+    const unsigned char* cursor,
+    int* result) {
+  int value = cursor[0] & 63;
+  while ((cursor[0] & 64) != 0) {
+    cursor++;
+    value = (value << 6) | (cursor[0] & 63);
+  }
+  *result = value;
+  return cursor + 1;
+}
+
+bool isInExceptionProtectedRange(
+    BorrowedRef<PyCodeObject> code,
+    BCOffset target_offset) {
+  auto* cursor = reinterpret_cast<const unsigned char*>(
+      PyBytes_AS_STRING(code->co_exceptiontable));
+  const auto* end = cursor + PyBytes_GET_SIZE(code->co_exceptiontable);
+  const int target_index = target_offset.asIndex().value();
+
+  while (cursor < end) {
+    int start = 0;
+    int size = 0;
+    int unused = 0;
+    cursor = parseExceptionTableVarint(cursor, &start);
+    cursor = parseExceptionTableVarint(cursor, &size);
+    cursor = parseExceptionTableVarint(cursor, &unused);
+    cursor = parseExceptionTableVarint(cursor, &unused);
+    if (target_index >= start && target_index < start + size) {
+      return true;
+    }
+  }
+  return false;
+}
+
+int findLocalsplusIndex(const FrameState& fs, Register* reg) {
+  auto it = std::find(fs.localsplus.begin(), fs.localsplus.end(), reg);
+  return it == fs.localsplus.end() ? -1 : it - fs.localsplus.begin();
+}
+
+} // namespace
+
+void Function::markOSREntries(
+    const std::vector<BCOffset>& offsets,
+    BorrowedRef<PyCodeObject> osr_code) {
+  UnorderedSet<BCOffset> wanted(offsets.begin(), offsets.end());
+  for (auto& block : cfg.blocks) {
+    Snapshot* snapshot = block.entrySnapshot();
+    if (snapshot == nullptr) {
+      continue;
+    }
+    FrameState* fs = snapshot->frameState();
+    if (fs == nullptr || !wanted.contains(fs->instrOffset()) ||
+        !isEligibleOSREntry(*fs, osr_code)) {
+      continue;
+    }
+
+    OSREntry* entry = OSREntry::create(fs->instrOffset());
+    block.insert(entry, std::next(block.iterator_to(*snapshot)));
+    osr_entries_.emplace(fs->instrOffset(), entry);
+  }
+}
+
+bool Function::hasOSREntries() const {
+  return !osr_entries_.empty();
+}
+
+bool Function::isEligibleOSREntry(
+    const FrameState& fs,
+    BorrowedRef<PyCodeObject> osr_code) const {
+  return fs.parent == nullptr && fs.stack.isEmpty() &&
+      fs.block_stack.isEmpty() && !osr_entries_.contains(fs.instrOffset()) &&
+      !isInExceptionProtectedRange(osr_code, fs.instrOffset());
+}
+
+void Function::refreshOSREntries() {
+  osr_entries_.clear();
+  osr_metadata_.clear();
+  for (auto& block : cfg.blocks) {
+    for (auto& instr : block) {
+      if (!instr.IsOSREntry()) {
+        continue;
+      }
+      auto& entry = static_cast<OSREntry&>(instr);
+      osr_entries_[entry.targetOffset()] = &entry;
+    }
+  }
+}
+
+void Function::extractOSRLiveIns() {
+  refreshOSREntries();
+
+  std::vector<BCOffset> rejected;
+  for (auto& [offset, entry] : osr_entries_) {
+    FrameState* fs = entry->frameState();
+    if (fs == nullptr) {
+      rejected.push_back(offset);
+      continue;
+    }
+
+    std::vector<OSRLiveIn> live_ins;
+    bool reject = false;
+    for (const RegState& state : entry->live_regs()) {
+      OSRLiveIn live_in;
+      live_in.localsplus_index = findLocalsplusIndex(*fs, state.reg);
+      live_in.stack_index = -1;
+      live_in.value_kind = state.value_kind;
+      live_in.ref_kind = state.ref_kind;
+      live_in.reconstructible =
+          state.value_kind == ValueKind::kObject &&
+          state.ref_kind == RefKind::kOwned &&
+          live_in.localsplus_index >= 0;
+      if (!live_in.reconstructible) {
+        reject = true;
+        break;
+      }
+      live_in.is_phi = state.reg->instr()->IsPhi();
+      live_in.hir_reg = state.reg;
+      live_ins.emplace_back(live_in);
+    }
+    if (reject) {
+      rejected.push_back(offset);
+      continue;
+    }
+
+    OSRMetadata metadata;
+    metadata.target_offset = offset;
+    metadata.live_ins.resize(live_ins.size());
+    metadata.owned_ref_count = live_ins.size();
+    for (std::size_t i = 0; i < live_ins.size(); ++i) {
+      metadata.live_ins[i] = live_ins[i];
+    }
+    osr_metadata_.emplace(entry, std::move(metadata));
+  }
+
+  for (BCOffset offset : rejected) {
+    auto it = osr_entries_.find(offset);
+    if (it == osr_entries_.end()) {
+      continue;
+    }
+    OSREntry* entry = it->second;
+    entry->unlink();
+    delete entry;
+    osr_entries_.erase(it);
+  }
+}
+
+const OSRMetadata* Function::osrMetadataFor(const OSREntry& entry) const {
+  auto it = osr_metadata_.find(&entry);
+  return it == osr_metadata_.end() ? nullptr : &it->second;
 }
 
 BorrowedRef<PyCodeObject> Function::codeFor(const Instr& instr) const {

@@ -834,6 +834,158 @@ void NativeGenerator::generateFunctionExit() {
 #endif
 }
 
+#if defined(CINDER_AARCH64)
+
+namespace {
+
+uint64_t osrStackRefObjectMask() {
+#if PY_VERSION_HEX >= 0x030E0000 && defined(Py_TAG_REFCNT)
+  return ~static_cast<uint64_t>(Py_TAG_REFCNT);
+#else
+  return ~uint64_t{0};
+#endif
+}
+
+uint64_t osrStackRefNullBits() {
+#if PY_VERSION_HEX >= 0x030E0000 && !defined(Py_STACKREF_DEBUG)
+  return PyStackRef_NULL.bits;
+#else
+  return 0;
+#endif
+}
+
+constexpr int osrStackSlotSize() {
+#if PY_VERSION_HEX >= 0x030E0000
+  return sizeof(_PyStackRef);
+#else
+  return sizeof(PyObject*);
+#endif
+}
+
+int32_t osrLocalsplusOffset(int localsplus_index) {
+  return static_cast<int32_t>(
+      offsetof(_PyInterpreterFrame, localsplus) +
+      localsplus_index * osrStackSlotSize());
+}
+
+} // namespace
+
+void NativeGenerator::emitOSRFrameSetup(const jit::OSRMetadata& metadata) {
+  generateFunctionEntry();
+  arch::sub_immediate(
+      as_,
+      a64::sp,
+      a64::sp,
+      static_cast<uint64_t>(metadata.resume_frame_total_size));
+
+  auto gp_regs = metadata.resume_saved_regs & ALL_GP_REGISTERS;
+  auto vecd_regs = metadata.resume_saved_regs & ALL_VECD_REGISTERS;
+
+  arch::sub_immediate(
+      as_,
+      a64::x9,
+      arch::fp,
+      static_cast<uint64_t>(metadata.resume_header_and_spill_size));
+
+  int reg_offset = 0;
+  if (!gp_regs.Empty()) {
+    if (gp_regs.count() % 2 == 1) {
+      as_->str(
+          a64::x(gp_regs.GetFirst().loc),
+          a64::ptr(a64::x9, -(reg_offset + 16)));
+      gp_regs.RemoveFirst();
+      reg_offset += 16;
+    }
+    while (!gp_regs.Empty()) {
+      auto first = a64::x(gp_regs.GetFirst().loc);
+      gp_regs.RemoveFirst();
+      auto second = a64::x(gp_regs.GetFirst().loc);
+      gp_regs.RemoveFirst();
+      as_->stp(first, second, a64::ptr(a64::x9, -(reg_offset + 16)));
+      reg_offset += 16;
+    }
+  }
+  if (!vecd_regs.Empty()) {
+    if (vecd_regs.count() % 2 == 1) {
+      as_->str(
+          a64::d(vecd_regs.GetFirst().loc - VECD_REG_BASE),
+          a64::ptr(a64::x9, -(reg_offset + 16)));
+      vecd_regs.RemoveFirst();
+      reg_offset += 16;
+    }
+    while (!vecd_regs.Empty()) {
+      auto first = a64::d(vecd_regs.GetFirst().loc - VECD_REG_BASE);
+      vecd_regs.RemoveFirst();
+      auto second = a64::d(vecd_regs.GetFirst().loc - VECD_REG_BASE);
+      vecd_regs.RemoveFirst();
+      as_->stp(first, second, a64::ptr(a64::x9, -(reg_offset + 16)));
+      reg_offset += 16;
+    }
+  }
+}
+
+void NativeGenerator::moveOSRValueToLocation(
+    PhyLocation destination,
+    asmjit::a64::Gp value,
+    asmjit::a64::Gp address_scratch) {
+  if (destination.loc == PhyLocation::REG_INVALID) {
+    JIT_ABORT("OSR destination location is invalid");
+  }
+  if (destination.is_gp_register()) {
+    as_->mov(a64::x(destination.loc), value);
+    return;
+  }
+  JIT_CHECK(destination.is_memory(), "OSR destination must be GP or stack");
+  as_->str(
+      value,
+      arch::ptr_resolve(as_, arch::fp, destination.loc, address_scratch));
+}
+
+void NativeGenerator::generateOSREntryStub(
+    jit::OSRMetadata& metadata,
+    lir::BasicBlock* target_block) {
+  const auto kStateReg = a64::x0;
+  const auto kFrameReg = a64::x9;
+  const auto kValueReg = a64::x12;
+
+  emitOSRFrameSetup(metadata);
+
+  as_->ldr(kValueReg, a64::ptr(kStateReg, offsetof(jit::OSRState, tstate)));
+  moveOSRValueToLocation(metadata.tstate_location, kValueReg, kFrameReg);
+
+  as_->ldr(kFrameReg, a64::ptr(kStateReg, offsetof(jit::OSRState, frame)));
+  moveOSRValueToLocation(metadata.frame_location, kFrameReg, kValueReg);
+
+  as_->ldr(
+      kValueReg, a64::ptr(kFrameReg, offsetof(_PyInterpreterFrame, f_funcobj)));
+#if PY_VERSION_HEX >= 0x030E0000
+  as_->and_(kValueReg, kValueReg, osrStackRefObjectMask());
+#endif
+  moveOSRValueToLocation(metadata.func_location, kValueReg, kFrameReg);
+
+  for (const jit::OSRLiveIn& live_in : metadata.live_ins) {
+    JIT_CHECK(
+        live_in.localsplus_index >= 0,
+        "OSR live-in must have a localsplus source");
+    int32_t slot_offset = osrLocalsplusOffset(live_in.localsplus_index);
+
+    as_->ldr(kFrameReg, a64::ptr(kStateReg, offsetof(jit::OSRState, frame)));
+    as_->ldr(kValueReg, a64::ptr(kFrameReg, slot_offset));
+#if PY_VERSION_HEX >= 0x030E0000
+    as_->and_(kValueReg, kValueReg, osrStackRefObjectMask());
+#endif
+    moveOSRValueToLocation(live_in.destination, kValueReg, kFrameReg);
+
+    as_->ldr(kFrameReg, a64::ptr(kStateReg, offsetof(jit::OSRState, frame)));
+    as_->mov(kValueReg, osrStackRefNullBits());
+    as_->str(kValueReg, a64::ptr(kFrameReg, slot_offset));
+  }
+
+  as_->b(map_get(env_.block_label_map, target_block));
+}
+
+#endif
+
 NativeGenerator::FrameInfo NativeGenerator::computeFrameInfo() {
   // During execution, the stack looks like the diagram below. The column to
   // left indicates how many words on the stack each line occupies.
@@ -1195,6 +1347,12 @@ void NativeGenerator::generateCode(
   env_.resume_frame_total_size = frame_info.size();
   env_.resume_header_and_spill_size = frame_info.header_and_spill_size;
   env_.resume_saved_regs = frame_info.saved_regs;
+  for (std::size_t id = 0; id < env_.code_rt->osrMetadatas().size(); ++id) {
+    OSRMetadata& metadata = env_.code_rt->getOSRMetadata(id);
+    metadata.resume_frame_total_size = env_.resume_frame_total_size;
+    metadata.resume_header_and_spill_size = env_.resume_header_and_spill_size;
+    metadata.resume_saved_regs = env_.resume_saved_regs;
+  }
 
   // For generators, populate the resume entry block (allocated during LIR
   // generation) with post-regalloc instructions. This block uses only physical
@@ -1416,6 +1574,19 @@ void NativeGenerator::generateCode(
 
   generateDeoptExits(codeholder);
 
+  for (auto& [osr_idx, block] : env_.osr_entry_blocks) {
+    Label stub_label = as_->newLabel();
+    env_.osr_entry_stub_labels.emplace(osr_idx, stub_label);
+    as_->bind(stub_label);
+#if defined(CINDER_X86_64)
+    as_->jmp(map_get(env_.block_label_map, block));
+#elif defined(CINDER_AARCH64)
+    generateOSREntryStub(env_.code_rt->getOSRMetadata(osr_idx), block);
+#else
+    CINDER_UNSUPPORTED
+#endif
+  }
+
 #if defined(CINDER_AARCH64)
   // Emit constant pool data for MovConstPool instructions. Each entry is an
   // 8-byte value loaded via PC-relative ldr.
@@ -1465,6 +1636,14 @@ void NativeGenerator::generateCode(
           base + codeholder.labelOffsetFromBase(entry.deopt_exit_label);
       env_.code_rt->addCallsiteDeoptExit(return_addr, exit_addr);
     }
+  }
+
+  for (auto& [osr_idx, label] : env_.osr_entry_stub_labels) {
+    OSRMetadata& metadata = env_.code_rt->getOSRMetadata(osr_idx);
+    metadata.entry_point_offset = codeholder.labelOffsetFromBase(label);
+    metadata.resume_frame_total_size = env_.resume_frame_total_size;
+    metadata.resume_header_and_spill_size = env_.resume_header_and_spill_size;
+    metadata.resume_saved_regs = env_.resume_saved_regs;
   }
 
   vectorcall_entry_ = static_cast<char*>(code_start_) +

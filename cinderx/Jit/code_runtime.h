@@ -5,6 +5,7 @@
 #include "cinderx/Common/ref.h"
 #include "cinderx/Jit/debug_info.h"
 #include "cinderx/Jit/deopt.h"
+#include "cinderx/Jit/osr.h"
 #include "cinderx/Jit/threaded_compile.h"
 
 #include <deque>
@@ -123,6 +124,20 @@ class alignas(16) CodeRuntime {
   // Get all deopt metadatas for the given CodeRuntime.
   const std::vector<DeoptMetadata>& deoptMetadatas() const;
 
+  // Add OSR metadata for a loop-header secondary entry point.
+  // Returns the index of the newly added metadata.
+  std::size_t addOSRMetadata(OSRMetadata&& osr_meta);
+
+  OSRMetadata& getOSRMetadata(std::size_t id);
+  const OSRMetadata& getOSRMetadata(std::size_t id) const;
+
+  // Get all OSR metadatas.
+  std::vector<OSRMetadata>& osrMetadatas();
+  const std::vector<OSRMetadata>& osrMetadatas() const;
+
+  // Check if this CodeRuntime has any OSR entry stubs.
+  bool hasOSREntries() const;
+
   // Get the top-level runtime frame state for this CodeRuntime's PyCodeObject.
   const RuntimeFrameState* frameState() const;
 
@@ -191,6 +206,9 @@ class alignas(16) CodeRuntime {
   // Metadata about deopt points.  Safe to use a vector as these are always
   // accessed by index.
   std::vector<DeoptMetadata> deopt_metadatas_;
+
+  // OSR entry metadata (one per loop-header secondary entry point).
+  std::vector<OSRMetadata> osr_metadatas_;
 
 #if PY_VERSION_HEX >= 0x030E0000 && defined(ENABLE_LIGHTWEIGHT_FRAMES)
   ThreadedRef<> reifier_;

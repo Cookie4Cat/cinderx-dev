@@ -3,6 +3,7 @@
 #include <gtest/gtest.h>
 
 #include "cinderx/Jit/generators_rt.h"
+#include "cinderx/Jit/osr_capi.h"
 #include "cinderx/Jit/perf_jitdump.h"
 #include "cinderx/Jit/pyjit.h"
 #include "cinderx/RuntimeTests/fixtures.h"
@@ -289,6 +290,58 @@ TEST_F(CmdLineTest, JITEnable) {
                 getConfig().asm_syntax,
                 AsmSyntax::ATT); // default to AT&T syntax
           }),
+      0);
+}
+
+TEST_F(CmdLineTest, OSREnabledFlag) {
+  ASSERT_EQ(
+      try_flag_and_envvar_effect(
+          L"osr-enabled",
+          "CINDERX_OSR_ENABLED",
+          []() { getMutableConfig().osr_enabled = false; },
+          []() { ASSERT_TRUE(getConfig().osr_enabled); }),
+      0);
+}
+
+TEST_F(CmdLineTest, OSREnabledFlagSyncsRuntimeGate) {
+  ASSERT_EQ(
+      try_flag_and_envvar_effect(
+          L"osr-enabled",
+          "CINDERX_OSR_ENABLED",
+          []() {
+            getMutableConfig().osr_enabled = false;
+            getMutableConfig().osr_capable = false;
+            cinderx_osr_enabled = 0;
+            cinderx_osr_capable = 0;
+            cinderx_osr_state = 0;
+          },
+          []() {
+            ASSERT_TRUE(getConfig().osr_enabled);
+            ASSERT_TRUE(getConfig().osr_capable);
+            ASSERT_EQ(cinderx_osr_enabled, 1);
+            ASSERT_EQ(cinderx_osr_capable, 1);
+            ASSERT_EQ(cinderx_osr_state, 1);
+          }),
+      0);
+}
+
+TEST_F(CmdLineTest, OSRBackedgeThresholdFlag) {
+  ASSERT_EQ(
+      try_flag_and_envvar_effect(
+          L"osr-backedge-threshold=7",
+          "CINDERX_OSR_BACKEDGE_THRESHOLD=7",
+          []() { getMutableConfig().osr_backedge_threshold = 2000; },
+          []() { ASSERT_EQ(getConfig().osr_backedge_threshold, 7); }),
+      0);
+}
+
+TEST_F(CmdLineTest, OSRCompileBudgetFlag) {
+  ASSERT_EQ(
+      try_flag_and_envvar_effect(
+          L"osr-compile-budget=17",
+          "CINDERX_OSR_COMPILE_BUDGET=17",
+          []() { getMutableConfig().osr_compile_budget_code_units = 1024; },
+          []() { ASSERT_EQ(getConfig().osr_compile_budget_code_units, 17); }),
       0);
 }
 
