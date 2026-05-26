@@ -393,6 +393,9 @@ PyTypeObject* getStdlibArrayType() {
     return nullptr;
   }
 
+  // Transfer ownership: array_type's Ref<> will decref on scope exit,
+  // so we must incref to keep the type alive for the static cache.
+  Py_INCREF(type);
   cached_type = type;
   return cached_type;
 }
