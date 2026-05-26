@@ -923,7 +923,13 @@ void HIRBuilder::translate(
         case BINARY_OR:
         case BINARY_POWER:
         case BINARY_RSHIFT:
-        case BINARY_SUBSCR:
+        case BINARY_SUBSCR: {
+          if (tryBinarySubscrArray(irfunc.cfg, tc, bc_instr)) {
+            break;
+          }
+          emitBinaryOp(tc, bc_instr);
+          break;
+        }
         case BINARY_SUBTRACT:
         case BINARY_TRUE_DIVIDE:
         case BINARY_XOR: {
@@ -4149,6 +4155,101 @@ void HIRBuilder::emitStoreSubscr(
   }
 
   tc.emit<StoreSubscr>(container, sub, value, tc.frame);
+}
+
+bool HIRBuilder::tryBinarySubscrArray(
+    CFG& cfg,
+    TranslationContext& tc,
+    const jit::BytecodeInstruction& bc_instr) {
+  if (!getConfig().specialized_opcodes) {
+    return false;
+  }
+
+  auto* array_type = getStdlibArrayType();
+  if (array_type == nullptr) {
+    return false;
+  }
+
+  auto& stack = tc.frame.stack;
+  Register* sub = stack.pop();
+  Register* container = stack.pop();
+
+  // Set up blocks for fast/slow path branching
+  BasicBlock* fast_path = cfg.AllocateBlock();
+  BasicBlock* slow_path = cfg.AllocateBlock();
+  BasicBlock* done_path = cfg.AllocateBlock();
+
+  // Guard: container is array.array
+  Type array_type_guard = Type::fromTypeExact(array_type);
+  tc.frame.cur_instr_offs = bc_instr.baseOffset();
+  tc.emitSnapshot();
+  tc.emit<CondBranchCheckType>(container, array_type_guard, fast_path, slow_path);
+
+  // --- Fast path ---
+  tc.block = fast_path;
+  tc.emitSnapshot();
+  tc.emit<RefineType>(container, array_type_guard, container);
+
+  // Guard: sub is LongExact
+  auto sub_guard = temps_.AllocateStack();
+  tc.emit<GuardType>(sub_guard, TLongExact, sub, tc.frame);
+  tc.emit<RefineType>(sub_guard, TLongExact, sub_guard);
+  Register* unboxed_idx = temps_.AllocateStack();
+  tc.emit<PrimitiveUnbox>(unboxed_idx, sub_guard, TCInt64);
+  Register* neg_check = temps_.AllocateStack();
+  tc.emit<IsNegativeAndErrOccurred>(neg_check, unboxed_idx, tc.frame);
+
+  // Check typecode == 'd'
+  auto descr = temps_.AllocateStack();
+  tc.emit<LoadField>(
+      descr,
+      container,
+      "ob_descr",
+      offsetof(StdlibArrayObject, ob_descr),
+      TCPtr);
+  auto typecode = temps_.AllocateStack();
+  tc.emit<LoadField>(
+      typecode, descr, "typecode", offsetof(StdlibArrayDescr, typecode), TCInt8);
+  auto expected_tc = temps_.AllocateStack();
+  tc.emit<LoadConst>(expected_tc, Type::fromCInt('d', TCInt8));
+  auto tc_match = temps_.AllocateStack();
+  tc.emit<PrimitiveCompare>(
+      tc_match, PrimitiveCompareOp::kEqual, typecode, expected_tc);
+
+  // Branch on typecode match
+  BasicBlock* tc_ok = cfg.AllocateBlock();
+  tc.emit<CondBranch>(tc_match, tc_ok, slow_path);
+
+  // typecode matched — bounds check + load
+  tc.block = tc_ok;
+  auto adjusted_idx = temps_.AllocateStack();
+  tc.emit<CheckSequenceBounds>(adjusted_idx, container, unboxed_idx, tc.frame);
+  auto ob_item = temps_.AllocateStack();
+  tc.emit<LoadField>(
+      ob_item,
+      container,
+      "ob_item",
+      offsetof(StdlibArrayObject, ob_item),
+      TCPtr);
+  auto raw_double = temps_.AllocateStack();
+  tc.emit<LoadArrayItem>(raw_double, ob_item, adjusted_idx, container, 0, TCDouble);
+  auto boxed_float = temps_.AllocateStack();
+  tc.emit<PrimitiveBox>(boxed_float, raw_double, TCDouble, tc.frame);
+  stack.push(boxed_float);
+  tc.emit<Branch>(done_path);
+
+  // --- Slow path ---
+  tc.block = slow_path;
+  stack.pop(); // Undo fast_path's push
+  Register* result = temps_.AllocateStack();
+  tc.emit<BinaryOp>(result, BinaryOpKind::kSubscript, container, sub, tc.frame);
+  stack.push(result);
+  tc.emit<Branch>(done_path);
+
+  // --- Done path ---
+  tc.block = done_path;
+
+  return true;
 }
 
 void HIRBuilder::emitGetIter(TranslationContext& tc) {

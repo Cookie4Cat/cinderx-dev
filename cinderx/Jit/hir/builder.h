@@ -260,6 +260,10 @@ class HIRBuilder {
       CFG& cfg,
       TranslationContext& tc,
       const jit::BytecodeInstruction& bc_instr);
+  bool tryBinarySubscrArray(
+      CFG& cfg,
+      TranslationContext& tc,
+      const jit::BytecodeInstruction& bc_instr);
   void emitInPlaceOp(
       TranslationContext& tc,
       const jit::BytecodeInstruction& bc_instr);
