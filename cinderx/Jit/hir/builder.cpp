@@ -1001,7 +1001,7 @@ void HIRBuilder::translate(
           break;
         }
         case TO_BOOL: {
-          emitToBool(tc);
+          emitToBool(tc, &bc_instr);
           break;
         }
         case COPY_DICT_WITHOUT_KEYS: {
@@ -2704,8 +2704,38 @@ void HIRBuilder::emitCompareOp(
   }
 }
 
-void HIRBuilder::emitToBool(TranslationContext& tc) {
+void HIRBuilder::emitToBool(
+    TranslationContext& tc,
+    const jit::BytecodeInstruction* bc_instr) {
+  FrameState deopt_frame = tc.frame;
   Register* operand = tc.frame.stack.pop();
+
+  if (bc_instr != nullptr && getConfig().specialized_opcodes) {
+    switch (bc_instr->specializedOpcode()) {
+#if PY_VERSION_HEX >= 0x030E0000
+      case TO_BOOL_BOOL:
+        tc.emit<GuardType>(operand, TBool, operand, deopt_frame);
+        tc.emit<UseType>(operand, TBool);
+        tc.frame.stack.push(operand);
+        return;
+      case TO_BOOL_INT:
+        tc.emit<GuardType>(operand, TLongExact, operand, deopt_frame);
+        tc.emit<UseType>(operand, TLongExact);
+        break;
+      case TO_BOOL_LIST:
+        tc.emit<GuardType>(operand, TListExact, operand, deopt_frame);
+        tc.emit<UseType>(operand, TListExact);
+        break;
+      case TO_BOOL_STR:
+        tc.emit<GuardType>(operand, TUnicodeExact, operand, deopt_frame);
+        tc.emit<UseType>(operand, TUnicodeExact);
+        break;
+#endif
+      default:
+        break;
+    }
+  }
+
   Register* truthy_result = temps_.AllocateStack();
   tc.emit<IsTruthy>(truthy_result, operand, tc.frame);
 
