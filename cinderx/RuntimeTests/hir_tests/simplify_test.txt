@@ -1214,7 +1214,7 @@ BinaryOpSubscriptFromNonListEmitsBinaryOp
 # HIR
 fun test {
   bb 0 {
-    v0 = LoadArg<0>
+    v0 = LoadArg<0, Long>
     v1 = LoadConst<LongExact[1]>
     v2 = BinaryOp<Subscript> v0 v1
     Return v2
@@ -1223,7 +1223,7 @@ fun test {
 --- Expected 3.12 ---
 fun test {
   bb 0 {
-    v0:Object = LoadArg<0>
+    v0:Long = LoadArg<0, Long>
     v1:ImmortalLongExact[1] = LoadConst<ImmortalLongExact[1]>
     v2:Object = BinaryOp<Subscript> v0 v1 {
       FrameState {
@@ -1236,7 +1236,7 @@ fun test {
 --- Expected 3.14 ---
 fun test {
   bb 0 {
-    v0:Object = LoadArg<0>
+    v0:Long = LoadArg<0, Long>
     v1:ImmortalLongExact[1] = LoadConst<ImmortalLongExact[1]>
     v2:Object = BinaryOp<Subscript> v0 v1 {
       FrameState {
@@ -1249,7 +1249,7 @@ fun test {
 --- Expected 3.15 ---
 fun test {
   bb 0 {
-    v0:Object = LoadArg<0>
+    v0:Long = LoadArg<0, Long>
     v1:ImmortalLongExact[1] = LoadConst<ImmortalLongExact[1]>
     v2:Object = BinaryOp<Subscript> v0 v1 {
       FrameState {
@@ -7193,23 +7193,23 @@ fun jittestmodule:test {
 --- Expected 3.14 ---
 fun jittestmodule:test {
   bb 0 {
-    v21:Object = LoadArg<0; "x">
-    v22:Object = LoadArg<1; "y">
-    v23:Object = LoadArg<2; "z">
-    v24:Func = LoadCurrentFunc
+    v10:Object = LoadArg<0; "x">
+    v11:Object = LoadArg<1; "y">
+    v12:Object = LoadArg<2; "z">
+    v13:Func = LoadCurrentFunc
     LoadFrame
-    v25:Nullptr = LoadConst<Nullptr>
+    v14:Nullptr = LoadConst<Nullptr>
     Snapshot
-    v26:CInt64 = LoadEvalBreaker
-    CondBranch<2, 1> v26
+    v15:CInt64 = LoadEvalBreaker
+    CondBranch<2, 1> v15
   }
 
   bb 2 (preds 0) {
     Snapshot
-    v27:CInt32 = RunPeriodicTasks {
+    v16:CInt32 = RunPeriodicTasks {
       FrameState {
         CurInstrOffset 0
-        Locals<4> v21 v22 v23 v25
+        Locals<4> v10 v11 v12 v14
       }
     }
     Branch<1>
@@ -7217,28 +7217,26 @@ fun jittestmodule:test {
 
   bb 1 (preds 0, 2) {
     Snapshot
-    v32:MortalTupleExact = MakeTuple<3> v21 v22 v23 {
+    v21:MortalTupleExact = MakeTuple<3> v10 v11 v12 {
       FrameState {
         CurInstrOffset 6
-        Locals<4> v21 v22 v23 v25
-        Stack<3> v21 v22 v23
+        Locals<4> v10 v11 v12 v14
+        Stack<3> v10 v11 v12
       }
     }
     Snapshot
-    v34:ImmortalLongExact[1] = LoadConst<ImmortalLongExact[1]>
+    v23:ImmortalLongExact[1] = LoadConst<ImmortalLongExact[1]>
     Snapshot
+    UseType<TupleExact> v21
+    UseType<LongExact> v23
+    v29:CInt64[1] = LoadConst<CInt64[1]>
+    v30:CInt64[0] = LoadConst<CInt64[0]>
+    UseType<MortalTupleExact> v21
+    UseType<CInt64[1]> v29
+    UseType<TupleExact> v21
+    UseType<CInt64[1]> v29
     Snapshot
-    UseType<MortalTupleExact> v32
-    UseType<TupleExact> v32
-    UseType<LongExact> v34
-    v65:CInt64[1] = LoadConst<CInt64[1]>
-    v66:CInt64[0] = LoadConst<CInt64[0]>
-    UseType<MortalTupleExact> v32
-    UseType<CInt64[1]> v65
-    UseType<TupleExact> v32
-    UseType<CInt64[1]> v65
-    Snapshot
-    Return v22
+    Return v11
   }
 }
 --- Expected 3.15 ---
@@ -7350,23 +7348,23 @@ fun jittestmodule:test {
 --- Expected 3.14 ---
 fun jittestmodule:test {
   bb 0 {
-    v21:Object = LoadArg<0; "x">
-    v22:Object = LoadArg<1; "y">
-    v23:Object = LoadArg<2; "z">
-    v24:Func = LoadCurrentFunc
+    v10:Object = LoadArg<0; "x">
+    v11:Object = LoadArg<1; "y">
+    v12:Object = LoadArg<2; "z">
+    v13:Func = LoadCurrentFunc
     LoadFrame
-    v25:Nullptr = LoadConst<Nullptr>
+    v14:Nullptr = LoadConst<Nullptr>
     Snapshot
-    v26:CInt64 = LoadEvalBreaker
-    CondBranch<2, 1> v26
+    v15:CInt64 = LoadEvalBreaker
+    CondBranch<2, 1> v15
   }
 
   bb 2 (preds 0) {
     Snapshot
-    v27:CInt32 = RunPeriodicTasks {
+    v16:CInt32 = RunPeriodicTasks {
       FrameState {
         CurInstrOffset 0
-        Locals<4> v21 v22 v23 v25
+        Locals<4> v10 v11 v12 v14
       }
     }
     Branch<1>
@@ -7374,31 +7372,29 @@ fun jittestmodule:test {
 
   bb 1 (preds 0, 2) {
     Snapshot
-    v32:MortalTupleExact = MakeTuple<3> v21 v22 v23 {
+    v21:MortalTupleExact = MakeTuple<3> v10 v11 v12 {
       FrameState {
         CurInstrOffset 6
-        Locals<4> v21 v22 v23 v25
-        Stack<3> v21 v22 v23
+        Locals<4> v10 v11 v12 v14
+        Stack<3> v10 v11 v12
       }
     }
     Snapshot
-    v34:ImmortalLongExact[3] = LoadConst<ImmortalLongExact[3]>
+    v23:ImmortalLongExact[3] = LoadConst<ImmortalLongExact[3]>
     Snapshot
-    Snapshot
-    UseType<MortalTupleExact> v32
-    UseType<TupleExact> v32
-    UseType<LongExact> v34
-    v65:CInt64[3] = LoadConst<CInt64[3]>
-    v66:CInt64[0] = LoadConst<CInt64[0]>
-    v63:CInt64 = CheckSequenceBounds v32 v65 {
+    UseType<TupleExact> v21
+    UseType<LongExact> v23
+    v29:CInt64[3] = LoadConst<CInt64[3]>
+    v30:CInt64[0] = LoadConst<CInt64[0]>
+    v27:CInt64 = CheckSequenceBounds v21 v29 {
       FrameState {
         CurInstrOffset 14
-        Locals<4> v21 v22 v23 v32
+        Locals<4> v10 v11 v12 v21
       }
     }
-    v64:Object = LoadArrayItem<Offset[32]> v32 v63 v32
+    v28:Object = LoadArrayItem<Offset[32]> v21 v27 v21
     Snapshot
-    Return v64
+    Return v28
   }
 }
 --- Expected 3.15 ---
