@@ -6,6 +6,7 @@
 #include "cinderx/Common/util.h"
 #include "cinderx/Jit/compiled_function.h"
 #include "cinderx/Jit/config.h"
+#include "cinderx/Jit/elf/header.h"
 
 #include <fcntl.h>
 #include <stddef.h>
@@ -399,7 +400,7 @@ static const ELFHeader elfhdr_template = {
     .eabiversion = 0,
     .epad = {0, 0, 0, 0, 0, 0, 0},
     .type = 1,
-    .machine = 62,
+    .machine = jit::elf::kBuildElfMachine,
     .version = 1,
     .entry = 0,
     .phofs = 0,
