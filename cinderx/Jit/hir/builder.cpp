@@ -21,6 +21,7 @@ extern "C" {
 #include "cinderx/Jit/containers.h"
 #include "cinderx/Jit/context.h"
 #include "cinderx/Jit/hir/annotation_index.h"
+#include "cinderx/Jit/hir/array_specialize.h"
 #include "cinderx/Jit/hir/ssa.h"
 #include "cinderx/Jit/hir/type.h"
 #include "cinderx/Jit/threaded_compile.h"
@@ -296,21 +297,6 @@ bool codeHasBackedge(BorrowedRef<PyCodeObject> code) {
 }
 
 } // namespace
-
-// Memory layout mirrors CPython arraymodule.c arrayobject and arraydescr.
-struct StdlibArrayDescr {
-  char typecode;
-  int itemsize;
-};
-
-struct StdlibArrayObject {
-  PyObject_VAR_HEAD
-  char* ob_item;
-  Py_ssize_t allocated;
-  const StdlibArrayDescr* ob_descr;
-  PyObject* weakreflist;
-  Py_ssize_t ob_exports;
-};
 
 // Get the array.array type object for fast path type guards.
 // Pre-cached with runtime layout validation. The cached value is readable
@@ -935,16 +921,14 @@ void HIRBuilder::translate(
         case BINARY_OR:
         case BINARY_POWER:
         case BINARY_RSHIFT:
-        case BINARY_SUBSCR: {
-          if (tryBinarySubscrArray(irfunc.cfg, tc, bc_instr)) {
-            break;
-          }
-          emitBinaryOp(tc, bc_instr);
-          break;
-        }
+        case BINARY_SUBSCR:
         case BINARY_SUBTRACT:
         case BINARY_TRUE_DIVIDE:
         case BINARY_XOR: {
+          // The array.array('d') subscript fast path is emitted later in the
+          // Simplify pass (simplifyBinaryOp), where the container's type is
+          // known, so it does not perturb subscripts on statically-typed
+          // containers (list/tuple/dict/str).
           emitBinaryOp(tc, bc_instr);
           break;
         }
@@ -4209,89 +4193,6 @@ bool HIRBuilder::tryStoreSubscrArray(
   tc.block = slow_path;
   tc.emit<StoreSubscr>(container, sub, value, tc.frame);
   tc.emit<Branch>(done_path);
-
-  return true;
-}
-
-bool HIRBuilder::tryBinarySubscrArray(
-    CFG& cfg,
-    TranslationContext& tc,
-    const jit::BytecodeInstruction& bc_instr) {
-  if (!getConfig().specialized_opcodes) {
-    return false;
-  }
-
-  // Only handle subscript operations (BINARY_SUBSCR or BINARY_OP with NB_SUBSCR)
-  auto opcode = bc_instr.opcode();
-  if (opcode != BINARY_SUBSCR) {
-#if PY_VERSION_HEX >= 0x030E0000
-    if (opcode != BINARY_OP || bc_instr.oparg() != NB_SUBSCR) {
-      return false;
-    }
-#else
-    return false;
-#endif
-  }
-
-  auto* array_type = getStdlibArrayType();
-  if (array_type == nullptr) {
-    return false;
-  }
-
-  auto& stack = tc.frame.stack;
-  Register* sub = stack.pop();
-  Register* container = stack.pop();
-
-  // Set up blocks for fast/slow path branching
-  BasicBlock* fast_path = cfg.AllocateBlock();
-  BasicBlock* slow_path = cfg.AllocateBlock();
-  BasicBlock* done_path = cfg.AllocateBlock();
-
-  // Guard: container is array.array
-  Type array_type_guard = Type::fromTypeExact(array_type);
-  tc.frame.cur_instr_offs = bc_instr.baseOffset();
-  tc.emitSnapshot();
-  tc.emit<CondBranchCheckType>(container, array_type_guard, fast_path, slow_path);
-
-  // --- Fast path ---
-  tc.block = fast_path;
-  tc.emitSnapshot();
-  tc.emit<RefineType>(container, array_type_guard, container);
-
-  // Route non-int indices (e.g. slices) to the generic subscript path.
-  Register* unboxed_idx = emitArrayIndexGuard(cfg, tc, sub, slow_path);
-
-  // Check typecode == 'd'
-  BasicBlock* tc_ok = emitArrayTypecodeCheck(cfg, tc, container, slow_path);
-
-  // Shared result register written by both paths. The push happens once at
-  // done_path so the abstract stack depth stays consistent across the merge.
-  Register* result = temps_.AllocateStack();
-
-  // typecode matched — bounds check + load
-  tc.block = tc_ok;
-  auto adjusted_idx = temps_.AllocateStack();
-  tc.emit<CheckSequenceBounds>(adjusted_idx, container, unboxed_idx, tc.frame);
-  auto ob_item = temps_.AllocateStack();
-  tc.emit<LoadField>(
-      ob_item,
-      container,
-      "ob_item",
-      offsetof(StdlibArrayObject, ob_item),
-      TCPtr);
-  auto raw_double = temps_.AllocateStack();
-  tc.emit<LoadArrayItem>(raw_double, ob_item, adjusted_idx, container, 0, TCDouble);
-  tc.emit<PrimitiveBox>(result, raw_double, TCDouble, tc.frame);
-  tc.emit<Branch>(done_path);
-
-  // --- Slow path ---
-  tc.block = slow_path;
-  tc.emit<BinaryOp>(result, BinaryOpKind::kSubscript, container, sub, tc.frame);
-  tc.emit<Branch>(done_path);
-
-  // --- Done path ---
-  tc.block = done_path;
-  stack.push(result);
 
   return true;
 }

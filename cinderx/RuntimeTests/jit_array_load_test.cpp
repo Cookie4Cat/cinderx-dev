@@ -5,8 +5,19 @@
 #include "cinderx/RuntimeTests/fixtures.h"
 
 #include "cinderx/Jit/hir/hir.h"
+#include "cinderx/Jit/hir/simplify.h"
+#include "cinderx/Jit/hir/ssa.h"
 
 using ArrayLoadTest = RuntimeTest;
+
+namespace {
+// The array.array('d') subscript fast path is emitted by the Simplify pass, so
+// run SSA construction + Simplify before inspecting the HIR.
+void runArrayFastPath(std::unique_ptr<jit::hir::Function>& irfunc) {
+  jit::hir::SSAify{}.Run(*irfunc);
+  jit::hir::Simplify{}.Run(*irfunc);
+}
+} // namespace
 
 // Test that BINARY_SUBSCR on array('d') generates LoadArrayItem(TCDouble) in
 // HIR.
@@ -22,6 +33,8 @@ def load_array_double(a, i):
       irfunc);
 
   ASSERT_NE(irfunc, nullptr);
+
+  runArrayFastPath(irfunc);
 
   bool found_load_array_item = false;
   for (auto& block : irfunc->cfg.blocks) {
@@ -54,6 +67,8 @@ def load_array_double(a, i):
       irfunc);
 
   ASSERT_NE(irfunc, nullptr);
+
+  runArrayFastPath(irfunc);
 
   bool found_load_array_item = false;
   bool found_primitive_box_cdouble = false;
@@ -95,6 +110,8 @@ def load_any(a, i):
 
   ASSERT_NE(irfunc, nullptr);
 
+  runArrayFastPath(irfunc);
+
   bool found_load_array_item = false;
   bool found_binary_op_subscr = false;
   for (auto& block : irfunc->cfg.blocks) {
@@ -134,6 +151,8 @@ def load_array_double(a, i):
       irfunc);
 
   ASSERT_NE(irfunc, nullptr);
+
+  runArrayFastPath(irfunc);
 
   bool found_cond_branch_check = false;
   for (auto& block : irfunc->cfg.blocks) {

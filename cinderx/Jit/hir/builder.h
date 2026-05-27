@@ -269,10 +269,6 @@ class HIRBuilder {
       Register* value,
       BasicBlock* slow_path,
       BasicBlock* done_path);
-  bool tryBinarySubscrArray(
-      CFG& cfg,
-      TranslationContext& tc,
-      const jit::BytecodeInstruction& bc_instr);
   // Shared array fast-path guard helpers.
   Register* emitArrayIndexGuard(
       CFG& cfg,
