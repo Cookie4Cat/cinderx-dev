@@ -461,7 +461,7 @@ class HIRBuilder {
       TranslationContext& tc,
       const BytecodeInstruction& bc_instr);
 
-  void emitTypeAnnotationGuards(TranslationContext& tc);
+  bool emitTypeAnnotationGuards(TranslationContext& tc);
 
   void emitBuildInterpolation(
       TranslationContext& tc,
