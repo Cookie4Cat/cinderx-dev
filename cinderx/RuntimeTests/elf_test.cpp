@@ -5,6 +5,9 @@
 #include "cinderx/Jit/elf/writer.h"
 #include "cinderx/RuntimeTests/fixtures.h"
 
+#include <cstddef>
+#include <cstdint>
+#include <cstring>
 #include <sstream>
 
 using namespace jit;
@@ -18,12 +21,28 @@ bool sectionExists(std::span<const std::byte> bytes, std::string_view name) {
   return elf::findSection(bytes, name).data() != nullptr;
 }
 
+std::uint16_t expectedElfMachine() {
+#if defined(__x86_64__) || defined(_M_X64) || defined(_M_AMD64)
+  return 0x3e;
+#elif defined(__aarch64__) || defined(_M_ARM64)
+  return 0xb7;
+#else
+#error Please provide the ELF e_machine value for your architecture.
+#endif
+}
+
 void verifyElf(std::span<const std::byte> bytes) {
   // Verify the magic ELF bytes at the start.
   ASSERT_EQ(static_cast<uint8_t>(bytes[0]), 0x7f);
   ASSERT_EQ(static_cast<char>(bytes[1]), 'E');
   ASSERT_EQ(static_cast<char>(bytes[2]), 'L');
   ASSERT_EQ(static_cast<char>(bytes[3]), 'F');
+
+  std::uint16_t machine = 0;
+  constexpr size_t kMachineOffset = offsetof(elf::FileHeader, machine);
+  ASSERT_GE(bytes.size(), kMachineOffset + sizeof(machine));
+  std::memcpy(&machine, bytes.data() + kMachineOffset, sizeof(machine));
+  ASSERT_EQ(machine, expectedElfMachine());
 
   // Standard sections are all there.
   ASSERT_TRUE(sectionExists(bytes, ".text"));
