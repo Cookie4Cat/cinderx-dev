@@ -3,7 +3,9 @@
 #include "cinderx/python.h"
 
 #include <gtest/gtest.h>
+#include <initializer_list>
 #include <string>
+#include <utility>
 
 #include <vector>
 
@@ -57,6 +59,126 @@ size_t countOpcode(const Function& func, Opcode opcode) {
     }
   }
   return count;
+}
+
+std::vector<const GuardType*> guardTypesWithFrameState(const Function& func) {
+  std::vector<const GuardType*> guards;
+  for (const auto& block : func.cfg.blocks) {
+    for (const auto& instr : block) {
+      if (instr.IsGuardType()) {
+        const auto& guard = static_cast<const GuardType&>(instr);
+        if (guard.frameState() != nullptr) {
+          guards.push_back(&guard);
+        }
+      }
+    }
+  }
+  return guards;
+}
+
+bool isEntrySetupInstrForTest(
+    const BytecodeInstruction& instr,
+    bool initial_yield_value_on_stack) {
+  switch (instr.opcode()) {
+    case COPY_FREE_VARS:
+    case GEN_START:
+    case MAKE_CELL:
+    case NOP:
+    case NOT_TAKEN:
+    case RESUME:
+    case RETURN_GENERATOR:
+      return true;
+    case POP_TOP:
+      return initial_yield_value_on_stack;
+    default:
+      return false;
+  }
+}
+
+BCOffset firstNonEntrySetupOffset(BorrowedRef<PyCodeObject> code) {
+  bool initial_yield_value_on_stack = false;
+  for (const auto& instr : BytecodeInstructionBlock{code}) {
+    if (!isEntrySetupInstrForTest(instr, initial_yield_value_on_stack)) {
+      return instr.baseOffset();
+    }
+
+    int opcode = instr.opcode();
+    if (opcode == RETURN_GENERATOR) {
+      initial_yield_value_on_stack = true;
+    } else if (opcode == POP_TOP) {
+      initial_yield_value_on_stack = false;
+    }
+  }
+  return BCOffset{countIndices(code)};
+}
+
+bool entrySetupPrefixContains(BorrowedRef<PyCodeObject> code, int opcode) {
+  bool initial_yield_value_on_stack = false;
+  for (const auto& instr : BytecodeInstructionBlock{code}) {
+    if (!isEntrySetupInstrForTest(instr, initial_yield_value_on_stack)) {
+      return false;
+    }
+    if (instr.opcode() == opcode) {
+      return true;
+    }
+
+    int instr_opcode = instr.opcode();
+    if (instr_opcode == RETURN_GENERATOR) {
+      initial_yield_value_on_stack = true;
+    } else if (instr_opcode == POP_TOP) {
+      initial_yield_value_on_stack = false;
+    }
+  }
+  return false;
+}
+
+void moveEntryResumeBeforeInitialYieldPop(BorrowedRef<PyCodeObject> code) {
+  int resume_idx = -1;
+  int pop_top_idx = -1;
+  bool saw_return_generator = false;
+  for (const auto& instr : BytecodeInstructionBlock{code}) {
+    int opcode = instr.opcode();
+    if (opcode == RETURN_GENERATOR) {
+      saw_return_generator = true;
+      continue;
+    }
+    if (!saw_return_generator) {
+      continue;
+    }
+    if (opcode == POP_TOP) {
+      pop_top_idx = instr.baseIndex().value();
+    } else if (opcode == RESUME) {
+      resume_idx = instr.baseIndex().value();
+    }
+    if (resume_idx != -1 && pop_top_idx != -1) {
+      break;
+    }
+  }
+
+  ASSERT_NE(pop_top_idx, -1);
+  ASSERT_NE(resume_idx, -1);
+  ASSERT_LT(pop_top_idx, resume_idx);
+  std::swap(codeUnit(code)[pop_top_idx], codeUnit(code)[resume_idx]);
+}
+
+void assertEntrySelfGuardAfterSetup(
+    BorrowedRef<PyFunctionObject> method,
+    const Function& irfunc,
+    std::initializer_list<int> required_prefix_opcodes) {
+  auto guards = guardTypesWithFrameState(irfunc);
+  ASSERT_EQ(guards.size(), 1) << fullPrinter().ToString(irfunc);
+
+  BorrowedRef<PyCodeObject> code{method->func_code};
+  BCOffset expected_offset = firstNonEntrySetupOffset(code);
+  const FrameState* frame_state = guards.front()->frameState();
+  ASSERT_NE(frame_state, nullptr);
+  EXPECT_EQ(frame_state->instrOffset(), expected_offset)
+      << fullPrinter().ToString(irfunc);
+  for (int opcode : required_prefix_opcodes) {
+    EXPECT_TRUE(entrySetupPrefixContains(code, opcode))
+        << "expected " << opcodeName(opcode)
+        << " in the entry setup prefix";
+  }
 }
 
 size_t countStaticCallsTo(const Function& func, void* addr) {
@@ -737,6 +859,203 @@ class Vec:
   std::string hir = fullPrinter().ToString(*irfunc);
   EXPECT_EQ(countSubstring(hir, "GuardType<ObjectUser[Vec:Exact]>"), 1)
       << hir;
+}
+
+TEST_F(HIRBuildTest, InferredSelfGuardFrameStateAfterResume) {
+  const char* src = R"(
+class Vec:
+    def magnitude(self):
+        return self.x
+)";
+  Ref<> klass(compileAndGet(src, "Vec"));
+  ASSERT_NE(klass, nullptr);
+  Ref<PyFunctionObject> method(
+      Ref<PyFunctionObject>::steal(
+          PyObject_GetAttrString(klass, "magnitude")));
+  ASSERT_NE(method, nullptr);
+  ASSERT_TRUE(PyFunction_Check(method));
+
+  std::unique_ptr<Function> irfunc(buildHIR(method));
+  ASSERT_NO_FATAL_FAILURE(
+      assertEntrySelfGuardAfterSetup(method, *irfunc, {RESUME}));
+}
+
+TEST_F(HIRBuildTest, InferredSelfGuardFrameStateAfterClosureSetup) {
+  const char* src = R"(
+class ClosureBox:
+    def value(self):
+        scale = 7
+        def inner():
+            return scale + len(__class__.__name__)
+        return self.x + inner()
+)";
+  Ref<> klass(compileAndGet(src, "ClosureBox"));
+  ASSERT_NE(klass, nullptr);
+  Ref<PyFunctionObject> method(
+      Ref<PyFunctionObject>::steal(PyObject_GetAttrString(klass, "value")));
+  ASSERT_NE(method, nullptr);
+  ASSERT_TRUE(PyFunction_Check(method));
+
+  std::unique_ptr<Function> irfunc(buildHIR(method));
+  ASSERT_NO_FATAL_FAILURE(assertEntrySelfGuardAfterSetup(
+      method, *irfunc, {COPY_FREE_VARS, MAKE_CELL, RESUME}));
+}
+
+TEST_F(HIRBuildTest, InferredSelfGuardFrameStateAfterGeneratorSetup) {
+  const char* src = R"(
+class YieldBox:
+    def values(self):
+        yield self.x
+        return self.x + 1
+)";
+  Ref<> klass(compileAndGet(src, "YieldBox"));
+  ASSERT_NE(klass, nullptr);
+  Ref<PyFunctionObject> method(
+      Ref<PyFunctionObject>::steal(PyObject_GetAttrString(klass, "values")));
+  ASSERT_NE(method, nullptr);
+  ASSERT_TRUE(PyFunction_Check(method));
+
+  std::unique_ptr<Function> irfunc(buildHIR(method));
+  ASSERT_NO_FATAL_FAILURE(assertEntrySelfGuardAfterSetup(
+      method, *irfunc, {RETURN_GENERATOR, POP_TOP, RESUME}));
+}
+
+TEST_F(HIRBuildTest, InferredSelfGuardFrameStateAfterInitialYieldPop) {
+  const char* src = R"(
+class YieldBox:
+    def values(self):
+        yield self.x
+        return self.x + 1
+)";
+  Ref<> klass(compileAndGet(src, "YieldBox"));
+  ASSERT_NE(klass, nullptr);
+  Ref<PyFunctionObject> method(
+      Ref<PyFunctionObject>::steal(PyObject_GetAttrString(klass, "values")));
+  ASSERT_NE(method, nullptr);
+  ASSERT_TRUE(PyFunction_Check(method));
+  ASSERT_NO_FATAL_FAILURE(
+      moveEntryResumeBeforeInitialYieldPop(method->func_code));
+
+  std::unique_ptr<Function> irfunc(buildHIR(method));
+  ASSERT_NO_FATAL_FAILURE(assertEntrySelfGuardAfterSetup(
+      method, *irfunc, {RETURN_GENERATOR, RESUME, POP_TOP}));
+}
+
+TEST_F(HIRBuildTest, InferredSelfGuardMissAfterClosureSetupMatchesInterpreter) {
+  const char* src = R"(
+class ClosureBox:
+    def value(self):
+        scale = 7
+        def inner():
+            return scale + len(__class__.__name__)
+        return self.x + inner()
+)";
+  Ref<> klass(compileAndGet(src, "ClosureBox"));
+  ASSERT_NE(klass, nullptr);
+  Ref<PyFunctionObject> method(
+      Ref<PyFunctionObject>::steal(PyObject_GetAttrString(klass, "value")));
+  ASSERT_NE(method, nullptr);
+  ASSERT_TRUE(PyFunction_Check(method));
+  ASSERT_EQ(jit::compileFunction(method), jit::Result::OK);
+
+  runCode(R"(
+import types
+
+class ClosureSubBox(ClosureBox):
+    pass
+
+closure_sub = ClosureSubBox()
+closure_sub.x = 11
+closure_baseline = types.FunctionType(
+    ClosureBox.value.__code__,
+    ClosureBox.value.__globals__,
+    "closure_baseline",
+    ClosureBox.value.__defaults__,
+    ClosureBox.value.__closure__,
+)
+
+def capture_error(func, obj):
+    try:
+        func(obj)
+    except Exception as exc:
+        return (type(exc).__name__, str(exc))
+    return ("return", None)
+
+closure_guard_result = ClosureBox.value(closure_sub)
+closure_baseline_result = closure_baseline(closure_sub)
+closure_missing = ClosureSubBox()
+closure_guard_error = capture_error(ClosureBox.value, closure_missing)
+closure_baseline_error = capture_error(closure_baseline, closure_missing)
+)");
+
+  Ref<> guard_result(getGlobal("closure_guard_result"));
+  Ref<> baseline_result(getGlobal("closure_baseline_result"));
+  ASSERT_EQ(PyObject_RichCompareBool(guard_result, baseline_result, Py_EQ), 1);
+  Ref<> guard_error(getGlobal("closure_guard_error"));
+  Ref<> baseline_error(getGlobal("closure_baseline_error"));
+  ASSERT_EQ(PyObject_RichCompareBool(guard_error, baseline_error, Py_EQ), 1);
+}
+
+TEST_F(HIRBuildTest, InferredSelfGuardMissAfterGeneratorSetupMatchesInterpreter) {
+  const char* src = R"(
+class YieldBox:
+    def values(self):
+        yield self.x
+        return self.x + 1
+)";
+  Ref<> klass(compileAndGet(src, "YieldBox"));
+  ASSERT_NE(klass, nullptr);
+  Ref<PyFunctionObject> method(
+      Ref<PyFunctionObject>::steal(PyObject_GetAttrString(klass, "values")));
+  ASSERT_NE(method, nullptr);
+  ASSERT_TRUE(PyFunction_Check(method));
+  ASSERT_EQ(jit::compileFunction(method), jit::Result::OK);
+
+  runCode(R"(
+import types
+
+class YieldSubBox(YieldBox):
+    pass
+
+yield_sub = YieldSubBox()
+yield_sub.x = 41
+yield_baseline = types.FunctionType(
+    YieldBox.values.__code__,
+    YieldBox.values.__globals__,
+    "yield_baseline",
+    YieldBox.values.__defaults__,
+    YieldBox.values.__closure__,
+)
+
+def consume(func, obj):
+    gen = func(obj)
+    first = next(gen)
+    try:
+        next(gen)
+    except StopIteration as exc:
+        return (first, exc.value)
+    return (first, "not stopped")
+
+def capture_next_error(func, obj):
+    try:
+        next(func(obj))
+    except Exception as exc:
+        return (type(exc).__name__, str(exc))
+    return ("return", None)
+
+yield_guard_result = consume(YieldBox.values, yield_sub)
+yield_baseline_result = consume(yield_baseline, yield_sub)
+yield_missing = YieldSubBox()
+yield_guard_error = capture_next_error(YieldBox.values, yield_missing)
+yield_baseline_error = capture_next_error(yield_baseline, yield_missing)
+)");
+
+  Ref<> guard_result(getGlobal("yield_guard_result"));
+  Ref<> baseline_result(getGlobal("yield_baseline_result"));
+  ASSERT_EQ(PyObject_RichCompareBool(guard_result, baseline_result, Py_EQ), 1);
+  Ref<> guard_error(getGlobal("yield_guard_error"));
+  Ref<> baseline_error(getGlobal("yield_baseline_error"));
+  ASSERT_EQ(PyObject_RichCompareBool(guard_error, baseline_error, Py_EQ), 1);
 }
 
 TEST_F(HIRBuildTest, InferredSelfGuardForRaytraceVectorDot) {

@@ -474,6 +474,25 @@ static bool should_snapshot(
   }
 }
 
+static bool isEntrySetupInstr(
+    const BytecodeInstruction& bci,
+    bool initial_yield_value_on_stack) {
+  switch (bci.opcode()) {
+    case COPY_FREE_VARS:
+    case GEN_START:
+    case MAKE_CELL:
+    case NOP:
+    case NOT_TAKEN:
+    case RESUME:
+    case RETURN_GENERATOR:
+      return true;
+    case POP_TOP:
+      return initial_yield_value_on_stack;
+    default:
+      return false;
+  }
+}
+
 // Compute basic block boundaries and allocate corresponding HIR blocks
 HIRBuilder::BlockMap HIRBuilder::createBlocks(
     Function& irfunc,
@@ -565,21 +584,19 @@ std::unique_ptr<Function> HIRBuilder::buildHIR() {
 
 // Loop through each of the arguments on the current translation context and
 // check and see if there is any annotation to guard against.
-void HIRBuilder::emitTypeAnnotationGuards(TranslationContext& tc) {
+bool HIRBuilder::emitTypeAnnotationGuards(TranslationContext& tc) {
   AnnotationIndex* index = preloader_.annotations();
   bool first = true;
 
   auto emit_arg_guard = [&](int arg_idx,
                             Type type,
                             bool needs_frame_state = false) {
-    // If we have a guard to emit, we need a snapshot for deopt.
-    //
-    // It's likely that no bytecode instructions have been compiled yet,
-    // meaning the instruction offset has not yet been set. Setting it to zero
-    // here ensures that deopt starts executing at the first instruction.
+    // If we have a guard to emit, we need a snapshot for deopt. Callers should
+    // only emit entry guards after any bytecode setup required by the frame has
+    // been translated, so the current instruction offset is a valid resume
+    // point.
     if (first) {
       first = false;
-      tc.frame.cur_instr_offs = BCOffset(0);
       tc.emitSnapshot();
     }
 
@@ -611,7 +628,7 @@ void HIRBuilder::emitTypeAnnotationGuards(TranslationContext& tc) {
 
   // Bail out if there are no annotations.
   if (!index) {
-    return;
+    return !first;
   }
 
   PyCodeObject* const code = tc.frame.code;
@@ -633,6 +650,8 @@ void HIRBuilder::emitTypeAnnotationGuards(TranslationContext& tc) {
         Type::fromTypeExact(reinterpret_cast<PyTypeObject*>(annotation));
     emit_arg_guard(arg_idx, type);
   }
+
+  return !first;
 }
 
 BasicBlock* HIRBuilder::buildHIRImpl(
@@ -678,8 +697,6 @@ BasicBlock* HIRBuilder::buildHIRImpl(
   if (frame_state == nullptr) {
     entry_tc.emit<LoadFrame>();
   }
-
-  emitTypeAnnotationGuards(entry_tc);
 
   // "Initial Yield" has an explicit bytecode instruction in
   // "RETURN_GENERATOR" and so is emitted at the appropriate time.
@@ -782,6 +799,9 @@ void HIRBuilder::translate(
   std::deque<TranslationContext> queue = {initial_tc};
   std::unordered_set<BasicBlock*> processed;
   std::unordered_set<BasicBlock*> loop_headers;
+  bool entry_guards_emitted = false;
+  bool in_entry_setup = true;
+  bool saw_initial_yield = false;
 
   while (!queue.empty()) {
     auto tc = std::move(queue.front());
@@ -793,6 +813,7 @@ void HIRBuilder::translate(
 
     // Translate remaining instructions into HIR
     auto& bc_block = map_get(block_map_.bc_blocks, tc.block);
+    bool is_entry_bc_block = bc_block.startOffset() == BCOffset{0};
 
     auto is_in_async_for_header_block = [&tc, &bc_instrs]() {
       if (tc.frame.block_stack.isEmpty()) {
@@ -808,21 +829,35 @@ void HIRBuilder::translate(
 
       tc.frame.cur_instr_offs = bc_instr.baseOffset();
       Instr* prev_hir_instr = tc.block->GetTerminator();
+      bool emitted_entry_guards = false;
+      bool initial_yield_value_on_stack =
+          saw_initial_yield && !tc.frame.stack.isEmpty();
+      bool is_entry_setup_instr = is_entry_bc_block && in_entry_setup &&
+          isEntrySetupInstr(bc_instr, initial_yield_value_on_stack);
+      if (is_entry_bc_block && !entry_guards_emitted &&
+          !is_entry_setup_instr) {
+        JIT_DCHECK(
+            tc.frame.stack.isEmpty(),
+            "entry guards inserted with non-empty operand stack");
+        if (tc.frame.stack.isEmpty()) {
+          emitted_entry_guards = emitTypeAnnotationGuards(tc);
+        }
+        entry_guards_emitted = true;
+        in_entry_setup = false;
+      }
       // Outputting too many snapshots is safe but noisy so try to cull.
       // Note in some cases we'll have a non-empty block without yet having
       // translated any bytecodes. For example, if this is the first block and
       // there were prologue HIR instructions.
-      if (
+      if (!emitted_entry_guards &&
           // A completely empty block always gets a snapshot.
-          prev_hir_instr == nullptr ||
-          (
-              // If we already have HIR instructions but haven't processed a
-              // bytecode yet then conservatively emit a Snapshot.
-              (prev_bc_instr.baseOffset() < 0 ||
-               // Only emit a Snapshot after bytecode instructions which might
-               // change the frame state.
-               should_snapshot(
-                   prev_bc_instr, is_in_async_for_header_block())))) {
+          (prev_hir_instr == nullptr ||
+           // If we already have HIR instructions but haven't processed a
+           // bytecode yet then conservatively emit a Snapshot.
+           prev_bc_instr.baseOffset() < 0 ||
+           // Only emit a Snapshot after bytecode instructions which might
+           // change the frame state.
+           should_snapshot(prev_bc_instr, is_in_async_for_header_block()))) {
         if (prev_hir_instr && prev_hir_instr->IsSnapshot()) {
           auto snapshot = static_cast<Snapshot*>(prev_hir_instr);
           snapshot->setFrameState(tc.frame);
@@ -1541,6 +1576,14 @@ void HIRBuilder::translate(
               opcodeName(opcode));
         default: {
           JIT_ABORT("Unhandled opcode {} ({})", opcode, opcodeName(opcode));
+        }
+      }
+
+      if (is_entry_setup_instr) {
+        if (opcode == RETURN_GENERATOR) {
+          saw_initial_yield = true;
+        } else if (opcode == POP_TOP && tc.frame.stack.isEmpty()) {
+          saw_initial_yield = false;
         }
       }
     }
