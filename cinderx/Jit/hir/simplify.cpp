@@ -19,6 +19,8 @@
 #include "cinderx/Jit/threaded_compile.h"
 #include "cinderx/StaticPython/strictmoduleobject.h"
 
+#include <cfloat>
+
 #include <fmt/ostream.h>
 
 #include <unordered_set>
@@ -989,6 +991,16 @@ Register* simplifyBinaryOp(Env& env, const BinaryOp* instr) {
         env.emit<UseType>(float_reg, TFloatExact);
         env.emit<UseType>(int_reg, int_reg->type());
         Register* unbox_float = env.emit<PrimitiveUnbox>(float_reg, TCDouble);
+        if (op == BinaryOpKind::kPower && long_val == 2) {
+          Register* result = env.emit<DoubleBinaryOp>(
+              BinaryOpKind::kMultiply, unbox_float, unbox_float);
+          Register* max_double =
+              env.emit<LoadConst>(Type::fromCDouble(DBL_MAX));
+          Register* is_finite = env.emit<PrimitiveCompare>(
+              PrimitiveCompareOp::kLessThan, result, max_double);
+          env.emitInstr<Guard>(is_finite);
+          return env.emit<PrimitiveBox>(result, TCDouble, *instr->frameState());
+        }
         Register* const_double =
             env.emit<LoadConst>(Type::fromCDouble(double_val));
         Register* unbox_left = int_on_right ? unbox_float : const_double;
@@ -1004,6 +1016,29 @@ Register* simplifyBinaryOp(Env& env, const BinaryOp* instr) {
             env.emit<DoubleBinaryOp>(op, unbox_left, unbox_right);
         return env.emit<PrimitiveBox>(result, TCDouble, *instr->frameState());
       }
+    }
+  }
+
+  if (op == BinaryOpKind::kPower && rhs->isA(TLongExact) &&
+      rhs->type().hasObjectSpec()) {
+    int overflow;
+    long long_val = PyLong_AsLongAndOverflow(
+        rhs->type().objectSpec(), &overflow);
+    if (!overflow && long_val == 2) {
+      Register* guarded_left =
+          env.emit<GuardType>(TFloatExact, lhs, *instr->frameState());
+      env.emit<UseType>(guarded_left, TFloatExact);
+      Register* unbox_left =
+          env.emit<PrimitiveUnbox>(guarded_left, TCDouble);
+      Register* result = env.emit<DoubleBinaryOp>(
+          BinaryOpKind::kMultiply, unbox_left, unbox_left);
+      Register* max_double =
+          env.emit<LoadConst>(Type::fromCDouble(DBL_MAX));
+      Register* is_finite = env.emit<PrimitiveCompare>(
+          PrimitiveCompareOp::kLessThan, result, max_double);
+      env.emitInstr<Guard>(is_finite);
+      return env.emit<PrimitiveBox>(
+          result, TCDouble, *instr->frameState());
     }
   }
 
@@ -1198,13 +1233,28 @@ Register* simplifyFloatBinaryOp(Env& env, const FloatBinaryOp* instr) {
   // into a call to sqrt().
   if (op == BinaryOpKind::kPower) {
     Type right_type = instr->right()->type();
-    if (right_type.hasObjectSpec() && PyFloat_Check(right_type.objectSpec()) &&
-        PyFloat_AS_DOUBLE(right_type.objectSpec()) == 0.5) {
-      Register* unbox_left = env.emit<PrimitiveUnbox>(instr->left(), TCDouble);
-      Register* half = env.emit<LoadConst>(Type::fromCDouble(0.5));
-      Register* result =
-          env.emit<DoubleBinaryOp>(BinaryOpKind::kPower, unbox_left, half);
-      return env.emit<PrimitiveBox>(result, TCDouble, *instr->frameState());
+    if (right_type.hasObjectSpec() && PyFloat_Check(right_type.objectSpec())) {
+      double val = PyFloat_AS_DOUBLE(right_type.objectSpec());
+      if (val == 0.5) {
+        Register* unbox_left =
+            env.emit<PrimitiveUnbox>(instr->left(), TCDouble);
+        Register* half = env.emit<LoadConst>(Type::fromCDouble(0.5));
+        Register* result =
+            env.emit<DoubleBinaryOp>(BinaryOpKind::kPower, unbox_left, half);
+        return env.emit<PrimitiveBox>(result, TCDouble, *instr->frameState());
+      }
+      if (val == 2.0) {
+        Register* unbox_left =
+            env.emit<PrimitiveUnbox>(instr->left(), TCDouble);
+        Register* result = env.emit<DoubleBinaryOp>(
+            BinaryOpKind::kMultiply, unbox_left, unbox_left);
+        Register* max_double =
+            env.emit<LoadConst>(Type::fromCDouble(DBL_MAX));
+        Register* is_finite = env.emit<PrimitiveCompare>(
+            PrimitiveCompareOp::kLessThan, result, max_double);
+        env.emitInstr<Guard>(is_finite);
+        return env.emit<PrimitiveBox>(result, TCDouble, *instr->frameState());
+      }
     }
   }
 
@@ -1428,14 +1478,15 @@ Register* simplifyLoadAttrSplitDict(
   if (attr_idx == -1) {
     return nullptr;
   }
-  // T244151823: For now we deopt on the type keys changing and in that case,
-  // de-opt the whole function. Ideally we'd just skip to the slow-path in this
-  // case.
+  // T244151823: For now we deopt on the type changing and in that case, de-opt
+  // the whole function. Ideally we'd just skip to the slow-path in this case.
+  // PyType_Modified() can notify watchers before the class dict update is
+  // visible, so a narrower split-dict patcher can miss descriptor additions.
   Register* receiver = load_attr->GetOperand(0);
   auto patchpoint = env.emitInstr<DeoptPatchpoint>(
-      env.func.allocateCodePatcher<SplitDictDeoptPatcher>(type, name, keys));
+      env.func.allocateCodePatcher<TypeDeoptPatcher>(type));
   patchpoint->setGuiltyReg(receiver);
-  patchpoint->setDescr("SplitDictDeoptPatcher");
+  patchpoint->setDescr("split dict type modified");
   env.emit<UseType>(receiver, receiver->type());
 
   Register* inline_values_valid = env.emit<LoadField>(
@@ -1496,9 +1547,9 @@ Register* simplifyLoadAttrSplitDict(
 
   Register* receiver = load_attr->GetOperand(0);
   auto patchpoint = env.emitInstr<DeoptPatchpoint>(
-      env.func.allocateCodePatcher<SplitDictDeoptPatcher>(type, name, keys));
+      env.func.allocateCodePatcher<TypeDeoptPatcher>(type));
   patchpoint->setGuiltyReg(receiver);
-  patchpoint->setDescr("SplitDictDeoptPatcher");
+  patchpoint->setDescr("split dict type modified");
   env.emit<UseType>(receiver, receiver->type());
 
   // PyDictOrValues is stored at -3 per _PyObject_DictOrValuesPointer

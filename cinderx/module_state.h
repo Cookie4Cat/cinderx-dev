@@ -137,6 +137,7 @@ struct ModuleState {
   // Index for the extra data that CinderX saves on code objects with
   // PyUnstable_Code_SetExtra, and loads with PyUnstable_Code_GetExtra.
   Py_ssize_t code_extra_index{-1};
+  Py_ssize_t osr_backedge_counters_extra_index{-1};
 
   // Whether the Static Python audit hook has been installed.
   bool sp_audit_hook_installed{false};

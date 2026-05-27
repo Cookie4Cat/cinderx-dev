@@ -3345,6 +3345,20 @@ class INSTR_CLASS(Snapshot, (), Operands<0>) {
   std::unique_ptr<FrameState> frame_state_{nullptr};
 };
 
+// Compilation anchor for a loop-header OSR secondary entry.
+class INSTR_CLASS(OSREntry, (), Operands<0>, DeoptBase) {
+ public:
+  explicit OSREntry(BCOffset target_offset)
+      : InstrT(), target_offset_{target_offset} {}
+
+  BCOffset targetOffset() const {
+    return target_offset_;
+  }
+
+ private:
+  BCOffset target_offset_;
+};
+
 // Used to indicate a control flow path that is statically known to be
 // unreachable. Executing an Unreachable at runtime can only happen due
 // to bugs in the compiler.

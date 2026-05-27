@@ -311,6 +311,13 @@ constexpr PhyRegisterSet ALL_REGISTERS = ALL_GP_REGISTERS | ALL_VECD_REGISTERS;
 constexpr PhyRegisterSet DISALLOWED_REGISTERS = PhyRegisterSet(X29) /* FP */ |
     X30 /* LR */ | XZR /* zero */ | X13 /* scratch0 */ | X14 /* scratch1 */ |
     X16 /* IP0 */ | D16 /* fp_scratch0 */ | D17 /* fp_scratch1 */;
+static_assert(
+    DISALLOWED_REGISTERS.Has(X30),
+    "AArch64 deopt trampoline stores zero in the X30 save slot");
+
+// OSR entry stubs use X9/X12 as internal scratch registers while materializing
+// Environ values and localsplus live-ins before jumping to the loop header.
+constexpr PhyRegisterSet OSR_STUB_SCRATCH_REGS = PhyRegisterSet(X9) | X12;
 
 constexpr PhyRegisterSet INIT_REGISTERS = ALL_REGISTERS - DISALLOWED_REGISTERS;
 

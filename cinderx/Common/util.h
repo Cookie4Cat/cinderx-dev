@@ -409,6 +409,10 @@ class FrozenList {
     return size_;
   }
 
+  bool empty() const {
+    return size_ == 0;
+  }
+
   // Set the size of the frozen list and build a new pointer to the data, then
   // fill the data with the default value for the type.
   //

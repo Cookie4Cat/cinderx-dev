@@ -5,9 +5,11 @@
 #include "cinderx/Jit/compiler.h"
 #include "cinderx/Jit/context.h"
 #include "cinderx/Jit/frame.h"
+#include "cinderx/Jit/jit_rt.h"
 #include "cinderx/Jit/pyjit.h"
 #include "cinderx/RuntimeTests/fixtures.h"
 
+#include <initializer_list>
 #include <memory>
 #include <stdexcept>
 #include <string>
@@ -115,6 +117,7 @@ TEST_F(JITConfigTest, DefaultHIROptsEnabled) {
   EXPECT_TRUE(opts.simplify);
   EXPECT_TRUE(opts.clean_cfg);
   EXPECT_TRUE(opts.dead_code_elim);
+  EXPECT_TRUE(opts.list_prefix_reverse_assign);
   EXPECT_TRUE(opts.phi_elim);
 }
 
@@ -1741,9 +1744,447 @@ Ref<> callJitOneArg(BorrowedRef<> mod, const char* name, PyObject* arg) {
   return result;
 }
 
+Ref<> makeLong(long value) {
+  return Ref<>::steal(PyLong_FromLong(value));
+}
+
+Ref<> makeList(std::initializer_list<long> values) {
+  auto list =
+      Ref<>::steal(PyList_New(static_cast<Py_ssize_t>(values.size())));
+  if (list == nullptr) {
+    return list;
+  }
+  Py_ssize_t idx = 0;
+  for (long value : values) {
+    PyObject* item = PyLong_FromLong(value);
+    if (item == nullptr) {
+      return Ref<>(nullptr);
+    }
+    PyList_SET_ITEM(list.get(), idx++, item);
+  }
+  return list;
+}
+
+Ref<> call2(PyObject* func, PyObject* arg0, PyObject* arg1) {
+  return Ref<>::steal(PyObject_CallFunctionObjArgs(
+      func, arg0, arg1, nullptr));
+}
+
+std::string pyRepr(BorrowedRef<> obj) {
+  auto repr = Ref<>::steal(PyObject_Repr(obj));
+  if (repr == nullptr) {
+    PyErr_Print();
+    throw std::runtime_error("PyObject_Repr failed");
+  }
+  const char* utf8 = PyUnicode_AsUTF8(repr);
+  if (utf8 == nullptr) {
+    PyErr_Print();
+    throw std::runtime_error("PyUnicode_AsUTF8 failed");
+  }
+  return utf8;
+}
+
+long getLongAttr(BorrowedRef<> obj, const char* name) {
+  auto attr = Ref<>::steal(PyObject_GetAttrString(obj, name));
+  if (attr == nullptr) {
+    PyErr_Print();
+    throw std::runtime_error(std::string("missing attribute ") + name);
+  }
+  return PyLong_AsLong(attr);
+}
+
+void expectPyEqual(BorrowedRef<> actual, BorrowedRef<> expected) {
+  int equal = PyObject_RichCompareBool(actual, expected, Py_EQ);
+  ASSERT_NE(equal, -1) << "comparison failed";
+  EXPECT_EQ(equal, 1) << pyRepr(actual) << " != " << pyRepr(expected);
+}
+
+void expectPrefixReverseHelperMatchesPython(
+    BorrowedRef<> original_func,
+    BorrowedRef<> actual,
+    BorrowedRef<> expected,
+    BorrowedRef<> actual_index,
+    BorrowedRef<> expected_index) {
+  auto original_result =
+      call2(original_func.get(), expected.get(), expected_index.get());
+  ASSERT_NE(original_result, nullptr) << "reference Python expression failed";
+
+  ASSERT_EQ(JITRT_ListPrefixReverseAssign(actual.get(), actual_index.get()), 0)
+      << "helper failed: " << (PyErr_Occurred() ? "exception set" : "no exception");
+  expectPyEqual(actual, original_result);
+}
+
 } // namespace
 
 class JITJitRtCoverageTest : public RuntimeTest {};
+
+TEST_F(JITJitRtCoverageTest, ListPrefixReverseAssignHelperFastPathSemantics) {
+  const char* py_src = R"(
+def original(seq, k):
+    seq[: k + 1] = seq[k::-1]
+    return seq
+)";
+  Ref<> original(compileAndGet(py_src, "original"));
+
+  {
+    Ref<> index = makeLong(3);
+    expectPrefixReverseHelperMatchesPython(
+        original,
+        makeList({0, 1, 2, 3, 4}),
+        makeList({0, 1, 2, 3, 4}),
+        index,
+        index);
+  }
+  {
+    Ref<> index = makeLong(10);
+    expectPrefixReverseHelperMatchesPython(
+        original,
+        makeList({0, 1, 2, 3, 4}),
+        makeList({0, 1, 2, 3, 4}),
+        index,
+        index);
+  }
+  {
+    Ref<> index = makeLong(10);
+    expectPrefixReverseHelperMatchesPython(
+        original, makeList({}), makeList({}), index, index);
+  }
+  {
+    Ref<> index = makeLong(10);
+    expectPrefixReverseHelperMatchesPython(
+        original, makeList({7}), makeList({7}), index, index);
+  }
+}
+
+TEST_F(JITJitRtCoverageTest, ListPrefixReverseAssignHelperFallbackSemantics) {
+  const char* py_src = R"(
+def original(seq, k):
+    seq[: k + 1] = seq[k::-1]
+    return seq
+
+class CountingList(list):
+    def __init__(self, value):
+        super().__init__(value)
+        self.get_count = 0
+        self.set_count = 0
+    def __getitem__(self, key):
+        self.get_count += 1
+        return super().__getitem__(key)
+    def __setitem__(self, key, value):
+        self.set_count += 1
+        return super().__setitem__(key, value)
+
+class CustomIndex:
+    def __init__(self, value):
+        self.value = value
+        self.index_count = 0
+        self.add_count = 0
+    def __index__(self):
+        self.index_count += 1
+        return self.value
+    def __add__(self, other):
+        self.add_count += 1
+        return self.value + other
+
+class CustomSequence:
+    def __init__(self, value):
+        self.data = list(value)
+        self.get_count = 0
+        self.set_count = 0
+    def __getitem__(self, key):
+        self.get_count += 1
+        return self.data[key]
+    def __setitem__(self, key, value):
+        self.set_count += 1
+        self.data[key] = value
+    def __eq__(self, other):
+        return isinstance(other, CustomSequence) and self.data == other.data
+)";
+  Ref<> original(compileAndGet(py_src, "original"));
+  Ref<> counting_list_type(getGlobal("CountingList"));
+  Ref<> custom_index_type(getGlobal("CustomIndex"));
+  Ref<> custom_sequence_type(getGlobal("CustomSequence"));
+
+  {
+    Ref<> index = makeLong(-1);
+    expectPrefixReverseHelperMatchesPython(
+        original,
+        makeList({0, 1, 2, 3, 4}),
+        makeList({0, 1, 2, 3, 4}),
+        index,
+        index);
+  }
+  {
+    expectPrefixReverseHelperMatchesPython(
+        original,
+        makeList({0, 1, 2}),
+        makeList({0, 1, 2}),
+        Ref<>::create(Py_True),
+        Ref<>::create(Py_True));
+  }
+  {
+    Ref<> source = makeList({0, 1, 2, 3});
+    Ref<> actual = Ref<>::steal(
+        PyObject_CallFunctionObjArgs(counting_list_type.get(), source.get(), nullptr));
+    Ref<> expected = Ref<>::steal(
+        PyObject_CallFunctionObjArgs(counting_list_type.get(), source.get(), nullptr));
+    Ref<> index = makeLong(2);
+    expectPrefixReverseHelperMatchesPython(original, actual, expected, index, index);
+    EXPECT_EQ(getLongAttr(actual, "get_count"), 1);
+    EXPECT_EQ(getLongAttr(actual, "set_count"), 1);
+  }
+  {
+    Ref<> actual_index = Ref<>::steal(
+        PyObject_CallFunction(custom_index_type.get(), "i", 2));
+    Ref<> expected_index = Ref<>::steal(
+        PyObject_CallFunction(custom_index_type.get(), "i", 2));
+    Ref<> actual = makeList({0, 1, 2, 3});
+    Ref<> expected = makeList({0, 1, 2, 3});
+    auto original_result =
+        call2(original.get(), expected.get(), expected_index.get());
+    ASSERT_NE(original_result, nullptr);
+
+    ASSERT_EQ(
+        JITRT_ListPrefixReverseAssign(actual.get(), actual_index.get()), 0);
+    expectPyEqual(actual, original_result);
+    EXPECT_GE(getLongAttr(actual_index, "index_count"), 1);
+    EXPECT_EQ(getLongAttr(actual_index, "add_count"), 1);
+  }
+  {
+    Ref<> source = makeList({0, 1, 2, 3});
+    Ref<> actual = Ref<>::steal(
+        PyObject_CallFunctionObjArgs(custom_sequence_type.get(), source.get(), nullptr));
+    Ref<> expected = Ref<>::steal(
+        PyObject_CallFunctionObjArgs(custom_sequence_type.get(), source.get(), nullptr));
+    Ref<> index = makeLong(2);
+    expectPrefixReverseHelperMatchesPython(original, actual, expected, index, index);
+    EXPECT_EQ(getLongAttr(actual, "get_count"), 1);
+    EXPECT_EQ(getLongAttr(actual, "set_count"), 1);
+  }
+}
+
+TEST_F(JITJitRtCoverageTest, ListPrefixReverseAssignHelperExceptionSideEffects) {
+  const char* py_src = R"(
+class GetError(Exception):
+    pass
+class AddError(Exception):
+    pass
+class SetError(Exception):
+    pass
+
+class RaisingSeq:
+    def __init__(self, phase):
+        self.phase = phase
+        self.get_count = 0
+        self.set_count = 0
+    def __getitem__(self, key):
+        self.get_count += 1
+        if self.phase == "get":
+            raise GetError("get")
+        return [2, 1, 0]
+    def __setitem__(self, key, value):
+        self.set_count += 1
+        if self.phase == "set":
+            raise SetError("set")
+
+class RaisingIndex:
+    def __init__(self, phase):
+        self.phase = phase
+        self.add_count = 0
+    def __index__(self):
+        return 2
+    def __add__(self, other):
+        self.add_count += 1
+        if self.phase == "add":
+            raise AddError("add")
+        return 3
+)";
+  Ref<> raising_seq_type(compileAndGet(py_src, "RaisingSeq"));
+  Ref<> raising_index_type(getGlobal("RaisingIndex"));
+  Ref<> get_error(getGlobal("GetError"));
+  Ref<> add_error(getGlobal("AddError"));
+  Ref<> set_error(getGlobal("SetError"));
+
+  {
+    Ref<> seq = Ref<>::steal(PyObject_CallFunction(raising_seq_type.get(), "s", "get"));
+    Ref<> index = Ref<>::steal(PyObject_CallFunction(raising_index_type.get(), "s", ""));
+    ASSERT_EQ(JITRT_ListPrefixReverseAssign(seq.get(), index.get()), -1);
+    EXPECT_TRUE(PyErr_ExceptionMatches(get_error.get()));
+    PyErr_Clear();
+    EXPECT_EQ(getLongAttr(seq, "get_count"), 1);
+    EXPECT_EQ(getLongAttr(seq, "set_count"), 0);
+    EXPECT_EQ(getLongAttr(index, "add_count"), 0);
+  }
+  {
+    Ref<> seq = Ref<>::steal(PyObject_CallFunction(raising_seq_type.get(), "s", ""));
+    Ref<> index = Ref<>::steal(PyObject_CallFunction(raising_index_type.get(), "s", "add"));
+    ASSERT_EQ(JITRT_ListPrefixReverseAssign(seq.get(), index.get()), -1);
+    EXPECT_TRUE(PyErr_ExceptionMatches(add_error.get()));
+    PyErr_Clear();
+    EXPECT_EQ(getLongAttr(seq, "get_count"), 1);
+    EXPECT_EQ(getLongAttr(seq, "set_count"), 0);
+    EXPECT_EQ(getLongAttr(index, "add_count"), 1);
+  }
+  {
+    Ref<> seq = Ref<>::steal(PyObject_CallFunction(raising_seq_type.get(), "s", "set"));
+    Ref<> index = Ref<>::steal(PyObject_CallFunction(raising_index_type.get(), "s", ""));
+    ASSERT_EQ(JITRT_ListPrefixReverseAssign(seq.get(), index.get()), -1);
+    EXPECT_TRUE(PyErr_ExceptionMatches(set_error.get()));
+    PyErr_Clear();
+    EXPECT_EQ(getLongAttr(seq, "get_count"), 1);
+    EXPECT_EQ(getLongAttr(seq, "set_count"), 1);
+    EXPECT_EQ(getLongAttr(index, "add_count"), 1);
+  }
+}
+
+TEST_F(JITJitRtCoverageTest, CompiledListPrefixReverseAssignFastPathSemantics) {
+  const char* py_src = R"(
+def target(seq, k):
+    seq[: k + 1] = seq[k::-1]
+    return seq
+)";
+  Ref<PyFunctionObject> target(compileAndGet(py_src, "target"));
+  ASSERT_EQ(jit::compileFunction(target), jit::Result::OK);
+
+  {
+    Ref<> seq = makeList({0, 1, 2, 3, 4});
+    Ref<> index = makeLong(3);
+    Ref<> result = Ref<>::steal(PyObject_CallFunctionObjArgs(
+        reinterpret_cast<PyObject*>(target.get()),
+        seq.get(),
+        index.get(),
+        nullptr));
+    ASSERT_NE(result, nullptr);
+    expectPyEqual(result, makeList({3, 2, 1, 0, 4}));
+  }
+  {
+    Ref<> seq = makeList({0, 1, 2, 3, 4});
+    Ref<> index = makeLong(10);
+    Ref<> result = Ref<>::steal(PyObject_CallFunctionObjArgs(
+        reinterpret_cast<PyObject*>(target.get()),
+        seq.get(),
+        index.get(),
+        nullptr));
+    ASSERT_NE(result, nullptr);
+    expectPyEqual(result, makeList({4, 3, 2, 1, 0}));
+  }
+  {
+    Ref<> seq = makeList({});
+    Ref<> index = makeLong(10);
+    Ref<> result = Ref<>::steal(PyObject_CallFunctionObjArgs(
+        reinterpret_cast<PyObject*>(target.get()),
+        seq.get(),
+        index.get(),
+        nullptr));
+    ASSERT_NE(result, nullptr);
+    expectPyEqual(result, makeList({}));
+  }
+  {
+    Ref<> seq = makeList({7});
+    Ref<> index = makeLong(10);
+    Ref<> result = Ref<>::steal(PyObject_CallFunctionObjArgs(
+        reinterpret_cast<PyObject*>(target.get()),
+        seq.get(),
+        index.get(),
+        nullptr));
+    ASSERT_NE(result, nullptr);
+    expectPyEqual(result, makeList({7}));
+  }
+}
+
+TEST_F(JITJitRtCoverageTest, CompiledListPrefixReverseAssignExceptionSideEffects) {
+  const char* py_src = R"(
+class GetError(Exception):
+    pass
+class AddError(Exception):
+    pass
+class SetError(Exception):
+    pass
+
+class RaisingSeq:
+    def __init__(self, phase):
+        self.phase = phase
+        self.get_count = 0
+        self.set_count = 0
+    def __getitem__(self, key):
+        self.get_count += 1
+        if self.phase == "get":
+            raise GetError("get")
+        return [2, 1, 0]
+    def __setitem__(self, key, value):
+        self.set_count += 1
+        if self.phase == "set":
+            raise SetError("set")
+
+class RaisingIndex:
+    def __init__(self, phase):
+        self.phase = phase
+        self.add_count = 0
+    def __index__(self):
+        return 2
+    def __add__(self, other):
+        self.add_count += 1
+        if self.phase == "add":
+            raise AddError("add")
+        return 3
+
+def target(seq, k):
+    seq[: k + 1] = seq[k::-1]
+)";
+  Ref<PyFunctionObject> target(compileAndGet(py_src, "target"));
+  Ref<> raising_seq_type(getGlobal("RaisingSeq"));
+  Ref<> raising_index_type(getGlobal("RaisingIndex"));
+  Ref<> get_error(getGlobal("GetError"));
+  Ref<> add_error(getGlobal("AddError"));
+  Ref<> set_error(getGlobal("SetError"));
+  ASSERT_EQ(jit::compileFunction(target), jit::Result::OK);
+
+  {
+    Ref<> seq = Ref<>::steal(PyObject_CallFunction(raising_seq_type.get(), "s", "get"));
+    Ref<> index = Ref<>::steal(PyObject_CallFunction(raising_index_type.get(), "s", ""));
+    Ref<> result = Ref<>::steal(PyObject_CallFunctionObjArgs(
+        reinterpret_cast<PyObject*>(target.get()),
+        seq.get(),
+        index.get(),
+        nullptr));
+    ASSERT_EQ(result, nullptr);
+    EXPECT_TRUE(PyErr_ExceptionMatches(get_error.get()));
+    PyErr_Clear();
+    EXPECT_EQ(getLongAttr(seq, "get_count"), 1);
+    EXPECT_EQ(getLongAttr(seq, "set_count"), 0);
+    EXPECT_EQ(getLongAttr(index, "add_count"), 0);
+  }
+  {
+    Ref<> seq = Ref<>::steal(PyObject_CallFunction(raising_seq_type.get(), "s", ""));
+    Ref<> index = Ref<>::steal(PyObject_CallFunction(raising_index_type.get(), "s", "add"));
+    Ref<> result = Ref<>::steal(PyObject_CallFunctionObjArgs(
+        reinterpret_cast<PyObject*>(target.get()),
+        seq.get(),
+        index.get(),
+        nullptr));
+    ASSERT_EQ(result, nullptr);
+    EXPECT_TRUE(PyErr_ExceptionMatches(add_error.get()));
+    PyErr_Clear();
+    EXPECT_EQ(getLongAttr(seq, "get_count"), 1);
+    EXPECT_EQ(getLongAttr(seq, "set_count"), 0);
+    EXPECT_EQ(getLongAttr(index, "add_count"), 1);
+  }
+  {
+    Ref<> seq = Ref<>::steal(PyObject_CallFunction(raising_seq_type.get(), "s", "set"));
+    Ref<> index = Ref<>::steal(PyObject_CallFunction(raising_index_type.get(), "s", ""));
+    Ref<> result = Ref<>::steal(PyObject_CallFunctionObjArgs(
+        reinterpret_cast<PyObject*>(target.get()),
+        seq.get(),
+        index.get(),
+        nullptr));
+    ASSERT_EQ(result, nullptr);
+    EXPECT_TRUE(PyErr_ExceptionMatches(set_error.get()));
+    PyErr_Clear();
+    EXPECT_EQ(getLongAttr(seq, "get_count"), 1);
+    EXPECT_EQ(getLongAttr(seq, "set_count"), 1);
+    EXPECT_EQ(getLongAttr(index, "add_count"), 1);
+  }
+}
 
 TEST_F(JITJitRtCoverageTest, CompiledArithmeticUnaryModAndPower) {
   const char* py_src = R"(

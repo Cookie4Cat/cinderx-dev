@@ -1209,7 +1209,8 @@ void bindGuards(Function& irfunc) {
         snapshots.emplace_back(&instr);
       } else if (
           instr.IsGuard() || instr.IsGuardIs() || instr.IsGuardType() ||
-          instr.IsDeopt() || instr.IsDeoptPatchpoint()) {
+          instr.IsDeopt() || instr.IsDeoptPatchpoint() ||
+          instr.IsOSREntry()) {
         JIT_DCHECK(
             fs != nullptr,
             "No dominating snapshot for '{}' in function:\n{}",

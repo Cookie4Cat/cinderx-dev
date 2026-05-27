@@ -24,6 +24,7 @@ extern "C" {
 #include "cinderx/Jit/hir/array_specialize.h"
 #include "cinderx/Jit/hir/ssa.h"
 #include "cinderx/Jit/hir/type.h"
+#include "cinderx/Jit/jit_rt.h"
 #include "cinderx/Jit/threaded_compile.h"
 #include "cinderx/StaticPython/checked_dict.h"
 #include "cinderx/StaticPython/checked_list.h"
@@ -563,6 +564,25 @@ static bool should_snapshot(
   }
 }
 
+static bool isEntrySetupInstr(
+    const BytecodeInstruction& bci,
+    bool initial_yield_value_on_stack) {
+  switch (bci.opcode()) {
+    case COPY_FREE_VARS:
+    case GEN_START:
+    case MAKE_CELL:
+    case NOP:
+    case NOT_TAKEN:
+    case RESUME:
+    case RETURN_GENERATOR:
+      return true;
+    case POP_TOP:
+      return initial_yield_value_on_stack;
+    default:
+      return false;
+  }
+}
+
 // Compute basic block boundaries and allocate corresponding HIR blocks
 HIRBuilder::BlockMap HIRBuilder::createBlocks(
     Function& irfunc,
@@ -654,16 +674,54 @@ std::unique_ptr<Function> HIRBuilder::buildHIR() {
 
 // Loop through each of the arguments on the current translation context and
 // check and see if there is any annotation to guard against.
-void HIRBuilder::emitTypeAnnotationGuards(TranslationContext& tc) {
+bool HIRBuilder::emitTypeAnnotationGuards(TranslationContext& tc) {
   AnnotationIndex* index = preloader_.annotations();
+  bool first = true;
+
+  auto emit_arg_guard = [&](int arg_idx,
+                            Type type,
+                            bool needs_frame_state = false) {
+    // If we have a guard to emit, we need a snapshot for deopt. Callers should
+    // only emit entry guards after any bytecode setup required by the frame has
+    // been translated, so the current instruction offset is a valid resume
+    // point.
+    if (first) {
+      first = false;
+      tc.emitSnapshot();
+    }
+
+    auto arg = tc.frame.localsplus.at(arg_idx);
+    JIT_CHECK(arg != nullptr, "No register for argument {}", arg_idx);
+    if (needs_frame_state) {
+      tc.emit<GuardType>(arg, type, arg, tc.frame);
+    } else {
+      tc.emit<GuardType>(arg, type, arg);
+    }
+  };
+
+  auto emit_inferred_self_guard = [&]() {
+    auto inferred_self_type = preloader_.inferredSelfType();
+    if (!inferred_self_type) {
+      return;
+    }
+
+    auto arg = tc.frame.localsplus.at(0);
+    JIT_CHECK(arg != nullptr, "No register for argument 0");
+    if (arg->type() != TTop && arg->type() != TObject) {
+      return;
+    }
+
+    emit_arg_guard(0, *inferred_self_type, /*needs_frame_state=*/true);
+  };
+
+  emit_inferred_self_guard();
 
   // Bail out if there are no annotations.
   if (!index) {
-    return;
+    return !first;
   }
 
   PyCodeObject* const code = tc.frame.code;
-  bool first = true;
 
   for (int arg_idx = 0; arg_idx < preloader_.numArgs(); arg_idx++) {
     PyObject* annotation = index->find(getVarname(code, arg_idx));
@@ -678,28 +736,12 @@ void HIRBuilder::emitTypeAnnotationGuards(TranslationContext& tc) {
       continue;
     }
 
-    // If we have an annotation that we are going to guard against, we need to
-    // emit a snapshot for the guard.
-    //
-    // It's likely that no bytecode instructions have been compiled yet, meaning
-    // the instruction offset has not yet been set. Setting it to zero here
-    // ensures that if we need to deopt that it starts executing the first
-    // instruction.
-    if (first) {
-      first = false;
-      tc.frame.cur_instr_offs = BCOffset(0);
-      tc.emitSnapshot();
-    }
-
-    // Now guard against the type of the argument.
-    auto arg = tc.frame.localsplus.at(arg_idx);
-    JIT_CHECK(arg != nullptr, "No register for argument {}", arg_idx);
-
     Type type =
         Type::fromTypeExact(reinterpret_cast<PyTypeObject*>(annotation));
-
-    tc.emit<GuardType>(arg, type, arg);
+    emit_arg_guard(arg_idx, type);
   }
+
+  return !first;
 }
 
 BasicBlock* HIRBuilder::buildHIRImpl(
@@ -745,8 +787,6 @@ BasicBlock* HIRBuilder::buildHIRImpl(
   if (frame_state == nullptr) {
     entry_tc.emit<LoadFrame>();
   }
-
-  emitTypeAnnotationGuards(entry_tc);
 
   // "Initial Yield" has an explicit bytecode instruction in
   // "RETURN_GENERATOR" and so is emitted at the appropriate time.
@@ -849,6 +889,9 @@ void HIRBuilder::translate(
   std::deque<TranslationContext> queue = {initial_tc};
   std::unordered_set<BasicBlock*> processed;
   std::unordered_set<BasicBlock*> loop_headers;
+  bool entry_guards_emitted = false;
+  bool in_entry_setup = true;
+  bool saw_initial_yield = false;
 
   while (!queue.empty()) {
     auto tc = std::move(queue.front());
@@ -860,6 +903,7 @@ void HIRBuilder::translate(
 
     // Translate remaining instructions into HIR
     auto& bc_block = map_get(block_map_.bc_blocks, tc.block);
+    bool is_entry_bc_block = bc_block.startOffset() == BCOffset{0};
 
     auto is_in_async_for_header_block = [&tc, &bc_instrs]() {
       if (tc.frame.block_stack.isEmpty()) {
@@ -875,21 +919,35 @@ void HIRBuilder::translate(
 
       tc.frame.cur_instr_offs = bc_instr.baseOffset();
       Instr* prev_hir_instr = tc.block->GetTerminator();
+      bool emitted_entry_guards = false;
+      bool initial_yield_value_on_stack =
+          saw_initial_yield && !tc.frame.stack.isEmpty();
+      bool is_entry_setup_instr = is_entry_bc_block && in_entry_setup &&
+          isEntrySetupInstr(bc_instr, initial_yield_value_on_stack);
+      if (is_entry_bc_block && !entry_guards_emitted &&
+          !is_entry_setup_instr) {
+        JIT_DCHECK(
+            tc.frame.stack.isEmpty(),
+            "entry guards inserted with non-empty operand stack");
+        if (tc.frame.stack.isEmpty()) {
+          emitted_entry_guards = emitTypeAnnotationGuards(tc);
+        }
+        entry_guards_emitted = true;
+        in_entry_setup = false;
+      }
       // Outputting too many snapshots is safe but noisy so try to cull.
       // Note in some cases we'll have a non-empty block without yet having
       // translated any bytecodes. For example, if this is the first block and
       // there were prologue HIR instructions.
-      if (
+      if (!emitted_entry_guards &&
           // A completely empty block always gets a snapshot.
-          prev_hir_instr == nullptr ||
-          (
-              // If we already have HIR instructions but haven't processed a
-              // bytecode yet then conservatively emit a Snapshot.
-              (prev_bc_instr.baseOffset() < 0 ||
-               // Only emit a Snapshot after bytecode instructions which might
-               // change the frame state.
-               should_snapshot(
-                   prev_bc_instr, is_in_async_for_header_block())))) {
+          (prev_hir_instr == nullptr ||
+           // If we already have HIR instructions but haven't processed a
+           // bytecode yet then conservatively emit a Snapshot.
+           prev_bc_instr.baseOffset() < 0 ||
+           // Only emit a Snapshot after bytecode instructions which might
+           // change the frame state.
+           should_snapshot(prev_bc_instr, is_in_async_for_header_block()))) {
         if (prev_hir_instr && prev_hir_instr->IsSnapshot()) {
           auto snapshot = static_cast<Snapshot*>(prev_hir_instr);
           snapshot->setFrameState(tc.frame);
@@ -1107,6 +1165,10 @@ void HIRBuilder::translate(
         }
         case LOAD_FAST_LOAD_FAST:
         case LOAD_FAST_BORROW_LOAD_FAST_BORROW: {
+          if (tryEmitListPrefixReverseAssign(tc, bc_it, bc_block.end())) {
+            prev_bc_instr = *bc_it;
+            break;
+          }
           emitLoadFastLoadFast(tc, bc_instr);
           break;
         }
@@ -1608,6 +1670,14 @@ void HIRBuilder::translate(
               opcodeName(opcode));
         default: {
           JIT_ABORT("Unhandled opcode {} ({})", opcode, opcodeName(opcode));
+        }
+      }
+
+      if (is_entry_setup_instr) {
+        if (opcode == RETURN_GENERATOR) {
+          saw_initial_yield = true;
+        } else if (opcode == POP_TOP && tc.frame.stack.isEmpty()) {
+          saw_initial_yield = false;
         }
       }
     }
@@ -4096,6 +4166,119 @@ BasicBlock* HIRBuilder::emitArrayTypecodeCheck(
   BasicBlock* tc_ok = cfg.AllocateBlock();
   tc.emit<CondBranch>(tc_match, tc_ok, slow_path);
   return tc_ok;
+}
+
+bool HIRBuilder::tryEmitListPrefixReverseAssign(
+    TranslationContext& tc,
+    jit::BytecodeInstructionBlock::Iterator& bc_it,
+    const jit::BytecodeInstructionBlock::Iterator& bc_end) {
+#if PY_VERSION_HEX >= 0x030E0000 && PY_VERSION_HEX < 0x030F0000
+  if (!getConfig().hir_opts.list_prefix_reverse_assign) {
+    return false;
+  }
+
+  auto it = bc_it;
+  auto next = [&]() -> std::optional<BytecodeInstruction> {
+    if (it == bc_end) {
+      return std::nullopt;
+    }
+    BytecodeInstruction instr = *it;
+    ++it;
+    return instr;
+  };
+  auto const_obj = [&](const BytecodeInstruction& instr) -> PyObject* {
+    if (instr.opcode() != LOAD_CONST) {
+      return nullptr;
+    }
+    if (instr.oparg() < 0 ||
+        instr.oparg() >= PyTuple_GET_SIZE(code_->co_consts)) {
+      return nullptr;
+    }
+    return PyTuple_GET_ITEM(code_->co_consts, instr.oparg());
+  };
+  auto is_const = [&](const BytecodeInstruction& instr, PyObject* obj) {
+    return const_obj(instr) == obj;
+  };
+  auto is_const_long = [&](const BytecodeInstruction& instr, long value) {
+    PyObject* obj = const_obj(instr);
+    if (obj == nullptr || !PyLong_CheckExact(obj)) {
+      return false;
+    }
+    int overflow = 0;
+    long actual = PyLong_AsLongAndOverflow(obj, &overflow);
+    return overflow == 0 && actual == value;
+  };
+
+  auto first = next();
+  if (!first.has_value() ||
+      (first->opcode() != LOAD_FAST_BORROW_LOAD_FAST_BORROW &&
+       first->opcode() != LOAD_FAST_LOAD_FAST)) {
+    return false;
+  }
+  int container_idx = first->oparg() >> 4;
+  int index_idx = first->oparg() & 0xf;
+  size_t localsplus_size = tc.frame.localsplus.size();
+  if (container_idx >= localsplus_size || index_idx >= localsplus_size) {
+    return false;
+  }
+
+  auto rhs_stop = next();
+  auto rhs_step = next();
+  auto rhs_build_slice = next();
+  auto rhs_subscr = next();
+  auto lhs_container = next();
+  auto lhs_start = next();
+  auto lhs_index = next();
+  auto lhs_one = next();
+  auto lhs_add = next();
+  auto store_slice_it = it;
+  auto store_slice = next();
+  if (!rhs_stop || !rhs_step || !rhs_build_slice || !rhs_subscr ||
+      !lhs_container || !lhs_start || !lhs_index || !lhs_one || !lhs_add ||
+      !store_slice) {
+    return false;
+  }
+  if (!is_const(*rhs_stop, Py_None) || !is_const_long(*rhs_step, -1) ||
+      rhs_build_slice->opcode() != BUILD_SLICE || rhs_build_slice->oparg() != 3 ||
+      rhs_subscr->opcode() != BINARY_OP || rhs_subscr->oparg() != NB_SUBSCR ||
+      lhs_container->opcode() != LOAD_FAST_BORROW ||
+      lhs_container->oparg() != container_idx ||
+      !is_const(*lhs_start, Py_None) ||
+      lhs_index->opcode() != LOAD_FAST_BORROW ||
+      lhs_index->oparg() != index_idx ||
+      lhs_one->opcode() != LOAD_SMALL_INT || lhs_one->oparg() != 1 ||
+      lhs_add->opcode() != BINARY_OP || lhs_add->oparg() != NB_ADD ||
+      store_slice->opcode() != STORE_SLICE) {
+    return false;
+  }
+
+  Register* container = tc.frame.localsplus[container_idx];
+  Register* index = tc.frame.localsplus[index_idx];
+  if (container == nullptr || index == nullptr) {
+    return false;
+  }
+
+  auto output = temps_.AllocateStack();
+  tc.emit<CallStatic>(
+      2,
+      output,
+      reinterpret_cast<void*>(JITRT_ListPrefixReverseAssign),
+      TCInt32,
+      container,
+      index);
+  // The helper owns the entire folded operation.  On failure it has already
+  // performed any Python-visible work that the original bytecode prefix would
+  // have performed, then returns -1 with a Python exception set.  CheckNeg uses
+  // the frame state only for the exception edge; it must not resume the
+  // interpreter at this bytecode and replay the folded slice operations.
+  // RuntimeTests cover the may-raise fallback paths and assert that already
+  // executed Python side effects are not repeated.
+  tc.emit<CheckNeg>(output, output, tc.frame);
+  bc_it = store_slice_it;
+  return true;
+#else
+  return false;
+#endif
 }
 
 void HIRBuilder::emitStoreSubscr(

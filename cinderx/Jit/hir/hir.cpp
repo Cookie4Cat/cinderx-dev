@@ -222,9 +222,16 @@ void* Instr::operator new(std::size_t count, void* ptr) {
   return ::operator new(count, ptr);
 }
 
+namespace {
+void* instrBaseFromHeader(void* ptr) {
+  auto operand_count_addr = static_cast<char*>(ptr) - sizeof(std::size_t);
+  auto num_operands = *reinterpret_cast<std::size_t*>(operand_count_addr);
+  return operand_count_addr - (num_operands * kPointerSize);
+}
+} // namespace
+
 void Instr::operator delete(void* ptr) {
-  auto instr = static_cast<Instr*>(ptr);
-  free(instr->base());
+  free(instrBaseFromHeader(ptr));
 }
 
 Instr::Instr(Opcode opcode) : opcode_{opcode} {}
@@ -496,6 +503,7 @@ bool Instr::isReplayable() const {
     case Opcode::kMatchClass:
     case Opcode::kMatchKeys:
     case Opcode::kMergeSetUnpack:
+    case Opcode::kOSREntry:
     case Opcode::kPhi:
     case Opcode::kRaiseAwaitableError:
     case Opcode::kReturn:
@@ -621,8 +629,7 @@ const DeoptBase* Instr::asDeoptBase() const {
 }
 
 void* Instr::base() {
-  return reinterpret_cast<char*>(this) - (NumOperands() * kPointerSize) -
-      sizeof(size_t);
+  return instrBaseFromHeader(this);
 }
 
 Register** Instr::operands() {
@@ -844,6 +851,7 @@ bool isPassthrough(const Instr& instr) {
     case Opcode::kSetCellItem:
     case Opcode::kSetFunctionAttr:
     case Opcode::kSnapshot:
+    case Opcode::kOSREntry:
     case Opcode::kStoreField:
     case Opcode::kUpdatePrevInstr:
     case Opcode::kUnreachable:
