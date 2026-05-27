@@ -4,7 +4,9 @@
 
 #include "cinderx/RuntimeTests/fixtures.h"
 
+#include "cinderx/Jit/compiler.h"
 #include "cinderx/Jit/hir/hir.h"
+#include "cinderx/Jit/hir/printer.h"
 #include "cinderx/Jit/hir/simplify.h"
 #include "cinderx/Jit/hir/ssa.h"
 
@@ -16,6 +18,38 @@ namespace {
 void runArrayFastPath(std::unique_ptr<jit::hir::Function>& irfunc) {
   jit::hir::SSAify{}.Run(*irfunc);
   jit::hir::Simplify{}.Run(*irfunc);
+}
+
+size_t countDoubleArrayLoads(const jit::hir::Function& irfunc) {
+  size_t count = 0;
+  for (auto& block : irfunc.cfg.blocks) {
+    for (auto it = block.begin(); it != block.end(); ++it) {
+      auto& instr = *it;
+      if (instr.IsLoadArrayItem()) {
+        auto* lai = static_cast<const jit::hir::LoadArrayItem*>(&instr);
+        if (lai->type() <= jit::hir::TCDouble) {
+          ++count;
+        }
+      }
+    }
+  }
+  return count;
+}
+
+size_t countBinarySubscrs(const jit::hir::Function& irfunc) {
+  size_t count = 0;
+  for (auto& block : irfunc.cfg.blocks) {
+    for (auto it = block.begin(); it != block.end(); ++it) {
+      auto& instr = *it;
+      if (instr.IsBinaryOp()) {
+        auto* binop = static_cast<const jit::hir::BinaryOp*>(&instr);
+        if (binop->op() == jit::hir::BinaryOpKind::kSubscript) {
+          ++count;
+        }
+      }
+    }
+  }
+  return count;
 }
 } // namespace
 
@@ -166,4 +200,23 @@ def load_array_double(a, i):
 
   EXPECT_TRUE(found_cond_branch_check)
       << "Expected CondBranchCheckType guard for array type check";
+}
+
+TEST_F(ArrayLoadTest, SlowPathIsNotReSpecializedAcrossSimplifyPasses) {
+  std::unique_ptr<jit::hir::Function> irfunc;
+  CompileToHIR(
+      R"(
+def load_any(a, i):
+    return a[i]
+)",
+      "load_any",
+      irfunc);
+
+  ASSERT_NE(irfunc, nullptr);
+
+  jit::Compiler::runPasses(*irfunc, jit::PassConfig::kSimplify);
+
+  std::string hir = jit::hir::HIRPrinter{}.ToString(*irfunc);
+  EXPECT_EQ(countDoubleArrayLoads(*irfunc), 1) << hir;
+  EXPECT_EQ(countBinarySubscrs(*irfunc), 1) << hir;
 }

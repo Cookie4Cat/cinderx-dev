@@ -567,8 +567,11 @@ class INSTR_CLASS(
       BinaryOpKind op,
       Register* left,
       Register* right,
-      const FrameState& frame)
-      : InstrT(dst, left, right, frame), op_(op) {}
+      const FrameState& frame,
+      bool array_subscr_slow_path = false)
+      : InstrT(dst, left, right, frame),
+        op_(op),
+        array_subscr_slow_path_(array_subscr_slow_path) {}
 
   BinaryOpKind op() const {
     return op_;
@@ -582,8 +585,13 @@ class INSTR_CLASS(
     return GetOperand(1);
   }
 
+  bool isArraySubscrSlowPath() const {
+    return array_subscr_slow_path_;
+  }
+
  private:
   BinaryOpKind op_;
+  bool array_subscr_slow_path_;
 };
 
 #define FOREACH_UNARY_OP_KIND(V) \

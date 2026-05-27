@@ -92,11 +92,6 @@ struct Env {
   // Number of new basic blocks added by the simplifier.
   size_t new_blocks{0};
 
-  // Generic subscript instructions emitted on the slow path of an array.array
-  // fast path. They must not be re-specialized on subsequent fixpoint
-  // iterations, or the simplifier would wrap them in another guard forever.
-  std::unordered_set<const Instr*> array_specialize_slow_paths;
-
   // Create and insert the specified instruction. If the instruction has an
   // output, a new Register* will be created and returned.
   template <typename T, typename... Args>
@@ -748,7 +743,7 @@ Register* trySimplifyArraySubscr(Env& env, const BinaryOp* instr) {
     return nullptr;
   }
   // The generic BinaryOp we leave on the slow path must not be re-specialized.
-  if (env.array_specialize_slow_paths.count(instr)) {
+  if (instr->isArraySubscrSlowPath()) {
     return nullptr;
   }
   PyTypeObject* array_type = getStdlibArrayType();
@@ -815,8 +810,12 @@ Register* trySimplifyArraySubscr(Env& env, const BinaryOp* instr) {
   env.block = slow;
   env.cursor = slow->end();
   BinaryOp* slow_instr =
-      env.emitInstr<BinaryOp>(BinaryOpKind::kSubscript, container, sub, frame);
-  env.array_specialize_slow_paths.insert(slow_instr);
+      env.emitInstr<BinaryOp>(
+          BinaryOpKind::kSubscript,
+          container,
+          sub,
+          frame,
+          /* array_subscr_slow_path= */ true);
   Register* slow_result = slow_instr->output();
   env.emit<Branch>(done);
 
