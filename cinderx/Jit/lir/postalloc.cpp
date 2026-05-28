@@ -9,6 +9,7 @@
 #include "cinderx/Jit/lir/operand.h"
 #include "cinderx/Jit/lir/printer.h"
 
+#include <algorithm>
 #include <optional>
 
 using namespace jit::codegen;
@@ -1269,6 +1270,215 @@ class RegisterToMemoryMoves {
   }
 };
 
+#if defined(CINDER_AARCH64)
+bool isArgumentRegister(PhyLocation reg, bool is_fp) {
+  const auto& arg_regs = is_fp ? FP_ARGUMENT_REGS : ARGUMENT_REGS;
+  return std::find(arg_regs.begin(), arg_regs.end(), reg) != arg_regs.end();
+}
+
+bool operandUsesRegister(const OperandBase* operand, PhyLocation reg) {
+  if (operand->isReg()) {
+    return operand->getPhyRegister() == reg;
+  }
+
+  if (!operand->isInd()) {
+    return false;
+  }
+
+  auto* ind = operand->getMemoryIndirect();
+  auto* base = ind->getBaseRegOperand();
+  if (base != nullptr && base->isReg() && base->getPhyRegister() == reg) {
+    return true;
+  }
+
+  auto* index = ind->getIndexRegOperand();
+  return index != nullptr && index->isReg() &&
+      index->getPhyRegister() == reg;
+}
+
+bool instrUsesRegister(const Instruction* instr, PhyLocation reg) {
+  bool used = false;
+  instr->foreachInputOperand([&](const OperandBase* operand) {
+    used |= operandUsesRegister(operand, reg);
+  });
+  return used || operandUsesRegister(instr->output(), reg);
+}
+
+bool isSelfMove(const Instruction* instr) {
+  if (!instr->isMove()) {
+    return false;
+  }
+
+  auto out = instr->output();
+  auto in = instr->getInput(0);
+  return out->isReg() && in->isReg() &&
+      out->getPhyRegister() == in->getPhyRegister();
+}
+
+bool isCallResultFoldBarrier(const Instruction* instr) {
+  if (instr->opcode() == Instruction::kOSREntry) {
+    return true;
+  }
+
+  return InstrProperty::getProperties(instr->opcode()).flag_effects ==
+      FlagEffects::kInvalidate;
+}
+
+const OperandBase* getImplicitDefOperand(const Instruction* instr) {
+  if (instr->getNumOutputs() != 0) {
+    return nullptr;
+  }
+
+  switch (instr->opcode()) {
+    case Instruction::kNegate:
+    case Instruction::kInvert:
+    case Instruction::kAdd:
+    case Instruction::kSub:
+    case Instruction::kAnd:
+    case Instruction::kOr:
+    case Instruction::kXor:
+    case Instruction::kMul:
+    case Instruction::kFadd:
+    case Instruction::kFsub:
+    case Instruction::kFmul:
+    case Instruction::kFdiv:
+    case Instruction::kInc:
+    case Instruction::kDec:
+      return instr->getInput(0);
+    case Instruction::kDiv:
+    case Instruction::kDivUn:
+      if (instr->getNumInputs() == 3 && instr->getInput(0)->isImm()) {
+        return instr->getInput(1);
+      }
+      return instr->getInput(0);
+    default:
+      return nullptr;
+  }
+}
+
+bool instrDefinesRegister(const Instruction* instr, PhyLocation reg) {
+  auto out = instr->output();
+  if (out->isReg() && out->getPhyRegister() == reg) {
+    return true;
+  }
+
+  if (instr->isExchange()) {
+    auto in = instr->getInput(0);
+    return in->isReg() && in->getPhyRegister() == reg;
+  }
+
+  auto implicit_def = getImplicitDefOperand(instr);
+  return implicit_def != nullptr && implicit_def->isReg() &&
+      implicit_def->getPhyRegister() == reg;
+}
+
+bool isRegisterMove(
+    const Instruction* instr,
+    PhyLocation dst,
+    PhyLocation src,
+    bool is_fp) {
+  if (!instr->isMove()) {
+    return false;
+  }
+
+  auto out = instr->output();
+  auto in = instr->getInput(0);
+  return out->isReg() && in->isReg() && out->isFp() == is_fp &&
+      in->isFp() == is_fp && out->getPhyRegister() == dst &&
+      in->getPhyRegister() == src;
+}
+
+RewriteResult foldAarch64CallResultMoveChain(
+    BasicBlock* basicblock,
+    instr_iter_t instr_iter) {
+  auto instr = instr_iter->get();
+  if (!instr->isMove() || instr_iter == basicblock->instructions().begin()) {
+    return kUnchanged;
+  }
+
+  auto out = instr->output();
+  auto in = instr->getInput(0);
+  if (!out->isReg() || !in->isReg() || out->isFp() != in->isFp()) {
+    return kUnchanged;
+  }
+
+  const bool is_fp = out->isFp();
+  if (!isArgumentRegister(out->getPhyRegister(), is_fp)) {
+    return kUnchanged;
+  }
+
+  PhyLocation intermediate_reg = in->getPhyRegister();
+  PhyLocation ret_reg =
+      is_fp ? arch::reg_double_return_loc : arch::reg_general_return_loc;
+  if (intermediate_reg == ret_reg) {
+    return kUnchanged;
+  }
+
+  auto chain_iter = instr_iter;
+  bool found_chain = false;
+  auto scan_iter = instr_iter;
+  const auto block_begin = basicblock->instructions().begin();
+  while (scan_iter != block_begin) {
+    --scan_iter;
+    auto scan = scan_iter->get();
+
+    if (isSelfMove(scan)) {
+      continue;
+    }
+
+    if (isCallResultFoldBarrier(scan)) {
+      break;
+    }
+
+    if (isRegisterMove(scan, intermediate_reg, ret_reg, is_fp)) {
+      chain_iter = scan_iter;
+      found_chain = true;
+      break;
+    }
+
+    if (instrDefinesRegister(scan, intermediate_reg) ||
+        instrDefinesRegister(scan, ret_reg)) {
+      break;
+    }
+  }
+
+  if (!found_chain) {
+    return kUnchanged;
+  }
+
+  bool intermediate_used = false;
+  auto check_iter = chain_iter;
+  ++check_iter;
+  for (; check_iter != instr_iter; ++check_iter) {
+    auto check = check_iter->get();
+    if (isSelfMove(check)) {
+      continue;
+    }
+    if (instrUsesRegister(check, intermediate_reg)) {
+      intermediate_used = true;
+      break;
+    }
+  }
+
+  auto opnd = static_cast<Operand*>(in);
+  auto data_type = opnd->dataType();
+  auto old_opnd = fmt::to_string(*opnd);
+  opnd->setPhyRegister(ret_reg);
+  JIT_CHECK(
+      bitSize(data_type) == bitSize(opnd->dataType()),
+      "Incorrectly changed data type from {} to {} in {}",
+      old_opnd,
+      *opnd,
+      *instr);
+
+  if (opnd->isLastUse() && !intermediate_used) {
+    basicblock->instructions().erase(chain_iter);
+  }
+
+  return kChanged;
+}
+#endif
+
 // Replace memory input with register when possible within a basic block and
 // remove the unnecessary moves after the replacement.
 RewriteResult optimizeMoveSequence(BasicBlock* basicblock) {
@@ -1281,6 +1491,13 @@ RewriteResult optimizeMoveSequence(BasicBlock* basicblock) {
     auto& instr = *instr_iter;
     // TODO: do not optimize for yield for now. They need to be special cased.
     if (!instr->isAnyYield()) {
+#if defined(CINDER_AARCH64)
+      if (foldAarch64CallResultMoveChain(basicblock, instr_iter) ==
+          kChanged) {
+        changed = kChanged;
+      }
+#endif
+
       auto out_reg = instr->output()->isReg()
           ? instr->output()->getPhyRegister()
           : PhyLocation::REG_INVALID;
