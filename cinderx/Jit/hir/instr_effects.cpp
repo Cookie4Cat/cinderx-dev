@@ -325,6 +325,25 @@ MemoryEffects memoryEffects(const Instr& inst) {
     case Opcode::kCallCFunc:
       return commonEffects(inst, AManagedHeapAny);
 
+    // TreeIter state machine instructions.
+    case Opcode::kEnsureTreeIterState:
+    case Opcode::kSaveCurrentNode:
+    case Opcode::kStateStackPush:
+    case Opcode::kCheckTreeIterChildEntry:
+    case Opcode::kTreeIterEnterChild:
+    case Opcode::kTreeIterLeaveCurrentNode:
+    case Opcode::kClearTreeIterState:
+      return commonEffects(inst, AManagedHeapAny);
+    case Opcode::kLoadCurrentNode:
+    case Opcode::kStateStackPop:
+      return commonEffects(inst, AOther);
+    case Opcode::kSavePhase:
+      return commonEffects(inst, AOther);
+    case Opcode::kLoadPhase:
+    case Opcode::kLoadPoppedPhase:
+    case Opcode::kLoadStackTop:
+      return commonEffects(inst, AEmpty);
+
     case Opcode::kBranch:
     case Opcode::kCondBranch:
     case Opcode::kCondBranchCheckType:
@@ -451,6 +470,10 @@ bool hasArbitraryExecution(const Instr& inst) {
     case Opcode::kWaitHandleLoadWaiter:
     case Opcode::kWaitHandleRelease:
     case Opcode::kXIncref:
+    // TreeIter read-only phase/stack-top loads; no side effects.
+    case Opcode::kLoadPhase:
+    case Opcode::kLoadPoppedPhase:
+    case Opcode::kLoadStackTop:
       return false;
 
     /*
@@ -525,6 +548,17 @@ bool hasArbitraryExecution(const Instr& inst) {
     case Opcode::kVectorCall:
     case Opcode::kXDecref:
     case Opcode::kYieldValue:
+    // TreeIter state machine instructions with side effects or refcount ops.
+    case Opcode::kEnsureTreeIterState:
+    case Opcode::kSaveCurrentNode:
+    case Opcode::kLoadCurrentNode:
+    case Opcode::kSavePhase:
+    case Opcode::kStateStackPush:
+    case Opcode::kStateStackPop:
+    case Opcode::kCheckTreeIterChildEntry:
+    case Opcode::kTreeIterEnterChild:
+    case Opcode::kTreeIterLeaveCurrentNode:
+    case Opcode::kClearTreeIterState:
       return true;
 
     case Opcode::kCallCFunc:

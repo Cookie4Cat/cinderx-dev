@@ -702,6 +702,7 @@ JITRT_AllocateAndLinkGenAndInterpreterFrame(
   footer->yieldPoint = nullptr;
   footer->gen = static_cast<PyGenObject*>(gen);
   footer->code_rt = code_rt;
+  footer->tree_iter_state = nullptr;
   footer->originalFramePointer = original_frame_pointer;
   footer->linkAddress =
       *reinterpret_cast<uint64_t*>( // NOLINT performance-no-int-to-ptr
@@ -2202,4 +2203,135 @@ PyObject* JITRT_InvokeIterNext(PyObject* iterator) {
   }
   Py_INCREF(&JITRT_IterDoneSentinel);
   return &JITRT_IterDoneSentinel;
+}
+
+// ---------------------------------------------------------------------------
+// TreeIter state machine runtime helpers
+// ---------------------------------------------------------------------------
+
+int JITRT_EnsureTreeIterState(jit::GenDataFooter* footer) {
+  if (footer->tree_iter_state != nullptr) {
+    return 0;
+  }
+  jit::TreeIterState* state = jit::allocateTreeIterState();
+  if (state == nullptr) {
+    PyErr_NoMemory();
+    return -1;
+  }
+  footer->tree_iter_state = state;
+  return 0;
+}
+
+void JITRT_SaveCurrentNode(jit::GenDataFooter* footer, PyObject* node) {
+  jit::TreeIterState* state = footer->tree_iter_state;
+  JIT_DCHECK(state != nullptr, "tree_iter_state must be allocated");
+  if (node != nullptr) {
+    Py_INCREF(node);
+  }
+  PyObject* old = state->tree_iter_current_node;
+  state->tree_iter_current_node = node;
+  Py_XDECREF(old);
+}
+
+PyObject* JITRT_LoadCurrentNode(jit::GenDataFooter* footer) {
+  jit::TreeIterState* state = footer->tree_iter_state;
+  if (state == nullptr) {
+    return nullptr;
+  }
+  PyObject* node = state->tree_iter_current_node;
+  Py_XINCREF(node);
+  return node;
+}
+
+void JITRT_SavePhase(jit::GenDataFooter* footer, int32_t phase) {
+  jit::TreeIterState* state = footer->tree_iter_state;
+  JIT_DCHECK(state != nullptr, "tree_iter_state must be allocated");
+  state->tree_iter_current_phase = phase;
+}
+
+int32_t JITRT_LoadPhase(jit::GenDataFooter* footer) {
+  jit::TreeIterState* state = footer->tree_iter_state;
+  if (state == nullptr) {
+    return 0;
+  }
+  return state->tree_iter_current_phase;
+}
+
+int JITRT_StateStackPush(
+    jit::GenDataFooter* footer,
+    PyObject* node,
+    int32_t phase) {
+  jit::TreeIterState* state = footer->tree_iter_state;
+  JIT_DCHECK(state != nullptr, "tree_iter_state must be allocated");
+  int32_t top = state->tree_iter_stack_top;
+  if (top >= state->tree_iter_stack_capacity) {
+    int32_t new_cap = state->tree_iter_stack_capacity * 2;
+    auto* new_stack = static_cast<jit::TreeIterStackEntry*>(
+        std::realloc(
+            state->tree_iter_stack,
+            static_cast<std::size_t>(new_cap) *
+                sizeof(jit::TreeIterStackEntry)));
+    if (new_stack == nullptr) {
+      PyErr_NoMemory();
+      return -1;
+    }
+    state->tree_iter_stack = new_stack;
+    state->tree_iter_stack_capacity = new_cap;
+  }
+  if (node != nullptr) {
+    Py_INCREF(node);
+  }
+  state->tree_iter_stack[top].node = node;
+  state->tree_iter_stack[top].phase = phase;
+  state->tree_iter_stack_top = top + 1;
+  return 0;
+}
+
+PyObject* JITRT_StateStackPop(jit::GenDataFooter* footer) {
+  jit::TreeIterState* state = footer->tree_iter_state;
+  JIT_DCHECK(state != nullptr, "tree_iter_state must be allocated");
+  int32_t top = state->tree_iter_stack_top - 1;
+  JIT_DCHECK(top >= 0, "stack underflow in StateStackPop");
+  state->tree_iter_stack_top = top;
+  PyObject* node = state->tree_iter_stack[top].node;
+  state->tree_iter_popped_phase = state->tree_iter_stack[top].phase;
+  state->tree_iter_stack[top].node = nullptr;
+  state->tree_iter_stack[top].phase = 0;
+  return node;
+}
+
+int32_t JITRT_LoadPoppedPhase(jit::GenDataFooter* footer) {
+  jit::TreeIterState* state = footer->tree_iter_state;
+  if (state == nullptr) {
+    return 0;
+  }
+  return state->tree_iter_popped_phase;
+}
+
+int32_t JITRT_LoadStackTop(jit::GenDataFooter* footer) {
+  jit::TreeIterState* state = footer->tree_iter_state;
+  if (state == nullptr) {
+    return 0;
+  }
+  return state->tree_iter_stack_top;
+}
+
+void JITRT_CheckTreeIterChildEntry(
+    jit::GenDataFooter* /* footer */,
+    PyObject* /* child */) {
+  // Experimental first version: active-path/depth checks not yet implemented.
+}
+
+void JITRT_TreeIterEnterChild(
+    jit::GenDataFooter* /* footer */,
+    PyObject* /* child */) {
+  // Experimental first version: active-path tracking not yet implemented.
+}
+
+void JITRT_TreeIterLeaveCurrentNode(jit::GenDataFooter* /* footer */) {
+  // Experimental first version: active-path tracking not yet implemented.
+}
+
+void JITRT_ClearTreeIterState(jit::GenDataFooter* footer) {
+  jit::clearTreeIterState(footer);
 }

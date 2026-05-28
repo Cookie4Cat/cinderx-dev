@@ -4137,6 +4137,48 @@ const char* getInlineFailureName(InlineFailureType failure_type);
 FrameState* get_frame_state(Instr& instr);
 const FrameState* get_frame_state(const Instr& instr);
 
+// TreeIter state machine instructions.  These are emitted by
+// TreeIterStateMachinePass to implement the explicit in-order state machine
+// that replaces the recursive yield-from tree traversal.
+
+// Ensure footer->tree_iter_state is allocated.  Raises MemoryError on failure.
+DEFINE_SIMPLE_INSTR(EnsureTreeIterState, (), Operands<0>, DeoptBase);
+
+// Write/read tree_iter_current_node in the heap state.
+// SaveCurrentNode: Py_INCREF(new), write, Py_DECREF(old).
+DEFINE_SIMPLE_INSTR(SaveCurrentNode, (TObject), Operands<1>);
+// LoadCurrentNode: read current_node with Py_INCREF.
+DEFINE_SIMPLE_INSTR(LoadCurrentNode, (TObject), HasOutput, Operands<0>);
+
+// Write/read tree_iter_current_phase.
+DEFINE_SIMPLE_INSTR(SavePhase, (TCInt32), Operands<1>);
+DEFINE_SIMPLE_INSTR(LoadPhase, (TCInt32), HasOutput, Operands<0>);
+
+// Push (node, phase) onto the heap stack.  Raises MemoryError if growth fails.
+DEFINE_SIMPLE_INSTR(StateStackPush, (TObject, TCInt32), Operands<2>, DeoptBase);
+
+// Pop the top entry; transfers ownership of node to output; writes popped_phase.
+DEFINE_SIMPLE_INSTR(StateStackPop, (TObject), HasOutput, Operands<0>);
+
+// Read tree_iter_popped_phase (written by StateStackPop).
+DEFINE_SIMPLE_INSTR(LoadPoppedPhase, (TCInt32), HasOutput, Operands<0>);
+
+// Read tree_iter_stack_top.
+DEFINE_SIMPLE_INSTR(LoadStackTop, (TCInt32), HasOutput, Operands<0>);
+
+// Production gate: verify child identity is not in active-path and depth is
+// within budget.  No-op in experimental builds (all checks pass).
+DEFINE_SIMPLE_INSTR(CheckTreeIterChildEntry, (TObject), Operands<1>, DeoptBase);
+
+// Record child entry in active-path and increment depth.
+DEFINE_SIMPLE_INSTR(TreeIterEnterChild, (TObject), Operands<1>);
+
+// Remove current node from active-path and decrement depth.
+DEFINE_SIMPLE_INSTR(TreeIterLeaveCurrentNode, (), Operands<0>);
+
+// Release all owned refs in tree_iter_state and set footer pointer to nullptr.
+DEFINE_SIMPLE_INSTR(ClearTreeIterState, (), Operands<0>);
+
 } // namespace jit::hir
 
 template <>
