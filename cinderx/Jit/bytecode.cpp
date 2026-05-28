@@ -132,6 +132,12 @@ int BytecodeInstruction::specializedOpcode() const {
     case COMPARE_OP_FLOAT:
     case COMPARE_OP_INT:
     case COMPARE_OP_STR:
+#if PY_VERSION_HEX >= 0x030E0000
+    case TO_BOOL_BOOL:
+    case TO_BOOL_INT:
+    case TO_BOOL_LIST:
+    case TO_BOOL_STR:
+#endif
     case LOAD_ATTR_SLOT:
     case LOAD_ATTR_MODULE:
     case STORE_ATTR_SLOT:

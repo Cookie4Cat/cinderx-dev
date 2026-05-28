@@ -775,6 +775,89 @@ class HIRBuildTest : public RuntimeTest {
   }
 };
 
+#if PY_VERSION_HEX >= 0x030E0000
+TEST_F(HIRBuildTest, ToBoolBoolSpecializedUsesBoolGuard) {
+  const char* src = R"(
+def test(x):
+    if x:
+        return 1
+    return 0
+)";
+  std::unique_ptr<Function> irfunc(
+      build_specialized_source(src, TO_BOOL_BOOL));
+  ASSERT_NE(irfunc, nullptr);
+
+  std::string hir = fullPrinter().ToString(*irfunc);
+  EXPECT_EQ(countSubstring(hir, "GuardType<Bool>"), 1) << hir;
+  EXPECT_EQ(countOpcode(*irfunc, Opcode::kPrimitiveBoxBool), 0) << hir;
+}
+
+TEST_F(HIRBuildTest, ToBoolIntSpecializedUsesLongGuard) {
+  const char* src = R"(
+def test(x):
+    if x:
+        return 1
+    return 0
+)";
+  std::unique_ptr<Function> irfunc(build_specialized_source(src, TO_BOOL_INT));
+  ASSERT_NE(irfunc, nullptr);
+
+  std::string hir = fullPrinter().ToString(*irfunc);
+  EXPECT_EQ(countSubstring(hir, "GuardType<LongExact>"), 1) << hir;
+  EXPECT_EQ(countOpcode(*irfunc, Opcode::kIsTruthy), 1) << hir;
+}
+
+TEST_F(HIRBuildTest, ToBoolListSpecializedUsesListGuard) {
+  const char* src = R"(
+def test(x):
+    if x:
+        return 1
+    return 0
+)";
+  std::unique_ptr<Function> irfunc(build_specialized_source(src, TO_BOOL_LIST));
+  ASSERT_NE(irfunc, nullptr);
+
+  std::string hir = fullPrinter().ToString(*irfunc);
+  EXPECT_EQ(countSubstring(hir, "GuardType<ListExact>"), 1) << hir;
+  EXPECT_EQ(countOpcode(*irfunc, Opcode::kIsTruthy), 1) << hir;
+}
+
+TEST_F(HIRBuildTest, ToBoolStrSpecializedUsesUnicodeGuard) {
+  const char* src = R"(
+def test(x):
+    if x:
+        return 1
+    return 0
+)";
+  std::unique_ptr<Function> irfunc(build_specialized_source(src, TO_BOOL_STR));
+  ASSERT_NE(irfunc, nullptr);
+
+  std::string hir = fullPrinter().ToString(*irfunc);
+  EXPECT_EQ(countSubstring(hir, "GuardType<UnicodeExact>"), 1) << hir;
+  EXPECT_EQ(countOpcode(*irfunc, Opcode::kIsTruthy), 1) << hir;
+}
+
+TEST_F(HIRBuildTest, ToBoolUnretainedSpecializationsStayGeneric) {
+  const char* src = R"(
+def test(x):
+    if x:
+        return 1
+    return 0
+)";
+  std::unique_ptr<Function> none_irfunc(
+      build_specialized_source(src, TO_BOOL_NONE));
+  ASSERT_NE(none_irfunc, nullptr);
+  EXPECT_EQ(countOpcode(*none_irfunc, Opcode::kGuardType), 0)
+      << fullPrinter().ToString(*none_irfunc);
+
+  std::unique_ptr<Function> always_true_irfunc(
+      build_specialized_source(src, TO_BOOL_ALWAYS_TRUE));
+  ASSERT_NE(always_true_irfunc, nullptr);
+  EXPECT_EQ(countOpcode(*always_true_irfunc, Opcode::kGuardType), 0)
+      << fullPrinter().ToString(*always_true_irfunc);
+}
+#endif
+
 TEST_F(HIRBuildTest, ExactIntGlobalLoadUsesGuardType) {
   const char* src = R"(
 G = 257
