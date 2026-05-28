@@ -1304,6 +1304,23 @@ bool instrUsesRegister(const Instruction* instr, PhyLocation reg) {
   return used || operandUsesRegister(instr->output(), reg);
 }
 
+bool operandTouchesMemory(const OperandBase* operand) {
+  return operand != nullptr &&
+      (operand->isStack() || operand->isMem() || operand->isInd());
+}
+
+bool instrTouchesMemory(const Instruction* instr) {
+  if (operandTouchesMemory(instr->output())) {
+    return true;
+  }
+
+  bool touches_memory = false;
+  instr->foreachInputOperand([&](const OperandBase* operand) {
+    touches_memory |= operandTouchesMemory(operand);
+  });
+  return touches_memory;
+}
+
 bool isSelfMove(const Instruction* instr) {
   if (!instr->isMove()) {
     return false;
@@ -1315,16 +1332,9 @@ bool isSelfMove(const Instruction* instr) {
       out->getPhyRegister() == in->getPhyRegister();
 }
 
-bool isCallResultFoldBarrier(const Instruction* instr) {
-  if (instr->opcode() == Instruction::kOSREntry) {
-    return true;
-  }
-
-  return InstrProperty::getProperties(instr->opcode()).flag_effects ==
-      FlagEffects::kInvalidate;
-}
-
-const OperandBase* getImplicitDefOperand(const Instruction* instr) {
+// nullopt means an unknown no-output opcode; nullptr means no implicit def.
+std::optional<const OperandBase*> getKnownImplicitDefOperand(
+    const Instruction* instr) {
   if (instr->getNumOutputs() != 0) {
     return nullptr;
   }
@@ -1352,7 +1362,50 @@ const OperandBase* getImplicitDefOperand(const Instruction* instr) {
       }
       return instr->getInput(0);
     default:
-      return nullptr;
+      return std::nullopt;
+  }
+}
+
+bool isCallResultFoldPassthroughOpcode(Instruction::Opcode opcode) {
+  switch (opcode) {
+    case Instruction::kNop:
+    case Instruction::kNegate:
+    case Instruction::kInvert:
+    case Instruction::kAdd:
+    case Instruction::kSub:
+    case Instruction::kAnd:
+    case Instruction::kOr:
+    case Instruction::kXor:
+    case Instruction::kMul:
+    case Instruction::kFadd:
+    case Instruction::kFsub:
+    case Instruction::kFmul:
+    case Instruction::kFdiv:
+    case Instruction::kInt64ToDouble:
+    case Instruction::kEqual:
+    case Instruction::kNotEqual:
+    case Instruction::kGreaterThanSigned:
+    case Instruction::kGreaterThanEqualSigned:
+    case Instruction::kLessThanSigned:
+    case Instruction::kLessThanEqualSigned:
+    case Instruction::kGreaterThanUnsigned:
+    case Instruction::kGreaterThanEqualUnsigned:
+    case Instruction::kLessThanUnsigned:
+    case Instruction::kLessThanEqualUnsigned:
+    case Instruction::kCmp:
+    case Instruction::kLea:
+    case Instruction::kMove:
+    case Instruction::kMoveRelaxed:
+    case Instruction::kMovConstPool:
+    case Instruction::kMovZX:
+    case Instruction::kMovSX:
+    case Instruction::kMovSXD:
+    case Instruction::kInc:
+    case Instruction::kDec:
+    case Instruction::kIntToBool:
+      return true;
+    default:
+      return false;
   }
 }
 
@@ -1367,16 +1420,47 @@ bool instrDefinesRegister(const Instruction* instr, PhyLocation reg) {
     return in->isReg() && in->getPhyRegister() == reg;
   }
 
-  auto implicit_def = getImplicitDefOperand(instr);
-  return implicit_def != nullptr && implicit_def->isReg() &&
-      implicit_def->getPhyRegister() == reg;
+  auto implicit_def = getKnownImplicitDefOperand(instr);
+  if (!implicit_def.has_value()) {
+    return instrUsesRegister(instr, reg);
+  }
+  return *implicit_def != nullptr && (*implicit_def)->isReg() &&
+      (*implicit_def)->getPhyRegister() == reg;
+}
+
+bool canCrossCallResultFoldInstruction(const Instruction* instr) {
+  if (!isCallResultFoldPassthroughOpcode(instr->opcode())) {
+    return false;
+  }
+
+  const auto& properties = InstrProperty::getProperties(instr->opcode());
+  if (properties.is_essential || instr->isAnyBranch() ||
+      instr->isTerminator() || instr->isAnyYield()) {
+    return false;
+  }
+
+  if (properties.flag_effects == FlagEffects::kInvalidate) {
+    return false;
+  }
+
+  if (instrTouchesMemory(instr)) {
+    return false;
+  }
+
+  if (instr->getNumOutputs() == 0 &&
+      !getKnownImplicitDefOperand(instr).has_value()) {
+    return false;
+  }
+
+  return true;
 }
 
 bool isRegisterMove(
     const Instruction* instr,
     PhyLocation dst,
     PhyLocation src,
-    bool is_fp) {
+    bool is_fp,
+    DataType data_type) {
   if (!instr->isMove()) {
     return false;
   }
@@ -1385,7 +1469,9 @@ bool isRegisterMove(
   auto in = instr->getInput(0);
   return out->isReg() && in->isReg() && out->isFp() == is_fp &&
       in->isFp() == is_fp && out->getPhyRegister() == dst &&
-      in->getPhyRegister() == src;
+      in->getPhyRegister() == src &&
+      bitSize(out->dataType()) == bitSize(data_type) &&
+      bitSize(in->dataType()) == bitSize(data_type);
 }
 
 RewriteResult foldAarch64CallResultMoveChain(
@@ -1398,7 +1484,8 @@ RewriteResult foldAarch64CallResultMoveChain(
 
   auto out = instr->output();
   auto in = instr->getInput(0);
-  if (!out->isReg() || !in->isReg() || out->isFp() != in->isFp()) {
+  if (!out->isReg() || !in->isReg() || out->isFp() != in->isFp() ||
+      bitSize(out->dataType()) != bitSize(in->dataType())) {
     return kUnchanged;
   }
 
@@ -1426,11 +1513,8 @@ RewriteResult foldAarch64CallResultMoveChain(
       continue;
     }
 
-    if (isCallResultFoldBarrier(scan)) {
-      break;
-    }
-
-    if (isRegisterMove(scan, intermediate_reg, ret_reg, is_fp)) {
+    if (isRegisterMove(
+            scan, intermediate_reg, ret_reg, is_fp, in->dataType())) {
       chain_iter = scan_iter;
       found_chain = true;
       break;
@@ -1438,6 +1522,10 @@ RewriteResult foldAarch64CallResultMoveChain(
 
     if (instrDefinesRegister(scan, intermediate_reg) ||
         instrDefinesRegister(scan, ret_reg)) {
+      break;
+    }
+
+    if (!canCrossCallResultFoldInstruction(scan)) {
       break;
     }
   }
