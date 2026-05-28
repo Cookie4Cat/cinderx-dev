@@ -100,7 +100,7 @@ def store_array_double(a, i, v):
 // Test that STORE_SUBSCR on any type generates both fast and slow paths.
 // The array fast path is always emitted with a CondBranchCheckType guard;
 // non-array containers will take the slow path at runtime.
-TEST_F(ArrayStoreTest, StoreSubscriGeneratesBothPaths) {
+TEST_F(ArrayStoreTest, StoreSubscrGeneratesBothPaths) {
   std::unique_ptr<jit::hir::Function> irfunc;
   CompileToHIR(
       R"(
@@ -131,4 +131,69 @@ def store_list(a, i, v):
       << "Expected StoreArrayItem (fast path) in HIR";
   EXPECT_TRUE(found_store_subscr)
       << "Expected StoreSubscr (slow path) in HIR";
+}
+
+TEST_F(ArrayStoreTest, CompiledStoreArrayDoubleFastPathUpdatesArray) {
+  runCode(R"(
+from array import array
+import cinderx.jit as jit
+
+jit.enable_specialized_opcodes()
+
+def store_array_double(a, i, v):
+    a[i] = v
+
+for _ in range(20):
+    store_array_double(array("d", [1.0, 2.0, 3.0]), 1, 4.5)
+
+assert jit.force_compile(store_array_double)
+counts = jit.get_function_hir_opcode_counts(store_array_double)
+assert counts.get("StoreArrayItem", 0) > 0
+
+arr = array("d", [1.0, 2.0, 3.0])
+store_array_double(arr, 1, 42.5)
+assert list(arr) == [1.0, 42.5, 3.0]
+)");
+}
+
+TEST_F(ArrayStoreTest, CompiledStoreArrayDoubleGuardMissUsesGenericStore) {
+  runCode(R"(
+from array import array
+import cinderx.jit as jit
+
+jit.enable_specialized_opcodes()
+
+def store_any(a, i, v):
+    a[i] = v
+
+def generic_store(a, i, v):
+    a[i] = v
+
+def exception_info(func, *args):
+    try:
+        func(*args)
+    except Exception as exc:
+        return type(exc), str(exc)
+    return None, None
+
+for _ in range(20):
+    store_any(array("d", [1.0, 2.0, 3.0]), 1, 4.5)
+
+assert jit.force_compile(store_any)
+counts = jit.get_function_hir_opcode_counts(store_any)
+assert counts.get("StoreArrayItem", 0) > 0
+
+lst = [1, 2, 3]
+store_any(lst, 1, 99)
+assert lst == [1, 99, 3]
+
+arr_i = array("i", [1, 2, 3])
+store_any(arr_i, 2, 77)
+assert list(arr_i) == [1, 2, 77]
+
+jit_error = exception_info(store_any, (1, 2, 3), 0, 99)
+generic_error = exception_info(generic_store, (1, 2, 3), 0, 99)
+assert jit_error[0] is generic_error[0]
+assert jit_error[1] == generic_error[1]
+)");
 }
