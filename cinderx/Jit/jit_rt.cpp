@@ -781,51 +781,6 @@ void JITRT_UnlinkFrame(PyThreadState* tstate) {
   // JIT frames are stack allocated so there's nothing to pop.
 }
 
-void JITRT_UnlinkLightweightFrameFast(PyThreadState* tstate) {
-  _PyInterpreterFrame* frame = currentFrame(tstate);
-  setCurrentFrame(tstate, frame->previous);
-
-  JIT_DCHECK(
-      jit::getConfig().frame_mode == jit::FrameMode::kLightweight,
-      "only safe to call with lightweight frames");
-  JIT_DCHECK(
-      frameCode(frame) != nullptr && frameCode(frame)->co_nfreevars == 0,
-      "assumes no freevars");
-
-  JIT_DCHECK(
-      frameCode(frame) != nullptr &&
-          !(frameCode(frame)->co_flags & jit::kCoFlagsAnyGenerator),
-      "doesn't work with generators");
-
-  // Fast path for non-generator frames with no freevars.
-  // The frame header is directly before the frame for non-generators.
-  auto* header = reinterpret_cast<jit::FrameHeader*>(frame) - 1;
-  if (header->rtfs & JIT_FRAME_INITIALIZED) {
-    // Frame was materialized by the runtime, use the slow path.
-    jit::jitFrameClearExceptCode(frame);
-  } else {
-    // Common case: just close the function object.
-    Ci_STACK_CLOSE(frame->f_funcobj);
-  }
-
-#if PY_VERSION_HEX >= 0x030E0000
-  PyStackRef_CLOSE(frame->f_executable);
-#else
-  // We can't leave our reifier dangling here otherwise we may
-  // continue to get callbacks, instead leave the function dangling.
-  if (jit::hasRtfsFunction(frame)) {
-    frame->f_funcobj = jit::jitFrameGetRtfs(frame)->func();
-  } else {
-    PyObject* func = jit::jitFrameGetFunction(frame);
-    frame->f_funcobj = func;
-    Py_XDECREF(func);
-    header->rtfs = JIT_FRAME_INITIALIZED;
-  }
-
-  Py_DECREF(frameExecutable(frame));
-#endif
-}
-
 PyObject*
 JITRT_LoadGlobal(PyObject* globals, PyObject* builtins, PyObject* name) {
   PyObject* result = Cix_PyDict_LoadGlobal(

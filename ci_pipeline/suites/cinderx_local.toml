@@ -11,6 +11,7 @@ command = "mkdir -p \"{run_dir}/wheelhouse\" && \"$CINDERX_TEST_PYTHON\" -m pip 
 [jobs.env]
 CINDERX_INCLUDE_TEST_PACKAGE_DATA = "1"
 CINDERX_LOCAL_DEPS = "{repo}/../cinderx-local-deps"
+ENABLE_LIGHTWEIGHT_FRAMES = "1"
 ENABLE_XXCLASSLOADER = "1"
 
 [[jobs]]

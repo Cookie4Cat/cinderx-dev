@@ -84,6 +84,7 @@ try:
         immortalize_heap,
         install_frame_evaluator,
         is_frame_evaluator_installed,
+        is_lightweight_frames_enabled,
         is_immortal,
         remove_frame_evaluator,
         strict_module_patch,
@@ -129,6 +130,9 @@ except ImportError as e:
         return []
 
     def _is_compile_perf_trampoline_pre_fork_enabled() -> bool:
+        return False
+
+    def is_lightweight_frames_enabled() -> bool:
         return False
 
     from asyncio import AbstractEventLoop, Future

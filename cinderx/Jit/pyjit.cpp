@@ -54,6 +54,7 @@
 #include <cstdlib>
 #include <fstream>
 #include <iostream>
+#include <limits>
 #include <memory>
 #include <thread>
 #include <unordered_set>
@@ -86,6 +87,9 @@ CompilerContext<Compiler>* jitCtx() {
   }
   return nullptr;
 }
+
+bool isLightweightFramesCompiledIn();
+int validateFrameModeConfig();
 
 // Don't care flags: CO_NOFREE, CO_FUTURE_* (the only still-relevant future is
 // "annotations" which doesn't impact bytecode execution.)
@@ -1963,6 +1967,62 @@ PyObject* disassemble(PyObject* /* self */, PyObject* func) {
   Py_RETURN_NONE;
 }
 
+PyObject* test_parse_thread_state_prologue(PyObject* /* self */, PyObject* arg) {
+  Ref<> seq = Ref<>::steal(PySequence_Fast(
+      arg, "_test_parse_thread_state_prologue expects an iterable"));
+  if (seq == nullptr) {
+    return nullptr;
+  }
+
+  Py_ssize_t size = PySequence_Fast_GET_SIZE(seq.get());
+  if (size <= 0) {
+    PyErr_SetString(PyExc_ValueError, "instruction sequence cannot be empty");
+    return nullptr;
+  }
+
+  std::vector<uint32_t> insns;
+  insns.reserve(size);
+  PyObject** items = PySequence_Fast_ITEMS(seq.get());
+  for (Py_ssize_t i = 0; i < size; i++) {
+    unsigned long value = PyLong_AsUnsignedLong(items[i]);
+    if (PyErr_Occurred()) {
+      return nullptr;
+    }
+    if (value > std::numeric_limits<uint32_t>::max()) {
+      PyErr_SetString(PyExc_ValueError, "instruction does not fit in uint32_t");
+      return nullptr;
+    }
+    insns.push_back(static_cast<uint32_t>(value));
+  }
+
+#if defined(CINDER_AARCH64)
+  auto offset =
+      jit::codegen::parseThreadStatePrologue(insns.data(), insns.size());
+  if (!offset.has_value()) {
+    Py_RETURN_NONE;
+  }
+  return PyLong_FromLong(*offset);
+#else
+  Py_RETURN_NONE;
+#endif
+}
+
+PyObject* test_set_thread_state_offset(PyObject* /* self */, PyObject* arg) {
+  long offset = PyLong_AsLong(arg);
+  if (PyErr_Occurred()) {
+    return nullptr;
+  }
+  if (offset < std::numeric_limits<int32_t>::min() ||
+      offset > std::numeric_limits<int32_t>::max()) {
+    PyErr_SetString(PyExc_ValueError, "offset does not fit in int32_t");
+    return nullptr;
+  }
+  auto module_state = cinderx::getModuleState();
+  module_state->tstate_offset = static_cast<int32_t>(offset);
+  module_state->tstate_offset_inited = true;
+  Py_RETURN_NONE;
+}
+
 #ifndef WIN32
 PyObject* dump_elf(PyObject* /* self */, PyObject* arg) {
   JIT_CHECK(
@@ -2439,6 +2499,10 @@ PyObject* jit_frame_mode(PyObject* /* self */, PyObject*) {
   return PyLong_FromLong(static_cast<int>(getConfig().frame_mode));
 }
 
+PyObject* is_lightweight_frames_enabled(PyObject* /* self */, PyObject*) {
+  return PyBool_FromLong(isLightweightFramesCompiledIn());
+}
+
 PyObject* get_and_clear_inline_cache_stats(PyObject* /* self */, PyObject*) {
   auto stats = Ref<>::steal(PyDict_New());
   if (stats == nullptr) {
@@ -2859,6 +2923,14 @@ PyMethodDef jit_methods[] = {
          "Configure the JIT to automatically compile functions after "
          "they are called a set number of times.")},
     {"disassemble", disassemble, METH_O, "Disassemble JIT compiled functions."},
+    {"_test_parse_thread_state_prologue",
+     test_parse_thread_state_prologue,
+     METH_O,
+     PyDoc_STR("Test helper for AArch64 thread-state TLS prologue parsing.")},
+    {"_test_set_thread_state_offset",
+     test_set_thread_state_offset,
+     METH_O,
+     PyDoc_STR("Test helper for forcing the cached thread-state TLS offset.")},
 #ifndef WIN32
     {"dump_elf",
      dump_elf,
@@ -2927,6 +2999,10 @@ PyMethodDef jit_methods[] = {
      METH_NOARGS,
      PyDoc_STR(
          "Get JIT frame mode (0 = normal frames, 1 = lightweight frames).")},
+    {"is_lightweight_frames_enabled",
+     is_lightweight_frames_enabled,
+     METH_NOARGS,
+     PyDoc_STR("Return True when JIT lightweight frames are compiled in.")},
     {"get_jit_list",
      get_jit_list,
      METH_NOARGS,
@@ -3326,6 +3402,33 @@ constexpr std::string_view getCpuArchName() {
 #endif
 }
 
+bool isLightweightFramesCompiledIn() {
+#ifdef ENABLE_LIGHTWEIGHT_FRAMES
+  return true;
+#else
+  return false;
+#endif
+}
+
+int validateFrameModeConfig() {
+  if (getConfig().frame_mode == FrameMode::kLightweight &&
+      !isLightweightFramesCompiledIn()) {
+    PyErr_SetString(
+        PyExc_RuntimeError,
+        "PYTHONJITLIGHTWEIGHTFRAME requires ENABLE_LIGHTWEIGHT_FRAMES");
+    return -1;
+  }
+  if (getConfig().frame_mode == FrameMode::kLightweight &&
+      getConfig().osr_enabled) {
+    PyErr_SetString(
+        PyExc_RuntimeError,
+        "PYTHONJITLIGHTWEIGHTFRAME is mutually exclusive with "
+        "CINDERX_OSR_ENABLED");
+    return -1;
+  }
+  return 0;
+}
+
 void notifyUnitDeletedDuringPreload(
     cinderx::ModuleState* state,
     BorrowedRef<> unit) {
@@ -3397,6 +3500,9 @@ int initialize() {
     std::cout << flag_processor.jitXOptionHelpMessage() << '\n';
     // Return rather than exit here for arg printing test doesn't end early.
     return -2;
+  }
+  if (validateFrameModeConfig() < 0) {
+    return -1;
   }
 
   // Handle force_init = false case only after parsing all flags.

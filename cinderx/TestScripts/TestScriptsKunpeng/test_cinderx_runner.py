@@ -20,6 +20,14 @@ REPO_ROOT = find_repo_root()
 KUNPENG_TEST_SCRIPT_DIR = Path(__file__).resolve().parent
 TEST_CINDERX_DIR = REPO_ROOT / "cinderx" / "PythonLib" / "test_cinderx"
 KUNPENG_TEST_CINDERX_DIR = TEST_CINDERX_DIR / "test_kunpeng"
+KUNPENG_OSR_TEST = KUNPENG_TEST_CINDERX_DIR / "test_osr.py"
+LIGHTWEIGHT_FRAME_ENV = {
+    "PYTHONJITLIGHTWEIGHTFRAME": "1",
+    "CINDERX_OSR_ENABLED": "0",
+}
+OSR_PARENT_ENV = {
+    "PYTHONJITLIGHTWEIGHTFRAME": "0",
+}
 ALL_TEST_CINDERX = [
     str(path.relative_to(REPO_ROOT)) for path in sorted(TEST_CINDERX_DIR.glob("test*.py"))
 ]
@@ -28,6 +36,7 @@ if KUNPENG_TEST_CINDERX_DIR.exists():
     ALL_TEST_CINDERX.extend(
         str(path.relative_to(REPO_ROOT))
         for path in sorted(KUNPENG_TEST_CINDERX_DIR.glob("test*.py"))
+        if path != KUNPENG_OSR_TEST
     )
 COUNT_KEYS = ("passed", "failed", "error", "skipped", "deselected")
 COUNT_KEY_ALIASES = {
@@ -139,6 +148,19 @@ for suite in SUITES:
 SUITES.extend(
     [
         {
+            "name": "test_osr",
+            "args": [
+                "-m",
+                "pytest",
+                "-vv",
+                "-rs",
+                "--import-mode=importlib",
+                str(KUNPENG_OSR_TEST.relative_to(REPO_ROOT)),
+            ],
+            "allow_oss": True,
+            "env": OSR_PARENT_ENV,
+        },
+        {
             "name": "test_jit_support_instrumentation",
             "args": [
                 "-m",
@@ -169,6 +191,13 @@ SUITES.extend(
         },
     ]
 )
+
+for suite in SUITES:
+    if suite["name"] == "test_osr":
+        continue
+    env = dict(LIGHTWEIGHT_FRAME_ENV)
+    env.update(suite.get("env", {}))
+    suite["env"] = env
 
 
 def normalize_count_key(key: str) -> str | None:

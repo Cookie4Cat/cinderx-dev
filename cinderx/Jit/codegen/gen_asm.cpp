@@ -160,12 +160,14 @@ DeoptResult prepareForDeopt(
   // reification destroys it. Walk past inlined frames to find the outer one.
 #ifdef ENABLE_LIGHTWEIGHT_FRAMES
   {
-    _PyInterpreterFrame* outer = frame;
-    for (size_t i = 0; i < deopt_meta.inline_depth(); i++) {
-      outer = outer->previous;
+    if (getConfig().frame_mode == FrameMode::kLightweight) {
+      _PyInterpreterFrame* outer = frame;
+      for (size_t i = 0; i < deopt_meta.inline_depth(); i++) {
+        outer = outer->previous;
+      }
+      is_instrumentation_deopt =
+          (jitFrameGetHeader(outer)->rtfs & JIT_FRAME_DEOPT_PATCHED) != 0;
     }
-    is_instrumentation_deopt =
-        (jitFrameGetHeader(outer)->rtfs & JIT_FRAME_DEOPT_PATCHED) != 0;
   }
 #endif
 
@@ -711,7 +713,9 @@ void* NativeGenerator::getVectorcallEntry() {
   env_.code_rt = env_.ctx->allocateCodeRuntime(
       func->code.get(), func->builtins.get(), func->globals.get());
 #if defined(ENABLE_LIGHTWEIGHT_FRAMES) && PY_VERSION_HEX >= 0x030E0000
-  env_.code_rt->setReifier(func->reifier);
+  if (func->frameMode == FrameMode::kLightweight) {
+    env_.code_rt->setReifier(func->reifier);
+  }
 #endif
 
   for (auto& ref : func->env.references()) {

@@ -150,7 +150,7 @@ inline void setFrameInstruction(_PyInterpreterFrame* frame, _Py_CODEUNIT* loc) {
 #define FRAME_INSTR_OFFSET offsetof(_PyInterpreterFrame, instr_ptr)
 
 static inline PyCodeObject* frameCode(_PyInterpreterFrame* frame) {
-#ifdef ENABLE_LIGHTWEIGHT_FRAMES
+#if defined(ENABLE_LIGHTWEIGHT_FRAMES) && PY_VERSION_HEX >= 0x030F0000
   PyObject* executable = PyStackRef_AsPyObjectBorrow(frame->f_executable);
   if (PyUnstable_JITExecutable_Check(executable)) {
     return ((PyUnstable_PyJitExecutable*)executable)->je_code;

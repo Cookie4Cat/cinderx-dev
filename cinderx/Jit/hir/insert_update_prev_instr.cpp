@@ -160,6 +160,14 @@ void InsertUpdatePrevInstr::Run([[maybe_unused]] Function& func) {
 
           inited_once = true;
         }
+#if PY_VERSION_HEX < 0x030F0000
+        // Stock CPython 3.14 has no JIT executable reifier callback. Keep
+        // instr_ptr current before arbitrary execution so frame APIs observe a
+        // complete frame at the right source line.
+        else if (hasArbitraryExecution(instr)) {
+          update_one();
+        }
+#endif
       } else if (hasArbitraryExecution(instr)) {
         update_one();
       }
