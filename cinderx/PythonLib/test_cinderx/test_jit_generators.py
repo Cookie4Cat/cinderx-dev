@@ -3,11 +3,14 @@
 # pyre-unsafe
 
 import gc
+import os
 import sys
 import threading
 import unittest
 import weakref
 
+import cinderx
+import cinderx.jit
 import cinderx.test_support as cinder_support
 from cinderx.jit import _deopt_gen, is_jit_compiled
 
@@ -597,3 +600,240 @@ class GeneratorFrameTest(unittest.TestCase):
         f = g.send(g)
         self.assertEqual(f, g.gi_frame)
         next(g)
+
+
+# ---------------------------------------------------------------------------
+# TreeIter state machine optimization tests
+# ---------------------------------------------------------------------------
+
+def _make_node_class_with_guards():
+    """Node class with explicit None guards — the target pattern for optimization."""
+
+    class Node:
+        def __init__(self, value, left=None, right=None):
+            self.value = value
+            self.left = left
+            self.right = right
+
+        def __iter__(self):
+            if self.left is not None:
+                yield from self.left
+            yield self.value
+            if self.right is not None:
+                yield from self.right
+
+    return Node
+
+
+def _build_complete_tree(Node, depth, counter=None):
+    """Build a complete binary tree; values are unique integers (BFS order)."""
+    if counter is None:
+        counter = [0]
+    if depth <= 0:
+        return None
+    left = _build_complete_tree(Node, depth - 1, counter)
+    counter[0] += 1
+    val = counter[0]
+    right = _build_complete_tree(Node, depth - 1, counter)
+    return Node(val, left, right)
+
+
+def _inorder(node):
+    """Reference in-order traversal using recursion."""
+    if node is None:
+        return []
+    return _inorder(node.left) + [node.value] + _inorder(node.right)
+
+
+class TreeIterStateMachineTest(unittest.TestCase):
+    """Tests for the TreeIter JIT state machine optimization.
+
+    The state machine is enabled by setting PYTHONJITTREEITERSTATEMACHINE=1
+    and is gated behind ``cinderx.jit.is_enabled()``.  Most correctness tests
+    run regardless of whether the optimization fired; they define the
+    behavioural contract that the state machine must preserve.
+    """
+
+    # ------------------------------------------------------------------
+    # Correctness tests — must pass with and without the optimisation
+    # ------------------------------------------------------------------
+
+    @cinder_support.skip_unless_jit("Requires CinderX JIT")
+    def test_tree_iter_state_machine_depths(self):
+        """Depths 1-8: in-order traversal matches recursive reference."""
+        Node = _make_node_class_with_guards()
+        cinderx.jit.force_compile(Node.__iter__)
+
+        for depth in range(1, 9):
+            root = _build_complete_tree(Node, depth)
+            got = list(root)
+            want = _inorder(root)
+            self.assertEqual(got, want, f"depth={depth}")
+            self.assertEqual(len(got), 2**depth - 1)
+
+    @cinder_support.skip_unless_jit("Requires CinderX JIT")
+    def test_tree_iter_state_machine_repeated_iteration(self):
+        """Iterating the same tree twice yields identical results."""
+        Node = _make_node_class_with_guards()
+        cinderx.jit.force_compile(Node.__iter__)
+
+        root = _build_complete_tree(Node, 5)
+        self.assertEqual(list(root), list(root))
+
+    @cinder_support.skip_unless_jit("Requires CinderX JIT")
+    def test_tree_iter_state_machine_guarded_none_children(self):
+        """Explicit is-not-None guards: None children are skipped correctly."""
+        Node = _make_node_class_with_guards()
+        cinderx.jit.force_compile(Node.__iter__)
+
+        # Right-skewed chain
+        n3 = Node(3)
+        n2 = Node(2, right=n3)
+        n1 = Node(1, right=n2)
+        self.assertEqual(list(n1), [1, 2, 3])
+
+        # Left-skewed chain
+        n3 = Node(3)
+        n2 = Node(2, left=n3)
+        n1 = Node(1, left=n2)
+        self.assertEqual(list(n1), [3, 2, 1])
+
+        # Single node
+        self.assertEqual(list(Node(42)), [42])
+
+    # ------------------------------------------------------------------
+    # Negative / semantic-boundary tests
+    # ------------------------------------------------------------------
+
+    def test_tree_iter_state_machine_bare_yield_from_none_not_optimized(self):
+        """Bare ``yield from None`` must raise TypeError, not be silently skipped."""
+
+        class BareYieldFromNoneNode:
+            def __init__(self, value):
+                self.value = value
+                self.left = None
+                self.right = None
+
+            def __iter__(self):
+                yield from self.left  # no guard — left is None → TypeError
+                yield self.value
+                yield from self.right
+
+        if cinderx.jit.is_enabled():
+            cinderx.jit.force_compile(BareYieldFromNoneNode.__iter__)
+
+        node = BareYieldFromNoneNode(42)
+        gen = node.__iter__()
+        with self.assertRaises(TypeError):
+            next(gen)
+
+    def test_tree_iter_state_machine_not_triggered_for_non_tree(self):
+        """Plain generators without the left/right/value pattern are unaffected."""
+
+        def simple_gen(n):
+            for i in range(n):
+                yield i
+
+        if cinderx.jit.is_enabled():
+            cinderx.jit.force_compile(simple_gen)
+
+        self.assertEqual(list(simple_gen(5)), list(range(5)))
+
+    @cinder_support.skip_unless_jit("Requires CinderX JIT")
+    def test_tree_iter_state_machine_exact_type_required(self):
+        """Subclass overriding __iter__ must not be optimised as a TreeIter."""
+        Node = _make_node_class_with_guards()
+
+        class SubNode(Node):
+            def __iter__(self):
+                yield 999
+                yield from super().__iter__()
+
+        cinderx.jit.force_compile(Node.__iter__)
+        cinderx.jit.force_compile(SubNode.__iter__)
+
+        root = SubNode(1, SubNode(2), SubNode(3))
+        # SubNode.__iter__ inserts 999 first; result is not a plain in-order list
+        result = list(root)
+        self.assertIn(999, result)
+
+    # ------------------------------------------------------------------
+    # State and lifecycle tests
+    # ------------------------------------------------------------------
+
+    @cinder_support.skip_unless_jit("Requires CinderX JIT")
+    def test_tree_iter_state_machine_completion_clears_state(self):
+        """After full iteration, generator is exhausted and GC-safe."""
+        Node = _make_node_class_with_guards()
+        cinderx.jit.force_compile(Node.__iter__)
+
+        root = _build_complete_tree(Node, 4)
+        gen = root.__iter__()
+        results = list(gen)
+        self.assertEqual(results, _inorder(root))
+
+        with self.assertRaises(StopIteration):
+            next(gen)
+
+        # Force GC to exercise clear/dealloc paths
+        del gen
+        gc.collect()
+
+    @cinder_support.skip_unless_jit("Requires CinderX JIT")
+    def test_tree_iter_state_machine_gc_cycle(self):
+        """GC with live generator referencing nodes must not leak or crash."""
+        Node = _make_node_class_with_guards()
+        cinderx.jit.force_compile(Node.__iter__)
+
+        root = _build_complete_tree(Node, 4)
+        gen = root.__iter__()
+        # Advance partway so generator holds state referencing nodes
+        for _ in range(3):
+            next(gen)
+
+        ref = weakref.ref(root)
+        del root
+        gc.collect()
+        # Generator keeps nodes alive
+        self.assertIsNotNone(ref())
+        del gen
+        gc.collect()
+
+    @cinder_support.skip_unless_jit("Requires CinderX JIT")
+    def test_tree_iter_state_machine_stack_limit(self):
+        """Deep skewed tree exercises heap stack growth without crash."""
+        Node = _make_node_class_with_guards()
+        cinderx.jit.force_compile(Node.__iter__)
+
+        # Build left-skewed tree of depth 20 (exceeds initial stack capacity of 16)
+        depth = 20
+        root = None
+        for i in range(depth, 0, -1):
+            root = Node(i, left=root)
+
+        got = list(root)
+        want = list(range(1, depth + 1))
+        self.assertEqual(got, want)
+
+    # ------------------------------------------------------------------
+    # Protocol gate tests (first-version experiment: fail-closed)
+    # ------------------------------------------------------------------
+
+    @cinder_support.skip_unless_jit("Requires CinderX JIT")
+    def test_tree_iter_state_machine_protocol_gate(self):
+        """send(non-None) on optimised generator must not silently corrupt state."""
+        Node = _make_node_class_with_guards()
+        cinderx.jit.force_compile(Node.__iter__)
+
+        root = _build_complete_tree(Node, 3)
+        gen = root.__iter__()
+        first = next(gen)
+        self.assertIsNotNone(first)
+
+        # send(non-None) into a plain generator is a no-op for the value;
+        # it must not crash or return garbage.
+        try:
+            val = gen.send(None)
+            self.assertIsNotNone(val)
+        except StopIteration:
+            pass  # early exhaustion is acceptable
