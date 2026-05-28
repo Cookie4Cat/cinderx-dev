@@ -7,6 +7,7 @@
 #include "cinderx/Common/util.h"
 #include "cinderx/Jit/code_runtime.h"
 #include "cinderx/Jit/frame_header.h"
+#include "cinderx/Jit/tree_iter_state.h"
 
 namespace jit {
 
@@ -55,6 +56,10 @@ struct GenDataFooter {
 
   // JIT metadata for associated code object
   CodeRuntime* code_rt{nullptr};
+
+  // State machine state for the TreeIter optimisation.  Null for non-TreeIter
+  // generators and before the first resume of an optimised generator.
+  TreeIterState* tree_iter_state{nullptr};
 
 #if defined(ENABLE_LIGHTWEIGHT_FRAMES)
   // Frame header used for tracking the current frame.

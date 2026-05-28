@@ -12,6 +12,7 @@
 #include "cinderx/Jit/deopt.h"
 #include "cinderx/Jit/frame.h"
 #include "cinderx/Jit/generators_mm.h"
+#include "cinderx/Jit/tree_iter_state.h"
 #include "cinderx/UpstreamBorrow/borrowed.h"
 #include "cinderx/module_state.h"
 
@@ -86,6 +87,12 @@ void gen_dealloc_with_custom_free(PyObject* self) {
 }
 
 void jitgen_dealloc(PyObject* self) {
+  // Clear TreeIter state before deopt so the footer pointer is still valid.
+  JitGenObject* jit_gen = JitGenObject::cast(self);
+  if (jit_gen != nullptr) {
+    clearTreeIterState(jit_gen->genDataFooter());
+  }
+
   if (!deopt_jit_gen(self)) {
     JIT_ABORT("Tried to dealloc a running JIT generator");
   }
@@ -118,6 +125,11 @@ int jitgen_traverse(PyObject* obj, visitproc visit, void* arg) {
         Py_VISIT(v);
       }
       JIT_CHECK(JitGen_CheckAny(obj), "Deopted during GC traversal");
+    }
+
+    // Visit TreeIter state machine owned references if present.
+    if (int r = visitTreeIterState(gen_footer->tree_iter_state, visit, arg)) {
+      return r;
     }
 
 #if PY_VERSION_HEX < 0x030E0000
