@@ -210,6 +210,40 @@ for func in (
 )");
 }
 
+TEST_F(SanityTest, JitCallResultChainBehavior) {
+  runStockCode(R"(
+import cinderx.jit as jit
+
+jit.enable()
+jit.compile_after_n_calls(1000000)
+
+def h(a):
+    return a + 1
+
+def g(x, b, c):
+    return x * 100 + b * 10 + c
+
+def f(a, b, c):
+    return g(h(a), b, c)
+
+def use(x):
+    return x * 2
+
+def f_shared(a):
+    tmp = h(a)
+    side = use(tmp)
+    return g(tmp, side, 7)
+
+for func in (h, g, f, use, f_shared):
+    assert jit.force_compile(func), func
+
+assert f(2, 3, 4) == 334
+assert f(10, 20, 30) == 1330
+assert f_shared(4) == 607
+assert f_shared(8) == 1087
+)");
+}
+
 TEST_F(SanityTest, AsyncLazyValueCoverage) {
   runStockCode(R"(
 import _cinderx

@@ -190,6 +190,474 @@ static std::vector<Instruction*> collectInstrs(BasicBlock& bb) {
   return result;
 }
 
+static void runPostAllocRewrite(Function& func) {
+  jit::codegen::Environ env;
+  PostRegAllocRewrite rewrite(&func, &env);
+  rewrite.run();
+}
+
+static void expectRegMove(
+    Instruction* instr,
+    PhyLocation dst,
+    PhyLocation src,
+    DataType data_type = DataType::kObject) {
+  ASSERT_TRUE(instr->isMove());
+  ASSERT_TRUE(instr->output()->isReg());
+  ASSERT_TRUE(instr->getInput(0)->isReg());
+  EXPECT_EQ(instr->output()->getPhyRegister(), dst);
+  EXPECT_EQ(instr->getInput(0)->getPhyRegister(), src);
+  EXPECT_EQ(instr->output()->dataType(), data_type);
+  EXPECT_EQ(instr->getInput(0)->dataType(), data_type);
+}
+
+TEST_F(LIRPostAllocRewriteTest, CallResultArgMoveChainFoldsIntermediateGP) {
+  Function func;
+  auto* bb = func.allocateBasicBlock();
+
+  bb->allocateInstr(
+      Instruction::kMove,
+      nullptr,
+      OutPhyReg{X8, DataType::kObject},
+      PhyReg{X0, DataType::kObject});
+  auto* arg_move = bb->allocateInstr(
+      Instruction::kMove,
+      nullptr,
+      OutPhyReg{X1, DataType::kObject},
+      PhyReg{X8, DataType::kObject});
+  arg_move->getInput(0)->setLastUse();
+
+  runPostAllocRewrite(func);
+
+  auto instrs = collectInstrs(*bb);
+  ASSERT_EQ(instrs.size(), 1);
+  expectRegMove(instrs[0], X1, X0);
+  ASSERT_TRUE(verifyPostRegAllocInvariants(&func, std::cout));
+}
+
+TEST_F(LIRPostAllocRewriteTest, CallResultArgMoveChainSkipsSelfMoves) {
+  Function func;
+  auto* bb = func.allocateBasicBlock();
+
+  bb->allocateInstr(
+      Instruction::kMove,
+      nullptr,
+      OutPhyReg{X8, DataType::kObject},
+      PhyReg{X0, DataType::kObject});
+  bb->allocateInstr(
+      Instruction::kMove,
+      nullptr,
+      OutPhyReg{X0, DataType::kObject},
+      PhyReg{X0, DataType::kObject});
+  auto* arg_move = bb->allocateInstr(
+      Instruction::kMove,
+      nullptr,
+      OutPhyReg{X1, DataType::kObject},
+      PhyReg{X8, DataType::kObject});
+  arg_move->getInput(0)->setLastUse();
+
+  runPostAllocRewrite(func);
+
+  auto instrs = collectInstrs(*bb);
+  ASSERT_EQ(instrs.size(), 1);
+  expectRegMove(instrs[0], X1, X0);
+  ASSERT_TRUE(verifyPostRegAllocInvariants(&func, std::cout));
+}
+
+TEST_F(LIRPostAllocRewriteTest, CallResultArgMoveChainFoldsIntermediateFP) {
+  Function func;
+  auto* bb = func.allocateBasicBlock();
+
+  bb->allocateInstr(
+      Instruction::kMove,
+      nullptr,
+      OutPhyReg{D8, DataType::kDouble},
+      PhyReg{D0, DataType::kDouble});
+  auto* arg_move = bb->allocateInstr(
+      Instruction::kMove,
+      nullptr,
+      OutPhyReg{D1, DataType::kDouble},
+      PhyReg{D8, DataType::kDouble});
+  arg_move->getInput(0)->setLastUse();
+
+  runPostAllocRewrite(func);
+
+  auto instrs = collectInstrs(*bb);
+  ASSERT_EQ(instrs.size(), 1);
+  expectRegMove(instrs[0], D1, D0, DataType::kDouble);
+  ASSERT_TRUE(verifyPostRegAllocInvariants(&func, std::cout));
+}
+
+TEST_F(LIRPostAllocRewriteTest, CallResultArgMoveKeepsIntermediateRealUse) {
+  Function func;
+  auto* bb = func.allocateBasicBlock();
+
+  bb->allocateInstr(
+      Instruction::kMove,
+      nullptr,
+      OutPhyReg{X8, DataType::k64bit},
+      PhyReg{X0, DataType::k64bit});
+  auto* use = bb->allocateInstr(
+      Instruction::kAdd,
+      nullptr,
+      OutPhyReg{X9, DataType::k64bit},
+      PhyReg{X8, DataType::k64bit},
+      Imm{1, DataType::k64bit});
+  auto* arg_move = bb->allocateInstr(
+      Instruction::kMove,
+      nullptr,
+      OutPhyReg{X1, DataType::k64bit},
+      PhyReg{X8, DataType::k64bit});
+  arg_move->getInput(0)->setLastUse();
+
+  runPostAllocRewrite(func);
+
+  auto instrs = collectInstrs(*bb);
+  ASSERT_EQ(instrs.size(), 3);
+  expectRegMove(instrs[0], X8, X0, DataType::k64bit);
+  ASSERT_TRUE(instrs[1]->isAdd());
+  ASSERT_TRUE(instrs[1]->getInput(0)->isReg());
+  EXPECT_EQ(instrs[1]->getInput(0)->getPhyRegister(), X8);
+  EXPECT_EQ(instrs[1], use);
+  expectRegMove(instrs[2], X1, X0, DataType::k64bit);
+  ASSERT_TRUE(verifyPostRegAllocInvariants(&func, std::cout));
+}
+
+TEST_F(LIRPostAllocRewriteTest, CallResultArgMoveKeepsChainWhenInputNotLastUse) {
+  Function func;
+  auto* bb = func.allocateBasicBlock();
+
+  bb->allocateInstr(
+      Instruction::kMove,
+      nullptr,
+      OutPhyReg{X8, DataType::k64bit},
+      PhyReg{X0, DataType::k64bit});
+  auto* arg_move = bb->allocateInstr(
+      Instruction::kMove,
+      nullptr,
+      OutPhyReg{X1, DataType::k64bit},
+      PhyReg{X8, DataType::k64bit});
+  auto* later_use = bb->allocateInstr(
+      Instruction::kAdd,
+      nullptr,
+      OutPhyReg{X9, DataType::k64bit},
+      PhyReg{X8, DataType::k64bit},
+      Imm{1, DataType::k64bit});
+
+  runPostAllocRewrite(func);
+
+  auto instrs = collectInstrs(*bb);
+  ASSERT_EQ(instrs.size(), 3);
+  expectRegMove(instrs[0], X8, X0, DataType::k64bit);
+  expectRegMove(instrs[1], X1, X0, DataType::k64bit);
+  ASSERT_TRUE(instrs[2]->isAdd());
+  EXPECT_EQ(instrs[2], later_use);
+  ASSERT_TRUE(instrs[2]->getInput(0)->isReg());
+  EXPECT_EQ(instrs[2]->getInput(0)->getPhyRegister(), X8);
+  ASSERT_EQ(instrs[1], arg_move);
+  ASSERT_TRUE(verifyPostRegAllocInvariants(&func, std::cout));
+}
+
+TEST_F(LIRPostAllocRewriteTest, CallResultArgMoveDoesNotFoldMixedWidthChain) {
+  Function func;
+  auto* bb = func.allocateBasicBlock();
+
+  bb->allocateInstr(
+      Instruction::kMove,
+      nullptr,
+      OutPhyReg{X8, DataType::k32bit},
+      PhyReg{X0, DataType::k32bit});
+  auto* arg_move = bb->allocateInstr(
+      Instruction::kMove,
+      nullptr,
+      OutPhyReg{X1, DataType::k64bit},
+      PhyReg{X8, DataType::k64bit});
+  arg_move->getInput(0)->setLastUse();
+
+  runPostAllocRewrite(func);
+
+  auto instrs = collectInstrs(*bb);
+  ASSERT_EQ(instrs.size(), 2);
+  expectRegMove(instrs[0], X8, X0, DataType::k32bit);
+  expectRegMove(instrs[1], X1, X8, DataType::k64bit);
+  ASSERT_TRUE(verifyPostRegAllocInvariants(&func, std::cout));
+}
+
+TEST_F(LIRPostAllocRewriteTest, CallResultArgMoveKeepsIntermediateInPlaceDef) {
+  Function func;
+  auto* bb = func.allocateBasicBlock();
+
+  bb->allocateInstr(
+      Instruction::kMove,
+      nullptr,
+      OutPhyReg{X8, DataType::k64bit},
+      PhyReg{X0, DataType::k64bit});
+  bb->allocateInstr(
+      Instruction::kAdd,
+      nullptr,
+      PhyReg{X8, DataType::k64bit},
+      Imm{1, DataType::k64bit});
+  auto* arg_move = bb->allocateInstr(
+      Instruction::kMove,
+      nullptr,
+      OutPhyReg{X1, DataType::k64bit},
+      PhyReg{X8, DataType::k64bit});
+  arg_move->getInput(0)->setLastUse();
+
+  runPostAllocRewrite(func);
+
+  auto instrs = collectInstrs(*bb);
+  ASSERT_EQ(instrs.size(), 3);
+  expectRegMove(instrs[0], X8, X0, DataType::k64bit);
+  ASSERT_TRUE(instrs[1]->isAdd());
+  ASSERT_TRUE(instrs[1]->output()->isNone());
+  EXPECT_EQ(instrs[1]->getInput(0)->getPhyRegister(), X8);
+  expectRegMove(instrs[2], X1, X8, DataType::k64bit);
+  ASSERT_TRUE(verifyPostRegAllocInvariants(&func, std::cout));
+}
+
+TEST_F(LIRPostAllocRewriteTest, CallResultArgMoveKeepsUnlistedInPlaceDef) {
+  Function func;
+  auto* bb = func.allocateBasicBlock();
+
+  bb->allocateInstr(
+      Instruction::kMove,
+      nullptr,
+      OutPhyReg{X8, DataType::k64bit},
+      PhyReg{X0, DataType::k64bit});
+  bb->allocateInstr(
+      Instruction::kLShift,
+      nullptr,
+      PhyReg{X8, DataType::k64bit},
+      Imm{1, DataType::k8bit});
+  auto* arg_move = bb->allocateInstr(
+      Instruction::kMove,
+      nullptr,
+      OutPhyReg{X1, DataType::k64bit},
+      PhyReg{X8, DataType::k64bit});
+  arg_move->getInput(0)->setLastUse();
+
+  runPostAllocRewrite(func);
+
+  auto instrs = collectInstrs(*bb);
+  ASSERT_EQ(instrs.size(), 3);
+  expectRegMove(instrs[0], X8, X0, DataType::k64bit);
+  ASSERT_TRUE(instrs[1]->isLShift());
+  ASSERT_TRUE(instrs[1]->output()->isNone());
+  EXPECT_EQ(instrs[1]->getInput(0)->getPhyRegister(), X8);
+  expectRegMove(instrs[2], X1, X8, DataType::k64bit);
+  ASSERT_TRUE(verifyPostRegAllocInvariants(&func, std::cout));
+}
+
+TEST_F(LIRPostAllocRewriteTest, CallResultArgMoveKeepsReturnRegInPlaceDef) {
+  Function func;
+  auto* bb = func.allocateBasicBlock();
+
+  bb->allocateInstr(
+      Instruction::kMove,
+      nullptr,
+      OutPhyReg{X8, DataType::k64bit},
+      PhyReg{X0, DataType::k64bit});
+  bb->allocateInstr(
+      Instruction::kAdd,
+      nullptr,
+      PhyReg{X0, DataType::k64bit},
+      Imm{1, DataType::k64bit});
+  auto* arg_move = bb->allocateInstr(
+      Instruction::kMove,
+      nullptr,
+      OutPhyReg{X1, DataType::k64bit},
+      PhyReg{X8, DataType::k64bit});
+  arg_move->getInput(0)->setLastUse();
+
+  runPostAllocRewrite(func);
+
+  auto instrs = collectInstrs(*bb);
+  ASSERT_EQ(instrs.size(), 3);
+  expectRegMove(instrs[0], X8, X0, DataType::k64bit);
+  ASSERT_TRUE(instrs[1]->isAdd());
+  ASSERT_TRUE(instrs[1]->output()->isNone());
+  EXPECT_EQ(instrs[1]->getInput(0)->getPhyRegister(), X0);
+  expectRegMove(instrs[2], X1, X8, DataType::k64bit);
+  ASSERT_TRUE(verifyPostRegAllocInvariants(&func, std::cout));
+}
+
+TEST_F(LIRPostAllocRewriteTest, CallResultArgMoveKeepsExchangeDef) {
+  Function func;
+  auto* bb = func.allocateBasicBlock();
+
+  bb->allocateInstr(
+      Instruction::kMove,
+      nullptr,
+      OutPhyReg{X8, DataType::k64bit},
+      PhyReg{X0, DataType::k64bit});
+  auto* exchange = bb->allocateInstr(
+      Instruction::kExchange,
+      nullptr,
+      OutPhyReg{X9, DataType::k64bit},
+      PhyReg{X8, DataType::k64bit});
+  auto* arg_move = bb->allocateInstr(
+      Instruction::kMove,
+      nullptr,
+      OutPhyReg{X1, DataType::k64bit},
+      PhyReg{X8, DataType::k64bit});
+  arg_move->getInput(0)->setLastUse();
+
+  runPostAllocRewrite(func);
+
+  auto instrs = collectInstrs(*bb);
+  ASSERT_EQ(instrs.size(), 3);
+  expectRegMove(instrs[0], X8, X0, DataType::k64bit);
+  ASSERT_TRUE(instrs[1]->isExchange());
+  EXPECT_EQ(instrs[1], exchange);
+  EXPECT_EQ(instrs[1]->output()->getPhyRegister(), X9);
+  EXPECT_EQ(instrs[1]->getInput(0)->getPhyRegister(), X8);
+  expectRegMove(instrs[2], X1, X8, DataType::k64bit);
+  ASSERT_TRUE(verifyPostRegAllocInvariants(&func, std::cout));
+}
+
+TEST_F(LIRPostAllocRewriteTest, CallResultArgMoveDoesNotCrossTStateLoad) {
+  Function func;
+  auto* bb = func.allocateBasicBlock();
+
+  bb->allocateInstr(
+      Instruction::kMove,
+      nullptr,
+      OutPhyReg{X8, DataType::kObject},
+      PhyReg{X0, DataType::kObject});
+  bb->allocateInstr(
+      Instruction::kLoadThreadState,
+      nullptr,
+      OutStk{PhyLocation(-16, 64), DataType::kObject});
+  auto* arg_move = bb->allocateInstr(
+      Instruction::kMove,
+      nullptr,
+      OutPhyReg{X1, DataType::kObject},
+      PhyReg{X8, DataType::kObject});
+  arg_move->getInput(0)->setLastUse();
+
+  runPostAllocRewrite(func);
+
+  auto instrs = collectInstrs(*bb);
+  ASSERT_EQ(instrs.size(), 3);
+  expectRegMove(instrs[0], X8, X0);
+  ASSERT_TRUE(instrs[1]->isLoadThreadState());
+  ASSERT_TRUE(instrs[1]->output()->isStack());
+  expectRegMove(instrs[2], X1, X8);
+  ASSERT_TRUE(verifyPostRegAllocInvariants(&func, std::cout));
+}
+
+TEST_F(LIRPostAllocRewriteTest, CallResultArgMoveDoesNotCrossEssentialBarrier) {
+  Function func;
+  auto* bb = func.allocateBasicBlock();
+
+  bb->allocateInstr(
+      Instruction::kMove,
+      nullptr,
+      OutPhyReg{X8, DataType::kObject},
+      PhyReg{X0, DataType::kObject});
+  bb->allocateInstr(Instruction::kVariadicPush, nullptr);
+  auto* arg_move = bb->allocateInstr(
+      Instruction::kMove,
+      nullptr,
+      OutPhyReg{X1, DataType::kObject},
+      PhyReg{X8, DataType::kObject});
+  arg_move->getInput(0)->setLastUse();
+
+  runPostAllocRewrite(func);
+
+  auto instrs = collectInstrs(*bb);
+  ASSERT_EQ(instrs.size(), 3);
+  expectRegMove(instrs[0], X8, X0);
+  ASSERT_TRUE(instrs[1]->isVariadicPush());
+  expectRegMove(instrs[2], X1, X8);
+  ASSERT_TRUE(verifyPostRegAllocInvariants(&func, std::cout));
+}
+
+TEST_F(LIRPostAllocRewriteTest, CallResultArgMoveDoesNotCrossCallBarrier) {
+  Function func;
+  auto* bb = func.allocateBasicBlock();
+
+  bb->allocateInstr(
+      Instruction::kMove,
+      nullptr,
+      OutPhyReg{X8, DataType::kObject},
+      PhyReg{X0, DataType::kObject});
+  bb->allocateInstr(Instruction::kCall, nullptr, Imm{0});
+  auto* arg_move = bb->allocateInstr(
+      Instruction::kMove,
+      nullptr,
+      OutPhyReg{X1, DataType::kObject},
+      PhyReg{X8, DataType::kObject});
+  arg_move->getInput(0)->setLastUse();
+
+  runPostAllocRewrite(func);
+
+  auto instrs = collectInstrs(*bb);
+  ASSERT_EQ(instrs.size(), 3);
+  expectRegMove(instrs[0], X8, X0);
+  ASSERT_TRUE(instrs[1]->isCall());
+  expectRegMove(instrs[2], X1, X8);
+  ASSERT_TRUE(verifyPostRegAllocInvariants(&func, std::cout));
+}
+
+TEST_F(LIRPostAllocRewriteTest, CallResultArgMoveDoesNotCrossOSREntry) {
+  Function func;
+  auto* bb = func.allocateBasicBlock();
+
+  bb->allocateInstr(
+      Instruction::kMove,
+      nullptr,
+      OutPhyReg{X8, DataType::kObject},
+      PhyReg{X0, DataType::kObject});
+  bb->allocateInstr(Instruction::kOSREntry, nullptr, Imm{0});
+  auto* arg_move = bb->allocateInstr(
+      Instruction::kMove,
+      nullptr,
+      OutPhyReg{X1, DataType::kObject},
+      PhyReg{X8, DataType::kObject});
+  arg_move->getInput(0)->setLastUse();
+
+  runPostAllocRewrite(func);
+
+  auto instrs = collectInstrs(*bb);
+  ASSERT_EQ(instrs.size(), 3);
+  expectRegMove(instrs[0], X8, X0);
+  ASSERT_TRUE(instrs[1]->isOSREntry());
+  expectRegMove(instrs[2], X1, X8);
+  ASSERT_TRUE(verifyPostRegAllocInvariants(&func, std::cout));
+}
+
+TEST_F(LIRPostAllocRewriteTest, CallResultArgMoveDoesNotCrossRegisterClasses) {
+  Function func;
+  auto* bb = func.allocateBasicBlock();
+
+  bb->allocateInstr(
+      Instruction::kMove,
+      nullptr,
+      OutPhyReg{D8, DataType::kDouble},
+      PhyReg{D0, DataType::kDouble});
+  auto* arg_move = bb->allocateInstr(
+      Instruction::kMove,
+      nullptr,
+      OutPhyReg{X1, DataType::k64bit},
+      PhyReg{D8, DataType::kDouble});
+  arg_move->getInput(0)->setLastUse();
+
+  runPostAllocRewrite(func);
+
+  auto instrs = collectInstrs(*bb);
+  ASSERT_EQ(instrs.size(), 2);
+  expectRegMove(instrs[0], D8, D0, DataType::kDouble);
+  ASSERT_TRUE(instrs[1]->isMove());
+  ASSERT_TRUE(instrs[1]->output()->isReg());
+  ASSERT_TRUE(instrs[1]->getInput(0)->isReg());
+  EXPECT_EQ(instrs[1]->output()->getPhyRegister(), X1);
+  EXPECT_EQ(instrs[1]->output()->dataType(), DataType::k64bit);
+  EXPECT_EQ(instrs[1]->getInput(0)->getPhyRegister(), D8);
+  EXPECT_EQ(instrs[1]->getInput(0)->dataType(), DataType::kDouble);
+  ASSERT_TRUE(verifyPostRegAllocInvariants(&func, std::cout));
+}
+
 // kAdd with one register input and one stack input should insert a Move from
 // stack to GP scratch register before the Add, then rewrite the Add's stack
 // input to use the scratch register.
