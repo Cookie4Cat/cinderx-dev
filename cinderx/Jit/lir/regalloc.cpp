@@ -526,6 +526,7 @@ void LinearScanAllocator::calculateLiveIntervals() {
       }
 
       if (instr->isCallLike() || isTreeIterHelperCall(instr_opcode)) {
+        call_locations_.emplace(instr_id);
         reserveCallerSaveRegisters(instr_id);
       }
       // kLoadThreadState needs caller-save reservation when the TLS
@@ -588,8 +589,9 @@ void LinearScanAllocator::calculateLiveIntervals() {
     auto loop_iter = loop_ends.find(bb);
     if (loop_iter != loop_ends.end()) {
       for (auto& loop_end_id : loop_iter->second) {
+        LiveRange loop_range(bb_start_id, loop_end_id);
+        loop_ranges_.push_back(loop_range);
         for (auto& opnd : live) {
-          LiveRange loop_range(bb_start_id, loop_end_id);
           getInterval(opnd).addRange(loop_range);
           // if the last use is in a loop, it is not a real last use
           auto opnd_iter = vreg_last_use_.find(opnd);
@@ -623,6 +625,65 @@ void LinearScanAllocator::calculateLiveIntervals() {
 
     visited_blocks.insert(bb);
   }
+}
+
+bool LinearScanAllocator::intervalCoversLoopCall(
+    const LiveInterval& interval) const {
+  for (const auto& loop_range : loop_ranges_) {
+    auto iter = call_locations_.lower_bound(loop_range.start);
+    while (iter != call_locations_.end() && *iter < loop_range.end) {
+      if (interval.covers(*iter)) {
+        return true;
+      }
+      ++iter;
+    }
+  }
+
+  return false;
+}
+
+void LinearScanAllocator::assignLoopCallRegisterPreferences() {
+#if defined(CINDER_AARCH64)
+  std::vector<LiveInterval*> candidates;
+  for (auto& interval : allocated_) {
+    if (interval->fixed || interval->isRegisterAllocated() ||
+        !interval->operand->isVreg() ||
+        interval->operand->dataType() == DataType::kObject ||
+        !intervalCoversLoopCall(*interval)) {
+      continue;
+    }
+    candidates.push_back(interval.get());
+  }
+
+  std::sort(candidates.begin(), candidates.end(), [](auto* lhs, auto* rhs) {
+    if (lhs->startLocation() != rhs->startLocation()) {
+      return lhs->startLocation() < rhs->startLocation();
+    }
+    if (lhs->endLocation() != rhs->endLocation()) {
+      return lhs->endLocation() > rhs->endLocation();
+    }
+    return lhs->operand < rhs->operand;
+  });
+
+  bool assigned_gp = false;
+  bool assigned_fp = false;
+  for (auto* interval : candidates) {
+    auto bit_size = interval->operand->sizeInBits();
+    if (interval->operand->isFp()) {
+      if (assigned_fp) {
+        continue;
+      }
+      interval->allocateTo(PhyLocation(D15.loc, bit_size));
+      assigned_fp = true;
+    } else {
+      if (assigned_gp) {
+        continue;
+      }
+      interval->allocateTo(PhyLocation(X27.loc, bit_size));
+      assigned_gp = true;
+    }
+  }
+#endif
 }
 
 void LinearScanAllocator::spillRegistersForYield(int instr_id) {
@@ -705,6 +766,7 @@ void LinearScanAllocator::linearScan() {
     TRACE("Queuing interval {} for allocation", *new_interval);
     allocated_.emplace_back(std::move(new_interval));
   }
+  assignLoopCallRegisterPreferences();
 
   UnorderedSet<LiveInterval*> active;
   UnorderedSet<LiveInterval*> inactive;
