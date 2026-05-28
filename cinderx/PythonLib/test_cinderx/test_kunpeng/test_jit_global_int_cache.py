@@ -11,6 +11,7 @@ _jit_bool_guard_global_int = 257
 _jit_float_guard_global_int = 257
 _jit_str_guard_global_int = 257
 _jit_int_subclass_guard_global_int = 257
+_jit_timestamp = 257
 
 
 class _MyInt(int):
@@ -65,12 +66,41 @@ def _load_int_subclass_guard_global_int_and_update(value):
     return result
 
 
+@failUnlessHasOpcodes("LOAD_GLOBAL")
+def _next_timestamp():
+    global _jit_timestamp
+    _jit_timestamp += 1
+    return _jit_timestamp
+
+
+@failUnlessHasOpcodes("LOAD_GLOBAL")
+def _read_stable_builtin_global():
+    return len
+
+
 class LoadGlobalIntCacheTests(unittest.TestCase):
     def assert_global_int_load_uses_exact_int_type_guard(self, func):
+        cinderx.jit.force_uncompile(func)
         self.assertTrue(cinderx.jit.force_compile(func))
         ops = cinderx.jit.get_function_hir_opcode_counts(func)
         self.assertEqual(ops.get("GuardType", 0), 1)
         self.assertEqual(ops.get("GuardIs", 0), 0)
+
+    def assert_global_int_op_uses_type_guard_without_identity_guard(self, func):
+        cinderx.jit.force_uncompile(func)
+        self.assertTrue(cinderx.jit.force_compile(func))
+        ops = cinderx.jit.get_function_hir_opcode_counts(func)
+        self.assertGreaterEqual(ops.get("GuardType", 0), 1)
+        self.assertEqual(ops.get("GuardIs", 0), 0)
+
+    def assert_no_relevant_deopts(self, func):
+        stats = cinderx.jit.get_and_clear_runtime_stats()
+        relevant_deopts = [
+            d
+            for d in stats["deopt"]  # pyrefly: ignore [not-iterable]
+            if d["normal"]["func_qualname"] == func.__qualname__
+        ]
+        self.assertEqual(relevant_deopts, [])
 
     def assert_mutable_global_int_load_does_not_deopt(self, func, values):
         self.assert_global_int_load_uses_exact_int_type_guard(func)
@@ -121,6 +151,46 @@ class LoadGlobalIntCacheTests(unittest.TestCase):
             _load_cross_small_int_global_and_update,
             [0, 1, 2, 255, 256, 257, 258],
         )
+
+    def test_mutable_global_int_increment_does_not_deopt(self):
+        if not cinderx.jit.is_enabled():
+            return
+        global _jit_timestamp
+        _jit_timestamp = 257
+        self.assert_global_int_op_uses_type_guard_without_identity_guard(
+            _next_timestamp
+        )
+
+        cinderx.jit.get_and_clear_runtime_stats()
+        self.assertEqual([_next_timestamp() for _ in range(3)], [258, 259, 260])
+        self.assert_no_relevant_deopts(_next_timestamp)
+
+    def test_mutable_global_int_increment_crosses_small_int_cache_without_deopt(self):
+        if not cinderx.jit.is_enabled():
+            return
+        global _jit_timestamp
+        _jit_timestamp = 253
+        self.assert_global_int_op_uses_type_guard_without_identity_guard(
+            _next_timestamp
+        )
+
+        cinderx.jit.get_and_clear_runtime_stats()
+        self.assertEqual(
+            [_next_timestamp() for _ in range(6)],
+            [254, 255, 256, 257, 258, 259],
+        )
+        self.assert_no_relevant_deopts(_next_timestamp)
+
+    def test_stable_builtin_global_load_keeps_identity_guard(self):
+        if not cinderx.jit.is_enabled():
+            return
+        cinderx.jit.force_uncompile(_read_stable_builtin_global)
+        self.assertTrue(cinderx.jit.force_compile(_read_stable_builtin_global))
+        ops = cinderx.jit.get_function_hir_opcode_counts(_read_stable_builtin_global)
+        self.assertIsNotNone(ops)
+        self.assertEqual(ops.get("GuardType", 0), 0)
+        self.assertEqual(ops.get("GuardIs", 0), 1)
+        self.assertIs(_read_stable_builtin_global(), len)
 
     def test_global_int_load_deopts_when_rebound_to_bool(self):
         if not cinderx.jit.is_enabled():
