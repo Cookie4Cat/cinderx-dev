@@ -21,6 +21,9 @@
 | V1.0 | 2026-05-26 | Codex Agent | 整合 `github/bench-cur-7c361dce-claudecode` 分支 generators JIT 优化文档，按当前 master 重写功能设计 |
 | V1.1 | 2026-05-26 | Codex Agent | 按文档审校意见收紧 CPython yield-from 语义、deopt/lifecycle、栈溢出和生产发布边界 |
 | V1.2 | 2026-05-26 | Codex Agent | 按二轮审校意见固定首版实验边界、heap-backed 状态栈、生产 gate 和里程碑拆分 |
+| V1.3 | 2026-05-28 | Codex Agent | 修复二轮审查剩余 gated_auto，补齐状态清理、实验消费边界和异常/准入契约 |
+| V1.4 | 2026-05-28 | Codex Agent | 明确生产协议操作采用精确 deopt/reify，将环检测和深度限制限定为原始 generator 语义，并确定生产准入五个纵切面 artifact |
+| V1.5 | 2026-05-28 | Codex Agent | 修复文档审查意见，拆分实验/生产 gate，补齐 reify 可表示性、active-path/depth 不变量、artifact/workload schema 和实验协议 guard |
 
 ## 4 Keywords 关键词
 
@@ -32,7 +35,7 @@ CinderX, JIT, generator, yield from, TreeIter, HIR, LIR, GenDataFooter, 状态�
 
 本文档不再把裸 `yield from self.left/right` 直接等同于空子树跳过。按 CPython 语义，`yield from None` 必须抛出 `TypeError`；状态机只有在原始源码/HIR 已显式包含空子树 guard，或编译期能证明子节点是同一精确 Node 类型且不会触发自定义 iterator 协议时，才允许替换原始 yield-from 路径。
 
-本文档不直接移植旧分支的大量非 generators 改动、实验脚本、Docker 配置和阶段性文档；后续实现应以本文档作为功能边界，以当前 `master` 的 HIR 表示和 generator runtime 为准。V1.2 明确首版交付不是 production-ready 默认启用方案，而是默认关闭的实验核心：允许在受控 benchmark/test 配置中重建旧分支状态机核心逻辑，生产启用必须等 yield-from 协议、deopt reify、平台和验收矩阵全部闭合。
+本文档不直接移植旧分支的大量非 generators 改动、实验脚本、Docker 配置和阶段性文档；后续实现应以本文档作为功能边界，以当前 `master` 的 HIR 表示和 generator runtime 为准。首版交付不是 production-ready 默认启用方案，而是默认关闭的实验核心：允许在受控 benchmark/test 配置中重建旧分支状态机核心逻辑。实验 gate 只证明受控 allowlist 下的 `next()`/`for`/`list()` 核心正确性和性能；生产 gate 另行要求 yield-from 协议 exact deopt/reify、active-path 环检测、原始递归深度边界、五个纵切面准入 artifact、平台和验收矩阵全部闭合。
 
 ## 6 List of abbreviations 缩略语清单
 
@@ -98,7 +101,7 @@ def __iter__(self):
 
 未带 guard 的 `yield from self.left/right` 不是上述形态。若 `left/right` 为 `None`，CPython 会在 `GET_YIELD_FROM_ITER` / `PyObject_GetIter` 路径抛出 `TypeError`，状态机不得把它改写为空遍历。
 
-该模式来自 pyperformance `generators` benchmark 和树结构遍历代码，但当前 master 是否能匹配正式 benchmark 不能只按源码形态推断。实现前必须用当前 master dump 目标 `Tree.__iter__` 的 HIR，证明 owner type、child type、iterator identity 和 guard 约束均满足；若证明失败，pyperformance 只能作为候选场景，不能作为首版覆盖承诺。原始 JIT 路径仍按 Python generator 语义维护递归生成器帧，每个 `yield from` 都可能触发子生成器创建、恢复入口查询、帧切换、`gi_yieldfrom` 暴露、`send/throw/close` 委派和状态保存。状态机优化将上述递归控制流转换为单个 JIT generator 内部的显式循环，但生产启用必须保留这些可观察语义，或在无法保留时拒绝优化：
+该模式来自 pyperformance `generators` benchmark 和树结构遍历代码，但当前 master 是否能匹配正式 benchmark 不能只按源码形态推断。实验实现前必须提交当前 master 目标 `Tree.__iter__` 的 HIR 形态、exactness/layout/iterator identity 证据和精确 allowlist；生产启用前还必须提交五个纵切面准入 artifact verifier：HIR 结构、owner/child exactness、field layout、iterator identity、失效/deopt。若实验准入失败，pyperformance 只能作为候选场景，不能作为首版覆盖承诺。原始 JIT 路径仍按 Python generator 语义维护递归生成器帧，每个 `yield from` 都可能触发子生成器创建、恢复入口查询、帧切换、`gi_yieldfrom` 暴露、`send/throw/close` 委派和状态保存。状态机优化将上述递归控制流转换为单个 JIT generator 内部的显式循环，但生产启用必须能在可观察协议操作前 exact deopt/reify 到等价原始 generator/yield-from 状态；无法 reify 时拒绝优化：
 
 ```text
 current node + phase + state stack
@@ -116,20 +119,21 @@ current node + phase + state stack
 | 泛化任意递归生成器 | 不涉及 |
 | 消除所有 generator frame | 不涉及 |
 | 逃逸分析驱动的 caller 内联 | 不作为首版依赖 |
-| pyperformance 正式覆盖 | 需先给出当前 master HIR 准入证明；无证明时只做候选 benchmark |
+| pyperformance 正式覆盖 | 实验覆盖需先给出当前 master 实验准入证据；生产覆盖需五个纵切面准入 artifact verifier；无证明时只做候选 benchmark |
 
 生产状态：
 
 | 项目 | 结论 |
 | ---- | ---- |
 | 首版交付定位 | 默认关闭的实验核心实现，用于复现旧分支 TreeIter 状态机收益和风险 |
-| 实验启用条件 | 显式配置开启、目标架构已验证、目标 HIR 有准入证明、测试只声明 `next()`/`for` 消费语义 |
-| 生产启用前置 | CPython yield-from 协议、deopt reify、release 栈安全、平台 codegen、GC/lifecycle 和验收矩阵全部闭合 |
+| 实验启用条件 | 显式配置开启、目标架构已验证、目标 HIR 形态已匹配、精确 code-object allowlist/jitlist 或专用 harness 已限定目标函数，测试只声明 `next()`/`for`/`list()` 受控消费结果 |
+| 实验协议边界 | allowlist 只限定可优化 code object，不限定 generator object 的消费方式；首版实验必须在 `gi_yieldfrom`、`send(non-None)`、`throw`、`close`、suspended deopt 和 instrumentation attach 路径上 fail closed，不能让已优化实验 generator 暴露未实现协议 |
+| 生产启用前置 | CPython yield-from 协议、deopt reify 可表示性、active-path/depth 转移不变量、五个纵切面准入 artifact verifier、真实 workload gate、release 栈安全、平台 codegen、GC/lifecycle 和验收矩阵全部闭合 |
 | 不满足生产前置时 | 生产配置下 pass 必须 no-op；不得把实验状态机作为 production-ready 路径发布 |
 
 ## 8.2 功能域总体方案
 
-总体方案分为五层：
+总体方案分为六层：
 
 ```text
 Python generator bytecode
@@ -141,7 +145,7 @@ Python generator bytecode
 TreeIterStateMachinePass
         |
         v
-状态机 HIR: Load/SaveCurrentNode, Load/SavePhase, StateStackPush/Pop, YieldValue
+状态机 HIR: Ensure/ClearTreeIterState, Load/SaveCurrentNode, Load/SavePhase, StateStackPush/Pop, YieldValue
         |
         v
 LIR + codegen: 通过 FP 正偏移读取 GenDataFooter.tree_iter_state 指针
@@ -153,10 +157,10 @@ LIR + codegen: 通过 FP 正偏移读取 GenDataFooter.tree_iter_state 指针
 设计原则：
 
 1. 以当前 master 的 HIR 为输入，不要求先移植旧分支的 `YieldFrom`、`OptimizedYieldFrom`、`InlineIter` 全套指令。
-2. `GenDataFooter` 只保存 TreeIter 状态指针，实际 current/phase/stack 放在按需分配的 heap-backed `TreeIterState` 中，避免给所有 JIT generator 增加固定 256B+ 状态数组。
+2. `GenDataFooter` 只保存 TreeIter 状态指针，实际 current/phase/stack 以及生产 active-path/depth 辅助状态放在按需分配的 heap-backed `TreeIterState` 中，避免给所有 JIT generator 增加固定 256B+ 状态数组。
 3. 新增 HIR 指令按副作用保守建模，写操作和引用计数相关操作不得被 DCE/CSE 错误消除。
 4. 首版只匹配原始空子树 guard、exact type/layout 和 iterator identity 都明确的 `left/right/value` 树遍历，任何不确定情况直接回退到原始 generator 路径。
-5. codegen 首先保障 AArch64 路径；x86_64 可同步实现但必须单独验证后标记可用，未验证架构即使配置开启也 no-op。
+5. 首版 native codegen 只保障 AArch64 路径；x86_64 首版只实现 no-op arch gate，不生成状态机机器码，后续独立完成同等 correctness、protocol、deopt 和性能矩阵后再加入 native translate 规则。
 
 ## 8.3 功能域规格设计
 
@@ -171,13 +175,13 @@ LIR + codegen: 通过 FP 正偏移读取 GenDataFooter.tree_iter_state 指针
 | GJIT-SM-005 | 状态机相关 `PyObject*` 必须满足 CinderX RefcountInsertion、GC traverse、clear/dealloc、deopt 和 generator finalize 的所有权假设 |
 | GJIT-SM-006 | 功能必须可通过独立 JIT 配置关闭，用于回归定位和性能对照 |
 | GJIT-SM-007 | 目标架构未完成 codegen 和测试矩阵前，即使配置开启也必须 no-op |
-| GJIT-SM-008 | 默认开启前必须具备当前 master HIR 准入证明、量化性能 gate 和完整协议回归 gate |
+| GJIT-SM-008 | 默认开启前必须具备当前 master 五个纵切面准入 artifact、量化性能 gate 和完整协议回归 gate |
 
 ### 8.3.2 非目标
 
 | 编号 | 非目标 |
 | ---- | ------ |
-| GJIT-SM-N001 | 不重写 CPython generator 协议；无法保持协议时拒绝优化 |
+| GJIT-SM-N001 | 不重写 CPython generator 协议；无法通过 exact deopt/reify 保持协议时拒绝生产优化 |
 | GJIT-SM-N002 | 不在首版支持任意属性名、任意递归图、任意子类或用户自定义 iterator 协议内联 |
 | GJIT-SM-N003 | 不把旧分支中与 ARM benchmark、Docker、wheel、其它 HIR 优化相关的改动纳入本功能 |
 | GJIT-SM-N004 | 不承诺首版实验路径支持 deopt 后恢复到状态机精确位置；生产路径在精确 reify 未实现前必须 no-op |
@@ -191,11 +195,14 @@ LIR + codegen: 通过 FP 正偏移读取 GenDataFooter.tree_iter_state 指针
 | 状态字段 | 说明 |
 | -------- | ---- |
 | `current_node` | 当前遍历节点 |
-| `current_phase` | 当前阶段：left、yield、right、backtrack |
+| `current_phase` | 当前阶段：left、yield、right、backtrack；生产 active-path/depth 路径可使用 exit cleanup marker |
 | `stack_capacity` | 当前 heap stack 容量 |
 | `stack_top` | 显式遍历栈栈顶 |
-| `state_stack` | heap-backed growable 栈，保存待回溯的 `(node, phase)` |
+| `state_stack` | heap-backed growable 栈，保存待回溯的 `(node, phase)`；生产路径可用 exit marker 表示 right 子树完成后还需移除 parent active-path |
 | `popped_phase` | 单输出 HIR 限制下保存 `StateStackPop` 的 phase 结果 |
+| `depth` | 生产路径中当前递归语义深度 |
+| `depth_budget` | 生产路径中原始递归 generator 可接受的深度预算 |
+| `active_path` | 生产路径中当前递归路径的节点身份集合，用于检测回边而不做全图 visited 去重 |
 
 ### 8.4.2 实现思路
 
@@ -221,12 +228,12 @@ loop:
 LEFT:
   if original left guard says no child:
       phase = YIELD
-  elif current.left is an exact supported child node:
+  elif matcher has proven current.left is an exact supported child node:
       push(current, YIELD)
       current = current.left
       phase = LEFT
   else:
-      fallback/deopt or reject optimization
+      no match before CFG rewrite
 
 YIELD:
   yield current.value
@@ -235,17 +242,19 @@ YIELD:
 RIGHT:
   if original right guard says no child:
       phase = BACKTRACK
-  elif current.right is an exact supported child node:
+  elif matcher has proven current.right is an exact supported child node:
       current = current.right
       phase = LEFT
   else:
-      fallback/deopt or reject optimization
+      no match before CFG rewrite
 
 BACKTRACK:
   if stack is empty:
       return None
   current, phase = pop()
 ```
+
+首版目标逻辑不包含 active-state runtime fallback。无法在 matcher 阶段证明 child exactness、layout 和 iterator identity 的函数，必须在 CFG 改写前保持原 HIR 不变。
 
 该设计实质上把递归调用栈替换为显式栈，把生成器恢复点替换为 `current_phase`。显式栈首版使用初始容量 16 的 heap-backed growable 结构。release 路径必须在每次 push 前做容量检查；容量不足时调用 grow helper 扩容，扩容失败时走受控错误路径，不能越界写或只依赖 debug 断言。
 
@@ -279,10 +288,13 @@ GenDataFooter
 
 TreeIterState
   current_node: PyObject*
-  current_phase: int32
+  current_phase: int32  # left/yield/right/backtrack，生产路径可含 exit cleanup marker
   stack_top: int32
   stack_capacity: int32
   popped_phase: int32
+  depth: int32
+  depth_budget: int32
+  active_path: identity set
   state_stack:
     node: PyObject*
     phase: int32
@@ -294,8 +306,10 @@ TreeIterState
 | ---- | -------- |
 | 初始栈条目数 | 16 |
 | 单条目大小 | 16 bytes |
-| 支持深度 | 目标覆盖 depth <= 12 的树遍历验证场景 |
-| 超限行为 | release 构建每次 push 前动态检查；容量不足时扩容 heap stack，扩容失败时抛出受控错误并保持引用所有权一致 |
+| 支持深度 | 核心 correctness 覆盖 depth 1-12；生产路径只支持原始递归 generator 语义可接受的深度范围，不因 heap stack 动态扩容而隐式支持更深的树 |
+| 超限行为 | release 构建每次 push 前同时检查物理容量和语义深度预算；容量不足但仍在预算内时扩容，分配失败走受控错误路径；若继续进入 child 将超过原始递归语义边界，生产路径必须精确 deopt/reify，无法 reify 时不得生产优化 |
+
+生产路径不做全图 `visited` 去重。状态机只维护当前递归路径的 active-path 集合：进入 `left/right` child 前检查 child 是否已在当前路径中；命中表示存在回边，必须精确 deopt/reify 到原始 generator/yield-from 状态，让 CPython/CinderX 原路径产生对应行为。shared subtree 在离开当前路径后可以再次进入，不能因为“曾经见过”而跳过。
 
 #### 8.4.3.3 CFG 生成设计
 
@@ -313,7 +327,7 @@ bb_init
 
 关键约束：
 
-1. `SaveCurrentNode(self)` 和 `SavePhase(LEFT)` 必须插入到 `InitialYield` 之前，避免 `InitialYield` 后 caller-saved register 被覆盖。
+1. `EnsureTreeIterState()`、`SaveCurrentNode(self)` 和 `SavePhase(LEFT)` 必须插入到 `InitialYield` 之前，避免 `InitialYield` 后 caller-saved register 被覆盖；`EnsureTreeIterState()` 必须携带可复用 `FrameState`。
 2. 新插入指令必须满足定义先于使用，不能用追加到块末尾的辅助函数在 `InitialYield` 前创建依赖。
 3. `YieldValue` 必须携带原始 `FrameState`；如果无法安全构造 FrameState，则回退。
 4. 状态机生成后必须重新清理不可达块，并对新寄存器做类型重推导，避免 `TTop` 被误当作 object 导致错误 decref。
@@ -324,7 +338,8 @@ bb_init
 
 | 指令 | 类型 | 语义 | 副作用策略 |
 | ---- | ---- | ---- | ---------- |
-| `SaveCurrentNode(node)` | HIR | 更新 `TreeIterState.current_node`，必要时 lazy 分配状态对象 | 写状态并处理 refcount，必须保守 |
+| `EnsureTreeIterState()` | HIR | 在首个状态写入前分配并初始化 `TreeIterState`，失败时按原 `FrameState` 抛出受控异常 | 可分配内存，必须保守 |
+| `SaveCurrentNode(node)` | HIR | 更新 `TreeIterState.current_node`；输入可能来自 borrowed field load，必须先持有新 node 再释放旧 node | 写状态并处理 refcount/decref，必须保守 |
 | `LoadCurrentNode()` | HIR | 读取当前节点 | 返回 object，需要给寄存器独立引用，必须保守 |
 | `SavePhase(phase)` | HIR | 更新 `TreeIterState.current_phase` | 写状态，必须保守 |
 | `LoadPhase()` | HIR | 读取 `current_phase` | 纯读，可在确认安全后放宽 |
@@ -332,14 +347,15 @@ bb_init
 | `StateStackPop()` | HIR | 出栈 node，phase 写到 `popped_phase` | 写状态并转移引用，必须保守 |
 | `LoadPoppedPhase()` | HIR | 读取最近 pop 的 phase | 纯读，可在确认安全后放宽 |
 | `LoadStackTop()` | HIR | 读取栈顶 | 纯读，可在确认安全后放宽 |
+| `ClearTreeIterState()` | HIR | 正常 done、frame clear 和 dealloc backstop 清理 current/stack/active-path owned references | 写状态并处理 refcount/decref，必须保守 |
 
 生产协议约束：
 
 | 项目 | 约束 |
 | ---- | ---- |
-| `gi_yieldfrom` | 如果优化后 generator 在原语义中应处于 delegated yield-from 状态，必须保留可观察元数据，或在可观察前精确 deopt |
-| `send(non-None)` | 必须按 CPython yield-from 语义委派到当前子 iterator；无法委派时不得优化 |
-| `throw/close/finalize` | 必须能传播到当前 delegated iterator 或精确 deopt 到等价解释器状态 |
+| `gi_yieldfrom` | 如果优化后 generator 在原语义中应处于 delegated yield-from 状态，生产路径必须在可观察前精确 deopt/reify 到等价原始 generator/yield-from 状态 |
+| `send(non-None)` | 生产路径必须在发送前精确 deopt/reify，并交给 CPython yield-from 语义委派到当前子 iterator；无法 reify 时不得生产优化 |
+| `throw/close/finalize` | 生产路径必须先精确 deopt/reify，再由原路径传播到当前 delegated iterator；无法 reify 时不得生产优化 |
 | StopIteration value | 必须保留 yield-from 完成值处理；目标 TreeIter 不使用该值也不能改变异常传播 |
 
 codegen 分层：
@@ -350,7 +366,7 @@ codegen 分层：
 | instr effects | 写操作和 refcount 操作默认 `hasArbitraryExecution=true`；纯读操作可在测试覆盖后优化 |
 | LIR lowering | 状态机热路径使用原生 LIR opcode，不使用 `appendCallInstruction` 伪装成 C 调用 |
 | AArch64 codegen | 通过 frame pointer 正偏移读取 `GenDataFooter.tree_iter_state`，再访问 heap state 字段 |
-| x86_64 codegen | 可与 AArch64 同步实现，但发布前必须单独验证 |
+| x86_64 codegen | 首版只要求 no-op arch gate；native translate 规则后续单独实现和验证 |
 
 #### 8.4.3.5 引用计数设计
 
@@ -362,7 +378,7 @@ codegen 分层：
 | 读取 current node | 返回前 `INCREF`，交给 RefcountInsertion 后续 `XDecref` |
 | stack push | 栈持有节点引用，push 时 `INCREF` |
 | stack pop | 栈引用转移给输出寄存器，pop 后清空槽位 |
-| generator data 释放 | 清理 `TreeIterState.current_node`、栈内残留引用和 heap stack |
+| generator data 释放 | 清理 `TreeIterState.current_node`、栈内残留引用、生产 active-path 中 owned references 和 heap stack；depth/depth_budget 清零 |
 
 该规则来自旧分支 depth>=3 崩溃的根因：运行时函数返回 borrowed reference 后被 RefcountInsertion 自动 `XDecref`，导致树节点被提前释放。
 
@@ -381,11 +397,13 @@ codegen 分层：
 | 里程碑 | SR编号 | 需求描述 | 是否允许生成状态机 HIR |
 | ------ | ------ | -------- | ------------------------ |
 | M0 | SR-GJIT-001 | 新增配置、触发探针和 no-op pass 框架，默认关闭 | 否 |
-| M1 | SR-GJIT-002 | 模式识别、当前 master HIR 准入证明和负例覆盖，失败时无行为变化 | 否 |
+| M1 | SR-GJIT-002 | 模式识别、当前 master HIR 形态和 exactness/layout/iterator identity 实验证据、负例覆盖，失败时无行为变化 | 否 |
+| M1.5 | SR-GJIT-002A | 真实 workload go/no-go：证明 pyperformance `generators` 当前 master 满足实验准入，或指定一个非合成、生产等价的 TreeIter workload 和 owner；若二者都没有，停止在 matcher 研究，不进入 M2-M4 | 否 |
+| M1.6 | SR-GJIT-002B | 生产可表示性 go/no-go：提交 exact reify 可表示性 artifact、active-path/depth 转移不变量草案、五纵切面 artifact schema 和真实 workload 接受标准；若可表示性失败，必须在 M2 前调整状态模型或明确 M2-M4 只保留实验目标 | 否 |
 | M2 | SR-GJIT-003 | heap-backed `TreeIterState`、引用清理、GC traverse、release 扩容安全路径 | 否 |
-| M3 | SR-GJIT-004 | 在显式实验开关下生成 TreeIter 状态机 CFG、HIR/LIR/codegen 和 `next()`/`for` correctness 测试 | 仅实验配置 |
+| M3 | SR-GJIT-004 | 在显式实验开关和精确 code-object allowlist/jitlist 或专用 harness 下生成 TreeIter 状态机 CFG、HIR/LIR/codegen 和 `next()`/`for`/`list()` correctness 测试；缺少 allowlist、wildcard jitlist 或低 `PYTHONJITAUTO` 阈值时 no-op | 仅实验配置 |
 | M4 | SR-GJIT-005 | AArch64 实验性能 gate 和非目标 generator 回退检查 | 仅实验配置 |
-| M5 | SR-GJIT-006 | 精确 yield-from/deopt 协议、lifecycle、平台矩阵和生产性能 gate 全部闭合 | 是，生产配置 |
+| M5 | SR-GJIT-006 | exact reify 实现、协议敏感操作 runtime guard、active-path/depth 生产语义、五纵切面 verifier、lifecycle、平台矩阵和生产性能 gate 全部闭合 | 是，生产配置 |
 | 后续演进 | SR-GJIT-F001 | 泛化到更多递归生成器模式 | 否，不纳入首版 SR |
 
 ### 8.4.5 实现接口设计
@@ -419,7 +437,7 @@ Compiler pass pipeline
 | pass-local matcher | HIR function | 匹配结果：字段偏移、yield frame state、self register | 只服务 TreeIterStateMachinePass，不引入公共 PatternDetector 抽象 |
 | pass-local builder | 匹配结果 | 新状态机基本块集合 | 只负责本 pass 的 CFG 构造和原始路径替换 |
 | TreeIter state HIR ops | node/phase/stack 操作 | 状态读写 HIR | 访问 `GenDataFooter.tree_iter_state` 指向的 heap state |
-| LIR translate rules | 状态机 LIR op | 目标架构机器码 | 接入现有 AArch64/x86_64 codegen，不创建独立 StateMachineCodegen 框架 |
+| LIR translate rules | 状态机 LIR op | 目标架构机器码 | 首版接入 AArch64 codegen，不创建独立 StateMachineCodegen 框架；x86_64 只保留 no-op arch gate |
 | `JIT config` | 环境变量或配置对象 | pass enable/disable | 控制功能开关 |
 
 ### 8.4.6 功能规格设计
@@ -434,7 +452,7 @@ Compiler pass pipeline
 5. pass 在 InitialYield 前保存初始 current node 和 phase。
 6. pass split 原入口块并生成状态机 CFG。
 7. 状态机执行中通过 `GenDataFooter.tree_iter_state` 指向的 heap state 保存 current node、phase 和显式栈。
-8. 每次 YIELD 阶段读取 current.value；首版实验只声明受控 `next()`/`for` 消费结果正确，生产路径在无法保留协议语义时不触发优化。
+8. 每次 YIELD 阶段读取 current.value；首版实验只声明受控 `next()`/`for`/`list()` 消费结果正确，生产路径在协议敏感操作无法 exact deopt/reify 时不触发优化。
 9. 栈为空且 phase 为 backtrack 时清理 tree_iter 状态并返回 None，generator 正常结束。
 ```
 
@@ -444,9 +462,11 @@ Compiler pass pipeline
 | ---- | ---- |
 | 字段名或 HIR 链路不匹配 | 不改写，走原始 generator |
 | 缺少可复用 FrameState | 不改写，走原始 generator |
-| 状态栈容量不足 | release 必须在写入前动态检查并扩容 heap stack；扩容失败走受控错误路径 |
+| TreeIterState 分配失败 | `EnsureTreeIterState` 在状态写入前抛出受控异常，不能留下半初始化状态 |
+| 状态栈容量不足 | release 必须在写入前动态检查并在语义深度预算内扩容 heap stack；扩容失败走受控错误路径 |
+| 检测到 active-path 回边或超过原始递归深度边界 | 生产配置必须精确 deopt/reify 到原始 generator；无法 reify 时不改写，走原始 generator |
 | `yield from None` 或非 iterable | 保留 CPython 异常语义，不得作为空子树跳过 |
-| `send/throw/close/gi_yieldfrom` 无法保持 | 生产配置不改写，走原始 generator；首版实验配置只覆盖已声明的 `next()`/`for` 受控场景 |
+| 协议敏感操作无法 exact deopt/reify | 生产配置在 `send/throw/close/gi_yieldfrom` 前精确 deopt/reify；无法 reify 时不改写，走原始 generator；首版实验配置只覆盖已声明的 `next()`/`for`/`list()` 受控场景 |
 | refcount 或 dealloc 罕见路径 | codegen 需调用安全 dealloc 或退回 C helper |
 | postalloc 优化破坏 move 链 | 新指令必须成为优化边界或补充中间寄存器使用检查 |
 | 目标架构未验证 | 配置关闭或仅启用解释/原始 JIT 路径 |
@@ -459,8 +479,8 @@ Compiler pass pipeline
 | 稳定性 | 同一棵树重复遍历，多次 generator 创建和销毁无崩溃、无悬挂引用 |
 | 准入 | 非 TreeIter generator 不触发 pass |
 | 可控性 | 环境变量关闭时 HIR 不含状态机专用指令 |
-| 协议 | 生产启用前 `gi_yieldfrom`、`send(non-None)`、`throw`、`close`、StopIteration value、异常上下文必须与 CPython 原语义一致；首版实验只覆盖受控 `next()`/`for` 消费 |
-| 溢出 | depth 16、17、极深 skewed tree 和循环对象图在 release 下不越界、不崩溃、不产生错误结果 |
+| 协议 | 生产启用前 `gi_yieldfrom`、`send(non-None)`、`throw`、`close`、StopIteration value、异常上下文必须与 CPython 原语义一致；首版实验只覆盖受控 `next()`/`for`/`list()` 消费结果 |
+| 环与深度 | finite acyclic tree 在原始递归语义可接受深度内结果一致；active-path 回边、self-cycle、right-cycle、极深 skewed tree 超过原语义边界时，生产路径精确 deopt/reify 或不触发优化，不能 silently 成功遍历 |
 | 性能 | 指定平台和命令下，相对当前 master + feature off 达到量化收益阈值，非目标 generator 无统计显著回退 |
 | 回归 | 现有 `test_jit_generators`、`test_jit_coroutines`、generator frame、instrumentation deopt 相关测试通过 |
 
@@ -491,7 +511,7 @@ Compiler pass pipeline
 | 编译后寄存器读垃圾 | 崩溃或错误节点 | InitialYield clobber self register | HIR dump 检查 init 顺序 | SaveCurrentNode 位于 InitialYield 前 |
 | postalloc 删除返回值 move | 错误 decref 或 stale register | fold 未检查中间使用 | LIR dump 对比 | 增加优化屏障和中间使用检查 |
 | `yield from None` 被跳过 | 本应抛出的 TypeError 消失 | 把 `None` 当空子树而非原始 guard | None/非 iterable 语义测试 | 只匹配原始 guard，裸 yield-from 保留异常 |
-| close/throw 未委派 | generator finalization 或异常传播错误 | 普通 YieldValue 丢失 delegated iterator 元数据 | 生产 gate 协议测试 | 首版实验不声明支持；生产启用前必须保留 yield-from 元数据或精确 deopt |
+| close/throw 未委派 | generator finalization 或异常传播错误 | 普通 YieldValue 丢失 delegated iterator 元数据 | 生产 gate 协议测试 | 首版实验不声明支持；生产启用前必须在协议敏感操作前精确 deopt/reify |
 
 #### 8.4.7.2 可服务性分析
 
@@ -541,9 +561,11 @@ Compiler pass pipeline
 
 | Gate | 要求 |
 | ---- | ---- |
+| 实验准入 | M1.5/M4 目标 workload 必须有精确 allowlist、当前 master HIR 形态证据、exactness/layout/iterator identity 实验证据和真实 workload 接受标准；缺任一项实验性能 gate 失败 |
+| 生产准入 | 生产优化函数必须具备可验证的五个纵切面 artifact：HIR 结构、owner/child exactness、field layout、iterator identity、失效/deopt；缺任一项或 verifier 过期时生产配置 no-op |
 | 平台 | 每个启用架构独立通过 debug/release correctness、ASAN/refleak；生产启用还需协议矩阵 |
 | deopt/lifecycle | 实验路径覆盖 tp_clear、finalize、正常完成无泄漏；生产启用还需 instrumentation attach、close、throw 无语义漂移 |
-| 性能 | 目标 benchmark 相对 feature off 达到预设阈值，且非目标 generator 无显著回退 |
+| 性能 | M1.5 真实 workload 接受标准通过；AArch64 实验 median speedup >= 2.0x 且 95% CI 下界 > 1.25x；生产启用前重测 median speedup >= 1.5x 且 95% CI 下界 > 1.10x；非目标 generator median slowdown 不得 > 5% |
 | 回滚 | 环境变量和 HIR pass 配置可完全关闭，关闭后 HIR 不含状态机指令 |
 
 ### 8.4.8 影响点列表
@@ -554,9 +576,9 @@ Compiler pass pipeline
 | `cinderx/Jit/compiler.*` | 接入 pass pipeline 和配置位 |
 | `cinderx/Jit/config.*`、`pyjit.cpp` | 新增开关 |
 | `cinderx/Jit/gen_data_footer.*` | 增加 TreeIter 状态指针，避免内嵌固定大栈 |
-| `cinderx/Jit/jit_rt.cpp`、`generators_rt.cpp` | 初始化、lazy 分配、GC traverse、clear/dealloc 和实验 deopt gate 需要处理新增状态 |
+| `cinderx/Jit/jit_rt.cpp`、`generators_rt.cpp` | 初始化、显式状态分配、GC traverse、clear/dealloc 和实验 deopt gate 需要处理新增状态 |
 | `cinderx/Jit/lir/*` | 新增 LIR opcode/lowering/postalloc 边界 |
-| `cinderx/Jit/codegen/autogen.cpp` | 新增 AArch64/x86_64 translate 规则 |
+| `cinderx/Jit/codegen/autogen.cpp` | 首版新增 AArch64 translate 规则；x86_64 首版只新增或复用 no-op arch gate，不实现 native translate |
 | `cinderx/PythonLib/test_cinderx/*` | 新增 TreeIter 状态机测试 |
 | benchmark 脚本 | 性能验收需增加 jitlist/auto 激活包装并固化量化 gate |
 
@@ -565,13 +587,15 @@ Compiler pass pipeline
 | 需求 | 分配模块 |
 | ---- | -------- |
 | GJIT-SM-001 | pass-local TreeIter matcher |
-| GJIT-SM-002 | pass-local builder + HIR CFG |
+| GJIT-SM-002 | generator protocol/deopt production gate 和协议回归矩阵 |
 | GJIT-SM-003 | Heap-backed TreeIterState model |
-| GJIT-SM-004 | HIR/LIR/codegen state ops |
+| GJIT-SM-004 | matcher admission guards 和 bare None、non-iterable、子类覆盖等负例语义测试 |
 | GJIT-SM-005 | Refcount and generator lifecycle |
 | GJIT-SM-006 | Config, probe, tests |
 | GJIT-SM-007 | Platform gate and architecture-specific codegen |
 | GJIT-SM-008 | Production performance/protocol gate |
+
+状态机 HIR/LIR/codegen state ops 属于 SR-GJIT-004 的实现任务，不作为 GJIT-SM-004 的语义需求分配条目；GJIT-SM-004 的语义边界由准入 matcher 和负例测试共同承接。
 
 # 9 详细设计与实现输入
 
@@ -579,10 +603,21 @@ Compiler pass pipeline
 
 1. 当前 master HIR 中 guard、`GET_YIELD_FROM_ITER`、`Send`、`YieldValue::yieldFromIter()` 到 `self.left/right` 的精确追踪规则。
 2. `GenDataFooter` 字段布局、初始化路径、释放路径和版本条件。
-3. 每个新增 HIR 指令的 output type、memory effects、replayable/passthrough 规则。
-4. AArch64 codegen 的寄存器使用约束，以及 x86_64 验证矩阵。
+3. 每个新增 HIR 指令的 output type、memory effects、exception contract、replayable/passthrough 规则。
+4. AArch64 codegen 的寄存器使用约束，以及 x86_64 首版 no-op gate 和后续验证矩阵。
 5. postalloc move fold 对新原生 LIR 指令的屏障规则。
 6. 首版实验路径和未来生产路径的 `gi_yieldfrom`、`send/throw/close`、StopIteration value 和异常传播边界。
 7. 生产启用所需的 FrameState/reify 恢复模型；未实现前生产配置 no-op。
-8. heap-backed growable stack 的扩容、失败和引用所有权路径。
-9. pyperformance HIR 准入证明、量化性能 gate 和完整协议回归 gate。
+8. active-path/depth 的进入、离开、shared subtree、kExit marker 和引用所有权路径。
+9. heap-backed growable stack 的扩容、失败和引用所有权路径。
+10. pyperformance 或真实 workload 的实验准入 artifact、生产五纵切面 artifact verifier、量化性能 gate 和完整协议回归 gate。
+
+# 10 决策项状态
+
+以下问题来自文档审查的 manual 类意见，均已按讨论确认。功能设计只定义生产准入原则和证据边界；具体采集方式、pass 阶段和数据结构由详细设计承接：
+
+| 编号 | 状态 | 决策项 | 功能结论 |
+| ---- | ---- | ------ | -------- |
+| D-GJIT-SM-001 | 已决 | allowlisted 且已优化的 generator 上执行协议敏感操作时如何处理 | 生产路径采用精确 deopt/reify：`gi_yieldfrom`、`send(non-None)`、`throw`、`close` 发生前恢复为等价原始 generator/yield-from 状态，再走 CPython/CinderX 现有协议路径；M1.6 必须先证明 TreeIterState 到原始 frame/yield-from 栈可表示，无法精确 reify 的函数不得生产优化 |
+| D-GJIT-SM-002 | 已决 | 有限无环树是否作为首版生产前提，以及生产环境如何处理环和深度 | 生产路径限定在有限无环树和原始递归 generator 可接受深度内；运行时维护 active-path 集合而不是全局 visited，进入 child 前发现回边或深度越界时精确 deopt/reify；详细设计必须给出 active-path/depth 转移不变量、shared subtree 退出语义和 kExit marker；无法 reify 时不触发生产状态机 |
+| D-GJIT-SM-003 | 已决 | 生产准入证明来源的 artifact 格式 | 每个生产优化函数必须提交可验证的五个纵切面 artifact：HIR 结构、owner/child exactness、field layout、iterator identity、失效/deopt。每个纵切面必须列明证明来源和失效处理，并由当前 master artifact verifier fail-closed 校验；observed profile、本地样例或单次 HIR dump 只能作为候选信号，不能单独作为生产准入证据。任一纵切面缺少强证明或失效/deopt 机制时，生产配置必须 no-op |
