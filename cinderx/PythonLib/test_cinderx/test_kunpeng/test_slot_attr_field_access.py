@@ -88,6 +88,53 @@ class SlotAttrFieldAccessTests(unittest.TestCase):
         counter.increment()
         self.assertEqual(counter.value, 6)
 
+    def test_slot_read_only_access_lowers_to_field_ops(self) -> None:
+        class Point:
+            __slots__ = ("x", "y")
+
+            def norm(self) -> int:
+                return self.x * self.x + self.y * self.y
+
+        point = Point()
+        point.x = 3
+        point.y = 4
+
+        specialize(Point.norm, point.norm)
+
+        names = opnames(Point.norm)
+        self.assertIn("LOAD_ATTR_SLOT", names)
+        self.assertTrue(cinderx.jit.is_jit_compiled(Point.norm))
+
+        ops = cinderx.jit.get_function_hir_opcode_counts(Point.norm)
+        self.assertGreaterEqual(ops.get("LoadField", 0), 2)
+        self.assertGreaterEqual(ops.get("Guard", 0), 2)
+        self.assertEqual(ops.get("CheckField", 0), 0)
+        self.assertEqual(ops.get("LoadAttrCached", 0), 0)
+        self.assertEqual(point.norm(), 25)
+
+    def test_dynamic_attr_read_does_not_use_slot_field_path(self) -> None:
+        class DynamicPoint:
+            def __init__(self, x: int, y: int) -> None:
+                self.x = x
+                self.y = y
+
+            def norm(self) -> int:
+                return self.x * self.x + self.y * self.y
+
+        point = DynamicPoint(3, 4)
+
+        specialize(DynamicPoint.norm, point.norm)
+
+        names = opnames(DynamicPoint.norm)
+        self.assertNotIn("LOAD_ATTR_SLOT", names)
+        self.assertTrue(cinderx.jit.is_jit_compiled(DynamicPoint.norm))
+
+        self.assertEqual(point.norm(), 25)
+
+        point.x = 6
+        point.y = 8
+        self.assertEqual(point.norm(), 100)
+
     def test_slot_specialized_load_method_pushes_null(self) -> None:
         def target() -> int:
             return 42
