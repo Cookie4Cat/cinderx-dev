@@ -128,8 +128,8 @@ struct TreeIterMatch {
 // overhead for each left/right child.
 //
 // The pass is gated behind the `tree_iter_state_machine` config option
-// (env var PYTHONJITTREEITERSTATEMACHINE). It defaults to enabled and can be
-// explicitly disabled with PYTHONJITTREEITERSTATEMACHINE=0.
+// (env var PYTHONJITTREEITERSTATEMACHINE). It is an experimental, explicit
+// opt-in until exact deopt/reify for suspended state-machine generators lands.
 class TreeIterStateMachinePass : public Pass {
  public:
   TreeIterStateMachinePass() : Pass("TreeIterStateMachinePass") {}

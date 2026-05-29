@@ -39,7 +39,7 @@ V1.6 进一步收紧实现方向：性能目标仍以 pyperformance `generators`
 
 本文档不再把裸 `yield from self.left/right` 直接等同于空子树跳过。按 CPython 语义，`yield from None` 必须抛出 `TypeError`；状态机只有在原始源码/HIR 已包含可证明的 child 跳过 guard 时，才允许替换原始 yield-from 路径。编译期观察到某个样本 child 非空、是同一精确 Node 类型，不能替代原始控制流 guard。truthiness guard 必须额外证明 default truthiness，不能隐式吞掉用户 `__bool__` / `__len__`。
 
-本文档不直接移植旧分支的大量非 generators 改动、实验脚本、Docker 配置和阶段性文档；后续实现应以本文档作为功能边界，以当前 `master` 的 HIR 表示和 generator runtime 为准。首版交付按生产默认启用落地：TreeIter 状态机在 JIT 开启且 matcher 准入证明完整时默认生成，仍提供 `PYTHONJITTREEITERSTATEMACHINE=0` 作为显式回退开关。准入 gate 只允许可证明的 `left/value/right` TreeIter 形态进入状态机；字段证明、exactness、layout、iterator identity、lifecycle、平台 codegen 和验收矩阵必须共同闭合。
+本文档不直接移植旧分支的大量非 generators 改动、实验脚本、Docker 配置和阶段性文档；后续实现应以本文档作为功能边界，以当前 `master` 的 HIR 表示和 generator runtime 为准。首版实现按实验显式启用落地：TreeIter 状态机只有在 `PYTHONJITTREEITERSTATEMACHINE=1`、JIT 开启、目标平台已验证且 matcher 准入证明完整时生成；生产默认启用必须等待 exact deopt/reify、协议/lifecycle 和性能 gate 闭合。准入 gate 只允许可证明的 `left/value/right` TreeIter 形态进入状态机；字段证明、exactness、layout、iterator identity、lifecycle、平台 codegen 和验收矩阵必须共同闭合。
 
 ## 6 List of abbreviations 缩略语清单
 
@@ -116,7 +116,7 @@ def __iter__(self):
 
 未带 guard 的 `yield from self.left/right` 不是上述形态。若 `left/right` 为 `None`，CPython 会在 `GET_YIELD_FROM_ITER` / `PyObject_GetIter` 路径抛出 `TypeError`；状态机不得把裸 yield-from 改写为空遍历。若 truthiness guard 可能调用用户代码或把非 `None` child 判为 false，也不得优化。
 
-该模式来自 pyperformance `generators` benchmark 和树结构遍历代码，但当前 master 是否能匹配正式 benchmark 不能只按源码形态推断。当前已知根因是正式 benchmark 使用 dict-backed heap object，HIR 中字段访问表现为 split-dict fast path 与 `LoadAttr` fallback 的合流，而不是单一 slot `LoadField`。因此 V2 必须以通用 `FieldAccessProof` 表达字段来源：slot/member 字段、split-dict inline-values 字段、对应 guard/dependency、失效或 deopt 处理。默认启用前必须提交当前 master 目标 `Tree.__iter__` 的 HIR 形态、truthiness 等价性、exactness/layout/iterator identity 证据，并在实现中保持失败即不改写的准入边界。原始 JIT 路径仍按 Python generator 语义维护递归生成器帧，每个 `yield from` 都可能触发子生成器创建、恢复入口查询、帧切换、`gi_yieldfrom` 暴露、`send/throw/close` 委派和状态保存。状态机优化将上述递归控制流转换为单个 JIT generator 内部的显式循环；任何无法证明语义保持的形态都拒绝优化：
+该模式来自 pyperformance `generators` benchmark 和树结构遍历代码，但当前 master 是否能匹配正式 benchmark 不能只按源码形态推断。当前已知根因是正式 benchmark 使用 dict-backed heap object，HIR 中字段访问表现为 split-dict fast path 与 `LoadAttr` fallback 的合流，而不是单一 slot `LoadField`。因此 V2 必须以通用 `FieldAccessProof` 表达字段来源：slot/member 字段、split-dict inline-values 字段、对应 guard/dependency、失效或 deopt 处理。生产默认启用前必须提交当前 master 目标 `Tree.__iter__` 的 HIR 形态、truthiness 等价性、exactness/layout/iterator identity 证据，并在实现中保持失败即不改写的准入边界。原始 JIT 路径仍按 Python generator 语义维护递归生成器帧，每个 `yield from` 都可能触发子生成器创建、恢复入口查询、帧切换、`gi_yieldfrom` 暴露、`send/throw/close` 委派和状态保存。状态机优化将上述递归控制流转换为单个 JIT generator 内部的显式循环；任何无法证明语义保持的形态都拒绝优化：
 
 ```text
 current node + phase + state stack
@@ -130,7 +130,7 @@ current node + phase + state stack
 
 | 范围 | 结论 |
 | ---- | ---- |
-| 树遍历生成器状态机 | 首版生产实现，默认启用，可显式关闭 |
+| 树遍历生成器状态机 | 首版实验实现，默认关闭，可显式启用 |
 | 泛化任意递归生成器 | 不涉及 |
 | 消除所有 generator frame | 不涉及 |
 | 逃逸分析驱动的 caller 内联 | 不作为首版依赖 |
@@ -140,11 +140,11 @@ current node + phase + state stack
 
 | 项目 | 结论 |
 | ---- | ---- |
-| 首版交付定位 | 默认启用的 TreeIter 生产优化，用于直接提升 `generators` 代表的递归树遍历负载 |
+| 首版交付定位 | 显式启用的 TreeIter 实验优化，用于验证 `generators` 代表的递归树遍历负载 |
 | 启用条件 | JIT 开启、目标架构已验证、目标 HIR 形态已匹配，且 HIR 结构、owner/child exactness、field layout、iterator identity、失效/deopt/lifecycle 证明全部满足 |
 | 协议边界 | 状态机必须保持普通 `next()`/`for`/`list()`、`send(non-None)`、`close`/deopt/GC lifecycle 的既有语义；无法证明的 generator 形态保持原始路径 |
-| 显式回退 | `PYTHONJITTREEITERSTATEMACHINE=0` 关闭该 pass，用于 A/B、回滚和问题定位 |
-| 不满足生产前置时 | 默认配置下 pass 必须 no-op；不得为证明不完整的函数生成状态机 |
+| 显式启用 | `PYTHONJITTREEITERSTATEMACHINE=1` 打开该 pass，用于 A/B、benchmark 和问题定位 |
+| 不满足生产前置时 | 默认配置下 pass no-op；不得为证明不完整的函数生成状态机 |
 
 ### 8.1.1 pyperformance JIT 用例覆盖边界
 
@@ -197,13 +197,13 @@ LIR + codegen: 通过 FP 正偏移读取 GenDataFooter.tree_iter_state 指针
 | 编号 | 规格 |
 | ---- | ---- |
 | GJIT-SM-001 | JIT 编译树遍历生成器时，只识别原始源码/HIR 已显式包含空子树跳过语义的 `left/value/right` 中序遍历模式；该语义可以来自 `is not None` 等价 guard，或来自 truthiness guard 加 exact default truthiness 证明 |
-| GJIT-SM-002 | 默认启用的状态机必须保持 CPython 可观察 generator 语义与原始 generator 完全一致，包括异常、`gi_yieldfrom`、`send/throw/close`、StopIteration value 和 suspend/resume 状态；无法证明时不得改写 |
+| GJIT-SM-002 | 生产默认启用的状态机必须保持 CPython 可观察 generator 语义与原始 generator 完全一致，包括异常、`gi_yieldfrom`、`send/throw/close`、StopIteration value 和 suspend/resume 状态；无法证明时不得改写 |
 | GJIT-SM-003 | 状态栈采用 heap-backed growable 结构；release 构建每次 push 前必须动态检查并安全扩容或报错，不能只依赖 debug 断言 |
 | GJIT-SM-004 | 状态机路径不得把裸 `yield from None`、非 iterable、子类覆盖或自定义 iterator 协议改写为普通空遍历 |
 | GJIT-SM-005 | 状态机相关 `PyObject*` 必须满足 CinderX RefcountInsertion、GC traverse、clear/dealloc、deopt 和 generator finalize 的所有权假设 |
 | GJIT-SM-006 | 功能必须可通过独立 JIT 配置关闭，用于回归定位和性能对照 |
 | GJIT-SM-007 | 目标架构未完成 codegen 和测试矩阵前，即使配置开启也必须 no-op |
-| GJIT-SM-008 | 默认启用必须具备当前 master 五个纵切面准入证明、量化性能 gate 和完整协议回归 gate |
+| GJIT-SM-008 | 生产默认启用必须具备当前 master 五个纵切面准入证明、量化性能 gate 和完整协议回归 gate |
 | GJIT-SM-009 | 字段访问必须通过通用 `FieldAccessProof` 表达，覆盖 slot/member 与 dict-backed split-dict fast path；证明对象应可被后续 OO-heavy 优化复用，不能写成 pyperformance `generators` 专用分支 |
 
 ### 8.3.2 非目标
@@ -439,7 +439,7 @@ codegen 分层：
 | ---- | ---- |
 | 配置项 | 新增独立 HIR optimization 配置，例如 `tree_iter_state_machine` |
 | 环境变量 | 提供 `PYTHONJITTREEITERSTATEMACHINE` 开关 |
-| 默认值 | 默认启用；`PYTHONJITTREEITERSTATEMACHINE=0` 显式关闭 |
+| 默认值 | 默认关闭；`PYTHONJITTREEITERSTATEMACHINE=1` 显式启用 |
 | 触发探针 | 提供 debug/test-only counter，用于确认 pass 是否触发 |
 | 日志 | 使用 JIT debug 日志，不向 stdout/stderr 输出热路径日志 |
 
@@ -452,12 +452,12 @@ codegen 分层：
 | M1.5 | SR-GJIT-002A | `generators` go/no-go：证明 pyperformance `generators` 当前 master 的 split-dict/truthiness HIR 形态满足实验准入；若不满足，V2 停止在 matcher 研究，不进入 M2-M4。非合成、生产等价的 TreeIter workload 只能作为后续 pivot 候选，必须另行决策后才能替代本 V2 目标 | 否 |
 | M1.6 | SR-GJIT-002B | 生产可表示性 go/no-go：提交 exact reify 可表示性 artifact、active-path/depth 转移不变量草案、五纵切面 artifact schema 和 `generators` workload 接受标准；若可表示性失败，必须在 M2 前调整状态模型或明确 M2-M4 只保留实验目标 | 否 |
 | M2 | SR-GJIT-003 | heap-backed `TreeIterState`、引用清理、GC traverse、release 扩容安全路径 | 否 |
-| M3 | SR-GJIT-004 | 默认配置下生成 TreeIter 状态机 CFG、HIR/LIR/codegen 和 correctness 测试；`PYTHONJITTREEITERSTATEMACHINE=0` 必须 no-op | 是，默认配置 |
-| M4 | SR-GJIT-005 | AArch64 性能 gate 和非目标 generator 回退检查 | 是，默认配置 |
+| M3 | SR-GJIT-004 | 显式启用配置下生成 TreeIter 状态机 CFG、HIR/LIR/codegen 和 correctness 测试；默认配置必须 no-op | 是，实验配置 |
+| M4 | SR-GJIT-005 | AArch64 性能 gate 和非目标 generator 回退检查 | 是，实验配置 |
 | M5 | SR-GJIT-006 | 后续 rollout 增强：扩大协议/平台/形态覆盖、五纵切面 verifier 工具化、lifecycle 和生产性能 gate 持续闭合 | 是，生产配置 |
 | 后续演进 | SR-GJIT-F001 | 泛化到更多递归生成器模式 | 否，不纳入首版 SR |
 
-V2 实现范围到 M4 为止。M5 是默认启用后的生产化增强候选；如果 M4 未证明 `generators` 在当前 master 上有稳定收益，默认启用策略必须回退或重新决策。
+V2 实现范围到 M4 为止。M5 是生产默认启用前的增强候选；如果 M4 未证明 `generators` 在当前 master 上有稳定收益，生产默认启用策略必须回退或重新决策。
 
 ### 8.4.5 实现接口设计
 
@@ -617,15 +617,15 @@ Compiler pass pipeline
 | stock CPython | 口径基线 |
 | CinderX JIT with jitlist | 避免低 auto 阈值编译 stdlib 干扰 |
 
-默认启用至少满足：
+生产默认启用前至少满足：
 
 | Gate | 要求 |
 | ---- | ---- |
 | HIR 准入 | 当前 master HIR 形态、truthiness 等价性、exactness/layout/iterator identity 证据和接受标准全部通过 |
-| 生产准入 | 生产优化函数必须具备五个纵切面证明：HIR 结构、owner/child exactness、field layout、iterator identity、失效/deopt；缺任一项时默认配置 no-op |
+| 生产准入 | 生产优化函数必须具备五个纵切面证明：HIR 结构、owner/child exactness、field layout、iterator identity、失效/deopt；缺任一项时生产配置 no-op |
 | 平台 | 每个启用架构独立通过 debug/release correctness、ASAN/refleak 和协议矩阵 |
 | deopt/lifecycle | 覆盖 tp_clear、finalize、正常完成、显式 deopt、close/send 和 GC lifecycle，无泄漏或语义漂移 |
-| 性能 | `generators` 接受标准通过；默认配置相对 `PYTHONJITTREEITERSTATEMACHINE=0` 有稳定收益，并在 21 个 JIT 用例列表上确认没有由本特性引入的显著整体回退 |
+| 性能 | `generators` 接受标准通过；显式启用配置相对默认关闭配置有稳定收益，并在 21 个 JIT 用例列表上确认没有由本特性引入的显著整体回退 |
 | 回滚 | 环境变量和 HIR pass 配置可完全关闭，关闭后 HIR 不含状态机指令 |
 
 ### 8.4.8 影响点列表

@@ -11,11 +11,12 @@ import platform
 import sys
 
 import cinderx.jit as jit
+from cinderx.jit import _deopt_gen
 
 jit.compile_after_n_calls(1000000)
 
 def state_machine_expected():
-    enabled = os.environ.get("PYTHONJITTREEITERSTATEMACHINE", "1").lower()
+    enabled = os.environ.get("PYTHONJITTREEITERSTATEMACHINE", "0").lower()
     arch_supported = platform.machine().lower() in ("aarch64", "arm64")
     return enabled not in ("0", "false", "no") and arch_supported
 
@@ -39,13 +40,23 @@ counts = jit.get_function_hir_opcode_counts(Node.__iter__)
 if state_machine_expected():
     assert counts.get("EnsureTreeIterState", 0) > 0, counts
 
+root = Node(4, Node(2, Node(1), Node(3)), Node(6, Node(5), Node(7)))
+gen = iter(root)
+first = next(gen)
+if state_machine_expected():
+    assert not _deopt_gen(gen), "TreeIter deopt must fail closed while active"
+else:
+    assert _deopt_gen(gen)
+assert [first, *list(gen)] == [1, 2, 3, 4, 5, 6, 7]
+
 class Other:
     pass
 
 try:
     list(Node(1, left=Other()))
 except TypeError as exc:
-    assert "TreeIter child type" in str(exc) or "'Other' object is not iterable"
+    msg = str(exc)
+    assert "TreeIter child type" in msg or "'Other' object is not iterable" in msg, msg
 else:
     raise AssertionError("child type mismatch should fail")
 
@@ -82,6 +93,8 @@ split_root = SplitNode(None, 1, None)
 for i in range(50):
     setattr(split_root, f"extra_{i}", i)
 assert list(split_root) == [1]
+assert list(SplitNode(0, 1, [])) == [1]
+del gen, root, split_root, Node, SplitNode, Other
 )");
 }
 
@@ -117,5 +130,6 @@ except TypeError:
     pass
 else:
     raise AssertionError("bare yield-from None must keep raising TypeError")
+del MisplacedGuardNode
 )");
 }

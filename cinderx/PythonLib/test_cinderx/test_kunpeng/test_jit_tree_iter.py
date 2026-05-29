@@ -130,7 +130,7 @@ def _inorder(node):
 
 
 def _tree_iter_state_machine_enabled():
-    value = os.environ.get("PYTHONJITTREEITERSTATEMACHINE", "1")
+    value = os.environ.get("PYTHONJITTREEITERSTATEMACHINE", "0")
     return value.lower() not in ("0", "false", "no")
 
 
@@ -277,6 +277,17 @@ class TreeIterStateMachineTest(unittest.TestCase):
             list(Node(1, left=Other()))
 
     @cinder_support.skip_unless_jit("Requires CinderX JIT")
+    def test_tree_iter_default_path_preserves_non_node_iterables(self):
+        """Default-off production path keeps heterogeneous yield-from semantics."""
+        if _tree_iter_state_machine_expected():
+            self.skipTest("experimental TreeIter path intentionally exact-only")
+
+        Node = _make_node_class_with_guards()
+        cinderx.jit.force_compile(Node.__iter__)
+
+        self.assertEqual(list(Node(1, left=[0], right=(2,))), [0, 1, 2])
+
+    @cinder_support.skip_unless_jit("Requires CinderX JIT")
     def test_tree_iter_truthiness_guard_default(self):
         """``if child:`` with default truthiness is matched like ``if child is not None:``."""
 
@@ -304,6 +315,10 @@ class TreeIterStateMachineTest(unittest.TestCase):
             Node(6, Node(5), Node(7)),
         )
         self.assertEqual(list(big), [1, 2, 3, 4, 5, 6, 7])
+
+        # The state-machine builder must preserve `if child:` semantics and
+        # skip non-None falsy children instead of treating them as tree nodes.
+        self.assertEqual(list(Node(2, 0, [])), [2])
 
     @cinder_support.skip_unless_jit("Requires CinderX JIT")
     def test_tree_iter_split_dict_truthiness_guard(self):
@@ -448,21 +463,49 @@ class TreeIterStateMachineTest(unittest.TestCase):
         gc.collect()
 
     @cinder_support.skip_unless_jit("Requires CinderX JIT")
-    def test_tree_iter_state_machine_deopt_clears_state(self):
-        """Explicit deopt releases TreeIter heap state before changing type."""
+    def test_tree_iter_state_machine_deopt_resume_is_fail_closed(self):
+        """Explicit deopt must not silently discard the TreeIter heap stack."""
         Node = _make_node_class_with_guards()
         cinderx.jit.force_compile(Node.__iter__)
 
         root = _build_complete_tree(Node, 4)
+        expected = _inorder(root)
         gen = root.__iter__()
-        next(gen)
+        first = next(gen)
+
+        if _tree_iter_state_machine_expected():
+            self.assertFalse(_deopt_gen(gen))
+        else:
+            self.assertTrue(_deopt_gen(gen))
+
+        self.assertEqual([first, *list(gen)], expected)
 
         ref = weakref.ref(root)
-        self.assertTrue(_deopt_gen(gen))
         del root
         del gen
         gc.collect()
         self.assertIsNone(ref())
+
+    @cinder_support.skip_unless_jit("Requires CinderX JIT")
+    def test_tree_iter_state_machine_throw_close_are_fail_closed(self):
+        """throw()/close() must not deopt to an incorrect recursive frame."""
+        if not _tree_iter_state_machine_expected():
+            self.skipTest("TreeIter fail-closed protocol is opt-in only")
+
+        Node = _make_node_class_with_guards()
+        cinderx.jit.force_compile(Node.__iter__)
+
+        root = _build_complete_tree(Node, 3)
+        expected = _inorder(root)
+        gen = root.__iter__()
+        first = next(gen)
+
+        with self.assertRaises(RuntimeError):
+            gen.throw(ValueError)
+        with self.assertRaises(RuntimeError):
+            gen.close()
+
+        self.assertEqual([first, *list(gen)], expected)
 
     @cinder_support.skip_unless_jit("Requires CinderX JIT")
     def test_tree_iter_state_machine_gc_cycle(self):

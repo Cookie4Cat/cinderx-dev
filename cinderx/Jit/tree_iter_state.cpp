@@ -5,22 +5,25 @@
 #include "cinderx/Jit/gen_data_footer.h"
 
 #include <cstdlib>
-#include <cstring>
+#include <new>
+#include <unordered_set>
 
 namespace jit {
 
+struct TreeIterActivePath {
+  std::unordered_set<PyObject*> nodes;
+};
+
 TreeIterState* allocateTreeIterState() {
-  auto* state = static_cast<TreeIterState*>(
-      std::malloc(sizeof(TreeIterState)));
+  auto* state = new (std::nothrow) TreeIterState();
   if (state == nullptr) {
     return nullptr;
   }
-  std::memset(state, 0, sizeof(TreeIterState));
 
   auto* stack = static_cast<TreeIterStackEntry*>(
       std::calloc(kTreeIterInitialStackCapacity, sizeof(TreeIterStackEntry)));
   if (stack == nullptr) {
-    std::free(state);
+    delete state;
     return nullptr;
   }
   state->tree_iter_stack = stack;
@@ -28,10 +31,61 @@ TreeIterState* allocateTreeIterState() {
   return state;
 }
 
+int ensureTreeIterActivePath(TreeIterState* state) {
+  if (state == nullptr) {
+    return -1;
+  }
+  if (state->tree_iter_active_path != nullptr) {
+    return 0;
+  }
+  auto* active_path = new (std::nothrow) TreeIterActivePath();
+  if (active_path == nullptr) {
+    return -1;
+  }
+  state->tree_iter_active_path = active_path;
+  return 0;
+}
+
+bool treeIterActivePathContains(TreeIterState* state, PyObject* node) {
+  if (state == nullptr || state->tree_iter_active_path == nullptr ||
+      node == nullptr) {
+    return false;
+  }
+  return state->tree_iter_active_path->nodes.count(node) != 0;
+}
+
+int treeIterActivePathInsert(TreeIterState* state, PyObject* node) {
+  if (node == nullptr) {
+    return 0;
+  }
+  if (ensureTreeIterActivePath(state) < 0) {
+    return -1;
+  }
+  try {
+    state->tree_iter_active_path->nodes.insert(node);
+  } catch (const std::bad_alloc&) {
+    return -1;
+  }
+  return 0;
+}
+
+void treeIterActivePathErase(TreeIterState* state, PyObject* node) {
+  if (state == nullptr || state->tree_iter_active_path == nullptr ||
+      node == nullptr) {
+    return;
+  }
+  state->tree_iter_active_path->nodes.erase(node);
+}
+
 void freeTreeIterState(TreeIterState* state) {
   if (state == nullptr) {
     return;
   }
+  PyObject* exc_type = nullptr;
+  PyObject* exc_value = nullptr;
+  PyObject* exc_tb = nullptr;
+  PyErr_Fetch(&exc_type, &exc_value, &exc_tb);
+
   // Release current node.
   Py_XDECREF(state->tree_iter_current_node);
   state->tree_iter_current_node = nullptr;
@@ -47,10 +101,16 @@ void freeTreeIterState(TreeIterState* state) {
     state->tree_iter_stack = nullptr;
   }
 
-  // Production active-path is not yet implemented; nothing to free.
-  // state->tree_iter_active_path is always nullptr in this version.
+  delete state->tree_iter_active_path;
+  state->tree_iter_active_path = nullptr;
 
-  std::free(state);
+  delete state;
+
+  if (exc_type != nullptr || exc_value != nullptr || exc_tb != nullptr) {
+    PyErr_Restore(exc_type, exc_value, exc_tb);
+  } else {
+    PyErr_Clear();
+  }
 }
 
 int visitTreeIterState(TreeIterState* state, visitproc visit, void* arg) {

@@ -950,48 +950,44 @@ void TreeIterStateMachinePass::buildTreeIterStateMachine(
   // -----------------------------------------------------------------------
   // 5. bb_left (LEFT phase): load left child, branch on None.
   // -----------------------------------------------------------------------
+  Register* left_current = nullptr;
+  Register* left_child = nullptr;
   {
-    Register* current = env.AllocateRegister();
-    bb_left->append<LoadCurrentNode>(current);
+    left_current = env.AllocateRegister();
+    bb_left->append<LoadCurrentNode>(left_current);
 
     FieldLoadResult left_load = emitFieldLoad(
-        func, bb_left, env, match.left_field, current, TOptObject, fs);
+        func, bb_left, env, match.left_field, left_current, TOptObject, fs);
     BasicBlock* bb_left_loaded = left_load.block;
-    Register* left_child = left_load.value;
+    left_child = left_load.value;
 
-    // Check left_child != None (None is represented as nullptr or TNoneType).
-    // We use a PrimitiveCompare(kEqual, left_child, none_const) to detect None.
-    Register* none_const = env.AllocateRegister();
-    bb_left_loaded->append<LoadConst>(none_const, Type::fromObject(Py_None));
-    Register* is_none = env.AllocateRegister();
-    bb_left_loaded->append<PrimitiveCompare>(
-        is_none, PrimitiveCompareOp::kEqual, left_child, none_const);
-    bb_left_loaded->append<CondBranch>(
-        is_none, bb_no_left, bb_check_null_left);
+    if (match.left_guard.kind == ChildGuardKind::kDefaultTruthinessGuard) {
+      bb_left_loaded->append<CondBranch>(
+          left_child, bb_check_null_left, bb_no_left);
+    } else {
+      Register* none_const = env.AllocateRegister();
+      bb_left_loaded->append<LoadConst>(
+          none_const, Type::fromObject(Py_None));
+      Register* is_none = env.AllocateRegister();
+      bb_left_loaded->append<PrimitiveCompare>(
+          is_none, PrimitiveCompareOp::kEqual, left_child, none_const);
+      bb_left_loaded->append<CondBranch>(
+          is_none, bb_no_left, bb_check_null_left);
+    }
   }
 
-  // bb_check_null_left: check for nullptr (also means no child)
+  // bb_check_null_left: preserve the original child guard semantics.
   {
-    Register* kZero = env.AllocateRegister();
-    bb_check_null_left->append<LoadConst>(kZero, Type::fromCInt(0, TCInt64));
-    // Reuse left_child — but we don't have it here. Instead rely on the fact
-    // that if left_child != None it might still be nullptr (null ptr).
-    // We re-load current and left_child to check for null.
-    Register* current2 = env.AllocateRegister();
-    bb_check_null_left->append<LoadCurrentNode>(current2);
-    FieldLoadResult left_load = emitFieldLoad(
-        func,
-        bb_check_null_left,
-        env,
-        match.left_field,
-        current2,
-        TOptObject,
-        fs);
-    BasicBlock* bb_check_null_left_loaded = left_load.block;
-    Register* left_child2 = left_load.value;
-    // If left_child is null (0), go to no_left
-    bb_check_null_left_loaded->append<CondBranch>(
-        left_child2, bb_has_left, bb_no_left);
+    JIT_CHECK(left_child != nullptr, "left child register was not created");
+    if (match.left_guard.kind == ChildGuardKind::kDefaultTruthinessGuard) {
+      Register* is_truthy = env.AllocateRegister();
+      bb_check_null_left->append<IsTruthy>(is_truthy, left_child, fs);
+      bb_check_null_left->append<CondBranch>(
+          is_truthy, bb_has_left, bb_no_left);
+    } else {
+      bb_check_null_left->append<CondBranch>(
+          left_child, bb_has_left, bb_no_left);
+    }
   }
 
   // bb_no_left: set phase to kYield and loop
@@ -1003,25 +999,20 @@ void TreeIterStateMachinePass::buildTreeIterStateMachine(
 
   // bb_has_left: push (current, kYield) and enter left child
   {
-    // Re-load current and left_child for the state transition.
-    Register* current = env.AllocateRegister();
-    bb_has_left->append<LoadCurrentNode>(current);
-    FieldLoadResult left_load = emitFieldLoad(
-        func, bb_has_left, env, match.left_field, current, TOptObject, fs);
-    BasicBlock* bb_has_left_loaded = left_load.block;
-    Register* left_child = left_load.value;
+    JIT_CHECK(left_current != nullptr, "left current register was not created");
+    JIT_CHECK(left_child != nullptr, "left child register was not created");
 
     Register* kYield_r =
-        emitPhaseConst(bb_has_left_loaded, env, TreeIterPhase::kYield);
+        emitPhaseConst(bb_has_left, env, TreeIterPhase::kYield);
     Register* check_status = env.AllocateRegister();
-    bb_has_left_loaded->append<CheckTreeIterChildEntry>(
+    bb_has_left->append<CheckTreeIterChildEntry>(
         check_status, left_child, fs);
     emitStatusBranch(
-        bb_has_left_loaded, env, check_status, bb_left_checked, bb_error);
+        bb_has_left, env, check_status, bb_left_checked, bb_error);
 
     Register* push_status = env.AllocateRegister();
     bb_left_checked->append<StateStackPush>(
-        push_status, current, kYield_r, fs);
+        push_status, left_current, kYield_r, fs);
     emitStatusBranch(
         bb_left_checked, env, push_status, bb_left_pushed, bb_error);
 
@@ -1056,39 +1047,43 @@ void TreeIterStateMachinePass::buildTreeIterStateMachine(
   // -----------------------------------------------------------------------
   // 7. bb_right (RIGHT phase): load right child, branch on None.
   // -----------------------------------------------------------------------
+  Register* right_current = nullptr;
+  Register* right_child = nullptr;
   {
-    Register* current = env.AllocateRegister();
-    bb_right->append<LoadCurrentNode>(current);
+    right_current = env.AllocateRegister();
+    bb_right->append<LoadCurrentNode>(right_current);
     FieldLoadResult right_load = emitFieldLoad(
-        func, bb_right, env, match.right_field, current, TOptObject, fs);
+        func, bb_right, env, match.right_field, right_current, TOptObject, fs);
     BasicBlock* bb_right_loaded = right_load.block;
-    Register* right_child = right_load.value;
+    right_child = right_load.value;
 
-    Register* none_const = env.AllocateRegister();
-    bb_right_loaded->append<LoadConst>(none_const, Type::fromObject(Py_None));
-    Register* is_none = env.AllocateRegister();
-    bb_right_loaded->append<PrimitiveCompare>(
-        is_none, PrimitiveCompareOp::kEqual, right_child, none_const);
-    bb_right_loaded->append<CondBranch>(
-        is_none, bb_no_right, bb_check_null_right);
+    if (match.right_guard.kind == ChildGuardKind::kDefaultTruthinessGuard) {
+      bb_right_loaded->append<CondBranch>(
+          right_child, bb_check_null_right, bb_no_right);
+    } else {
+      Register* none_const = env.AllocateRegister();
+      bb_right_loaded->append<LoadConst>(
+          none_const, Type::fromObject(Py_None));
+      Register* is_none = env.AllocateRegister();
+      bb_right_loaded->append<PrimitiveCompare>(
+          is_none, PrimitiveCompareOp::kEqual, right_child, none_const);
+      bb_right_loaded->append<CondBranch>(
+          is_none, bb_no_right, bb_check_null_right);
+    }
   }
 
   // bb_check_null_right
   {
-    Register* current2 = env.AllocateRegister();
-    bb_check_null_right->append<LoadCurrentNode>(current2);
-    FieldLoadResult right_load = emitFieldLoad(
-        func,
-        bb_check_null_right,
-        env,
-        match.right_field,
-        current2,
-        TOptObject,
-        fs);
-    BasicBlock* bb_check_null_right_loaded = right_load.block;
-    Register* right_child2 = right_load.value;
-    bb_check_null_right_loaded->append<CondBranch>(
-        right_child2, bb_has_right, bb_no_right);
+    JIT_CHECK(right_child != nullptr, "right child register was not created");
+    if (match.right_guard.kind == ChildGuardKind::kDefaultTruthinessGuard) {
+      Register* is_truthy = env.AllocateRegister();
+      bb_check_null_right->append<IsTruthy>(is_truthy, right_child, fs);
+      bb_check_null_right->append<CondBranch>(
+          is_truthy, bb_has_right, bb_no_right);
+    } else {
+      bb_check_null_right->append<CondBranch>(
+          right_child, bb_has_right, bb_no_right);
+    }
   }
 
   // bb_no_right: phase = kBacktrack, loop
@@ -1100,24 +1095,21 @@ void TreeIterStateMachinePass::buildTreeIterStateMachine(
 
   // bb_has_right: push (current, kExit) and enter right child
   {
-    Register* current = env.AllocateRegister();
-    bb_has_right->append<LoadCurrentNode>(current);
-    FieldLoadResult right_load = emitFieldLoad(
-        func, bb_has_right, env, match.right_field, current, TOptObject, fs);
-    BasicBlock* bb_has_right_loaded = right_load.block;
-    Register* right_child = right_load.value;
+    JIT_CHECK(
+        right_current != nullptr, "right current register was not created");
+    JIT_CHECK(right_child != nullptr, "right child register was not created");
 
     Register* kExit_r =
-        emitPhaseConst(bb_has_right_loaded, env, TreeIterPhase::kExit);
+        emitPhaseConst(bb_has_right, env, TreeIterPhase::kExit);
     Register* check_status = env.AllocateRegister();
-    bb_has_right_loaded->append<CheckTreeIterChildEntry>(
+    bb_has_right->append<CheckTreeIterChildEntry>(
         check_status, right_child, fs);
     emitStatusBranch(
-        bb_has_right_loaded, env, check_status, bb_right_checked, bb_error);
+        bb_has_right, env, check_status, bb_right_checked, bb_error);
 
     Register* push_status = env.AllocateRegister();
     bb_right_checked->append<StateStackPush>(
-        push_status, current, kExit_r, fs);
+        push_status, right_current, kExit_r, fs);
     emitStatusBranch(
         bb_right_checked, env, push_status, bb_right_pushed, bb_error);
 

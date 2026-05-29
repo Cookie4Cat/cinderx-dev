@@ -47,7 +47,7 @@ struct HIROptimizations {
   bool insert_update_prev_instr{true};
   bool list_prefix_reverse_assign{true};
   bool phi_elim{true};
-  bool tree_iter_state_machine{true};
+  bool tree_iter_state_machine{false};
   bool primitive_box_remat{true};
   bool primitive_unbox_cse{true};
   bool simplify{true};

@@ -2448,6 +2448,11 @@ int JITRT_CheckTreeIterChildEntry(
     return -1;
   }
 
+  if (jit::treeIterActivePathInsert(state, current) < 0) {
+    PyErr_NoMemory();
+    return -1;
+  }
+
   int32_t next_depth = state->tree_iter_stack_top + 1;
   if (state->tree_iter_depth_budget > 0 &&
       next_depth >= state->tree_iter_depth_budget) {
@@ -2457,19 +2462,16 @@ int JITRT_CheckTreeIterChildEntry(
     return -1;
   }
 
-  if (child == current) {
+  if (jit::treeIterActivePathContains(state, child)) {
     PyErr_SetString(
         PyExc_RecursionError,
         "cycle detected while traversing tree iterator");
     return -1;
   }
-  for (int32_t i = 0; i < state->tree_iter_stack_top; i++) {
-    if (child == state->tree_iter_stack[i].node) {
-      PyErr_SetString(
-          PyExc_RecursionError,
-          "cycle detected while traversing tree iterator");
-      return -1;
-    }
+
+  if (jit::treeIterActivePathInsert(state, child) < 0) {
+    PyErr_NoMemory();
+    return -1;
   }
   return 0;
 }
@@ -2486,6 +2488,7 @@ void JITRT_TreeIterEnterChild(
 void JITRT_TreeIterLeaveCurrentNode(jit::GenDataFooter* footer) {
   jit::TreeIterState* state = footer->tree_iter_state;
   if (state != nullptr && state->tree_iter_depth > 0) {
+    jit::treeIterActivePathErase(state, state->tree_iter_current_node);
     state->tree_iter_depth--;
   }
 }

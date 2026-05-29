@@ -19,8 +19,8 @@ struct TreeIterStackEntry {
 
 static_assert(sizeof(TreeIterStackEntry) == 16, "TreeIterStackEntry must be 16 bytes");
 
-// Forward declaration; the active-path structure is only used in production
-// mode, which is not yet implemented.
+// Forward declaration for the non-owning identity set used to detect cycles on
+// the active traversal path.
 struct TreeIterActivePath;
 
 // Heap-backed state for the TreeIter state machine.  One instance per
@@ -57,8 +57,8 @@ struct TreeIterState {
   // Growable heap stack.  nullptr until first push.  Owned.
   TreeIterStackEntry* tree_iter_stack{nullptr};
 
-  // Active-path set for cycle detection; production use only.  nullptr until
-  // production gate is enabled.
+  // Active-path set for cycle detection.  It stores borrowed PyObject*
+  // identities; node ownership remains with tree_iter_current_node/stack.
   TreeIterActivePath* tree_iter_active_path{nullptr};
 };
 
@@ -77,6 +77,15 @@ TreeIterState* allocateTreeIterState();
 // Release all owned PyObject* references in *state and free the object itself.
 // Safe to call on nullptr.
 void freeTreeIterState(TreeIterState* state);
+
+// Lazily allocate the active-path identity set.  Returns -1 on allocation
+// failure without setting a Python exception.
+int ensureTreeIterActivePath(TreeIterState* state);
+
+// Active-path membership helpers.  The set does not own node references.
+bool treeIterActivePathContains(TreeIterState* state, PyObject* node);
+int treeIterActivePathInsert(TreeIterState* state, PyObject* node);
+void treeIterActivePathErase(TreeIterState* state, PyObject* node);
 
 // GC traverse: call visit on every PyObject* owned by *state.
 // Returns the first non-zero visit result, or 0.
