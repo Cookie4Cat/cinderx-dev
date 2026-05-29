@@ -33,7 +33,7 @@ CinderX, JIT, generator, yield from, TreeIter, HIR, LIR, GenDataFooter, FieldAcc
 
 ## 5 Abstract 摘要
 
-本文档描述基于当前 `master` 重新实现 generators JIT TreeIter 状态机优化的详细设计。输入来自上一阶段功能设计文档 `docs/design/generators-jit-treeiter-state-machine/function-design.md`，实现证据来自旧分支 `github/bench-cur-7c361dce-claudecode` 中已完成的 `TreeIterStateMachinePass`、`GenDataFooter` 扩展、状态机 HIR/LIR 指令、AArch64/x86_64 codegen 和调试经验。旧分支仅作为 MVP 参考；正确性以当前 CinderX 源码、该构建绑定的 CPython source tag/commit，以及 CI/local artifact 中记录的源码获取方式为准。本地绝对路径不能作为规范来源。
+本文档描述基于当前 `master` 重新实现 generators JIT TreeIter 状态机优化的详细设计。输入来自上一阶段功能设计文档 `docs/design/generators-jit-treeiter-state-machine/【功能设计】Generators JIT TreeIter 状态机优化.md`，实现证据来自旧分支 `github/bench-cur-7c361dce-claudecode` 中已完成的 `TreeIterStateMachinePass`、`GenDataFooter` 扩展、状态机 HIR/LIR 指令、AArch64/x86_64 codegen 和调试经验。旧分支仅作为 MVP 参考；正确性以当前 CinderX 源码、该构建绑定的 CPython source tag/commit，以及 CI/local artifact 中记录的源码获取方式为准。本地绝对路径不能作为规范来源。
 
 本次详细设计不按旧分支逐文件复制。旧分支的核心算法保留，但接口适配当前 `master`：当前 HIR 使用 `Send` 与 `YieldValue::yieldFromIter()` 表示 yield-from，不再引入旧分支的显式 `YieldFrom`、`OptimizedYieldFrom`、`InlineIter` 作为必要前置。V1.2 将首版收敛为默认启用、可显式关闭的生产优化：选择 heap-backed growable `TreeIterState` 解决 release 栈溢出和全局内存膨胀问题。V1.5 将准入 gate 收敛到生产路径：只有 HIR 结构、owner/child exactness、field layout、iterator identity、失效/deopt/lifecycle 证明全部满足时才生成状态机；否则保持原始 generator 路径。V1.6 针对当前实现未能提升 pyperformance `generators` 的根因，将 matcher 从“slot-only `LoadField` + 显式 `is not None`”扩展为“原始 child guard + 字段访问证明”：支持 default truthiness 下的 `if child:`，并支持 dict-backed heap object 的 split-dict fast path、fallback 语义和 guard/deopt 处理。
 
@@ -103,7 +103,7 @@ current_node + current_phase + state_stack
 
 | 类型 | 路径或来源 | 用途 |
 | ---- | ---------- | ---- |
-| 功能设计 | `docs/design/generators-jit-treeiter-state-machine/function-design.md` | 功能边界、DFX、验收规格 |
+| 功能设计 | `docs/design/generators-jit-treeiter-state-machine/【功能设计】Generators JIT TreeIter 状态机优化.md` | 功能边界、DFX、验收规格 |
 | 当前 master HIR builder | `cinderx/Jit/hir/builder.cpp` | `YieldValue::setYieldFromIter()` 生成逻辑 |
 | 当前 master HIR 定义 | `cinderx/Jit/hir/hir.h` | `YieldValue`、`Send`、`InitialYield` 当前接口 |
 | 当前 master 字段访问 HIR | `cinderx/Jit/hir/hir.h`、`cinderx/Jit/hir/builder.cpp`、HIR dump artifact | `LoadField`、`LoadAttr`、`CheckField`、split-dict inline-values valid guard 和合流形态 |
