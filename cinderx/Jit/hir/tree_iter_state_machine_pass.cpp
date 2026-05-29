@@ -375,51 +375,114 @@ std::optional<TreeIterMatch> TreeIterStateMachinePass::matchTreeIter(
   }
 
   // -----------------------------------------------------------------------
-  // 7. Require an explicit None guard before each yield-from.
+  // 7. Require an explicit child-skip guard before each yield-from.
   //
-  //    The canonical HIR for `if self.left is not None: yield from self.left`
-  //    contains a PrimitiveCompare(kEqual/kNotEqual, field_val, none_const)
-  //    whose first operand traces to the same LoadField that feeds the
-  //    yield-from.  A GuardIs(field_val, Py_None) is the post-Simplify form.
+  //    Two guard forms are accepted:
+  //      a) None guard — a PrimitiveCompare or GuardIs that compares the
+  //         field value against Py_None.  Kind = kNoneGuard.
+  //      b) Truthiness guard — a CondBranch that branches directly on the
+  //         field value (the `if child:` pattern).  Kind = kDefaultTruthiness-
+  //         Guard.  Only accepted when the exact node type has no custom
+  //         __bool__ / __len__ (default truthiness).
   //
-  //    We scan for any PrimitiveCompare or GuardIs instruction that has at
-  //    least one operand whose producer-chain ends at the same field identity.
-  //    A full dominance check is deferred to M3; here we just verify that
-  //    the guard code exists somewhere in the function.
+  //    We scan the entire CFG for matching instructions.  A full dominance
+  //    check is deferred to the production gate; here we verify that the
+  //    guard code exists somewhere in the function.
   // -----------------------------------------------------------------------
-  bool left_guard_found = false;
-  bool right_guard_found = false;
+
+  // Returns true if tp has default truthiness (no custom __bool__ / __len__).
+  auto typeHasDefaultTruthiness = [](PyTypeObject* tp) -> bool {
+    if (tp == nullptr) {
+      return false;
+    }
+    if (tp->tp_as_number != nullptr && tp->tp_as_number->nb_bool != nullptr) {
+      return false;
+    }
+    if (tp->tp_as_sequence != nullptr &&
+        tp->tp_as_sequence->sq_length != nullptr) {
+      return false;
+    }
+    return true;
+  };
+
+  PyTypeObject* node_pytype = self_type.runtimePyType();
+
+  struct GuardScanResult {
+    bool found{false};
+    ChildGuardKind kind{ChildGuardKind::kNoneGuard};
+    Instr* guard_instr{nullptr};
+  };
+  GuardScanResult left_result, right_result;
 
   for (const BasicBlock& block : func.cfg.blocks) {
     for (const Instr& instr : block) {
-      if (instr.opcode() != Opcode::kPrimitiveCompare &&
-          instr.opcode() != Opcode::kGuardIs) {
-        continue;
+      // --- None guard: PrimitiveCompare or GuardIs ---
+      if (instr.opcode() == Opcode::kPrimitiveCompare ||
+          instr.opcode() == Opcode::kGuardIs) {
+        for (std::size_t i = 0; i < instr.NumOperands(); i++) {
+          const Register* operand = instr.GetOperand(i);
+          if (operand == nullptr) {
+            continue;
+          }
+          const LoadField* lf = traceYieldFromIterable(operand);
+          if (lf != nullptr && isSameField(lf, lf_left) && !left_result.found) {
+            left_result.found = true;
+            left_result.kind = ChildGuardKind::kNoneGuard;
+            left_result.guard_instr = const_cast<Instr*>(&instr);
+          }
+          if (lf != nullptr && isSameField(lf, lf_right) &&
+              !right_result.found) {
+            right_result.found = true;
+            right_result.kind = ChildGuardKind::kNoneGuard;
+            right_result.guard_instr = const_cast<Instr*>(&instr);
+          }
+        }
       }
-      for (std::size_t i = 0; i < instr.NumOperands(); i++) {
-        const Register* operand = instr.GetOperand(i);
-        if (operand == nullptr) {
-          continue;
-        }
-        const LoadField* lf = traceYieldFromIterable(operand);
-        if (lf != nullptr && isSameField(lf, lf_left)) {
-          left_guard_found = true;
-        }
-        if (lf != nullptr && isSameField(lf, lf_right)) {
-          right_guard_found = true;
+
+      // --- Truthiness guard: CondBranch directly on the field value ---
+      if (instr.opcode() == Opcode::kCondBranch) {
+        const Register* operand = instr.GetOperand(0);
+        if (operand != nullptr) {
+          const LoadField* lf = traceYieldFromIterable(operand);
+          if (lf != nullptr && isSameField(lf, lf_left) && !left_result.found) {
+            left_result.found = true;
+            left_result.kind = ChildGuardKind::kDefaultTruthinessGuard;
+            left_result.guard_instr = const_cast<Instr*>(&instr);
+          }
+          if (lf != nullptr && isSameField(lf, lf_right) &&
+              !right_result.found) {
+            right_result.found = true;
+            right_result.kind = ChildGuardKind::kDefaultTruthinessGuard;
+            right_result.guard_instr = const_cast<Instr*>(&instr);
+          }
         }
       }
-      if (left_guard_found && right_guard_found) {
+
+      if (left_result.found && right_result.found) {
         break;
       }
     }
+    if (left_result.found && right_result.found) {
+      break;
+    }
   }
 
-  if (!left_guard_found || !right_guard_found) {
+  if (!left_result.found || !right_result.found) {
     JIT_DLOG(
-        "TreeIter matcher: missing None guard (left={}, right={}) in {}",
-        left_guard_found,
-        right_guard_found,
+        "TreeIter matcher: missing child-skip guard (left={}, right={}) in {}",
+        left_result.found,
+        right_result.found,
+        func.fullname);
+    return std::nullopt;
+  }
+
+  // Verify default truthiness for any truthiness guard found.
+  if ((left_result.kind == ChildGuardKind::kDefaultTruthinessGuard ||
+       right_result.kind == ChildGuardKind::kDefaultTruthinessGuard) &&
+      !typeHasDefaultTruthiness(node_pytype)) {
+    JIT_DLOG(
+        "TreeIter matcher: truthiness guard but type has custom __bool__/"
+        "__len__ in {}",
         func.fullname);
     return std::nullopt;
   }
@@ -438,14 +501,39 @@ std::optional<TreeIterMatch> TreeIterStateMachinePass::matchTreeIter(
   // -----------------------------------------------------------------------
   // 9. Build and return the match result.
   // -----------------------------------------------------------------------
+
+  // Helper: build a slot/member FieldAccessProof from a LoadField.
+  auto makeFieldProof = [&](const LoadField* lf) -> FieldAccessProof {
+    FieldAccessProof proof;
+    proof.kind = FieldAccessKind::kSlotOrMember;
+    proof.owner_type = node_pytype;
+    proof.field_name = lf->name();
+    proof.value_offset = static_cast<intptr_t>(lf->offset());
+    // valid_offset, guard_source, layout_dependency, fallback_shape
+    // are left at defaults (production stubs).
+    proof.runtime_failure_action = RuntimeFailureAction::kExperimentalFailClosed;
+    return proof;
+  };
+
+  auto makeChildGuardProof = [](const GuardScanResult& r) -> ChildGuardProof {
+    ChildGuardProof proof;
+    proof.kind = r.kind;
+    proof.guard_instr = r.guard_instr;
+    proof.requires_default_truthiness =
+        (r.kind == ChildGuardKind::kDefaultTruthinessGuard);
+    return proof;
+  };
+
   TreeIterMatch match;
   match.self_reg = exact_self_reg;
   match.initial_yield = initial_yield;
   match.yield_frame_state = const_cast<FrameState*>(frame_state);
   match.exact_node_type = self_type;
-  match.left_offset = lf_left->offset();
-  match.right_offset = lf_right->offset();
-  match.value_offset = lf_value->offset();
+  match.left_field = makeFieldProof(lf_left);
+  match.right_field = makeFieldProof(lf_right);
+  match.value_field = makeFieldProof(lf_value);
+  match.left_guard = makeChildGuardProof(left_result);
+  match.right_guard = makeChildGuardProof(right_result);
   match.left_yield_from = left_yf;
   match.value_yield = plain_yv;
   match.right_yield_from = right_yf;
@@ -577,7 +665,8 @@ void TreeIterStateMachinePass::buildTreeIterStateMachine(
 
     Register* left_child = env.AllocateRegister();
     bb_left->append<LoadField>(
-        left_child, current, "left", match.left_offset, TOptObject);
+        left_child, current, match.left_field.field_name.c_str(),
+        match.left_field.value_offset, TOptObject);
 
     // Check left_child != None (None is represented as nullptr or TNoneType).
     // We use a PrimitiveCompare(kEqual, left_child, none_const) to detect None.
@@ -600,7 +689,8 @@ void TreeIterStateMachinePass::buildTreeIterStateMachine(
     bb_check_null_left->append<LoadCurrentNode>(current2);
     Register* left_child2 = env.AllocateRegister();
     bb_check_null_left->append<LoadField>(
-        left_child2, current2, "left", match.left_offset, TOptObject);
+        left_child2, current2, match.left_field.field_name.c_str(),
+        match.left_field.value_offset, TOptObject);
     // If left_child is null (0), go to no_left
     bb_check_null_left->append<CondBranch>(left_child2, bb_has_left, bb_no_left);
   }
@@ -619,7 +709,8 @@ void TreeIterStateMachinePass::buildTreeIterStateMachine(
     bb_has_left->append<LoadCurrentNode>(current);
     Register* left_child = env.AllocateRegister();
     bb_has_left->append<LoadField>(
-        left_child, current, "left", match.left_offset, TOptObject);
+        left_child, current, match.left_field.field_name.c_str(),
+        match.left_field.value_offset, TOptObject);
 
     Register* kYield_r = emitPhaseConst(bb_has_left, env, TreeIterPhase::kYield);
     Register* check_status = env.AllocateRegister();
@@ -641,7 +732,8 @@ void TreeIterStateMachinePass::buildTreeIterStateMachine(
     bb_yield->append<LoadCurrentNode>(current);
     Register* value = env.AllocateRegister();
     bb_yield->append<LoadField>(
-        value, current, "value", match.value_offset, TObject);
+        value, current, match.value_field.field_name.c_str(),
+        match.value_field.value_offset, TObject);
 
     Register* yield_dst = env.AllocateRegister();
     bb_yield->append<YieldValue>(yield_dst, value, fs);
@@ -659,7 +751,8 @@ void TreeIterStateMachinePass::buildTreeIterStateMachine(
     bb_right->append<LoadCurrentNode>(current);
     Register* right_child = env.AllocateRegister();
     bb_right->append<LoadField>(
-        right_child, current, "right", match.right_offset, TOptObject);
+        right_child, current, match.right_field.field_name.c_str(),
+        match.right_field.value_offset, TOptObject);
 
     Register* none_const = env.AllocateRegister();
     bb_right->append<LoadConst>(none_const, Type::fromObject(Py_None));
@@ -675,7 +768,8 @@ void TreeIterStateMachinePass::buildTreeIterStateMachine(
     bb_check_null_right->append<LoadCurrentNode>(current2);
     Register* right_child2 = env.AllocateRegister();
     bb_check_null_right->append<LoadField>(
-        right_child2, current2, "right", match.right_offset, TOptObject);
+        right_child2, current2, match.right_field.field_name.c_str(),
+        match.right_field.value_offset, TOptObject);
     bb_check_null_right->append<CondBranch>(
         right_child2, bb_has_right, bb_no_right);
   }
@@ -693,7 +787,8 @@ void TreeIterStateMachinePass::buildTreeIterStateMachine(
     bb_has_right->append<LoadCurrentNode>(current);
     Register* right_child = env.AllocateRegister();
     bb_has_right->append<LoadField>(
-        right_child, current, "right", match.right_offset, TOptObject);
+        right_child, current, match.right_field.field_name.c_str(),
+        match.right_field.value_offset, TOptObject);
 
     Register* kExit_r = emitPhaseConst(bb_has_right, env, TreeIterPhase::kExit);
     Register* check_status = env.AllocateRegister();
@@ -773,11 +868,13 @@ void TreeIterStateMachinePass::Run(Function& func) {
 
   JIT_DLOG(
       "TreeIter matcher: matched {} (left_offset={}, right_offset={}, "
-      "value_offset={})",
+      "value_offset={}, left_guard={}, right_guard={})",
       func.fullname,
-      match->left_offset,
-      match->right_offset,
-      match->value_offset);
+      match->left_field.value_offset,
+      match->right_field.value_offset,
+      match->value_field.value_offset,
+      match->left_guard.kind == ChildGuardKind::kNoneGuard ? "none" : "truthiness",
+      match->right_guard.kind == ChildGuardKind::kNoneGuard ? "none" : "truthiness");
 
   buildTreeIterStateMachine(func, *match);
 }

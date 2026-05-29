@@ -6,8 +6,11 @@
 #include "cinderx/Jit/hir/pass.h"
 #include "cinderx/Jit/hir/type.h"
 
+#include <Python.h>
+
 #include <cstddef>
 #include <optional>
+#include <string>
 
 namespace jit::hir {
 
@@ -21,6 +24,66 @@ enum class TreeIterPhase : int32_t {
   kExit = 4,
 };
 
+// ---------------------------------------------------------------------------
+// Field-access proof types (GJIT-SM-009)
+//
+// These structures capture how a tree-node field is accessed (slot/member vs.
+// dict-backed split-dict) and what action to take if the proof is invalidated
+// at runtime.  Production guard/layout tracking fields (GuardSource,
+// DependencySource, FallbackShape) are stub types in the experimental first
+// version; they will be populated when the production gate is opened.
+// ---------------------------------------------------------------------------
+
+struct GuardSource {};       // production: exactness/type-version deps
+struct DependencySource {};  // production: layout invalidation hook
+struct FallbackShape {};     // production: LoadAttr fallback semantics
+
+enum class FieldAccessKind {
+  kSlotOrMember,  // direct offset load from __slots__ or C member
+  kSplitDict,     // dict-backed heap object: fast inline-values path + fallback
+};
+
+enum class ChildGuardKind {
+  kNoneGuard,               // explicit `is not None` / PrimitiveCompare/GuardIs
+  kDefaultTruthinessGuard,  // `if child:` with proven default truthiness
+};
+
+enum class MatchRejectReason {
+  kUnsupportedShape,
+  kMissingGuard,
+  kMissingFieldProof,
+  kMissingIteratorIdentity,
+  kMissingRuntimeFailureAction,
+};
+
+enum class RuntimeFailureAction {
+  kExperimentalFailClosed,  // experimental path: clear state + bail
+  kInvalidate,              // production: invalidate compiled code
+  kExactDeoptReify,         // production: deopt + reify original generator
+};
+
+// Describes how to read one named field from a tree node and what to do if
+// the proof is invalidated at runtime.
+struct FieldAccessProof {
+  FieldAccessKind kind{FieldAccessKind::kSlotOrMember};
+  PyTypeObject* owner_type{nullptr};  // exact node type at match time
+  std::string field_name;
+  intptr_t value_offset{0};
+  std::optional<intptr_t> valid_offset;  // split-dict inline-values valid slot
+  GuardSource guard_source;
+  DependencySource layout_dependency;
+  FallbackShape fallback_shape;
+  RuntimeFailureAction runtime_failure_action{
+      RuntimeFailureAction::kExperimentalFailClosed};
+};
+
+// Describes the child-skip guard that was found for one yield-from arm.
+struct ChildGuardProof {
+  ChildGuardKind kind{ChildGuardKind::kNoneGuard};
+  Instr* guard_instr{nullptr};          // the guard instruction in the HIR
+  bool requires_default_truthiness{false};
+};
+
 // Holds the results of TreeIter pattern matching.  All pointers are borrowed
 // from the Function being matched — they are invalidated once the CFG is
 // rewritten.
@@ -30,18 +93,18 @@ struct TreeIterMatch {
   FrameState* yield_frame_state{nullptr};
   Type exact_node_type{TTop};
 
-  std::size_t left_offset{0};
-  std::size_t right_offset{0};
-  std::size_t value_offset{0};
+  FieldAccessProof left_field;
+  FieldAccessProof right_field;
+  FieldAccessProof value_field;
 
-  Instr* left_none_guard{nullptr};
-  Instr* right_none_guard{nullptr};
+  ChildGuardProof left_guard;
+  ChildGuardProof right_guard;
   const YieldValue* left_yield_from{nullptr};
   const YieldValue* value_yield{nullptr};
   const YieldValue* right_yield_from{nullptr};
 
   // Production capability flags — all false in the experimental first version.
-  bool production_admission_artifact_passed{false};
+  bool production_admission_manifest_verified{false};
   bool can_exact_reify_yield_from_protocol{false};
   bool can_deopt_state_machine{false};
   bool can_enforce_active_path{false};

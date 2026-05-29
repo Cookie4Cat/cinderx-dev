@@ -761,6 +761,88 @@ class TreeIterStateMachineTest(unittest.TestCase):
         with self.assertRaises(TypeError):
             next(gen)
 
+    @cinder_support.skip_unless_jit("Requires CinderX JIT")
+    def test_tree_iter_truthiness_guard_default(self):
+        """``if child:`` with default truthiness is matched like ``if child is not None:``."""
+
+        # Fresh unique class so the JIT doesn't share compiled code with other
+        # tests that use the canonical is-not-None form.
+        class TruthinessNode:
+            __slots__ = ("value", "left", "right")
+
+            def __init__(self, value, left=None, right=None):
+                self.value = value
+                self.left = left
+                self.right = right
+
+            def __iter__(self):
+                if self.left:          # truthiness guard — no custom __bool__
+                    yield from self.left
+                yield self.value
+                if self.right:
+                    yield from self.right
+
+        self.assertTrue(cinderx.jit.force_compile(TruthinessNode.__iter__))
+
+        if _tree_iter_state_machine_enabled():
+            ops = cinderx.jit.get_function_hir_opcode_counts(
+                TruthinessNode.__iter__
+            )
+            self.assertGreater(
+                ops.get("EnsureTreeIterState", 0),
+                0,
+                "EnsureTreeIterState should appear when truthiness guard is matched",
+            )
+
+        root = TruthinessNode(
+            2,
+            TruthinessNode(1),
+            TruthinessNode(3),
+        )
+        self.assertEqual(list(root), [1, 2, 3])
+
+        # Larger tree — correctness must hold at depth.
+        big = TruthinessNode(
+            4,
+            TruthinessNode(2, TruthinessNode(1), TruthinessNode(3)),
+            TruthinessNode(6, TruthinessNode(5), TruthinessNode(7)),
+        )
+        self.assertEqual(list(big), [1, 2, 3, 4, 5, 6, 7])
+
+    @cinder_support.skip_unless_jit("Requires CinderX JIT")
+    def test_tree_iter_custom_bool_not_optimized(self):
+        """A node class with custom __bool__ must NOT be matched as a TreeIter."""
+
+        class BoolNode:
+            __slots__ = ("value", "left", "right")
+
+            def __init__(self, value, left=None, right=None):
+                self.value = value
+                self.left = left
+                self.right = right
+
+            def __bool__(self):
+                return self.value != 0  # custom truthiness
+
+            def __iter__(self):
+                if self.left:
+                    yield from self.left
+                yield self.value
+                if self.right:
+                    yield from self.right
+
+        self.assertTrue(cinderx.jit.force_compile(BoolNode.__iter__))
+        ops = cinderx.jit.get_function_hir_opcode_counts(BoolNode.__iter__)
+        self.assertEqual(
+            ops.get("EnsureTreeIterState", 0),
+            0,
+            "EnsureTreeIterState must be absent when node has custom __bool__",
+        )
+
+        # Correctness must still hold via the original generator path.
+        root = BoolNode(2, BoolNode(1), BoolNode(3))
+        self.assertEqual(list(root), [1, 2, 3])
+
     def test_tree_iter_state_machine_not_triggered_for_non_tree(self):
         """Plain generators without the left/right/value pattern are unaffected."""
 
