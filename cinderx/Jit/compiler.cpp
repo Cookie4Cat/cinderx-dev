@@ -120,9 +120,12 @@ void Compiler::runPasses(
   // PrimitiveUnboxCSE makes more of those boxes frame-state-only by merging
   // repeated unboxes before remat looks at direct uses.
   runPassIf(hir::PrimitiveUnboxCSE{}, PassConfig::kPrimitiveUnboxCSE);
+#if defined(CINDER_AARCH64)
+  // ARM-only: relies on fcmp + signed GT/GE for correct NaN semantics.
   runPassIf(
       hir::FloatComparisonSimplification{},
       PassConfig::kFloatComparisonSimplification);
+#endif
   // Deopt correctness also requires the backend trampoline to save FP
   // registers in regs[]; that support is currently implemented for AArch64.
 #if defined(CINDER_AARCH64)

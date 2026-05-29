@@ -38,7 +38,7 @@ fun test {
     v5:ImmortalBool[True] = LoadConst<ImmortalBool[True]>
     v12:CDouble = PrimitiveUnbox<CDouble> v2
     v13:CDouble = PrimitiveUnbox<CDouble> v3
-    v6:CBool = PrimitiveCompare<GreaterThanUnsigned> v12 v13
+    v6:CBool = PrimitiveCompare<GreaterThan> v12 v13
     CondBranch<1, 2> v6
   }
 
@@ -88,7 +88,7 @@ fun test {
     v5:ImmortalBool[False] = LoadConst<ImmortalBool[False]>
     v12:CDouble = PrimitiveUnbox<CDouble> v2
     v13:CDouble = PrimitiveUnbox<CDouble> v3
-    v6:CBool = PrimitiveCompare<GreaterThanUnsigned> v12 v13
+    v6:CBool = PrimitiveCompare<GreaterThan> v12 v13
     CondBranch<1, 2> v6
   }
 

@@ -12,12 +12,27 @@ namespace jit::hir {
 namespace {
 
 // Map FloatCompare's CompareOp to the PrimitiveCompareOp that yields correct
-// float comparison behavior on native fp compare instructions.
+// IEEE 754 / Python float comparison semantics on native fp compare
+// instructions.
 //
-// For ordered comparisons we use the "Unsigned" variants: on x86 comisd only
-// sets CF, so seta/setae/setb/setbe are correct while setg/setge/setl/setle
-// are not.  On ARM fcmp sets both CF and the N/V flags, so both signed and
-// unsigned work for normal numbers.
+// This pass is ARM (aarch64) only and relies on ARM fcmp + condition-code
+// behavior for correct NaN handling:
+//
+//   ARM fcmp sets flags for unordered (NaN): N=0, Z=0, C=1, V=1
+//
+//   Operator          PrimitiveCompareOp    ARM cond   NaN result   Correct?
+//   --------          ------------------    --------   ----------   --------
+//   GreaterThan       kGreaterThan          GT         false        yes
+//   GreaterThanEqual  kGreaterThanEqual     GE         false        yes
+//   LessThan          kLessThanUnsigned     LO         false        yes
+//   LessThanEqual     kLessThanEqualUnsigned LS        false        yes
+//   Equal             kEqual                EQ         false        yes
+//   NotEqual          kNotEqual             NE         true         yes
+//
+// Signed GT/GE check N==V which fails for NaN (V=1, N=0 => N!=V).
+// Unsigned LO/LS check C==0 which fails for NaN (C=1).
+// On x86 the signed/unsigned condition codes have different NaN behavior;
+// this pass is guarded by #if defined(CINDER_AARCH64) in compiler.cpp.
 PrimitiveCompareOp mapToFloatPrimitiveCompareOp(CompareOp op) {
   switch (op) {
     case CompareOp::kLessThan:
@@ -29,9 +44,9 @@ PrimitiveCompareOp mapToFloatPrimitiveCompareOp(CompareOp op) {
     case CompareOp::kNotEqual:
       return PrimitiveCompareOp::kNotEqual;
     case CompareOp::kGreaterThan:
-      return PrimitiveCompareOp::kGreaterThanUnsigned;
+      return PrimitiveCompareOp::kGreaterThan;
     case CompareOp::kGreaterThanEqual:
-      return PrimitiveCompareOp::kGreaterThanEqualUnsigned;
+      return PrimitiveCompareOp::kGreaterThanEqual;
     default:
       JIT_ABORT("Unsupported CompareOp for float comparison: {}",
                 static_cast<int>(op));
