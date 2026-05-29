@@ -46,6 +46,28 @@ int ensureTreeIterActivePath(TreeIterState* state) {
   return 0;
 }
 
+int treeIterMaterializeActivePath(TreeIterState* state) {
+  if (ensureTreeIterActivePath(state) < 0) {
+    return -1;
+  }
+  try {
+    auto& nodes = state->tree_iter_active_path->nodes;
+    nodes.clear();
+    if (state->tree_iter_current_node != nullptr) {
+      nodes.insert(state->tree_iter_current_node);
+    }
+    for (int32_t i = 0; i < state->tree_iter_stack_top; i++) {
+      PyObject* node = state->tree_iter_stack[i].node;
+      if (node != nullptr) {
+        nodes.insert(node);
+      }
+    }
+  } catch (const std::bad_alloc&) {
+    return -1;
+  }
+  return 0;
+}
+
 bool treeIterActivePathContains(TreeIterState* state, PyObject* node) {
   if (state == nullptr || state->tree_iter_active_path == nullptr ||
       node == nullptr) {

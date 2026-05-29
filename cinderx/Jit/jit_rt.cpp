@@ -2459,17 +2459,42 @@ int JITRT_CheckTreeIterChildEntry(
     return -1;
   }
 
-  if (jit::treeIterActivePathInsert(state, current) < 0) {
-    PyErr_NoMemory();
-    return -1;
-  }
-
   int32_t next_depth = state->tree_iter_stack_top + 1;
   if (state->tree_iter_depth_budget > 0 &&
       next_depth >= state->tree_iter_depth_budget) {
     PyErr_SetString(
         PyExc_RecursionError,
         "maximum recursion depth exceeded while traversing tree iterator");
+    return -1;
+  }
+
+  if (state->tree_iter_active_path == nullptr &&
+      next_depth <= jit::kTreeIterActivePathHashThreshold) {
+    if (child == current) {
+      PyErr_SetString(
+          PyExc_RecursionError,
+          "cycle detected while traversing tree iterator");
+      return -1;
+    }
+    for (int32_t i = 0; i < state->tree_iter_stack_top; i++) {
+      if (child == state->tree_iter_stack[i].node) {
+        PyErr_SetString(
+            PyExc_RecursionError,
+            "cycle detected while traversing tree iterator");
+        return -1;
+      }
+    }
+    return 0;
+  }
+
+  if (state->tree_iter_active_path == nullptr &&
+      jit::treeIterMaterializeActivePath(state) < 0) {
+    PyErr_NoMemory();
+    return -1;
+  }
+
+  if (jit::treeIterActivePathInsert(state, current) < 0) {
+    PyErr_NoMemory();
     return -1;
   }
 

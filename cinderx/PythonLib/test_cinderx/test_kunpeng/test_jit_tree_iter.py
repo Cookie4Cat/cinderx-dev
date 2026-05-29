@@ -561,6 +561,16 @@ class TreeIterStateMachineTest(unittest.TestCase):
         finally:
             sys.setrecursionlimit(old_limit)
 
+        head = Node(0)
+        cur = head
+        for i in range(1, 140):
+            child = Node(i)
+            cur.left = child
+            cur = child
+        cur.left = head
+        with self.assertRaises(RecursionError):
+            list(head)
+
     # ------------------------------------------------------------------
     # Protocol gate tests (first-version experiment: fail-closed)
     # ------------------------------------------------------------------

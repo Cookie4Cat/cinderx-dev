@@ -82,7 +82,13 @@ void freeTreeIterState(TreeIterState* state);
 // failure without setting a Python exception.
 int ensureTreeIterActivePath(TreeIterState* state);
 
+// Shallow trees are faster with a compact stack scan than with an
+// unordered_set lookup.  Materialize the hash set only beyond this depth, where
+// the scan cost would otherwise dominate skewed trees.
+constexpr int32_t kTreeIterActivePathHashThreshold = 128;
+
 // Active-path membership helpers.  The set does not own node references.
+int treeIterMaterializeActivePath(TreeIterState* state);
 bool treeIterActivePathContains(TreeIterState* state, PyObject* node);
 int treeIterActivePathInsert(TreeIterState* state, PyObject* node);
 void treeIterActivePathErase(TreeIterState* state, PyObject* node);
