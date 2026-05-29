@@ -152,10 +152,10 @@ def test_mixed_accumulator_initial_argument_keeps_generic_path():
     _specialize_then_compile(func, warmup_calls=warmup_calls)
 
     data = [1.0] * 1000
+    cinderx.jit.get_and_clear_runtime_stats()
     for initial in (1, 0.5):
         expected = _interpreted_result(_make_mixed_accumulator, data, initial)
         assert func(data, initial) == expected
 
-    opcodes = cinderx.jit.get_function_hir_opcode_counts(func)
-    assert opcodes is not None
-    assert opcodes.get("DoubleBinaryOp", 0) == 0
+    stats = cinderx.jit.get_and_clear_runtime_stats()
+    assert stats["deopt"] == []
