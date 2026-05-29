@@ -41,7 +41,8 @@ enum PassConfig : uint64_t {
   kFloatAccumulatorPromotion = 1 << 10,
   kPrimitiveBoxRemat = 1 << 11,
   kPrimitiveUnboxCSE = 1 << 12,
-  kTreeIterStateMachine = 1 << 13,
+  kFloatComparisonSimplification = 1 << 13,
+  kTreeIterStateMachine = 1 << 14,
 
   // Run all the passes.
   kAll = ~uint64_t{0},

@@ -33,6 +33,18 @@ constexpr uint32_t kSegmentExecutable = 0x1;
 constexpr uint32_t kSegmentWritable = 0x2;
 constexpr uint32_t kSegmentReadable = 0x4;
 
+// ELF e_machine values.
+constexpr uint16_t kElfMachineX86_64 = 0x3e;
+constexpr uint16_t kElfMachineAArch64 = 0xb7;
+
+#if defined(__x86_64__) || defined(_M_X64) || defined(_M_AMD64)
+constexpr uint16_t kBuildElfMachine = kElfMachineX86_64;
+#elif defined(__aarch64__) || defined(_M_ARM64)
+constexpr uint16_t kBuildElfMachine = kElfMachineAArch64;
+#else
+#error Please provide the ELF e_machine value for your architecture.
+#endif
+
 // Header that describes an ELF section.
 struct SectionHeader {
   // Offset into .shstrtab section for the name of this section.
@@ -123,8 +135,7 @@ struct FileHeader {
   // Dynamic library.
   uint16_t type{3};
 
-  // AMD x86-64.
-  uint16_t machine{0x3e};
+  uint16_t machine{kBuildElfMachine};
 
   // Duplicate of the previous version field.
   const uint32_t version{1};

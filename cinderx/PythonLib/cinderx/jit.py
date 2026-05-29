@@ -48,6 +48,7 @@ try:
         get_num_inlined_functions,
         is_enabled,
         is_hir_inliner_enabled,
+        is_lightweight_frames_enabled,
         is_inline_cache_stats_collection_enabled,
         is_jit_compiled,
         jit_suppress,
@@ -171,6 +172,9 @@ except ImportError:
         return False
 
     def is_hir_inliner_enabled() -> bool:
+        return False
+
+    def is_lightweight_frames_enabled() -> bool:
         return False
 
     def is_inline_cache_stats_collection_enabled() -> bool:

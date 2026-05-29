@@ -64,11 +64,22 @@ int reifyRunningFrame(_PyInterpreterFrame* frame, PyObject* reifier) {
 
 bool isJitFrame(_PyInterpreterFrame* frame) {
 #ifdef ENABLE_LIGHTWEIGHT_FRAMES
+  if (getConfig().frame_mode != FrameMode::kLightweight) {
+    return false;
+  }
 
-#if PY_VERSION_HEX >= 0x030E0000
+#if PY_VERSION_HEX >= 0x030F0000
   PyObject* code = PyStackRef_AsPyObjectBorrow(frame->f_executable);
   return PyUnstable_JITExecutable_Check(code) &&
       ((PyUnstable_PyJitExecutable*)code)->je_reifier == &reifyRunningFrame;
+#elif PY_VERSION_HEX >= 0x030E0000
+  // CPython 3.14 has no reliable JIT-frame predicate: stock 3.14 does not
+  // expose the 3.15 JITExecutable reifier hook, and this port eagerly
+  // materializes frame metadata instead of relying on lazy reification.
+  // Deopt walks inline metadata directly, while getIP/setIP/stack-wide deopt
+  // remain x86-only. Reaching this path means one of those invariants changed.
+  (void)frame;
+  JIT_ABORT("isJitFrame has no reliable predicate on 3.14.x");
 #else
   return frameFunction(frame) == cinderx::getModuleState()->frame_reifier;
 #endif
@@ -348,6 +359,7 @@ PyType_Slot framereifier_type_slots[] = {
 Ref<> makeFrameReifier([[maybe_unused]] BorrowedRef<PyCodeObject> code) {
 #if PY_VERSION_HEX >= 0x030E0000 && defined(ENABLE_LIGHTWEIGHT_FRAMES)
   if (getConfig().frame_mode == FrameMode::kLightweight) {
+#if PY_VERSION_HEX >= 0x030F0000
     PyObject* reifier =
         PyUnstable_MakeJITExecutable(reifyRunningFrame, code, nullptr);
     if (reifier == nullptr) {
@@ -356,6 +368,9 @@ Ref<> makeFrameReifier([[maybe_unused]] BorrowedRef<PyCodeObject> code) {
           fmt::format("failed to make reifier {}", codeQualname(code)));
     }
     return Ref<>::steal(reifier);
+#else
+    return Ref<>::create((PyObject*)code);
+#endif
   }
 #endif
   return nullptr;
@@ -431,7 +446,10 @@ void jitFramePopulateFrame([[maybe_unused]] _PyInterpreterFrame* frame) {
 #else
   frame->stacktop = code->co_nlocalsplus;
 #endif
-  frame->frame_obj = nullptr;
+  // Preserve an already-materialized frame object. Stock CPython 3.14 can
+  // create it directly from f_executable without going through Cinder's
+  // reifier hook, and deopt needs to keep it attached so slab migration updates
+  // PyFrameObject::f_frame.
   frame->return_offset = 0;
   if (!(code->co_flags & kCoFlagsAnyGenerator)) {
     frame->owner = FRAME_OWNED_BY_THREAD;
@@ -457,7 +475,7 @@ void jitFramePopulateFrame([[maybe_unused]] _PyInterpreterFrame* frame) {
 // is going to be transferred there.
 void jitFrameRemoveReifier(_PyInterpreterFrame* frame) {
 #ifdef ENABLE_LIGHTWEIGHT_FRAMES
-#if PY_VERSION_HEX >= 0x030E0000
+#if PY_VERSION_HEX >= 0x030F0000
   PyObject* code = PyStackRef_AsPyObjectBorrow(frame->f_executable);
   if (PyUnstable_JITExecutable_Check(code)) {
     _PyStackRef existing = frame->f_executable;
@@ -465,6 +483,8 @@ void jitFrameRemoveReifier(_PyInterpreterFrame* frame) {
         ((PyUnstable_PyJitExecutable*)code)->je_code);
     PyStackRef_CLOSE(existing);
   }
+#elif PY_VERSION_HEX >= 0x030E0000
+  // No-op on OSS 3.14: f_executable is already the code object.
 #else
   // We no longer own the frame and need to provide a proper function for the
   // interpreter.
@@ -577,6 +597,12 @@ void jitFrameInitLightweight(
 #if defined(CINDER_AARCH64)
   jitFrameGetHeader(frame)->deopt_idx = 0;
 #endif
+#if PY_VERSION_HEX < 0x030F0000
+  // Stock CPython 3.14 does not expose the JIT executable reifier hook used by
+  // 3.15+. Materialize the CPython-visible frame fields eagerly so APIs like
+  // sys._getframe()/inspect.currentframe() do not observe a partial JIT frame.
+  jitFramePopulateFrame(frame);
+#endif
 #else
   frame->stacktop = 0;
   setFrameInstruction(frame, _PyCode_CODE(code) - 1);
@@ -662,10 +688,11 @@ void jitFrameClearExceptCode(_PyInterpreterFrame* frame) {
     return;
   }
 
-  // If we've already been requested by the runtime to initialize this
-  // _PyInterpreterFrame then we just fall back to its implementation to
-  // handle the clearing.
-  if (jitFrameGetHeader(frame)->rtfs & JIT_FRAME_INITIALIZED) {
+  // If we've already initialized this _PyInterpreterFrame, or stock CPython
+  // materialized a PyFrameObject from it directly, fall back to CPython's
+  // clearing path so escaped frame objects take ownership of the frame data.
+  if ((jitFrameGetHeader(frame)->rtfs & JIT_FRAME_INITIALIZED) ||
+      frame->frame_obj != nullptr) {
     jitFrameRemoveReifier(frame);
     _PyFrame_ClearExceptCode(frame);
     return;

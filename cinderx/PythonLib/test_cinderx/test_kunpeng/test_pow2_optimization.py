@@ -99,3 +99,20 @@ class KunpengPow2OptimizationTests(unittest.TestCase):
 
         with self.assertRaises(OverflowError):
             f(1e308)
+
+    def test_s5_float_pow2_uses_double_binary_op(self) -> None:
+        """S5/E5: float x ** 2 is lowered to the double multiply path."""
+        def f(x: Any) -> Any:
+            return x ** 2
+
+        specialize(f, lambda: f(3.0))
+
+        self.assertTrue(cinderx.jit.is_jit_compiled(f))
+
+        for value in (-3.5, -0.0, 0.0, 2.25):
+            self.assertEqual(f(value), value ** 2)
+
+        counts = cinderx.jit.get_function_hir_opcode_counts(f)
+        self.assertIsNotNone(counts)
+        self.assertEqual(counts.get("DoubleBinaryOp", 0), 1, dict(counts))
+        self.assertEqual(counts.get("BinaryOp", 0), 0, dict(counts))

@@ -71,6 +71,7 @@ def _clean_env():
         "PYTHONJITDISABLE",
         "PYTHONJITDUMPHIR",
         "PYTHONJITDUMPSTATS",
+        "PYTHONJITLIGHTWEIGHTFRAME",
         "PYTHONJITLISTFILE",
         "PYTHONPATH",
     ):

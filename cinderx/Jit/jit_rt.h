@@ -66,11 +66,6 @@ void JITRT_DecrefFrame(PyFrameObject* frame);
  */
 void JITRT_UnlinkFrame(PyThreadState* tstate);
 
-// Specialized version of JITRT_UnlinkFrame for non-generator functions with no
-// free variables that use lightweight frames. Avoids the expensive
-// jitFrameClearExceptCode path.
-void JITRT_UnlinkLightweightFrameFast(PyThreadState* tstate);
-
 /*
  * Handles a call that includes kw arguments or excess tuple arguments
  */
@@ -198,6 +193,15 @@ PyObject* JITRT_Vectorcall(
  * Perform a method lookup on an object.
  */
 LoadMethodResult JITRT_GetMethod(PyObject* obj, PyObject* name);
+
+#if PY_VERSION_HEX >= 0x030E0000
+LoadMethodResult JITRT_LoadAttrMethodWithValues(
+    PyObject* obj,
+    int64_t type_version,
+    int64_t keys_version,
+    PyObject* descr,
+    PyObject* name);
+#endif
 
 /*
  * Perform an attribute lookup in a super class

@@ -710,6 +710,16 @@ PyObject* is_frame_evaluator_installed(
   Py_RETURN_FALSE;
 }
 
+PyObject* is_lightweight_frames_enabled(
+    PyObject* /* mod */,
+    PyObject* /* args */) {
+#ifdef ENABLE_LIGHTWEIGHT_FRAMES
+  Py_RETURN_TRUE;
+#else
+  Py_RETURN_FALSE;
+#endif
+}
+
 // Check if Python code is still being executed.
 bool isCodeRunning() {
   PyThreadState* tstate = PyThreadState_Get();
@@ -814,6 +824,10 @@ PyMethodDef _cinderx_methods[] = {
      is_frame_evaluator_installed,
      METH_NOARGS,
      is_frame_evaluator_installed_doc},
+    {"is_lightweight_frames_enabled",
+     is_lightweight_frames_enabled,
+     METH_NOARGS,
+     PyDoc_STR("Return True when JIT lightweight frames are compiled in.")},
     {"clear_caches",
      clear_caches,
      METH_NOARGS,

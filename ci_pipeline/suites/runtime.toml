@@ -11,4 +11,7 @@ kind = "runtime_tests"
 coverage = true
 [jobs.env]
 CINDERX_LOCAL_DEPS = "{repo}/../cinderx-local-deps"
+CINDERX_RUNTIME_TEST_LIGHTWEIGHT_REGEX = "CmdLineTest.LightweightFrame|ReifyFrameTest|Deopt"
+CINDERX_RUNTIME_TEST_SPLIT_LWF_OSR = "1"
+ENABLE_LIGHTWEIGHT_FRAMES = "1"
 ENABLE_XXCLASSLOADER = "1"
