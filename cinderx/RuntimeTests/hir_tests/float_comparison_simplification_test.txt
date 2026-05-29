@@ -1,0 +1,446 @@
+--- Test Suite Name ---
+FloatComparisonSimplificationTest
+--- Passes ---
+FloatComparisonSimplification
+--- Test Name ---
+GreaterThanWithTrueBecomesGreaterThanUnsigned
+--- Input ---
+# HIR
+fun test {
+  bb 0 {
+    v0 = LoadArg<0; "a">
+    v1 = LoadArg<1; "b">
+    v2 = RefineType<FloatExact> v0
+    v3 = RefineType<FloatExact> v1
+    v4 = FloatCompare<GreaterThan> v2 v3
+    v5 = LoadConst<ImmortalBool[True]>
+    v6 = PrimitiveCompare<Equal> v4 v5
+    CondBranch<1, 2> v6
+  }
+
+  bb 1 {
+    v10 = LoadConst<ImmortalLongExact[1]>
+    Return v10
+  }
+
+  bb 2 {
+    v11 = LoadConst<NoneType>
+    Return v11
+  }
+}
+--- Expected 3.14 ---
+fun test {
+  bb 0 {
+    v0:Object = LoadArg<0>
+    v1:Object = LoadArg<1>
+    v2:FloatExact = RefineType<FloatExact> v0
+    v3:FloatExact = RefineType<FloatExact> v1
+    v5:ImmortalBool[True] = LoadConst<ImmortalBool[True]>
+    v12:CDouble = PrimitiveUnbox<CDouble> v2
+    v13:CDouble = PrimitiveUnbox<CDouble> v3
+    v6:CBool = PrimitiveCompare<GreaterThanUnsigned> v12 v13
+    CondBranch<1, 2> v6
+  }
+
+  bb 1 (preds 0) {
+    v10:ImmortalLongExact[1] = LoadConst<ImmortalLongExact[1]>
+    Return v10
+  }
+
+  bb 2 (preds 0) {
+    v11:NoneType = LoadConst<NoneType>
+    Return v11
+  }
+}
+--- Test Name ---
+GreaterThanWithFalseIsNotFalseIdentity
+--- Input ---
+# HIR
+fun test {
+  bb 0 {
+    v0 = LoadArg<0; "a">
+    v1 = LoadArg<1; "b">
+    v2 = RefineType<FloatExact> v0
+    v3 = RefineType<FloatExact> v1
+    v4 = FloatCompare<GreaterThan> v2 v3
+    v5 = LoadConst<ImmortalBool[False]>
+    v6 = PrimitiveCompare<NotEqual> v4 v5
+    CondBranch<1, 2> v6
+  }
+
+  bb 1 {
+    v10 = LoadConst<ImmortalLongExact[1]>
+    Return v10
+  }
+
+  bb 2 {
+    v11 = LoadConst<NoneType>
+    Return v11
+  }
+}
+--- Expected 3.14 ---
+fun test {
+  bb 0 {
+    v0:Object = LoadArg<0>
+    v1:Object = LoadArg<1>
+    v2:FloatExact = RefineType<FloatExact> v0
+    v3:FloatExact = RefineType<FloatExact> v1
+    v5:ImmortalBool[False] = LoadConst<ImmortalBool[False]>
+    v12:CDouble = PrimitiveUnbox<CDouble> v2
+    v13:CDouble = PrimitiveUnbox<CDouble> v3
+    v6:CBool = PrimitiveCompare<GreaterThanUnsigned> v12 v13
+    CondBranch<1, 2> v6
+  }
+
+  bb 1 (preds 0) {
+    v10:ImmortalLongExact[1] = LoadConst<ImmortalLongExact[1]>
+    Return v10
+  }
+
+  bb 2 (preds 0) {
+    v11:NoneType = LoadConst<NoneType>
+    Return v11
+  }
+}
+--- Test Name ---
+LessThanWithTrueBecomesLessThanUnsigned
+--- Input ---
+# HIR
+fun test {
+  bb 0 {
+    v0 = LoadArg<0; "a">
+    v1 = LoadArg<1; "b">
+    v2 = RefineType<FloatExact> v0
+    v3 = RefineType<FloatExact> v1
+    v4 = FloatCompare<LessThan> v2 v3
+    v5 = LoadConst<ImmortalBool[True]>
+    v6 = PrimitiveCompare<Equal> v4 v5
+    CondBranch<1, 2> v6
+  }
+
+  bb 1 {
+    v10 = LoadConst<ImmortalLongExact[1]>
+    Return v10
+  }
+
+  bb 2 {
+    v11 = LoadConst<NoneType>
+    Return v11
+  }
+}
+--- Expected 3.14 ---
+fun test {
+  bb 0 {
+    v0:Object = LoadArg<0>
+    v1:Object = LoadArg<1>
+    v2:FloatExact = RefineType<FloatExact> v0
+    v3:FloatExact = RefineType<FloatExact> v1
+    v5:ImmortalBool[True] = LoadConst<ImmortalBool[True]>
+    v12:CDouble = PrimitiveUnbox<CDouble> v2
+    v13:CDouble = PrimitiveUnbox<CDouble> v3
+    v6:CBool = PrimitiveCompare<LessThanUnsigned> v12 v13
+    CondBranch<1, 2> v6
+  }
+
+  bb 1 (preds 0) {
+    v10:ImmortalLongExact[1] = LoadConst<ImmortalLongExact[1]>
+    Return v10
+  }
+
+  bb 2 (preds 0) {
+    v11:NoneType = LoadConst<NoneType>
+    Return v11
+  }
+}
+--- Test Name ---
+EqualWithTrueBecomesEqual
+--- Input ---
+# HIR
+fun test {
+  bb 0 {
+    v0 = LoadArg<0; "a">
+    v1 = LoadArg<1; "b">
+    v2 = RefineType<FloatExact> v0
+    v3 = RefineType<FloatExact> v1
+    v4 = FloatCompare<Equal> v2 v3
+    v5 = LoadConst<ImmortalBool[True]>
+    v6 = PrimitiveCompare<Equal> v4 v5
+    CondBranch<1, 2> v6
+  }
+
+  bb 1 {
+    v10 = LoadConst<ImmortalLongExact[1]>
+    Return v10
+  }
+
+  bb 2 {
+    v11 = LoadConst<NoneType>
+    Return v11
+  }
+}
+--- Expected 3.14 ---
+fun test {
+  bb 0 {
+    v0:Object = LoadArg<0>
+    v1:Object = LoadArg<1>
+    v2:FloatExact = RefineType<FloatExact> v0
+    v3:FloatExact = RefineType<FloatExact> v1
+    v5:ImmortalBool[True] = LoadConst<ImmortalBool[True]>
+    v12:CDouble = PrimitiveUnbox<CDouble> v2
+    v13:CDouble = PrimitiveUnbox<CDouble> v3
+    v6:CBool = PrimitiveCompare<Equal> v12 v13
+    CondBranch<1, 2> v6
+  }
+
+  bb 1 (preds 0) {
+    v10:ImmortalLongExact[1] = LoadConst<ImmortalLongExact[1]>
+    Return v10
+  }
+
+  bb 2 (preds 0) {
+    v11:NoneType = LoadConst<NoneType>
+    Return v11
+  }
+}
+--- Test Name ---
+InvertingCaseNotEqualTrueIsSkipped
+--- Input ---
+# HIR
+fun test {
+  bb 0 {
+    v0 = LoadArg<0; "a">
+    v1 = LoadArg<1; "b">
+    v2 = RefineType<FloatExact> v0
+    v3 = RefineType<FloatExact> v1
+    v4 = FloatCompare<GreaterThan> v2 v3
+    v5 = LoadConst<ImmortalBool[True]>
+    v6 = PrimitiveCompare<NotEqual> v4 v5
+    CondBranch<1, 2> v6
+  }
+
+  bb 1 {
+    v10 = LoadConst<ImmortalLongExact[1]>
+    Return v10
+  }
+
+  bb 2 {
+    v11 = LoadConst<NoneType>
+    Return v11
+  }
+}
+--- Expected 3.14 ---
+fun test {
+  bb 0 {
+    v0:Object = LoadArg<0>
+    v1:Object = LoadArg<1>
+    v2:FloatExact = RefineType<FloatExact> v0
+    v3:FloatExact = RefineType<FloatExact> v1
+    v4:Bool = FloatCompare<GreaterThan> v2 v3
+    v5:ImmortalBool[True] = LoadConst<ImmortalBool[True]>
+    v6:CBool = PrimitiveCompare<NotEqual> v4 v5
+    CondBranch<1, 2> v6
+  }
+
+  bb 1 (preds 0) {
+    v10:ImmortalLongExact[1] = LoadConst<ImmortalLongExact[1]>
+    Return v10
+  }
+
+  bb 2 (preds 0) {
+    v11:NoneType = LoadConst<NoneType>
+    Return v11
+  }
+}
+--- Test Name ---
+InvertingCaseEqualFalseIsSkipped
+--- Input ---
+# HIR
+fun test {
+  bb 0 {
+    v0 = LoadArg<0; "a">
+    v1 = LoadArg<1; "b">
+    v2 = RefineType<FloatExact> v0
+    v3 = RefineType<FloatExact> v1
+    v4 = FloatCompare<GreaterThan> v2 v3
+    v5 = LoadConst<ImmortalBool[False]>
+    v6 = PrimitiveCompare<Equal> v4 v5
+    CondBranch<1, 2> v6
+  }
+
+  bb 1 {
+    v10 = LoadConst<ImmortalLongExact[1]>
+    Return v10
+  }
+
+  bb 2 {
+    v11 = LoadConst<NoneType>
+    Return v11
+  }
+}
+--- Expected 3.14 ---
+fun test {
+  bb 0 {
+    v0:Object = LoadArg<0>
+    v1:Object = LoadArg<1>
+    v2:FloatExact = RefineType<FloatExact> v0
+    v3:FloatExact = RefineType<FloatExact> v1
+    v4:Bool = FloatCompare<GreaterThan> v2 v3
+    v5:ImmortalBool[False] = LoadConst<ImmortalBool[False]>
+    v6:CBool = PrimitiveCompare<Equal> v4 v5
+    CondBranch<1, 2> v6
+  }
+
+  bb 1 (preds 0) {
+    v10:ImmortalLongExact[1] = LoadConst<ImmortalLongExact[1]>
+    Return v10
+  }
+
+  bb 2 (preds 0) {
+    v11:NoneType = LoadConst<NoneType>
+    Return v11
+  }
+}
+--- Test Name ---
+OtherUserBlocksOptimization
+--- Input ---
+# HIR
+fun test {
+  bb 0 {
+    v0 = LoadArg<0; "a">
+    v1 = LoadArg<1; "b">
+    v2 = RefineType<FloatExact> v0
+    v3 = RefineType<FloatExact> v1
+    v4 = FloatCompare<GreaterThan> v2 v3
+    v5 = LoadConst<ImmortalBool[True]>
+    v6 = PrimitiveCompare<Equal> v4 v5
+    UseType<Bool> v4
+    CondBranch<1, 2> v6
+  }
+
+  bb 1 {
+    v10 = LoadConst<ImmortalLongExact[1]>
+    Return v10
+  }
+
+  bb 2 {
+    v11 = LoadConst<NoneType>
+    Return v11
+  }
+}
+--- Expected 3.14 ---
+fun test {
+  bb 0 {
+    v0:Object = LoadArg<0>
+    v1:Object = LoadArg<1>
+    v2:FloatExact = RefineType<FloatExact> v0
+    v3:FloatExact = RefineType<FloatExact> v1
+    v4:Bool = FloatCompare<GreaterThan> v2 v3
+    v5:ImmortalBool[True] = LoadConst<ImmortalBool[True]>
+    v6:CBool = PrimitiveCompare<Equal> v4 v5
+    UseType<Bool> v4
+    CondBranch<1, 2> v6
+  }
+
+  bb 1 (preds 0) {
+    v10:ImmortalLongExact[1] = LoadConst<ImmortalLongExact[1]>
+    Return v10
+  }
+
+  bb 2 (preds 0) {
+    v11:NoneType = LoadConst<NoneType>
+    Return v11
+  }
+}
+--- Test Name ---
+NonBoolConstantNotOptimized
+--- Input ---
+# HIR
+fun test {
+  bb 0 {
+    v0 = LoadArg<0; "a">
+    v1 = LoadArg<1; "b">
+    v2 = RefineType<FloatExact> v0
+    v3 = RefineType<FloatExact> v1
+    v4 = FloatCompare<GreaterThan> v2 v3
+    v5 = LoadConst<ImmortalLongExact[1]>
+    v6 = PrimitiveCompare<Equal> v4 v5
+    CondBranch<1, 2> v6
+  }
+
+  bb 1 {
+    v10 = LoadConst<ImmortalLongExact[1]>
+    Return v10
+  }
+
+  bb 2 {
+    v11 = LoadConst<NoneType>
+    Return v11
+  }
+}
+--- Expected 3.14 ---
+fun test {
+  bb 0 {
+    v0:Object = LoadArg<0>
+    v1:Object = LoadArg<1>
+    v2:FloatExact = RefineType<FloatExact> v0
+    v3:FloatExact = RefineType<FloatExact> v1
+    v4:Bool = FloatCompare<GreaterThan> v2 v3
+    v5:ImmortalLongExact[1] = LoadConst<ImmortalLongExact[1]>
+    v6:CBool = PrimitiveCompare<Equal> v4 v5
+    CondBranch<1, 2> v6
+  }
+
+  bb 1 (preds 0) {
+    v10:ImmortalLongExact[1] = LoadConst<ImmortalLongExact[1]>
+    Return v10
+  }
+
+  bb 2 (preds 0) {
+    v11:NoneType = LoadConst<NoneType>
+    Return v11
+  }
+}
+--- Test Name ---
+NonFloatCompareNotOptimized
+--- Input ---
+# HIR
+fun test {
+  bb 0 {
+    v0 = LoadArg<0; "a">
+    v2 = PrimitiveBoxBool v0
+    v3 = LoadConst<ImmortalBool[True]>
+    v4 = PrimitiveCompare<Equal> v2 v3
+    CondBranch<1, 2> v4
+  }
+
+  bb 1 {
+    v10 = LoadConst<ImmortalLongExact[1]>
+    Return v10
+  }
+
+  bb 2 {
+    v11 = LoadConst<NoneType>
+    Return v11
+  }
+}
+--- Expected 3.14 ---
+fun test {
+  bb 0 {
+    v0:Object = LoadArg<0>
+    v2:Bool = PrimitiveBoxBool v0
+    v3:ImmortalBool[True] = LoadConst<ImmortalBool[True]>
+    v4:CBool = PrimitiveCompare<Equal> v2 v3
+    CondBranch<1, 2> v4
+  }
+
+  bb 1 (preds 0) {
+    v10:ImmortalLongExact[1] = LoadConst<ImmortalLongExact[1]>
+    Return v10
+  }
+
+  bb 2 (preds 0) {
+    v11:NoneType = LoadConst<NoneType>
+    Return v11
+  }
+}
+--- End ---

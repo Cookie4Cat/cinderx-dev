@@ -49,6 +49,7 @@ struct HIROptimizations {
   bool phi_elim{true};
   bool primitive_box_remat{true};
   bool primitive_unbox_cse{true};
+  bool float_comparison_simplification{true};
   bool simplify{true};
 };
 
