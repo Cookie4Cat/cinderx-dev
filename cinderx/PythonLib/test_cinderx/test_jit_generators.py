@@ -721,15 +721,16 @@ def _inorder(node):
 
 
 def _tree_iter_state_machine_enabled():
-    value = os.environ.get("PYTHONJITTREEITERSTATEMACHINE", "")
-    return value.lower() not in ("", "0", "false", "no")
+    value = os.environ.get("PYTHONJITTREEITERSTATEMACHINE", "1")
+    return value.lower() not in ("0", "false", "no")
 
 
 class TreeIterStateMachineTest(unittest.TestCase):
     """Tests for the TreeIter JIT state machine optimization.
 
-    The state machine is enabled by setting PYTHONJITTREEITERSTATEMACHINE=1
-    and is gated behind ``cinderx.jit.is_enabled()``.  Most correctness tests
+    The state machine is enabled by default and can be disabled by setting
+    PYTHONJITTREEITERSTATEMACHINE=0. It is also gated behind
+    ``cinderx.jit.is_enabled()``. Most correctness tests
     run regardless of whether the optimization fired; they define the
     behavioural contract that the state machine must preserve.
     """

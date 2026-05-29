@@ -35,7 +35,7 @@ CinderX, JIT, generator, yield from, TreeIter, HIR, LIR, GenDataFooter, FieldAcc
 
 本文档描述基于当前 `master` 重新实现 generators JIT TreeIter 状态机优化的详细设计。输入来自上一阶段功能设计文档 `docs/design/generators-jit-treeiter-state-machine/function-design.md`，实现证据来自旧分支 `github/bench-cur-7c361dce-claudecode` 中已完成的 `TreeIterStateMachinePass`、`GenDataFooter` 扩展、状态机 HIR/LIR 指令、AArch64/x86_64 codegen 和调试经验。旧分支仅作为 MVP 参考；正确性以当前 CinderX 源码、该构建绑定的 CPython source tag/commit，以及 CI/local artifact 中记录的源码获取方式为准。本地绝对路径不能作为规范来源。
 
-本次详细设计不按旧分支逐文件复制。旧分支的核心算法保留，但接口适配当前 `master`：当前 HIR 使用 `Send` 与 `YieldValue::yieldFromIter()` 表示 yield-from，不再引入旧分支的显式 `YieldFrom`、`OptimizedYieldFrom`、`InlineIter` 作为必要前置。V1.2 将首版收敛为默认关闭的实验核心实现：选择 heap-backed growable `TreeIterState` 解决 release 栈溢出和全局内存膨胀问题；不把 `gi_yieldfrom` / `send` / `throw` / `close` / suspended deopt 精确协议声明为首版生产能力。V1.5 将实验 gate 和生产 gate 分开：实验路径只证明 allowlisted `next()`/`for`/`list()` 核心正确性和性能，并在协议敏感入口 fail closed；生产路径必须先证明 TreeIterState 能 exact reify 为等价原始 generator/yield-from 栈，再闭合 active-path/depth 转移不变量、五个纵切面 artifact verifier 和 `generators` workload gate。V1.6 针对当前实现未能提升 pyperformance `generators` 的根因，将 matcher 从“slot-only `LoadField` + 显式 `is not None`”扩展为“原始 child guard + 字段访问证明”：支持 default truthiness 下的 `if child:`，并支持 dict-backed heap object 的 split-dict fast path、fallback 语义和 guard/deopt 处理。
+本次详细设计不按旧分支逐文件复制。旧分支的核心算法保留，但接口适配当前 `master`：当前 HIR 使用 `Send` 与 `YieldValue::yieldFromIter()` 表示 yield-from，不再引入旧分支的显式 `YieldFrom`、`OptimizedYieldFrom`、`InlineIter` 作为必要前置。V1.2 将首版收敛为默认启用、可显式关闭的生产优化：选择 heap-backed growable `TreeIterState` 解决 release 栈溢出和全局内存膨胀问题。V1.5 将准入 gate 收敛到生产路径：只有 HIR 结构、owner/child exactness、field layout、iterator identity、失效/deopt/lifecycle 证明全部满足时才生成状态机；否则保持原始 generator 路径。V1.6 针对当前实现未能提升 pyperformance `generators` 的根因，将 matcher 从“slot-only `LoadField` + 显式 `is not None`”扩展为“原始 child guard + 字段访问证明”：支持 default truthiness 下的 `if child:`，并支持 dict-backed heap object 的 split-dict fast path、fallback 语义和 guard/deopt 处理。
 
 ## 6 List of abbreviations 缩略语清单
 
@@ -94,7 +94,7 @@ current_node + current_phase + state_stack
 1. 当前 `master` 中如何识别带 child 跳过 guard、truthiness 等价性和精确类型约束的 TreeIter yield-from HIR。
 2. 如何用 `FieldAccessProof` 覆盖 slot/member 字段和 dict-backed split-dict 字段访问，并让 proof 载荷或 proof id 穿透 HIR、printer/parser、LIR 和 codegen，保留 fallback、invalidation 或 deopt 语义。
 3. 新增哪些内部数据结构、HIR 指令、LIR 指令和 codegen 规则。
-4. 状态机 CFG 如何在显式实验配置下生成，以及哪些语义不允许声明为生产能力。
+4. 状态机 CFG 如何在默认配置下生成，以及哪些证明不足的形态必须保持原始路径。
 5. `PyObject*` 引用如何在 `GenDataFooter`、heap-backed `TreeIterState`、寄存器和显式栈之间转移。
 6. 首版如何闭合 release 栈容量安全、GC/finalize/tp_clear；生产 deopt、`gi_yieldfrom`、`send/throw/close`、环检测和深度越界由 exact deopt/reify gate 承接。
 7. 需要在哪些现有文件中接入配置、初始化、GC、deopt、测试和性能验证。
@@ -133,7 +133,7 @@ current_node + current_phase + state_stack
 | `cinderx/Jit/compiler.h`、`compiler.cpp` | 新增 pass config bit 并接入 pipeline |
 | `cinderx/Jit/config.h`、`pyjit.cpp` | 新增 `tree_iter_state_machine` 配置和环境变量 |
 | `cinderx/Jit/gen_data_footer.h` | 增加 `TreeIterState*` 指针，不内嵌固定栈数组 |
-| `cinderx/Jit/jit_rt.cpp` | 初始化 footer 指针为空，实验路径按需分配状态对象 |
+| `cinderx/Jit/jit_rt.cpp` | 初始化 footer 指针为空，状态机路径按需分配状态对象 |
 | `cinderx/Jit/generators_rt.cpp` | GC traverse、clear/dealloc、实验 deopt gate 处理 TreeIter 状态 |
 | `cinderx/Jit/lir/instruction.h` | 新增状态机 LIR opcode |
 | `cinderx/Jit/lir/generator.cpp` | HIR 状态机指令 lowering 到原生 LIR |
@@ -171,22 +171,21 @@ Codegen
 
 ### 9.1.3 首版交付闭环和生产边界
 
-首版不是 production-ready 默认启用方案，而是显式实验交付。二轮审校和功能设计决策后固定如下闭环，避免实现阶段继续在互斥模型之间摇摆：
+首版按 production 默认启用交付，同时保留显式关闭开关。二轮审校和功能设计决策后固定如下闭环，避免实现阶段继续在互斥模型之间摇摆：
 
 | 主题 | 决策 | 结果 |
 | ---- | --------- | ---- |
-| 交付定位 | 默认关闭的实验核心，面向 `next()` / `for` / `list()` 受控消费 | 不声明完整 generator 协议生产完备 |
+| 交付定位 | 默认启用的 TreeIter 状态机，面向可证明的递归树遍历 generator | 非匹配形态保持原始 generator 路径 |
 | release 栈容量 | 选择 heap-backed growable `TreeIterState`，初始容量 16，push 前检查并在语义深度预算内扩容 | 不再使用固定 16 项 footer 内嵌栈作为 release 边界，也不隐式支持超过原始递归 generator 语义的深度 |
 | footer 内存影响 | `GenDataFooter` 只新增一个 `TreeIterState*` 指针 | 非 TreeIter JIT generator 不承担 256B+ 固定栈开销 |
 | 环检测 | 生产路径维护当前递归路径 active-path 集合，检测回边；不做全图 visited 去重 | self-cycle/right-cycle 等回边 exact deopt/reify；shared subtree 离开当前路径后可再次进入 |
 | yield-from 协议 | 生产路径在 `gi_yieldfrom` / `send(non-None)` / `throw` / `close` 等协议敏感操作前 exact deopt/reify | 无法 reify 时生产配置 no-op；不再保留 delegated metadata 作为首选生产方案 |
 | suspended deopt | 生产路径必须实现 footer state 到等价解释器 generator/yield-from 栈的 exact reify | instrumentation、`close()`、`throw()` 的生产路径在 reify 未闭合前禁用状态机 |
-| 实验准入 | 必须有精确 code-object allowlist/jitlist 或专用 harness、当前 HIR 形态证据、exactness/layout/iterator identity 实验证据和受控协议入口 | 缺少 allowlist、wildcard jitlist 或低 `PYTHONJITAUTO` 阈值时 no-op；实验结果不能替代生产 gate |
-| 生产准入 | 必须提供五个纵切面准入 artifact verifier：HIR 结构、owner/child exactness、field layout、iterator identity、失效/deopt | 缺任一 artifact 或 verifier 过期时生产 no-op；CI/release 证据进入发布清单，不作为普通 runtime boolean |
+| 准入 | 必须满足 HIR 结构、owner/child exactness、field layout、iterator identity、失效/deopt/lifecycle 五个纵切面证明 | 缺任一证明时 no-op；`PYTHONJITTREEITERSTATEMACHINE=0` 显式关闭整个 pass |
 | 字段证明 | 使用 `FieldAccessProof` 同时描述 slot/member 和 dict-backed split-dict 字段访问 | TreeIter 使用该证明读取 `left/right/value`；后续 OO-heavy 优化可复用 exactness/layout/deopt 语义 |
 | workload 覆盖 | M1.5 以 pyperformance `generators` 为直接性能目标和 M4 成功硬 gate，同时记录 21 个 JIT 用例的非目标/rollout 回归边界 | 未满足来源、形态分布、命令、allowlist、运行次数和稳定性标准时停止在 matcher/实验研究；不得把 `generators` benchmark 名称写入 matcher 特判 |
 
-因此本文后续的状态机 CFG、HIR/LIR/codegen 描述属于 M0-M4 默认关闭实验路径。M5 生产 rollout 不与 V2 实验核心捆绑交付；只有 M4 证明 `generators` 收益和非目标回退 gate 达标后，才进入 M5 投资决策。任何生产启用必须实现 exact deopt/reify、active-path/深度语义、五个纵切面准入 artifact，并通过 9.6.6 和测试矩阵。
+因此本文后续的状态机 CFG、HIR/LIR/codegen 描述属于默认启用路径。M5 是默认启用后的生产化增强；M4 必须证明 `generators` 收益和非目标回退 gate 达标，否则默认启用策略需要回退或重新决策。
 
 ## 9.2 关键算法与流程
 
@@ -238,7 +237,7 @@ iter_reg.def == Assign(original_iterable)
 original_iterable.def == Phi(fast CheckField/LoadField arm, slow LoadAttr arm)
 ```
 
-若 trace 结果需要删除 coroutine TypeError 或 non-iterable TypeError，则返回 no match，不修改 CFG。若生产配置无法在 `gi_yieldfrom`、`send(non-None)`、`throw`、`close` 等协议敏感操作前 exact deopt/reify，也必须 no-op；首版实验配置仅允许在已声明的 `next()`/`for`/`list()` 受控范围内生成状态机。
+若 trace 结果需要删除 coroutine TypeError 或 non-iterable TypeError，则返回 no match，不修改 CFG。若默认配置无法在 `gi_yieldfrom`、`send(non-None)`、`throw`、`close` 等协议敏感操作前保持等价语义，也必须 no-op。
 
 ### 9.2.2 字段访问证明规则
 
@@ -318,19 +317,19 @@ traceSplitDictField(reg):
 
 | 层级 | 行为 |
 | ---- | ---- |
-| 实验路径 | 只允许测试/benchmark 专用配置使用 `kExperimentalFailClosed`。该动作必须在任何 current/stack/active-path 状态突变前清理 `TreeIterState`、使当前 optimized entry 失效，并抛出确定性的内部实验 bailout；它不声明 Python 语义等价，不能在生产配置或默认开启路径出现。若无法把失败点放在状态突变前，pass no-op |
-| 生产路径 | guard 失败、layout dependency 失效、descriptor/property 变化或 fallback 可观察时，必须 invalidate 或 exact deopt/reify 到原始 generator/yield-from 状态；无法 reify 时 pass no-op |
+| 诊断路径 | 只允许测试/benchmark 专用配置使用 `kExperimentalFailClosed`。该动作必须在任何 current/stack/active-path 状态突变前清理 `TreeIterState`、使当前 optimized entry 失效，并抛出确定性的内部 bailout；它不能在默认生产路径出现 |
+| 默认生产路径 | guard 失败、layout dependency 失效、descriptor/property 变化或 fallback 可观察时，必须 invalidate 或 exact deopt/reify 到原始 generator/yield-from 状态；无法 reify 时 pass no-op |
 
-实验准入和生产准入分开处理。实验准入只证明 allowlisted 目标函数在受控 `next()`/`for`/`list()` 消费下值得继续实现；生产准入面向 M5/default，必须是逐函数、可验证、fail-closed 的五个纵切面 artifact。
+默认启用的准入必须是逐函数、可验证、fail-closed 的五个纵切面证明；诊断 harness 只能作为辅助证据，不能绕过 matcher。
 
-实验准入必须包含：
+默认启用准入必须包含：
 
 | 项目 | 要求 |
 | ---- | ---- |
-| code-object allowlist | 目标 `Tree.__iter__` 必须由 TreeIter 专用精确 code-object allowlist、精确 jitlist 条目或专用 harness 触发；wildcard jitlist、低 `PYTHONJITAUTO`、普通 `compile_after_n_calls()` 不能单独放行 |
+| 触发范围 | 只由 `tree_iter_state_machine` 配置位和 matcher 准入决定；不得按 benchmark 名称或 wildcard jitlist 特判放行 |
 | HIR 形态证据 | 当前 master HIR 能识别 left/value/right 骨架、原始 child 跳过 guard、truthiness 等价性和 yield-from 链路 |
 | 类型与布局证据 | M1.5 只要求实验样例中 owner/child exactness、field layout、iterator identity 有可审查证据；不要求此时已有生产 invalidation verifier |
-| 协议边界 | 已优化实验 generator 的 `gi_yieldfrom`、`send(non-None)`、`throw`、`close`、suspended deopt 和 instrumentation attach 必须 fail closed，不能依赖“调用方不会这样用”的约定 |
+| 协议边界 | 已优化 generator 的 `gi_yieldfrom`、`send(non-None)`、`throw`、`close`、suspended deopt 和 instrumentation attach 不得静默破坏语义 |
 
 生产准入不是单个 HIR dump 结论，而是逐函数五个纵切面 artifact。每个被优化的 production function 都必须同时给出证明来源、运行时 guard 或失效/deopt 处理：
 
@@ -742,7 +741,7 @@ struct ChildGuardProof {
 };
 ```
 
-`kExperimentalFailClosed` 的默认初值只表示默认关闭实验路径的保守占位。生产 matcher 必须显式选择 `kInvalidate` 或 `kExactDeoptReify`；若无法选择，返回 `MatchRejectReason::kMissingRuntimeFailureAction` 并保持原 HIR。
+`kExperimentalFailClosed` 只属于诊断路径的保守占位。默认生产 matcher 必须显式选择 `kInvalidate` 或 `kExactDeoptReify`；若无法选择，返回 `MatchRejectReason::kMissingRuntimeFailureAction` 并保持原 HIR。
 
 ```cpp
 struct TreeIterMatch {
@@ -828,8 +827,8 @@ static_assert(sizeof(TreeIterStackEntry) == 16);
 | 项目 | 要求 |
 | ---- | ---- |
 | 非 TreeIter generator | 仅增加一个指针字段，不承担 heap stack 分配 |
-| TreeIter 实验路径 | 首次进入状态机前分配 `TreeIterState` 和初始 16 项 stack |
-| TreeIter 生产路径 | 首次进入状态机前还初始化 active-path 集合和原始递归深度预算；未闭合时生产 no-op |
+| TreeIter 状态机路径 | 首次进入状态机前分配 `TreeIterState` 和初始 16 项 stack |
+| TreeIter 增强路径 | 首次进入状态机前还初始化 active-path 集合和原始递归深度预算；未闭合时保持当前已验证的 no-op/回退语义 |
 | free-list 复用 | generator 释放或 clear 时必须释放 heap stack 并将 footer 指针清空 |
 | 生产默认 | 生产 gate 未闭合时不分配 `TreeIterState` |
 
@@ -1007,17 +1006,17 @@ HIR lowering 必须使用 `appendInstr(Instruction::kXxx)` 或带 output 的 `ap
 ```cpp
 struct HIROptimizations {
   ...
-  bool tree_iter_state_machine{false};
+  bool tree_iter_state_machine{true};
 };
 ```
 
 环境变量：
 
 ```text
-PYTHONJITTREEITERSTATEMACHINE=1
+PYTHONJITTREEITERSTATEMACHINE=0  # 显式关闭
 ```
 
-首版默认 `false`，只允许测试和 benchmark 显式开启实验路径。只有生产 gate 全部通过后，才能单独评估默认开启。
+首版默认 `true`，允许生产默认路径直接获得 `generators` 收益；测试、benchmark 和回滚场景可通过 `PYTHONJITTREEITERSTATEMACHINE=0` 显式关闭。
 
 实验配置和生产配置使用不同 gate。实验 gate 是 executable runtime/pass gate，只限制是否生成实验状态机 HIR。生产 gate 由两类输入组成：pass-time admission verifier 结果和 runtime capability bits。admission artifact 不是用户可设置的 runtime boolean，而是版本化 manifest/verifier 对当前 code object、HIR fingerprint 和五个纵切面的 fail-closed 校验结果；校验缺失、过期或 hash 不匹配时，pass 视为 false 并保持 no-op。
 
@@ -1045,23 +1044,23 @@ production_enabled =
   && cycle_depth_semantics_enabled
 ```
 
-gate 来源必须显式落到代码、配置或 CI 证据，不能只因为 `PYTHONJITTREEITERSTATEMACHINE=1` 就生成状态机 HIR：
+gate 来源必须显式落到代码、配置或 CI 证据；默认启用也不能绕过 matcher 准入：
 
 | Gate | 执行来源 |
 | ---- | -------- |
-| `tree_iter_state_machine` | `cinderx/Jit/config.h` / `pyjit.cpp` 中的独立配置位和环境变量，默认 `false` |
+| `tree_iter_state_machine` | `cinderx/Jit/config.h` / `pyjit.cpp` 中的独立配置位和环境变量，默认 `true`，可由 `PYTHONJITTREEITERSTATEMACHINE=0` 关闭 |
 | `target_arch_verified` | pass 或 config 的架构 allowlist；未在测试矩阵中验证的平台返回 no-op，并由 `test_tree_iter_state_machine_arch_gate` 覆盖 |
-| `experimental_exact_code_object_allowlisted` | TreeIter 专用精确 code-object allowlist/jitlist 或专用 harness provenance；wildcard jitlist、低 `PYTHONJITAUTO` 和普通全局 `compile_after_n_calls()` 不设置该位 |
+| `code_object_scope` | 由 matcher 精确识别目标 code object；wildcard jitlist、低 `PYTHONJITAUTO` 和普通全局 `compile_after_n_calls()` 只能触发普通 JIT，不能替代 TreeIter 准入证明 |
 | `production_admission_manifest_verified` | pass 在编译目标函数时读取版本化 admission manifest，并由 verifier 对 HIR 结构、owner/child exactness、field layout、iterator identity、失效/deopt 五个纵切面均返回 pass；pyperformance 覆盖声明还必须由 `test_tree_iter_state_machine_admission_artifact` 或等价 CI artifact 支撑。该位不可由环境变量或普通配置直接打开 |
 | `heap_tree_iter_state_enabled` | `GenDataFooter.tree_iter_state`、`EnsureTreeIterState`、`clearTreeIterState`、`visitTreeIterState` helper 均已接入并通过 lifecycle/GC/分配失败测试；未完成 M2 前 pass 不插入 |
-| `experimental_tree_iter_core_enabled` | 显式实验配置和实验 matcher 通过；不得由低 `PYTHONJITAUTO` 阈值隐式扩大覆盖面 |
+| `tree_iter_core_enabled` | 默认配置和 matcher 通过；不得由低 `PYTHONJITAUTO` 阈值隐式扩大覆盖面 |
 | `field_access_proof_enabled` | M1/M3 必须证明 slot/member 或 split-dict `FieldAccessProof` 的 lowering 和 runtime failure action 可支撑当前启用层级；未完成时 matcher no-op。若作为 runtime gate 实现，应并入 `experimental_tree_iter_core_enabled` 或生产 artifact verifier，不单独暴露给用户 |
-| `experimental_protocol_fail_closed_enabled` | 已优化实验 generator 在 `gi_yieldfrom`、`send(non-None)`、`throw`、`close`、suspended deopt 和 instrumentation attach 路径上 fail closed；未实现时实验 pass no-op |
+| `protocol_guard_enabled` | 已优化 generator 在 `gi_yieldfrom`、`send(non-None)`、`throw`、`close`、suspended deopt 和 instrumentation attach 路径上不破坏原语义；未实现时 pass no-op |
 | `generator_protocol_model_enabled` | 默认硬编码为 false；只有协议敏感操作前 exact deopt/reify 实现并通过 protocol 矩阵后才能打开 |
 | `deopt_reify_model_enabled` | 默认硬编码为 false；只有 `TreeIterState` 到解释器 generator/yield-from 栈 reify contract 实现并通过 deopt 矩阵后才能打开 |
 | `cycle_depth_semantics_enabled` | 默认硬编码为 false；只有 active-path 回边检测、shared subtree 允许再次进入、原始递归深度预算和对应 exact deopt/reify 全部通过测试后才能打开 |
 
-实验配置任一 `experimental_enabled` 条件不满足时，`TreeIterStateMachinePass` 必须 no-op，不能生成状态机 HIR。生产配置任一 `production_enabled` 条件不满足时必须 no-op；x86_64 未完成同等 correctness、protocol、deopt 和性能矩阵前，即使配置为 true 也必须禁用生产路径。
+默认配置任一准入条件不满足时，`TreeIterStateMachinePass` 必须 no-op，不能生成状态机 HIR；未完成同等 correctness、protocol、deopt 和性能矩阵的平台即使配置为 true 也必须禁用生产路径。
 
 `experimental_protocol_fail_closed_enabled` 必须对应可执行 helper，而不是文档承诺。建议实现为 `treeIterExperimentalAbort(gen, reason)`：在 `gi_yieldfrom`、`send(non-None)`、`throw`、显式 `close`、suspended deopt 和 instrumentation attach 入口检测到 active experimental TreeIterState 时，先清理 owned TreeIterState、使当前 optimized entry 失效，再抛出确定性的内部实验 bailout；finalize/tp_clear 路径不能抛异常，只执行清理和失效。该 helper 的行为只用于测试/benchmark 专用实验配置，不声明 CPython 协议等价，生产配置必须依赖 exact deopt/reify 或 no-op。
 
@@ -1229,7 +1228,7 @@ V1.4 固定协议决策为“实验限制 + 生产 exact deopt/reify”，不再
 
 | 模型 | 首版状态 | 要求 |
 | ---- | -------- | ---- |
-| 实验限制 | 采用 | 默认关闭；只声明 `next()`/`for`/`list()` 受控消费结果正确；不声明 `gi_yieldfrom`、`send(non-None)`、`throw`、`close`、StopIteration value 委派语义生产完备 |
+| 生产默认启用 | 采用 | 默认生成已准入 TreeIter 状态机；非匹配或证明缺失形态 no-op；保留环境变量关闭能力 |
 | 保留 delegated iterator 元数据 | 不采用为当前生产方案 | 只能作为后续增强讨论；当前生产方案不依赖显式栈模拟完整 delegated iterator 元数据 |
 | exact deopt/reify 后委派 | 生产采用，但非首版实验 | 必须定义 `TreeIterState` 到等价解释器 generator/yield-from 栈的 reify 格式，在协议敏感操作前调用 CPython 原路径 |
 
@@ -1372,7 +1371,7 @@ PYTHONJITTREEITERSTATEMACHINE=1
 
 ```text
 baseline: 当前 master + PYTHONJITTREEITERSTATEMACHINE=0
-target:   当前 master + PYTHONJITTREEITERSTATEMACHINE=1（实验路径）
+target:   当前 master 默认配置（或 PYTHONJITTREEITERSTATEMACHINE=1）
 case:     已通过当前 master split-dict/truthiness 实验准入和 workload 接受标准的 pyperformance generators Tree.__iter__，
           若该用例无法准入，停止在 matcher 研究，不进入 M2-M4；
           非合成、生产等价 TreeIter workload 只能记录为后续 pivot 候选，不能替代本 V2 的 M4 成功标准。
