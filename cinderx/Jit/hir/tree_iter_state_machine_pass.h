@@ -68,6 +68,7 @@ struct FieldAccessProof {
   FieldAccessKind kind{FieldAccessKind::kSlotOrMember};
   PyTypeObject* owner_type{nullptr};  // exact node type at match time
   std::string field_name;
+  int name_idx{-1};
   intptr_t value_offset{0};
   std::optional<intptr_t> valid_offset;  // split-dict inline-values valid slot
   GuardSource guard_source;

@@ -2,13 +2,18 @@
 
 #include "cinderx/Jit/hir/tree_iter_state_machine_pass.h"
 
+#include "cinderx/Common/dict.h"
 #include "cinderx/Common/log.h"
 #include "cinderx/Jit/config.h"
+#include "cinderx/Jit/hir/analysis.h"
 #include "cinderx/Jit/hir/clean_cfg.h"
+#include "cinderx/Jit/hir/cfg.h"
 #include "cinderx/Jit/hir/function.h"
 #include "cinderx/Jit/hir/pass.h"
 
 #include <Python.h>
+
+#include <unordered_map>
 
 namespace jit::hir {
 
@@ -30,6 +35,21 @@ static bool tupleContainsName(PyObject* names, const char* name) {
     }
   }
   return false;
+}
+
+static int tupleNameIndex(PyObject* names, const char* name) {
+  if (names == nullptr || !PyTuple_Check(names)) {
+    return -1;
+  }
+  Py_ssize_t n = PyTuple_GET_SIZE(names);
+  for (Py_ssize_t i = 0; i < n; i++) {
+    PyObject* item = PyTuple_GET_ITEM(names, i);
+    if (PyUnicode_CheckExact(item) &&
+        PyUnicode_CompareWithASCIIString(item, name) == 0) {
+      return static_cast<int>(i);
+    }
+  }
+  return -1;
 }
 
 static bool loadAttrFallbackMatchesField(
@@ -54,6 +74,30 @@ static bool loadAttrFallbackMatchesField(
 
   return PyUnicode_CompareWithASCIIString(
              load_attr->name(), field->name().c_str()) == 0;
+}
+
+static bool loadConstIsNone(const Register* reg) {
+  if (reg == nullptr) {
+    return false;
+  }
+  const Instr* def = reg->instr();
+  if (def == nullptr || def->opcode() != Opcode::kLoadConst) {
+    return false;
+  }
+  return static_cast<const LoadConst*>(def)->type() <= TNoneType;
+}
+
+static bool blockCanReach(const BasicBlock* start, const BasicBlock* target) {
+  if (start == nullptr || target == nullptr) {
+    return false;
+  }
+  for (BasicBlock* block :
+       CFG::GetRPOTraversal(const_cast<BasicBlock*>(start))) {
+    if (block == target) {
+      return true;
+    }
+  }
+  return false;
 }
 
 // ---------------------------------------------------------------------------
@@ -431,9 +475,10 @@ std::optional<TreeIterMatch> TreeIterStateMachinePass::matchTreeIter(
   //         Guard.  Only accepted when the exact node type has no custom
   //         __bool__ / __len__ (default truthiness).
   //
-  //    We scan the entire CFG for matching instructions.  A full dominance
-  //    check is deferred to the production gate; here we verify that the
-  //    guard code exists somewhere in the function.
+  //    We only accept a guard when the guarding branch dominates the matching
+  //    yield-from block and exactly one branch successor can reach that
+  //    yield-from.  This rejects shapes where a guard exists somewhere in the
+  //    function but does not actually skip the corresponding child traversal.
   // -----------------------------------------------------------------------
 
   // Returns true if tp has default truthiness (no custom __bool__ / __len__).
@@ -452,55 +497,108 @@ std::optional<TreeIterMatch> TreeIterStateMachinePass::matchTreeIter(
   };
 
   PyTypeObject* node_pytype = self_type.runtimePyType();
+  DominatorAnalysis doms(func);
 
   struct GuardScanResult {
     bool found{false};
     ChildGuardKind kind{ChildGuardKind::kNoneGuard};
-    Instr* guard_instr{nullptr};
+    const CondBranchBase* guard_branch{nullptr};
   };
   GuardScanResult left_result, right_result;
 
+  auto guardControlsYield =
+      [&](const CondBranchBase* branch, const YieldValue* yield) -> bool {
+    if (branch == nullptr || yield == nullptr) {
+      return false;
+    }
+    const BasicBlock* guard_block = branch->block();
+    const BasicBlock* yield_block = yield->block();
+    if (guard_block == nullptr || yield_block == nullptr) {
+      return false;
+    }
+    if (!doms.getBlocksDominatedBy(guard_block).contains(yield_block)) {
+      return false;
+    }
+    bool true_reaches = blockCanReach(branch->true_bb(), yield_block);
+    bool false_reaches = blockCanReach(branch->false_bb(), yield_block);
+    return true_reaches != false_reaches;
+  };
+
+  auto primitiveCompareUsesFieldAndNone =
+      [&](const PrimitiveCompare* compare, const LoadField* field) -> bool {
+    if (compare == nullptr) {
+      return false;
+    }
+    if (compare->op() != PrimitiveCompareOp::kEqual &&
+        compare->op() != PrimitiveCompareOp::kNotEqual) {
+      return false;
+    }
+
+    auto operand_matches_field = [&](const Register* reg) {
+      const LoadField* lf = traceYieldFromIterable(reg);
+      return lf != nullptr && isSameField(lf, field);
+    };
+
+    return (operand_matches_field(compare->left()) &&
+            loadConstIsNone(compare->right())) ||
+        (operand_matches_field(compare->right()) &&
+         loadConstIsNone(compare->left()));
+  };
+
+  auto branchGuardKindForField =
+      [&](const CondBranchBase* branch,
+          const LoadField* field) -> std::optional<ChildGuardKind> {
+    const Register* operand = branch->GetOperand(0);
+    if (operand == nullptr) {
+      return std::nullopt;
+    }
+
+    const LoadField* direct_lf = traceYieldFromIterable(operand);
+    if (direct_lf != nullptr && isSameField(direct_lf, field)) {
+      return ChildGuardKind::kDefaultTruthinessGuard;
+    }
+
+    const Instr* def = operand->instr();
+    if (def == nullptr) {
+      return std::nullopt;
+    }
+    if (def->opcode() == Opcode::kPrimitiveCompare &&
+        primitiveCompareUsesFieldAndNone(
+            static_cast<const PrimitiveCompare*>(def), field)) {
+      return ChildGuardKind::kNoneGuard;
+    }
+    if (def->opcode() == Opcode::kGuardIs) {
+      const auto* guard_is = static_cast<const GuardIs*>(def);
+      const LoadField* lf = traceYieldFromIterable(guard_is->GetOperand(0));
+      if (guard_is->target() == Py_None && lf != nullptr &&
+          isSameField(lf, field)) {
+        return ChildGuardKind::kNoneGuard;
+      }
+    }
+    return std::nullopt;
+  };
+
   for (const BasicBlock& block : func.cfg.blocks) {
     for (const Instr& instr : block) {
-      // --- None guard: PrimitiveCompare or GuardIs ---
-      if (instr.opcode() == Opcode::kPrimitiveCompare ||
-          instr.opcode() == Opcode::kGuardIs) {
-        for (std::size_t i = 0; i < instr.NumOperands(); i++) {
-          const Register* operand = instr.GetOperand(i);
-          if (operand == nullptr) {
-            continue;
-          }
-          const LoadField* lf = traceYieldFromIterable(operand);
-          if (lf != nullptr && isSameField(lf, lf_left) && !left_result.found) {
-            left_result.found = true;
-            left_result.kind = ChildGuardKind::kNoneGuard;
-            left_result.guard_instr = const_cast<Instr*>(&instr);
-          }
-          if (lf != nullptr && isSameField(lf, lf_right) &&
-              !right_result.found) {
-            right_result.found = true;
-            right_result.kind = ChildGuardKind::kNoneGuard;
-            right_result.guard_instr = const_cast<Instr*>(&instr);
-          }
-        }
+      if (instr.opcode() != Opcode::kCondBranch) {
+        continue;
       }
 
-      // --- Truthiness guard: CondBranch directly on the field value ---
-      if (instr.opcode() == Opcode::kCondBranch) {
-        const Register* operand = instr.GetOperand(0);
-        if (operand != nullptr) {
-          const LoadField* lf = traceYieldFromIterable(operand);
-          if (lf != nullptr && isSameField(lf, lf_left) && !left_result.found) {
-            left_result.found = true;
-            left_result.kind = ChildGuardKind::kDefaultTruthinessGuard;
-            left_result.guard_instr = const_cast<Instr*>(&instr);
-          }
-          if (lf != nullptr && isSameField(lf, lf_right) &&
-              !right_result.found) {
-            right_result.found = true;
-            right_result.kind = ChildGuardKind::kDefaultTruthinessGuard;
-            right_result.guard_instr = const_cast<Instr*>(&instr);
-          }
+      const auto* branch = static_cast<const CondBranchBase*>(&instr);
+      if (!left_result.found && guardControlsYield(branch, left_yf)) {
+        auto kind = branchGuardKindForField(branch, lf_left);
+        if (kind.has_value()) {
+          left_result.found = true;
+          left_result.kind = *kind;
+          left_result.guard_branch = branch;
+        }
+      }
+      if (!right_result.found && guardControlsYield(branch, right_yf)) {
+        auto kind = branchGuardKindForField(branch, lf_right);
+        if (kind.has_value()) {
+          right_result.found = true;
+          right_result.kind = *kind;
+          right_result.guard_branch = branch;
         }
       }
 
@@ -560,9 +658,22 @@ std::optional<TreeIterMatch> TreeIterStateMachinePass::matchTreeIter(
     proof.kind = FieldAccessKind::kSlotOrMember;
     proof.owner_type = node_pytype;
     proof.field_name = lf->name();
+    proof.name_idx = tupleNameIndex(func.code->co_names, lf->name().c_str());
     proof.value_offset = static_cast<intptr_t>(lf->offset());
-    // valid_offset, guard_source, layout_dependency, fallback_shape
-    // are left at defaults (production stubs).
+    if (node_pytype != nullptr &&
+        PyType_HasFeature(
+            node_pytype,
+            Py_TPFLAGS_MANAGED_DICT | Py_TPFLAGS_INLINE_VALUES)) {
+      intptr_t inline_values_start =
+          node_pytype->tp_basicsize + offsetof(PyDictValues, values);
+      if (proof.value_offset >= inline_values_start) {
+        proof.kind = FieldAccessKind::kSplitDict;
+        proof.valid_offset =
+            node_pytype->tp_basicsize + offsetof(PyDictValues, valid);
+      }
+    }
+    // guard_source, layout_dependency, and fallback_shape are left at defaults
+    // (production stubs).
     proof.runtime_failure_action = RuntimeFailureAction::kExperimentalFailClosed;
     return proof;
   };
@@ -570,7 +681,7 @@ std::optional<TreeIterMatch> TreeIterStateMachinePass::matchTreeIter(
   auto makeChildGuardProof = [](const GuardScanResult& r) -> ChildGuardProof {
     ChildGuardProof proof;
     proof.kind = r.kind;
-    proof.guard_instr = r.guard_instr;
+    proof.guard_instr = const_cast<CondBranchBase*>(r.guard_branch);
     proof.requires_default_truthiness =
         (r.kind == ChildGuardKind::kDefaultTruthinessGuard);
     return proof;
@@ -606,6 +717,90 @@ static Register* emitPhaseConst(
   block->append<LoadConst>(
       r, Type::fromCInt(static_cast<int32_t>(phase), TCInt32));
   return r;
+}
+
+static void emitStatusBranch(
+    BasicBlock* block,
+    Environment& env,
+    Register* status,
+    BasicBlock* ok_block,
+    BasicBlock* error_block) {
+  Register* zero = env.AllocateRegister();
+  block->append<LoadConst>(zero, Type::fromCInt(0, TCInt32));
+  Register* failed = env.AllocateRegister();
+  block->append<PrimitiveCompare>(
+      failed, PrimitiveCompareOp::kLessThan, status, zero);
+  block->append<CondBranch>(failed, error_block, ok_block);
+}
+
+struct FieldLoadResult {
+  BasicBlock* block{nullptr};
+  Register* value{nullptr};
+};
+
+static FieldLoadResult emitFieldLoad(
+    Function& func,
+    BasicBlock* block,
+    Environment& env,
+    const FieldAccessProof& proof,
+    Register* receiver,
+    Type result_type,
+    const FrameState& frame_state) {
+  if (proof.kind != FieldAccessKind::kSplitDict) {
+    Register* value = env.AllocateRegister();
+    block->append<LoadField>(
+        value,
+        receiver,
+        proof.field_name.c_str(),
+        proof.value_offset,
+        result_type);
+    return {block, value};
+  }
+
+  JIT_CHECK(
+      proof.valid_offset.has_value(),
+      "split-dict field proof is missing valid offset");
+  JIT_CHECK(
+      proof.name_idx >= 0, "split-dict field proof is missing name index");
+
+  Register* inline_values_valid = env.AllocateRegister();
+  block->append<LoadField>(
+      inline_values_valid,
+      receiver,
+      "inline_values.valid",
+      *proof.valid_offset,
+      TCUInt8);
+
+  BasicBlock* bb_valid = func.cfg.AllocateBlock();
+  BasicBlock* bb_invalid = func.cfg.AllocateBlock();
+  BasicBlock* bb_join = func.cfg.AllocateBlock();
+  block->append<CondBranch>(inline_values_valid, bb_valid, bb_invalid);
+
+  Register* fast_value = env.AllocateRegister();
+  bb_valid->append<LoadField>(
+      fast_value,
+      receiver,
+      proof.field_name.c_str(),
+      proof.value_offset,
+      result_type);
+  bb_valid->append<Branch>(bb_join);
+
+  Register* fallback_value = env.AllocateRegister();
+  bb_invalid->append<LoadAttr>(
+      fallback_value,
+      receiver,
+      proof.name_idx,
+      frame_state,
+      /* already_optimized= */ true);
+  bb_invalid->append<Branch>(bb_join);
+
+  Register* value = env.AllocateRegister();
+  std::unordered_map<BasicBlock*, Register*> phi_args{
+      {bb_valid, fast_value},
+      {bb_invalid, fallback_value},
+  };
+  bb_join->append<Phi>(value, phi_args);
+  return {bb_join, value};
 }
 
 static FrameState remapFrameStateRegister(
@@ -657,20 +852,26 @@ void TreeIterStateMachinePass::buildTreeIterStateMachine(
   // -----------------------------------------------------------------------
   // 2. Allocate state machine basic blocks.
   // -----------------------------------------------------------------------
+  BasicBlock* bb_init_ok         = func.cfg.AllocateBlock();
   BasicBlock* bb_loop            = func.cfg.AllocateBlock();
   BasicBlock* bb_left            = func.cfg.AllocateBlock();
   BasicBlock* bb_check_null_left = func.cfg.AllocateBlock();
   BasicBlock* bb_has_left        = func.cfg.AllocateBlock();
+  BasicBlock* bb_left_checked    = func.cfg.AllocateBlock();
+  BasicBlock* bb_left_pushed     = func.cfg.AllocateBlock();
   BasicBlock* bb_no_left         = func.cfg.AllocateBlock();
   BasicBlock* bb_yield           = func.cfg.AllocateBlock();
   BasicBlock* bb_right           = func.cfg.AllocateBlock();
   BasicBlock* bb_check_null_right= func.cfg.AllocateBlock();
   BasicBlock* bb_has_right       = func.cfg.AllocateBlock();
+  BasicBlock* bb_right_checked   = func.cfg.AllocateBlock();
+  BasicBlock* bb_right_pushed    = func.cfg.AllocateBlock();
   BasicBlock* bb_no_right        = func.cfg.AllocateBlock();
   BasicBlock* bb_backtrack       = func.cfg.AllocateBlock();
   BasicBlock* bb_pop             = func.cfg.AllocateBlock();
   BasicBlock* bb_exit            = func.cfg.AllocateBlock();
   BasicBlock* bb_done            = func.cfg.AllocateBlock();
+  BasicBlock* bb_error           = func.cfg.AllocateBlock();
 
   Environment& env = func.env;
   Register* root_node = env.AllocateRegister();
@@ -695,11 +896,13 @@ void TreeIterStateMachinePass::buildTreeIterStateMachine(
 
     Register* ensure_status = env.AllocateRegister();
     init_block->append<EnsureTreeIterState>(ensure_status, fs);
-    init_block->append<SaveCurrentNode>(root_node);
-    Register* kLeft_r = emitPhaseConst(init_block, env, TreeIterPhase::kLeft);
-    init_block->append<SavePhase>(kLeft_r);
+    emitStatusBranch(init_block, env, ensure_status, bb_init_ok, bb_error);
+
+    bb_init_ok->append<SaveCurrentNode>(root_node);
+    Register* kLeft_r = emitPhaseConst(bb_init_ok, env, TreeIterPhase::kLeft);
+    bb_init_ok->append<SavePhase>(kLeft_r);
+    bb_init_ok->append<Branch>(bb_loop);
   }
-  init_block->append<Branch>(bb_loop);
 
   // -----------------------------------------------------------------------
   // 4. bb_loop: LoadPhase, then dispatch to one of five phase blocks.
@@ -751,19 +954,20 @@ void TreeIterStateMachinePass::buildTreeIterStateMachine(
     Register* current = env.AllocateRegister();
     bb_left->append<LoadCurrentNode>(current);
 
-    Register* left_child = env.AllocateRegister();
-    bb_left->append<LoadField>(
-        left_child, current, match.left_field.field_name.c_str(),
-        match.left_field.value_offset, TOptObject);
+    FieldLoadResult left_load = emitFieldLoad(
+        func, bb_left, env, match.left_field, current, TOptObject, fs);
+    BasicBlock* bb_left_loaded = left_load.block;
+    Register* left_child = left_load.value;
 
     // Check left_child != None (None is represented as nullptr or TNoneType).
     // We use a PrimitiveCompare(kEqual, left_child, none_const) to detect None.
     Register* none_const = env.AllocateRegister();
-    bb_left->append<LoadConst>(none_const, Type::fromObject(Py_None));
+    bb_left_loaded->append<LoadConst>(none_const, Type::fromObject(Py_None));
     Register* is_none = env.AllocateRegister();
-    bb_left->append<PrimitiveCompare>(
+    bb_left_loaded->append<PrimitiveCompare>(
         is_none, PrimitiveCompareOp::kEqual, left_child, none_const);
-    bb_left->append<CondBranch>(is_none, bb_no_left, bb_check_null_left);
+    bb_left_loaded->append<CondBranch>(
+        is_none, bb_no_left, bb_check_null_left);
   }
 
   // bb_check_null_left: check for nullptr (also means no child)
@@ -775,12 +979,19 @@ void TreeIterStateMachinePass::buildTreeIterStateMachine(
     // We re-load current and left_child to check for null.
     Register* current2 = env.AllocateRegister();
     bb_check_null_left->append<LoadCurrentNode>(current2);
-    Register* left_child2 = env.AllocateRegister();
-    bb_check_null_left->append<LoadField>(
-        left_child2, current2, match.left_field.field_name.c_str(),
-        match.left_field.value_offset, TOptObject);
+    FieldLoadResult left_load = emitFieldLoad(
+        func,
+        bb_check_null_left,
+        env,
+        match.left_field,
+        current2,
+        TOptObject,
+        fs);
+    BasicBlock* bb_check_null_left_loaded = left_load.block;
+    Register* left_child2 = left_load.value;
     // If left_child is null (0), go to no_left
-    bb_check_null_left->append<CondBranch>(left_child2, bb_has_left, bb_no_left);
+    bb_check_null_left_loaded->append<CondBranch>(
+        left_child2, bb_has_left, bb_no_left);
   }
 
   // bb_no_left: set phase to kYield and loop
@@ -795,21 +1006,31 @@ void TreeIterStateMachinePass::buildTreeIterStateMachine(
     // Re-load current and left_child for the state transition.
     Register* current = env.AllocateRegister();
     bb_has_left->append<LoadCurrentNode>(current);
-    Register* left_child = env.AllocateRegister();
-    bb_has_left->append<LoadField>(
-        left_child, current, match.left_field.field_name.c_str(),
-        match.left_field.value_offset, TOptObject);
+    FieldLoadResult left_load = emitFieldLoad(
+        func, bb_has_left, env, match.left_field, current, TOptObject, fs);
+    BasicBlock* bb_has_left_loaded = left_load.block;
+    Register* left_child = left_load.value;
 
-    Register* kYield_r = emitPhaseConst(bb_has_left, env, TreeIterPhase::kYield);
+    Register* kYield_r =
+        emitPhaseConst(bb_has_left_loaded, env, TreeIterPhase::kYield);
     Register* check_status = env.AllocateRegister();
-    bb_has_left->append<CheckTreeIterChildEntry>(check_status, left_child, fs);
+    bb_has_left_loaded->append<CheckTreeIterChildEntry>(
+        check_status, left_child, fs);
+    emitStatusBranch(
+        bb_has_left_loaded, env, check_status, bb_left_checked, bb_error);
+
     Register* push_status = env.AllocateRegister();
-    bb_has_left->append<StateStackPush>(push_status, current, kYield_r, fs);
-    bb_has_left->append<TreeIterEnterChild>(left_child);
-    bb_has_left->append<SaveCurrentNode>(left_child);
-    Register* kLeft_r = emitPhaseConst(bb_has_left, env, TreeIterPhase::kLeft);
-    bb_has_left->append<SavePhase>(kLeft_r);
-    bb_has_left->append<Branch>(bb_loop);
+    bb_left_checked->append<StateStackPush>(
+        push_status, current, kYield_r, fs);
+    emitStatusBranch(
+        bb_left_checked, env, push_status, bb_left_pushed, bb_error);
+
+    bb_left_pushed->append<TreeIterEnterChild>(left_child);
+    bb_left_pushed->append<SaveCurrentNode>(left_child);
+    Register* kLeft_r =
+        emitPhaseConst(bb_left_pushed, env, TreeIterPhase::kLeft);
+    bb_left_pushed->append<SavePhase>(kLeft_r);
+    bb_left_pushed->append<Branch>(bb_loop);
   }
 
   // -----------------------------------------------------------------------
@@ -818,17 +1039,18 @@ void TreeIterStateMachinePass::buildTreeIterStateMachine(
   {
     Register* current = env.AllocateRegister();
     bb_yield->append<LoadCurrentNode>(current);
-    Register* value = env.AllocateRegister();
-    bb_yield->append<LoadField>(
-        value, current, match.value_field.field_name.c_str(),
-        match.value_field.value_offset, TObject);
+    FieldLoadResult value_load = emitFieldLoad(
+        func, bb_yield, env, match.value_field, current, TObject, fs);
+    BasicBlock* bb_yield_loaded = value_load.block;
+    Register* value = value_load.value;
 
     Register* yield_dst = env.AllocateRegister();
-    bb_yield->append<YieldValue>(yield_dst, value, fs);
+    bb_yield_loaded->append<YieldValue>(yield_dst, value, fs);
 
-    Register* kRight_r = emitPhaseConst(bb_yield, env, TreeIterPhase::kRight);
-    bb_yield->append<SavePhase>(kRight_r);
-    bb_yield->append<Branch>(bb_loop);
+    Register* kRight_r =
+        emitPhaseConst(bb_yield_loaded, env, TreeIterPhase::kRight);
+    bb_yield_loaded->append<SavePhase>(kRight_r);
+    bb_yield_loaded->append<Branch>(bb_loop);
   }
 
   // -----------------------------------------------------------------------
@@ -837,28 +1059,35 @@ void TreeIterStateMachinePass::buildTreeIterStateMachine(
   {
     Register* current = env.AllocateRegister();
     bb_right->append<LoadCurrentNode>(current);
-    Register* right_child = env.AllocateRegister();
-    bb_right->append<LoadField>(
-        right_child, current, match.right_field.field_name.c_str(),
-        match.right_field.value_offset, TOptObject);
+    FieldLoadResult right_load = emitFieldLoad(
+        func, bb_right, env, match.right_field, current, TOptObject, fs);
+    BasicBlock* bb_right_loaded = right_load.block;
+    Register* right_child = right_load.value;
 
     Register* none_const = env.AllocateRegister();
-    bb_right->append<LoadConst>(none_const, Type::fromObject(Py_None));
+    bb_right_loaded->append<LoadConst>(none_const, Type::fromObject(Py_None));
     Register* is_none = env.AllocateRegister();
-    bb_right->append<PrimitiveCompare>(
+    bb_right_loaded->append<PrimitiveCompare>(
         is_none, PrimitiveCompareOp::kEqual, right_child, none_const);
-    bb_right->append<CondBranch>(is_none, bb_no_right, bb_check_null_right);
+    bb_right_loaded->append<CondBranch>(
+        is_none, bb_no_right, bb_check_null_right);
   }
 
   // bb_check_null_right
   {
     Register* current2 = env.AllocateRegister();
     bb_check_null_right->append<LoadCurrentNode>(current2);
-    Register* right_child2 = env.AllocateRegister();
-    bb_check_null_right->append<LoadField>(
-        right_child2, current2, match.right_field.field_name.c_str(),
-        match.right_field.value_offset, TOptObject);
-    bb_check_null_right->append<CondBranch>(
+    FieldLoadResult right_load = emitFieldLoad(
+        func,
+        bb_check_null_right,
+        env,
+        match.right_field,
+        current2,
+        TOptObject,
+        fs);
+    BasicBlock* bb_check_null_right_loaded = right_load.block;
+    Register* right_child2 = right_load.value;
+    bb_check_null_right_loaded->append<CondBranch>(
         right_child2, bb_has_right, bb_no_right);
   }
 
@@ -873,21 +1102,31 @@ void TreeIterStateMachinePass::buildTreeIterStateMachine(
   {
     Register* current = env.AllocateRegister();
     bb_has_right->append<LoadCurrentNode>(current);
-    Register* right_child = env.AllocateRegister();
-    bb_has_right->append<LoadField>(
-        right_child, current, match.right_field.field_name.c_str(),
-        match.right_field.value_offset, TOptObject);
+    FieldLoadResult right_load = emitFieldLoad(
+        func, bb_has_right, env, match.right_field, current, TOptObject, fs);
+    BasicBlock* bb_has_right_loaded = right_load.block;
+    Register* right_child = right_load.value;
 
-    Register* kExit_r = emitPhaseConst(bb_has_right, env, TreeIterPhase::kExit);
+    Register* kExit_r =
+        emitPhaseConst(bb_has_right_loaded, env, TreeIterPhase::kExit);
     Register* check_status = env.AllocateRegister();
-    bb_has_right->append<CheckTreeIterChildEntry>(check_status, right_child, fs);
+    bb_has_right_loaded->append<CheckTreeIterChildEntry>(
+        check_status, right_child, fs);
+    emitStatusBranch(
+        bb_has_right_loaded, env, check_status, bb_right_checked, bb_error);
+
     Register* push_status = env.AllocateRegister();
-    bb_has_right->append<StateStackPush>(push_status, current, kExit_r, fs);
-    bb_has_right->append<TreeIterEnterChild>(right_child);
-    bb_has_right->append<SaveCurrentNode>(right_child);
-    Register* kLeft_r = emitPhaseConst(bb_has_right, env, TreeIterPhase::kLeft);
-    bb_has_right->append<SavePhase>(kLeft_r);
-    bb_has_right->append<Branch>(bb_loop);
+    bb_right_checked->append<StateStackPush>(
+        push_status, current, kExit_r, fs);
+    emitStatusBranch(
+        bb_right_checked, env, push_status, bb_right_pushed, bb_error);
+
+    bb_right_pushed->append<TreeIterEnterChild>(right_child);
+    bb_right_pushed->append<SaveCurrentNode>(right_child);
+    Register* kLeft_r =
+        emitPhaseConst(bb_right_pushed, env, TreeIterPhase::kLeft);
+    bb_right_pushed->append<SavePhase>(kLeft_r);
+    bb_right_pushed->append<Branch>(bb_loop);
   }
 
   // -----------------------------------------------------------------------
@@ -932,6 +1171,12 @@ void TreeIterStateMachinePass::buildTreeIterStateMachine(
     bb_done->append<Return>(none_r);
   }
 
+  // Error exit: helpers have already set the Python exception.
+  {
+    bb_error->append<ClearTreeIterState>();
+    bb_error->append<Raise>(fs);
+  }
+
   // -----------------------------------------------------------------------
   // 11. Clean up unreachable blocks (the original recursive body) and
   //     re-derive register types.
@@ -948,6 +1193,9 @@ void TreeIterStateMachinePass::Run(Function& func) {
   if (!getConfig().hir_opts.tree_iter_state_machine) {
     return;
   }
+#if !defined(CINDER_AARCH64)
+  return;
+#endif
 
   auto match = matchTreeIter(func);
   if (!match.has_value()) {
