@@ -56,6 +56,17 @@ def _interpreted_result(factory, *args):
         jit_unsuppress(func)
 
 
+def _assert_mixed_accumulator_was_not_promoted(func):
+    opcodes = cinderx.jit.get_function_hir_opcode_counts(func)
+    assert opcodes is not None
+    # A generic specialized float add can still leave a DoubleBinaryOp here.
+    # The promotion-specific fingerprint is the synthetic 0.0 LoadConst and
+    # extra promoted Phi that remove the accumulator GuardType.
+    assert opcodes.get("GuardType", 0) >= 2
+    assert opcodes.get("Phi", 0) == 2
+    assert opcodes.get("LoadConst", 0) == 1
+
+
 def _specialize_then_compile(func, *warmup_args, warmup_calls=None):
     if not warmup_args:
         warmup_args = (10,)
@@ -150,6 +161,7 @@ def test_mixed_accumulator_initial_argument_keeps_generic_path():
     warmup_data = [1.0]
     warmup_calls = [(warmup_data, 1), (warmup_data, 0.5)] * 10
     _specialize_then_compile(func, warmup_calls=warmup_calls)
+    _assert_mixed_accumulator_was_not_promoted(func)
 
     for data, initial in (
         ([1.0] * 1000, 1),
