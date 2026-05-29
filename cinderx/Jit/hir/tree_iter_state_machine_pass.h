@@ -89,6 +89,7 @@ struct ChildGuardProof {
 // rewritten.
 struct TreeIterMatch {
   Register* self_reg{nullptr};
+  Register* original_self_reg{nullptr};
   Instr* initial_yield{nullptr};
   FrameState* yield_frame_state{nullptr};
   Type exact_node_type{TTop};

@@ -288,32 +288,33 @@ std::optional<TreeIterMatch> TreeIterStateMachinePass::matchTreeIter(
   //    accepted field loads must then share the same exact receiver register,
   //    which is the owner proof used by the generated state machine.
   // -----------------------------------------------------------------------
-  auto isFromSelf = [&](const Register* recv) -> bool {
-    if (recv == self_reg) {
-      return true;
-    }
+  auto traceSelfArg = [&](const Register* recv) -> Register* {
     constexpr int kMaxSelfTraceDepth = 8;
     const Register* cur = recv;
     for (int depth = 0; depth < kMaxSelfTraceDepth; depth++) {
       const Instr* def = cur->instr();
       if (def == nullptr) {
-        return false;
+        return nullptr;
       }
       if (def->opcode() == Opcode::kLoadArg) {
-        return static_cast<const LoadArg*>(def)->arg_idx() == 0;
+        if (static_cast<const LoadArg*>(def)->arg_idx() == 0) {
+          return const_cast<Register*>(cur);
+        }
+        return nullptr;
       }
       if (def->opcode() == Opcode::kAssign ||
           def->opcode() == Opcode::kGuardType ||
           def->opcode() == Opcode::kRefineType) {
         cur = def->GetOperand(0);
-        if (cur == self_reg) {
-          return true;
-        }
         continue;
       }
-      return false;
+      return nullptr;
     }
-    return false;
+    return nullptr;
+  };
+
+  auto isFromSelf = [&](const Register* recv) -> bool {
+    return recv == self_reg || traceSelfArg(recv) != nullptr;
   };
 
   auto isSameReceiver = [](const LoadField* lhs, const LoadField* rhs) {
@@ -363,6 +364,13 @@ std::optional<TreeIterMatch> TreeIterStateMachinePass::matchTreeIter(
   }
 
   Register* exact_self_reg = lf_left->receiver();
+  Register* original_self_reg = traceSelfArg(exact_self_reg);
+  if (original_self_reg == nullptr) {
+    JIT_DLOG(
+        "TreeIter matcher: cannot trace exact receiver to self in {}",
+        func.fullname);
+    return std::nullopt;
+  }
   Type self_type = exact_self_reg->type();
   if (!self_type.isExact() || self_type.runtimePyType() == nullptr) {
     JIT_DLOG(
@@ -535,6 +543,12 @@ std::optional<TreeIterMatch> TreeIterStateMachinePass::matchTreeIter(
         func.fullname);
     return std::nullopt;
   }
+  if (frame_state->parent != nullptr) {
+    JIT_DLOG(
+        "TreeIter matcher: inlined FrameState is unsupported in {}",
+        func.fullname);
+    return std::nullopt;
+  }
 
   // -----------------------------------------------------------------------
   // 9. Build and return the match result.
@@ -564,6 +578,7 @@ std::optional<TreeIterMatch> TreeIterStateMachinePass::matchTreeIter(
 
   TreeIterMatch match;
   match.self_reg = exact_self_reg;
+  match.original_self_reg = original_self_reg;
   match.initial_yield = initial_yield;
   match.yield_frame_state = const_cast<FrameState*>(frame_state);
   match.exact_node_type = self_type;
@@ -593,6 +608,23 @@ static Register* emitPhaseConst(
   return r;
 }
 
+static FrameState remapFrameStateRegister(
+    const FrameState& frame_state,
+    Register* from,
+    Register* to) {
+  JIT_CHECK(
+      frame_state.parent == nullptr,
+      "TreeIter FrameState remapping does not support inlined parents");
+  FrameState remapped{frame_state};
+  remapped.visitUses([&](Register*& reg) {
+    if (reg == from) {
+      reg = to;
+    }
+    return true;
+  });
+  return remapped;
+}
+
 void TreeIterStateMachinePass::buildTreeIterStateMachine(
     Function& func,
     const TreeIterMatch& match) {
@@ -603,8 +635,16 @@ void TreeIterStateMachinePass::buildTreeIterStateMachine(
   Instr* init_yield = match.initial_yield;
   BasicBlock* init_block = init_yield->block();
   JIT_CHECK(init_block != nullptr, "InitialYield has no block");
-
-  const FrameState& fs = *match.yield_frame_state;
+  JIT_CHECK(match.original_self_reg != nullptr, "TreeIter match lost self arg");
+  const DeoptBase* init_yield_deopt = init_yield->asDeoptBase();
+  JIT_CHECK(
+      init_yield_deopt != nullptr, "InitialYield must carry a FrameState");
+  const FrameState* init_frame_state = init_yield_deopt->frameState();
+  JIT_CHECK(
+      init_frame_state != nullptr, "InitialYield must carry a FrameState");
+  JIT_CHECK(
+      init_frame_state->parent == nullptr,
+      "TreeIter InitialYield FrameState must not be inlined");
 
   // -----------------------------------------------------------------------
   // 1. Split the CFG after InitialYield so init_block ends with it.
@@ -633,6 +673,9 @@ void TreeIterStateMachinePass::buildTreeIterStateMachine(
   BasicBlock* bb_done            = func.cfg.AllocateBlock();
 
   Environment& env = func.env;
+  Register* root_node = env.AllocateRegister();
+  FrameState fs = remapFrameStateRegister(
+      *match.yield_frame_state, match.self_reg, root_node);
 
   // -----------------------------------------------------------------------
   // 3. init_block resume path setup → Branch(bb_loop).
@@ -643,9 +686,16 @@ void TreeIterStateMachinePass::buildTreeIterStateMachine(
   //    instructions following InitialYield in the resume block.
   // -----------------------------------------------------------------------
   {
+    init_block->append<Snapshot>(*init_frame_state);
+    init_block->append<GuardType>(
+        root_node,
+        match.exact_node_type,
+        match.original_self_reg,
+        *init_frame_state);
+
     Register* ensure_status = env.AllocateRegister();
     init_block->append<EnsureTreeIterState>(ensure_status, fs);
-    init_block->append<SaveCurrentNode>(match.self_reg);
+    init_block->append<SaveCurrentNode>(root_node);
     Register* kLeft_r = emitPhaseConst(init_block, env, TreeIterPhase::kLeft);
     init_block->append<SavePhase>(kLeft_r);
   }
