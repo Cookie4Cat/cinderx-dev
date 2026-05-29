@@ -50,6 +50,8 @@ void JITRT_InitFrameCellVars(
 std::pair<jit::JitGenObject*, jit::GenDataFooter*>
 JITRT_UnlinkGenFrameAndReturnGenDataFooter(PyThreadState* tstate);
 
+void JITRT_MarkGeneratorCompleted();
+
 /*
  * Helper function to decref a frame.
  *

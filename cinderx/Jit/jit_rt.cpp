@@ -744,6 +744,22 @@ JITRT_UnlinkGenFrameAndReturnGenDataFooter(PyThreadState* tstate) {
   return {gen, gen->genDataFooter()};
 }
 
+void JITRT_MarkGeneratorCompleted() {
+  PyThreadState* tstate = PyThreadState_GET();
+  _PyInterpreterFrame* frame = currentFrame(tstate);
+  if (frame->owner != FRAME_OWNED_BY_GENERATOR) {
+    return;
+  }
+  PyGenObject* gen = _PyGen_GetGeneratorFromFrame(frame);
+  if (gen->gi_frame_state == FRAME_EXECUTING) {
+#if PY_VERSION_HEX >= 0x030F0000
+    gen->gi_frame_state = FRAME_CLEARED;
+#else
+    gen->gi_frame_state = FRAME_COMPLETED;
+#endif
+  }
+}
+
 void JITRT_DecrefFrame(PyFrameObject* frame) {
   if (Py_REFCNT(frame) > 1) {
     // If the frame escaped it needs to be tracked

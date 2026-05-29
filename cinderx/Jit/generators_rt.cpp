@@ -234,6 +234,16 @@ PySendResult jitgen_am_send(PyObject* obj, PyObject* arg, PyObject** presult) {
     return Py_TYPE(obj)->tp_as_async->am_send(obj, arg, presult);
   }
 
+  // A finalizer can re-enter a generator while its return-path refcount
+  // cleanup is still running.  At that point the generator is already
+  // logically complete, but deopting it would race the cleanup that is
+  // releasing JIT-owned live values.
+  if (FRAME_STATE_FINISHED(gen->gi_frame_state) &&
+      Py_TYPE(obj) == cinderx::getModuleState()->gen_type) {
+    *presult = Py_NewRef(Py_None);
+    return PYGEN_RETURN;
+  }
+
   // Check for user programming errors.
   if (gen->gi_frame_state >= FRAME_EXECUTING ||
       (gen->gi_frame_state == FRAME_CREATED && arg && !Py_IsNone(arg))) {
