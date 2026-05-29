@@ -37,6 +37,7 @@
 #endif
 
 #include <cmath>
+#include <limits>
 
 // This is mostly taken from ceval.c _PyEval_EvalCodeWithName
 // We use the same logic to turn **args, nargsf, and kwnames into
@@ -2218,6 +2219,7 @@ int JITRT_EnsureTreeIterState(jit::GenDataFooter* footer) {
     PyErr_NoMemory();
     return -1;
   }
+  state->tree_iter_depth_budget = Py_GetRecursionLimit();
   footer->tree_iter_state = state;
   return 0;
 }
@@ -2265,6 +2267,11 @@ int JITRT_StateStackPush(
   JIT_DCHECK(state != nullptr, "tree_iter_state must be allocated");
   int32_t top = state->tree_iter_stack_top;
   if (top >= state->tree_iter_stack_capacity) {
+    if (state->tree_iter_stack_capacity >
+        std::numeric_limits<int32_t>::max() / 2) {
+      PyErr_NoMemory();
+      return -1;
+    }
     int32_t new_cap = state->tree_iter_stack_capacity * 2;
     auto* new_stack = static_cast<jit::TreeIterStackEntry*>(
         std::realloc(
@@ -2316,20 +2323,65 @@ int32_t JITRT_LoadStackTop(jit::GenDataFooter* footer) {
   return state->tree_iter_stack_top;
 }
 
-void JITRT_CheckTreeIterChildEntry(
-    jit::GenDataFooter* /* footer */,
-    PyObject* /* child */) {
-  // Experimental first version: active-path/depth checks not yet implemented.
+int JITRT_CheckTreeIterChildEntry(
+    jit::GenDataFooter* footer,
+    PyObject* child) {
+  jit::TreeIterState* state = footer->tree_iter_state;
+  if (state == nullptr) {
+    PyErr_SetString(PyExc_SystemError, "TreeIter state is not allocated");
+    return -1;
+  }
+  if (child == nullptr || child == Py_None) {
+    return 0;
+  }
+  PyObject* current = state->tree_iter_current_node;
+  if (current == nullptr || !Py_IS_TYPE(child, Py_TYPE(current))) {
+    PyErr_SetString(
+        PyExc_TypeError,
+        "TreeIter child type does not match the current node type");
+    return -1;
+  }
+
+  int32_t next_depth = state->tree_iter_stack_top + 1;
+  if (state->tree_iter_depth_budget > 0 &&
+      next_depth >= state->tree_iter_depth_budget) {
+    PyErr_SetString(
+        PyExc_RecursionError,
+        "maximum recursion depth exceeded while traversing tree iterator");
+    return -1;
+  }
+
+  if (child == current) {
+    PyErr_SetString(
+        PyExc_RecursionError,
+        "cycle detected while traversing tree iterator");
+    return -1;
+  }
+  for (int32_t i = 0; i < state->tree_iter_stack_top; i++) {
+    if (child == state->tree_iter_stack[i].node) {
+      PyErr_SetString(
+          PyExc_RecursionError,
+          "cycle detected while traversing tree iterator");
+      return -1;
+    }
+  }
+  return 0;
 }
 
 void JITRT_TreeIterEnterChild(
-    jit::GenDataFooter* /* footer */,
+    jit::GenDataFooter* footer,
     PyObject* /* child */) {
-  // Experimental first version: active-path tracking not yet implemented.
+  jit::TreeIterState* state = footer->tree_iter_state;
+  if (state != nullptr) {
+    state->tree_iter_depth++;
+  }
 }
 
-void JITRT_TreeIterLeaveCurrentNode(jit::GenDataFooter* /* footer */) {
-  // Experimental first version: active-path tracking not yet implemented.
+void JITRT_TreeIterLeaveCurrentNode(jit::GenDataFooter* footer) {
+  jit::TreeIterState* state = footer->tree_iter_state;
+  if (state != nullptr && state->tree_iter_depth > 0) {
+    state->tree_iter_depth--;
+  }
 }
 
 void JITRT_ClearTreeIterState(jit::GenDataFooter* footer) {

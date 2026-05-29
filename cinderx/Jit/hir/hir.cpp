@@ -441,6 +441,7 @@ bool Instr::isReplayable() const {
     case Opcode::kCondBranchIterNotDone:
     case Opcode::kConvertValue:
     case Opcode::kCopyDictWithoutKeys:
+    case Opcode::kCheckTreeIterChildEntry:
     case Opcode::kDecref:
     case Opcode::kDeleteAttr:
     case Opcode::kDeleteSubscr:
@@ -451,6 +452,7 @@ bool Instr::isReplayable() const {
     case Opcode::kDictUpdate:
     case Opcode::kEagerImportName:
     case Opcode::kEndInlinedFunction:
+    case Opcode::kEnsureTreeIterState:
     case Opcode::kFillTypeAttrCache:
     case Opcode::kFillTypeMethodCache:
     case Opcode::kFloatBinaryOp:
@@ -475,13 +477,17 @@ bool Instr::isReplayable() const {
     case Opcode::kLoadAttrCached:
     case Opcode::kLoadAttrSpecial:
     case Opcode::kLoadAttrSuper:
+    case Opcode::kLoadCurrentNode:
     case Opcode::kLoadGlobal:
     case Opcode::kLoadMethod:
     case Opcode::kLoadMethodCached:
     case Opcode::kLoadModuleAttrCached:
     case Opcode::kLoadModuleMethodCached:
     case Opcode::kLoadMethodSuper:
+    case Opcode::kLoadPhase:
+    case Opcode::kLoadPoppedPhase:
     case Opcode::kLoadSpecial:
+    case Opcode::kLoadStackTop:
     case Opcode::kLongBinaryOp:
     case Opcode::kLongInPlaceOp:
     case Opcode::kMakeCell:
@@ -500,6 +506,8 @@ bool Instr::isReplayable() const {
     case Opcode::kRaiseAwaitableError:
     case Opcode::kReturn:
     case Opcode::kRunPeriodicTasks:
+    case Opcode::kSaveCurrentNode:
+    case Opcode::kSavePhase:
     case Opcode::kSend:
     case Opcode::kSetCellItem:
     case Opcode::kSwapCellItem:
@@ -510,10 +518,15 @@ bool Instr::isReplayable() const {
     case Opcode::kSetFunctionAttr:
     case Opcode::kStoreField:
     case Opcode::kSnapshot:
+    case Opcode::kStateStackPop:
+    case Opcode::kStateStackPush:
     case Opcode::kStoreArrayItem:
     case Opcode::kStoreAttr:
     case Opcode::kStoreAttrCached:
     case Opcode::kStoreSubscr:
+    case Opcode::kClearTreeIterState:
+    case Opcode::kTreeIterEnterChild:
+    case Opcode::kTreeIterLeaveCurrentNode:
     case Opcode::kTpAlloc:
     case Opcode::kUnaryOp:
     case Opcode::kUnicodeRepeat:
@@ -704,6 +717,7 @@ bool isPassthrough(const Instr& instr) {
     case Opcode::kCallMethod:
     case Opcode::kCallStatic:
     case Opcode::kCallStaticRetVoid:
+    case Opcode::kCheckTreeIterChildEntry:
     case Opcode::kCheckSequenceBounds:
     case Opcode::kCIntToCBool:
     case Opcode::kCompactLongUnbox:
@@ -728,6 +742,7 @@ bool isPassthrough(const Instr& instr) {
     case Opcode::kGetLength:
     case Opcode::kGetSecondOutput:
     case Opcode::kGetTuple:
+    case Opcode::kEnsureTreeIterState:
     case Opcode::kImportFrom:
     case Opcode::kImportName:
     case Opcode::kInPlaceOp:
@@ -752,6 +767,7 @@ bool isPassthrough(const Instr& instr) {
     case Opcode::kLoadCellItem:
     case Opcode::kLoadConst:
     case Opcode::kLoadCurrentFunc:
+    case Opcode::kLoadCurrentNode:
     case Opcode::kLoadFrame:
     case Opcode::kLoadEvalBreaker:
     case Opcode::kLoadField:
@@ -765,7 +781,10 @@ bool isPassthrough(const Instr& instr) {
     case Opcode::kLoadSpecial:
     case Opcode::kLoadModuleAttrCached:
     case Opcode::kLoadModuleMethodCached:
+    case Opcode::kLoadPhase:
+    case Opcode::kLoadPoppedPhase:
     case Opcode::kLoadSplitDictItem:
+    case Opcode::kLoadStackTop:
     case Opcode::kLoadTupleItem:
     case Opcode::kLoadTypeAttrCacheEntryType:
     case Opcode::kLoadTypeAttrCacheEntryValue:
@@ -800,6 +819,8 @@ bool isPassthrough(const Instr& instr) {
     case Opcode::kSetSetItem:
     case Opcode::kSetUpdate:
     case Opcode::kStealCellItem:
+    case Opcode::kStateStackPop:
+    case Opcode::kStateStackPush:
     case Opcode::kSwapCellItem:
     case Opcode::kStoreArrayItem:
     case Opcode::kStoreAttr:
@@ -841,13 +862,18 @@ bool isPassthrough(const Instr& instr) {
     case Opcode::kRaiseAwaitableError:
     case Opcode::kRaiseStatic:
     case Opcode::kReturn:
+    case Opcode::kSaveCurrentNode:
+    case Opcode::kSavePhase:
     case Opcode::kSetCellItem:
     case Opcode::kSetFunctionAttr:
     case Opcode::kSnapshot:
     case Opcode::kStoreField:
+    case Opcode::kTreeIterEnterChild:
+    case Opcode::kTreeIterLeaveCurrentNode:
     case Opcode::kUpdatePrevInstr:
     case Opcode::kUnreachable:
     case Opcode::kWaitHandleRelease:
+    case Opcode::kClearTreeIterState:
     case Opcode::kXDecref:
     case Opcode::kXIncref:
       JIT_ABORT("Opcode {} has no output", instr.opname());

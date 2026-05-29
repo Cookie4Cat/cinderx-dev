@@ -48,6 +48,27 @@ bool shouldReplaceOperand(const OperandBase& operand) {
   return operand.isVreg() || operand.isLinked();
 }
 
+bool isTreeIterHelperCall(Instruction::Opcode opcode) {
+  switch (opcode) {
+    case Instruction::kEnsureTreeIterState:
+    case Instruction::kSaveCurrentNode:
+    case Instruction::kLoadCurrentNode:
+    case Instruction::kSavePhase:
+    case Instruction::kLoadPhase:
+    case Instruction::kStateStackPush:
+    case Instruction::kStateStackPop:
+    case Instruction::kLoadPoppedPhase:
+    case Instruction::kLoadStackTop:
+    case Instruction::kCheckTreeIterChildEntry:
+    case Instruction::kTreeIterEnterChild:
+    case Instruction::kTreeIterLeaveCurrentNode:
+    case Instruction::kClearTreeIterState:
+      return true;
+    default:
+      return false;
+  }
+}
+
 } // namespace
 
 RegallocBlockState::RegallocBlockState(
@@ -493,7 +514,8 @@ void LinearScanAllocator::calculateLiveIntervals() {
 
       if (instr_opcode == Instruction::kCall ||
           instr_opcode == Instruction::kVarArgCall ||
-          instr_opcode == Instruction::kVectorCall) {
+          instr_opcode == Instruction::kVectorCall ||
+          isTreeIterHelperCall(instr_opcode)) {
         reserveCallerSaveRegisters(instr_id);
       }
       // kLoadThreadState needs caller-save reservation when the TLS
@@ -1179,6 +1201,7 @@ void LinearScanAllocator::rewriteInstrOutput(
   if (instr->opcode() == Instruction::kCall ||
       instr->opcode() == Instruction::kVarArgCall ||
       instr->opcode() == Instruction::kVectorCall ||
+      isTreeIterHelperCall(instr->opcode()) ||
       instr->opcode() == Instruction::kLoadThreadState) {
     output->setNone();
   } else {

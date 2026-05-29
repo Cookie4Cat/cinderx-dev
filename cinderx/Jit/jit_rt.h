@@ -602,18 +602,16 @@ int32_t JITRT_LoadPoppedPhase(jit::GenDataFooter* footer);
 // Read footer->tree_iter_state->stack_top.
 int32_t JITRT_LoadStackTop(jit::GenDataFooter* footer);
 
-// Production: check child is not in active-path and depth is within budget.
-// Experimental first version: always succeeds (no-op).
-void JITRT_CheckTreeIterChildEntry(
+// Check child exactness, active-path, and depth budget before entering child.
+// Returns 0 on success; sets an exception and returns -1 on failure.
+int JITRT_CheckTreeIterChildEntry(
     jit::GenDataFooter* footer,
     PyObject* child);
 
-// Production: add child to active-path and increment depth.
-// Experimental first version: no-op.
+// Record child entry depth.
 void JITRT_TreeIterEnterChild(jit::GenDataFooter* footer, PyObject* child);
 
-// Production: remove current node from active-path and decrement depth.
-// Experimental first version: no-op.
+// Record current-node exit depth.
 void JITRT_TreeIterLeaveCurrentNode(jit::GenDataFooter* footer);
 
 // Release all owned refs in tree_iter_state and set footer->tree_iter_state

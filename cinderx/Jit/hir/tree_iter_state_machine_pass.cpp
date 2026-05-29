@@ -10,6 +10,8 @@
 
 #include <Python.h>
 
+#include <unordered_map>
+
 namespace jit::hir {
 
 // ---------------------------------------------------------------------------
@@ -42,7 +44,7 @@ const LoadField* TreeIterStateMachinePass::traceYieldFromIterable(
     return nullptr;
   }
 
-  // Walk through Assign and trivial Phi nodes to reach the original producer.
+  // Walk through transparent wrappers to reach the original field producer.
   // Limit iterations to avoid infinite loops on ill-formed HIR.
   constexpr int kMaxDepth = 16;
   const Register* cur = iter_reg;
@@ -54,6 +56,13 @@ const LoadField* TreeIterStateMachinePass::traceYieldFromIterable(
     switch (def->opcode()) {
       case Opcode::kLoadField:
         return static_cast<const LoadField*>(def);
+
+      case Opcode::kCheckField:
+        // Slot/member-descriptor field loads are commonly guarded by
+        // CheckField to preserve AttributeError semantics for unset slots.
+        // The field identity and offset are still carried by the operand.
+        cur = def->GetOperand(0);
+        break;
 
       case Opcode::kAssign:
         // Assign is transparent: continue tracing through the source operand.
@@ -109,6 +118,16 @@ std::optional<TreeIterMatch> TreeIterStateMachinePass::matchTreeIter(
   if (!func.code) {
     return std::nullopt;
   }
+  if (func.code->co_argcount != 1 || func.code->co_kwonlyargcount != 0 ||
+      (func.code->co_flags & (CO_VARARGS | CO_VARKEYWORDS)) ||
+      !PyUnicode_CheckExact(func.code->co_name) ||
+      PyUnicode_CompareWithASCIIString(func.code->co_name, "__iter__") != 0) {
+    JIT_DLOG(
+        "TreeIter matcher: code object is not an exact __iter__(self): {}",
+        func.fullname);
+    return std::nullopt;
+  }
+
   PyObject* co_names = func.code->co_names;
   if (!tupleContainsName(co_names, "left") ||
       !tupleContainsName(co_names, "right") ||
@@ -127,9 +146,12 @@ std::optional<TreeIterMatch> TreeIterStateMachinePass::matchTreeIter(
   const YieldValue* plain_yv = nullptr;
   const YieldValue* yf_first = nullptr;
   const YieldValue* yf_second = nullptr;
+  std::unordered_map<const Instr*, std::size_t> instr_order;
+  std::size_t next_instr_order = 0;
 
   for (const BasicBlock& block : func.cfg.blocks) {
     for (const Instr& instr : block) {
+      instr_order.emplace(&instr, next_instr_order++);
       switch (instr.opcode()) {
         case Opcode::kInitialYield:
           if (initial_yield != nullptr) {
@@ -223,37 +245,48 @@ std::optional<TreeIterMatch> TreeIterStateMachinePass::matchTreeIter(
   }
 
   // -----------------------------------------------------------------------
-  // 5. Identify left vs. right by field name, verify receiver is self.
+  // 5. Identify left vs. right by field name and exact self receiver.
   //
-  //    The receiver of each LoadField must be self_reg (or a register that
-  //    traces back to it through Assign).  We do a simple one-hop check:
-  //    after SSAify, self_reg may have been renamed but the LoadArg(0) output
-  //    is what we collected.  Allow the receiver to be any register whose
-  //    def is LoadArg(0) with arg_idx 0.
+  //    The receiver of each LoadField must trace back to LoadArg(0) through
+  //    transparent HIR wrappers such as Assign/GuardType/RefineType.  The
+  //    accepted field loads must then share the same exact receiver register,
+  //    which is the owner proof used by the generated state machine.
   // -----------------------------------------------------------------------
   auto isFromSelf = [&](const Register* recv) -> bool {
     if (recv == self_reg) {
       return true;
     }
-    const Instr* def = recv->instr();
-    if (def == nullptr) {
+    constexpr int kMaxSelfTraceDepth = 8;
+    const Register* cur = recv;
+    for (int depth = 0; depth < kMaxSelfTraceDepth; depth++) {
+      const Instr* def = cur->instr();
+      if (def == nullptr) {
+        return false;
+      }
+      if (def->opcode() == Opcode::kLoadArg) {
+        return static_cast<const LoadArg*>(def)->arg_idx() == 0;
+      }
+      if (def->opcode() == Opcode::kAssign ||
+          def->opcode() == Opcode::kGuardType ||
+          def->opcode() == Opcode::kRefineType) {
+        cur = def->GetOperand(0);
+        if (cur == self_reg) {
+          return true;
+        }
+        continue;
+      }
       return false;
     }
-    if (def->opcode() == Opcode::kAssign) {
-      const Register* src = def->GetOperand(0);
-      if (src == self_reg) {
-        return true;
-      }
-      // One more hop for double-assign (unlikely but safe).
-      const Instr* src_def = src->instr();
-      if (src_def && src_def->opcode() == Opcode::kLoadArg) {
-        return static_cast<const LoadArg*>(src_def)->arg_idx() == 0;
-      }
-    }
-    if (def->opcode() == Opcode::kLoadArg) {
-      return static_cast<const LoadArg*>(def)->arg_idx() == 0;
-    }
     return false;
+  };
+
+  auto isSameReceiver = [](const LoadField* lhs, const LoadField* rhs) {
+    return lhs->receiver() == rhs->receiver();
+  };
+
+  auto isSameField = [&](const LoadField* lhs, const LoadField* rhs) {
+    return lhs->name() == rhs->name() && lhs->offset() == rhs->offset() &&
+        isSameReceiver(lhs, rhs);
   };
 
   if (!isFromSelf(lf_first->receiver()) ||
@@ -287,6 +320,34 @@ std::optional<TreeIterMatch> TreeIterStateMachinePass::matchTreeIter(
     return std::nullopt;
   }
 
+  if (!isSameReceiver(lf_left, lf_right)) {
+    JIT_DLOG(
+        "TreeIter matcher: left/right receivers differ in {}", func.fullname);
+    return std::nullopt;
+  }
+
+  Register* exact_self_reg = lf_left->receiver();
+  Type self_type = exact_self_reg->type();
+  if (!self_type.isExact() || self_type.runtimePyType() == nullptr) {
+    JIT_DLOG(
+        "TreeIter matcher: self type is not exact in {}", func.fullname);
+    return std::nullopt;
+  }
+
+  auto orderOf = [&](const Instr* instr) -> std::size_t {
+    auto it = instr_order.find(instr);
+    JIT_CHECK(it != instr_order.end(), "TreeIter matcher lost instruction");
+    return it->second;
+  };
+
+  if (!(orderOf(left_yf) < orderOf(plain_yv) &&
+        orderOf(plain_yv) < orderOf(right_yf))) {
+    JIT_DLOG(
+        "TreeIter matcher: yields are not ordered left/value/right in {}",
+        func.fullname);
+    return std::nullopt;
+  }
+
   // -----------------------------------------------------------------------
   // 6. Verify the plain YieldValue comes from LoadField(self, "value").
   // -----------------------------------------------------------------------
@@ -294,18 +355,22 @@ std::optional<TreeIterMatch> TreeIterStateMachinePass::matchTreeIter(
   if (value_reg == nullptr) {
     return std::nullopt;
   }
-  const Instr* value_def = value_reg->instr();
-  if (value_def == nullptr || value_def->opcode() != Opcode::kLoadField) {
+  const LoadField* lf_value = traceYieldFromIterable(value_reg);
+  if (lf_value == nullptr) {
     JIT_DLOG(
         "TreeIter matcher: plain yield value is not from LoadField in {}",
         func.fullname);
     return std::nullopt;
   }
-  const auto* lf_value = static_cast<const LoadField*>(value_def);
   if (lf_value->name() != "value" || !isFromSelf(lf_value->receiver())) {
     JIT_DLOG(
         "TreeIter matcher: plain yield value LoadField not self.value in {}",
         func.fullname);
+    return std::nullopt;
+  }
+  if (!isSameReceiver(lf_left, lf_value)) {
+    JIT_DLOG(
+        "TreeIter matcher: value receiver differs in {}", func.fullname);
     return std::nullopt;
   }
 
@@ -318,7 +383,7 @@ std::optional<TreeIterMatch> TreeIterStateMachinePass::matchTreeIter(
   //    yield-from.  A GuardIs(field_val, Py_None) is the post-Simplify form.
   //
   //    We scan for any PrimitiveCompare or GuardIs instruction that has at
-  //    least one operand whose producer-chain ends at lf_left / lf_right.
+  //    least one operand whose producer-chain ends at the same field identity.
   //    A full dominance check is deferred to M3; here we just verify that
   //    the guard code exists somewhere in the function.
   // -----------------------------------------------------------------------
@@ -337,10 +402,10 @@ std::optional<TreeIterMatch> TreeIterStateMachinePass::matchTreeIter(
           continue;
         }
         const LoadField* lf = traceYieldFromIterable(operand);
-        if (lf == lf_left) {
+        if (lf != nullptr && isSameField(lf, lf_left)) {
           left_guard_found = true;
         }
-        if (lf == lf_right) {
+        if (lf != nullptr && isSameField(lf, lf_right)) {
           right_guard_found = true;
         }
       }
@@ -374,16 +439,16 @@ std::optional<TreeIterMatch> TreeIterStateMachinePass::matchTreeIter(
   // 9. Build and return the match result.
   // -----------------------------------------------------------------------
   TreeIterMatch match;
-  match.self_reg = self_reg;
+  match.self_reg = exact_self_reg;
   match.initial_yield = initial_yield;
   match.yield_frame_state = const_cast<FrameState*>(frame_state);
+  match.exact_node_type = self_type;
   match.left_offset = lf_left->offset();
   match.right_offset = lf_right->offset();
   match.value_offset = lf_value->offset();
   match.left_yield_from = left_yf;
   match.value_yield = plain_yv;
   match.right_yield_from = right_yf;
-  // exact_node_type and guards left at defaults; M3 refines them.
   return match;
 }
 
@@ -416,39 +481,7 @@ void TreeIterStateMachinePass::buildTreeIterStateMachine(
   const FrameState& fs = *match.yield_frame_state;
 
   // -----------------------------------------------------------------------
-  // 1. Insert setup instructions before InitialYield.
-  //    Use iterator-based insert so the constants are defined BEFORE use.
-  // -----------------------------------------------------------------------
-  auto it = init_yield->iterator();
-
-  auto insert_before = [&](Instr* instr) {
-    init_block->insert(instr, it);
-  };
-
-  // EnsureTreeIterState (may raise MemoryError)
-  {
-    auto* ensure = EnsureTreeIterState::create(fs);
-    insert_before(ensure);
-  }
-
-  // SaveCurrentNode(self)
-  {
-    auto* save_node = SaveCurrentNode::create(match.self_reg);
-    insert_before(save_node);
-  }
-
-  // LoadConst(kLeft) then SavePhase(kLeft)
-  {
-    Register* kLeft_r = func.env.AllocateRegister();
-    auto* lc = LoadConst::create(
-        kLeft_r, Type::fromCInt(static_cast<int32_t>(TreeIterPhase::kLeft), TCInt32));
-    insert_before(lc);
-    auto* sp = SavePhase::create(kLeft_r);
-    insert_before(sp);
-  }
-
-  // -----------------------------------------------------------------------
-  // 2. Split the CFG after InitialYield so init_block ends with it.
+  // 1. Split the CFG after InitialYield so init_block ends with it.
   //    The tail is the original continuation of the init block.  We do not
   //    use the tail in the state machine; it will become unreachable and
   //    removed by CleanCFG.
@@ -456,7 +489,7 @@ void TreeIterStateMachinePass::buildTreeIterStateMachine(
   /* tail = */ func.cfg.splitAfter(*init_yield);
 
   // -----------------------------------------------------------------------
-  // 3. Allocate state machine basic blocks.
+  // 2. Allocate state machine basic blocks.
   // -----------------------------------------------------------------------
   BasicBlock* bb_loop            = func.cfg.AllocateBlock();
   BasicBlock* bb_left            = func.cfg.AllocateBlock();
@@ -476,12 +509,24 @@ void TreeIterStateMachinePass::buildTreeIterStateMachine(
   Environment& env = func.env;
 
   // -----------------------------------------------------------------------
-  // 4. init_block → Branch(bb_loop)
+  // 3. init_block resume path setup → Branch(bb_loop).
+  //
+  //    TreeIter helpers take GenDataFooter* as their first argument.  The JIT
+  //    frame pointer is not switched to the footer until InitialYield runs, so
+  //    setup must be emitted after InitialYield.  LIR generation places HIR
+  //    instructions following InitialYield in the resume block.
   // -----------------------------------------------------------------------
+  {
+    Register* ensure_status = env.AllocateRegister();
+    init_block->append<EnsureTreeIterState>(ensure_status, fs);
+    init_block->append<SaveCurrentNode>(match.self_reg);
+    Register* kLeft_r = emitPhaseConst(init_block, env, TreeIterPhase::kLeft);
+    init_block->append<SavePhase>(kLeft_r);
+  }
   init_block->append<Branch>(bb_loop);
 
   // -----------------------------------------------------------------------
-  // 5. bb_loop: LoadPhase, then dispatch to one of five phase blocks.
+  // 4. bb_loop: LoadPhase, then dispatch to one of five phase blocks.
   //    We chain CondBranch comparisons: kLeft → bb_left, kYield → bb_yield,
   //    kRight → bb_right, kExit → bb_exit, default → bb_backtrack.
   // -----------------------------------------------------------------------
@@ -524,7 +569,7 @@ void TreeIterStateMachinePass::buildTreeIterStateMachine(
   }
 
   // -----------------------------------------------------------------------
-  // 6. bb_left (LEFT phase): load left child, branch on None.
+  // 5. bb_left (LEFT phase): load left child, branch on None.
   // -----------------------------------------------------------------------
   {
     Register* current = env.AllocateRegister();
@@ -569,7 +614,7 @@ void TreeIterStateMachinePass::buildTreeIterStateMachine(
 
   // bb_has_left: push (current, kYield) and enter left child
   {
-    // Re-load current and left_child (experimental: no CheckTreeIterChildEntry)
+    // Re-load current and left_child for the state transition.
     Register* current = env.AllocateRegister();
     bb_has_left->append<LoadCurrentNode>(current);
     Register* left_child = env.AllocateRegister();
@@ -577,7 +622,10 @@ void TreeIterStateMachinePass::buildTreeIterStateMachine(
         left_child, current, "left", match.left_offset, TOptObject);
 
     Register* kYield_r = emitPhaseConst(bb_has_left, env, TreeIterPhase::kYield);
-    bb_has_left->append<StateStackPush>(current, kYield_r, fs);
+    Register* check_status = env.AllocateRegister();
+    bb_has_left->append<CheckTreeIterChildEntry>(check_status, left_child, fs);
+    Register* push_status = env.AllocateRegister();
+    bb_has_left->append<StateStackPush>(push_status, current, kYield_r, fs);
     bb_has_left->append<TreeIterEnterChild>(left_child);
     bb_has_left->append<SaveCurrentNode>(left_child);
     Register* kLeft_r = emitPhaseConst(bb_has_left, env, TreeIterPhase::kLeft);
@@ -586,7 +634,7 @@ void TreeIterStateMachinePass::buildTreeIterStateMachine(
   }
 
   // -----------------------------------------------------------------------
-  // 7. bb_yield (YIELD phase): load value, yield, set phase to kRight.
+  // 6. bb_yield (YIELD phase): load value, yield, set phase to kRight.
   // -----------------------------------------------------------------------
   {
     Register* current = env.AllocateRegister();
@@ -604,7 +652,7 @@ void TreeIterStateMachinePass::buildTreeIterStateMachine(
   }
 
   // -----------------------------------------------------------------------
-  // 8. bb_right (RIGHT phase): load right child, branch on None.
+  // 7. bb_right (RIGHT phase): load right child, branch on None.
   // -----------------------------------------------------------------------
   {
     Register* current = env.AllocateRegister();
@@ -648,7 +696,10 @@ void TreeIterStateMachinePass::buildTreeIterStateMachine(
         right_child, current, "right", match.right_offset, TOptObject);
 
     Register* kExit_r = emitPhaseConst(bb_has_right, env, TreeIterPhase::kExit);
-    bb_has_right->append<StateStackPush>(current, kExit_r, fs);
+    Register* check_status = env.AllocateRegister();
+    bb_has_right->append<CheckTreeIterChildEntry>(check_status, right_child, fs);
+    Register* push_status = env.AllocateRegister();
+    bb_has_right->append<StateStackPush>(push_status, current, kExit_r, fs);
     bb_has_right->append<TreeIterEnterChild>(right_child);
     bb_has_right->append<SaveCurrentNode>(right_child);
     Register* kLeft_r = emitPhaseConst(bb_has_right, env, TreeIterPhase::kLeft);
@@ -657,7 +708,7 @@ void TreeIterStateMachinePass::buildTreeIterStateMachine(
   }
 
   // -----------------------------------------------------------------------
-  // 9. bb_backtrack (BACKTRACK phase): empty stack → done, else pop.
+  // 8. bb_backtrack (BACKTRACK phase): empty stack → done, else pop.
   // -----------------------------------------------------------------------
   {
     Register* stack_top = env.AllocateRegister();
@@ -678,7 +729,7 @@ void TreeIterStateMachinePass::buildTreeIterStateMachine(
   }
 
   // -----------------------------------------------------------------------
-  // 10. bb_exit (EXIT phase): leave current node, phase=kBacktrack, loop.
+  // 9. bb_exit (EXIT phase): leave current node, phase=kBacktrack, loop.
   // -----------------------------------------------------------------------
   {
     bb_exit->append<TreeIterLeaveCurrentNode>();
@@ -688,7 +739,7 @@ void TreeIterStateMachinePass::buildTreeIterStateMachine(
   }
 
   // -----------------------------------------------------------------------
-  // 11. bb_done: clear state, return None.
+  // 10. bb_done: clear state, return None.
   // -----------------------------------------------------------------------
   {
     bb_done->append<TreeIterLeaveCurrentNode>();
@@ -699,7 +750,7 @@ void TreeIterStateMachinePass::buildTreeIterStateMachine(
   }
 
   // -----------------------------------------------------------------------
-  // 12. Clean up unreachable blocks (the original recursive body) and
+  // 11. Clean up unreachable blocks (the original recursive body) and
   //     re-derive register types.
   // -----------------------------------------------------------------------
   CleanCFG{}.Run(func);

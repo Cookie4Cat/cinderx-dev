@@ -4537,7 +4537,7 @@ LIRGenerator::TranslatedBlock LIRGenerator::TranslateOneBasicBlock(
       // autogen.cpp.  Instructions without output use appendInstr(opcode, ...);
       // instructions with output use appendInstr(output, opcode, ...).
       case Opcode::kEnsureTreeIterState: {
-        bbb.appendInstr(Instruction::kEnsureTreeIterState);
+        bbb.appendInstr(i.output(), Instruction::kEnsureTreeIterState);
         break;
       }
       case Opcode::kSaveCurrentNode: {
@@ -4558,6 +4558,7 @@ LIRGenerator::TranslatedBlock LIRGenerator::TranslateOneBasicBlock(
       }
       case Opcode::kStateStackPush: {
         bbb.appendInstr(
+            i.output(),
             Instruction::kStateStackPush,
             i.GetOperand(0),
             i.GetOperand(1));
@@ -4576,7 +4577,8 @@ LIRGenerator::TranslatedBlock LIRGenerator::TranslateOneBasicBlock(
         break;
       }
       case Opcode::kCheckTreeIterChildEntry: {
-        bbb.appendInstr(Instruction::kCheckTreeIterChildEntry, i.GetOperand(0));
+        bbb.appendInstr(
+            i.output(), Instruction::kCheckTreeIterChildEntry, i.GetOperand(0));
         break;
       }
       case Opcode::kTreeIterEnterChild: {

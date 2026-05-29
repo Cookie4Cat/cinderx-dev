@@ -850,6 +850,7 @@ bool deopt_jit_gen(PyObject* obj) {
         "JIT generator has no yield point and is not running or completed");
   }
 
+  clearTreeIterState(gen_footer);
   deopt_jit_gen_object_only(jit_gen);
 
   return true;

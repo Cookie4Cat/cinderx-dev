@@ -190,16 +190,16 @@ enum OperandSizeType {
   X(Leave, false, FlagEffects::kInvalidate, kDefault, 0, {}, 1)               \
   X(Ret, false, FlagEffects::kInvalidate, kDefault, 0, {}, 1)                 \
   /* TreeIter state machine LIR opcodes. All are essential side-effect ops. */\
-  X(EnsureTreeIterState, false, FlagEffects::kInvalidate, kDefault, 0, {}, 1) \
+  X(EnsureTreeIterState, false, FlagEffects::kInvalidate, kDefault, 1, {}, 1) \
   X(SaveCurrentNode, false, FlagEffects::kInvalidate, kDefault, 0, {1}, 1)   \
   X(LoadCurrentNode, false, FlagEffects::kNone, kAlways64, 1, {}, 1)         \
   X(SavePhase, false, FlagEffects::kNone, kDefault, 0, {1}, 1)               \
   X(LoadPhase, false, FlagEffects::kNone, kDefault, 1, {}, 0)                \
-  X(StateStackPush, false, FlagEffects::kInvalidate, kDefault, 0, {1, 1}, 1) \
+  X(StateStackPush, false, FlagEffects::kInvalidate, kDefault, 1, {1, 1}, 1) \
   X(StateStackPop, false, FlagEffects::kNone, kAlways64, 1, {}, 1)           \
   X(LoadPoppedPhase, false, FlagEffects::kNone, kDefault, 1, {}, 0)          \
   X(LoadStackTop, false, FlagEffects::kNone, kDefault, 1, {}, 0)             \
-  X(CheckTreeIterChildEntry, false, FlagEffects::kInvalidate, kDefault, 0, {1}, 1) \
+  X(CheckTreeIterChildEntry, false, FlagEffects::kInvalidate, kDefault, 1, {1}, 1) \
   X(TreeIterEnterChild, false, FlagEffects::kInvalidate, kDefault, 0, {1}, 1)\
   X(TreeIterLeaveCurrentNode, false, FlagEffects::kInvalidate, kDefault, 0, {}, 1) \
   X(ClearTreeIterState, false, FlagEffects::kInvalidate, kDefault, 0, {}, 1)

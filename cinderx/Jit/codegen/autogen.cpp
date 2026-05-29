@@ -1338,8 +1338,12 @@ static void emitTreeIterCallOneInput(
   const OperandBase* in0 = instr->getInput(0);
   x86::Gp src0 =
       in0->isReg() ? x86::gpq(in0->getPhyRegister().loc) : x86::r10;
-  if (in0->isStack()) {
+  if (in0->isImm()) {
+    as->mov(x86::r10, getImm(in0));
+  } else if (in0->isStack()) {
     as->mov(x86::r10, x86::ptr(x86::rbp, in0->getStackSlot().loc));
+  } else if (!in0->isReg()) {
+    JIT_ABORT("Unsupported TreeIter helper input: {}", in0->type());
   }
   // Save src0 to scratch if it is rdi (would be clobbered).
   if (src0 == x86::rdi) {
@@ -1356,8 +1360,12 @@ static void emitTreeIterCallOneInput(
   a64::Gp src0;
   if (in0->isReg()) {
     src0 = a64::x(in0->getPhyRegister().loc);
+  } else if (in0->isImm()) {
+    src0 = arch::reg_scratch_1;
+    as->mov(src0, in0->getConstant());
   } else {
-    // Stack slot: load into scratch register first.
+    JIT_CHECK(
+        in0->isStack(), "Unsupported TreeIter helper input: {}", in0->type());
     src0 = arch::reg_scratch_1;
     as->ldr(
         src0,
@@ -1390,13 +1398,21 @@ static void emitTreeIterCallTwoInputs(
   // Load inputs to scratch before setting up arg registers.
   x86::Gp src0 =
       in0->isReg() ? x86::gpq(in0->getPhyRegister().loc) : x86::r10;
-  if (in0->isStack()) {
+  if (in0->isImm()) {
+    as->mov(x86::r10, getImm(in0));
+  } else if (in0->isStack()) {
     as->mov(x86::r10, x86::ptr(x86::rbp, in0->getStackSlot().loc));
+  } else if (!in0->isReg()) {
+    JIT_ABORT("Unsupported TreeIter helper input: {}", in0->type());
   }
   x86::Gp src1 =
       in1->isReg() ? x86::gpq(in1->getPhyRegister().loc) : x86::r11;
-  if (in1->isStack()) {
+  if (in1->isImm()) {
+    as->mov(x86::r11, getImm(in1));
+  } else if (in1->isStack()) {
     as->mov(x86::r11, x86::ptr(x86::rbp, in1->getStackSlot().loc));
+  } else if (!in1->isReg()) {
+    JIT_ABORT("Unsupported TreeIter helper input: {}", in1->type());
   }
   // Avoid clobber: copy conflicting inputs to scratch regs.
   if (src0 == x86::rdi || src0 == x86::rsi) {
@@ -1421,7 +1437,12 @@ static void emitTreeIterCallTwoInputs(
   a64::Gp src0;
   if (in0->isReg()) {
     src0 = a64::x(in0->getPhyRegister().loc);
+  } else if (in0->isImm()) {
+    src0 = arch::reg_scratch_0;
+    as->mov(src0, in0->getConstant());
   } else {
+    JIT_CHECK(
+        in0->isStack(), "Unsupported TreeIter helper input: {}", in0->type());
     src0 = arch::reg_scratch_0;
     as->ldr(
         src0,
@@ -1432,7 +1453,12 @@ static void emitTreeIterCallTwoInputs(
   if (in1->isReg()) {
     // int32 phase: use 64-bit reg; the helper accepts int32_t through x reg.
     src1 = a64::x(in1->getPhyRegister().loc);
+  } else if (in1->isImm()) {
+    src1 = arch::reg_scratch_1;
+    as->mov(src1, in1->getConstant());
   } else {
+    JIT_CHECK(
+        in1->isStack(), "Unsupported TreeIter helper input: {}", in1->type());
     src1 = arch::reg_scratch_1;
     as->ldr(
         src1,
@@ -1473,22 +1499,30 @@ static void moveReturnToOutput(
   }
 #if defined(CINDER_X86_64)
   if (out->isReg()) {
-    x86::Gp dst = x86::gpq(out->getPhyRegister().loc);
-    if (dst != x86::rax) {
-      as->mov(dst, x86::rax);
+    x86::Gp dst = AutoTranslator::getGp(out);
+    x86::Gp src =
+        AutoTranslator::getGp(out, arch::reg_general_return_loc.loc);
+    if (dst.id() != src.id()) {
+      as->mov(dst, src);
     }
   } else if (out->isStack()) {
-    as->mov(x86::ptr(x86::rbp, out->getStackSlot().loc), x86::rax);
+    x86::Gp src =
+        AutoTranslator::getGp(out, arch::reg_general_return_loc.loc);
+    as->mov(x86::ptr(x86::rbp, out->getStackSlot().loc), src);
   }
 #elif defined(CINDER_AARCH64)
   if (out->isReg()) {
-    a64::Gp dst = a64::x(out->getPhyRegister().loc);
-    if (dst.id() != a64::x0.id()) {
-      as->mov(dst, a64::x0);
+    a64::Gp dst = AutoTranslator::getGp(out);
+    a64::Gp src =
+        AutoTranslator::getGp(out, arch::reg_general_return_loc.loc);
+    if (dst.id() != src.id()) {
+      as->mov(dst, src);
     }
   } else if (out->isStack()) {
+    a64::Gp src =
+        AutoTranslator::getGp(out, arch::reg_general_return_loc.loc);
     as->str(
-        a64::x0,
+        src,
         arch::ptr_resolve(
             as, arch::fp, out->getStackSlot().loc, arch::reg_scratch_0));
   }
@@ -1503,8 +1537,7 @@ void translateTreeIterOp(Environ* env, const Instruction* instr) {
   switch (op) {
     case Instruction::kEnsureTreeIterState:
       emitTreeIterCallNoInputs(as, reinterpret_cast<const void*>(JITRT_EnsureTreeIterState));
-      // EnsureTreeIterState returns int: check for -1 (OOM) if needed.
-      // Exception check is emitted by the DeoptBase handler below.
+      moveReturnToOutput(as, instr);
       break;
     case Instruction::kSaveCurrentNode:
       emitTreeIterCallOneInput(as, instr, reinterpret_cast<const void*>(JITRT_SaveCurrentNode));
@@ -1522,6 +1555,7 @@ void translateTreeIterOp(Environ* env, const Instruction* instr) {
       break;
     case Instruction::kStateStackPush:
       emitTreeIterCallTwoInputs(as, instr, reinterpret_cast<const void*>(JITRT_StateStackPush));
+      moveReturnToOutput(as, instr);
       break;
     case Instruction::kStateStackPop:
       emitTreeIterCallNoInputs(as, reinterpret_cast<const void*>(JITRT_StateStackPop));
@@ -1537,6 +1571,7 @@ void translateTreeIterOp(Environ* env, const Instruction* instr) {
       break;
     case Instruction::kCheckTreeIterChildEntry:
       emitTreeIterCallOneInput(as, instr, reinterpret_cast<const void*>(JITRT_CheckTreeIterChildEntry));
+      moveReturnToOutput(as, instr);
       break;
     case Instruction::kTreeIterEnterChild:
       emitTreeIterCallOneInput(as, instr, reinterpret_cast<const void*>(JITRT_TreeIterEnterChild));

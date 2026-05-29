@@ -119,6 +119,18 @@ Type outputType(
     case Opcode::kCallMethod:
       return returnType(static_cast<const CallMethod&>(instr).func()->type());
 
+    case Opcode::kEnsureTreeIterState:
+    case Opcode::kStateStackPush:
+    case Opcode::kCheckTreeIterChildEntry:
+    case Opcode::kLoadPhase:
+    case Opcode::kLoadPoppedPhase:
+    case Opcode::kLoadStackTop:
+      return TCInt32;
+
+    case Opcode::kLoadCurrentNode:
+    case Opcode::kStateStackPop:
+      return TObject;
+
     case Opcode::kCompare: {
       CompareOp op = static_cast<const Compare&>(instr).op();
       if (op == CompareOp::kIn || op == CompareOp::kNotIn) {
@@ -532,6 +544,8 @@ Type outputType(
     case Opcode::kRaiseAwaitableError:
     case Opcode::kRaiseStatic:
     case Opcode::kReturn:
+    case Opcode::kSaveCurrentNode:
+    case Opcode::kSavePhase:
     case Opcode::kSetCurrentAwaiter:
     case Opcode::kSetCellItem:
     case Opcode::kSetFunctionAttr:
@@ -541,10 +555,13 @@ Type outputType(
     case Opcode::kStoreAttrCached:
     case Opcode::kStoreField:
     case Opcode::kStoreSubscr:
+    case Opcode::kTreeIterEnterChild:
+    case Opcode::kTreeIterLeaveCurrentNode:
     case Opcode::kUnreachable:
     case Opcode::kUpdatePrevInstr:
     case Opcode::kUseType:
     case Opcode::kWaitHandleRelease:
+    case Opcode::kClearTreeIterState:
     case Opcode::kXDecref:
     case Opcode::kXIncref:
       JIT_ABORT("Opcode {} has no output", instr.opname());
