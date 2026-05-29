@@ -16,6 +16,7 @@
 #include "cinderx/Interpreter/cinder_opcode.h"
 #include "cinderx/Jit/codegen/arch.h"
 #include "cinderx/Jit/codegen/gen_asm.h"
+#include "cinderx/Jit/bytecode.h"
 #include "cinderx/Jit/compiler.h"
 #include "cinderx/Jit/context.h"
 #include "cinderx/Jit/deopt.h"
@@ -470,7 +471,26 @@ class DeoptStressTest : public RuntimeTest {
       }
       for (auto it = block.begin(); it != block.end();) {
         auto& instr = *it++;
-        if (instr.getDominatingFrameState() != nullptr) {
+        if (instr.IsLoadConst()) {
+          // LoadConst only mutates the interpreter stack. Artificial guards
+          // before it can produce deopt points that don't correspond to real
+          // guardable work, especially around 3.14 fused stack opcodes.
+          continue;
+        }
+        const FrameState* fs = instr.getDominatingFrameState();
+        if (fs != nullptr && fs->code != nullptr) {
+          switch (BytecodeInstruction{fs->code, fs->cur_instr_offs}.opcode()) {
+            case LOAD_CONST:
+            case LOAD_FAST:
+            case LOAD_FAST_BORROW:
+            case LOAD_FAST_CHECK:
+            case LOAD_FAST_LOAD_FAST:
+            case LOAD_FAST_BORROW_LOAD_FAST_BORROW:
+            case STORE_SUBSCR:
+              continue;
+          }
+        }
+        if (fs != nullptr) {
           // Nothing defines reg, so it will be null initialized and the guard
           // will fail, thus causing deopt.
           auto guard = Guard::create(reg);

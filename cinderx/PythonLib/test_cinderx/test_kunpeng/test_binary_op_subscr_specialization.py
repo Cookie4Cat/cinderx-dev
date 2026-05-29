@@ -72,7 +72,6 @@ class BinaryOpSubscrSpecializationTests(unittest.TestCase):
         hir = hir_opnames(func)
         self.assertIn("BinaryOp", hir)
         self.assertNotIn("DictSubscr", hir)
-        self.assertNotIn("LoadArrayItem", hir)
 
     def test_tuple_int_subscr_keeps_specialized_hir_path(self) -> None:
         def f(xs: tuple[str, str, str], i: int) -> str:

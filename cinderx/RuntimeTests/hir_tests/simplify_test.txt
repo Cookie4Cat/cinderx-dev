@@ -1214,7 +1214,7 @@ BinaryOpSubscriptFromNonListEmitsBinaryOp
 # HIR
 fun test {
   bb 0 {
-    v0 = LoadArg<0>
+    v0 = LoadArg<0, Long>
     v1 = LoadConst<LongExact[1]>
     v2 = BinaryOp<Subscript> v0 v1
     Return v2
@@ -1223,7 +1223,7 @@ fun test {
 --- Expected 3.12 ---
 fun test {
   bb 0 {
-    v0:Object = LoadArg<0>
+    v0:Long = LoadArg<0, Long>
     v1:ImmortalLongExact[1] = LoadConst<ImmortalLongExact[1]>
     v2:Object = BinaryOp<Subscript> v0 v1 {
       FrameState {
@@ -1236,7 +1236,7 @@ fun test {
 --- Expected 3.14 ---
 fun test {
   bb 0 {
-    v0:Object = LoadArg<0>
+    v0:Long = LoadArg<0, Long>
     v1:ImmortalLongExact[1] = LoadConst<ImmortalLongExact[1]>
     v2:Object = BinaryOp<Subscript> v0 v1 {
       FrameState {
@@ -1249,7 +1249,7 @@ fun test {
 --- Expected 3.15 ---
 fun test {
   bb 0 {
-    v0:Object = LoadArg<0>
+    v0:Long = LoadArg<0, Long>
     v1:ImmortalLongExact[1] = LoadConst<ImmortalLongExact[1]>
     v2:Object = BinaryOp<Subscript> v0 v1 {
       FrameState {
