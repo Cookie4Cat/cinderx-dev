@@ -10,8 +10,6 @@
 
 #include <Python.h>
 
-#include <unordered_map>
-
 namespace jit::hir {
 
 // ---------------------------------------------------------------------------
@@ -32,6 +30,30 @@ static bool tupleContainsName(PyObject* names, const char* name) {
     }
   }
   return false;
+}
+
+static bool loadAttrFallbackMatchesField(
+    const Instr* instr,
+    const LoadField* field) {
+  if (instr == nullptr || field == nullptr) {
+    return false;
+  }
+
+  if (instr->opcode() != Opcode::kLoadAttr) {
+    return false;
+  }
+
+  const auto* load_attr = static_cast<const LoadAttr*>(instr);
+  if (!load_attr->alreadyOptimized()) {
+    return false;
+  }
+
+  if (load_attr->GetOperand(0) != field->receiver()) {
+    return false;
+  }
+
+  return PyUnicode_CompareWithASCIIString(
+             load_attr->name(), field->name().c_str()) == 0;
 }
 
 // ---------------------------------------------------------------------------
@@ -76,23 +98,40 @@ const LoadField* TreeIterStateMachinePass::traceYieldFromIterable(
         break;
       }
 
+      case Opcode::kIsTruthy:
+        // Truthiness guards lower to IsTruthy(field) followed by CondBranch.
+        // The guard still proves the original field value.
+        cur = def->GetOperand(0);
+        break;
+
       case Opcode::kPhi: {
         // A Phi is acceptable only if it is trivial (all arms produce the same
         // source), which is the emitGetYieldFromIter pattern where exact
         // generator/coroutine objects are Assigned directly while the slow
-        // path goes through GetIter.  Accept a non-trivial Phi only if every
-        // arm traces to the same LoadField (same instruction pointer).
+        // path goes through GetIter.  Split-dict LoadAttr lowering also emits
+        // a Phi(fast LoadField/CheckField, already-optimized LoadAttr
+        // fallback); accept that shape when the fallback reads the same field.
         const auto* phi = static_cast<const Phi*>(def);
         const LoadField* result = nullptr;
         for (std::size_t i = 0; i < phi->NumOperands(); i++) {
           const Register* arm = phi->GetOperand(i);
           const LoadField* arm_lf = traceYieldFromIterable(arm);
-          if (arm_lf == nullptr) {
+          if (arm_lf != nullptr && result == nullptr) {
+            result = arm_lf;
+          } else if (arm_lf != nullptr && result != arm_lf) {
             return nullptr;
           }
-          if (result == nullptr) {
-            result = arm_lf;
-          } else if (result != arm_lf) {
+        }
+        if (result == nullptr) {
+          return nullptr;
+        }
+        for (std::size_t i = 0; i < phi->NumOperands(); i++) {
+          const Register* arm = phi->GetOperand(i);
+          if (traceYieldFromIterable(arm) != nullptr) {
+            continue;
+          }
+          const Instr* arm_def = arm->instr();
+          if (!loadAttrFallbackMatchesField(arm_def, result)) {
             return nullptr;
           }
         }
@@ -146,12 +185,9 @@ std::optional<TreeIterMatch> TreeIterStateMachinePass::matchTreeIter(
   const YieldValue* plain_yv = nullptr;
   const YieldValue* yf_first = nullptr;
   const YieldValue* yf_second = nullptr;
-  std::unordered_map<const Instr*, std::size_t> instr_order;
-  std::size_t next_instr_order = 0;
 
   for (const BasicBlock& block : func.cfg.blocks) {
     for (const Instr& instr : block) {
-      instr_order.emplace(&instr, next_instr_order++);
       switch (instr.opcode()) {
         case Opcode::kInitialYield:
           if (initial_yield != nullptr) {
@@ -334,14 +370,16 @@ std::optional<TreeIterMatch> TreeIterStateMachinePass::matchTreeIter(
     return std::nullopt;
   }
 
-  auto orderOf = [&](const Instr* instr) -> std::size_t {
-    auto it = instr_order.find(instr);
-    JIT_CHECK(it != instr_order.end(), "TreeIter matcher lost instruction");
-    return it->second;
+  auto yieldOrderOf = [&](const YieldValue* instr) -> intptr_t {
+    const FrameState* frame_state = instr->frameState();
+    if (frame_state != nullptr) {
+      return frame_state->instrOffset().value();
+    }
+    return instr->bytecodeOffset().value();
   };
 
-  if (!(orderOf(left_yf) < orderOf(plain_yv) &&
-        orderOf(plain_yv) < orderOf(right_yf))) {
+  if (!(yieldOrderOf(left_yf) < yieldOrderOf(plain_yv) &&
+        yieldOrderOf(plain_yv) < yieldOrderOf(right_yf))) {
     JIT_DLOG(
         "TreeIter matcher: yields are not ordered left/value/right in {}",
         func.fullname);

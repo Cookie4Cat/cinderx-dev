@@ -640,6 +640,66 @@ class {name}:
     return Node
 
 
+def _make_node_class_with_truthiness_guard():
+    """Node class whose child guard is default truthiness, with exact proofs."""
+    global _tree_iter_node_counter
+    name = f"_TreeIterTruthyNode{_tree_iter_node_counter}"
+    _tree_iter_node_counter += 1
+    namespace = {}
+    exec(
+        f"""
+class {name}:
+    __slots__ = ("value", "left", "right", "__weakref__")
+
+    def __init__(self, value, left=None, right=None):
+        self.value = value
+        self.left = left
+        self.right = right
+
+    def __iter__(self):
+        if self.left:
+            yield from self.left
+        yield self.value
+        if self.right:
+            yield from self.right
+""",
+        globals(),
+        namespace,
+    )
+    Node = namespace[name]
+    globals()[name] = Node
+    return Node
+
+
+def _make_split_dict_node_class_with_truthiness_guard():
+    """Pyperformance-style Tree class with split-dict field loads."""
+    global _tree_iter_node_counter
+    name = f"_TreeIterSplitDictTruthyNode{_tree_iter_node_counter}"
+    _tree_iter_node_counter += 1
+    namespace = {}
+    exec(
+        f"""
+class {name}:
+    def __init__(self, left, value, right):
+        self.left = left
+        self.value = value
+        self.right = right
+
+    def __iter__(self):
+        if self.left:
+            yield from self.left
+        yield self.value
+        if self.right:
+            yield from self.right
+""",
+        globals(),
+        namespace,
+    )
+    Node = namespace[name]
+    globals()[name] = Node
+    return Node
+
+
 def _build_complete_tree(Node, depth, counter=None):
     """Build a complete binary tree; values are unique integers (BFS order)."""
     if counter is None:
@@ -766,27 +826,15 @@ class TreeIterStateMachineTest(unittest.TestCase):
         """``if child:`` with default truthiness is matched like ``if child is not None:``."""
 
         # Fresh unique class so the JIT doesn't share compiled code with other
-        # tests that use the canonical is-not-None form.
-        class TruthinessNode:
-            __slots__ = ("value", "left", "right")
-
-            def __init__(self, value, left=None, right=None):
-                self.value = value
-                self.left = left
-                self.right = right
-
-            def __iter__(self):
-                if self.left:          # truthiness guard — no custom __bool__
-                    yield from self.left
-                yield self.value
-                if self.right:
-                    yield from self.right
-
-        self.assertTrue(cinderx.jit.force_compile(TruthinessNode.__iter__))
+        # tests that use the canonical is-not-None form.  Keep it in globals so
+        # the matcher has the same exact owner/field-layout proof as the
+        # production TreeIter shape.
+        Node = _make_node_class_with_truthiness_guard()
+        self.assertTrue(cinderx.jit.force_compile(Node.__iter__))
 
         if _tree_iter_state_machine_enabled():
             ops = cinderx.jit.get_function_hir_opcode_counts(
-                TruthinessNode.__iter__
+                Node.__iter__
             )
             self.assertGreater(
                 ops.get("EnsureTreeIterState", 0),
@@ -794,20 +842,42 @@ class TreeIterStateMachineTest(unittest.TestCase):
                 "EnsureTreeIterState should appear when truthiness guard is matched",
             )
 
-        root = TruthinessNode(
+        root = Node(
             2,
-            TruthinessNode(1),
-            TruthinessNode(3),
+            Node(1),
+            Node(3),
         )
         self.assertEqual(list(root), [1, 2, 3])
 
         # Larger tree — correctness must hold at depth.
-        big = TruthinessNode(
+        big = Node(
             4,
-            TruthinessNode(2, TruthinessNode(1), TruthinessNode(3)),
-            TruthinessNode(6, TruthinessNode(5), TruthinessNode(7)),
+            Node(2, Node(1), Node(3)),
+            Node(6, Node(5), Node(7)),
         )
         self.assertEqual(list(big), [1, 2, 3, 4, 5, 6, 7])
+
+    @cinder_support.skip_unless_jit("Requires CinderX JIT")
+    def test_tree_iter_split_dict_truthiness_guard(self):
+        """Pyperformance's ``generators`` Tree shape uses split-dict fields."""
+
+        Node = _make_split_dict_node_class_with_truthiness_guard()
+        self.assertTrue(cinderx.jit.force_compile(Node.__iter__))
+
+        if _tree_iter_state_machine_enabled():
+            ops = cinderx.jit.get_function_hir_opcode_counts(Node.__iter__)
+            self.assertGreater(
+                ops.get("EnsureTreeIterState", 0),
+                0,
+                "EnsureTreeIterState should appear for split-dict Tree nodes",
+            )
+
+        root = Node(
+            Node(None, 1, None),
+            2,
+            Node(None, 3, None),
+        )
+        self.assertEqual(list(root), [1, 2, 3])
 
     @cinder_support.skip_unless_jit("Requires CinderX JIT")
     def test_tree_iter_custom_bool_not_optimized(self):
