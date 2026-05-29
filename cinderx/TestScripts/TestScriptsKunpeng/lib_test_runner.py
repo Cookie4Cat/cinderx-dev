@@ -277,6 +277,8 @@ def env_for_mode(startup_dir: Path, marker_file: Path) -> dict[str, str]:
 
     env.pop("CINDERX_JIT_DISABLE", None)
     env.pop("PYTHONJITDISABLE", None)
+    env["PYTHONJITLIGHTWEIGHTFRAME"] = "1"
+    env["CINDERX_OSR_ENABLED"] = "0"
 
     return env
 

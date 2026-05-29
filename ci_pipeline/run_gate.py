@@ -529,10 +529,54 @@ def runtime_tests_command(
         "--parallel",
         parallelism,
     ]
-    ctest_command = (
-        f"cd {shlex.quote(str(build_dir))} && "
-        f"{shell_join(['ctest', '--output-on-failure', '-C', build_type])}"
-    )
+    ctest_args = ["ctest", "--output-on-failure", "-C", build_type]
+    if truthy_env_value(env.get("CINDERX_RUNTIME_TEST_SPLIT_LWF_OSR")):
+        osr_regex = env.get("CINDERX_RUNTIME_TEST_OSR_REGEX", "OSR|Osr|osr")
+        lightweight_regex = env.get(
+            "CINDERX_RUNTIME_TEST_LIGHTWEIGHT_REGEX",
+            "CmdLineTest.LightweightFrame|ReifyFrameTest|Deopt",
+        )
+        normal_ctest_command = shell_join(
+            [
+                "env",
+                "PYTHONJITLIGHTWEIGHTFRAME=0",
+                "CINDERX_OSR_ENABLED=0",
+                *ctest_args,
+                "-E",
+                osr_regex,
+            ]
+        )
+        lwf_ctest_command = shell_join(
+            [
+                "env",
+                "PYTHONJITLIGHTWEIGHTFRAME=1",
+                "CINDERX_OSR_ENABLED=0",
+                *ctest_args,
+                "-R",
+                lightweight_regex,
+            ]
+        )
+        osr_ctest_command = shell_join(
+            [
+                "env",
+                "PYTHONJITLIGHTWEIGHTFRAME=0",
+                "CINDERX_OSR_ENABLED=1",
+                *ctest_args,
+                "-R",
+                osr_regex,
+            ]
+        )
+        ctest_command = (
+            f"cd {shlex.quote(str(build_dir))} && "
+            f"{normal_ctest_command} && "
+            f"{lwf_ctest_command} && "
+            f"{osr_ctest_command}"
+        )
+    else:
+        ctest_command = (
+            f"cd {shlex.quote(str(build_dir))} && "
+            f"{shell_join(ctest_args)}"
+        )
 
     return " && ".join(
         [

@@ -12,6 +12,7 @@
 #include <cstdlib>
 #include <filesystem>
 #include <fstream>
+#include <optional>
 #include <string>
 
 // Here we make sure that the JIT specific command line arguments
@@ -25,6 +26,72 @@ class CmdLineTest : public RuntimeTest {
  public:
   CmdLineTest() : RuntimeTest{RuntimeTest::Flags{}} {}
 };
+
+namespace {
+
+class ScopedEnvVar {
+ public:
+  explicit ScopedEnvVar(const char* name) : name_{name} {
+    if (const char* value = getenv(name)) {
+      old_value_ = value;
+    }
+  }
+
+  ~ScopedEnvVar() {
+    if (old_value_.has_value()) {
+      setenv(name_, old_value_->c_str(), 1);
+    } else {
+      unsetenv(name_);
+    }
+  }
+
+  void set(const char* value) {
+    setenv(name_, value, 1);
+  }
+
+ private:
+  const char* name_;
+  std::optional<std::string> old_value_;
+};
+
+class ScopedJitConfigState {
+ public:
+  ScopedJitConfigState()
+      : frame_mode_{getMutableConfig().frame_mode},
+        osr_enabled_{getMutableConfig().osr_enabled},
+        osr_capable_{getMutableConfig().osr_capable},
+        cinderx_osr_enabled_{cinderx_osr_enabled},
+        cinderx_osr_capable_{cinderx_osr_capable},
+        cinderx_osr_state_{cinderx_osr_state} {}
+
+  ~ScopedJitConfigState() {
+    getMutableConfig().frame_mode = frame_mode_;
+    getMutableConfig().osr_enabled = osr_enabled_;
+    getMutableConfig().osr_capable = osr_capable_;
+    cinderx_osr_enabled = cinderx_osr_enabled_;
+    cinderx_osr_capable = cinderx_osr_capable_;
+    cinderx_osr_state = cinderx_osr_state_;
+  }
+
+ private:
+  FrameMode frame_mode_;
+  bool osr_enabled_;
+  bool osr_capable_;
+  int cinderx_osr_enabled_;
+  int cinderx_osr_capable_;
+  int cinderx_osr_state_;
+};
+
+void resetFrameModeAndOSRConfig() {
+  getMutableConfig().frame_mode = FrameMode::kNormal;
+  getMutableConfig().osr_enabled = false;
+  getMutableConfig().osr_capable = false;
+  cinderx_osr_enabled = 0;
+  cinderx_osr_capable = 0;
+  cinderx_osr_state = 0;
+}
+
+} // namespace
 
 int try_flag_and_envvar_effect(
     const wchar_t* flag,
@@ -324,6 +391,46 @@ TEST_F(CmdLineTest, OSREnabledFlagSyncsRuntimeGate) {
           }),
       0);
 }
+
+TEST_F(CmdLineTest, LightweightFrameFlagRequiresCompileSupport) {
+  ScopedEnvVar lightweight_env{"PYTHONJITLIGHTWEIGHTFRAME"};
+  ScopedJitConfigState config_guard;
+  jit::finalize();
+  jit::shutdown_jit_genobject_type();
+  resetFrameModeAndOSRConfig();
+  lightweight_env.set("1");
+  int init_status = jit::initialize();
+#ifdef ENABLE_LIGHTWEIGHT_FRAMES
+  ASSERT_EQ(init_status, 0);
+  EXPECT_EQ(getConfig().frame_mode, FrameMode::kLightweight);
+  jit::finalize();
+#else
+  ASSERT_EQ(init_status, -1);
+  ASSERT_TRUE(PyErr_ExceptionMatches(PyExc_RuntimeError));
+  PyErr_Clear();
+#endif
+  jit::shutdown_jit_genobject_type();
+}
+
+#ifdef ENABLE_LIGHTWEIGHT_FRAMES
+TEST_F(CmdLineTest, LightweightFrameRejectsOSRConflict) {
+  ScopedEnvVar lightweight_env{"PYTHONJITLIGHTWEIGHTFRAME"};
+  ScopedEnvVar osr_env{"CINDERX_OSR_ENABLED"};
+  ScopedJitConfigState config_guard;
+  jit::finalize();
+  jit::shutdown_jit_genobject_type();
+  resetFrameModeAndOSRConfig();
+  lightweight_env.set("1");
+  osr_env.set("1");
+
+  int init_status = jit::initialize();
+  ASSERT_EQ(init_status, -1);
+  ASSERT_TRUE(PyErr_ExceptionMatches(PyExc_RuntimeError));
+  PyErr_Clear();
+
+  jit::shutdown_jit_genobject_type();
+}
+#endif
 
 TEST_F(CmdLineTest, OSRBackedgeThresholdFlag) {
   ASSERT_EQ(

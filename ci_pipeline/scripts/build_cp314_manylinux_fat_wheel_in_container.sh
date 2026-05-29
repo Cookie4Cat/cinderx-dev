@@ -259,6 +259,7 @@ import _cinderx
 print("smoke", sys.version.split()[0], cinderx.is_initialized(), getattr(_cinderx, "__file__", None))
 assert sys.version_info[:2] == (3, 14)
 assert cinderx.is_initialized() is not None
+assert cinderx.is_lightweight_frames_enabled()
 PY
   done
 fi

@@ -45,6 +45,7 @@ extern "C" {
 #include <fmt/format.h>
 #include <fmt/ostream.h>
 
+#include <cstring>
 #include <functional>
 #include <sstream>
 
@@ -62,6 +63,23 @@ namespace {
 #ifndef Py_GIL_DISABLED
 constexpr size_t kRefcountOffset = offsetof(PyObject, ob_refcnt);
 #endif
+
+#if PY_VERSION_HEX >= 0x030E0000
+constexpr size_t kInterpreterFrameVisitedOffset =
+    offsetof(_PyInterpreterFrame, visited);
+static_assert(
+    kInterpreterFrameVisitedOffset ==
+        offsetof(_PyInterpreterFrame, owner) + sizeof(char),
+    "lightweight frame visited byte must immediately follow owner");
+#endif
+
+uint64_t stackNullBits() {
+  Ci_STACK_TYPE null_ref = Ci_STACK_NULL;
+  uint64_t bits = 0;
+  static_assert(sizeof(null_ref) <= sizeof(bits));
+  std::memcpy(&bits, &null_ref, sizeof(null_ref));
+  return bits;
+}
 
 // These functions call their counterparts and convert its output from int (32
 // bits) to uint64_t (64 bits). This is solely because the code generator cannot
@@ -4095,13 +4113,34 @@ LIRGenerator::TranslatedBlock LIRGenerator::TranslateOneBasicBlock(
             caller_frame);
 
 #if PY_VERSION_HEX >= 0x030E0000
+        bbb.appendInstr(
+            OutInd{callee_frame, offsetof(_PyInterpreterFrame, f_globals)},
+            Instruction::kMove,
+            globals);
+        bbb.appendInstr(
+            OutInd{callee_frame, offsetof(_PyInterpreterFrame, f_builtins)},
+            Instruction::kMove,
+            builtins);
+        bbb.appendInstr(
+            OutInd{callee_frame, offsetof(_PyInterpreterFrame, frame_obj)},
+            Instruction::kMove,
+            Imm{0});
+        bbb.appendInstr(
+            OutInd{
+                callee_frame,
+                offsetof(_PyInterpreterFrame, return_offset),
+                OperandBase::k16bit},
+            Instruction::kMove,
+            Imm{0, OperandBase::k16bit});
+
         Instruction* localsplus = bbb.appendInstr(
             OutVReg{},
             Instruction::kLea,
             Stk{PhyLocation(
                 static_cast<int32_t>(
                     frameOffsetOf(instr) +
-                    offsetof(_PyInterpreterFrame, localsplus)))});
+                    offsetof(_PyInterpreterFrame, localsplus) +
+                    code->co_nlocalsplus * sizeof(Ci_STACK_TYPE)))});
 
         bbb.appendInstr(
             OutInd{callee_frame, offsetof(_PyInterpreterFrame, stackpointer)},
@@ -4112,6 +4151,17 @@ LIRGenerator::TranslatedBlock LIRGenerator::TranslateOneBasicBlock(
             OutInd{callee_frame, offsetof(_PyInterpreterFrame, f_locals)},
             Instruction::kMove,
             Imm{0});
+        int free_offset = code->co_nlocalsplus - code->co_nfreevars;
+        for (int local_idx = 0; local_idx < free_offset; local_idx++) {
+          bbb.appendInstr(
+              OutInd{
+                  callee_frame,
+                  static_cast<int32_t>(
+                      offsetof(_PyInterpreterFrame, localsplus) +
+                      local_idx * sizeof(Ci_STACK_TYPE))},
+              Instruction::kMove,
+              Imm{stackNullBits()});
+        }
 
         // Store prev_instr
         _Py_CODEUNIT* frame_code = _PyCode_CODE(code.get());
@@ -4146,6 +4196,15 @@ LIRGenerator::TranslatedBlock LIRGenerator::TranslateOneBasicBlock(
             Instruction::kMove,
             Imm{static_cast<uint8_t>(FRAME_OWNED_BY_THREAD),
                 OperandBase::k8bit});
+#if PY_VERSION_HEX >= 0x030E0000
+        bbb.appendInstr(
+            OutInd{
+                callee_frame,
+                kInterpreterFrameVisitedOffset,
+                OperandBase::k8bit},
+            Instruction::kMove,
+            Imm{0, OperandBase::k8bit});
+#endif
 #if PY_VERSION_HEX < 0x030E0000
         if (!_Py_IsImmortal(code.get()))
 #endif
@@ -4199,9 +4258,18 @@ LIRGenerator::TranslatedBlock LIRGenerator::TranslateOneBasicBlock(
                                               // below
         bbb.appendInstr(Instruction::kBitTest, rtfs_reg, Imm{1});
         auto done_block = bbb.allocateBlock();
+        auto materialized_block = bbb.allocateBlock();
         auto not_materialized_block = bbb.allocateBlock();
-        bbb.appendBranch(Instruction::kBranchNC, not_materialized_block);
+        bbb.appendBranch(Instruction::kBranchC, materialized_block);
         bbb.appendBlock(bbb.allocateBlock());
+
+        Instruction* frame_obj = bbb.appendInstr(
+            OutVReg{},
+            Instruction::kMove,
+            Ind{callee_frame, offsetof(_PyInterpreterFrame, frame_obj)});
+        bbb.appendInstr(Instruction::kTest, frame_obj, frame_obj);
+        bbb.appendBranch(Instruction::kBranchZ, not_materialized_block);
+        bbb.appendBlock(materialized_block);
 
         // The frame was materialized, let's use the unlink helper to clean
         // things up.
@@ -4240,11 +4308,18 @@ LIRGenerator::TranslatedBlock LIRGenerator::TranslateOneBasicBlock(
         auto reifier = inline_code_to_reifier_.at(code.get());
         Instruction* reifier_reg =
             bbb.appendInstr(OutVReg{}, Instruction::kMove, reifier.get());
+#if PY_VERSION_HEX >= 0x030F0000
         makeDecref(
             bbb,
             reifier_reg,
             std::optional<destructor>(
                 PyUnstable_JITExecutable_Type.tp_dealloc));
+#else
+        makeDecref(
+            bbb,
+            reifier_reg,
+            std::optional<destructor>(PyCode_Type.tp_dealloc));
+#endif
 #if PY_VERSION_HEX < 0x030F0000
         // On 3.14, we stored the function object in f_funcobj and incref'd it.
         // Need to decref it here since the frame was not materialized.
@@ -5053,15 +5128,51 @@ void LIRGenerator::emitLoadFrame(BasicBlockBuilder& bbb) {
         Imm{static_cast<uint8_t>(FRAME_OWNED_BY_THREAD), OperandBase::k8bit});
 
 #if PY_VERSION_HEX >= 0x030E0000
+    bbb.annotateNext("Set _PyInterpreterFrame::f_globals");
+    Instruction* globals = bbb.appendInstr(
+        OutVReg{},
+        Instruction::kMove,
+        Ind{env_->asm_func, offsetof(PyFunctionObject, func_globals)});
+    bbb.appendInstr(
+        OutInd{frame, offsetof(_PyInterpreterFrame, f_globals)},
+        Instruction::kMove,
+        globals);
+
+    bbb.annotateNext("Set _PyInterpreterFrame::f_builtins");
+    Instruction* builtins = bbb.appendInstr(
+        OutVReg{},
+        Instruction::kMove,
+        Ind{env_->asm_func, offsetof(PyFunctionObject, func_builtins)});
+    bbb.appendInstr(
+        OutInd{frame, offsetof(_PyInterpreterFrame, f_builtins)},
+        Instruction::kMove,
+        builtins);
+
+    bbb.annotateNext("Set _PyInterpreterFrame::frame_obj");
+    bbb.appendInstr(
+        OutInd{frame, offsetof(_PyInterpreterFrame, frame_obj)},
+        Instruction::kMove,
+        Imm{0});
+
+    bbb.annotateNext("Set _PyInterpreterFrame::return_offset");
+    bbb.appendInstr(
+        OutInd{
+            frame,
+            offsetof(_PyInterpreterFrame, return_offset),
+            OperandBase::k16bit},
+        Instruction::kMove,
+        Imm{0, OperandBase::k16bit});
+
     bbb.annotateNext("Set _PyInterpreterFrame::localsplus");
-    // Store stackpointer = &localsplus[0]
+    // Store stackpointer = &localsplus[co_nlocalsplus]
     Instruction* localsplus = bbb.appendInstr(
         OutVReg{},
         Instruction::kLea,
         Stk{PhyLocation(
             static_cast<int32_t>(
                 -fh_size + sizeof(jit::FrameHeader) +
-                offsetof(_PyInterpreterFrame, localsplus)))});
+                offsetof(_PyInterpreterFrame, localsplus) +
+                func_->code->co_nlocalsplus * sizeof(Ci_STACK_TYPE)))});
     bbb.appendInstr(
         OutInd{frame, offsetof(_PyInterpreterFrame, stackpointer)},
         Instruction::kMove,
@@ -5073,6 +5184,26 @@ void LIRGenerator::emitLoadFrame(BasicBlockBuilder& bbb) {
         OutInd{frame, offsetof(_PyInterpreterFrame, f_locals)},
         Instruction::kMove,
         Imm{0});
+    int free_offset = func_->code->co_nlocalsplus - func_->code->co_nfreevars;
+    for (int local_idx = 0; local_idx < free_offset; local_idx++) {
+      bbb.appendInstr(
+          OutInd{
+              frame,
+              static_cast<int32_t>(
+                  offsetof(_PyInterpreterFrame, localsplus) +
+                  local_idx * sizeof(Ci_STACK_TYPE))},
+          Instruction::kMove,
+          Imm{stackNullBits()});
+    }
+
+    bbb.annotateNext("Set _PyInterpreterFrame::visited");
+    bbb.appendInstr(
+        OutInd{
+            frame,
+            kInterpreterFrameVisitedOffset,
+            OperandBase::k8bit},
+        Instruction::kMove,
+        Imm{0, OperandBase::k8bit});
 #endif
 
     // Link frame into tstate

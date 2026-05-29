@@ -146,6 +146,18 @@ def compute_py_version() -> str:
     return f"{sys.version_info.major}.{sys.version_info.minor}"
 
 
+def should_enable_lightweight_frames(
+    py_version: str,
+    meta_python: bool,
+    machine: str | None = None,
+) -> bool:
+    if meta_python and py_version == "3.12":
+        return True
+    if machine is None:
+        machine = platform.machine()
+    return py_version == "3.14" and machine.lower() in {"aarch64", "arm64"}
+
+
 class BuildCommand(build):
     user_options = build.user_options + [
         (
@@ -519,7 +531,14 @@ class BuildExt(build_ext):
         set_option("ENABLE_GENERATOR_AWAITER", meta_312)
         set_option("ENABLE_INTERPRETER_LOOP", meta_312 or is_314plus)
         set_option("ENABLE_LAZY_IMPORTS", meta_312)
-        set_option("ENABLE_LIGHTWEIGHT_FRAMES", meta_312)
+        set_option(
+            "ENABLE_LIGHTWEIGHT_FRAMES",
+            should_enable_lightweight_frames(
+                py_version,
+                meta_python,
+                platform.machine(),
+            ),
+        )
         set_option("ENABLE_PARALLEL_GC", meta_312)
         set_option("ENABLE_PEP523_HOOK", meta_312 or is_314plus)
         set_option("ENABLE_PERF_TRAMPOLINE", meta_312)
