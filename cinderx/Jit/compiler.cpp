@@ -13,6 +13,7 @@
 #include "cinderx/Jit/hir/dead_code_elimination.h"
 #include "cinderx/Jit/hir/dynamic_comparison_elimination.h"
 #include "cinderx/Jit/hir/float_accumulator_promotion.h"
+#include "cinderx/Jit/hir/float_comparison_simplification.h"
 #include "cinderx/Jit/hir/guard_removal.h"
 #include "cinderx/Jit/hir/hir_stats.h"
 #include "cinderx/Jit/hir/inliner.h"
@@ -119,6 +120,12 @@ void Compiler::runPasses(
   // PrimitiveUnboxCSE makes more of those boxes frame-state-only by merging
   // repeated unboxes before remat looks at direct uses.
   runPassIf(hir::PrimitiveUnboxCSE{}, PassConfig::kPrimitiveUnboxCSE);
+#if defined(CINDER_AARCH64)
+  // ARM-only: relies on fcmp + signed GT/GE for correct NaN semantics.
+  runPassIf(
+      hir::FloatComparisonSimplification{},
+      PassConfig::kFloatComparisonSimplification);
+#endif
   // Deopt correctness also requires the backend trampoline to save FP
   // registers in regs[]; that support is currently implemented for AArch64.
 #if defined(CINDER_AARCH64)
@@ -181,6 +188,8 @@ PassConfig createConfig() {
   set(hir_opts.phi_elim, PassConfig::kPhiElim);
   set(hir_opts.primitive_box_remat, PassConfig::kPrimitiveBoxRemat);
   set(hir_opts.primitive_unbox_cse, PassConfig::kPrimitiveUnboxCSE);
+  set(hir_opts.float_comparison_simplification,
+      PassConfig::kFloatComparisonSimplification);
   set(hir_opts.simplify, PassConfig::kSimplify);
 
   return static_cast<PassConfig>(result);
