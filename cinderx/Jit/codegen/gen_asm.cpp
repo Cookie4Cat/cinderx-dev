@@ -24,6 +24,7 @@
 #include "cinderx/Jit/hir/analysis.h"
 #include "cinderx/Jit/hir/hir.h"
 #include "cinderx/Jit/hir/printer.h"
+#include "cinderx/Jit/inline_cache.h"
 #include "cinderx/Jit/jit_gdb_support.h"
 #include "cinderx/Jit/jit_rt.h"
 #include "cinderx/Jit/lir/dce.h"
@@ -413,6 +414,36 @@ void* finalizeCode(arch::Builder& builder, std::string_view name) {
 // When |code| and |metadata| are non-null, CodeSectionOverride is applied per
 // block (for multi-section support in normal JIT functions).  When they are
 // null the section override is skipped (standalone trampolines).
+void flushAarch64NearDeoptBranches(Environ* env, bool has_fallthrough) {
+#if defined(CINDER_AARCH64)
+  if (env->aarch64_near_deopt_branches.empty()) {
+    return;
+  }
+
+  auto* as = env->as;
+  Label continuation;
+  if (has_fallthrough) {
+    continuation = as->newLabel();
+    as->b(continuation);
+  }
+
+  auto cursor = as->cursor();
+  for (const auto& branch : env->aarch64_near_deopt_branches) {
+    as->bind(branch.near_label);
+    as->b(branch.deopt_label);
+  }
+  env->aarch64_near_deopt_branches.clear();
+  env->addAnnotation("AArch64 near deopt branches", cursor);
+
+  if (has_fallthrough) {
+    as->bind(continuation);
+  }
+#else
+  (void)env;
+  (void)has_fallthrough;
+#endif
+}
+
 void emitLIRBlocks(
     Environ* env,
     lir::Function* lir_func,
@@ -428,7 +459,8 @@ void emitLIRBlocks(
   std::string pending_annotation;
   asmjit::BaseNode* annotation_cursor = nullptr;
 
-  for (lir::BasicBlock* basicblock : blocks) {
+  for (size_t i = 0; i < blocks.size(); ++i) {
+    lir::BasicBlock* basicblock = blocks[i];
     // Optional section override for multi-section code layout.
     std::optional<CodeSectionOverride> section_override;
     if (code != nullptr && metadata != nullptr) {
@@ -466,6 +498,16 @@ void emitLIRBlocks(
       env->addAnnotation(std::move(pending_annotation), annotation_cursor);
       pending_annotation.clear();
     }
+
+    bool has_fallthrough = false;
+    if (i + 1 < blocks.size() &&
+        blocks[i + 1]->section() == basicblock->section()) {
+      auto& successors = basicblock->successors();
+      has_fallthrough =
+          std::find(successors.begin(), successors.end(), blocks[i + 1]) !=
+          successors.end();
+    }
+    flushAarch64NearDeoptBranches(env, has_fallthrough);
   }
 }
 
@@ -1249,6 +1291,114 @@ void NativeGenerator::generateDeoptExits(const asmjit::CodeHolder& code) {
 #endif
 }
 
+void NativeGenerator::emitAarch64LoadAttrInvokeStub(
+    const asmjit::CodeHolder& code) {
+#if defined(CINDER_AARCH64) && PY_VERSION_HEX >= 0x030E0000 && \
+    !defined(Py_GIL_DISABLED)
+  if (!env_.load_attr_invoke_stub.isValid()) {
+    return;
+  }
+
+  CodeSectionOverride hot_override{as_, &code, &metadata_, CodeSection::kHot};
+
+  Label slow_path = as_->newLabel();
+  Label return_value = as_->newLabel();
+  Label incref_done = as_->newLabel();
+
+  constexpr int kEntryTypeOffset = static_cast<int>(
+      jit::AttributeCache::entriesOffset() +
+      jit::AttributeMutator::typeOffset());
+  constexpr int kValOffsetOffset = static_cast<int>(
+      jit::AttributeCache::entriesOffset() +
+      jit::AttributeMutator::splitValOffsetOffset());
+  constexpr int kEntrySize = sizeof(jit::AttributeMutator);
+  constexpr uint64_t kKindMask = jit::AttributeMutator::kindMask();
+  constexpr uint64_t kSplitInlineKnownOffsetKind =
+      jit::AttributeMutator::splitInlineKnownOffsetKind();
+  constexpr int kObTypeOffset = offsetof(PyObject, ob_type);
+  constexpr int kTpBasicSizeOffset = offsetof(PyTypeObject, tp_basicsize);
+  constexpr int kInlineValuesValidOffset = offsetof(PyDictValues, valid);
+  constexpr uint64_t kInlineValuesValuesOffset = offsetof(PyDictValues, values);
+  constexpr int kRefcountOffset = offsetof(PyObject, ob_refcnt);
+
+  ASM_CHECK(as_->align(AlignMode::kCode, 8), GetFunction()->fullname);
+  as_->bind(env_.load_attr_invoke_stub);
+
+  // x0=cache, x1=obj, x2=name
+  as_->ldr(a64::x11, arch::ptr_offset(a64::x1, kObTypeOffset));
+
+  auto emit_load_attr_entry = [&](uint32_t entry_index, Label next_entry) {
+    const int entry_offset = static_cast<int>(entry_index) * kEntrySize;
+    as_->ldr(
+        a64::x12,
+        arch::ptr_offset(a64::x0, kEntryTypeOffset + entry_offset));
+    as_->cbz(a64::x12, next_entry);
+
+    as_->mov(a64::x13, ~kKindMask);
+    as_->and_(a64::x13, a64::x12, a64::x13);
+    as_->cmp(a64::x13, a64::x11);
+    as_->b_ne(next_entry);
+
+    as_->and_(a64::x14, a64::x12, kKindMask);
+    arch::cmp_immediate(as_, a64::x14, kSplitInlineKnownOffsetKind);
+    as_->b_ne(slow_path);
+
+    as_->ldr(a64::x14, arch::ptr_offset(a64::x13, kTpBasicSizeOffset));
+    as_->add(a64::x15, a64::x1, a64::x14);
+    as_->ldrb(
+        a64::w14,
+        arch::ptr_offset(
+            a64::x15, kInlineValuesValidOffset, arch::AccessSize::k8));
+    as_->cbz(a64::w14, slow_path);
+
+    as_->ldr(
+        a64::x14,
+        arch::ptr_offset(a64::x0, kValOffsetOffset + entry_offset));
+    arch::add_immediate(as_, a64::x15, a64::x15, kInlineValuesValuesOffset);
+    as_->add(a64::x15, a64::x15, a64::x14, a64::lsl(3));
+    as_->ldr(a64::x9, a64::ptr(a64::x15));
+    as_->cbz(a64::x9, slow_path);
+    as_->b(return_value);
+  };
+
+  constexpr uint32_t kMaxStubEntries = 4;
+  const uint32_t stub_entries =
+      std::min<uint32_t>(jit::getConfig().attr_cache_size, kMaxStubEntries);
+  if (stub_entries == 0) {
+    as_->b(slow_path);
+  }
+  for (uint32_t entry_index = 0; entry_index < stub_entries; ++entry_index) {
+    const bool has_next_entry = entry_index + 1 != stub_entries;
+    Label next_entry = has_next_entry ? as_->newLabel() : slow_path;
+    emit_load_attr_entry(entry_index, next_entry);
+    if (has_next_entry) {
+      as_->bind(next_entry);
+    }
+  }
+
+  as_->bind(return_value);
+  as_->ldr(
+      a64::w12,
+      arch::ptr_offset(a64::x9, kRefcountOffset, arch::AccessSize::k32));
+  as_->adds(a64::w12, a64::w12, 1);
+  as_->b_mi(incref_done);
+  as_->str(
+      a64::w12,
+      arch::ptr_offset(a64::x9, kRefcountOffset, arch::AccessSize::k32));
+  as_->bind(incref_done);
+  as_->mov(a64::x0, a64::x9);
+  as_->ret(arch::lr);
+
+  as_->bind(slow_path);
+  as_->mov(
+      arch::reg_scratch_br,
+      reinterpret_cast<uint64_t>(jit::LoadAttrCache::invoke));
+  as_->br(arch::reg_scratch_br);
+#else
+  (void)code;
+#endif
+}
+
 void NativeGenerator::linkDeoptPatchers(const asmjit::CodeHolder& code) {
   JIT_CHECK(code.hasBaseAddress(), "code not generated!");
   uint64_t base = code.baseAddress();
@@ -1573,6 +1723,7 @@ void NativeGenerator::generateCode(
   }
 
   generateDeoptExits(codeholder);
+  emitAarch64LoadAttrInvokeStub(codeholder);
 
   for (auto& [osr_idx, block] : env_.osr_entry_blocks) {
     Label stub_label = as_->newLabel();
