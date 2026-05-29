@@ -26,6 +26,7 @@
 #include "cinderx/Jit/hir/ssa.h"
 #include "cinderx/Jit/hir/tree_iter_state_machine_pass.h"
 #include "cinderx/Jit/jit_time_log.h"
+#include "cinderx/Jit/osr.h"
 
 #include <chrono>
 #include <iostream>
@@ -221,6 +222,11 @@ std::optional<CompiledFunctionData> Compiler::Compile(
   Timer timer;
   std::unique_ptr<hir::Function> irfunc(hir::buildHIR(preloader));
   irfunc->reifier = ThreadedRef<>::create(preloader.reifier());
+  const bool compile_osr_entries =
+      getConfig().osr_enabled && !preloader.osrEntryTargetOffsets().empty();
+  if (compile_osr_entries) {
+    irfunc->markOSREntries(preloader.osrEntryTargetOffsets(), preloader.code());
+  }
   if (nullptr != compilation_phase_timer) {
     compilation_phase_timer->end();
   }
@@ -238,6 +244,9 @@ std::optional<CompiledFunctionData> Compiler::Compile(
       irfunc->compilation_phase_timer,
       "HIR transformations",
       Compiler::runPasses(*irfunc, config))
+  if (compile_osr_entries && irfunc->hasOSREntries()) {
+    irfunc->extractOSRLiveIns();
+  }
 
   hir::OpcodeCounts hir_opcode_counts = hir::count_opcodes(*irfunc);
 
@@ -287,6 +296,8 @@ std::optional<CompiledFunctionData> Compiler::Compile(
   compiled_data.inline_function_stats = std::move(inline_stats);
   compiled_data.hir_opcode_counts = hir_opcode_counts;
   compiled_data.runtime = code_runtime;
+  compiled_data.osr_aware = compile_osr_entries;
+  compiled_data.has_osr_entries = code_runtime->hasOSREntries();
   compiled_data.compile_time = compile_time;
   compiled_data.code_patchers = std::move(irfunc->code_patchers);
   if (getConfig().log.debug) {

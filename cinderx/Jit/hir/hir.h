@@ -567,8 +567,11 @@ class INSTR_CLASS(
       BinaryOpKind op,
       Register* left,
       Register* right,
-      const FrameState& frame)
-      : InstrT(dst, left, right, frame), op_(op) {}
+      const FrameState& frame,
+      bool array_subscr_slow_path = false)
+      : InstrT(dst, left, right, frame),
+        op_(op),
+        array_subscr_slow_path_(array_subscr_slow_path) {}
 
   BinaryOpKind op() const {
     return op_;
@@ -582,8 +585,13 @@ class INSTR_CLASS(
     return GetOperand(1);
   }
 
+  bool isArraySubscrSlowPath() const {
+    return array_subscr_slow_path_;
+  }
+
  private:
   BinaryOpKind op_;
+  bool array_subscr_slow_path_;
 };
 
 #define FOREACH_UNARY_OP_KIND(V) \
@@ -3335,6 +3343,20 @@ class INSTR_CLASS(Snapshot, (), Operands<0>) {
 
  private:
   std::unique_ptr<FrameState> frame_state_{nullptr};
+};
+
+// Compilation anchor for a loop-header OSR secondary entry.
+class INSTR_CLASS(OSREntry, (), Operands<0>, DeoptBase) {
+ public:
+  explicit OSREntry(BCOffset target_offset)
+      : InstrT(), target_offset_{target_offset} {}
+
+  BCOffset targetOffset() const {
+    return target_offset_;
+  }
+
+ private:
+  BCOffset target_offset_;
 };
 
 // Used to indicate a control flow path that is statically known to be

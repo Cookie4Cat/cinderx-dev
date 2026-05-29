@@ -2966,6 +2966,29 @@ LIRGenerator::TranslatedBlock LIRGenerator::TranslateOneBasicBlock(
         }
         break;
       }
+      case Opcode::kOSREntry: {
+        const auto& entry = static_cast<const OSREntry&>(i);
+        const OSRMetadata* skeleton = func_->osrMetadataFor(entry);
+        if (skeleton == nullptr) {
+          break;
+        }
+        std::size_t osr_id =
+            env_->code_rt->addOSRMetadata(OSRMetadata{*skeleton});
+        Instruction* lir =
+            bbb.appendInstr(Instruction::kOSREntry, Imm{osr_id});
+        JIT_CHECK(
+            env_->asm_tstate != nullptr && env_->asm_func != nullptr &&
+                env_->asm_interpreter_frame != nullptr,
+            "OSR entry requires materialized Environ registers");
+        lir->addOperands(VReg{env_->asm_tstate});
+        lir->addOperands(VReg{env_->asm_func});
+        lir->addOperands(VReg{env_->asm_interpreter_frame});
+        for (const OSRLiveIn& live_in : skeleton->live_ins) {
+          lir->addOperands(VReg{bbb.getDefInstr(live_in.hir_reg)});
+        }
+        env_->osr_entry_blocks.emplace(osr_id, lir->basicblock());
+        break;
+      }
       case Opcode::kRaiseAwaitableError: {
         const auto& instr = static_cast<const RaiseAwaitableError&>(i);
         bbb.appendInvokeInstruction(
@@ -4615,6 +4638,7 @@ LIRGenerator::TranslatedBlock LIRGenerator::TranslateOneBasicBlock(
         case Opcode::kInvokeStaticFunction:
         case Opcode::kIsInstance:
         case Opcode::kIsTruthy:
+        case Opcode::kOSREntry:
         case Opcode::kRaiseAwaitableError:
         case Opcode::kRaise:
         case Opcode::kRaiseStatic:

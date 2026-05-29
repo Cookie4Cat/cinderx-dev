@@ -126,6 +126,8 @@ struct Environ {
   UnorderedMap<const hir::Register*, hir::Register*> copy_propagation_map;
 
   UnorderedMap<jit::lir::BasicBlock*, asmjit::Label> block_label_map;
+  UnorderedMap<std::size_t, jit::lir::BasicBlock*> osr_entry_blocks;
+  UnorderedMap<std::size_t, asmjit::Label> osr_entry_stub_labels;
 
   UnorderedMap<const hir::BeginInlinedFunction*, lir::Instruction*>
       inline_frame_map;

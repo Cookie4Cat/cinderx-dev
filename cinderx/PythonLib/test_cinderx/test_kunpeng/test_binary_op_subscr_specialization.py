@@ -1,175 +1,304 @@
 import dis
 import sys
-
-import pytest
+import unittest
+from typing import Any, Callable, TypeVar
 
 import cinderx.jit
 
 
-_all_opnames = list(dis.opname)
+TCallableRet = TypeVar("TCallableRet")
+
+
+_ALL_OPNAMES = list(dis.opname)
 if hasattr(dis, "_specialized_instructions"):
-    _specialized_indices = [
-        index for index, name in enumerate(_all_opnames) if name.startswith("<")
+    _SPECIALIZED_INDICES = [
+        index for index, name in enumerate(_ALL_OPNAMES) if name.startswith("<")
     ]
-
-    for index, name in zip(_specialized_indices, dis._specialized_instructions):
-        _all_opnames[index] = name
-
-
-def _opnames(func):
-    return [_all_opnames[insn.opcode] for insn in dis.Bytecode(func, adaptive=True)]
+    for index, name in zip(_SPECIALIZED_INDICES, dis._specialized_instructions):
+        _ALL_OPNAMES[index] = name
 
 
-def _expected_subscr_opname(container):
-    prefix = "BINARY_OP_SUBSCR" if sys.version_info >= (3, 14) else "BINARY_SUBSCR"
-    return f"{prefix}_{container}"
+def opnames(func: Callable[..., TCallableRet]) -> list[str]:
+    return [_ALL_OPNAMES[insn.opcode] for insn in dis.Bytecode(func, adaptive=True)]
 
 
-def _specialize_then_compile(func, runner, expected_opname, expected_hir_opname):
+def hir_opnames(func: Callable[..., TCallableRet]) -> set[str]:
+    counts = cinderx.jit.get_function_hir_opcode_counts(func)
+    assert counts is not None
+    return set(counts)
+
+
+def specialize(
+    func: Callable[..., TCallableRet],
+    callable: Callable[[], TCallableRet],
+    warmup: int = 8,
+) -> None:
     cinderx.jit.force_uncompile(func)
     cinderx.jit.jit_suppress(func)
-
     try:
-        for _ in range(20):
-            runner()
-
-        opnames = _opnames(func)
-        assert expected_opname in opnames, opnames
-
-        cinderx.jit.jit_unsuppress(func)
-        assert cinderx.jit.force_compile(func)
-        hir_counts = cinderx.jit.get_function_hir_opcode_counts(func)
-        assert hir_counts is not None
-        assert hir_counts.get(expected_hir_opname, 0) > 0, hir_counts
+        for _ in range(warmup):
+            callable()
     finally:
         cinderx.jit.jit_unsuppress(func)
+    assert cinderx.jit.force_compile(func)
 
 
-class _Index:
-    def __init__(self, value):
-        self.value = value
+@unittest.skipUnless(sys.version_info >= (3, 14), "requires BINARY_OP_SUBSCR")
+@unittest.skipUnless(cinderx.jit.is_enabled(), "requires CinderX JIT")
+class BinaryOpSubscrSpecializationTests(unittest.TestCase):
+    def setUp(self) -> None:
+        cinderx.jit.enable_specialized_opcodes()
 
-    def __index__(self):
-        return self.value
+    def tearDown(self) -> None:
+        cinderx.jit.disable_specialized_opcodes()
+
+    def assert_specialized_opcode(
+        self, func: Callable[..., object], expected: str
+    ) -> None:
+        names = opnames(func)
+        self.assertIn(expected, names)
+        self.assertNotIn("BINARY_OP", names)
+
+    def assert_hir_specialized_sequence_path(
+        self, func: Callable[..., object]
+    ) -> None:
+        hir = hir_opnames(func)
+        self.assertIn("LoadArrayItem", hir)
+        self.assertNotIn("BinaryOp", hir)
+
+    def assert_hir_generic_subscript_path(
+        self, func: Callable[..., object]
+    ) -> None:
+        hir = hir_opnames(func)
+        self.assertIn("BinaryOp", hir)
+        self.assertNotIn("DictSubscr", hir)
+
+    def test_tuple_int_subscr_keeps_specialized_hir_path(self) -> None:
+        def f(xs: tuple[str, str, str], i: int) -> str:
+            return xs[i]
+
+        specialize(f, lambda: f(("a", "b", "c"), 1))
+
+        self.assert_specialized_opcode(f, "BINARY_OP_SUBSCR_TUPLE_INT")
+        self.assert_hir_specialized_sequence_path(f)
+        self.assertEqual(f(("x", "y", "z"), 2), "z")
+
+    def test_list_int_subscr_keeps_specialized_hir_path(self) -> None:
+        def f(xs: list[str], i: int) -> str:
+            return xs[i]
+
+        specialize(f, lambda: f(["a", "b", "c"], 1))
+
+        self.assert_specialized_opcode(f, "BINARY_OP_SUBSCR_LIST_INT")
+        self.assert_hir_specialized_sequence_path(f)
+        self.assertEqual(f(["x", "y", "z"], 2), "z")
+
+    def test_dict_missing_key_preserves_key_error(self) -> None:
+        def f(d: dict[str, str], k: str) -> str:
+            return d[k]
+
+        specialize(f, lambda: f({"present": "value"}, "present"))
+
+        self.assert_specialized_opcode(f, "BINARY_OP_SUBSCR_DICT")
+        self.assertIn("DictSubscr", hir_opnames(f))
+        with self.assertRaises(KeyError):
+            f({"present": "value"}, "missing")
+
+    def test_dict_subscr_keeps_specialized_hir_path(self) -> None:
+        def f(d: dict[str, str], k: str) -> str:
+            return d[k]
+
+        specialize(f, lambda: f({"a": "b"}, "a"))
+
+        self.assert_specialized_opcode(f, "BINARY_OP_SUBSCR_DICT")
+        hir = hir_opnames(f)
+        self.assertIn("DictSubscr", hir)
+        self.assertNotIn("BinaryOp", hir)
+        self.assertEqual(f({"c": "d"}, "c"), "d")
+
+    def test_custom_getitem_stays_on_generic_subscript_path(self) -> None:
+        class CustomGetItem:
+            def __init__(self) -> None:
+                self.keys: list[str] = []
+
+            def __getitem__(self, key: str) -> str:
+                self.keys.append(key)
+                return f"value:{key}"
+
+        def f(obj: Any, key: Any) -> Any:
+            return obj[key]
+
+        obj = CustomGetItem()
+        specialize(f, lambda: f(obj, "a"))
+
+        names = opnames(f)
+        self.assertNotIn("BINARY_OP_SUBSCR_DICT", names)
+        self.assertNotIn("BINARY_OP_SUBSCR_LIST_INT", names)
+        self.assertNotIn("BINARY_OP_SUBSCR_TUPLE_INT", names)
+        self.assert_hir_generic_subscript_path(f)
+        self.assertEqual(f(obj, "b"), "value:b")
+        self.assertEqual(obj.keys[-1], "b")
+
+    def test_custom_len_to_bool_stays_on_generic_truth_path(self) -> None:
+        class CustomLen:
+            def __init__(self, length: int) -> None:
+                self.length = length
+                self.calls = 0
+
+            def __len__(self) -> int:
+                self.calls += 1
+                return self.length
+
+        def f(obj: Any) -> str:
+            if obj:
+                return "truthy"
+            return "falsey"
+
+        truthy = CustomLen(3)
+        specialize(f, lambda: f(truthy))
+
+        names = opnames(f)
+        self.assertNotIn("TO_BOOL_LIST", names)
+        self.assertNotIn("TO_BOOL_STR", names)
+        self.assertIn("IsTruthy", hir_opnames(f))
+
+        falsey = CustomLen(0)
+        self.assertEqual(f(falsey), "falsey")
+        self.assertEqual(falsey.calls, 1)
+
+    def test_sequence_non_int_subscr_stays_generic(self) -> None:
+        def f(xs: Any, i: Any) -> Any:
+            return xs[i]
+
+        cinderx.jit.force_uncompile(f)
+        cinderx.jit.jit_suppress(f)
+        try:
+            for _ in range(8):
+                with self.assertRaises(TypeError):
+                    f(["a", "b"], "0")
+        finally:
+            cinderx.jit.jit_unsuppress(f)
+        assert cinderx.jit.force_compile(f)
+
+        names = opnames(f)
+        self.assertNotIn("BINARY_OP_SUBSCR_LIST_INT", names)
+        self.assertNotIn("BINARY_OP_SUBSCR_TUPLE_INT", names)
+        self.assert_hir_generic_subscript_path(f)
+
+        with self.assertRaises(TypeError):
+            f(["a", "b"], "0")
+        with self.assertRaises(TypeError):
+            f(("a", "b"), 1.0)
+
+    def test_list_int_subscr_guard_misses_preserve_python_semantics(self) -> None:
+        class Index:
+            def __init__(self, value: int) -> None:
+                self.value = value
+
+            def __index__(self) -> int:
+                return self.value
+
+        class BadIndex:
+            def __index__(self) -> int:
+                raise RuntimeError("index failed")
+
+        class ListSubclass(list):
+            def __getitem__(self, index: object) -> tuple[str, object]:
+                return ("override", index)
+
+        def f(xs: Any, i: Any) -> Any:
+            return xs[i]
+
+        specialize(f, lambda: f(["a", "b"], 0))
+
+        self.assert_specialized_opcode(f, "BINARY_OP_SUBSCR_LIST_INT")
+        self.assertEqual(f(["a", "b"], -1), "b")
+        self.assertEqual(f(["a", "b"], False), "a")
+        self.assertEqual(f(["a", "b"], Index(1)), "b")
+        self.assertEqual(f(["a", "b"], slice(0, 1)), ["a"])
+        self.assertEqual(f(ListSubclass(["a"]), 0), ("override", 0))
+        with self.assertRaisesRegex(RuntimeError, "index failed"):
+            f(["a", "b"], BadIndex())
+        with self.assertRaises(IndexError):
+            f([], 0)
+        with self.assertRaises(IndexError):
+            f([], -1)
+        with self.assertRaises(IndexError):
+            f(["a"], 2)
+        with self.assertRaises(IndexError):
+            f(["a"], -2)
+        with self.assertRaises(IndexError):
+            f(["a"], 2**100)
+
+    def test_tuple_int_subscr_guard_misses_preserve_python_semantics(self) -> None:
+        class Index:
+            def __init__(self, value: int) -> None:
+                self.value = value
+
+            def __index__(self) -> int:
+                return self.value
+
+        class BadIndex:
+            def __index__(self) -> int:
+                raise RuntimeError("index failed")
+
+        class TupleSubclass(tuple):
+            def __getitem__(self, index: object) -> tuple[str, object]:
+                return ("override", index)
+
+        def f(xs: Any, i: Any) -> Any:
+            return xs[i]
+
+        specialize(f, lambda: f(("a", "b"), 0))
+
+        self.assert_specialized_opcode(f, "BINARY_OP_SUBSCR_TUPLE_INT")
+        self.assertEqual(f(("a", "b"), -1), "b")
+        self.assertEqual(f(("a", "b"), False), "a")
+        self.assertEqual(f(("a", "b"), Index(1)), "b")
+        self.assertEqual(f(("a", "b"), slice(0, 1)), ("a",))
+        self.assertEqual(f(TupleSubclass(("a",)), 0), ("override", 0))
+        with self.assertRaisesRegex(RuntimeError, "index failed"):
+            f(("a", "b"), BadIndex())
+        with self.assertRaises(IndexError):
+            f((), 0)
+        with self.assertRaises(IndexError):
+            f((), -1)
+        with self.assertRaises(IndexError):
+            f(("a",), 2)
+        with self.assertRaises(IndexError):
+            f(("a",), -2)
+        with self.assertRaises(IndexError):
+            f(("a",), 2**100)
+
+    def test_dict_subscr_guard_misses_preserve_python_semantics(self) -> None:
+        class MissingDict(dict):
+            def __missing__(self, key: object) -> tuple[str, object]:
+                return ("missing", key)
+
+        class Mapping:
+            def __getitem__(self, key: object) -> tuple[str, object]:
+                return ("mapped", key)
+
+        class BadHash:
+            def __hash__(self) -> int:
+                raise RuntimeError("hash failed")
+
+        def f(container: Any, key: Any) -> Any:
+            return container[key]
+
+        specialize(f, lambda: f({"a": "b"}, "a"))
+
+        self.assert_specialized_opcode(f, "BINARY_OP_SUBSCR_DICT")
+        self.assertEqual(f(MissingDict(), "x"), ("missing", "x"))
+        self.assertEqual(f(Mapping(), "x"), ("mapped", "x"))
+        with self.assertRaises(KeyError) as excinfo:
+            f({}, "x")
+        self.assertEqual(excinfo.exception.args, ("x",))
+        with self.assertRaises(TypeError):
+            f({}, [])
+        with self.assertRaisesRegex(RuntimeError, "hash failed"):
+            f({}, BadHash())
 
 
-class _BadIndex:
-    def __index__(self):
-        raise RuntimeError("index failed")
-
-
-@pytest.fixture(autouse=True)
-def _specialized_opcodes():
-    if not cinderx.jit.is_enabled():
-        pytest.skip("requires CinderX JIT")
-
-    cinderx.jit.enable_specialized_opcodes()
-
-
-def test_binary_op_subscr_list_int_semantics_and_guard_misses():
-    def f(container, index):
-        return container[index]
-
-    _specialize_then_compile(
-        f,
-        lambda: f(["a", "b"], 0),
-        _expected_subscr_opname("LIST_INT"),
-        "LoadArrayItem",
-    )
-
-    assert f(["a", "b"], -1) == "b"
-    assert f(["a", "b"], False) == "a"
-    assert f(["a", "b"], _Index(1)) == "b"
-    assert f(["a", "b"], slice(0, 1)) == ["a"]
-    with pytest.raises(RuntimeError, match="index failed"):
-        f(["a", "b"], _BadIndex())
-
-    class ListSubclass(list):
-        def __getitem__(self, index):
-            return ("override", index)
-
-    assert f(ListSubclass(["a"]), 0) == ("override", 0)
-
-    with pytest.raises(IndexError):
-        f([], 0)
-    with pytest.raises(IndexError):
-        f([], -1)
-    with pytest.raises(IndexError):
-        f(["a"], 2)
-    with pytest.raises(IndexError):
-        f(["a"], -2)
-    with pytest.raises(IndexError):
-        f(["a"], 2**100)
-
-
-def test_binary_op_subscr_tuple_int_semantics_and_guard_misses():
-    def f(container, index):
-        return container[index]
-
-    _specialize_then_compile(
-        f,
-        lambda: f(("a", "b"), 0),
-        _expected_subscr_opname("TUPLE_INT"),
-        "LoadArrayItem",
-    )
-
-    assert f(("a", "b"), -1) == "b"
-    assert f(("a", "b"), False) == "a"
-    assert f(("a", "b"), _Index(1)) == "b"
-    assert f(("a", "b"), slice(0, 1)) == ("a",)
-    with pytest.raises(RuntimeError, match="index failed"):
-        f(("a", "b"), _BadIndex())
-
-    class TupleSubclass(tuple):
-        def __getitem__(self, index):
-            return ("override", index)
-
-    assert f(TupleSubclass(("a",)), 0) == ("override", 0)
-
-    with pytest.raises(IndexError):
-        f((), 0)
-    with pytest.raises(IndexError):
-        f((), -1)
-    with pytest.raises(IndexError):
-        f(("a",), 2)
-    with pytest.raises(IndexError):
-        f(("a",), -2)
-    with pytest.raises(IndexError):
-        f(("a",), 2**100)
-
-
-def test_binary_op_subscr_dict_semantics_and_guard_misses():
-    def f(container, key):
-        return container[key]
-
-    _specialize_then_compile(
-        f,
-        lambda: f({"a": "b"}, "a"),
-        _expected_subscr_opname("DICT"),
-        "DictSubscr",
-    )
-
-    assert f({"x": "y"}, "x") == "y"
-
-    class MissingDict(dict):
-        def __missing__(self, key):
-            return ("missing", key)
-
-    class Mapping:
-        def __getitem__(self, key):
-            return ("mapped", key)
-
-    class BadHash:
-        def __hash__(self):
-            raise RuntimeError("hash failed")
-
-    assert f(MissingDict(), "x") == ("missing", "x")
-    assert f(Mapping(), "x") == ("mapped", "x")
-
-    with pytest.raises(KeyError) as excinfo:
-        f({}, "x")
-    assert excinfo.value.args == ("x",)
-    with pytest.raises(TypeError):
-        f({}, [])
-    with pytest.raises(RuntimeError, match="hash failed"):
-        f({}, BadHash())
+if __name__ == "__main__":
+    unittest.main()

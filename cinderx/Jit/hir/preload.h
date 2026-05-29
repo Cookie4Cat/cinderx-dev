@@ -6,10 +6,12 @@
 
 #include "cinderx/Common/log.h"
 #include "cinderx/Common/ref.h"
+#include "cinderx/Jit/bytecode_offsets.h"
 #include "cinderx/Jit/hir/annotation_index.h"
 #include "cinderx/Jit/hir/function.h"
 #include "cinderx/Jit/hir/hir.h"
 #include "cinderx/Jit/hir/type.h"
+#include "cinderx/Jit/osr.h"
 #include "cinderx/StaticPython/typed-args-info.h"
 
 #include <map>
@@ -114,7 +116,13 @@ class Preloader {
         "Expecting Python exception only when preloading fails, preloading "
         "result: {}",
         success);
-    return success ? std::move(preloader) : nullptr;
+    if (!success) {
+      return nullptr;
+    }
+#if defined(CINDER_AARCH64)
+    preloader->setOSREntryTargetOffsets(collectBackedgeTargetOffsets(code));
+#endif
+    return preloader;
   }
 
   Type type(BorrowedRef<> descr) const;
@@ -195,6 +203,17 @@ class Preloader {
     return reifier_;
   }
 
+  // OSR entry target offsets (BCOffset, byte offsets).
+  // Empty for normal function compilation. Non-empty triggers OSR entry
+  // generation in Compiler::Compile().
+  const std::vector<BCOffset>& osrEntryTargetOffsets() const {
+    return osr_entry_offsets_;
+  }
+
+  void setOSREntryTargetOffsets(std::vector<BCOffset> offsets) {
+    osr_entry_offsets_ = std::move(offsets);
+  }
+
  private:
   BorrowedRef<> constArg(BytecodeInstruction& bc_instr) const;
   PyObject** getGlobalCache(BorrowedRef<> name) const;
@@ -247,6 +266,8 @@ class Preloader {
   bool has_primitive_first_arg_{false};
   // for primitive args only, null unless has_primitive_args_
   Ref<_PyTypedArgsInfo> prim_args_info_;
+  // OSR entry target offsets (byte offsets). Empty for normal compilation.
+  std::vector<BCOffset> osr_entry_offsets_;
 };
 
 using PreloaderMap =

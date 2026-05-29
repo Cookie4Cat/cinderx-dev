@@ -540,6 +540,7 @@ Type outputType(
     case Opcode::kIncref:
     case Opcode::kInitFrameCellVars:
     case Opcode::kLoadFrame:
+    case Opcode::kOSREntry:
     case Opcode::kRaise:
     case Opcode::kRaiseAwaitableError:
     case Opcode::kRaiseStatic:

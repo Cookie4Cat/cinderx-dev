@@ -21,9 +21,11 @@ extern "C" {
 #include "cinderx/Jit/containers.h"
 #include "cinderx/Jit/context.h"
 #include "cinderx/Jit/hir/annotation_index.h"
+#include "cinderx/Jit/hir/array_specialize.h"
 #include "cinderx/Jit/hir/ssa.h"
 #include "cinderx/Jit/hir/type.h"
 #include "cinderx/Jit/jit_rt.h"
+#include "cinderx/Jit/threaded_compile.h"
 #include "cinderx/StaticPython/checked_dict.h"
 #include "cinderx/StaticPython/checked_list.h"
 #include "cinderx/StaticPython/classloader.h"
@@ -297,6 +299,94 @@ bool codeHasBackedge(BorrowedRef<PyCodeObject> code) {
 
 } // namespace
 
+// Get the array.array type object for fast path type guards.
+// Pre-cached with runtime layout validation. The cached value is readable
+// by any thread once initialized; only the initialization path requires
+// the GIL (and is skipped on worker threads).
+PyTypeObject* getStdlibArrayType() {
+  static PyTypeObject* cached_type = nullptr;
+  if (cached_type != nullptr) {
+    return cached_type;
+  }
+
+  // Initialization needs the GIL (PyImport_ImportModule etc.).
+  // Worker threads skip initialization and return nullptr; the fast path
+  // is only available for functions compiled on the main thread.
+  RETURN_MULTITHREADED_COMPILE(nullptr);
+
+  auto module = Ref<>::steal(PyImport_ImportModule("array"));
+  if (module == nullptr) {
+    PyErr_Clear();
+    return nullptr;
+  }
+
+  auto array_type = Ref<>::steal(PyObject_GetAttrString(module, "array"));
+  if (array_type == nullptr) {
+    PyErr_Clear();
+    return nullptr;
+  }
+
+  if (!PyType_Check(array_type)) {
+    return nullptr;
+  }
+
+  auto* type = reinterpret_cast<PyTypeObject*>(array_type.get());
+
+  // Runtime layout validation: create a probe instance and verify offsets.
+  auto probe_list = Ref<>::steal(PyList_New(1));
+  if (probe_list == nullptr) {
+    PyErr_Clear();
+    return nullptr;
+  }
+  auto float_val = Ref<>::steal(PyFloat_FromDouble(1.5));
+  if (float_val == nullptr) {
+    PyErr_Clear();
+    return nullptr;
+  }
+  PyList_SET_ITEM(probe_list, 0, float_val.release());
+
+  auto d_str = Ref<>::steal(PyUnicode_InternFromString("d"));
+  if (d_str == nullptr) {
+    PyErr_Clear();
+    return nullptr;
+  }
+  auto args = Ref<>::steal(PyTuple_Pack(2, d_str.get(), probe_list.get()));
+  if (args == nullptr) {
+    PyErr_Clear();
+    return nullptr;
+  }
+
+  auto probe = Ref<>::steal(PyObject_CallObject(array_type, args));
+  if (probe == nullptr) {
+    PyErr_Clear();
+    return nullptr;
+  }
+
+  auto* arr = reinterpret_cast<StdlibArrayObject*>(probe.get());
+
+  // Verify ob_item points to valid double data
+  if (arr->ob_item == nullptr) {
+    return nullptr;
+  }
+
+  // Verify ob_descr->typecode == 'd'
+  if (arr->ob_descr == nullptr || arr->ob_descr->typecode != 'd') {
+    return nullptr;
+  }
+
+  // Verify we can actually read the stored value
+  double val = *reinterpret_cast<double*>(arr->ob_item);
+  if (val != 1.5) {
+    return nullptr;
+  }
+
+  // Transfer ownership: array_type's Ref<> will decref on scope exit,
+  // so we must incref to keep the type alive for the static cache.
+  Py_INCREF(type);
+  cached_type = type;
+  return cached_type;
+}
+
 // Allocate a temp register that may be used for the stack. It should not be a
 // register that will be treated specially in the FrameState (e.g. tracked as
 // containing a local or cell.)
@@ -474,6 +564,25 @@ static bool should_snapshot(
   }
 }
 
+static bool isEntrySetupInstr(
+    const BytecodeInstruction& bci,
+    bool initial_yield_value_on_stack) {
+  switch (bci.opcode()) {
+    case COPY_FREE_VARS:
+    case GEN_START:
+    case MAKE_CELL:
+    case NOP:
+    case NOT_TAKEN:
+    case RESUME:
+    case RETURN_GENERATOR:
+      return true;
+    case POP_TOP:
+      return initial_yield_value_on_stack;
+    default:
+      return false;
+  }
+}
+
 // Compute basic block boundaries and allocate corresponding HIR blocks
 HIRBuilder::BlockMap HIRBuilder::createBlocks(
     Function& irfunc,
@@ -565,21 +674,19 @@ std::unique_ptr<Function> HIRBuilder::buildHIR() {
 
 // Loop through each of the arguments on the current translation context and
 // check and see if there is any annotation to guard against.
-void HIRBuilder::emitTypeAnnotationGuards(TranslationContext& tc) {
+bool HIRBuilder::emitTypeAnnotationGuards(TranslationContext& tc) {
   AnnotationIndex* index = preloader_.annotations();
   bool first = true;
 
   auto emit_arg_guard = [&](int arg_idx,
                             Type type,
                             bool needs_frame_state = false) {
-    // If we have a guard to emit, we need a snapshot for deopt.
-    //
-    // It's likely that no bytecode instructions have been compiled yet,
-    // meaning the instruction offset has not yet been set. Setting it to zero
-    // here ensures that deopt starts executing at the first instruction.
+    // If we have a guard to emit, we need a snapshot for deopt. Callers should
+    // only emit entry guards after any bytecode setup required by the frame has
+    // been translated, so the current instruction offset is a valid resume
+    // point.
     if (first) {
       first = false;
-      tc.frame.cur_instr_offs = BCOffset(0);
       tc.emitSnapshot();
     }
 
@@ -611,7 +718,7 @@ void HIRBuilder::emitTypeAnnotationGuards(TranslationContext& tc) {
 
   // Bail out if there are no annotations.
   if (!index) {
-    return;
+    return !first;
   }
 
   PyCodeObject* const code = tc.frame.code;
@@ -633,6 +740,8 @@ void HIRBuilder::emitTypeAnnotationGuards(TranslationContext& tc) {
         Type::fromTypeExact(reinterpret_cast<PyTypeObject*>(annotation));
     emit_arg_guard(arg_idx, type);
   }
+
+  return !first;
 }
 
 BasicBlock* HIRBuilder::buildHIRImpl(
@@ -678,8 +787,6 @@ BasicBlock* HIRBuilder::buildHIRImpl(
   if (frame_state == nullptr) {
     entry_tc.emit<LoadFrame>();
   }
-
-  emitTypeAnnotationGuards(entry_tc);
 
   // "Initial Yield" has an explicit bytecode instruction in
   // "RETURN_GENERATOR" and so is emitted at the appropriate time.
@@ -782,6 +889,9 @@ void HIRBuilder::translate(
   std::deque<TranslationContext> queue = {initial_tc};
   std::unordered_set<BasicBlock*> processed;
   std::unordered_set<BasicBlock*> loop_headers;
+  bool entry_guards_emitted = false;
+  bool in_entry_setup = true;
+  bool saw_initial_yield = false;
 
   while (!queue.empty()) {
     auto tc = std::move(queue.front());
@@ -793,6 +903,7 @@ void HIRBuilder::translate(
 
     // Translate remaining instructions into HIR
     auto& bc_block = map_get(block_map_.bc_blocks, tc.block);
+    bool is_entry_bc_block = bc_block.startOffset() == BCOffset{0};
 
     auto is_in_async_for_header_block = [&tc, &bc_instrs]() {
       if (tc.frame.block_stack.isEmpty()) {
@@ -808,21 +919,35 @@ void HIRBuilder::translate(
 
       tc.frame.cur_instr_offs = bc_instr.baseOffset();
       Instr* prev_hir_instr = tc.block->GetTerminator();
+      bool emitted_entry_guards = false;
+      bool initial_yield_value_on_stack =
+          saw_initial_yield && !tc.frame.stack.isEmpty();
+      bool is_entry_setup_instr = is_entry_bc_block && in_entry_setup &&
+          isEntrySetupInstr(bc_instr, initial_yield_value_on_stack);
+      if (is_entry_bc_block && !entry_guards_emitted &&
+          !is_entry_setup_instr) {
+        JIT_DCHECK(
+            tc.frame.stack.isEmpty(),
+            "entry guards inserted with non-empty operand stack");
+        if (tc.frame.stack.isEmpty()) {
+          emitted_entry_guards = emitTypeAnnotationGuards(tc);
+        }
+        entry_guards_emitted = true;
+        in_entry_setup = false;
+      }
       // Outputting too many snapshots is safe but noisy so try to cull.
       // Note in some cases we'll have a non-empty block without yet having
       // translated any bytecodes. For example, if this is the first block and
       // there were prologue HIR instructions.
-      if (
+      if (!emitted_entry_guards &&
           // A completely empty block always gets a snapshot.
-          prev_hir_instr == nullptr ||
-          (
-              // If we already have HIR instructions but haven't processed a
-              // bytecode yet then conservatively emit a Snapshot.
-              (prev_bc_instr.baseOffset() < 0 ||
-               // Only emit a Snapshot after bytecode instructions which might
-               // change the frame state.
-               should_snapshot(
-                   prev_bc_instr, is_in_async_for_header_block())))) {
+          (prev_hir_instr == nullptr ||
+           // If we already have HIR instructions but haven't processed a
+           // bytecode yet then conservatively emit a Snapshot.
+           prev_bc_instr.baseOffset() < 0 ||
+           // Only emit a Snapshot after bytecode instructions which might
+           // change the frame state.
+           should_snapshot(prev_bc_instr, is_in_async_for_header_block()))) {
         if (prev_hir_instr && prev_hir_instr->IsSnapshot()) {
           auto snapshot = static_cast<Snapshot*>(prev_hir_instr);
           snapshot->setFrameState(tc.frame);
@@ -858,6 +983,10 @@ void HIRBuilder::translate(
         case BINARY_SUBTRACT:
         case BINARY_TRUE_DIVIDE:
         case BINARY_XOR: {
+          // The array.array('d') subscript fast path is emitted later in the
+          // Simplify pass (simplifyBinaryOp), where the container's type is
+          // known, so it does not perturb subscripts on statically-typed
+          // containers (list/tuple/dict/str).
           emitBinaryOp(tc, bc_instr);
           break;
         }
@@ -966,7 +1095,7 @@ void HIRBuilder::translate(
           break;
         }
         case TO_BOOL: {
-          emitToBool(tc);
+          emitToBool(tc, &bc_instr);
           break;
         }
         case COPY_DICT_WITHOUT_KEYS: {
@@ -1255,7 +1384,7 @@ void HIRBuilder::translate(
           break;
         }
         case STORE_SUBSCR: {
-          emitStoreSubscr(tc, bc_instr);
+          emitStoreSubscr(irfunc.cfg, tc, bc_instr);
           break;
         }
         case BUILD_SLICE: {
@@ -1541,6 +1670,14 @@ void HIRBuilder::translate(
               opcodeName(opcode));
         default: {
           JIT_ABORT("Unhandled opcode {} ({})", opcode, opcodeName(opcode));
+        }
+      }
+
+      if (is_entry_setup_instr) {
+        if (opcode == RETURN_GENERATOR) {
+          saw_initial_yield = true;
+        } else if (opcode == POP_TOP && tc.frame.stack.isEmpty()) {
+          saw_initial_yield = false;
         }
       }
     }
@@ -2661,8 +2798,38 @@ void HIRBuilder::emitCompareOp(
   }
 }
 
-void HIRBuilder::emitToBool(TranslationContext& tc) {
+void HIRBuilder::emitToBool(
+    TranslationContext& tc,
+    const jit::BytecodeInstruction* bc_instr) {
+  FrameState deopt_frame = tc.frame;
   Register* operand = tc.frame.stack.pop();
+
+  if (bc_instr != nullptr && getConfig().specialized_opcodes) {
+    switch (bc_instr->specializedOpcode()) {
+#if PY_VERSION_HEX >= 0x030E0000
+      case TO_BOOL_BOOL:
+        tc.emit<GuardType>(operand, TBool, operand, deopt_frame);
+        tc.emit<UseType>(operand, TBool);
+        tc.frame.stack.push(operand);
+        return;
+      case TO_BOOL_INT:
+        tc.emit<GuardType>(operand, TLongExact, operand, deopt_frame);
+        tc.emit<UseType>(operand, TLongExact);
+        break;
+      case TO_BOOL_LIST:
+        tc.emit<GuardType>(operand, TListExact, operand, deopt_frame);
+        tc.emit<UseType>(operand, TListExact);
+        break;
+      case TO_BOOL_STR:
+        tc.emit<GuardType>(operand, TUnicodeExact, operand, deopt_frame);
+        tc.emit<UseType>(operand, TUnicodeExact);
+        break;
+#endif
+      default:
+        break;
+    }
+  }
+
   Register* truthy_result = temps_.AllocateStack();
   tc.emit<IsTruthy>(truthy_result, operand, tc.frame);
 
@@ -3985,6 +4152,52 @@ void HIRBuilder::emitStoreSlice(TranslationContext& tc) {
   tc.emit<StoreSubscr>(container, slice, values, tc.frame);
 }
 
+// Emit the index type guard: check sub is LongExact, unbox to CInt64,
+// and check for negative index. Returns the unboxed index register.
+// On type mismatch or negative index, branches to slow_path (deopt).
+Register* HIRBuilder::emitArrayIndexGuard(
+    CFG& cfg,
+    TranslationContext& tc,
+    Register* sub,
+    BasicBlock* slow_path) {
+  BasicBlock* idx_ok = cfg.AllocateBlock();
+  tc.emit<CondBranchCheckType>(sub, TLongExact, idx_ok, slow_path);
+  tc.block = idx_ok;
+  tc.emit<RefineType>(sub, TLongExact, sub);
+  Register* unboxed_idx = temps_.AllocateStack();
+  tc.emit<PrimitiveUnbox>(unboxed_idx, sub, TCInt64);
+  Register* neg_check = temps_.AllocateStack();
+  tc.emit<IsNegativeAndErrOccurred>(neg_check, unboxed_idx, tc.frame);
+  return unboxed_idx;
+}
+
+// Emit the typecode == 'd' check: load ob_descr->typecode, compare with
+// 'd', and branch. Returns the tc_ok block for the caller to continue.
+BasicBlock* HIRBuilder::emitArrayTypecodeCheck(
+    CFG& cfg,
+    TranslationContext& tc,
+    Register* container,
+    BasicBlock* slow_path) {
+  auto descr = temps_.AllocateStack();
+  tc.emit<LoadField>(
+      descr,
+      container,
+      "ob_descr",
+      offsetof(StdlibArrayObject, ob_descr),
+      TCPtr);
+  auto typecode = temps_.AllocateStack();
+  tc.emit<LoadField>(
+      typecode, descr, "typecode", offsetof(StdlibArrayDescr, typecode), TCInt8);
+  auto expected_tc = temps_.AllocateStack();
+  tc.emit<LoadConst>(expected_tc, Type::fromCInt('d', TCInt8));
+  auto tc_match = temps_.AllocateStack();
+  tc.emit<PrimitiveCompare>(
+      tc_match, PrimitiveCompareOp::kEqual, typecode, expected_tc);
+  BasicBlock* tc_ok = cfg.AllocateBlock();
+  tc.emit<CondBranch>(tc_match, tc_ok, slow_path);
+  return tc_ok;
+}
+
 bool HIRBuilder::tryEmitListPrefixReverseAssign(
     TranslationContext& tc,
     jit::BytecodeInstructionBlock::Iterator& bc_it,
@@ -4099,6 +4312,7 @@ bool HIRBuilder::tryEmitListPrefixReverseAssign(
 }
 
 void HIRBuilder::emitStoreSubscr(
+    CFG& cfg,
     TranslationContext& tc,
     const jit::BytecodeInstruction& bc_instr) {
   auto& stack = tc.frame.stack;
@@ -4106,12 +4320,94 @@ void HIRBuilder::emitStoreSubscr(
   Register* container = stack.pop();
   Register* value = stack.pop();
 
+  // Fast path for array.array('d') store
+  if (getConfig().specialized_opcodes &&
+      bc_instr.specializedOpcode() != STORE_SUBSCR_DICT) {
+    auto* array_type = getStdlibArrayType();
+    if (array_type != nullptr) {
+      BasicBlock* slow_path = cfg.AllocateBlock();
+      BasicBlock* done_path = cfg.AllocateBlock();
+
+      // Guard: container is array.array
+      Type array_type_guard = Type::fromTypeExact(array_type);
+      BasicBlock* fast_path = cfg.AllocateBlock();
+      tc.frame.cur_instr_offs = bc_instr.baseOffset();
+      tc.emitSnapshot();
+      tc.emit<CondBranchCheckType>(
+          container, array_type_guard, fast_path, slow_path);
+
+      tc.block = fast_path;
+      tc.emitSnapshot();
+      tc.emit<RefineType>(container, array_type_guard, container);
+
+      if (tryStoreSubscrArray(
+              cfg, tc, bc_instr, container, sub, value, slow_path, done_path)) {
+        tc.block = done_path;
+        return;
+      }
+
+      // tryStoreSubscrArray returned false — fall through to generic path
+    }
+  }
+
   if (getConfig().specialized_opcodes &&
       bc_instr.specializedOpcode() == STORE_SUBSCR_DICT) {
     tc.emit<GuardType>(container, TDictExact, container, tc.frame);
   }
 
   tc.emit<StoreSubscr>(container, sub, value, tc.frame);
+}
+
+// Store fast path for array.array('d'). Container is already known to be
+// array.array via the outer guard. Emits the value type check, typecode
+// check, bounds check, and direct store. Returns true if the full fast
+// path was emitted; false if setup failed (caller should fall through to
+// the generic path).
+bool HIRBuilder::tryStoreSubscrArray(
+    CFG& cfg,
+    TranslationContext& tc,
+    const jit::BytecodeInstruction& /*bc_instr*/,
+    Register* container,
+    Register* sub,
+    Register* value,
+    BasicBlock* slow_path,
+    BasicBlock* done_path) {
+  // Route non-int indices (e.g. slices) to the generic store path.
+  Register* unboxed_idx = emitArrayIndexGuard(cfg, tc, sub, slow_path);
+
+  // Route non-float values to the generic store path (also handles
+  // int-to-double coercion that stock array assignment performs).
+  BasicBlock* val_ok = cfg.AllocateBlock();
+  tc.emit<CondBranchCheckType>(value, TFloatExact, val_ok, slow_path);
+  tc.block = val_ok;
+  tc.emit<RefineType>(value, TFloatExact, value);
+  Register* unboxed_value = temps_.AllocateStack();
+  tc.emit<PrimitiveUnbox>(unboxed_value, value, TCDouble);
+
+  // Check typecode == 'd'
+  BasicBlock* tc_ok = emitArrayTypecodeCheck(cfg, tc, container, slow_path);
+
+  // typecode matched — bounds check + store
+  tc.block = tc_ok;
+  auto adjusted_idx = temps_.AllocateStack();
+  tc.emit<CheckSequenceBounds>(adjusted_idx, container, unboxed_idx, tc.frame);
+  auto ob_item = temps_.AllocateStack();
+  tc.emit<LoadField>(
+      ob_item,
+      container,
+      "ob_item",
+      offsetof(StdlibArrayObject, ob_item),
+      TCPtr);
+  tc.emit<StoreArrayItem>(
+      ob_item, adjusted_idx, unboxed_value, container, TCDouble);
+  tc.emit<Branch>(done_path);
+
+  // --- Slow path ---
+  tc.block = slow_path;
+  tc.emit<StoreSubscr>(container, sub, value, tc.frame);
+  tc.emit<Branch>(done_path);
+
+  return true;
 }
 
 void HIRBuilder::emitGetIter(TranslationContext& tc) {

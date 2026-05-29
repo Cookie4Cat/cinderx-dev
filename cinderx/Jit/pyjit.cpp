@@ -37,6 +37,7 @@
 #include "cinderx/Jit/jit_list.h"
 #include "cinderx/Jit/jit_time_log.h"
 #include "cinderx/Jit/mmap_file.h"
+#include "cinderx/Jit/osr.h"
 #include "cinderx/Jit/perf_jitdump.h"
 #include "cinderx/module_state.h"
 
@@ -96,6 +97,13 @@ bool hasRequiredFlags(BorrowedRef<PyCodeObject> code) {
 uint64_t countCalls(PyCodeObject* code) {
   auto extra = codeExtra(code);
   return extra != nullptr ? Ci_code_extra_get_calls(extra) : 0;
+}
+
+void setInterpreterJitFlag(bool enabled) {
+  PyThreadState* tstate = _PyThreadState_UncheckedGet();
+  if (tstate != nullptr && tstate->interp != nullptr) {
+    tstate->interp->jit = enabled;
+  }
 }
 
 // If functions in the cinderx module get compiled, they will somehow keep the
@@ -730,6 +738,30 @@ FlagProcessor initFlagProcessor() {
       "JIT specialized opcodes or to fall back to their generic counterparts.");
 
   flag_processor.addOption(
+      "osr-enabled",
+      "CINDERX_OSR_ENABLED",
+      getMutableConfig().osr_enabled,
+      "Enable OSR hot-loop detection");
+
+  flag_processor.addOption(
+      "osr-backedge-threshold",
+      "CINDERX_OSR_BACKEDGE_THRESHOLD",
+      [](int val) {
+        getMutableConfig().osr_backedge_threshold =
+            static_cast<uint32_t>(val);
+      },
+      "Set the per-backedge OSR trigger threshold");
+
+  flag_processor.addOption(
+      "osr-compile-budget",
+      "CINDERX_OSR_COMPILE_BUDGET",
+      [](int val) {
+        getMutableConfig().osr_compile_budget_code_units =
+            static_cast<uint32_t>(val);
+      },
+      "Set the OSR compile budget in code units");
+
+  flag_processor.addOption(
       "jit-backedge-gated-int-guards",
       "PYTHONJITBACKEDGEGATEDINTGUARDS",
       getMutableConfig().backedge_gated_int_guards,
@@ -1349,6 +1381,9 @@ void disable_jit_impl(bool deopt_all) {
 
   if (isJitUsable()) {
     getMutableConfig().state = State::kPaused;
+    getMutableConfig().osr_capable = false;
+    setInterpreterJitFlag(false);
+    syncOSRFlags();
     JIT_DLOG("Disabled the JIT");
   }
 }
@@ -1391,7 +1426,9 @@ bool enable_jit_impl() {
     count++;
   }
 
+  setInterpreterJitFlag(true);
   getMutableConfig().state = State::kRunning;
+  syncOSRFlags();
 
   JIT_DLOG("Re-enabled the JIT and re-optimized {} functions", count);
 
@@ -3452,7 +3489,10 @@ int initialize() {
     patchSysSetProfileAndSetTrace(mod);
   }
 
+  setInterpreterJitFlag(true);
+  getMutableConfig().osr_capable = true;
   getMutableConfig().state = State::kRunning;
+  syncOSRFlags();
 
   mod_state->jit_list = std::move(jit_list);
 
@@ -3481,6 +3521,8 @@ void finalize() {
   // Disable the JIT first so nothing we do in here ends up attempting to
   // invoke the JIT while we're finalizing our data structures.
   getMutableConfig().state = State::kFinalizing;
+  setInterpreterJitFlag(false);
+  syncOSRFlags();
 
   // Deopt all JIT generators, since JIT generators reference code and other
   // metadata that we will be freeing later in this function.
@@ -3536,6 +3578,8 @@ void finalize() {
   restoreSysSetProfileAndSetTrace();
 
   getMutableConfig().state = State::kNotInitialized;
+  getMutableConfig().osr_capable = false;
+  syncOSRFlags();
 }
 
 bool shouldScheduleCompile(BorrowedRef<PyFunctionObject> func) {
@@ -3605,6 +3649,43 @@ Result compileFunction(BorrowedRef<PyFunctionObject> func) {
   auto& jit_reg_units = cinderx::getModuleState()->registered_compilation_units;
   jit_reg_units.erase(func);
   return compile_func(func);
+}
+
+void uncompile(BorrowedRef<PyFunctionObject> func) {
+  deoptFuncImpl(func);
+  jitCtx()->forgetCode(func);
+}
+
+Result compileFunctionWithOSR(BorrowedRef<PyFunctionObject> func) {
+  FreeThreadedJITEntrypointGuard guard;
+  if (!isJitInitialized()) {
+    return Result::NOT_INITIALIZED;
+  }
+  if (isJitPaused()) {
+    return Result::PAUSED;
+  }
+  if (!isJitUsable()) {
+    return Result::UNKNOWN_ERROR;
+  }
+
+  JIT_CHECK(func != nullptr, "OSR only supports function frames");
+  BorrowedRef<PyCodeObject> pinned_code{func->func_code};
+  if (!osrCompileBudgetCheck(pinned_code)) {
+    return Result::CANNOT_SPECIALIZE;
+  }
+
+  hir::IsolatedPreloaders isolated_preloaders;
+  hir::Preloader* preloader = preload(func);
+  if (preloader == nullptr || func->func_code != pinned_code) {
+    PyErr_Clear();
+    return Result::CANNOT_SPECIALIZE;
+  }
+
+  Result result = compilePreloader(*preloader, func);
+  if (result != Result::OK && PyErr_Occurred()) {
+    PyErr_Clear();
+  }
+  return result;
 }
 
 std::vector<BorrowedRef<PyFunctionObject>> preloadFuncAndDeps(
@@ -3729,6 +3810,9 @@ void funcModified(BorrowedRef<PyFunctionObject> func) {
   // func->func_code and call scheduleCompile() to re-register with the new
   // code.
   unregisterFunctionCodes(func);
+  // Reset OSR state for the old code — must happen before func_code is
+  // updated by the caller.
+  resetOSRState(reinterpret_cast<PyCodeObject*>(func->func_code));
 }
 
 void typeDestroyed(BorrowedRef<PyTypeObject> type) {

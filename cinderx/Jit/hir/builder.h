@@ -160,7 +160,9 @@ class HIRBuilder {
   void emitCompareOp(
       TranslationContext& tc,
       const jit::BytecodeInstruction& bc_instr);
-  void emitToBool(TranslationContext& tc);
+  void emitToBool(
+      TranslationContext& tc,
+      const jit::BytecodeInstruction* bc_instr = nullptr);
   void emitCopyDictWithoutKeys(TranslationContext& tc);
   void emitGetLen(TranslationContext& tc);
   void emitJumpIf(
@@ -261,8 +263,29 @@ class HIRBuilder {
       jit::BytecodeInstructionBlock::Iterator& bc_it,
       const jit::BytecodeInstructionBlock::Iterator& bc_end);
   void emitStoreSubscr(
+      CFG& cfg,
       TranslationContext& tc,
       const jit::BytecodeInstruction& bc_instr);
+  bool tryStoreSubscrArray(
+      CFG& cfg,
+      TranslationContext& tc,
+      const jit::BytecodeInstruction& bc_instr,
+      Register* container,
+      Register* sub,
+      Register* value,
+      BasicBlock* slow_path,
+      BasicBlock* done_path);
+  // Shared array fast-path guard helpers.
+  Register* emitArrayIndexGuard(
+      CFG& cfg,
+      TranslationContext& tc,
+      Register* sub,
+      BasicBlock* slow_path);
+  BasicBlock* emitArrayTypecodeCheck(
+      CFG& cfg,
+      TranslationContext& tc,
+      Register* container,
+      BasicBlock* slow_path);
   void emitInPlaceOp(
       TranslationContext& tc,
       const jit::BytecodeInstruction& bc_instr);
@@ -461,7 +484,7 @@ class HIRBuilder {
       TranslationContext& tc,
       const BytecodeInstruction& bc_instr);
 
-  void emitTypeAnnotationGuards(TranslationContext& tc);
+  bool emitTypeAnnotationGuards(TranslationContext& tc);
 
   void emitBuildInterpolation(
       TranslationContext& tc,

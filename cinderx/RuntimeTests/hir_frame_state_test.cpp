@@ -2003,8 +2003,11 @@ TEST_F(FrameStateCreationTest, StoreSubscr) {
 def test(x, y):
   x[1] = y
 )";
+  auto saved_config = jit::getConfig();
+  jit::getMutableConfig().specialized_opcodes = false;
   std::unique_ptr<Function> irfunc;
   CompileToHIR(src, "test", irfunc);
+  jit::getMutableConfig() = saved_config;
 #if PY_VERSION_HEX >= 0x030F0000
   const char* expected = R"(fun jittestmodule:test {
   bb 0 {

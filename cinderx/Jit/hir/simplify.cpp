@@ -11,6 +11,7 @@
 #include "cinderx/Common/type.h"
 #include "cinderx/Jit/context.h"
 #include "cinderx/Jit/hir/analysis.h"
+#include "cinderx/Jit/hir/array_specialize.h"
 #include "cinderx/Jit/hir/clean_cfg.h"
 #include "cinderx/Jit/hir/copy_propagation.h"
 #include "cinderx/Jit/hir/printer.h"
@@ -18,7 +19,11 @@
 #include "cinderx/Jit/threaded_compile.h"
 #include "cinderx/StaticPython/strictmoduleobject.h"
 
+#include <cfloat>
+
 #include <fmt/ostream.h>
+
+#include <unordered_set>
 
 namespace jit::hir {
 
@@ -724,6 +729,107 @@ Register* simplifyLoadMethod(Env& env, const LoadMethod* load_meth) {
       *load_meth->frameState());
 }
 
+// Emit the array.array('d') BINARY_SUBSCR fast path. When the container's
+// static type cannot be proven to exclude array.array, speculatively guard on
+// it being an array.array('d') and lower the load to an inlined
+// LoadArrayItem(TCDouble) + PrimitiveBox; otherwise fall back to a generic
+// BinaryOp<Subscript>. Returns the merged value, or nullptr if the fast path
+// does not apply (caller continues with the normal subscript lowering).
+//
+// This runs in the Simplify pass rather than the HIR builder so that it only
+// fires for containers whose type is unknown at this point (e.g. array.array
+// arguments). Subscripts on statically-typed list/tuple/dict/str containers are
+// already lowered by simplifyBinaryOp and never reach here.
+Register* trySimplifyArraySubscr(Env& env, const BinaryOp* instr) {
+  if (!getConfig().specialized_opcodes) {
+    return nullptr;
+  }
+  // The generic BinaryOp we leave on the slow path must not be re-specialized.
+  if (instr->isArraySubscrSlowPath()) {
+    return nullptr;
+  }
+  PyTypeObject* array_type = getStdlibArrayType();
+  if (array_type == nullptr) {
+    return nullptr;
+  }
+
+  Register* container = instr->left();
+  Register* sub = instr->right();
+  Type array_guard = Type::fromTypeExact(array_type);
+  // Skip containers whose type already rules out array.array (list, tuple,
+  // dict, str, or any other known-exact type).
+  if (!container->type().couldBe(array_guard)) {
+    return nullptr;
+  }
+
+  const FrameState& frame = *instr->frameState();
+  CFG& cfg = env.func.cfg;
+
+  BasicBlock* arr_ok = cfg.AllocateBlock();
+  BasicBlock* idx_ok = cfg.AllocateBlock();
+  BasicBlock* tc_ok = cfg.AllocateBlock();
+  BasicBlock* slow = cfg.AllocateBlock();
+  env.new_blocks += 5; // arr_ok, idx_ok, tc_ok, slow, and the split-off tail.
+
+  // Guard: container is array.array. Split the continuation into `done`.
+  env.emit<CondBranchCheckType>(container, array_guard, arr_ok, slow);
+  BasicBlock* done = cfg.splitAfter(*std::prev(env.cursor));
+
+  // --- arr_ok: container confirmed array.array, guard the index type ---
+  env.block = arr_ok;
+  env.cursor = arr_ok->end();
+  Register* arr = env.emit<RefineType>(array_guard, container);
+  env.emit<CondBranchCheckType>(sub, TLongExact, idx_ok, slow);
+
+  // --- idx_ok: index is an int, unbox it and check the typecode == 'd' ---
+  env.block = idx_ok;
+  env.cursor = idx_ok->end();
+  Register* idx = env.emit<RefineType>(TLongExact, sub);
+  Register* unboxed_idx = env.emit<PrimitiveUnbox>(idx, TCInt64);
+  env.emit<IsNegativeAndErrOccurred>(unboxed_idx, frame);
+  Register* descr = env.emit<LoadField>(
+      arr, "ob_descr", offsetof(StdlibArrayObject, ob_descr), TCPtr);
+  Register* typecode = env.emit<LoadField>(
+      descr, "typecode", offsetof(StdlibArrayDescr, typecode), TCInt8);
+  Register* expected_tc = env.emit<LoadConst>(Type::fromCInt('d', TCInt8));
+  Register* tc_match = env.emit<PrimitiveCompare>(
+      PrimitiveCompareOp::kEqual, typecode, expected_tc);
+  env.emit<CondBranch>(tc_match, tc_ok, slow);
+
+  // --- tc_ok: bounds check, then inlined native load + box ---
+  env.block = tc_ok;
+  env.cursor = tc_ok->end();
+  Register* adjusted_idx =
+      env.emit<CheckSequenceBounds>(arr, unboxed_idx, frame);
+  Register* ob_item = env.emit<LoadField>(
+      arr, "ob_item", offsetof(StdlibArrayObject, ob_item), TCPtr);
+  Register* raw_double = env.emit<LoadArrayItem>(
+      ob_item, adjusted_idx, arr, static_cast<intptr_t>(0), TCDouble);
+  Register* fast_result = env.emit<PrimitiveBox>(raw_double, TCDouble, frame);
+  env.emit<Branch>(done);
+
+  // --- slow: generic subscript (PyObject_GetItem) ---
+  env.block = slow;
+  env.cursor = slow->end();
+  BinaryOp* slow_instr =
+      env.emitInstr<BinaryOp>(
+          BinaryOpKind::kSubscript,
+          container,
+          sub,
+          frame,
+          /* array_subscr_slow_path= */ true);
+  Register* slow_result = slow_instr->output();
+  env.emit<Branch>(done);
+
+  // --- done: merge the fast and slow results ---
+  env.block = done;
+  env.cursor = done->begin();
+  return env.emit<Phi>(std::unordered_map<BasicBlock*, Register*>{
+      {tc_ok, fast_result},
+      {slow, slow_result},
+  });
+}
+
 Register* simplifyBinaryOp(Env& env, const BinaryOp* instr) {
   BinaryOpKind op = instr->op();
   Register* lhs = instr->left();
@@ -732,6 +838,9 @@ Register* simplifyBinaryOp(Env& env, const BinaryOp* instr) {
   if (op == BinaryOpKind::kSubscript) {
     if (lhs->isA(TDictExact)) {
       return env.emit<DictSubscr>(lhs, rhs, *instr->frameState());
+    }
+    if (Register* array_result = trySimplifyArraySubscr(env, instr)) {
+      return array_result;
     }
     if (!rhs->isA(TLongExact)) {
       return nullptr;
@@ -882,6 +991,16 @@ Register* simplifyBinaryOp(Env& env, const BinaryOp* instr) {
         env.emit<UseType>(float_reg, TFloatExact);
         env.emit<UseType>(int_reg, int_reg->type());
         Register* unbox_float = env.emit<PrimitiveUnbox>(float_reg, TCDouble);
+        if (op == BinaryOpKind::kPower && long_val == 2) {
+          Register* result = env.emit<DoubleBinaryOp>(
+              BinaryOpKind::kMultiply, unbox_float, unbox_float);
+          Register* max_double =
+              env.emit<LoadConst>(Type::fromCDouble(DBL_MAX));
+          Register* is_finite = env.emit<PrimitiveCompare>(
+              PrimitiveCompareOp::kLessThan, result, max_double);
+          env.emitInstr<Guard>(is_finite);
+          return env.emit<PrimitiveBox>(result, TCDouble, *instr->frameState());
+        }
         Register* const_double =
             env.emit<LoadConst>(Type::fromCDouble(double_val));
         Register* unbox_left = int_on_right ? unbox_float : const_double;
@@ -897,6 +1016,29 @@ Register* simplifyBinaryOp(Env& env, const BinaryOp* instr) {
             env.emit<DoubleBinaryOp>(op, unbox_left, unbox_right);
         return env.emit<PrimitiveBox>(result, TCDouble, *instr->frameState());
       }
+    }
+  }
+
+  if (op == BinaryOpKind::kPower && rhs->isA(TLongExact) &&
+      rhs->type().hasObjectSpec()) {
+    int overflow;
+    long long_val = PyLong_AsLongAndOverflow(
+        rhs->type().objectSpec(), &overflow);
+    if (!overflow && long_val == 2) {
+      Register* guarded_left =
+          env.emit<GuardType>(TFloatExact, lhs, *instr->frameState());
+      env.emit<UseType>(guarded_left, TFloatExact);
+      Register* unbox_left =
+          env.emit<PrimitiveUnbox>(guarded_left, TCDouble);
+      Register* result = env.emit<DoubleBinaryOp>(
+          BinaryOpKind::kMultiply, unbox_left, unbox_left);
+      Register* max_double =
+          env.emit<LoadConst>(Type::fromCDouble(DBL_MAX));
+      Register* is_finite = env.emit<PrimitiveCompare>(
+          PrimitiveCompareOp::kLessThan, result, max_double);
+      env.emitInstr<Guard>(is_finite);
+      return env.emit<PrimitiveBox>(
+          result, TCDouble, *instr->frameState());
     }
   }
 
@@ -1091,13 +1233,28 @@ Register* simplifyFloatBinaryOp(Env& env, const FloatBinaryOp* instr) {
   // into a call to sqrt().
   if (op == BinaryOpKind::kPower) {
     Type right_type = instr->right()->type();
-    if (right_type.hasObjectSpec() && PyFloat_Check(right_type.objectSpec()) &&
-        PyFloat_AS_DOUBLE(right_type.objectSpec()) == 0.5) {
-      Register* unbox_left = env.emit<PrimitiveUnbox>(instr->left(), TCDouble);
-      Register* half = env.emit<LoadConst>(Type::fromCDouble(0.5));
-      Register* result =
-          env.emit<DoubleBinaryOp>(BinaryOpKind::kPower, unbox_left, half);
-      return env.emit<PrimitiveBox>(result, TCDouble, *instr->frameState());
+    if (right_type.hasObjectSpec() && PyFloat_Check(right_type.objectSpec())) {
+      double val = PyFloat_AS_DOUBLE(right_type.objectSpec());
+      if (val == 0.5) {
+        Register* unbox_left =
+            env.emit<PrimitiveUnbox>(instr->left(), TCDouble);
+        Register* half = env.emit<LoadConst>(Type::fromCDouble(0.5));
+        Register* result =
+            env.emit<DoubleBinaryOp>(BinaryOpKind::kPower, unbox_left, half);
+        return env.emit<PrimitiveBox>(result, TCDouble, *instr->frameState());
+      }
+      if (val == 2.0) {
+        Register* unbox_left =
+            env.emit<PrimitiveUnbox>(instr->left(), TCDouble);
+        Register* result = env.emit<DoubleBinaryOp>(
+            BinaryOpKind::kMultiply, unbox_left, unbox_left);
+        Register* max_double =
+            env.emit<LoadConst>(Type::fromCDouble(DBL_MAX));
+        Register* is_finite = env.emit<PrimitiveCompare>(
+            PrimitiveCompareOp::kLessThan, result, max_double);
+        env.emitInstr<Guard>(is_finite);
+        return env.emit<PrimitiveBox>(result, TCDouble, *instr->frameState());
+      }
     }
   }
 

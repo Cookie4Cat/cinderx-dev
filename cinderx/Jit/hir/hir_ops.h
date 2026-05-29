@@ -144,6 +144,7 @@ namespace jit::hir {
   V(MatchClass)                    \
   V(MatchKeys)                     \
   V(MergeSetUnpack)                \
+  V(OSREntry)                      \
   V(Phi)                           \
   V(Raise)                         \
   V(RaiseStatic)                   \

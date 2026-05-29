@@ -17,6 +17,7 @@
 #include "cinderx/Jit/frame.h"
 #include "cinderx/Jit/generators_rt.h"
 #include "cinderx/Jit/global_cache.h"
+#include "cinderx/Jit/osr.h"
 #include "cinderx/Jit/perf_jitdump.h"
 #include "cinderx/Jit/pyjit.h"
 #include "cinderx/Jit/symbolizer.h"
@@ -755,6 +756,7 @@ void module_free(void* raw_mod) {
 
   jit::finalize();
 
+  jit::finiOSRCodeExtraIndex();
   finiCodeExtraIndex();
 
   // This must be done at the point the module is free'd as the free-list uses
@@ -1162,6 +1164,7 @@ int _cinderx_exec_impl(PyObject* m) {
   // Initialize the code object extra data index early, before we hook into the
   // interpreter and try to use it.
   initCodeExtraIndex();
+  jit::initOSRCodeExtraIndex();
 
   if (watcher_state.init() < 0) {
     return -1;

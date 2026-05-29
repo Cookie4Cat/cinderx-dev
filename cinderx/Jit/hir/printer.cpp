@@ -288,6 +288,7 @@ static std::string format_immediates(const Function* func, const Instr& instr) {
     case Opcode::kMatchClass:
     case Opcode::kMatchKeys:
     case Opcode::kMergeSetUnpack:
+    case Opcode::kOSREntry:
     case Opcode::kPrimitiveBoxBool:
     case Opcode::kRaise:
     case Opcode::kRunPeriodicTasks:

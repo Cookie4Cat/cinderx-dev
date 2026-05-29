@@ -99,6 +99,9 @@ struct CompiledFunctionData {
   std::vector<std::unique_ptr<CodePatcher>> code_patchers;
   std::unique_ptr<hir::Function> irfunc;
   CodeRuntime* runtime{nullptr};
+  // Whether the compilation produced OSR entry stubs.
+  bool osr_aware{false};
+  bool has_osr_entries{false};
 
   CompiledFunctionData() = default;
 };
@@ -153,6 +156,14 @@ class CompiledFunction {
 
   CodeRuntime* runtime() const {
     return data_.runtime;
+  }
+
+  bool osrAware() const {
+    return data_.osr_aware;
+  }
+
+  bool hasOSREntries() const {
+    return data_.has_osr_entries;
   }
 
   PyObject* invoke(PyObject* func, PyObject** args, Py_ssize_t nargs) const {

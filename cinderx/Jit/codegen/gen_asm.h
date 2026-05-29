@@ -23,6 +23,10 @@
 #include <unordered_set>
 #include <vector>
 
+namespace jit {
+struct OSRMetadata;
+}
+
 namespace jit::codegen {
 
 class NativeGenerator {
@@ -123,6 +127,16 @@ class NativeGenerator {
   };
   FrameInfo computeFrameInfo();
   void saveCallerRegisters(const FrameInfo& frame_info);
+#if defined(CINDER_AARCH64)
+  void emitOSRFrameSetup(const jit::OSRMetadata& metadata);
+  void moveOSRValueToLocation(
+      PhyLocation destination,
+      asmjit::a64::Gp value,
+      asmjit::a64::Gp address_scratch);
+  void generateOSREntryStub(
+      jit::OSRMetadata& metadata,
+      lir::BasicBlock* target_block);
+#endif
 
   int maxInlineStackSize();
   void generateEpilogue(asmjit::BaseNode* epilogue_cursor);

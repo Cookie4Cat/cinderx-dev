@@ -167,6 +167,19 @@ struct Config {
   // Whether or not to JIT specialized opcodes or to fall back to their generic
   // counterparts.
   bool specialized_opcodes{true};
+
+  // Enable OSR hot-loop detection. OSR is production-off by default and must
+  // be explicitly enabled by -X osr-enabled or CINDERX_OSR_ENABLED.
+  bool osr_enabled{false};
+  // Set only by the early JIT initialization path when backedges can still be
+  // routed to JUMP_BACKWARD_JIT consistently.
+  bool osr_capable{false};
+  // Number of executions of a single backedge before attempting OSR.
+  uint32_t osr_backedge_threshold{2000};
+  // Compile budget knobs consumed by later OSR feature items.
+  uint32_t osr_compile_budget_code_units{1024};
+  uint32_t osr_compile_warn_threshold_ms{50};
+
   // Only emit exact-int guards for specialized numeric opcodes in code objects
   // that contain a loop backedge. Disable to restore the old unconditional
   // guard behavior.

@@ -56,6 +56,7 @@ MemoryEffects memoryEffects(const Instr& inst) {
     case Opcode::kMakeDict:
     case Opcode::kMakeSet:
     case Opcode::kMakeTupleFromList:
+    case Opcode::kOSREntry:
     case Opcode::kPrimitiveCompare:
     case Opcode::kPrimitiveUnaryOp:
     case Opcode::kPrimitiveUnbox:
@@ -443,6 +444,7 @@ bool hasArbitraryExecution(const Instr& inst) {
     case Opcode::kMakeSet:
     case Opcode::kMakeTuple:
     case Opcode::kMakeTupleFromList:
+    case Opcode::kOSREntry:
     case Opcode::kPhi:
     case Opcode::kPrimitiveBox:
     case Opcode::kPrimitiveBoxBool:
