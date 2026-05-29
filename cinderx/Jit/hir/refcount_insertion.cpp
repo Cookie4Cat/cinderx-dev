@@ -1286,7 +1286,7 @@ bool isGeneratorReturnTailInstr(const Instr& instr) {
 }
 
 void markGeneratorCompletedBeforeReturnCleanup(Function& irfunc) {
-  if ((irfunc.code->co_flags & CO_GENERATOR) == 0) {
+  if (irfunc.code == nullptr || (irfunc.code->co_flags & CO_GENERATOR) == 0) {
     return;
   }
 
