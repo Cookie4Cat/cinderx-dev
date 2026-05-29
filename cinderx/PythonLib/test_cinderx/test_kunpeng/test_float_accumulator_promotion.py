@@ -27,15 +27,49 @@ def _make_accumulator():
     return func
 
 
-def _specialize_then_compile(func, warmup_arg=10):
+def _make_data_accumulator():
+    def func(data):
+        s = 0
+        for x in data:
+            s += x
+        return s
+
+    return func
+
+
+def _make_mixed_accumulator():
+    def func(data, initial):
+        s = initial
+        for x in data:
+            s += x
+        return s
+
+    return func
+
+
+def _interpreted_result(factory, *args):
+    func = factory()
+    jit_suppress(func)
+    try:
+        return func(*args)
+    finally:
+        jit_unsuppress(func)
+
+
+def _specialize_then_compile(func, *warmup_args, warmup_calls=None):
+    if not warmup_args:
+        warmup_args = (10,)
+    if warmup_calls is None:
+        warmup_calls = [warmup_args] * 20
+
     # Run the function under the interpreter long enough for CPython's
     # adaptive specializer to rewrite ``BINARY_OP`` into the float fast
     # path before the JIT picks it up.
     force_uncompile(func)
     jit_suppress(func)
     try:
-        for _ in range(20):
-            func(warmup_arg)
+        for args in warmup_calls:
+            func(*args)
     finally:
         jit_unsuppress(func)
     assert force_compile(func)
@@ -77,3 +111,51 @@ def test_float_accumulator_repeated_calls_remain_deopt_free():
 
     stats = cinderx.jit.get_and_clear_runtime_stats()
     assert stats["deopt"] == []
+
+
+def test_data_float_accumulator_matches_interpreter_without_repeated_deopt():
+    func = _make_data_accumulator()
+    data = [1.0] * 1000
+    _specialize_then_compile(func, data)
+
+    expected = _interpreted_result(_make_data_accumulator, data)
+    cinderx.jit.get_and_clear_runtime_stats()
+    for _ in range(3):
+        assert func(data) == expected
+
+    stats = cinderx.jit.get_and_clear_runtime_stats()
+    assert stats["deopt"] == []
+
+    opcodes = cinderx.jit.get_function_hir_opcode_counts(func)
+    assert opcodes is not None
+    assert opcodes.get("DoubleBinaryOp", 0) >= 1
+
+
+def test_data_float_accumulator_empty_data_returns_int_zero():
+    func = _make_data_accumulator()
+    _specialize_then_compile(func, [1.0] * 1000)
+
+    expected = _interpreted_result(_make_data_accumulator, [])
+    result = func([])
+    assert result == expected
+    assert type(result) is int
+
+    opcodes = cinderx.jit.get_function_hir_opcode_counts(func)
+    assert opcodes is not None
+    assert opcodes.get("DoubleBinaryOp", 0) >= 1
+
+
+def test_mixed_accumulator_initial_argument_keeps_generic_path():
+    func = _make_mixed_accumulator()
+    warmup_data = [1.0]
+    warmup_calls = [(warmup_data, 1), (warmup_data, 0.5)] * 10
+    _specialize_then_compile(func, warmup_calls=warmup_calls)
+
+    data = [1.0] * 1000
+    for initial in (1, 0.5):
+        expected = _interpreted_result(_make_mixed_accumulator, data, initial)
+        assert func(data, initial) == expected
+
+    opcodes = cinderx.jit.get_function_hir_opcode_counts(func)
+    assert opcodes is not None
+    assert opcodes.get("DoubleBinaryOp", 0) == 0
