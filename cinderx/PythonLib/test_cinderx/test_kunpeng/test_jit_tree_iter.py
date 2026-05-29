@@ -130,7 +130,7 @@ def _inorder(node):
 
 
 def _tree_iter_state_machine_enabled():
-    value = os.environ.get("PYTHONJITTREEITERSTATEMACHINE", "0")
+    value = os.environ.get("PYTHONJITTREEITERSTATEMACHINE", "1")
     return value.lower() not in ("0", "false", "no")
 
 

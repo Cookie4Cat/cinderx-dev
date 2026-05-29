@@ -16,7 +16,7 @@ from cinderx.jit import _deopt_gen
 jit.compile_after_n_calls(1000000)
 
 def state_machine_expected():
-    enabled = os.environ.get("PYTHONJITTREEITERSTATEMACHINE", "0").lower()
+    enabled = os.environ.get("PYTHONJITTREEITERSTATEMACHINE", "1").lower()
     arch_supported = platform.machine().lower() in ("aarch64", "arm64")
     return enabled not in ("0", "false", "no") and arch_supported
 
