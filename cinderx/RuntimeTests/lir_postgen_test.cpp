@@ -150,4 +150,93 @@ BB %6
   EXPECT_EQ(runPostGenRewrite(lir_input_str), expected_lir_str.c_str());
 }
 
+#if defined(CINDER_AARCH64)
+
+TEST_F(LIRPostGenerationRewriteTest, RetainsSplitAddSubImmediate) {
+  const char* lir_input_str = R"(Function:
+BB %0
+  %1:64bit = Move 1(0x1):64bit
+  %2:64bit = Add %1:64bit, 8193(0x2001):64bit
+  %3:64bit = Sub %2:64bit, 8193(0x2001):64bit
+  Return %3:64bit
+)";
+
+  auto rewritten = runPostGenRewrite(lir_input_str);
+  EXPECT_NE(rewritten.find("Add %1:64bit, 8193(0x2001):64bit"),
+            std::string::npos);
+  EXPECT_NE(rewritten.find("Sub %2:64bit, 8193(0x2001):64bit"),
+            std::string::npos);
+  EXPECT_EQ(rewritten.find("Move 8193(0x2001):64bit"), std::string::npos);
+}
+
+TEST_F(LIRPostGenerationRewriteTest, RetainsSmallAddSubImmediate) {
+  const char* lir_input_str = R"(Function:
+BB %0
+  %1:64bit = Move 1(0x1):64bit
+  %2:64bit = Add %1:64bit, 4095(0xfff):64bit
+  %3:64bit = Sub %2:64bit, 4095(0xfff):64bit
+  Return %3:64bit
+)";
+
+  auto rewritten = runPostGenRewrite(lir_input_str);
+  EXPECT_NE(rewritten.find("Add %1:64bit, 4095(0xfff):64bit"),
+            std::string::npos);
+  EXPECT_NE(rewritten.find("Sub %2:64bit, 4095(0xfff):64bit"),
+            std::string::npos);
+  EXPECT_EQ(rewritten.find("Move 4095(0xfff):64bit"), std::string::npos);
+}
+
+TEST_F(LIRPostGenerationRewriteTest, RetainsSplitEqualityImmediateOnly) {
+  const char* lir_input_str = R"(Function:
+BB %0
+  %1:64bit = Move 8193(0x2001):64bit
+  %2:64bit = Equal %1:64bit, 8193(0x2001):64bit
+  %3:64bit = LessThanUnsigned %1:64bit, 8193(0x2001):64bit
+  Return %2:64bit
+)";
+
+  auto rewritten = runPostGenRewrite(lir_input_str);
+  EXPECT_NE(rewritten.find("Equal %1:64bit, 8193(0x2001):64bit"),
+            std::string::npos);
+  EXPECT_NE(rewritten.find("LessThanUnsigned %1:64bit, %"),
+            std::string::npos);
+  EXPECT_NE(rewritten.find("Move 8193(0x2001):64bit"),
+            std::string::npos);
+}
+
+TEST_F(LIRPostGenerationRewriteTest, RetainsMaxSplitEqualityImmediate) {
+  // Maximum split add/sub immediate: (0xfff << 12) + 0xfff.
+  const char* lir_input_str = R"(Function:
+BB %0
+  %1:64bit = Move 16777215(0xffffff):64bit
+  %2:64bit = Equal %1:64bit, 16777215(0xffffff):64bit
+  %3:64bit = LessThanUnsigned %1:64bit, 16777215(0xffffff):64bit
+  Return %2:64bit
+)";
+
+  auto rewritten = runPostGenRewrite(lir_input_str);
+  EXPECT_NE(rewritten.find("Equal %1:64bit, 16777215(0xffffff):64bit"),
+            std::string::npos);
+  EXPECT_NE(rewritten.find("LessThanUnsigned %1:64bit, %"),
+            std::string::npos);
+  EXPECT_NE(rewritten.find("Move 16777215(0xffffff):64bit"),
+            std::string::npos);
+}
+
+TEST_F(LIRPostGenerationRewriteTest, RewritesUnsplitAddImmediate) {
+  const char* lir_input_str = R"(Function:
+BB %0
+  %1:64bit = Move 1(0x1):64bit
+  %2:64bit = Add %1:64bit, 16777216(0x1000000):64bit
+  Return %2:64bit
+)";
+
+  auto rewritten = runPostGenRewrite(lir_input_str);
+  EXPECT_NE(rewritten.find("Move 16777216(0x1000000):64bit"),
+            std::string::npos);
+  EXPECT_NE(rewritten.find("Add %1:64bit, %"), std::string::npos);
+}
+
+#endif // CINDER_AARCH64
+
 } // namespace jit::lir

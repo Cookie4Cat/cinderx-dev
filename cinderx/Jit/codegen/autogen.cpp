@@ -455,7 +455,13 @@ void TranslateCompare(Environ* env, const Instruction* instr) {
     as->cmp(AutoTranslator::getGpWiden(inp0), scratch);
   } else if (inp1->isImm()) {
     auto constant = inp1->getConstantOrAddress();
-    arch::cmp_immediate(as, AutoTranslator::getGpWiden(inp0), constant);
+    if (instr->opcode() == Instruction::kEqual ||
+        instr->opcode() == Instruction::kNotEqual) {
+      arch::cmp_immediate_for_equality(
+          as, AutoTranslator::getGpWiden(inp0), constant);
+    } else {
+      arch::cmp_immediate(as, AutoTranslator::getGpWiden(inp0), constant);
+    }
   } else if (!inp1->isVecD()) {
     as->cmp(AutoTranslator::getGpWiden(inp0), AutoTranslator::getGpWiden(inp1));
   } else {
@@ -1897,12 +1903,13 @@ void translateInvert(Environ* env, const Instruction* instr) {
   }
 }
 
-template <typename EmitFn>
+template <typename EmitFn, typename EmitImmFn>
 void translateAddSubOp(
     Environ* env,
     const Instruction* instr,
     const char* opname,
-    EmitFn emit) {
+    EmitFn emit,
+    EmitImmFn emit_imm) {
   a64::Builder* as = env->as;
 
   const OperandBase* output =
@@ -1918,9 +1925,7 @@ void translateAddSubOp(
 
   if (opnd1->isImm()) {
     uint64_t constant = opnd1->getConstant();
-    JIT_CHECK(arm::Utils::isAddSubImm(constant), "Out of range");
-
-    emit(as, output_reg, opnd0_reg, constant);
+    emit_imm(as, output_reg, opnd0_reg, constant);
   } else if (opnd1->isReg()) {
     emit(as, output_reg, opnd0_reg, AT::getGpWiden(opnd1));
   } else {
@@ -1929,15 +1934,21 @@ void translateAddSubOp(
 }
 
 void translateAdd(Environ* env, const Instruction* instr) {
-  translateAddSubOp(env, instr, "Add", [](a64::Builder* as, auto... args) {
-    as->add(args...);
-  });
+  translateAddSubOp(
+      env,
+      instr,
+      "Add",
+      [](a64::Builder* as, auto... args) { as->add(args...); },
+      [](a64::Builder* as, auto... args) { arch::add_immediate(as, args...); });
 }
 
 void translateSub(Environ* env, const Instruction* instr) {
-  translateAddSubOp(env, instr, "Sub", [](a64::Builder* as, auto... args) {
-    as->sub(args...);
-  });
+  translateAddSubOp(
+      env,
+      instr,
+      "Sub",
+      [](a64::Builder* as, auto... args) { as->sub(args...); },
+      [](a64::Builder* as, auto... args) { arch::sub_immediate(as, args...); });
 }
 
 template <typename EmitFn>

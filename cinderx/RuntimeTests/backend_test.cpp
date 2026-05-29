@@ -3,10 +3,12 @@
 #include <gtest/gtest.h>
 
 #include "cinderx/Common/ref.h"
+#include "cinderx/Jit/code_allocator.h"
 #include "cinderx/Jit/codegen/arch.h"
 #include "cinderx/Jit/codegen/autogen.h"
 #include "cinderx/Jit/codegen/environ.h"
 #include "cinderx/Jit/codegen/gen_asm.h"
+#include "cinderx/Jit/disassembler.h"
 #include "cinderx/Jit/jit_rt.h"
 #include "cinderx/Jit/lir/inliner.h"
 #include "cinderx/Jit/lir/instruction.h"
@@ -17,6 +19,7 @@
 #include "cinderx/RuntimeTests/fixtures.h"
 #include "cinderx/module_state.h"
 
+#include <functional>
 #include <regex>
 #include <sstream>
 
@@ -423,6 +426,145 @@ TEST_F(BackendTest, FPCompare) {
   ASSERT_DOUBLE_EQ(test(Instruction::kGreaterThanEqualUnsigned), a >= b);
   ASSERT_DOUBLE_EQ(test(Instruction::kLessThanEqualUnsigned), a <= b);
 }
+
+#if defined(CINDER_AARCH64)
+
+namespace {
+
+std::string disassembleAArch64Snippet(
+    const std::function<void(asmjit::a64::Builder*)>& emit) {
+  auto code_allocator = std::unique_ptr<ICodeAllocator>(CodeAllocator::make());
+  asmjit::CodeHolder code;
+  code.init(code_allocator->asmJitEnvironment());
+
+  asmjit::a64::Builder as(&code);
+  emit(&as);
+  as.ret(arch::lr);
+  as.finalize();
+
+  JIT_CHECK(code.flatten() == asmjit::kErrorOk, "failed to flatten code");
+  JIT_CHECK(
+      code.resolveUnresolvedLinks() == asmjit::kErrorOk,
+      "failed to resolve code links");
+
+  std::ostringstream out;
+  auto section = code.sectionById(0);
+  Disassembler dis{
+      reinterpret_cast<const char*>(section->data()), section->bufferSize()};
+  dis.setPrintAddr(false);
+  dis.setPrintInstBytes(false);
+  dis.disassembleAll(out);
+  return out.str();
+}
+
+} // namespace
+
+TEST_F(BackendTest, SplitAddSubImmediate) {
+  constexpr uint64_t kSplitImm = 8193;
+
+  auto test = [&](Instruction::Opcode opcode, uint64_t arg) -> uint64_t {
+    auto lirfunc = std::make_unique<Function>();
+    auto bb = lirfunc->allocateBasicBlock();
+
+    auto input =
+        bb->allocateInstr(Instruction::kLoadArg, nullptr, OutVReg(), Imm(0));
+    auto result = bb->allocateInstr(
+        opcode, nullptr, OutVReg(), VReg(input), Imm(kSplitImm));
+    bb->allocateInstr(
+        Instruction::kMove,
+        nullptr,
+        OutPhyReg{arch::reg_general_return_loc},
+        VReg(result));
+    bb->allocateInstr(Instruction::kReturn, nullptr);
+
+    auto epilogue = lirfunc->allocateBasicBlock();
+    bb->addSuccessor(epilogue);
+
+    auto func = (uint64_t (*)(uint64_t))SimpleCompile(lirfunc.get());
+    return func(arg);
+  };
+
+  ASSERT_EQ(test(Instruction::kAdd, 7), 8200);
+  ASSERT_EQ(test(Instruction::kSub, 8200), 7);
+}
+
+TEST_F(BackendTest, SplitEqualImmediate) {
+  constexpr uint64_t kSplitImm = 8193;
+
+  auto lirfunc = std::make_unique<Function>();
+  auto bb = lirfunc->allocateBasicBlock();
+
+  auto input =
+      bb->allocateInstr(Instruction::kLoadArg, nullptr, OutVReg(), Imm(0));
+  auto result = bb->allocateInstr(
+      Instruction::kEqual, nullptr, OutVReg(), VReg(input), Imm(kSplitImm));
+  bb->allocateInstr(
+      Instruction::kMove,
+      nullptr,
+      OutPhyReg{arch::reg_general_return_loc},
+      VReg(result));
+  bb->allocateInstr(Instruction::kReturn, nullptr);
+
+  auto epilogue = lirfunc->allocateBasicBlock();
+  bb->addSuccessor(epilogue);
+
+  auto func = (bool (*)(uint64_t))SimpleCompile(lirfunc.get());
+  ASSERT_TRUE(func(kSplitImm));
+  ASSERT_FALSE(func(kSplitImm - 1));
+}
+
+TEST_F(BackendTest, SplitImmediateMachineCodeShape) {
+  auto add_disasm = disassembleAArch64Snippet([](asmjit::a64::Builder* as) {
+    arch::add_immediate(as, asmjit::a64::x0, asmjit::a64::x0, 8193);
+  });
+  EXPECT_TRUE(
+      std::regex_search(add_disasm, std::regex{"add\\s+x0, x0, #2, lsl #12"}))
+      << add_disasm;
+  EXPECT_TRUE(std::regex_search(add_disasm, std::regex{"add\\s+x0, x0, #1"}))
+      << add_disasm;
+  EXPECT_EQ(add_disasm.find("x13"), std::string::npos) << add_disasm;
+
+  auto sub_disasm = disassembleAArch64Snippet([](asmjit::a64::Builder* as) {
+    arch::sub_immediate(as, asmjit::a64::x0, asmjit::a64::x0, 8193);
+  });
+  EXPECT_TRUE(
+      std::regex_search(sub_disasm, std::regex{"sub\\s+x0, x0, #2, lsl #12"}))
+      << sub_disasm;
+  EXPECT_TRUE(std::regex_search(sub_disasm, std::regex{"sub\\s+x0, x0, #1"}))
+      << sub_disasm;
+  EXPECT_EQ(sub_disasm.find("x13"), std::string::npos) << sub_disasm;
+}
+
+TEST_F(BackendTest, SmallAndUnsplitImmediateMachineCodeShape) {
+  auto small_disasm = disassembleAArch64Snippet([](asmjit::a64::Builder* as) {
+    arch::add_immediate(as, asmjit::a64::x0, asmjit::a64::x0, 4095);
+  });
+  EXPECT_TRUE(std::regex_search(
+      small_disasm, std::regex{"add\\s+x0, x0, #(4095|0xfff)"}))
+      << small_disasm;
+  EXPECT_EQ(small_disasm.find("x13"), std::string::npos) << small_disasm;
+
+  auto unsplit_disasm = disassembleAArch64Snippet([](asmjit::a64::Builder* as) {
+    arch::add_immediate(as, asmjit::a64::x0, asmjit::a64::x0, 1 << 24);
+  });
+  EXPECT_NE(unsplit_disasm.find("x13"), std::string::npos) << unsplit_disasm;
+  EXPECT_TRUE(
+      std::regex_search(unsplit_disasm, std::regex{"add\\s+x0, x0, x13"}))
+      << unsplit_disasm;
+}
+
+TEST_F(BackendTest, CmpImmediateAvoidsClobberingScratchInput) {
+  auto disasm = disassembleAArch64Snippet([](asmjit::a64::Builder* as) {
+    arch::cmp_immediate(as, arch::reg_scratch_0, 1 << 24);
+  });
+
+  EXPECT_NE(disasm.find("x14"), std::string::npos) << disasm;
+  EXPECT_EQ(disasm.find("mov x13"), std::string::npos) << disasm;
+  EXPECT_TRUE(std::regex_search(disasm, std::regex{"cmp\\s+x13, x14"}))
+      << disasm;
+}
+
+#endif // CINDER_AARCH64
 
 namespace {
 double rt_func(
