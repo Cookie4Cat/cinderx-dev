@@ -141,6 +141,7 @@ class NativeGenerator {
   int maxInlineStackSize();
   void generateEpilogue(asmjit::BaseNode* epilogue_cursor);
   void generateDeoptExits(const asmjit::CodeHolder& code);
+  void emitAarch64LoadAttrInvokeStub(const asmjit::CodeHolder& code);
   void linkDeoptPatchers(const asmjit::CodeHolder& code);
   Py_ssize_t giJITDataOffset();
   void generateStaticEntryPoint(

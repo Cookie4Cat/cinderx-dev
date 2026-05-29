@@ -12,6 +12,7 @@
 #include "cinderx/StaticPython/typed-args-info.h"
 
 #include <array>
+#include <cstddef>
 #include <memory>
 #include <span>
 #include <unordered_map>
@@ -116,6 +117,19 @@ class AttributeMutator {
   int setAttr(PyObject* obj, PyObject* name, PyObject* value);
 
   static void changeKindFromSplitInline(SplitMutator* split, Kind new_kind);
+  static constexpr uintptr_t kindMask() {
+    return 0x07;
+  }
+  static constexpr uintptr_t splitInlineKnownOffsetKind() {
+    return static_cast<uintptr_t>(Kind::kSplitInlineKnownOffset);
+  }
+  static constexpr size_t typeOffset() {
+    return offsetof(AttributeMutator, type_);
+  }
+  static constexpr size_t splitValOffsetOffset() {
+    return offsetof(AttributeMutator, split_) +
+        offsetof(SplitMutator, val_offset);
+  }
 
  private:
   void set_type(PyTypeObject* type, Kind kind);
@@ -139,6 +153,9 @@ class AttributeCache {
   ~AttributeCache();
 
   void typeChanged(PyTypeObject* type);
+  static constexpr size_t entriesOffset() {
+    return offsetof(AttributeCache, entries_);
+  }
 
  protected:
   std::span<AttributeMutator> entries();

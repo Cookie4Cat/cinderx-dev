@@ -294,12 +294,15 @@ RewriteResult rewriteCallInstrs(instr_iter_t instr_iter, Environ* env) {
     env->max_arg_buffer_size =
         std::max<int>(env->max_arg_buffer_size, base_offset + rsp_sub);
     return kChanged;
-  } else if (!instr->isCall() && !instr->isVectorCall()) {
+  } else if (
+      !instr->isCall() && !instr->isVectorCall() &&
+      !instr->isLoadAttrCachedFastPath()) {
     return kUnchanged;
   }
 
   auto output = instr->output();
-  if (instr->isCall() && instr->getNumInputs() == 1 && output->isNone()) {
+  if ((instr->isCall() || instr->isLoadAttrCachedFastPath()) &&
+      instr->getNumInputs() == 1 && output->isNone()) {
     return kUnchanged;
   }
 
@@ -313,7 +316,9 @@ RewriteResult rewriteCallInstrs(instr_iter_t instr_iter, Environ* env) {
   }
 
   instr->setNumInputs(1); // leave function self operand only
-  instr->setOpcode(Instruction::kCall);
+  if (!instr->isLoadAttrCachedFastPath()) {
+    instr->setOpcode(Instruction::kCall);
+  }
 
   auto next_iter = std::next(instr_iter);
 
@@ -589,12 +594,13 @@ Instruction* findFusibleCompare(
   return nullptr;
 }
 
-// Convert CondBranch to Test and BranchCC instructions.
+// Convert CondBranch to target-specific branch instructions.
 void doRewriteCondBranch(instr_iter_t instr_iter, BasicBlock* next_block) {
   auto instr = instr_iter->get();
 
   auto input = instr->getInput(0);
   auto block = instr->basicblock();
+  auto size = input->dataType();
 
   auto true_block = block->getTrueSuccessor();
   auto false_block = block->getFalseSuccessor();
@@ -606,6 +612,7 @@ void doRewriteCondBranch(instr_iter_t instr_iter, BasicBlock* next_block) {
   // can use its flags directly (cmp + jcc) instead of setcc + test + je.
   Instruction* compare = findFusibleCompare(instr_iter, block);
   Instruction::Opcode opcode;
+  bool use_test_branch = false;
   if (compare != nullptr) {
     // Use the compare's condition directly for the branch.
     opcode = Instruction::compareToBranchCC(compare->opcode());
@@ -617,14 +624,20 @@ void doRewriteCondBranch(instr_iter_t instr_iter, BasicBlock* next_block) {
     // causing the live-out value to be stale. A proper fix requires liveness
     // information from the register allocator.
   } else {
-    // No fusible compare found. Insert test Reg, Reg instruction.
-    auto size = input->dataType();
-    block->allocateInstrBefore(
-        instr_iter,
-        Instruction::kTest,
-        PhyReg(input->getPhyRegister(), size),
-        PhyReg(input->getPhyRegister(), size));
     opcode = Instruction::kBranchNZ;
+#if defined(CINDER_AARCH64)
+    use_test_branch =
+        size == DataType::k32bit || size == DataType::k64bit ||
+        size == DataType::kObject;
+#endif
+    if (!use_test_branch) {
+      // Other cases branch on flags, so set flags with test Reg, Reg first.
+      block->allocateInstrBefore(
+          instr_iter,
+          Instruction::kTest,
+          PhyReg(input->getPhyRegister(), size),
+          PhyReg(input->getPhyRegister(), size));
+    }
   }
 
   if (true_block == next_block) {
@@ -637,7 +650,7 @@ void doRewriteCondBranch(instr_iter_t instr_iter, BasicBlock* next_block) {
   }
 
   instr->setOpcode(opcode);
-  instr->setNumInputs(0);
+  instr->setNumInputs(use_test_branch ? 1 : 0);
 
   instr->allocateLabelInput(target_block);
 

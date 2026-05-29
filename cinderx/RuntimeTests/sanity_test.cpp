@@ -379,6 +379,109 @@ call_or_error(jit.disassemble, target)
 )");
 }
 
+TEST_F(SanityTest, LoadAttrCachedFallbackAndInvalidationCoverage) {
+  runStockCode(R"(
+import cinderx.jit as jit
+
+jit.enable_specialized_opcodes()
+jit.compile_after_n_calls(1000000)
+
+class Box:
+    pass
+
+class Other:
+    pass
+
+class Descriptor:
+    def __get__(self, obj, typ=None):
+        if obj is None:
+            return self
+        return obj.seed + 5
+
+class WithDescriptor:
+    value = Descriptor()
+
+class SlotBox:
+    __slots__ = ("value",)
+
+box = Box()
+box.value = 41
+
+def read(obj):
+    return obj.value
+
+for _ in range(20000):
+    assert read(box) == 41
+
+assert jit.force_compile(read)
+counts = jit.get_function_hir_opcode_counts(read)
+assert counts.get("LoadAttrCached", 0) >= 1
+
+# Type mismatch should go through LoadAttrCache::invoke slow path and keep
+# normal Python lookup semantics.
+other = Other()
+other.value = 42
+assert read(other) == 42
+
+slot = SlotBox()
+slot.value = 43
+assert read(slot) == 43
+
+descr = WithDescriptor()
+descr.seed = 44
+assert read(descr) == 49
+
+try:
+    read(Other())
+except AttributeError:
+    pass
+else:
+    raise AssertionError("missing attribute should raise AttributeError")
+
+# Mutating the type should invalidate the cached split-inline fast path. If the
+# generated stub bypasses AttributeCache::typeChanged, this returns 41 instead.
+def custom_getattribute(self, name):
+    if name == "value":
+        return 99
+    return object.__getattribute__(self, name)
+
+Box.__getattribute__ = custom_getattribute
+assert read(box) == 99
+)");
+}
+
+TEST_F(SanityTest, TruthinessGuardFailurePropagatesException) {
+  runStockCode(R"(
+import cinderx.jit as jit
+
+jit.compile_after_n_calls(1000000)
+
+class BadBool:
+    def __bool__(self):
+        raise RuntimeError("truthiness failed")
+
+def truthy(obj):
+    if obj:
+        return 1
+    return 0
+
+for _ in range(20000):
+    assert truthy(True) == 1
+    assert truthy(False) == 0
+
+assert jit.force_compile(truthy)
+assert truthy(True) == 1
+assert truthy(False) == 0
+
+try:
+    truthy(BadBool())
+except RuntimeError as exc:
+    assert str(exc) == "truthiness failed"
+else:
+    raise AssertionError("guard failure should propagate RuntimeError")
+)");
+}
+
 TEST_F(SanityTest, JitAdvancedPythonShapeCoverage) {
   runStockCode(R"(
 import cinderx.jit as jit

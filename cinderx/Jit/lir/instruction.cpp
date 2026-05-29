@@ -301,6 +301,18 @@ bool Instruction::isAnyYield() const {
   }
 }
 
+bool Instruction::isCallLike() const {
+  switch (opcode_) {
+    case kCall:
+    case kLoadAttrCachedFastPath:
+    case kVarArgCall:
+    case kVectorCall:
+      return true;
+    default:
+      return false;
+  }
+}
+
 #define CASE_FLIP(op1, op2) \
   case op1:                 \
     return op2;             \

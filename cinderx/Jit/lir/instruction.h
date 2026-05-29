@@ -89,6 +89,13 @@ enum OperandSizeType {
   X(Nop)                                                                      \
   X(Unreachable, false, FlagEffects::kNone, kDefault, 0, {}, 1)               \
   X(Call, false, FlagEffects::kInvalidate, kAlways64, 1, {}, 1)               \
+  X(LoadAttrCachedFastPath,                                                   \
+    false,                                                                    \
+    FlagEffects::kInvalidate,                                                 \
+    kAlways64,                                                                \
+    1,                                                                        \
+    {},                                                                       \
+    1)                                                                        \
   X(VectorCall, false, FlagEffects::kInvalidate, kAlways64, 1, {1}, 1)        \
   X(VarArgCall, false, FlagEffects::kInvalidate, kDefault, 1, {1})            \
   X(Guard, false, FlagEffects::kInvalidate, kDefault, 1, {0, 0, 1, 1}, 1)     \
@@ -411,6 +418,7 @@ class Instruction {
   bool isAnyBranch() const;
   bool isTerminator() const;
   bool isAnyYield() const;
+  bool isCallLike() const;
 
   // negate the branch condition:
   // e.g. A >= B -> !(A < B)

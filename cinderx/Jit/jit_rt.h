@@ -463,11 +463,29 @@ PyObject* JITRT_SequenceNotContains(PyObject* haystack, PyObject* needle);
  */
 int JITRT_NotContainsBool(PyObject* w, PyObject* v);
 
+#if defined(__aarch64__)
+#define CINDERX_JIT_COMPACT_LONG_COMPARE_BOOL_FASTPATH 1
+#else
+#define CINDERX_JIT_COMPACT_LONG_COMPARE_BOOL_FASTPATH 0
+#endif
+
 /* Perform a rich comparison with integer result.  This wraps
    PyObject_RichCompare(), returning -1 for error, 0 for false, 1 for true.
    Unlike PyObject_RichCompareBool this doesn't perform an object equality
    check, which is incompatible w/ float comparisons. */
 
+#if CINDERX_JIT_COMPACT_LONG_COMPARE_BOOL_FASTPATH
+int JITRT_FastPyObjectRichCompareBoolLessThan(PyObject* v, PyObject* w);
+int JITRT_FastPyObjectRichCompareBoolLessThanEqual(PyObject* v, PyObject* w);
+int JITRT_FastPyObjectRichCompareBoolEqual(PyObject* v, PyObject* w);
+int JITRT_FastPyObjectRichCompareBoolNotEqual(PyObject* v, PyObject* w);
+int JITRT_FastPyObjectRichCompareBoolGreaterThan(PyObject* v, PyObject* w);
+int JITRT_FastPyObjectRichCompareBoolGreaterThanEqual(
+    PyObject* v,
+    PyObject* w);
+int JITRT_FastPyObjectRichCompareBool(PyObject* v, PyObject* w, int op);
+int JITRT_RichCompareBoolLessThanEqual(PyObject* v, PyObject* w);
+#endif
 int JITRT_RichCompareBool(PyObject* v, PyObject* w, int op);
 
 /* perform a batch decref to the objects in args */
