@@ -525,10 +525,7 @@ void LinearScanAllocator::calculateLiveIntervals() {
         register_input(opnd, instr->getInputPhyRegUse(i));
       }
 
-      if (instr_opcode == Instruction::kCall ||
-          instr_opcode == Instruction::kVarArgCall ||
-          instr_opcode == Instruction::kVectorCall ||
-          isTreeIterHelperCall(instr_opcode)) {
+      if (instr->isCallLike() || isTreeIterHelperCall(instr_opcode)) {
         reserveCallerSaveRegisters(instr_id);
       }
       // kLoadThreadState needs caller-save reservation when the TLS
@@ -1211,10 +1208,7 @@ void LinearScanAllocator::rewriteInstrOutput(
   // Avoid removing call instructions that may have side effects.
   // TODO: Fix HIR generator to avoid generating unused output/variables.
   // Need a separate pass in HIR to handle the dead code more gracefully.
-  if (instr->opcode() == Instruction::kCall ||
-      instr->opcode() == Instruction::kVarArgCall ||
-      instr->opcode() == Instruction::kVectorCall ||
-      isTreeIterHelperCall(instr->opcode()) ||
+  if (instr->isCallLike() || isTreeIterHelperCall(instr->opcode()) ||
       instr->opcode() == Instruction::kLoadThreadState) {
     output->setNone();
   } else {

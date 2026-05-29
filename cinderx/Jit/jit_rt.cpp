@@ -1973,9 +1973,86 @@ int JITRT_NotContainsBool(PyObject* w, PyObject* v) {
   return !res;
 }
 
-/* Perform a rich comparison with integer result.  This wraps
-   PyObject_RichCompare(), returning -1 for error, 0 for false, 1 for true. */
-int JITRT_RichCompareBool(PyObject* v, PyObject* w, int op) {
+#if CINDERX_JIT_COMPACT_LONG_COMPARE_BOOL_FASTPATH
+namespace {
+
+bool JITRT_TryCompactLongCompareBool(
+    PyObject* v,
+    PyObject* w,
+    int op,
+    int* result) {
+  if (!PyLong_CheckExact(v) || !PyLong_CheckExact(w)) {
+    return false;
+  }
+  auto left_long = reinterpret_cast<PyLongObject*>(v);
+  auto right_long = reinterpret_cast<PyLongObject*>(w);
+  if (!PyUnstable_Long_IsCompact(left_long) ||
+      !PyUnstable_Long_IsCompact(right_long)) {
+    return false;
+  }
+
+  Py_ssize_t left = PyUnstable_Long_CompactValue(left_long);
+  Py_ssize_t right = PyUnstable_Long_CompactValue(right_long);
+  switch (op) {
+    case Py_LT:
+      *result = left < right;
+      return true;
+    case Py_LE:
+      *result = left <= right;
+      return true;
+    case Py_EQ:
+      *result = left == right;
+      return true;
+    case Py_NE:
+      *result = left != right;
+      return true;
+    case Py_GT:
+      *result = left > right;
+      return true;
+    case Py_GE:
+      *result = left >= right;
+      return true;
+    default:
+      return false;
+  }
+}
+
+} // namespace
+
+int JITRT_FastPyObjectRichCompareBool(PyObject* v, PyObject* w, int op) {
+  int result = 0;
+  if (JITRT_TryCompactLongCompareBool(v, w, op, &result)) {
+    return result;
+  }
+  return PyObject_RichCompareBool(v, w, op);
+}
+
+#define DEFINE_FAST_COMPACT_LONG_COMPARE_BOOL(NAME, OP, PYOP)             \
+  int JITRT_FastPyObjectRichCompareBool##NAME(PyObject* v, PyObject* w) { \
+    if (PyLong_CheckExact(v) && PyLong_CheckExact(w)) {                   \
+      auto left_long = reinterpret_cast<PyLongObject*>(v);                \
+      auto right_long = reinterpret_cast<PyLongObject*>(w);               \
+      if (PyUnstable_Long_IsCompact(left_long) &&                         \
+          PyUnstable_Long_IsCompact(right_long)) {                        \
+        Py_ssize_t left = PyUnstable_Long_CompactValue(left_long);        \
+        Py_ssize_t right = PyUnstable_Long_CompactValue(right_long);      \
+        return left OP right;                                             \
+      }                                                                   \
+    }                                                                     \
+    return PyObject_RichCompareBool(v, w, PYOP);                          \
+  }
+
+DEFINE_FAST_COMPACT_LONG_COMPARE_BOOL(LessThan, <, Py_LT)
+DEFINE_FAST_COMPACT_LONG_COMPARE_BOOL(LessThanEqual, <=, Py_LE)
+DEFINE_FAST_COMPACT_LONG_COMPARE_BOOL(Equal, ==, Py_EQ)
+DEFINE_FAST_COMPACT_LONG_COMPARE_BOOL(NotEqual, !=, Py_NE)
+DEFINE_FAST_COMPACT_LONG_COMPARE_BOOL(GreaterThan, >, Py_GT)
+DEFINE_FAST_COMPACT_LONG_COMPARE_BOOL(GreaterThanEqual, >=, Py_GE)
+
+#undef DEFINE_FAST_COMPACT_LONG_COMPARE_BOOL
+#endif
+
+static int JITRT_RichCompareBoolGeneric(PyObject* v, PyObject* w, int op) {
   Ref<> res = Ref<>::steal(PyObject_RichCompare(v, w, op));
 
   if (res == nullptr) {
@@ -1985,6 +2062,35 @@ int JITRT_RichCompareBool(PyObject* v, PyObject* w, int op) {
   }
 
   return PyObject_IsTrue(res);
+}
+
+#if CINDERX_JIT_COMPACT_LONG_COMPARE_BOOL_FASTPATH
+int JITRT_RichCompareBoolLessThanEqual(PyObject* v, PyObject* w) {
+  if (PyLong_CheckExact(v) && PyLong_CheckExact(w)) {
+    auto left_long = reinterpret_cast<PyLongObject*>(v);
+    auto right_long = reinterpret_cast<PyLongObject*>(w);
+    if (PyUnstable_Long_IsCompact(left_long) &&
+        PyUnstable_Long_IsCompact(right_long)) {
+      Py_ssize_t left = PyUnstable_Long_CompactValue(left_long);
+      Py_ssize_t right = PyUnstable_Long_CompactValue(right_long);
+      return left <= right;
+    }
+  }
+  return JITRT_RichCompareBoolGeneric(v, w, Py_LE);
+}
+#endif
+
+/* Perform a rich comparison with integer result.  This wraps
+   PyObject_RichCompare(), returning -1 for error, 0 for false, 1 for true. */
+int JITRT_RichCompareBool(PyObject* v, PyObject* w, int op) {
+#if CINDERX_JIT_COMPACT_LONG_COMPARE_BOOL_FASTPATH
+  int fast_result = 0;
+  if (JITRT_TryCompactLongCompareBool(v, w, op, &fast_result)) {
+    return fast_result;
+  }
+#endif
+
+  return JITRT_RichCompareBoolGeneric(v, w, op);
 }
 
 /* perform a batch decref to the objects in args */

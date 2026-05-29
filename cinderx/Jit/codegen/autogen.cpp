@@ -265,6 +265,24 @@ void TranslateGuard(Environ* env, const Instruction* instr) {
   auto deopt_label = as->newLabel();
   auto kind = instr->getInput(0)->getConstant();
 
+  auto near_deopt_label = [&]() {
+    auto near_label = as->newLabel();
+    env->aarch64_near_deopt_branches.emplace_back(near_label, deopt_label);
+    return near_label;
+  };
+  auto emit_b_eq_deopt = [&]() {
+    as->b_eq(near_deopt_label());
+  };
+  auto emit_b_ne_deopt = [&]() {
+    as->b_ne(near_deopt_label());
+  };
+  auto emit_cbz_deopt = [&](auto reg_arg) {
+    as->cbz(reg_arg, near_deopt_label());
+  };
+  auto emit_cbnz_deopt = [&](auto reg_arg) {
+    as->cbnz(reg_arg, near_deopt_label());
+  };
+
   arch::Gp reg = arch::reg_scratch_0;
   uint64_t mask = 0;
   size_t sign_bit = 0;
@@ -302,20 +320,24 @@ void TranslateGuard(Environ* env, const Instruction* instr) {
     case kNotZero:
       if (mask) {
         as->tst(reg, mask);
-        as->b_eq(deopt_label);
+        emit_b_eq_deopt();
       } else {
-        as->cbz(reg, deopt_label);
+        emit_cbz_deopt(reg);
       }
       break;
-    case kNotNegative:
-      as->tbnz(reg, sign_bit, deopt_label);
+    case kNotNegative: {
+      auto skip = as->newLabel();
+      as->tbz(reg, sign_bit, skip);
+      as->b(deopt_label);
+      as->bind(skip);
       break;
+    }
     case kZero:
       if (mask) {
         as->tst(reg, mask);
-        as->b_ne(deopt_label);
+        emit_b_ne_deopt();
       } else {
-        as->cbnz(reg, deopt_label);
+        emit_cbnz_deopt(reg);
       }
       break;
     case kAlwaysFail:
@@ -323,7 +345,7 @@ void TranslateGuard(Environ* env, const Instruction* instr) {
       break;
     case kIs:
       emit_cmp(reg);
-      as->b_ne(deopt_label);
+      emit_b_ne_deopt();
       break;
     case kHasType:
       JIT_ABORT(
@@ -1823,6 +1845,34 @@ void translateCall(Environ* env, const Instruction* instr) {
   }
 }
 
+void translateLoadAttrCachedFastPath(Environ* env, const Instruction* instr) {
+#if defined(CINDER_AARCH64) && PY_VERSION_HEX >= 0x030E0000 && \
+    !defined(Py_GIL_DISABLED)
+  auto output = instr->output();
+  auto as = env->as;
+
+  if (!env->load_attr_invoke_stub.isValid()) {
+    env->load_attr_invoke_stub = as->newLabel();
+  }
+  emitCall(*env, env->load_attr_invoke_stub, instr);
+
+  if (output->type() != OperandBase::kNone) {
+    if (output->isVecD()) {
+      as->mov(AT::getVecD(output), a64::d0);
+    } else {
+      auto out_reg = AT::getGpOutput(output);
+      if (out_reg.isGpW()) {
+        as->mov(out_reg, a64::w0);
+      } else {
+        as->mov(out_reg, a64::x0);
+      }
+    }
+  }
+#else
+  translateCall(env, instr);
+#endif
+}
+
 // Our move instruction encapsulates moving a value between registers, setting
 // the value of a register, loading a value from memory, and storing a value to
 // memory. The operation that will be performed is determined by the
@@ -3193,9 +3243,21 @@ void AutoTranslator::translateInstr(Environ* env, const Instruction* instr)
       env->as->b(getLabel(env, instr->getInput(0)));
       return;
     case Instruction::kBranchZ:
+      if (instr->getNumInputs() == 2) {
+        env->as->cbz(
+            getReg(instr, instr->getInput(0)),
+            getLabel(env, instr->getInput(1)));
+        return;
+      }
       env->as->b_eq(getLabel(env, instr->getInput(0)));
       return;
     case Instruction::kBranchNZ:
+      if (instr->getNumInputs() == 2) {
+        env->as->cbnz(
+            getReg(instr, instr->getInput(0)),
+            getLabel(env, instr->getInput(1)));
+        return;
+      }
       env->as->b_ne(getLabel(env, instr->getInput(0)));
       return;
     case Instruction::kBranchA:
@@ -3401,6 +3463,9 @@ void AutoTranslator::translateInstr(Environ* env, const Instruction* instr)
     }
     case Instruction::kCall:
       translateCall(env, instr);
+      return;
+    case Instruction::kLoadAttrCachedFastPath:
+      translateLoadAttrCachedFastPath(env, instr);
       return;
     case Instruction::kMove:
       translateMove(env, instr);

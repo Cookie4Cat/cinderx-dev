@@ -51,6 +51,34 @@ BB %4 - preds: %1 %2
 
   std::stringstream ss;
   ss << *parsed_func;
+#if defined(CINDER_AARCH64)
+  auto expected_lir_str = fmt::format(
+      R"(Function:
+BB %0 - succs: %1 %2
+                   BranchNZ {}:Object, BB%1
+
+BB %2 - preds: %0 - succs: %3 %4
+                   BranchNZ {}:Object, BB%3
+                   Branch BB%4
+
+BB %1 - preds: %0 - succs: %3 %4
+                   BranchZ {}:Object, BB%4
+
+BB %3 - preds: %1 %2
+{:>9}:Object = Move {}:Object
+
+BB %4 - preds: %1 %2
+{:>9}:Object = Move {}:Object
+
+)",
+      PhyLocation{0, 64},
+      PhyLocation{0, 64},
+      PhyLocation{0, 64},
+      PhyLocation{0, 64},
+      PhyLocation{5, 64},
+      PhyLocation{0, 64},
+      PhyLocation{13, 64});
+#else
   auto expected_lir_str = fmt::format(
       R"(Function:
 BB %0 - succs: %1 %2
@@ -83,6 +111,7 @@ BB %4 - preds: %1 %2
       PhyLocation{5, 64},
       PhyLocation{0, 64},
       PhyLocation{13, 64});
+#endif
   ASSERT_EQ(expected_lir_str, ss.str());
   ASSERT_TRUE(verifyPostRegAllocInvariants(parsed_func.get(), std::cout));
 }
@@ -115,6 +144,26 @@ BB %2 - preds: %0
 
   std::stringstream ss;
   ss << *parsed_func;
+#if defined(CINDER_AARCH64)
+  auto expected_lir_str = fmt::format(
+      R"(Function:
+BB %0 - succs: %1 %2
+                   BranchZ {}:Object, BB%2
+                   Branch BB%1
+
+BB %1 - preds: %0 - section: .coldtext
+{:>9}:Object = Move {}:Object
+
+BB %2 - preds: %0
+{:>9}:Object = Move {}:Object
+
+)",
+      PhyLocation{0, 64},
+      PhyLocation{0, 64},
+      PhyLocation{13, 64},
+      PhyLocation{0, 64},
+      PhyLocation{5, 64});
+#else
   auto expected_lir_str = fmt::format(
       R"(Function:
 BB %0 - succs: %1 %2
@@ -135,6 +184,7 @@ BB %2 - preds: %0
       PhyLocation{13, 64},
       PhyLocation{0, 64},
       PhyLocation{5, 64});
+#endif
   ASSERT_EQ(expected_lir_str, ss.str());
   ASSERT_TRUE(verifyPostRegAllocInvariants(parsed_func.get(), std::cout));
 }
@@ -656,6 +706,64 @@ TEST_F(LIRPostAllocRewriteTest, CallResultArgMoveDoesNotCrossRegisterClasses) {
   EXPECT_EQ(instrs[1]->getInput(0)->getPhyRegister(), D8);
   EXPECT_EQ(instrs[1]->getInput(0)->dataType(), DataType::kDouble);
   ASSERT_TRUE(verifyPostRegAllocInvariants(&func, std::cout));
+}
+
+static void checkSubWordCondBranchUsesTest(DataType data_type) {
+  Function func;
+  auto* entry = func.allocateBasicBlock();
+  auto* true_bb = func.allocateBasicBlock();
+  auto* false_bb = func.allocateBasicBlock();
+
+  entry->addSuccessor(true_bb);
+  entry->addSuccessor(false_bb);
+  entry->allocateInstr(
+      Instruction::kCondBranch, nullptr, PhyReg{X0, data_type});
+
+  jit::codegen::Environ env;
+  PostRegAllocRewrite rewrite(&func, &env);
+  rewrite.run();
+
+  auto instrs = collectInstrs(*entry);
+  ASSERT_GE(instrs.size(), 2);
+  EXPECT_TRUE(instrs[0]->isTest());
+  EXPECT_EQ(instrs[0]->getInput(0)->dataType(), data_type);
+  EXPECT_EQ(instrs[0]->getInput(1)->dataType(), data_type);
+  EXPECT_TRUE(instrs[1]->isBranchNZ() || instrs[1]->isBranchZ());
+  ASSERT_EQ(instrs[1]->getNumInputs(), 1);
+  EXPECT_TRUE(instrs[1]->getInput(0)->isLabel());
+}
+
+TEST_F(LIRPostAllocRewriteTest, CondBranchSubWordStillUsesTest) {
+  checkSubWordCondBranchUsesTest(DataType::k8bit);
+  checkSubWordCondBranchUsesTest(DataType::k16bit);
+}
+
+TEST_F(LIRPostAllocRewriteTest, LoadAttrCachedFastPathKeepsOpcode) {
+  Function func;
+  auto* bb = func.allocateBasicBlock();
+  bb->allocateInstr(
+      Instruction::kLoadAttrCachedFastPath,
+      nullptr,
+      OutPhyReg{X0, DataType::kObject},
+      Imm{0x1234, DataType::kObject},
+      PhyReg{X1, DataType::k64bit},
+      PhyReg{X2, DataType::kObject},
+      PhyReg{X3, DataType::kObject});
+
+  jit::codegen::Environ env;
+  PostRegAllocRewrite rewrite(&func, &env);
+  rewrite.run();
+
+  Instruction* fast_path = nullptr;
+  for (auto* instr : collectInstrs(*bb)) {
+    ASSERT_FALSE(instr->isCall())
+        << "LoadAttrCachedFastPath must not be rewritten to kCall";
+    if (instr->isLoadAttrCachedFastPath()) {
+      fast_path = instr;
+    }
+  }
+  ASSERT_NE(fast_path, nullptr);
+  EXPECT_EQ(fast_path->getNumInputs(), 1);
 }
 
 // kAdd with one register input and one stack input should insert a Move from
