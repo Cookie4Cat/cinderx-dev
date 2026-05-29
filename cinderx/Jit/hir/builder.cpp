@@ -35,6 +35,7 @@ extern "C" {
 #include "cinderx/python_runtime.h"
 
 #include <algorithm>
+#include <cstring>
 #include <deque>
 #include <memory>
 #include <optional>
@@ -46,6 +47,24 @@ extern "C" {
 namespace jit::hir {
 
 namespace {
+
+#if PY_VERSION_HEX >= 0x030E0000
+PyObject* readCacheObj(
+    PyCodeObject* code,
+    const BytecodeInstruction& bc_instr,
+    int instruction_offset) {
+  static_assert(
+      sizeof(PyObject*) == 4 * sizeof(_Py_CODEUNIT),
+      "object cache slot must be exactly 4 code units");
+  PyObject* obj = nullptr;
+  std::memcpy(
+      &obj,
+      &codeUnit(code)[bc_instr.opcodeIndex().value() + instruction_offset]
+           .cache,
+      sizeof(obj));
+  return obj;
+}
+#endif
 
 void rotateStackTop(OperandStack& stack, int count) {
   if (count < 2) {
@@ -2950,10 +2969,18 @@ void HIRBuilder::emitLoadAttr(
       ? bc_instr.specializedOpcode()
       : LOAD_ATTR;
   bool slot_fast_path_enabled = specialized_opcode == LOAD_ATTR_SLOT;
+#if PY_VERSION_HEX >= 0x030E0000
+  bool method_with_values_fast_path_enabled =
+      specialized_opcode == LOAD_ATTR_METHOD_WITH_VALUES;
+#else
+  bool method_with_values_fast_path_enabled = false;
+#endif
 #ifdef Py_GIL_DISABLED
   slot_fast_path_enabled = false;
+  method_with_values_fast_path_enabled = false;
 #endif
-  if (is_method && !slot_fast_path_enabled) {
+  if (is_method && !slot_fast_path_enabled &&
+      !method_with_values_fast_path_enabled) {
     emitLoadMethod(tc, name_idx);
     return;
   }
@@ -2993,6 +3020,45 @@ void HIRBuilder::emitLoadAttr(
         if (is_method) {
           emitPushNull(tc);
         }
+        return;
+      }
+#endif
+#if PY_VERSION_HEX >= 0x030E0000
+      case LOAD_ATTR_METHOD_WITH_VALUES: {
+        JIT_DCHECK(
+            is_method,
+            "LOAD_ATTR_METHOD_WITH_VALUES must be a method-style LOAD_ATTR");
+        Register* type_version = temps_.AllocateStack();
+        Register* keys_version = temps_.AllocateStack();
+        Register* descr = temps_.AllocateStack();
+        Register* name = temps_.AllocateStack();
+        Register* raw_result = temps_.AllocateStack();
+        Register* result = temps_.AllocateStack();
+        Register* method_instance = temps_.AllocateStack();
+        tc.emit<LoadConst>(
+            type_version,
+            Type::fromCInt(bc_instr.cacheU32(2), TCInt64));
+        tc.emit<LoadConst>(
+            keys_version,
+            Type::fromCInt(bc_instr.cacheU32(4), TCInt64));
+        tc.emit<LoadConst>(
+            descr, Type::fromObject(readCacheObj(code_, bc_instr, 6)));
+        tc.emit<LoadConst>(
+            name, Type::fromObject(PyTuple_GET_ITEM(code_->co_names, name_idx)));
+        tc.emit<CallStatic>(
+            5,
+            raw_result,
+            reinterpret_cast<void*>(JITRT_LoadAttrMethodWithValues),
+            TOptObject,
+            receiver,
+            type_version,
+            keys_version,
+            descr,
+            name);
+        tc.emit<CheckExc>(result, raw_result, tc.frame);
+        tc.emit<GetSecondOutput>(method_instance, TOptObject, raw_result);
+        tc.frame.stack.push(result);
+        tc.frame.stack.push(method_instance);
         return;
       }
 #endif

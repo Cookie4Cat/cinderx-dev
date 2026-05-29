@@ -1619,6 +1619,295 @@ def test(obj):
   EXPECT_GE(countOpcode(*irfunc, Opcode::kGuard), 1) << hir;
 }
 
+#if PY_VERSION_HEX >= 0x030E0000
+TEST_F(HIRBuildTest, LoadAttrMethodWithValuesLowersToHelperCall) {
+  const char* src = R"(
+class MethodValue:
+    def __init__(self):
+        self.base = 40
+
+    def method(self, value):
+        return self.base + value
+
+obj = MethodValue()
+
+def test(obj, value):
+    return obj.method(value)
+)";
+
+  Ref<PyFunctionObject> func(compileAndGet(src, "test"));
+  ASSERT_NE(func.get(), nullptr);
+  Ref<> obj(getGlobal("obj"));
+  ASSERT_NE(obj.get(), nullptr);
+  Ref<> value = Ref<>::steal(PyLong_FromLong(2));
+  ASSERT_NE(value.get(), nullptr);
+
+  for (int i = 0; i < 100; i++) {
+    auto result = Ref<>::steal(PyObject_CallFunctionObjArgs(
+        reinterpret_cast<PyObject*>(func.get()),
+        obj.get(),
+        value.get(),
+        nullptr));
+    ASSERT_NE(result.get(), nullptr);
+    ASSERT_TRUE(isIntEquals(result, 42));
+  }
+  ASSERT_TRUE(hasSpecializedOpcode(func, LOAD_ATTR_METHOD_WITH_VALUES));
+
+  std::unique_ptr<Function> irfunc(buildHIR(func));
+  ASSERT_NE(irfunc, nullptr);
+
+  std::string hir = fullPrinter().ToString(*irfunc);
+  EXPECT_EQ(
+      countStaticCallsTo(
+          *irfunc, reinterpret_cast<void*>(JITRT_LoadAttrMethodWithValues)),
+      1)
+      << hir;
+  EXPECT_EQ(countOpcode(*irfunc, Opcode::kLoadAttr), 0) << hir;
+  EXPECT_EQ(countOpcode(*irfunc, Opcode::kLoadMethod), 0) << hir;
+  EXPECT_EQ(countOpcode(*irfunc, Opcode::kLoadMethodCached), 0) << hir;
+  EXPECT_EQ(countOpcode(*irfunc, Opcode::kGetSecondOutput), 1) << hir;
+}
+
+TEST_F(HIRBuildTest, LoadAttrMethodWithValuesFallbacksPreserveSemantics) {
+  const char* src = R"(
+class C:
+    def __init__(self, base):
+        self.base = base
+
+    def method(self, value):
+        return self.base + value
+
+class D:
+    def __init__(self, base):
+        self.base = base
+
+    def method(self, value):
+        return self.base + value
+
+c_obj = C(40)
+d_obj = D(200)
+
+def test_switch(obj, value):
+    return obj.method(value)
+
+def shadow_c():
+    c_obj.method = lambda value: value + 100
+
+class GetattrCallable:
+    def __getattr__(self, name):
+        if name == "method":
+            return lambda value: value + 500
+        raise AttributeError(name)
+
+getattr_obj = GetattrCallable()
+
+class Replaceable:
+    def __init__(self, base):
+        self.base = base
+
+    def method(self, value):
+        return self.base + value
+
+replace_obj = Replaceable(40)
+
+def test_replace(obj, value):
+    return obj.method(value)
+
+def new_method(self, value):
+    return self.base + value + 100
+
+def replace_method():
+    Replaceable.method = new_method
+
+class PropertyReplaceable:
+    def __init__(self, base):
+        self.base = base
+
+    def method(self, value):
+        return self.base + value
+
+property_obj = PropertyReplaceable(40)
+
+def test_property_replace(obj, value):
+    return obj.method(value)
+
+def replace_with_property():
+    PropertyReplaceable.method = property(
+        lambda self: lambda value: self.base + value + 200
+    )
+
+class CallableMethod:
+    def __call__(self, value):
+        return value + 300
+
+class CallableReplaceable:
+    def __init__(self, base):
+        self.base = base
+
+    def method(self, value):
+        return self.base + value
+
+callable_obj = CallableReplaceable(40)
+
+def test_callable_replace(obj, value):
+    return obj.method(value)
+
+def replace_with_callable():
+    CallableReplaceable.method = CallableMethod()
+)";
+
+  Ref<PyFunctionObject> test_switch(compileAndGet(src, "test_switch"));
+  ASSERT_NE(test_switch.get(), nullptr);
+  Ref<> c_obj(getGlobal("c_obj"));
+  ASSERT_NE(c_obj.get(), nullptr);
+  Ref<> d_obj(getGlobal("d_obj"));
+  ASSERT_NE(d_obj.get(), nullptr);
+  Ref<> value = Ref<>::steal(PyLong_FromLong(2));
+  ASSERT_NE(value.get(), nullptr);
+
+  for (int i = 0; i < 100; i++) {
+    auto result = Ref<>::steal(PyObject_CallFunctionObjArgs(
+        reinterpret_cast<PyObject*>(test_switch.get()),
+        c_obj.get(),
+        value.get(),
+        nullptr));
+    ASSERT_NE(result.get(), nullptr);
+    ASSERT_TRUE(isIntEquals(result, 42));
+  }
+  ASSERT_TRUE(hasSpecializedOpcode(test_switch, LOAD_ATTR_METHOD_WITH_VALUES));
+  ASSERT_EQ(jit::compileFunction(test_switch), jit::Result::OK);
+
+  auto type_miss_result = Ref<>::steal(PyObject_CallFunctionObjArgs(
+      reinterpret_cast<PyObject*>(test_switch.get()),
+      d_obj.get(),
+      value.get(),
+      nullptr));
+  ASSERT_NE(type_miss_result.get(), nullptr);
+  ASSERT_TRUE(isIntEquals(type_miss_result, 202));
+
+  Ref<PyFunctionObject> shadow_c(getGlobal("shadow_c"));
+  ASSERT_NE(shadow_c.get(), nullptr);
+  auto shadow_result = Ref<>::steal(PyObject_CallFunctionObjArgs(
+      reinterpret_cast<PyObject*>(shadow_c.get()), nullptr));
+  ASSERT_NE(shadow_result.get(), nullptr);
+
+  auto shadowed_call_result = Ref<>::steal(PyObject_CallFunctionObjArgs(
+      reinterpret_cast<PyObject*>(test_switch.get()),
+      c_obj.get(),
+      value.get(),
+      nullptr));
+  ASSERT_NE(shadowed_call_result.get(), nullptr);
+  ASSERT_TRUE(isIntEquals(shadowed_call_result, 102));
+
+  Ref<> getattr_obj(getGlobal("getattr_obj"));
+  ASSERT_NE(getattr_obj.get(), nullptr);
+  auto getattr_result = Ref<>::steal(PyObject_CallFunctionObjArgs(
+      reinterpret_cast<PyObject*>(test_switch.get()),
+      getattr_obj.get(),
+      value.get(),
+      nullptr));
+  ASSERT_NE(getattr_result.get(), nullptr);
+  ASSERT_TRUE(isIntEquals(getattr_result, 502));
+
+  Ref<PyFunctionObject> test_replace(compileAndGet(src, "test_replace"));
+  ASSERT_NE(test_replace.get(), nullptr);
+  Ref<> replace_obj(getGlobal("replace_obj"));
+  ASSERT_NE(replace_obj.get(), nullptr);
+
+  for (int i = 0; i < 100; i++) {
+    auto result = Ref<>::steal(PyObject_CallFunctionObjArgs(
+        reinterpret_cast<PyObject*>(test_replace.get()),
+        replace_obj.get(),
+        value.get(),
+        nullptr));
+    ASSERT_NE(result.get(), nullptr);
+    ASSERT_TRUE(isIntEquals(result, 42));
+  }
+  ASSERT_TRUE(hasSpecializedOpcode(test_replace, LOAD_ATTR_METHOD_WITH_VALUES));
+  ASSERT_EQ(jit::compileFunction(test_replace), jit::Result::OK);
+
+  Ref<PyFunctionObject> replace_method(getGlobal("replace_method"));
+  ASSERT_NE(replace_method.get(), nullptr);
+  auto replace_result = Ref<>::steal(PyObject_CallFunctionObjArgs(
+      reinterpret_cast<PyObject*>(replace_method.get()), nullptr));
+  ASSERT_NE(replace_result.get(), nullptr);
+
+  auto replaced_call_result = Ref<>::steal(PyObject_CallFunctionObjArgs(
+      reinterpret_cast<PyObject*>(test_replace.get()),
+      replace_obj.get(),
+      value.get(),
+      nullptr));
+  ASSERT_NE(replaced_call_result.get(), nullptr);
+  ASSERT_TRUE(isIntEquals(replaced_call_result, 142));
+
+  Ref<PyFunctionObject> test_property_replace(
+      compileAndGet(src, "test_property_replace"));
+  ASSERT_NE(test_property_replace.get(), nullptr);
+  Ref<> property_obj(getGlobal("property_obj"));
+  ASSERT_NE(property_obj.get(), nullptr);
+
+  for (int i = 0; i < 100; i++) {
+    auto result = Ref<>::steal(PyObject_CallFunctionObjArgs(
+        reinterpret_cast<PyObject*>(test_property_replace.get()),
+        property_obj.get(),
+        value.get(),
+        nullptr));
+    ASSERT_NE(result.get(), nullptr);
+    ASSERT_TRUE(isIntEquals(result, 42));
+  }
+  ASSERT_TRUE(
+      hasSpecializedOpcode(test_property_replace, LOAD_ATTR_METHOD_WITH_VALUES));
+  ASSERT_EQ(jit::compileFunction(test_property_replace), jit::Result::OK);
+
+  Ref<PyFunctionObject> replace_with_property(getGlobal("replace_with_property"));
+  ASSERT_NE(replace_with_property.get(), nullptr);
+  auto property_replace_result = Ref<>::steal(PyObject_CallFunctionObjArgs(
+      reinterpret_cast<PyObject*>(replace_with_property.get()), nullptr));
+  ASSERT_NE(property_replace_result.get(), nullptr);
+
+  auto property_call_result = Ref<>::steal(PyObject_CallFunctionObjArgs(
+      reinterpret_cast<PyObject*>(test_property_replace.get()),
+      property_obj.get(),
+      value.get(),
+      nullptr));
+  ASSERT_NE(property_call_result.get(), nullptr);
+  ASSERT_TRUE(isIntEquals(property_call_result, 242));
+
+  Ref<PyFunctionObject> test_callable_replace(
+      compileAndGet(src, "test_callable_replace"));
+  ASSERT_NE(test_callable_replace.get(), nullptr);
+  Ref<> callable_obj(getGlobal("callable_obj"));
+  ASSERT_NE(callable_obj.get(), nullptr);
+
+  for (int i = 0; i < 100; i++) {
+    auto result = Ref<>::steal(PyObject_CallFunctionObjArgs(
+        reinterpret_cast<PyObject*>(test_callable_replace.get()),
+        callable_obj.get(),
+        value.get(),
+        nullptr));
+    ASSERT_NE(result.get(), nullptr);
+    ASSERT_TRUE(isIntEquals(result, 42));
+  }
+  ASSERT_TRUE(
+      hasSpecializedOpcode(test_callable_replace, LOAD_ATTR_METHOD_WITH_VALUES));
+  ASSERT_EQ(jit::compileFunction(test_callable_replace), jit::Result::OK);
+
+  Ref<PyFunctionObject> replace_with_callable(getGlobal("replace_with_callable"));
+  ASSERT_NE(replace_with_callable.get(), nullptr);
+  auto callable_replace_result = Ref<>::steal(PyObject_CallFunctionObjArgs(
+      reinterpret_cast<PyObject*>(replace_with_callable.get()), nullptr));
+  ASSERT_NE(callable_replace_result.get(), nullptr);
+
+  auto callable_call_result = Ref<>::steal(PyObject_CallFunctionObjArgs(
+      reinterpret_cast<PyObject*>(test_callable_replace.get()),
+      callable_obj.get(),
+      value.get(),
+      nullptr));
+  ASSERT_NE(callable_call_result.get(), nullptr);
+  ASSERT_TRUE(isIntEquals(callable_call_result, 302));
+}
+#endif
+
 TEST_F(HIRBuildTest, MemberDescriptorStoreSimplifiesToStoreField) {
   const char* src = R"(
 class SlotValue:

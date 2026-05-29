@@ -38,6 +38,50 @@ static_assert(
     kAttrCacheIndexInstructionOffset == 4,
     "_PyAttrCache::index moved; update attr cache readers");
 
+#if PY_VERSION_HEX >= 0x030E0000
+// LOAD_ATTR specializations that carry a method descriptor (notably
+// LOAD_ATTR_METHOD_WITH_VALUES) read their inline cache through the
+// _PyLoadMethodCache view, NOT _PyAttrCache. The JIT bakes these fields as
+// constants at compile time (see HIRBuilder::emitLoadAttr), so pin their
+// code-unit offsets here: if CPython ever moves them, fail the build instead
+// of silently reading the wrong cache slot.
+static_assert(
+    offsetof(_PyLoadMethodCache, type_version) % sizeof(_Py_CODEUNIT) == 0,
+    "_PyLoadMethodCache::type_version must be code-unit aligned");
+static_assert(
+    offsetof(_PyLoadMethodCache, keys_version) % sizeof(_Py_CODEUNIT) == 0,
+    "_PyLoadMethodCache::keys_version must be code-unit aligned");
+static_assert(
+    offsetof(_PyLoadMethodCache, descr) % sizeof(_Py_CODEUNIT) == 0,
+    "_PyLoadMethodCache::descr must be code-unit aligned");
+
+constexpr int kLoadMethodCacheTypeVersionInstructionOffset =
+    attrCacheInstructionOffset(offsetof(_PyLoadMethodCache, type_version));
+constexpr int kLoadMethodCacheKeysVersionInstructionOffset =
+    attrCacheInstructionOffset(offsetof(_PyLoadMethodCache, keys_version));
+constexpr int kLoadMethodCacheDescrInstructionOffset =
+    attrCacheInstructionOffset(offsetof(_PyLoadMethodCache, descr));
+
+static_assert(
+    kLoadMethodCacheTypeVersionInstructionOffset == 2,
+    "_PyLoadMethodCache::type_version moved; update LOAD_ATTR method readers "
+    "in HIRBuilder::emitLoadAttr");
+static_assert(
+    kLoadMethodCacheKeysVersionInstructionOffset == 4,
+    "_PyLoadMethodCache::keys_version moved; update LOAD_ATTR method readers "
+    "in HIRBuilder::emitLoadAttr");
+static_assert(
+    kLoadMethodCacheDescrInstructionOffset == 6,
+    "_PyLoadMethodCache::descr moved; update LOAD_ATTR method readers "
+    "in HIRBuilder::emitLoadAttr");
+
+// descr is read with a pointer-sized memcpy in HIRBuilder::emitLoadAttr; make
+// sure the cache slot really is one pointer wide.
+static_assert(
+    sizeof(((_PyLoadMethodCache*)nullptr)->descr) == sizeof(PyObject*),
+    "_PyLoadMethodCache::descr is not pointer-sized");
+#endif
+
 } // namespace
 
 BCOffset BytecodeInstruction::baseOffset() const {
@@ -137,6 +181,7 @@ int BytecodeInstruction::specializedOpcode() const {
     case TO_BOOL_INT:
     case TO_BOOL_LIST:
     case TO_BOOL_STR:
+    case LOAD_ATTR_METHOD_WITH_VALUES:
 #endif
     case LOAD_ATTR_SLOT:
     case LOAD_ATTR_MODULE:
