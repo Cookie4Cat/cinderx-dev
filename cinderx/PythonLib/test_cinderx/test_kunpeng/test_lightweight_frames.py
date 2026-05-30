@@ -205,6 +205,37 @@ class LightweightFramesTests(unittest.TestCase):
 
         self.assertIn(("f", __file__), frames)
 
+    @unittest.skipUnless(
+        cinderx.is_lightweight_frames_enabled(),
+        "LWF not compiled in",
+    )
+    def test_generator_return_cleanup_marks_generator_done(self) -> None:
+        events = []
+        holder = {}
+
+        class ReenterOnDel:
+            def __del__(self) -> None:
+                gen = holder["gen"]
+                events.append(("running", gen.gi_running))
+                try:
+                    next(gen)
+                except BaseException as exc:
+                    events.append(type(exc).__name__)
+
+        def gen(obj):
+            if obj is None:
+                yield obj
+
+        self.assertTrue(cinderx.jit.force_compile(gen))
+        holder["gen"] = gen(ReenterOnDel())
+
+        with self.assertRaises(StopIteration):
+            next(holder["gen"])
+
+        self.assertIn(("running", False), events)
+        self.assertIn("StopIteration", events)
+        self.assertNotIn("ValueError", events)
+
 
 if __name__ == "__main__":
     if "--tls-case" in sys.argv:

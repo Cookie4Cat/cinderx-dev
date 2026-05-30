@@ -34,7 +34,9 @@ namespace jit::hir {
   V(CheckVar)                      \
   V(CheckFreevar)                  \
   V(CheckField)                    \
+  V(CheckTreeIterChildEntry)       \
   V(CIntToCBool)                   \
+  V(ClearTreeIterState)            \
   V(CompactLongUnbox)              \
   V(Compare)                       \
   V(CompareBool)                   \
@@ -54,6 +56,7 @@ namespace jit::hir {
   V(DoubleBinaryOp)                \
   V(EagerImportName)               \
   V(EndInlinedFunction)            \
+  V(EnsureTreeIterState)           \
   V(FillTypeAttrCache)             \
   V(FillTypeMethodCache)           \
   V(FloatBinaryOp)                 \
@@ -102,6 +105,7 @@ namespace jit::hir {
   V(LoadCellItem)                  \
   V(LoadConst)                     \
   V(LoadCurrentFunc)               \
+  V(LoadCurrentNode)               \
   V(LoadFrame)                     \
   V(LoadEvalBreaker)               \
   V(AtQuiescentState)              \
@@ -114,8 +118,11 @@ namespace jit::hir {
   V(LoadModuleAttrCached)          \
   V(LoadModuleMethodCached)        \
   V(LoadMethodSuper)               \
+  V(LoadPhase)                     \
+  V(LoadPoppedPhase)               \
   V(LoadSpecial)                   \
   V(LoadSplitDictItem)             \
+  V(LoadStackTop)                  \
   V(LoadTupleItem)                 \
   V(LoadTypeAttrCacheEntryType)    \
   V(LoadTypeAttrCacheEntryValue)   \
@@ -145,6 +152,8 @@ namespace jit::hir {
   V(RefineType)                    \
   V(Return)                        \
   V(RunPeriodicTasks)              \
+  V(SaveCurrentNode)               \
+  V(SavePhase)                     \
   V(Send)                          \
   V(SetCellItem)                   \
   V(SetCurrentAwaiter)             \
@@ -153,6 +162,8 @@ namespace jit::hir {
   V(SetSetItem)                    \
   V(SetUpdate)                     \
   V(Snapshot)                      \
+  V(StateStackPop)                 \
+  V(StateStackPush)                \
   V(StealCellItem)                 \
   V(SwapCellItem)                  \
   V(StoreArrayItem)                \
@@ -161,6 +172,8 @@ namespace jit::hir {
   V(StoreField)                    \
   V(StoreSubscr)                   \
   V(TpAlloc)                       \
+  V(TreeIterEnterChild)            \
+  V(TreeIterLeaveCurrentNode)      \
   V(UnaryOp)                       \
   V(UnicodeCompare)                \
   V(UnicodeConcat)                 \

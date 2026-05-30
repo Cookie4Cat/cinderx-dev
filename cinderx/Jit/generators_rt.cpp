@@ -12,6 +12,7 @@
 #include "cinderx/Jit/deopt.h"
 #include "cinderx/Jit/frame.h"
 #include "cinderx/Jit/generators_mm.h"
+#include "cinderx/Jit/tree_iter_state.h"
 #include "cinderx/UpstreamBorrow/borrowed.h"
 #include "cinderx/module_state.h"
 
@@ -34,6 +35,19 @@ namespace {
 
 const destructor original_gen_dealloc = PyGen_Type.tp_dealloc;
 const destructor original_coro_dealloc = PyCoro_Type.tp_dealloc;
+
+bool has_active_tree_iter_state(JitGenObject* gen) {
+  if (gen == nullptr) {
+    return false;
+  }
+  return gen->genDataFooter()->tree_iter_state != nullptr;
+}
+
+void raise_tree_iter_deopt_blocked() {
+  PyErr_SetString(
+      PyExc_RuntimeError,
+      "cannot deopt a suspended TreeIter state-machine generator");
+}
 
 // Reimplementation of CPython's gen_dealloc that uses our custom free-list
 // (Ci_free_jit_list_gen) instead of PyObject_GC_Del for memory recycling.
@@ -86,6 +100,12 @@ void gen_dealloc_with_custom_free(PyObject* self) {
 }
 
 void jitgen_dealloc(PyObject* self) {
+  // Clear TreeIter state before deopt so the footer pointer is still valid.
+  JitGenObject* jit_gen = JitGenObject::cast(self);
+  if (jit_gen != nullptr) {
+    clearTreeIterState(jit_gen->genDataFooter());
+  }
+
   if (!deopt_jit_gen(self)) {
     JIT_ABORT("Tried to dealloc a running JIT generator");
   }
@@ -118,6 +138,11 @@ int jitgen_traverse(PyObject* obj, visitproc visit, void* arg) {
         Py_VISIT(v);
       }
       JIT_CHECK(JitGen_CheckAny(obj), "Deopted during GC traversal");
+    }
+
+    // Visit TreeIter state machine owned references if present.
+    if (int r = visitTreeIterState(gen_footer->tree_iter_state, visit, arg)) {
+      return r;
     }
 
 #if PY_VERSION_HEX < 0x030E0000
@@ -207,6 +232,16 @@ PySendResult jitgen_am_send(PyObject* obj, PyObject* arg, PyObject** presult) {
   JitGenObject* gen = JitGenObject::cast(obj);
   if (gen == nullptr) {
     return Py_TYPE(obj)->tp_as_async->am_send(obj, arg, presult);
+  }
+
+  // A finalizer can re-enter a generator while its return-path refcount
+  // cleanup is still running.  At that point the generator is already
+  // logically complete, but deopting it would race the cleanup that is
+  // releasing JIT-owned live values.
+  if (FRAME_STATE_FINISHED(gen->gi_frame_state) &&
+      Py_TYPE(obj) == cinderx::getModuleState()->gen_type) {
+    *presult = Py_NewRef(Py_None);
+    return PYGEN_RETURN;
   }
 
   // Check for user programming errors.
@@ -342,7 +377,12 @@ PyObject* jitgen_throw(PyObject* obj, PyObject* const* args, Py_ssize_t nargs) {
   // Always deopt as an exception being raised internally would cause a JIT
   // generator to deopt anyway.
   if (!deopt_jit_gen(obj)) {
-    raise_already_running_exception(reinterpret_cast<JitGenObject*>(obj));
+    JitGenObject* gen = reinterpret_cast<JitGenObject*>(obj);
+    if (has_active_tree_iter_state(gen)) {
+      raise_tree_iter_deopt_blocked();
+    } else {
+      raise_already_running_exception(gen);
+    }
     return nullptr;
   }
   return gen_throw_meth(obj, args, nargs);
@@ -353,7 +393,12 @@ PyObject* jitgen_close(PyObject* obj, PyObject*) {
   // would cause a deopt anyway or if the generator is already done then deopt
   // is cheap and won't rexecute in the interpreter.
   if (!deopt_jit_gen(obj)) {
-    raise_already_running_exception(reinterpret_cast<JitGenObject*>(obj));
+    JitGenObject* gen = reinterpret_cast<JitGenObject*>(obj);
+    if (has_active_tree_iter_state(gen)) {
+      raise_tree_iter_deopt_blocked();
+    } else {
+      raise_already_running_exception(gen);
+    }
     return nullptr;
   }
   return gen_close_meth(obj, nullptr);
@@ -812,6 +857,9 @@ bool deopt_jit_gen(PyObject* obj) {
     return false;
   }
   GenDataFooter* gen_footer = jit_gen->genDataFooter();
+  if (gen_footer->tree_iter_state != nullptr) {
+    return false;
+  }
 
   if (gen_footer->yieldPoint) {
     // TODO: This "deopting" mechanism should be better shared with the
@@ -838,6 +886,7 @@ bool deopt_jit_gen(PyObject* obj) {
         "JIT generator has no yield point and is not running or completed");
   }
 
+  clearTreeIterState(gen_footer);
   deopt_jit_gen_object_only(jit_gen);
 
   return true;

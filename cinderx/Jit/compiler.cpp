@@ -25,6 +25,7 @@
 #include "cinderx/Jit/hir/refcount_insertion.h"
 #include "cinderx/Jit/hir/simplify.h"
 #include "cinderx/Jit/hir/ssa.h"
+#include "cinderx/Jit/hir/tree_iter_state_machine_pass.h"
 #include "cinderx/Jit/jit_time_log.h"
 #include "cinderx/Jit/osr.h"
 
@@ -134,6 +135,8 @@ void Compiler::runPasses(
   runPassIf(hir::CleanCFG{}, PassConfig::kCleanCFG);
   runPassIf(hir::DeadCodeElimination{}, PassConfig::kDeadCodeElim);
   runPassIf(hir::CleanCFG{}, PassConfig::kCleanCFG);
+  runPassIf(
+      hir::TreeIterStateMachinePass{}, PassConfig::kTreeIterStateMachine);
 
   runPass(jit::hir::RefcountInsertion{}, irfunc, callback);
 
@@ -191,6 +194,7 @@ PassConfig createConfig() {
   set(hir_opts.float_comparison_simplification,
       PassConfig::kFloatComparisonSimplification);
   set(hir_opts.simplify, PassConfig::kSimplify);
+  set(hir_opts.tree_iter_state_machine, PassConfig::kTreeIterStateMachine);
 
   return static_cast<PassConfig>(result);
 }

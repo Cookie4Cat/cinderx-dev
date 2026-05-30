@@ -8,6 +8,8 @@ import threading
 import unittest
 import weakref
 
+import cinderx
+import cinderx.jit
 import cinderx.test_support as cinder_support
 from cinderx.jit import _deopt_gen, is_jit_compiled
 

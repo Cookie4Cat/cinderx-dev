@@ -312,7 +312,20 @@ static std::string format_immediates(const Function* func, const Instr& instr) {
     case Opcode::kUnicodeRepeat:
     case Opcode::kUnicodeSubscr:
     case Opcode::kUnreachable:
-    case Opcode::kYieldValue: {
+    case Opcode::kYieldValue:
+    case Opcode::kEnsureTreeIterState:
+    case Opcode::kSaveCurrentNode:
+    case Opcode::kLoadCurrentNode:
+    case Opcode::kSavePhase:
+    case Opcode::kLoadPhase:
+    case Opcode::kStateStackPush:
+    case Opcode::kStateStackPop:
+    case Opcode::kLoadPoppedPhase:
+    case Opcode::kLoadStackTop:
+    case Opcode::kCheckTreeIterChildEntry:
+    case Opcode::kTreeIterEnterChild:
+    case Opcode::kTreeIterLeaveCurrentNode:
+    case Opcode::kClearTreeIterState: {
       return "";
     }
     case Opcode::kBeginInlinedFunction:

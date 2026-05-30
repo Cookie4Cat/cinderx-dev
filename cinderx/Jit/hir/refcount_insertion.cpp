@@ -11,6 +11,7 @@
 #include "cinderx/Jit/hir/instr_effects.h"
 #include "cinderx/Jit/hir/phi_elimination.h"
 #include "cinderx/Jit/hir/printer.h"
+#include "cinderx/Jit/jit_rt.h"
 
 #include <fmt/ostream.h>
 
@@ -1279,6 +1280,47 @@ void optimizeLongDecrefRuns(Function& irfunc) {
   }
 }
 
+bool isGeneratorReturnTailInstr(const Instr& instr) {
+  return instr.IsReturn() || instr.IsLoadConst() || instr.IsUpdatePrevInstr() ||
+      instr.IsDecref() || instr.IsXDecref();
+}
+
+void markGeneratorCompletedBeforeReturnCleanup(Function& irfunc) {
+  if (irfunc.code == nullptr || (irfunc.code->co_flags & CO_GENERATOR) == 0) {
+    return;
+  }
+
+  for (auto& block : irfunc.cfg.GetRPOTraversal()) {
+    if (!block->back().IsReturn()) {
+      continue;
+    }
+
+    Instr* insert_before = nullptr;
+    for (auto it = block->rbegin(); it != block->rend(); ++it) {
+      Instr& instr = *it;
+      if (!isGeneratorReturnTailInstr(instr)) {
+        break;
+      }
+      if (instr.IsDecref() || instr.IsXDecref()) {
+        insert_before = &instr;
+      }
+    }
+
+    if (insert_before == nullptr) {
+      continue;
+    }
+
+    // Refcount cleanup can run user finalizers.  Mark the generator complete
+    // before tail cleanup so re-entrant next() observes StopIteration rather
+    // than FRAME_EXECUTING.
+    Instr* marker = CallStaticRetVoid::create(
+        0,
+        reinterpret_cast<void*>(JITRT_MarkGeneratorCompleted));
+    marker->copyBytecodeOffset(*insert_before);
+    marker->InsertBefore(*insert_before);
+  }
+}
+
 } // namespace
 
 void RefcountInsertion::Run(Function& func) {
@@ -1351,6 +1393,8 @@ void RefcountInsertion::Run(Function& func) {
   //
   // Consider having a separate run of CleanCFG between passes clean this up.
   removeTrampolineBlocks(&func.cfg);
+
+  markGeneratorCompletedBeforeReturnCleanup(func);
 
   // Optimize long decref runs
   optimizeLongDecrefRuns(func);

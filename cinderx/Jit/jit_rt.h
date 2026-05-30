@@ -50,6 +50,8 @@ void JITRT_InitFrameCellVars(
 std::pair<jit::JitGenObject*, jit::GenDataFooter*>
 JITRT_UnlinkGenFrameAndReturnGenDataFooter(PyThreadState* tstate);
 
+void JITRT_MarkGeneratorCompleted();
+
 /*
  * Helper function to decref a frame.
  *
@@ -584,3 +586,58 @@ extern PyObject JITRT_IterDoneSentinel;
  * Returns the next value, or JITRT_IterDoneSentinel if the iterator is done.
  */
 PyObject* JITRT_InvokeIterNext(PyObject* iterator);
+
+/*
+ * TreeIter state machine runtime helpers.  These are called from JIT-generated
+ * code to implement the in-order tree traversal state machine.  All take
+ * footer as the first argument; footer IS the frame pointer of a JIT generator
+ * frame.
+ */
+
+// Ensure footer->tree_iter_state is allocated.
+// Returns 0 on success; sets MemoryError and returns -1 on OOM.
+int JITRT_EnsureTreeIterState(jit::GenDataFooter* footer);
+
+// Py_INCREF(node), write footer->tree_iter_state->current_node, Py_DECREF(old).
+void JITRT_SaveCurrentNode(jit::GenDataFooter* footer, PyObject* node);
+
+// Read current_node and Py_INCREF it; returns nullptr if state is null.
+PyObject* JITRT_LoadCurrentNode(jit::GenDataFooter* footer);
+
+// Write footer->tree_iter_state->current_phase.
+void JITRT_SavePhase(jit::GenDataFooter* footer, int32_t phase);
+
+// Read footer->tree_iter_state->current_phase; returns 0 if state is null.
+int32_t JITRT_LoadPhase(jit::GenDataFooter* footer);
+
+// Push (node, phase) onto the heap stack.
+// Returns 0 on success; sets MemoryError and returns -1 on OOM.
+int JITRT_StateStackPush(
+    jit::GenDataFooter* footer,
+    PyObject* node,
+    int32_t phase);
+
+// Pop top entry; transfers ownership of node to caller; writes popped_phase.
+PyObject* JITRT_StateStackPop(jit::GenDataFooter* footer);
+
+// Read footer->tree_iter_state->popped_phase (written by JITRT_StateStackPop).
+int32_t JITRT_LoadPoppedPhase(jit::GenDataFooter* footer);
+
+// Read footer->tree_iter_state->stack_top.
+int32_t JITRT_LoadStackTop(jit::GenDataFooter* footer);
+
+// Check child exactness, active-path, and depth budget before entering child.
+// Returns 0 on success; sets an exception and returns -1 on failure.
+int JITRT_CheckTreeIterChildEntry(
+    jit::GenDataFooter* footer,
+    PyObject* child);
+
+// Record child entry depth.
+void JITRT_TreeIterEnterChild(jit::GenDataFooter* footer, PyObject* child);
+
+// Record current-node exit depth.
+void JITRT_TreeIterLeaveCurrentNode(jit::GenDataFooter* footer);
+
+// Release all owned refs in tree_iter_state and set footer->tree_iter_state
+// to nullptr.  Idempotent.
+void JITRT_ClearTreeIterState(jit::GenDataFooter* footer);

@@ -61,6 +61,27 @@ bool shouldReplaceOperand(const OperandBase& operand) {
   return operand.isVreg() || operand.isLinked();
 }
 
+bool isTreeIterHelperCall(Instruction::Opcode opcode) {
+  switch (opcode) {
+    case Instruction::kEnsureTreeIterState:
+    case Instruction::kSaveCurrentNode:
+    case Instruction::kLoadCurrentNode:
+    case Instruction::kSavePhase:
+    case Instruction::kLoadPhase:
+    case Instruction::kStateStackPush:
+    case Instruction::kStateStackPop:
+    case Instruction::kLoadPoppedPhase:
+    case Instruction::kLoadStackTop:
+    case Instruction::kCheckTreeIterChildEntry:
+    case Instruction::kTreeIterEnterChild:
+    case Instruction::kTreeIterLeaveCurrentNode:
+    case Instruction::kClearTreeIterState:
+      return true;
+    default:
+      return false;
+  }
+}
+
 } // namespace
 
 RegallocBlockState::RegallocBlockState(
@@ -504,7 +525,7 @@ void LinearScanAllocator::calculateLiveIntervals() {
         register_input(opnd, instr->getInputPhyRegUse(i));
       }
 
-      if (instr->isCallLike()) {
+      if (instr->isCallLike() || isTreeIterHelperCall(instr_opcode)) {
         reserveCallerSaveRegisters(instr_id);
       }
       // kLoadThreadState needs caller-save reservation when the TLS
@@ -1187,7 +1208,8 @@ void LinearScanAllocator::rewriteInstrOutput(
   // Avoid removing call instructions that may have side effects.
   // TODO: Fix HIR generator to avoid generating unused output/variables.
   // Need a separate pass in HIR to handle the dead code more gracefully.
-  if (instr->isCallLike() || instr->opcode() == Instruction::kLoadThreadState) {
+  if (instr->isCallLike() || isTreeIterHelperCall(instr->opcode()) ||
+      instr->opcode() == Instruction::kLoadThreadState) {
     output->setNone();
   } else {
     instr->setOpcode(Instruction::kNop);

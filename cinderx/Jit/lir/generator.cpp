@@ -4737,6 +4737,68 @@ LIRGenerator::TranslatedBlock LIRGenerator::TranslateOneBasicBlock(
         bbb.appendInstr(i.output(), Instruction::kIntToBool, i.GetOperand(0));
         break;
       }
+
+      // TreeIter state machine: emit LIR opcodes 1-to-1; actual machine code
+      // translation is handled by the architecture-specific codegen rules in
+      // autogen.cpp.  Instructions without output use appendInstr(opcode, ...);
+      // instructions with output use appendInstr(output, opcode, ...).
+      case Opcode::kEnsureTreeIterState: {
+        bbb.appendInstr(i.output(), Instruction::kEnsureTreeIterState);
+        break;
+      }
+      case Opcode::kSaveCurrentNode: {
+        bbb.appendInstr(Instruction::kSaveCurrentNode, i.GetOperand(0));
+        break;
+      }
+      case Opcode::kLoadCurrentNode: {
+        bbb.appendInstr(i.output(), Instruction::kLoadCurrentNode);
+        break;
+      }
+      case Opcode::kSavePhase: {
+        bbb.appendInstr(Instruction::kSavePhase, i.GetOperand(0));
+        break;
+      }
+      case Opcode::kLoadPhase: {
+        bbb.appendInstr(i.output(), Instruction::kLoadPhase);
+        break;
+      }
+      case Opcode::kStateStackPush: {
+        bbb.appendInstr(
+            i.output(),
+            Instruction::kStateStackPush,
+            i.GetOperand(0),
+            i.GetOperand(1));
+        break;
+      }
+      case Opcode::kStateStackPop: {
+        bbb.appendInstr(i.output(), Instruction::kStateStackPop);
+        break;
+      }
+      case Opcode::kLoadPoppedPhase: {
+        bbb.appendInstr(i.output(), Instruction::kLoadPoppedPhase);
+        break;
+      }
+      case Opcode::kLoadStackTop: {
+        bbb.appendInstr(i.output(), Instruction::kLoadStackTop);
+        break;
+      }
+      case Opcode::kCheckTreeIterChildEntry: {
+        bbb.appendInstr(
+            i.output(), Instruction::kCheckTreeIterChildEntry, i.GetOperand(0));
+        break;
+      }
+      case Opcode::kTreeIterEnterChild: {
+        bbb.appendInstr(Instruction::kTreeIterEnterChild, i.GetOperand(0));
+        break;
+      }
+      case Opcode::kTreeIterLeaveCurrentNode: {
+        bbb.appendInstr(Instruction::kTreeIterLeaveCurrentNode);
+        break;
+      }
+      case Opcode::kClearTreeIterState: {
+        bbb.appendInstr(Instruction::kClearTreeIterState);
+        break;
+      }
     }
 
     if (auto db = i.asDeoptBase()) {

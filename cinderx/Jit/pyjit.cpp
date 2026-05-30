@@ -567,6 +567,11 @@ FlagProcessor initFlagProcessor() {
   HIR_OPTIMIZATION_OPTION(
       "phi elimination", phi_elim, "jit-phi-elim", "PYTHONJITPHIELIM");
   HIR_OPTIMIZATION_OPTION(
+      "TreeIter state machine",
+      tree_iter_state_machine,
+      "jit-tree-iter-state-machine",
+      "PYTHONJITTREEITERSTATEMACHINE");
+  HIR_OPTIMIZATION_OPTION(
       "PrimitiveBox rematerialization",
       primitive_box_remat,
       "jit-primitive-box-remat",
