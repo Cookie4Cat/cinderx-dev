@@ -78,6 +78,21 @@ python3.14 ci_pipeline/run_gate.py --suite wheel_compat_negative
 Python tests. Set `CINDERX_LOCAL_RUN_LIBTEST=1` to include the local-wheel
 Lib/test jobs, which is what the `daily` pipeline does.
 
+For offline ARM64 hosts, pass dependency paths through the environment before
+running a pipeline or standalone suite:
+
+```bash
+export CINDERX_LOCAL_DEPS=/opt/cinderx-deps
+export CINDERX_PIP_WHEELHOUSE=/opt/cinderx-pydeps
+export CINDERX_PIP_OFFLINE=1
+
+python3.14 ci_pipeline/run_gate.py --suite runtime --coverage
+python3.14 ci_pipeline/run_gate.py --suite cinderx_local
+```
+
+Leave `CINDERX_LOCAL_RUN_LIBTEST` unset when running the ordinary
+`cinderx_local` suite without Lib/test.
+
 `wheel_compat` expects:
 
 - `CINDERX_TEST_PYTHON`
@@ -91,16 +106,40 @@ Lib/test jobs, which is what the `daily` pipeline does.
 The test wheel enables `CINDERX_INCLUDE_TEST_PACKAGE_DATA=1` so gate-only
 package data stays out of normal release wheels.
 
-## Dependency Cache And Pip Offline Mode
+## Fat Wheel Build Options
 
-`run_gate` uses the CMake FetchContent dependency cache added by PR 27. The
-local suites set a default cache path next to the source tree:
+The CPython 3.14 manylinux fat wheel builder defaults to release-oriented
+settings:
 
-```text
-{repo}/../cinderx-local-deps
+```bash
+python3.14 ci_pipeline/build_cp314_manylinux_fat_wheel.py
 ```
 
-Override it with:
+Default build behavior:
+
+- `CMAKE_BUILD_TYPE=Release`
+- `CINDERX_ENABLE_PGO=0`
+- `CINDERX_ENABLE_LTO=0`
+
+Use explicit flags when a CI job needs different build characteristics:
+
+```bash
+python3.14 ci_pipeline/build_cp314_manylinux_fat_wheel.py \
+  --cmake-build-type RelWithDebInfo \
+  --pgo \
+  --lto
+```
+
+The host build manifest records the selected CMake build type and whether PGO
+or LTO was enabled. The in-container build script follows the same defaults and
+only enables PGO/LTO when `CINDERX_ENABLE_PGO` or `CINDERX_ENABLE_LTO` is set to
+a non-zero value.
+
+## Dependency Cache And Pip Offline Mode
+
+`run_gate` can pass a CMake FetchContent dependency cache into RuntimeTests and
+wheel builds. Local suites do not hard-code a cache path; set one explicitly
+when the host should use offline or pre-populated dependencies:
 
 - `CINDERX_LOCAL_DEPS`: local cache directory for CMake FetchContent
   dependencies
@@ -126,12 +165,15 @@ For Python package bootstrap in suite venvs, set:
 Example:
 
 ```bash
-export CINDERX_LOCAL_DEPS=/opt/cinderx-local-deps
+export CINDERX_LOCAL_DEPS=/opt/cinderx-deps
 export CINDERX_PIP_WHEELHOUSE=/opt/cinderx-pydeps
 export CINDERX_PIP_OFFLINE=1
 
 python3.14 ci_pipeline/run_gate.py pr --coverage
 ```
+
+Without `CINDERX_LOCAL_DEPS`, CMake falls back to the normal FetchContent
+behavior for the current environment.
 
 Coverage thresholds are configured in `COVERAGE_MIN_PERCENT` near the top of
 `ci_pipeline/run_gate.py`. They are calibrated for the current runtime-only

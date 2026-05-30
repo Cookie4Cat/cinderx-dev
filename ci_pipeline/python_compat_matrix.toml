@@ -19,11 +19,6 @@ python = "/usr/local/cpython-3.14.3/bin/python3.14"
 version = "3.14.3"
 
 [[unsupported]]
-name = "cp3144"
-python = "/usr/local/cpython-3.14.4/bin/python3.14"
-version = "3.14.4"
-
-[[unsupported]]
 name = "cp3116"
 python = "/usr/local/cpython-3.11.6/bin/python3.11"
 version = "3.11.6"
