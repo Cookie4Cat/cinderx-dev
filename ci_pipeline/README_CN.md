@@ -72,6 +72,19 @@ python3.14 ci_pipeline/run_gate.py --suite wheel_compat_negative
 `CINDERX_LOCAL_RUN_LIBTEST=1` 后会额外运行本地 wheel 的 Lib/test；`daily`
 pipeline 会自动打开这个开关。
 
+在 ARM64 离线主机上运行 pipeline 或独立 suite 前，通过环境变量传入依赖路径：
+
+```bash
+export CINDERX_LOCAL_DEPS=/opt/cinderx-deps
+export CINDERX_PIP_WHEELHOUSE=/opt/cinderx-pydeps
+export CINDERX_PIP_OFFLINE=1
+
+python3.14 ci_pipeline/run_gate.py --suite runtime --coverage
+python3.14 ci_pipeline/run_gate.py --suite cinderx_local
+```
+
+普通 `cinderx_local` 不跑 Lib/test 时，保持 `CINDERX_LOCAL_RUN_LIBTEST` 未设置即可。
+
 `wheel_compat` 需要：
 
 - `CINDERX_TEST_PYTHON`
@@ -85,15 +98,37 @@ pipeline 会自动打开这个开关。
 测试 wheel 会启用 `CINDERX_INCLUDE_TEST_PACKAGE_DATA=1`，避免门禁专用 package
 data 进入普通发布 wheel。
 
-## 依赖缓存 / pip 离线模式
+## Fat Wheel 构建参数
 
-`run_gate` 使用 PR 27 引入的 CMake FetchContent 依赖缓存。本地 suite 默认把缓存放在源码仓旁边：
+CPython 3.14 manylinux fat wheel 构建脚本默认使用更适合发布产物的参数：
 
-```text
-{repo}/../cinderx-local-deps
+```bash
+python3.14 ci_pipeline/build_cp314_manylinux_fat_wheel.py
 ```
 
-可以通过下面的环境变量覆盖：
+默认构建行为：
+
+- `CMAKE_BUILD_TYPE=Release`
+- `CINDERX_ENABLE_PGO=0`
+- `CINDERX_ENABLE_LTO=0`
+
+如果 CI job 需要不同构建特征，可以显式打开：
+
+```bash
+python3.14 ci_pipeline/build_cp314_manylinux_fat_wheel.py \
+  --cmake-build-type RelWithDebInfo \
+  --pgo \
+  --lto
+```
+
+host build manifest 会记录实际使用的 CMake build type，以及 PGO/LTO 是否开启。
+容器内构建脚本保持同样默认值，只有当 `CINDERX_ENABLE_PGO` 或
+`CINDERX_ENABLE_LTO` 被设置为非零值时才会启用对应能力。
+
+## 依赖缓存 / pip 离线模式
+
+`run_gate` 可以把 CMake FetchContent 依赖缓存传给 RuntimeTests 和 wheel 构建。
+本地 suite 不再硬编码缓存路径；需要使用离线或预置依赖时，请显式设置：
 
 - `CINDERX_LOCAL_DEPS`：CMake FetchContent 依赖的本地缓存目录
 
@@ -116,12 +151,14 @@ data 进入普通发布 wheel。
 示例：
 
 ```bash
-export CINDERX_LOCAL_DEPS=/opt/cinderx-local-deps
+export CINDERX_LOCAL_DEPS=/opt/cinderx-deps
 export CINDERX_PIP_WHEELHOUSE=/opt/cinderx-pydeps
 export CINDERX_PIP_OFFLINE=1
 
 python3.14 ci_pipeline/run_gate.py pr --coverage
 ```
+
+未设置 `CINDERX_LOCAL_DEPS` 时，CMake 会按当前环境使用普通 FetchContent 行为。
 
 覆盖率阈值定义在 `ci_pipeline/run_gate.py` 顶部附近的
 `COVERAGE_MIN_PERCENT`，当前按 runtime-only 覆盖范围校准。

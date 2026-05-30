@@ -169,13 +169,14 @@ def docker_mount_args(mounts: dict[Path, str]) -> list[str]:
 def build_docker_command(args: argparse.Namespace, dirs: dict[str, Path]) -> list[str]:
     proxy = detect_proxy(args)
     env: dict[str, str | None] = {
-        "CINDERX_ENABLE_PGO": "0" if args.no_pgo else "1",
-        "CINDERX_ENABLE_LTO": "0" if args.no_lto else "1",
+        "CINDERX_ENABLE_PGO": "1" if args.pgo else "0",
+        "CINDERX_ENABLE_LTO": "1" if args.lto else "0",
         "CINDERX_VERSION_PATCH": args.version_patch,
         "CINDERX_REQUIRES_PYTHON": args.requires_python,
         "CINDERX_SKIP_SMOKE": "1" if args.skip_smoke else "0",
         "CINDERX_SKIP_BUILDER_CHECK": "1" if args.skip_builder_check else "0",
         "CINDERX_RESUME": "1" if args.resume else "0",
+        "CMAKE_BUILD_TYPE": args.cmake_build_type,
         "CMAKE_BUILD_PARALLEL_LEVEL": args.cmake_build_parallel_level,
         "MAKEFLAGS": args.makeflags,
         "HTTP_PROXY": proxy,
@@ -224,8 +225,9 @@ def write_host_manifest(args: argparse.Namespace, dirs: dict[str, Path], docker_
         "docker_command": docker_command,
         "requires_python": args.requires_python,
         "version_patch": args.version_patch,
-        "pgo_enabled": not args.no_pgo,
-        "lto_enabled": not args.no_lto,
+        "cmake_build_type": args.cmake_build_type,
+        "pgo_enabled": args.pgo,
+        "lto_enabled": args.lto,
     }
     (dirs["logs"] / "host-build-manifest.json").write_text(
         json.dumps(manifest, indent=2, sort_keys=True) + "\n",
@@ -278,10 +280,44 @@ def parse_args(argv: list[str]) -> argparse.Namespace:
         help="CINDERX_VERSION_PATCH value used by setup.py",
     )
     parser.add_argument("--requires-python", default=DEFAULT_REQUIRES_PYTHON)
+    parser.add_argument(
+        "--cmake-build-type",
+        default="Release",
+        help=(
+            "CMAKE_BUILD_TYPE used by setup.py inside the builder container; "
+            "defaults to Release to avoid shipping RelWithDebInfo debug info"
+        ),
+    )
     parser.add_argument("--cmake-build-parallel-level")
     parser.add_argument("--makeflags")
-    parser.add_argument("--no-pgo", action="store_true", help="do not set CINDERX_ENABLE_PGO=1")
-    parser.add_argument("--no-lto", action="store_true", help="do not set CINDERX_ENABLE_LTO=1")
+    pgo_group = parser.add_mutually_exclusive_group()
+    pgo_group.add_argument(
+        "--pgo",
+        dest="pgo",
+        action="store_true",
+        default=False,
+        help="set CINDERX_ENABLE_PGO=1; disabled by default",
+    )
+    pgo_group.add_argument(
+        "--no-pgo",
+        dest="pgo",
+        action="store_false",
+        help="do not set CINDERX_ENABLE_PGO=1; default",
+    )
+    lto_group = parser.add_mutually_exclusive_group()
+    lto_group.add_argument(
+        "--lto",
+        dest="lto",
+        action="store_true",
+        default=False,
+        help="set CINDERX_ENABLE_LTO=1; disabled by default",
+    )
+    lto_group.add_argument(
+        "--no-lto",
+        dest="lto",
+        action="store_false",
+        help="do not set CINDERX_ENABLE_LTO=1; default",
+    )
     parser.add_argument("--skip-smoke", action="store_true", help="skip import smoke tests inside the builder image")
     parser.add_argument(
         "--skip-builder-check",

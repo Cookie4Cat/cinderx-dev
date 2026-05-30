@@ -28,19 +28,20 @@ else
   export CXX="${CXX:-g++}"
 fi
 
-if [ "${CINDERX_ENABLE_PGO:-1}" != "0" ]; then
+if [ "${CINDERX_ENABLE_PGO:-0}" != "0" ]; then
   export CINDERX_ENABLE_PGO=1
 else
   unset CINDERX_ENABLE_PGO
 fi
 
-if [ "${CINDERX_ENABLE_LTO:-1}" != "0" ]; then
+if [ "${CINDERX_ENABLE_LTO:-0}" != "0" ]; then
   export CINDERX_ENABLE_LTO=1
 else
   unset CINDERX_ENABLE_LTO
 fi
 
 export CINDERX_VERSION_PATCH="${CINDERX_VERSION_PATCH:-0}"
+export CMAKE_BUILD_TYPE="${CMAKE_BUILD_TYPE:-Release}"
 export CMAKE_BUILD_PARALLEL_LEVEL="${CMAKE_BUILD_PARALLEL_LEVEL:-$(nproc)}"
 export MAKEFLAGS="${MAKEFLAGS:--j$(nproc)}"
 export CINDERX_REQUIRES_PYTHON="${CINDERX_REQUIRES_PYTHON:->=3.14,<3.14.4}"
