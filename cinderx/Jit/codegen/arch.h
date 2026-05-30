@@ -148,6 +148,8 @@ namespace jit::codegen::arch {
 
 enum class AccessSize : int32_t { k8 = 1, k16 = 2, k32 = 4, k64 = 8 };
 
+bool is_split_add_sub_imm(uint64_t imm);
+
 asmjit::a64::Mem ptr_offset(
     const asmjit::a64::Gp& base,
     int32_t offset,
@@ -165,6 +167,11 @@ asmjit::a64::Mem ptr_resolve(
 namespace jit::codegen::arch {
 
 void cmp_immediate(
+    asmjit::a64::Builder* as,
+    const asmjit::a64::Gp& reg,
+    uint64_t imm);
+
+void cmp_immediate_for_equality(
     asmjit::a64::Builder* as,
     const asmjit::a64::Gp& reg,
     uint64_t imm);

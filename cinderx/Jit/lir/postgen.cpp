@@ -177,10 +177,23 @@ RewriteResult rewriteBinaryOpLargeConstant(instr_iter_t instr_iter) {
     return kUnchanged;
   }
 #elif defined(CINDER_AARCH64)
-  if (instr->isAdd() || instr->isSub() || instr->isCompare()) {
-    // add, sub, and cmp (which is a pseudo-instruction aliased to subs) all
-    // support a 12-bit immediate optionally shifted by 20 bits.
-    if (asmjit::arm::Utils::isAddSubImm(constant)) {
+  if (instr->isAdd() || instr->isSub()) {
+    // add/sub support a 12-bit immediate optionally shifted by 12 bits.
+    // Codegen can also split some larger values into two shifted-immediate
+    // instructions.
+    if (asmjit::arm::Utils::isAddSubImm(constant) ||
+        codegen::arch::is_split_add_sub_imm(constant)) {
+      return kUnchanged;
+    }
+  } else if (instr->isCompare()) {
+    // Ordering comparisons need the carry/overflow flags from one complete
+    // subtraction, so only equality comparisons may use the split form.
+    if (asmjit::arm::Utils::isAddSubImm(constant) ||
+        asmjit::arm::Utils::isAddSubImm(-constant) ||
+        ((instr->opcode() == Instruction::kEqual ||
+          instr->opcode() == Instruction::kNotEqual) &&
+         (codegen::arch::is_split_add_sub_imm(constant) ||
+          codegen::arch::is_split_add_sub_imm(-constant)))) {
       return kUnchanged;
     }
   } else if (instr->isAnd() || instr->isOr() || instr->isXor()) {
