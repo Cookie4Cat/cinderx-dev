@@ -4354,6 +4354,7 @@ bool HIRBuilder::tryEmitListPrefixReverseAssign(
     return false;
   }
 
+  tc.frame.cur_instr_offs = store_slice->baseOffset();
   auto output = temps_.AllocateStack();
   tc.emit<CallStatic>(
       2,
