@@ -141,6 +141,9 @@ class LinearScanAllocator {
 
   void calculateLiveIntervals();
 
+  bool intervalCoversLoopCall(const LiveInterval& interval) const;
+  void assignLoopCallRegisterPreferences();
+
   void spillRegistersForYield(int instr_id);
   void computeInitialYieldSpillSize(
       const UnorderedMap<const Operand*, const LiveInterval*>& mapping);
@@ -255,6 +258,8 @@ class LinearScanAllocator {
   IntervalList allocated_;
 
   UnorderedMap<const Operand*, OrderedSet<LIRLocation>> vreg_phy_uses_;
+  OrderedSet<LIRLocation> call_locations_;
+  std::vector<LiveRange> loop_ranges_;
 
   UnorderedMap<const BasicBlock*, RegallocBlockState> regalloc_blocks_;
 
@@ -287,6 +292,15 @@ class LinearScanAllocator {
 
   FRIEND_TEST(LinearScanAllocatorTest, RegAllocationNoSpill);
   FRIEND_TEST(LinearScanAllocatorTest, RegAllocation);
+  FRIEND_TEST(
+      LinearScanAllocatorTest,
+      Arm64LoopCallLiveVRegPrefersReservedCalleeSavedReg);
+  FRIEND_TEST(
+      LinearScanAllocatorTest,
+      Arm64LoopCallPreferenceKeepsPreallocatedRegister);
+  FRIEND_TEST(
+      LinearScanAllocatorTest,
+      Arm64LoopCallPreferenceWithCompetingCandidatesAllocatesLegally);
 };
 
 std::ostream& operator<<(std::ostream& out, const LiveRange& rhs);

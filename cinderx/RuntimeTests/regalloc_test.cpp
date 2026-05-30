@@ -353,4 +353,157 @@ TEST_F(LinearScanAllocatorTest, CallWithSideEffectTest) {
   ASSERT_TRUE(a->output()->type() == lir::Operand::kNone);
 }
 
+TEST_F(
+    LinearScanAllocatorTest,
+    Arm64LoopCallLiveVRegPrefersReservedCalleeSavedReg) {
+#if !defined(CINDER_AARCH64)
+  GTEST_SKIP() << "ARM64 register preference is target-specific";
+#else
+  const char* lir_source = R"(Function:
+BB %0 - succs: %2
+  %1:64bit = Move 0(0x0):64bit
+  Branch BB%2
+BB %2 - succs: %5
+  %3:64bit = Phi (BB%0, %1), (BB%5, %7)
+  Branch BB%5
+BB %5 - succs: %2 %10
+  %6:64bit = Call 1024(0x400), %3:64bit
+  %7:64bit = Add %3:64bit, 1
+  CondBranch %7, BB%2, BB%10
+BB %10
+  Return %3:64bit
+
+)";
+
+  Parser parser;
+  auto lir_func = parser.parse(lir_source);
+  auto opnd_id_map = buildOperandToIndexMap(parser.getOutputInstrMap());
+  const auto* loop_value = parser.getOutputInstrMap().at(3)->output();
+
+  LinearScanAllocator allocator(lir_func.get());
+  lir_func->sortBasicBlocks();
+  allocator.calculateLiveIntervals();
+  allocator.linearScan();
+
+  bool found_preferred_reg = false;
+  for (auto& interval : allocator.intervalList()) {
+    if (interval->operand != loop_value) {
+      continue;
+    }
+    found_preferred_reg |= interval->allocated_loc == codegen::X27;
+  }
+
+  ASSERT_TRUE(found_preferred_reg) << fmt::format(
+      "loop-carried value %{} should prefer X27 across loop call",
+      opnd_id_map.at(loop_value));
+#endif
+}
+
+TEST_F(
+    LinearScanAllocatorTest,
+    Arm64LoopCallPreferenceKeepsPreallocatedRegister) {
+#if !defined(CINDER_AARCH64)
+  GTEST_SKIP() << "ARM64 register preference is target-specific";
+#else
+  auto lir_source = fmt::format(
+      R"(Function:
+BB %0 - succs: %2
+  %1:64bit = Bind {}:64bit
+  Branch BB%2
+BB %2 - succs: %5
+  %3:64bit = Phi (BB%0, %1), (BB%5, %7)
+  Branch BB%5
+BB %5 - succs: %2 %10
+  %6:64bit = Call 1024(0x400), %3:64bit
+  %7:64bit = Add %3:64bit, %1:64bit
+  CondBranch %7, BB%2, BB%10
+BB %10
+  Return %3:64bit
+
+)",
+      codegen::X19);
+
+  Parser parser;
+  auto lir_func = parser.parse(lir_source);
+  auto opnd_id_map = buildOperandToIndexMap(parser.getOutputInstrMap());
+  const auto* bound_value = parser.getOutputInstrMap().at(1)->output();
+
+  LinearScanAllocator allocator(lir_func.get());
+  lir_func->sortBasicBlocks();
+  allocator.calculateLiveIntervals();
+  allocator.linearScan();
+
+  bool found_bound_interval = false;
+  for (auto& interval : allocator.intervalList()) {
+    if (interval->operand != bound_value) {
+      continue;
+    }
+    found_bound_interval = true;
+    ASSERT_EQ(interval->allocated_loc, codegen::X19) << fmt::format(
+        "preallocated loop value %{} must not be overwritten by preference",
+        opnd_id_map.at(bound_value));
+  }
+
+  ASSERT_TRUE(found_bound_interval);
+#endif
+}
+
+TEST_F(
+    LinearScanAllocatorTest,
+    Arm64LoopCallPreferenceWithCompetingCandidatesAllocatesLegally) {
+#if !defined(CINDER_AARCH64)
+  GTEST_SKIP() << "ARM64 register preference is target-specific";
+#else
+  const char* lir_source = R"(Function:
+BB %0 - succs: %4
+  %1:64bit = Move 0(0x0):64bit
+  %2:64bit = Move 1(0x1):64bit
+  Branch BB%4
+BB %4 - succs: %8
+  %5:64bit = Phi (BB%0, %1), (BB%8, %11)
+  %6:64bit = Phi (BB%0, %2), (BB%8, %12)
+  Branch BB%8
+BB %8 - succs: %4 %15
+  %9:64bit = Call 1024(0x400), %5:64bit, %6:64bit
+  %11:64bit = Add %5:64bit, 1
+  %12:64bit = Add %6:64bit, 1
+  %13:64bit = Add %11:64bit, %12:64bit
+  CondBranch %13, BB%4, BB%15
+BB %15
+  Return %13:64bit
+
+)";
+
+  Parser parser;
+  auto lir_func = parser.parse(lir_source);
+
+  LinearScanAllocator allocator(lir_func.get());
+  lir_func->sortBasicBlocks();
+  allocator.calculateLiveIntervals();
+  allocator.linearScan();
+
+  UnorderedMap<int, std::vector<LiveInterval*>> loc_interval_map;
+  for (auto& interval : allocator.intervalList()) {
+    if (!interval->allocated_loc.is_register()) {
+      continue;
+    }
+    loc_interval_map[interval->allocated_loc.loc].push_back(interval.get());
+  }
+
+  for (auto& [loc, intervals] : loc_interval_map) {
+    for (size_t i = 0; i < intervals.size(); i++) {
+      for (size_t j = i + 1; j < intervals.size(); j++) {
+        ASSERT_EQ(intervals[i]->intersectWith(*intervals[j]), INVALID_LOCATION)
+            << fmt::format(
+                   "Location {} has conflicting intervals: {} intersects "
+                   "with {}",
+                   loc,
+                   *intervals[i],
+                   *intervals[j]);
+      }
+    }
+  }
+#endif
+}
+
 } // namespace jit::lir
