@@ -1,6 +1,7 @@
 // Copyright (c) Meta Platforms, Inc. and affiliates.
 #include <gtest/gtest.h>
 
+#include "cinderx/Common/code.h"
 #include "cinderx/Common/ref.h"
 #include "cinderx/Jit/compiler.h"
 #include "cinderx/Jit/context.h"
@@ -71,6 +72,13 @@ TEST_F(JITConfigTest, IsJitUsableAfterInit) {
 
 TEST_F(JITConfigTest, IsJitInitialized) {
   EXPECT_TRUE(jit::isJitInitialized());
+}
+
+TEST_F(JITConfigTest, GlobalModuleStateAccessorMatchesModuleObjectState) {
+  Ref<> mod = Ref<>::steal(PyImport_ImportModule("_cinderx"));
+  ASSERT_NE(mod, nullptr);
+
+  EXPECT_EQ(cinderx::getModuleState(), cinderx::getModuleState(mod));
 }
 
 TEST_F(JITConfigTest, IsJitNotPaused) {
@@ -871,6 +879,140 @@ def func():
 
   auto compiled = jit_ctx_->lookupCode(code, builtins, globals);
   ASSERT_NE(compiled, nullptr);
+}
+
+TEST_F(JITContextExtendedTest, CompilePublishesCodeExtraCompiledEntry) {
+  const char* py_src = R"(
+def func():
+    return 1
+)";
+
+  Ref<PyFunctionObject> func(compileAndGet(py_src, "func"));
+  ASSERT_NE(func, nullptr);
+
+  std::unique_ptr<jit::hir::Preloader> preloader(
+      jit::hir::Preloader::makePreloader(
+          func, jit::makeFrameReifier(func->func_code)));
+
+  auto comp_result =
+      jit::compilePreloaderImpl(jit_ctx_.get(), *preloader, func);
+  ASSERT_EQ(comp_result, jit::Result::OK);
+
+  CodeExtra* extra = codeExtra(reinterpret_cast<PyCodeObject*>(func->func_code));
+  ASSERT_NE(extra, nullptr);
+
+  auto compiled = jit_ctx_->lookupCode(
+      func->func_code, func->func_builtins, func->func_globals);
+  ASSERT_NE(compiled, nullptr);
+
+  EXPECT_EQ(_Py_atomic_load_ptr_acquire(&extra->jit_compiled), compiled.get());
+  EXPECT_EQ(extra->jit_globals, func->func_globals);
+  EXPECT_EQ(extra->jit_builtins, func->func_builtins);
+}
+
+TEST_F(JITContextExtendedTest, ForgetCodeClearsCodeExtraCompiledEntry) {
+  const char* py_src = R"(
+def func():
+    return 1
+)";
+
+  Ref<PyFunctionObject> func(compileAndGet(py_src, "func"));
+  ASSERT_NE(func, nullptr);
+
+  std::unique_ptr<jit::hir::Preloader> preloader(
+      jit::hir::Preloader::makePreloader(
+          func, jit::makeFrameReifier(func->func_code)));
+
+  auto comp_result =
+      jit::compilePreloaderImpl(jit_ctx_.get(), *preloader, func);
+  ASSERT_EQ(comp_result, jit::Result::OK);
+
+  CodeExtra* extra = codeExtra(reinterpret_cast<PyCodeObject*>(func->func_code));
+  ASSERT_NE(extra, nullptr);
+
+  auto compiled = jit_ctx_->lookupCode(
+      func->func_code, func->func_builtins, func->func_globals);
+  ASSERT_NE(compiled, nullptr);
+  ASSERT_EQ(_Py_atomic_load_ptr_acquire(&extra->jit_compiled), compiled.get());
+
+  jit_ctx_->forgetCode(func);
+
+  EXPECT_EQ(_Py_atomic_load_ptr_acquire(&extra->jit_compiled), nullptr);
+  EXPECT_EQ(extra->jit_globals, nullptr);
+  EXPECT_EQ(extra->jit_builtins, nullptr);
+}
+
+TEST_F(
+    JITContextExtendedTest,
+    ClearForMultithreadedCompileTestClearsCodeExtraCompiledEntry) {
+  const char* py_src = R"(
+def func():
+    return 1
+)";
+
+  Ref<PyFunctionObject> func(compileAndGet(py_src, "func"));
+  ASSERT_NE(func, nullptr);
+
+  std::unique_ptr<jit::hir::Preloader> preloader(
+      jit::hir::Preloader::makePreloader(
+          func, jit::makeFrameReifier(func->func_code)));
+
+  auto comp_result =
+      jit::compilePreloaderImpl(jit_ctx_.get(), *preloader, func);
+  ASSERT_EQ(comp_result, jit::Result::OK);
+
+  CodeExtra* extra = codeExtra(reinterpret_cast<PyCodeObject*>(func->func_code));
+  ASSERT_NE(extra, nullptr);
+
+  auto compiled = jit_ctx_->lookupCode(
+      func->func_code, func->func_builtins, func->func_globals);
+  ASSERT_NE(compiled, nullptr);
+  ASSERT_EQ(_Py_atomic_load_ptr_acquire(&extra->jit_compiled), compiled.get());
+
+  jit_ctx_->clearForMultithreadedCompileTest();
+
+  EXPECT_EQ(_Py_atomic_load_ptr_acquire(&extra->jit_compiled), nullptr);
+  EXPECT_EQ(extra->jit_globals, nullptr);
+  EXPECT_EQ(extra->jit_builtins, nullptr);
+}
+
+TEST_F(
+    JITContextExtendedTest,
+    ForgetCompiledFunctionClearsCodeExtraCompiledEntry) {
+  const char* py_src = R"(
+def func():
+    return 1
+)";
+
+  Ref<PyFunctionObject> func(compileAndGet(py_src, "func"));
+  ASSERT_NE(func, nullptr);
+
+  std::unique_ptr<jit::hir::Preloader> preloader(
+      jit::hir::Preloader::makePreloader(
+          func, jit::makeFrameReifier(func->func_code)));
+
+  auto comp_result =
+      jit::compilePreloaderImpl(jit_ctx_.get(), *preloader, func);
+  ASSERT_EQ(comp_result, jit::Result::OK);
+
+  CodeExtra* extra = codeExtra(reinterpret_cast<PyCodeObject*>(func->func_code));
+  ASSERT_NE(extra, nullptr);
+
+  auto compiled = jit_ctx_->lookupCode(
+      func->func_code, func->func_builtins, func->func_globals);
+  ASSERT_NE(compiled, nullptr);
+  ASSERT_EQ(_Py_atomic_load_ptr_acquire(&extra->jit_compiled), compiled.get());
+  ASSERT_NE(func->func_dict, nullptr);
+
+  ASSERT_EQ(
+      PyDict_DelItemString(func->func_dict, "__cinderx_compiled_func__"), 0);
+
+  EXPECT_EQ(_Py_atomic_load_ptr_acquire(&extra->jit_compiled), nullptr);
+  EXPECT_EQ(extra->jit_globals, nullptr);
+  EXPECT_EQ(extra->jit_builtins, nullptr);
+  auto cached = jit_ctx_->lookupCode(
+      func->func_code, func->func_builtins, func->func_globals);
+  EXPECT_EQ(cached, nullptr);
 }
 
 TEST_F(JITContextExtendedTest, AddCompileTime) {

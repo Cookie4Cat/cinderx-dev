@@ -10,11 +10,10 @@
 
 namespace cinderx {
 
-namespace {
-
+// Definition of the global ModuleState singleton declared in module_state.h.
+// External linkage so getModuleState() can be inlined at its (many, hot) call
+// sites.
 ModuleState* s_cinderx_state;
-
-} // namespace
 
 int ModuleState::traverse(visitproc visit, void* arg) {
   Py_VISIT(static_type_error);
@@ -103,9 +102,8 @@ bool ModuleState::initBuiltinMembers() {
   return true;
 }
 
-ModuleState* getModuleState() {
-  return s_cinderx_state;
-}
+// getModuleState() (the global-singleton overload) is defined inline in
+// module_state.h so it can be inlined at its hot call sites.
 
 ModuleState* getModuleState(BorrowedRef<> mod) {
   return reinterpret_cast<ModuleState*>(PyModule_GetState(mod));
