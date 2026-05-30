@@ -159,8 +159,16 @@ struct ModuleState {
   int32_t tstate_offset{-1};
 };
 
+// The global ModuleState singleton (defined in module_state.cpp). Declared here
+// so getModuleState() below can be inlined -- it is called on many hot JIT
+// paths (per generator allocation, per function creation, etc.) where the
+// cross-translation-unit call overhead is measurable.
+extern ModuleState* s_cinderx_state;
+
 // Get the global ModuleState singleton.
-ModuleState* getModuleState();
+inline ModuleState* getModuleState() {
+  return s_cinderx_state;
+}
 
 // Get the ModuleState from the CinderX module object.
 //

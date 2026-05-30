@@ -6,6 +6,8 @@
 #include "internal/pycore_object.h"
 #include "internal/pycore_pystate.h"
 
+#include "cinderx/Common/code.h"
+#include "cinderx/Common/code_extra.h"
 #include "cinderx/Common/dict.h"
 #include "cinderx/Common/log.h"
 #include "cinderx/Common/py-portability.h"
@@ -503,6 +505,41 @@ const hir::Type& Context::typeForCommonConstant([[maybe_unused]] int i) const {
   JIT_ABORT("Common constants are a feature of 3.14+");
 }
 
+namespace {
+// Publish the compiled entry on the code object's CodeExtra so a newly created
+// function with the same code+globals+builtins can skip the compiled_codes_
+// hashmap lookup. Stores a *borrowed* pointer -- the CompiledFunction is kept
+// alive by the usual anchors (the compiling function's __dict__ / the outer
+// function's nested list) and is cleared here before it is freed. The pointer
+// is published with release ordering after its globals/builtins so a concurrent
+// reader (under the same JIT entrypoint guard) sees a consistent triple.
+void cacheCompiledOnCode(const CompilationKey& key, CompiledFunction* compiled) {
+  CodeExtra* extra = codeExtra(reinterpret_cast<PyCodeObject*>(key.code));
+  if (extra == nullptr) {
+    return;
+  }
+  extra->jit_globals = key.globals;
+  extra->jit_builtins = key.builtins;
+  _Py_atomic_store_ptr_release(&extra->jit_compiled, compiled);
+}
+
+// Clear the cache only if it still points at `compiled`. This must run before
+// `compiled` is freed and under JIT entrypoint serialization; the check guards
+// against clearing an entry republished earlier in the same serialized flow, not
+// against lock-free concurrent publishers.
+void clearCachedCompiledIfMatches(
+    BorrowedRef<PyCodeObject> code,
+    CompiledFunction* compiled) {
+  CodeExtra* extra = codeExtra(code);
+  if (extra != nullptr &&
+      _Py_atomic_load_ptr_relaxed(&extra->jit_compiled) == compiled) {
+    _Py_atomic_store_ptr_release(&extra->jit_compiled, nullptr);
+    extra->jit_globals = nullptr;
+    extra->jit_builtins = nullptr;
+  }
+}
+} // namespace
+
 void Context::forgetCode(BorrowedRef<PyFunctionObject> func) {
   auto it = compiled_codes_.find(CompilationKey{func});
   if (it == compiled_codes_.end()) {
@@ -537,6 +574,7 @@ void Context::forgetCode(BorrowedRef<PyFunctionObject> func) {
     }
   }
 
+  clearCachedCompiledIfMatches(code, cf.get());
   it->second->clear();
   compiled_codes_.erase(CompilationKey{func});
 }
@@ -549,7 +587,12 @@ void Context::forgetCompiledFunction(CompiledFunction& function) {
     for (auto pyfunc : function.functions()) {
       compiled_funcs_.erase(pyfunc);
     }
-    compiled_codes_.erase(CompilationKey{function});
+    CompilationKey key{function};
+    // Drop the CodeExtra fast-path cache before this CompiledFunction is freed,
+    // otherwise the cached (borrowed) pointer would dangle.
+    clearCachedCompiledIfMatches(
+        reinterpret_cast<PyCodeObject*>(key.code), &function);
+    compiled_codes_.erase(key);
   }
 }
 
@@ -619,6 +662,11 @@ void Context::setCinderJitModule(Ref<> mod) {
 void Context::clearForMultithreadedCompileTest() {
   for (auto& func_entry : compiled_funcs_) {
     BorrowedRef<CompiledFunction> compiled = func_entry.second;
+    if (compiled->runtime() != nullptr) {
+      CompilationKey key{*compiled.get()};
+      clearCachedCompiledIfMatches(
+          reinterpret_cast<PyCodeObject*>(key.code), compiled.get());
+    }
     // Disconnect from Context so clear() on eventual destruction won't call
     // back into us (e.g., forgetCompiledFunction, unwatch).
     compiled->setOwner(nullptr);
@@ -720,6 +768,7 @@ Ref<CompiledFunction> Context::makeCompiledFunction(
       pair.second,
       "CompilationKey already present {}",
       PyUnicode_AsUTF8(reinterpret_cast<PyCodeObject*>(key.code)->co_qualname));
+  cacheCompiledOnCode(key, compiled);
   return compiled;
 }
 

@@ -16,6 +16,18 @@ typedef struct CodeExtra {
     // Used for unallocated free list code extras
     struct CodeExtra* next;
   };
+  // Cached JIT-compiled entry for this code object. When jit_compiled is
+  // non-NULL the code has been JIT-compiled with (jit_globals, jit_builtins),
+  // letting a newly created PyFunctionObject with the same globals/builtins
+  // skip the compiled_codes_ hashmap lookup in jit::Context. These are borrowed
+  // pointers (jit::CompiledFunction* and PyObject*) owned by the JIT; the JIT
+  // clears them before the CompiledFunction is freed (see context.cpp). Stored
+  // as void* so the C interpreter can include this header. Accessed only by the
+  // JIT under the free-threaded entrypoint guard; published/read with
+  // release/acquire ordering (see context.cpp / pyjit.cpp).
+  void* jit_compiled;
+  void* jit_globals;
+  void* jit_builtins;
 } CodeExtra;
 
 // Thread-safe accessors for CodeExtra::calls.

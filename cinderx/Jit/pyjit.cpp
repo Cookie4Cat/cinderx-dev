@@ -1340,9 +1340,14 @@ bool deoptFuncImpl(BorrowedRef<PyFunctionObject> func) {
   return true;
 }
 
-void uncompile(BorrowedRef<PyFunctionObject> func) {
+void uncompileImpl(BorrowedRef<PyFunctionObject> func) {
   deoptFuncImpl(func);
   jitCtx()->forgetCode(func);
+}
+
+void uncompile(BorrowedRef<PyFunctionObject> func) {
+  FreeThreadedJITEntrypointGuard guard;
+  uncompileImpl(func);
 }
 
 /*
@@ -1802,7 +1807,7 @@ PyObject* force_uncompile(PyObject* /* self */, PyObject* arg) {
   funcDestroyed(func);
 
   if (jitCtx() != nullptr) {
-    uncompile(func);
+    uncompileImpl(func);
   }
 
   Py_RETURN_TRUE;
@@ -3694,8 +3699,61 @@ bool shouldScheduleCompile(BorrowedRef<PyFunctionObject> func) {
       getConfig().compile_after_n_calls.has_value();
 }
 
+// Fast path for creating a function whose code object has already been
+// JIT-compiled with the same globals/builtins (e.g. a closure or generator
+// expression recreated each iteration of a hot loop). It skips the
+// eligibility re-checks and the compiled_codes_ hashmap lookup + lock, then
+// hands off to the normal finalizeFunc() so the function is fully tracked for
+// deopt and the CompiledFunction's lifetime is anchored exactly as on the slow
+// path. Returns true if the function was attached.
+bool tryAttachCachedCompiledEntry(BorrowedRef<PyFunctionObject> func) {
+  if (jitCtx() == nullptr) {
+    return false;
+  }
+  // When an explicit JIT list is active, eligibility is per-function: it
+  // depends on the function's (possibly renamed) module/qualname, not just its
+  // code object (see getCompilationEligibility -> jit_list->lookupFunc). The
+  // fast path skips that check, so bail out and let the slow path enforce the
+  // JIT list exactly. Auto-JIT (no list) is unaffected.
+  if (cinderx::getModuleState()->jit_list != nullptr) {
+    return false;
+  }
+  auto code = reinterpret_cast<PyCodeObject*>(func->func_code);
+  CodeExtra* extra = codeExtra(code);
+  if (extra == nullptr) {
+    return false;
+  }
+  auto* compiled = reinterpret_cast<CompiledFunction*>(
+      _Py_atomic_load_ptr_acquire(&extra->jit_compiled));
+  if (compiled == nullptr) {
+    return false;
+  }
+  // Re-attaching compiled code during active instrumentation would bypass
+  // monitoring events; mirror the guard the slow reoptFunc() path uses.
+  if (isInstrumentationActive()) {
+    return false;
+  }
+  // The cached entry is only valid for the exact (code, globals, builtins)
+  // tuple it was compiled under -- see jit::CompilationKey. The cached
+  // CompiledFunction was already produced by the normal eligibility path, and
+  // code flags are immutable, so the original module/suppress checks still
+  // apply. Re-attachment is intentionally independent of scheduling thresholds.
+  if (extra->jit_globals != func->func_globals ||
+      extra->jit_builtins != func->func_builtins) {
+    return false;
+  }
+  // finalizeFunc() does the full association (compiled_funcs_ tracking,
+  // CompiledFunction function set, func_dict strong ref, vectorcall + static
+  // entry), so deopt and GC behave identically to the slow path.
+  return jitCtx()->finalizeFunc(func, compiled);
+}
+
 bool scheduleJitCompile(BorrowedRef<PyFunctionObject> func) {
   FreeThreadedJITEntrypointGuard guard;
+
+  if (tryAttachCachedCompiledEntry(func)) {
+    return true;
+  }
 
   auto eligible = getCompilationEligibility(func);
   if (eligible == JitEligibility::Ineligible) {
@@ -3758,8 +3816,8 @@ Result compileFunction(BorrowedRef<PyFunctionObject> func) {
 }
 
 void uncompile(BorrowedRef<PyFunctionObject> func) {
-  deoptFuncImpl(func);
-  jitCtx()->forgetCode(func);
+  FreeThreadedJITEntrypointGuard guard;
+  ::uncompileImpl(func);
 }
 
 Result compileFunctionWithOSR(BorrowedRef<PyFunctionObject> func) {
