@@ -1619,6 +1619,71 @@ def test(obj):
   EXPECT_GE(countOpcode(*irfunc, Opcode::kGuard), 1) << hir;
 }
 
+#if PY_VERSION_HEX >= 0x030E0000 && !defined(Py_GIL_DISABLED)
+TEST_F(HIRBuildTest, ManagedDictOnlySelfAttrDoesNotUseInlineValuesFastPath) {
+  const char* src = R"(
+class EncodingBytes(bytes):
+    def __new__(cls, value):
+        return bytes.__new__(cls, value)
+
+    def __init__(self, value):
+        self._position = 0
+
+    def read_position(self):
+        return self._position
+
+obj = EncodingBytes(b"abcdef")
+)";
+
+  Ref<> klass(compileAndGet(src, "EncodingBytes"));
+  ASSERT_NE(klass, nullptr);
+  Ref<PyFunctionObject> method(Ref<PyFunctionObject>::steal(
+      PyObject_GetAttrString(klass, "read_position")));
+  ASSERT_NE(method, nullptr);
+  ASSERT_TRUE(PyFunction_Check(method));
+
+  std::unique_ptr<Function> irfunc(buildHIR(method));
+  ASSERT_NE(irfunc, nullptr);
+  Compiler::runPasses(*irfunc, PassConfig::kSimplify);
+
+  std::string hir = fullPrinter().ToString(*irfunc);
+  EXPECT_EQ(countSubstring(hir, "GuardType<BytesUser[EncodingBytes:Exact]>"), 1)
+      << hir;
+  EXPECT_EQ(countSubstring(hir, "inline_values.valid"), 0) << hir;
+  EXPECT_GE(countOpcode(*irfunc, Opcode::kLoadAttrCached), 1) << hir;
+}
+
+TEST_F(HIRBuildTest, InlineValuesSelfAttrStillUsesSplitDictFastPath) {
+  const char* src = R"(
+class InlineBox:
+    def __init__(self):
+        self.value = 42
+
+    def read_value(self):
+        return self.value
+
+obj = InlineBox()
+)";
+
+  Ref<> klass(compileAndGet(src, "InlineBox"));
+  ASSERT_NE(klass, nullptr);
+  Ref<PyFunctionObject> method(
+      Ref<PyFunctionObject>::steal(PyObject_GetAttrString(klass, "read_value")));
+  ASSERT_NE(method, nullptr);
+  ASSERT_TRUE(PyFunction_Check(method));
+
+  std::unique_ptr<Function> irfunc(buildHIR(method));
+  ASSERT_NE(irfunc, nullptr);
+  Compiler::runPasses(*irfunc, PassConfig::kSimplify);
+
+  std::string hir = fullPrinter().ToString(*irfunc);
+  EXPECT_EQ(countSubstring(hir, "GuardType<ObjectUser[InlineBox:Exact]>"), 1)
+      << hir;
+  EXPECT_GE(countSubstring(hir, "inline_values.valid"), 1) << hir;
+  EXPECT_EQ(countOpcode(*irfunc, Opcode::kLoadAttrCached), 0) << hir;
+}
+#endif
+
 #if PY_VERSION_HEX >= 0x030E0000
 TEST_F(HIRBuildTest, LoadAttrMethodWithValuesLowersToHelperCall) {
   const char* src = R"(

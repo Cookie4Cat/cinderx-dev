@@ -126,6 +126,53 @@ class LoadAttrLIRFastPathTests(unittest.TestCase):
         self.assertGreaterEqual(int(lines[-2]), 1, proc.stdout)
         self.assertEqual(int(lines[-1]), 42, proc.stdout)
 
+    def test_managed_dict_without_inline_values_falls_back_safely(self) -> None:
+        if sys.version_info < (3, 14):
+            self.skipTest("split inline values fast path requires Python 3.14+")
+        if sysconfig.get_config_var("Py_GIL_DISABLED"):
+            self.skipTest("LoadAttrCachedFastPath is disabled without the GIL")
+
+        code = textwrap.dedent(
+            """
+            import cinderx.jit as jit
+
+            jit.enable()
+            jit.enable_specialized_opcodes()
+            jit.compile_after_n_calls(1000000)
+
+            class EncodingBytes(bytes):
+                def __new__(cls, value):
+                    return bytes.__new__(cls, value)
+
+                def __init__(self, value):
+                    self._position = 0
+
+                def match_bytes(self, needle):
+                    return self.startswith(needle, self._position)
+
+            buf = EncodingBytes(b"abcdef")
+            assert jit.force_compile(EncodingBytes.match_bytes)
+            assert buf.match_bytes(b"abc") is True
+            """
+        )
+
+        with tempfile.TemporaryDirectory() as tmp:
+            script = os.path.join(tmp, "managed_dict_without_inline_values.py")
+            with open(script, "w", encoding="utf-8") as fp:
+                fp.write(code)
+
+            proc = subprocess.run(
+                [sys.executable, script],
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                text=True,
+            )
+            self.assertEqual(
+                proc.returncode,
+                0,
+                f"stdout:\n{proc.stdout}\nstderr:\n{proc.stderr}",
+            )
+
 
 if __name__ == "__main__":
     unittest.main()
