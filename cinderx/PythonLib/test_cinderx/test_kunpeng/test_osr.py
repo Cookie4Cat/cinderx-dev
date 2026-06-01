@@ -245,6 +245,106 @@ def case_supported_while():
     )
 
 
+def osr_sum_while(limit):
+    i = 0
+    total = 0
+    while i < limit:
+        i += 1
+        total += i
+    return total
+
+
+def osr_multi_locals(limit):
+    i = 0
+    total = 0
+    scale = 3
+    bias = 7
+    value = 0
+    while i < limit:
+        i += 1
+        value = i * scale + bias
+        total += value
+    return total + scale + bias + value
+
+
+def osr_list_append(limit):
+    i = 0
+    values = []
+    while i < limit:
+        values.append(i & 3)
+        i += 1
+    return len(values), sum(values), values[:4], values[-4:]
+
+
+def osr_alias_state(limit):
+    i = 0
+    box = []
+    alias = box
+    while i < limit:
+        alias.append(i & 7)
+        i += 1
+    return box is alias, len(box), box[-1], sum(box)
+
+
+def osr_float_accumulate(limit):
+    i = 0
+    total = 0.0
+    while i < limit:
+        total += 0.5
+        i += 1
+    return total
+
+
+def osr_string_build(limit):
+    i = 0
+    total = 0
+    text = "kunpeng-osr"
+    while i < limit:
+        total += len(text)
+        i += 1
+    return total
+
+
+def _repeating_mask_sum(limit, mask):
+    cycle = mask + 1
+    full_cycles, remainder = divmod(limit, cycle)
+    return full_cycles * (mask * cycle // 2) + remainder * (remainder - 1) // 2
+
+
+def case_b017_state_mapping():
+    limit = 5000
+    _expect("osr_sum_while", osr_sum_while(limit), limit * (limit + 1) // 2)
+
+    scale = 3
+    bias = 7
+    last_value = limit * scale + bias
+    _expect(
+        "osr_multi_locals",
+        osr_multi_locals(limit),
+        scale * limit * (limit + 1) // 2 + bias * limit + scale + bias + last_value,
+    )
+
+    _expect(
+        "osr_list_append",
+        osr_list_append(limit),
+        (limit, _repeating_mask_sum(limit, 3), [0, 1, 2, 3], [0, 1, 2, 3]),
+    )
+
+    _expect(
+        "osr_alias_state",
+        osr_alias_state(limit),
+        (True, limit, (limit - 1) & 7, _repeating_mask_sum(limit, 7)),
+    )
+
+    _expect("osr_float_accumulate", osr_float_accumulate(limit), limit * 0.5)
+    _expect("osr_string_build", osr_string_build(limit), limit * len("kunpeng-osr"))
+
+
+def case_b017_low_heat_sum_while():
+    limit = 1000
+    _expect("osr_sum_while_low_heat", osr_sum_while(limit), limit * (limit + 1) // 2)
+
+
 def hot_threshold_loop(limit):
     index = 0
     total = 0
@@ -580,6 +680,8 @@ def case_perf_hot_loop():
 
 
 CASES = {
+    "b017_low_heat_sum_while": case_b017_low_heat_sum_while,
+    "b017_state_mapping": case_b017_state_mapping,
     "coroutine_async_generator": case_coroutine_async_generator,
     "deopt_after_osr": case_deopt_after_osr,
     "escaped_frame": case_escaped_frame,
@@ -622,6 +724,38 @@ SCENARIOS = (
             "__main__:hot_multiple_while",
             "__main__:hot_with_call",
         ),
+    ),
+    # B017 S1-S6：OSR 入口要能迁移常见 Python 端到端循环状态。
+    OSRScenario(
+        name="b017_osr_python_state_mapping",
+        comment="覆盖计数 while、多局部变量、list append、对象 alias、float accumulate 和 string read。",
+        case_name="b017_state_mapping",
+        env=_osr_env(),
+        results=(
+            "osr_sum_while",
+            "osr_multi_locals",
+            "osr_list_append",
+            "osr_alias_state",
+            "osr_float_accumulate",
+            "osr_string_build",
+        ),
+        osr_entries=(
+            "__main__:osr_sum_while",
+            "__main__:osr_multi_locals",
+            "__main__:osr_list_append",
+            "__main__:osr_alias_state",
+            "__main__:osr_float_accumulate",
+            "__main__:osr_string_build",
+        ),
+    ),
+    # B017 S7：同一计数 while 在低热度时应保持解释执行。
+    OSRScenario(
+        name="b017_low_heat_sum_while_stays_interpreted",
+        comment="osr_sum_while(1000) 低于阈值 2000，dump 中不应出现目标函数编译记录。",
+        case_name="b017_low_heat_sum_while",
+        env=_osr_env(CINDERX_OSR_BACKEDGE_THRESHOLD="2000"),
+        results=("osr_sum_while_low_heat",),
+        not_compiled=("__main__:osr_sum_while",),
     ),
     # 用例 2：只关闭 OSR 时，单次函数调用里的热循环不应触发 OSR 编译。
     OSRScenario(
