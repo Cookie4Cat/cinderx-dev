@@ -1465,8 +1465,8 @@ Register* simplifyLoadAttrSplitDict(
   return nullptr;
 #endif
 
-  if (!PyType_HasFeature(
-          type, Py_TPFLAGS_MANAGED_DICT | Py_TPFLAGS_INLINE_VALUES)) {
+  if (!PyType_HasFeature(type, Py_TPFLAGS_MANAGED_DICT) ||
+      !PyType_HasFeature(type, Py_TPFLAGS_INLINE_VALUES)) {
     return nullptr;
   }
   BorrowedRef<PyHeapTypeObject> heap_type{type};
