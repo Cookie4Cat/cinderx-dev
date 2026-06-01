@@ -198,6 +198,13 @@ include(FetchContent)
 
 set(CINDERX_LOCAL_DEPS_DIR "" CACHE PATH "Local cache directory for CMake FetchContent dependencies")
 
+function(cinderx_normalize_git_url URL OUT_VAR)
+  set(normalized_url "${URL}")
+  string(REGEX REPLACE "/+$" "" normalized_url "${normalized_url}")
+  string(REGEX REPLACE "\\.git$" "" normalized_url "${normalized_url}")
+  set(${OUT_VAR} "${normalized_url}" PARENT_SCOPE)
+endfunction()
+
 function(cinderx_local_dep_matches NAME REPOSITORY TAG LOCAL_DIR OUT_VAR)
   set(matches FALSE)
 
@@ -209,7 +216,10 @@ function(cinderx_local_dep_matches NAME REPOSITORY TAG LOCAL_DIR OUT_VAR)
       ERROR_QUIET
       OUTPUT_STRIP_TRAILING_WHITESPACE)
 
-    if(remote_result EQUAL 0 AND remote_url STREQUAL REPOSITORY)
+    cinderx_normalize_git_url("${remote_url}" normalized_remote_url)
+    cinderx_normalize_git_url("${REPOSITORY}" normalized_repository)
+
+    if(remote_result EQUAL 0 AND normalized_remote_url STREQUAL normalized_repository)
       execute_process(
         COMMAND "${CINDERX_GIT_EXECUTABLE}" -C "${LOCAL_DIR}" rev-parse HEAD
         RESULT_VARIABLE current_result
