@@ -1293,7 +1293,7 @@ def run_daily_compat_group(
         flush=True,
     )
     results_by_name: dict[str, dict[str, Any]] = {}
-    with concurrent.futures.ThreadPoolExecutor(max_workers=len(entries)) as executor:
+    with concurrent.futures.ThreadPoolExecutor(max_workers=1) as executor:
         futures = {
             executor.submit(
                 run_matrix_suite_entry,

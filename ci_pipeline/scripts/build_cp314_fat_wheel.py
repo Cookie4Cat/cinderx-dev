@@ -75,6 +75,19 @@ def read_wheel(path: Path) -> tuple[dict[str, bytes], dict[str, str | None]]:
     return entries, parsed
 
 
+def stable_wheel_content_sha256(entries: dict[str, bytes]) -> str:
+    """Return a sha256 over wheel paths and file contents, excluding zip metadata."""
+    digest = hashlib.sha256()
+    for name in sorted(entries):
+        encoded_name = name.encode("utf-8")
+        data = entries[name]
+        digest.update(len(encoded_name).to_bytes(8, "big"))
+        digest.update(encoded_name)
+        digest.update(len(data).to_bytes(8, "big"))
+        digest.update(data)
+    return digest.hexdigest()
+
+
 def find_dist_info(entries: dict[str, bytes]) -> str:
     dist_infos = sorted(
         {
@@ -284,7 +297,7 @@ def build_fat_wheel(
         wheel_path = wheels[variant_arg]
         provenance["variants"][dir_name] = {
             "source_wheel": str(wheel_path),
-            "source_sha256": hashlib.sha256(wheel_path.read_bytes()).hexdigest(),
+            "source_sha256": stable_wheel_content_sha256(loaded[variant_arg]),
             "native_source": original_name,
             "native_target": target,
         }
