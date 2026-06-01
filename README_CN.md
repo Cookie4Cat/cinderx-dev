@@ -26,11 +26,87 @@ CinderX 是一个 Python 运行时性能扩展，核心功能是将 Python 字�
 
 ## 安装
 
-在 [openeuler releases](https://gitcode.com/openeuler/cinderx/releases) 获取最新 cinderx whl 包：
+### 安装系统要求
+
+安装预编译 whl 前，请确认运行环境满足以下要求：
+
+- 操作系统：Linux aarch64/ARM64，推荐 openEuler 24.03 (LTS-SP3)。
+- Python：CPython 3.14.0 - 3.14.3，推荐 3.14.3；`pip` 必须来自同一个 `python3.14`。
+- 架构：当前发布包仅提供 aarch64 wheel，x86_64 暂无预编译包。
+- 权限：安装到系统 `site-packages` 需要 root 权限；普通用户建议先创建虚拟环境，或使用 `--user` 安装。
+
+建议先确认解释器和平台：
+
+```bash
+python3.14 - <<'PY'
+import platform
+import sys
+
+print(sys.version)
+print(platform.platform())
+print(platform.machine())
+PY
+```
+
+### 安装命令
+
+在 [openeuler releases](https://gitcode.com/openeuler/cinderx/releases) 获取最新
+cinderx whl 包后安装：
 
 ```bash
 python3.14 -m pip install --no-index cinderx-*_aarch64.whl
 ```
+
+### 安装后的文件变化
+
+安装成功后，目标 Python 的 `site-packages` 下会新增 CinderX 相关文件和目录。主要文件说明如下：
+
+| 文件/目录 | 说明 |
+|---|---|---|
+| `cinderx/` | CinderX Python 包，包含 `cinderx.jit`、缓存属性、Strict/Static 辅助接口等 | 
+| `__static__/`、`__strict__/` | Static Python 和 Strict Modules 的兼容包入口 | 
+| `opcodes/` | CinderX opcode 辅助模块 |
+| `_cinderx.so` | CinderX native 扩展，包含 JIT/runtime 核心能力 |
+| `_cinderx_auto.py` | 自动导入入口；由 `cinderx.pth` 在 Python 启动时触发 |
+| `cinderx.pth` | site 模块启动钩子；设置 `CINDERX_PLUGIN_ENABLE=1` 时自动导入 CinderX |
+| `cinderx-<version>.dist-info/` | wheel 元数据、`RECORD`、安装器信息等 |
+
+> 实际属主和权限会受安装方式、`umask`、虚拟环境或系统 Python 管理策略影响。系统级安装通常归 `root:root` 所有；虚拟环境安装通常归当前用户所有。
+
+### 安装成功验证
+
+先验证包和 native 扩展可以导入：
+
+```bash
+python3.14 - <<'PY'
+import _cinderx
+import cinderx
+import cinderx.jit
+
+print("cinderx:", cinderx.__file__)
+print("_cinderx:", _cinderx.__file__)
+print("jit enabled:", cinderx.jit.is_enabled())
+print("lightweight frames:", cinderx.is_lightweight_frames_enabled())
+PY
+```
+
+再验证自动导入路径：
+
+```bash
+CINDERX_PLUGIN_ENABLE=1 PYTHONJITAUTO=2 python3.14 - <<'PY'
+import sys
+
+print("_cinderx_auto loaded:", "_cinderx_auto" in sys.modules)
+import cinderx
+import cinderx.jit
+
+print("cinderx initialized:", cinderx.is_initialized())
+print("jit enabled:", cinderx.jit.is_enabled())
+PY
+```
+
+如果上述命令能输出 `cinderx` 和 `_cinderx` 的安装路径，且自动导入场景中
+`_cinderx_auto loaded: True`，说明 whl 已安装到当前 `python3.14` 的搜索路径中。
 
 ## 特性概览
 
@@ -41,6 +117,72 @@ CinderX 支持零代码侵入的自动导入机制。只需设置一个环境变
 ```bash
 export CINDERX_PLUGIN_ENABLE=1
 ```
+
+### OSR（栈上替换，实验特性）
+
+OSR（On-Stack Replacement，栈上替换）用于优化单次调用内运行很久的热循环。普通自动 JIT 主要在函数调用边界按调用次数触发编译；OSR 会在解释器执行循环回边时计数，达到阈值后尝试编译包含 OSR 入口的版本，并从当前循环头直接切入 JIT 代码。
+
+OSR 目前是实验特性，默认关闭，建议仅在性能验证或受控场景中开启。OSR 依赖 JIT 已完成初始化；如果设置了 `PYTHONJITDISABLE=1`，OSR 不会单独生效。
+
+**环境变量开关**：
+
+| 环境变量 | 作用 |
+|---|---|
+| `CINDERX_OSR_ENABLED=1` | 开启 OSR 热循环检测 |
+| `CINDERX_OSR_ENABLED=0` 或不设置 | 关闭 OSR（默认） |
+| `CINDERX_OSR_BACKEDGE_THRESHOLD=N` | 单条循环回边执行 N 次后尝试 OSR，默认值为 2000；`N` 建议设置为 1 到 2147483647 的整数 |
+
+**触发示例**：
+
+```python
+# osr_demo.py
+def hot_loop(n):
+    total = 0
+    i = 0
+    while i < n:
+        total += i
+        i += 1
+    return total
+
+
+print(hot_loop(20_000))
+```
+
+```bash
+CINDERX_PLUGIN_ENABLE=1 \
+PYTHONJITAUTO=10 \
+CINDERX_OSR_ENABLED=1 \
+CINDERX_OSR_BACKEDGE_THRESHOLD=100 \
+PYTHONJITDUMPHIR=1 \
+python3.14 osr_demo.py
+```
+
+上述示例只调用 `hot_loop` 一次，但循环回边会超过 OSR 阈值并触发 OSR 尝试。配合 `PYTHONJITDUMPHIR=1` 可在 HIR 日志中观察是否生成 `OSREntry`。
+
+### 轻量级帧（Lightweight Frames）
+
+轻量级帧提供更轻量的 JIT 帧模式，用于减少频繁调用场景下 Python 帧维护与物化带来的开销。完整 Python frame 会在需要调试、追踪或访问 frame 对象时再按需物化，因此开启后建议重点验证依赖 `sys._getframe()`、trace/profile、异常栈等能力的业务路径。
+
+**环境变量开关**：
+
+| 环境变量 | 作用 |
+|---|---|
+| `PYTHONJITLIGHTWEIGHTFRAME=1` | 开启轻量级帧 |
+| `PYTHONJITLIGHTWEIGHTFRAME=0` 或不设置 | 使用普通帧模式（默认） |
+
+示例：
+
+```bash
+CINDERX_PLUGIN_ENABLE=1 \
+PYTHONJITAUTO=2 \
+PYTHONJITLIGHTWEIGHTFRAME=1 \
+CINDERX_OSR_ENABLED=0 \
+python3.14 your_app.py
+```
+
+轻量级帧需要构建时启用 `ENABLE_LIGHTWEIGHT_FRAMES`；当前 Python 3.14 的 aarch64/arm64 构建默认编译该能力。如果运行时设置 `PYTHONJITLIGHTWEIGHTFRAME=1`，但构建产物未包含该能力，JIT 初始化会失败并报错。
+
+> **注意**：OSR 和轻量级帧互斥，不能同时开启。当前 OSR 的帧状态迁移和入口桩只支持普通帧模式（`FrameMode::kNormal`），而轻量级帧会切换到 `FrameMode::kLightweight`，两者的帧布局与状态保存方式不同。因此同时设置 `PYTHONJITLIGHTWEIGHTFRAME=1` 和 `CINDERX_OSR_ENABLED=1` 时，JIT 初始化会直接失败。
 
 ### JIT 编译器
 
@@ -95,7 +237,6 @@ cinderx.jit.enable()
 - **缓存属性（Cached Properties）**：高性能 `cached_property` / `async_cached_property` 实现，通过 `from cinderx import cached_property` 使用。
 - **对象不朽化（Immortalize）**：标记对象永不被 GC 回收，通过 `cinderx.immortalize_heap()` 开启。
 - **自定义帧求值器（Frame Evaluator）**：替换 CPython 解释器循环以支持 Static Python 字节码，通过 `cinderx.install_frame_evaluator()` 开启。
-- **轻量级帧（Lightweight Frames）**：更轻量的解释器帧实现，通过 `PYTHONJITLIGHTWEIGHTFRAME=1` 开启。
 - **JIT 列表（JIT List）**：通过外部文件精确控制 JIT 编译范围，通过 `PYTHONJITLISTFILE=/path/to/list` 开启。
 - **JIT 预加载（Preloading）**：编译前预先解析全局变量和类型描述符，为 JIT 内置步骤，通过 `PYTHONJITPRELOADDEPENDENTLIMIT` 等调整。
 - **调试与性能分析**：提供 `PYTHONJITDEBUG`、`PYTHONJITDUMPHIR`、`PYTHONJITDUMPASM` 等环境变量用于 JIT 调试和汇编输出，详情参见 [cinderx/Docs/README_CN.md](cinderx/Docs/README_CN.md#调试与性能分析)。
@@ -105,4 +246,4 @@ cinderx.jit.enable()
 详细的编译指南、性能测试方法等请参阅子目录文档：
 
 - [cinderx/Docs/README_CN.md](cinderx/Docs/README_CN.md) — 手动构建 CPython、性能测试、调试环境变量等详细操作指南
-- [cinderx/ci_pipeline/README_CN.md](cinderx/ci_pipeline/README_CN.md) — GitCode 门禁、全量功能测试指南
+- [ci_pipeline/README_CN.md](ci_pipeline/README_CN.md) — GitCode 门禁、全量功能测试指南

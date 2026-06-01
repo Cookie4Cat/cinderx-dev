@@ -64,7 +64,7 @@ python3.14 ci_pipeline/run_gate.py pr --coverage
 ## 性能测试
 
 推荐使用 [pyperformance](https://github.com/python/pyperformance) 进行基准性能测试。pyperformance 是 Python 官方认可的基准测试套件，覆盖 JSON 序列化、正则匹配、加密运算、迭代器等多种场景，能够全面评估 CinderX 带来的性能提升。
-性能测试需要基于自行编译的 CPython 进行，以确保基线一致和访问内部 API正常。
+性能测试需要基于自行编译的 CPython 进行，以确保基线一致和访问内部 API正常。CinderX依据自动导入功能， 替换CPython原生解释器，从而可借用pyperformance测试套件进行CinderX的性能测试。
 
 
 以下步骤从源码构建 CPython 开始，逐步完成测试环境搭建。
@@ -129,10 +129,15 @@ sed -i 's/^include-system-site-packages = false/include-system-site-packages = t
 
 ### 性能测试
 
-```text
-// todo
-本版本 cinderX 暂未支持 pyperformance 性能测试，后续版本提供测试手段
+``` bash
+// 命令示例
+CINDERX_PLUGIN_ENABLE=1 PYTHONJITAUTO=2 PYTHONJITLIGHTWEIGHTFRAME=1 python3.14 -m pyperformance run \ 
+    --affinity=300 \ 
+    --warmup 3 \ 
+    --inherit-environ http_proxy,https_proxy,LD_LIBRARY_PATH,CINDERX_PLUGIN_ENABLE,PYTHONJITAUTO,PYTHONJITLIGHTWEIGHTFRAME \ 
+    -o test.json
 ```
+pyperformance可通过`-b`参数指定用例范围，也可通过`--fast`方式快速验证，更多使用方式参考[pyperformance Docs](https://pyperformance.readthedocs.io)
 
 ---
 
@@ -159,3 +164,9 @@ CinderX 提供了丰富的环境变量用于调试和性能分析：
 | `CINDERX_DISABLE=1` | 强制禁用整个 CinderX 扩展 |
 
 ---
+
+## FAQ
+
+### 1. 如何简单确认pyperformance可正常使能CinderX插件
+- 确认`venv/<venv_name>/pyvenv.cfg`中的 `include-system-site-packages = true`
+
