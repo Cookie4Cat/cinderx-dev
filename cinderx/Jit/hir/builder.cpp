@@ -2968,7 +2968,8 @@ void HIRBuilder::emitLoadAttr(
   int specialized_opcode = getConfig().specialized_opcodes
       ? bc_instr.specializedOpcode()
       : LOAD_ATTR;
-  bool slot_fast_path_enabled = specialized_opcode == LOAD_ATTR_SLOT;
+  bool slot_fast_path_enabled = specialized_opcode == LOAD_ATTR_SLOT &&
+      bc_instr.attrCacheIndex() >= sizeof(PyObject);
 #if PY_VERSION_HEX >= 0x030E0000
   bool method_with_values_fast_path_enabled =
       specialized_opcode == LOAD_ATTR_METHOD_WITH_VALUES;
@@ -2996,6 +2997,9 @@ void HIRBuilder::emitLoadAttr(
       }
 #ifndef Py_GIL_DISABLED
       case LOAD_ATTR_SLOT: {
+        if (!slot_fast_path_enabled) {
+          break;
+        }
         BorrowedRef<PyUnicodeObject> name =
             PyTuple_GET_ITEM(code_->co_names, name_idx);
         const char* field_name = PyUnicode_AsUTF8(name);
@@ -3042,7 +3046,7 @@ void HIRBuilder::emitLoadAttr(
             keys_version,
             Type::fromCInt(bc_instr.cacheU32(4), TCInt64));
         tc.emit<LoadConst>(
-            descr, Type::fromObject(readCacheObj(code_, bc_instr, 6)));
+            descr, Type::fromCPtr(readCacheObj(code_, bc_instr, 6)));
         tc.emit<LoadConst>(
             name, Type::fromObject(PyTuple_GET_ITEM(code_->co_names, name_idx)));
         tc.emit<CallStatic>(
