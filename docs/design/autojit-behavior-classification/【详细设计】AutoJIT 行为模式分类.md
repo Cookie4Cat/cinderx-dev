@@ -16,15 +16,15 @@
 |---|---|
 | 拟制 | CinderX 性能优化组 |
 | 日期 | 2026-06-01 |
-| 上游功能设计 | `docs/design/2026-06-01-autojit-behavior-classification-function-design.md` |
-| 上游需求 | `docs/brainstorms/2026-05-31-autojit-behavior-classification-requirements.md` |
+| 上游功能设计 | `docs/design/autojit-behavior-classification/【功能设计】AutoJIT 行为模式分类.md` |
+| 上游需求 | `docs/design/autojit-behavior-classification/【需求分析】AutoJIT 行为模式分类.md` |
 
 ## 3 修订记录
 
 | 版本 | 日期 | 修订人 | 修订说明 |
 |---|---|---|---|
 | v0.1 | 2026-06-01 | 性能优化组 | 首版。落地 5 个实现单元的数据结构、算法、行为/异常模型、内部接口与代码实现要点（C++）。 |
-| v0.2 | 2026-06-02 | 性能优化组 | 根据 Phase 0 C++ dump 与 gdb 定位更新实现约束：分类 schema/default 起点可冻结，`startup_phase` 来源必须改为安全 import signal provider，禁止在 `jitVectorcall` 中遍历 frame/code metadata。 |
+| v0.2 | 2026-06-02 | 性能优化组 | 根据 Phase 0 C++ dump 与 gdb 定位更新实现约束：分类 schema/evidence 可冻结，`startup_phase` 来源必须改为安全 import signal provider，禁止在 `jitVectorcall` 中遍历 frame/code metadata；policy/default 需 A/B release gate。 |
 
 ## 4 Keywords 关键词
 
@@ -32,7 +32,7 @@ structure_key 打包、opcode 家族表、loop_score、Phase-3 特化观测、Co
 
 ## 5 Abstract 摘要
 
-本详细设计将功能设计落到可指导编码的 C++ 实现：(1) 数据结构与编码——`StructureKey` 打包为 16-bit payload、`CodeExtra` 扩展一个 32-bit 原子发布字 `skey_word`、`opcode→工作维度` 家族表；(2) 单次字节码扫描与 `structure_key` 派生算法；(3) 特化观测与滞回带（**v1 不实现，defer 到 Phase-3，审校 T2.2**）；(4) `CodeExtra` 的 free-threaded 单字 release/acquire 发布与失败回退；(5) `jitVectorcall` 集成与**最小阈值策略** `computeThreshold`（自由函数，对明确 `raise_threshold_candidate` 抬阈值削减 compile storm，T3.1b/T3.4/T3.5/T3.6/T3.7/T3.8/T3.9/T3.10/T3.11/T2.1）。2026-06-02 Phase 0 C++ clean summary 已冻结 gate-side 分类 schema 与 bootstrap default 起点；但 gdb 定位证明在 `jitVectorcall` 中遍历 Python frame/code metadata 计算 `import_stack` 会 SIGSEGV，故 `startup_phase` 必须来自安全 import signal provider，热路径只消费 provider 输出的冻结 bool。`high_risk` 保留为成本/安全 modifier，不再一刀切视为低 ROI；`Mixed` 通过 `mixed_shape` 保留 top-2 维度组合；剩余并列选族采用 benefit-first tie-break；分类配置进程内冻结且缓存无运行期失效；字符串仅用于诊断解码。设计以单字原子发布消除"值/标志"排序风险，并对每个单元给出正常/异常行为模型、数据流转、内部接口定义与 DFX。
+本详细设计将功能设计落到可指导编码的 C++ 实现：(1) 数据结构与编码——`StructureKey` 打包为 16-bit payload、`CodeExtra` 扩展一个 32-bit 原子发布字 `skey_word`、`opcode→工作维度` 家族表；(2) 单次字节码扫描与 `structure_key` 派生算法；(3) 特化观测与滞回带（**v1 不实现，defer 到 Phase-3，审校 T2.2**）；(4) `CodeExtra` 的 free-threaded 单字 release/acquire 发布与失败回退；(5) `jitVectorcall` 集成与**最小阈值策略** `computeThreshold`（自由函数，对明确 `raise_threshold_candidate` 抬阈值削减 compile storm，T3.1b/T3.4/T3.5/T3.6/T3.7/T3.8/T3.9/T3.10/T3.11/T2.1）。2026-06-02 Phase 0 C++ clean summary 已冻结 gate-side 分类 schema/evidence 与 bootstrap 编码起点，但未冻结生产 policy/default；默认策略需 `PYTHONJITAUTO=auto[:N]` vs 数值 `N` 的 A/B 和相邻配置比较后才能发布。gdb 定位证明在 `jitVectorcall` 中遍历 Python frame/code metadata 计算 `import_stack` 会 SIGSEGV，故 `startup_phase` 必须来自安全 import signal provider，热路径只消费 provider 输出的冻结 bool；provider 通过前 startup-init 分支关闭。`high_risk` 保留为成本/安全 modifier，不再一刀切视为低 ROI；synthetic 低 ROI 默认只覆盖无 loop、非 static、ReflectionMeta/Trivial；`Mixed` 通过 `mixed_shape` 保留 top-2 维度组合；剩余并列选族采用 benefit-first tie-break；分类配置进程内冻结且缓存无运行期失效；字符串仅用于诊断解码。设计以单字原子发布消除"值/标志"排序风险，并对每个单元给出正常/异常行为模型、数据流转、内部接口定义与 DFX。
 
 ## 6 List of abbreviations 缩略语清单
 
@@ -130,8 +130,6 @@ enum class WorkDim : uint8_t {
 using MixedShape = uint8_t;
 constexpr MixedShape kMixedShapeNone = 0;
 
-enum class SpecBand : uint8_t { Low = 0, Mid = 1, High = 2 };
-
 // 解析后的结构身份（值类型，可平凡拷贝）
 struct StructureKey {
   Family   family{Family::Trivial};
@@ -183,7 +181,7 @@ StructureKey StructureKey::unpack(uint16_t payload);
 MixedShape encodeMixedShape(WorkDim a, WorkDim b);  // canonical unordered pair；非 Mixed 使用 kMixedShapeNone
 WorkDim workDimOf(int canonical_opcode);   // 家族表查询，未知→Neutral
 bool isExceptionOpcode(int canonical_opcode);
-bool isSpecializableOpcode(int canonical_opcode);   // 供单元 11 计分母
+bool isSpecializableOpcode(int canonical_opcode);   // Phase-3 特化观测参考，v1 不调用
 ```
 
 ## 9.6 代码实现要点
@@ -392,11 +390,11 @@ StructureKey deriveStructureKey(BorrowedRef<PyCodeObject> code);   // 纯函数
 - **opcode 取值必须用公有 `BytecodeInstruction::opcode()`**（`bytecode.cpp:106`，已 unspecialize 且对 SP 复合 `EXTENDED_OPCODE_FLAG`）——**不要**用 `private` 的 `uninstrumentedOpcode()`（编译不可见，且返回未复合 flag 的 ≤255 原始字节，会漏掉全部 SP opcode，审校 T1.2）。（Phase-3 才加特化判定 `specializedOpcode() != opcode()`，与工作维度同遍历、互不污染，R22；v1 不做，T2.2。）
 - 后向边在同一遍历内就地收集（10.2.1），不调用第二遍 `collectBackedgeTargetOffsets`，使"单次 O(n) 扫描"成立（审校 T1.3）。
 - `bucketize` 必须对 `n_eff==0` 与低于 floor 短路，杜绝除零与微函数假信号（R14）。
-- bootstrap 常量集中为可调常量：`kDimCountFloor=2`、density cutoff `0.10/0.25/0.50`、`kMixedBucketDelta=1`、`kMixedMinBucket=2`、loop count score 阈值 `1/2/4`。这些常量已由 2026-06-02 Phase 0 C++ gate-side dump 通过 Mixed/family 红线，可作为 v1 编码默认起点；后续重新标定必须在新进程或清空 code objects 后进入 gate/cache/policy，并保留部署覆盖入口（T3.3/T3.9）。
+- bootstrap 常量集中为可调常量：`kDimCountFloor=2`、density cutoff `0.10/0.25/0.50`、`kMixedBucketDelta=1`、`kMixedMinBucket=2`、loop count score 阈值 `1/2/4`。这些常量已由 2026-06-02 Phase 0 C++ gate-side dump 通过 Mixed/family 红线，可作为 v1 编码起点；它们不是生产 policy/default 冻结结论。正式默认值需经 `auto[:N]` vs 数值 `N` A/B 和相邻 cutoff/floor/δ/loop 配置比较后冻结；后续重新标定必须在新进程或清空 code objects 后进入 gate/cache/policy，并保留部署覆盖入口（T3.3/T3.9）。
 
 ---
 
-# 11 实现设计 3：特化观测与滞回
+# 11 Phase-3 参考设计：特化观测与滞回（v1 不实现）
 
 > **⚠ v1 不实现（审校 T2.2）：** T3.1(b) 最小策略不读 `specialization_band`，本单元整条（`spec_band` 字段、`readSpecializationBand`、`applyHysteresis`、AE10）**defer 到 Phase-3**，与计数式真稳定性信号一起做。下文为 Phase-3 设计参考；v1 不创建 `CodeExtra.spec_band`、不在扫描内做特化旁路采集（单元 10 的 `s.specializable/s.specialized` 在 v1 可不计）。
 
@@ -429,7 +427,7 @@ SpecBand applyHysteresis(double p, SpecBand prev) {
 }
 ```
 
-`presence` 重读频率：每 gate 重算（随单元 10 的扫描）或缓存 + 每 N 次惰性刷新（Outstanding）。本期默认随首扫计算一次并缓存，N 次后惰性重扫（详细实现以开关控制）。
+`presence` 重读频率属于 Phase-3 待定项：可选每 gate 重算，或缓存 + 每 N 次惰性刷新。v1 不实现 `CodeExtra.spec_band`，不做首扫缓存，也不为此增加热路径刷新逻辑。
 
 ## 11.3 行为模型
 
@@ -446,7 +444,7 @@ SpecBand applyHysteresis(double p, SpecBand prev) {
 
 ### 11.4.1 数据结构定义
 
-`CodeExtra.spec_band`（uint32，relaxed 原子）。`SpecBand` 枚举见单元 9。
+`CodeExtra.spec_band`（uint32，relaxed 原子）只属于 Phase-3 参考设计；v1 不在 `CodeExtra` 增加该字段。`SpecBand` 可在 Phase-3 模块局部定义为 `enum class SpecBand : uint8_t { Low, Mid, High }`。
 
 ### 11.4.2 数据流转
 
@@ -561,13 +559,13 @@ std::optional<StructureKey> getOrComputeStructureKey(
 
 - 发布方案二选一并在实现注释说明：**(默认) 良性重复 + 最后写者胜**（最简，纯函数保证一致）；或 **`compare_exchange_strong`** 只发布一次（省重复计算，代价是一次 CAS）。鉴于扫描廉价且重复概率低，默认取前者。
 - `CodeExtra` 新增字段（v1 仅 `skey_word`）置于 `jit_builtins` 之后，避免改动 `union calls/next` 与既有偏移敏感代码；`PyMem_Calloc` 已零初始化 → `skey_word=0` 即未分类。（`spec_band` Phase-3 才加；v1 不加 schema/version 位，T3.11。）
-- 确认 `_Py_atomic_load_uint32_acquire/_store_uint32_release` 在目标 pyatomic 头存在；若命名不符，用等价 32 位 acquire/release helper（实现时核对）。
+- 实现时确认目标构建可用的 32 位 acquire/release 原子 helper；若 `_Py_atomic_load_uint32_acquire/_store_uint32_release` 不存在，使用等价 32 位 acquire/release helper 或封装本特性专用 helper。
 
 ---
 
 # 13 实现设计 5：jitVectorcall 集成与最小阈值策略 computeThreshold
 
-> **审校决策与 Phase 0 C++ 证据已回灌：** T3.1(b)/T3.4/T3.5/T3.6/T3.7/T3.8/T3.9/T3.10/T3.11 默认策略不再是 no-op，而是对明确 `raise_threshold_candidate` 抬阈值削减 compile storm；不可达 module/class body 只进 Phase 0 `InitCodeDiagnostic`；Phase 0 C++ clean summary 已通过 Mixed/family 红线，可冻结分类 schema/default 起点；`startup_phase` 来源仍未冻结，且 gdb 证明 `jitVectorcall` 内 frame/code metadata import-stack 采样不安全；`high_risk` 不再一刀切等同低 ROI；`Mixed` 记录 top-2 `mixed_shape`；剩余并列选族采用 benefit-first tie-break；`structure_key` 物理缓存固定为 32-bit `skey_word`，字符串仅作诊断展示；分类配置进程内冻结，`skey_word` 无运行期失效；T2.1 `AutoJitPolicy` 虚类降为自由函数 `computeThreshold`；T2.2 v1 不读特化观测；T2.3 不新增环境变量，复用 `PYTHONJITAUTO=auto[:N]` 启用。
+> **审校决策与 Phase 0 C++ 证据已回灌：** T3.1(b)/T3.4/T3.5/T3.6/T3.7/T3.8/T3.9/T3.10/T3.11 默认策略不再是 no-op，而是对明确 `raise_threshold_candidate` 抬阈值削减 compile storm；不可达 module/class body 只进 Phase 0 `InitCodeDiagnostic`；Phase 0 C++ clean summary 已通过 Mixed/family 红线，可冻结分类 schema/evidence 与编码起点，但不能冻结生产 policy/default；`startup_phase` 来源仍未冻结，且 gdb 证明 `jitVectorcall` 内 frame/code metadata import-stack 采样不安全；`high_risk` 不再一刀切等同低 ROI；synthetic 低 ROI 默认只覆盖无 loop、非 static、ReflectionMeta/Trivial；`Mixed` 记录 top-2 `mixed_shape`；剩余并列选族采用 benefit-first tie-break；`structure_key` 物理缓存固定为 32-bit `skey_word`，字符串仅作诊断展示；分类配置进程内冻结，`skey_word` 无运行期失效；T2.1 `AutoJitPolicy` 虚类降为自由函数 `computeThreshold`；T2.2 v1 不读特化观测；T2.3 不新增环境变量，复用 `PYTHONJITAUTO=auto[:N]` 启用。
 
 ## 13.1 实现概述
 
@@ -624,7 +622,7 @@ return forcedJitVectorcall(func_obj, stack, nargsf, kwnames);                // 
 // 只对明确 defer candidate 抬高阈值（晚编译/几乎不编译），削减启动期 compile storm；
 // 其余族走现状全局阈值。倍数为可 env 覆盖的保守默认（T3.3）。
 uint32_t computeThreshold(const StructureKey& sk, const GateContext& ctx, uint32_t global) {
-bool startup_init_candidate =
+  bool startup_init_candidate =
       ctx.startup_phase &&
       !sk.is_static &&
       sk.loop_score == 0 &&
@@ -632,8 +630,13 @@ bool startup_init_candidate =
        sk.family == Family::ReflectionMeta ||
        sk.family == Family::ObjectManipulator ||
        sk.family == Family::BranchFSM);
+  bool synthetic_low_roi_candidate =
+      sk.is_synthetic &&
+      sk.loop_score == 0 &&
+      !sk.is_static &&
+      (sk.family == Family::ReflectionMeta || sk.family == Family::Trivial);
   bool low_roi_candidate =
-      sk.family == Family::Trivial || sk.is_synthetic;       // synthetic/generated 不再混入 high_risk(T3.6)
+      sk.family == Family::Trivial || synthetic_low_roi_candidate; // synthetic 高 loop/static 不默认 defer(T3.6)
   bool compile_risk_defer_candidate =
       sk.high_risk && sk.loop_score == 0 && !sk.is_static;   // high_risk 不是低 ROI 的同义词(T3.6)
   bool raise_threshold_candidate =
@@ -666,10 +669,10 @@ bool startup_init_candidate =
 
 **Import signal provider 约束：**
 - 禁止在 `jitVectorcall` 中遍历 Python frame stack 或读取上层 frame code metadata 来判断 import stack；该路径已由 gdb 定位为 SIGSEGV。
-- provider 应在 import machinery 或其它安全点维护轻量状态，例如 thread-local import depth/counter、模块初始化安全标志或等价信号；`readGateContext()` 只做 O(1) 读取。
+- provider 应在 import machinery C 入口或其它安全点维护轻量状态，例如 thread-local import depth/counter、模块初始化安全标志或等价信号；候选挂点包括 `_PyEval_ImportName` / `_PyEval_LazyImportName` 及 `_PyEval_ImportFrom` / `_PyEval_LazyImportFrom` 对应入口，实际以目标版本生成代码和 import machinery 链路为准。`readGateContext()` 只做 O(1) 读取。
 - `module_initializing` 可作为辅助诊断信号，但 clean summary 中只覆盖 795/30605 个 storm，不能单独冻结为 `startup_phase`。
 - `early_window` 可作为辅助/兜底候选，但不得单独成为默认策略来源。
-- provider 缺失或未通过 Phase 0 复跑时，`startup_phase=false` 或 startup-init 策略分支关闭；low_roi / risk-defer 分支仍可独立验证。
+- provider 缺失或未通过 Phase 0.5 复跑时，`startup_phase=false` 且 startup-init 策略分支关闭；low_roi / risk-defer 分支可分阶段验证，但 v1 release 或 ImportInit 收益声明必须等待 provider 通过。
 
 ### 13.4.2 数据流转
 
@@ -700,18 +703,28 @@ uint32_t computeThreshold(const StructureKey& sk, const GateContext& ctx, uint32
 AutoJitGateState readAutoJitGateState(BorrowedRef<PyCodeObject> code);
 // readGateContext() 只能 O(1) 读取 provider 状态；不得遍历 Python frame stack。
 // 启用由 PYTHONJITAUTO 解析决定（不新增 env，T2.3）：
-//   =N      -> config.compile_after_n_calls=N, config.auto_classify=false  （现状）
-//   =auto   -> auto_classify=true, 全局阈值取默认
-//   =auto:N -> auto_classify=true, 全局阈值=N
+//   -X jit-auto(空 X-option) -> 现状阈值 1, auto_classify=false
+//   N        -> config.compile_after_n_calls=N, config.auto_classify=false  （现状）
+//   auto     -> auto_classify=true, 全局阈值取默认
+//   auto:N   -> auto_classify=true, 全局阈值=N
 // 聚合契约（注释强约束）：任何 pattern 统计 key == StructureKey（v1 无 SpecBand）
 ```
 
 ## 13.6 代码实现要点
 
 - 改造仅限 `jitVectorcall` 内"求 limit"一段；解释/编译两条返回路径完全沿用现状（`getInterpretedVectorcall`/`forcedJitVectorcall`），降低回归面。
-- **复用 `PYTHONJITAUTO`（不新增 env，T2.3）**：把其注册从 `void(uint32_t)` 改为 `void(const std::string&)`（FlagProcessor 已有该重载，`jit_flag_processor.h:84`），解析 `auto[:N]` 设 `config.auto_classify` + base 阈值，数值仍走原路径。`=N`（数值）= 分类关、等价现状，即 A/B 对照/止血手段。
+- **复用 `PYTHONJITAUTO`（不新增 env，T2.3）**：把其注册从 `void(uint32_t)` 改为 `void(const std::string&)`（FlagProcessor 已有该重载，`jit_flag_processor.h:84`），解析 `auto[:N]` 设 `config.auto_classify` + base 阈值，数值仍走原路径。`=N`（数值）= 分类关、等价现状，即 A/B 对照/止血手段。parser contract：
+
+| 输入 | 解析结果 | 说明 |
+|---|---|---|
+| `-X jit-auto`（空 X-option） | `compile_after_n_calls=1`，`auto_classify=false` | 保留现状；FlagProcessor 只把空 X-option 视为 1，空 env 不等价于 1 |
+| 十进制 `uint32_t N` | `compile_after_n_calls=N`，`auto_classify=false` | 数值路径逐函数等价现状 |
+| `auto` | `compile_after_n_calls=默认值`，`auto_classify=true` | 开启分类 + 最小策略 |
+| `auto:N` | `compile_after_n_calls=N`，`auto_classify=true` | 开启分类，base=N |
+| malformed / negative / empty env / overflow | 记录 invalid，字段保持原值 | 不把错误输入静默转成自动分类或阈值 1 |
+
 - **回归基线**：开关关时编译函数集合与现状逐函数 bit-for-bit 一致（CI 守门）；开关开时仅 `raise_threshold_candidate` 编译时机后移，可单独验证收益。
-- `kDeferThresholdFactor`、bucket cutoff/floor、Mixed δ、loop count score 等常量集中为可 env 覆盖的 bootstrap defaults，正式热路径默认值按 T3.2/T3.3/T3.9/T3.11 标定协议（混合语料）冻结；冻结后进程内不可变。
+- `kDeferThresholdFactor`、bucket cutoff/floor、Mixed δ、loop count score 等常量集中为可 env 覆盖的 bootstrap defaults。正式热路径默认值按 T3.2/T3.3/T3.9/T3.11 标定协议（混合语料）冻结：必须比较 `PYTHONJITAUTO=auto[:N]` 与数值 `N`，并至少比较一组相邻 cutoff/floor/δ/loop 设置；冻结后进程内不可变。
 - `readGateContext()` 实现必须有 gdb/smoke 验证：import-time JIT smoke 在 gdb 下正常退出；不得复现 `unicodeAsStringNoError -> isImportFrame -> hasImportStack -> recordGate -> jitVectorcall` crash 链。
 
 ---
@@ -725,7 +738,7 @@ AutoJitGateState readAutoJitGateState(BorrowedRef<PyCodeObject> code);
 | 半初始化/撕裂读 `structure_key` | **单字** release/acquire 发布（单元 12.2），无值/标志分离 | AE11 + TSan |
 | 统计被切碎（Phase-3 band 入键） | 类型隔离 + 聚合契约 + 评审守门（单元 11.5/13.5） | AE8 + 代码评审 |
 | Mixed 聚合过粗 | `mixed_shape` 记录 canonical top-2 工作维度组合，最多 15 种 | AE12 + Phase 0 分布 |
-| import-stack 采样崩溃 | 在 `jitVectorcall` 热路径遍历 Python frame/code metadata | 禁止热路径 frame stack 遍历；改用安全 import signal provider；gdb smoke 必须正常退出 |
+| import-stack 采样崩溃 | 禁止热路径 frame stack/code metadata 遍历；改用安全 import signal provider | gdb smoke 必须正常退出 |
 | 新 opcode 漏归类 | 家族表全 opcode 覆盖单测 | 单元 9.6 单测 |
 | 误把"曾单态"当稳定（Phase-3） | band 弱语义 + 限幅 + 滞回 | AE10 |
 | 分类器异常拖垮 gate | 纯计算无抛异常路径；失败→回退默认阈值 | AE11 + 故障注入 |
@@ -736,7 +749,7 @@ AutoJitGateState readAutoJitGateState(BorrowedRef<PyCodeObject> code);
 - **空/退化 code**：`scanCode` 对 `n_eff==0` 短路 → `Trivial`；`bucketize` 防除零。
 - **backedge 为空**：`loop_score=0`。
 - **开关关闭**：全路径等价现状，作为兜底回退手段。
-- **import signal provider 不可用**：`startup_phase=false` 或关闭 startup-init 分支，不得退而使用 `early_window` 单独判定 ImportInit。
+- **import signal provider 不可用**：`startup_phase=false` 且关闭 startup-init 分支，不得退而使用 `early_window` 单独判定 ImportInit。
 - 全链路无 C++ 异常向 `jitVectorcall` 传播（gate 不设 try/catch）。
 
 ## 14.3 性能分析
@@ -748,7 +761,9 @@ AutoJitGateState readAutoJitGateState(BorrowedRef<PyCodeObject> code);
   - (V1) 稳态命中路径：准入路径单次开销相对基线回归 **≤ 2%**（startup micro-bench，以 `compile_after_n_calls` 现状为基线）。
   - (V2) 启动期：compile-storm 场景（数千 code object 同期跨阈）首扫总耗时相对"被推迟的一次编译"占比 **< 5%**（实测，超标则评估 `compare_exchange` 或惰性分类）。
   - (V3) 等价性：`PYTHONJITAUTO=<N>` / `auto_classify=false` 下，编译函数集合与调用计数与现状**逐函数 bit-for-bit 一致**（CI 回归对比，作为分类/缓存基建零行为变更的硬门）；`PYTHONJITAUTO=auto[:N]` 下仅 `raise_threshold_candidate` 按 `computeThreshold` 后移。
-  - (V4) Import signal 安全性：包含 import-time JIT smoke 的 gdb 运行必须正常退出；`startup_phase` provider 复跑 Phase 0 dump 后，需报告 startup signal 覆盖率/误伤率，且不得只以 `module_initializing` 或 `early_window` 单信号冻结。
+  - (V4) Import signal 安全性：包含 import-time JIT smoke 的 gdb 运行必须正常退出；`startup_phase` provider 复跑 Phase 0.5 dump 后，需报告 startup signal 覆盖率/误伤率，且不得只以 `module_initializing` 或 `early_window` 单信号冻结。
+  - (V5) 策略/default A/B：`PYTHONJITAUTO=auto[:N]` 相对 `PYTHONJITAUTO=N` 在 pyperformance + import/dispatch 密集真实 workload 上必须减少 `raise_threshold_candidate` 编译次数和编译总耗时；非 candidate 的编译行为保持等价，启动/吞吐无显著回归。默认冻结前至少比较一组相邻 cutoff/floor/δ/loop 配置。
+  - (V6) ROI 守门：synthetic 高 loop/static/generated 与 risk-defer candidate 需用 top call-count 样本证明 saved compile cost 大于 lost execution acceleration；否则默认禁用或按 family/code size 收窄。
 
 ## 14.4 安全和韧性分析
 
@@ -765,14 +780,16 @@ AutoJitGateState readAutoJitGateState(BorrowedRef<PyCodeObject> code);
 |---|---|
 | gate 注入 | `cinderx/Jit/pyjit.cpp:183` `jitVectorcall`（函数起点；阈值门在 `:197`）；`:101` `countCalls` |
 | `PYTHONJITAUTO` 启用 | `cinderx/Jit/pyjit.cpp:300` `jit-auto`/`PYTHONJITAUTO` 注册；`cinderx/Jit/jit_flag_processor.h:84` `addOption` 的 `void(const std::string&)` 重载（支撑 `=auto[:N]` 解析，T2.3） |
+| `PYTHONJITAUTO` parser 兼容边界 | `cinderx/Jit/jit_flag_processor.cpp`：空 X-option 视为 1，空 env 不等价于 1；malformed/overflow 需保持字段原值 |
 | 公有 opcode 取值 | `cinderx/Jit/bytecode.cpp:106` `BytecodeInstruction::opcode()`（已 unspecialize + 复合 `EXTENDED_OPCODE_FLAG`）；`:153` `specializedOpcode()`（特化判定）。**勿用** `private` 的 `uninstrumentedOpcode()`（`bytecode.h:57` private） |
 | 指令遍历 | `cinderx/Jit/bytecode.h:102/111/163` `BytecodeInstructionBlock`/`Iterator`/`begin` |
 | SP opcode 编码 | `cinderx/Interpreter/3.14/cinder_opcode_ids.h` `EXTENDED_OPCODE_FLAG=0x200`，SP opcode = `(n\|flag)` ≥512（T1.1 依据） |
 | 后向边 | `cinderx/Jit/osr.cpp:327` / `osr.h:159` `collectBackedgeTargetOffsets`（仅 target、去重、上限 16）——**不提供 `{source,target}`**，故 loop_score 在本扫描内就地收集端点（T1.3） |
 | 缓存载体 | `cinderx/Common/code_extra.h:12` `CodeExtra`（既有 `calls` 用 `_Py_atomic_add_uint64`/`_load_uint64_relaxed`，非 release/acquire） |
-| 发布范式 | release/acquire 范式取自 `cinderx/Jit/context.cpp:523` `_Py_atomic_store_ptr_release`（`jit_compiled` 指针发布）——**`code_extra.h` 本身只描述、不实现该范式**；新 `skey_word` 沿用此 jit_compiled 范式。`_Py_atomic_load_uint32_acquire`/`_store_uint32_release` **已确认存在**（pyatomic.h），原"实现时核对"消解为绿 |
+| 发布范式 | release/acquire 范式取自 `cinderx/Jit/context.cpp:523` `_Py_atomic_store_ptr_release`（`jit_compiled` 指针发布）——**`code_extra.h` 本身只描述、不实现该范式**；新 `skey_word` 沿用此 jit_compiled 范式。32 位 acquire/release helper 名称需在目标构建中核对；若 `_Py_atomic_load_uint32_acquire`/`_store_uint32_release` 不存在，使用等价 helper 或封装本特性专用 helper |
 | get-or-create | `cinderx/Common/code.cpp:185` `codeExtra` + `CriticalSectionGuard`（`:200`）；NULL-on-failure |
 | SP/flags / 可达性 | `cinderx/Jit/hir/preload.cpp:449` `CI_CO_STATICALLY_COMPILED`；`pyjit.cpp:96` `required_code_flags`；`pyjit.cpp:1160/1199/4025` eligibility/compile 前均拒绝缺 flags code，支撑 `InitCodeDiagnostic` 不进 v1 gate |
+| import signal provider 候选挂点 | `cinderx/Interpreter/3.14/Includes/generated_cases.c.h` 与 `3.15/Includes/generated_cases.c.h` 的 `IMPORT_NAME` / `IMPORT_FROM` 调用 import C 入口；实际挂点以目标版本 import machinery 链路核对为准 |
 | 特化弱语义 | `cinderx/Interpreter/3.14/Includes/ceval_macros.h` `DEOPT_IF`/`backoff_counter` |
-| 上游需求/功能设计 | `docs/brainstorms/2026-05-31-...-requirements.md`；`docs/design/2026-06-01-...-function-design.md` |
+| 上游需求/功能设计 | `docs/design/autojit-behavior-classification/【需求分析】AutoJIT 行为模式分类.md`；`docs/design/autojit-behavior-classification/【功能设计】AutoJIT 行为模式分类.md` |
 | Phase 0 C++ evidence | `scratch/autojit_phase0/results/blue-98-20260602-cpp/report.md`、`summary-clean/summary.json`、`logs/autojit-phase0-gdb-debug-container-20260602-115858.log`、`logs/autojit-phase0-gdb-after-fix-20260602-120011.log` |

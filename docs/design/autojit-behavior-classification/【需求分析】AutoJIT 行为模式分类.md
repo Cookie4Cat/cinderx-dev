@@ -3,17 +3,19 @@ date: 2026-05-31
 topic: autojit-behavior-classification
 ---
 
-# 自适应 AutoJIT：行为模式分类（Behavior Pattern Classification）
+# 需求分析文档 — 自适应 AutoJIT 行为模式分类
 
 ## Summary
 
-为自适应 AutoJIT 定义一套**证据充分、生产完备**的函数行为分类方案：从字节码 + `co_flags` 提取一个**确定性的结构核**（衡量"做哪类工作 + 有多少热工作"），收敛为一个**有界、版本与特化鲁棒**的稳定 `structure_key`，作为下游策略 / 统计 / profile 的**唯一聚合身份**。`structure_key` 把当前全局固定的 `compile_after_n_calls` 阈值，替换为"按行为模式区分"的编译准入依据；弱特化观测（specialization observation）仅作为 Phase-3 旁路信号保留设计意图，v1 不实现、不进入聚合键。
+为自适应 AutoJIT 定义一套**证据充分、可生产化推进**的函数行为分类方案：从字节码 + `co_flags` 提取一个**确定性的结构核**（衡量"做哪类工作 + 有多少热工作"），收敛为一个**有界、版本与特化鲁棒**的稳定 `structure_key`，作为下游策略 / 统计 / profile 的**唯一聚合身份**。`structure_key` 把当前全局固定的 `compile_after_n_calls` 阈值，替换为"按行为模式区分"的编译准入依据；弱特化观测（specialization observation）仅作为 Phase-3 旁路信号保留设计意图，v1 不实现、不进入聚合键。
 
-本文档 v1 **交付分类法 + 最小阈值策略**：产出稳定 `structure_key`，并通过 `computeThreshold(structure_key, gate_context, global)` 只对明确 `raise_threshold_candidate` 抬阈值以削减 compile storm。完整阈值映射（`threshold = f(pattern)`）、弱特化观测、pattern 级在线反馈、profile 持久化是明确的下游工作（见 Scope Boundaries）。
+本文档 v1 **交付分类法 + 最小阈值策略**：产出稳定 `structure_key`，并通过 `computeThreshold(structure_key, gate_context, global)` 只对明确 `raise_threshold_candidate` 抬阈值以削减 compile storm。v1 可以先编码非 startup 分支，但**v1 完成 / 宣称 ImportInit 收益 / 冻结生产默认策略**必须通过两类 release gate：安全 import signal provider 复跑通过，以及 `PYTHONJITAUTO=auto[:N]` 相对数值 `N` 的 A/B 策略验收。完整阈值映射（`threshold = f(pattern)`）、弱特化观测、pattern 级在线反馈、profile 持久化是明确的下游工作（见 Scope Boundaries）。
 
 ## Evidence Update（2026-06-02 Phase 0 C++ dump）
 
-C++ Phase 0 dump 已在 `blue-98` / `cinderx-test` 上复跑并形成冻结证据，产物见 `scratch/autojit_phase0/results/blue-98-20260602-cpp/report.md` 与 `summary-clean/summary.json`。clean 口径覆盖 pyperformance subset + django 专项，共 53 个 dump 进程、417389 条 record、10434 个 unique `record_key`；`gate_reachable=416381`（99.8%）、`storm_candidates_reached_threshold=30605`、`compiled_records=23446`、`gate_observations=104232`。`Mixed(storm)=873`（2.9%），未触发 `Mixed > 40%` 红线；最大 storm family 为 `CallDispatcher=8796`，未触发“任一族 > 50%”红线。由此可冻结：Phase 0 dump schema、gate-side evidence 价值、family/Mixed 分类区分度，以及当前 bootstrap cutoff/floor/δ/loop defaults 作为 v1 编码默认起点。
+C++ Phase 0 dump 已在 `blue-98` / `cinderx-test` 上复跑并形成冻结证据，产物见 `scratch/autojit_phase0/results/blue-98-20260602-cpp/report.md` 与 `summary-clean/summary.json`。clean 口径覆盖 pyperformance subset + django 专项，共 53 个 dump 进程、417389 条 record、10434 个 unique `record_key`；`gate_reachable=416381`（99.8%）、`storm_candidates_reached_threshold=30605`、`compiled_records=23446`、`gate_observations=104232`。`Mixed(storm)=873`（2.9%），未触发 `Mixed > 40%` 红线；最大 storm family 为 `CallDispatcher=8796`，未触发“任一族 > 50%”红线。由此可冻结的是 **schema/evidence 层**：Phase 0 dump schema、gate-side evidence 价值、family/Mixed 分类区分度、Mixed 红线和 family 区分能力。当前 bootstrap cutoff/floor/δ/loop defaults 只能作为**编码起点**，不能等同于生产 policy/default 冻结；生产默认值还需经过混合语料 A/B 与至少一组相邻 cutoff/floor/δ/loop 配置对比后冻结。
+
+family 名称以 v1 文档为准：`BranchFSM`、`ObjectManipulator` 是规范名。已归档 Phase 0 C++ artifact 中若出现 `BranchyControl`、`ObjectAccess`，分别视为 `BranchFSM`、`ObjectManipulator` 的历史别名；后续 scanner/report/golden summary 必须输出规范名，或在比较前显式做 alias normalize，避免 schema 已冻而 artifact 名称漂移。
 
 但 startup/import 信号不能一起冻结。gdb 修复前 crash 证据见 `logs/autojit-phase0-gdb-debug-container-20260602-115858.log`：SIGSEGV 栈为 `PyType_HasFeature -> autojit_phase0::unicodeAsStringNoError -> isImportFrame -> hasImportStack -> currentSignalMask -> recordGate -> jitVectorcall -> CPython import machinery`。这证明**不能在 `jitVectorcall` 热路径通过遍历 Python frame/code metadata 来实现 `import_stack`**。修复后 gdb 正常退出，见 `logs/autojit-phase0-gdb-after-fix-20260602-120011.log`。当前 C++ clean summary 的 `import_stack={}` 是 gdb 驱动的稳定性边界，不表示 ImportInit 不重要；Python-only Phase 0 曾显示 import stack 是 ImportInit storm 的主要信号。C++ clean summary 中 `module_initializing` 只覆盖 795/30605 个 storm，不能替代完整 ImportInit 判定；`early_window` 覆盖 22451 个 storm，但早期时间窗口只能作辅助/对照，不能单独成为默认策略来源。
 
@@ -31,7 +33,7 @@ C++ Phase 0 dump 已在 `blue-98` / `cinderx-test` 上复跑并形成冻结证�
 
 - **KD1. gating 签名来源：bytecode + co_flags + 解释器特化状态。** 不消费 HIR（HIR 仅在编译后存在，只能做下游二级反馈）。
 
-- **KD2. 交付边界：分类法 + 最小阈值策略（审校 T3.1/T3.4/T3.5/T3.6 + Phase 0 C++ 证据修订）。** 产出稳定 `structure_key`，并带一个**最小有用策略** `computeThreshold(structure_key, gate_context, global)`：只对明确的 `raise_threshold_candidate` 抬阈值，包括低 ROI 形态（`Trivial` / synthetic-generated）、启动期可达的 `startup_init_candidate`、以及受限的编译风险延迟形态（`high_risk && loop_score==0 && !is_static`）；其余族走现状阈值。`high_risk` 本身只是成本/安全 modifier，不再等价于低 ROI。Phase 0 C++ clean summary 已证明 gate-side schema 与 family/Mixed 分类可冻结，但 `gate_context.startup_phase` 的来源**尚未冻结**：`module_initializing` 覆盖不足，`early_window` 不能单独作为默认来源，`import_stack` 的原始 C++ frame 遍历实现已被 gdb 证明不安全。v1 若要兑现 ImportInit 收益，必须先实现安全 import signal provider，再把 provider 输出折叠为热路径 bool。完整阈值映射、pattern 级在线反馈、特化观测、profile 持久化仍为下游（v1 不做）。v1 不实现特化观测（T2.2）。
+- **KD2. 交付边界：分类法 + 最小阈值策略（审校 T3.1/T3.4/T3.5/T3.6 + Phase 0 C++ 证据修订）。** 产出稳定 `structure_key`，并带一个**最小有用策略** `computeThreshold(structure_key, gate_context, global)`：只对明确的 `raise_threshold_candidate` 抬阈值，包括低 ROI 形态（`Trivial` / 窄 synthetic 低 ROI：`is_synthetic && loop_score==0 && !is_static && family ∈ {ReflectionMeta, Trivial}`）、启动期可达的 `startup_init_candidate`、以及受限的编译风险延迟形态（`high_risk && loop_score==0 && !is_static`）；其余族走现状阈值。`high_risk` 本身只是成本/安全 modifier，不再等价于低 ROI；synthetic NumericLoop、static synthetic、或高 loop synthetic 在 v1 默认不直接抬阈值，需 A/B 证明后再纳入。Phase 0 C++ clean summary 已证明 gate-side schema 与 family/Mixed 分类可冻结，但 `gate_context.startup_phase` 的来源**尚未冻结**：`module_initializing` 覆盖不足，`early_window` 不能单独作为默认来源，`import_stack` 的原始 C++ frame 遍历实现已被 gdb 证明不安全。安全 import signal provider 是 **v1 release gate**：可以先分阶段实现非 startup 分支，但未通过 provider 复跑前，startup-init 分支必须关闭，且 v1 不能宣称覆盖 ImportInit 收益目标。完整阈值映射、pattern 级在线反馈、特化观测、profile 持久化仍为下游（v1 不做）。v1 不实现特化观测（T2.2）。
 
 - **KD3. Key 派生：Approach C —— 主族 + Mixed 形态 + 结构修饰位 = 稳定 `structure_key`。** 6 个工作维度取主导轴决定 `family`；若落 `Mixed`，额外记录 canonical top-2 工作维度组合 `mixed_shape`（最多 15 种，非 `Mixed` 为 `none`）；loop / suspend / static / risk / synthetic 作为正交**结构修饰位**。`family + mixed_shape + 结构修饰位` 即 `structure_key`，**完全确定、即聚合身份**（有界 key 空间；Mixed 不再全部混成单桶）。特化观测（KD6）是独立旁路信号，**不并入 `structure_key`**。
 
@@ -57,7 +59,7 @@ R2. **`control_score` — 分支 / CFG 复杂度 / merge 密度。** `POP_JUMP_I
 
 R3. **`object_traffic_score` — 属性 / 容器 / 对象搬运。** `LOAD/STORE/DELETE_ATTR`(+特化)、`BINARY_SUBSCR/STORE_SUBSCR/DELETE_SUBSCR`(+特化)、`BUILD_LIST/MAP/SET/TUPLE/STRING/SLICE`、`LIST_APPEND/EXTEND`、`SET_ADD`、`DICT_MERGE/UPDATE`、`UNPACK_SEQUENCE/EX`、`GET_LEN/FAST_LEN`、`COPY/SWAP/ROT_*/DUP_TOP*`；Static：`SEQUENCE_GET/SET`、`STORE_FIELD`、`SEQ_LIST/TUPLE`、`BUILD_CHECKED_LIST/MAP`。
 
-R4. **`dispatch_score` — Python 调用 / dispatch 密度。** `CALL`(+`CALL_FUNCTION/METHOD/KW/EX`)、`KW_NAMES`、`PUSH_NULL`；Static：`INVOKE_FUNCTION/METHOD/NATIVE`。
+R4. **`dispatch_score` — Python 调用 / dispatch 密度。** `CALL`、`KW_NAMES`、`PUSH_NULL`；Static：`INVOKE_FUNCTION/METHOD/NATIVE`。旧式 `CALL_FUNCTION/METHOD/KW/EX` opcode 按 KD5 不进入 3.14+ 家族表。
 
 R5. **`suspend_score` — generator / coroutine / async。** `SEND`、`YIELD_VALUE/FROM`、`GET_AWAITABLE/AITER/ANEXT/YIELD_FROM_ITER`、`END_ASYNC_FOR`、`END_SEND`、`RETURN_GENERATOR`、`GEN_START`、`BEFORE_ASYNC_WITH`、`SETUP_ASYNC_WITH`。
 
@@ -67,7 +69,7 @@ R6. **`dynamic_score` — 反射 / 模板 / 动态代码。** 高密度 `LOAD/ST
 
 R7. **`loop_score`（0–3，分级，取代原 has_loop）—— 最高价值的 benefit 信号。** JIT 收益由"循环内时间"主导，故循环结构必须分级而非 1 bit：`0`=无后向边；`1`=单层平坦循环；`2`=嵌套或多个平坦循环；`3`=深嵌套 / 多循环。**bootstrap 映射（审校 T3.9，Phase 0 起跑用）：** `score = max(nesting_score, count_score)`；`nesting_score = min(max_static_nesting_depth, 3)`；`count_score = 0/1/2/3` 对应 backedge 数 `0 / 1 / 2–3 / >=4`。该映射进入 gate/cache/policy 前必须由 Phase 0 分布 dump 冻结或调整，不是永久调参结论。**实现路径（审校 T1.3 修正）**：既有 `collectBackedgeTargetOffsets`（`cinderx/Jit/osr.cpp:327` / `osr.h:159`）只返回 backedge 的 target 偏移（去重、上限 16），**不提供 `{source,target}` 端点对**；而嵌套深度需要源+目标区间。故 `loop_score` 不复用该 API，而在分类器**自身单次字节码扫描内就地收集** `(source, getJumpTarget())`（扫描本就逐指令遍历），既避免第二遍扫描，又不引入不存在的依赖。`loop_score` 既参与 family 细分（compute + loop → NumericLoop），又是下游阈值的首要输入。
 
-R8. **`risk_score` 与 synthetic modifier（派生 modifier，非 family）。** `high_risk` 由已分配计数派生（**不重复计原始 opcode**，KD7/R25）：高 `suspend_score`（async 状态机）+ 高 `dynamic_score` + control 的异常子计数 + 极大 code（`co_codelen`，编译成本）。synthetic / generated code 由 `co_filename` 等稳定元数据映射为独立 `is_synthetic` 位，避免把"生成代码低 ROI"和"一般编译风险高"混在一个 `high_risk` bit 里。v1 策略可直接对 `is_synthetic` 抬阈值；`high_risk` 只在 `loop_score==0 && !is_static` 时作为 `compile_risk_defer_candidate`。
+R8. **`risk_score` 与 synthetic modifier（派生 modifier，非 family）。** `high_risk` 由已分配计数派生（**不重复计原始 opcode**，KD7/R25）：高 `suspend_score`（async 状态机）+ 高 `dynamic_score` + control 的异常子计数 + 极大 code（`co_codelen`，编译成本）。synthetic / generated code 由 `co_filename` 等稳定元数据映射为独立 `is_synthetic` 位，避免把"生成代码低 ROI"和"一般编译风险高"混在一个 `high_risk` bit 里。v1 只把 `is_synthetic && loop_score==0 && !is_static && family ∈ {ReflectionMeta, Trivial}` 作为 synthetic 低 ROI candidate；synthetic NumericLoop、static synthetic、或高 loop synthetic 仍走全局阈值，除非 A/B 证明其编译收益低于编译成本。`high_risk` 只在 `loop_score==0 && !is_static` 时作为 `compile_risk_defer_candidate`，并需用 top call-count risk-defer candidate 的 saved compile cost 与 lost execution acceleration 对比来验证；若不能证明正 ROI，默认应禁用或按 family/code size 收窄。
 
 R9. **`is_static`（modifier）。** 由 `CI_CO_STATICALLY_COMPILED`（已核实：`cinderx/Jit/hir/preload.cpp:449`、`inliner.cpp:172`）。Static Python 类型化函数编译收益高且可靠——独立成高置信修饰位，不再溶解进 compute/dispatch。
 
@@ -81,13 +83,13 @@ R11. **`specialization_presence` = 已特化 opcode 数 / 可特化 opcode 数�
 
 ### D. 预过滤（Pre-filters，在 argmax 之前判定，保证无遗漏）
 
-R12. **初始化路径分流（替代原 `ImportInit` family，审校 T3.4/T3.5 + Phase 0 C++ 证据修订）。** 现有 AutoJIT 的 `jitVectorcall` gate 只覆盖通过 `required_code_flags = CO_OPTIMIZED | CO_NEWLOCALS` 的 `PyFunctionObject`；缺这些 flags 或 `co_name == "<module>"` 的 module/class body 在 v1 gate 上不可达。故 v1 不再把它们编码为 `structure_key` family，而是在 Phase 0 dump 中单独标为 **`InitCodeDiagnostic`**（诊断桶，不落 `skey_word`、不参与 `computeThreshold`）。startup/import compile storm 的 v1 收益目标仍是**可达的** `startup_init_candidate`：`gate_context.startup_phase == true`，且 `structure_key` 显示为低收益初始化形态（无 loop、非 static，主族偏 dynamic/dispatch/object/control，或已是 `Trivial`/`is_synthetic`）。`startup_phase` 只作为 gate 当次上下文输入，不并入 `structure_key`，不切碎聚合统计。Phase 0 C++ 证据要求 `startup_phase` 来源按以下约束实现：不得在 `jitVectorcall` 内遍历 Python frame/code metadata 计算 `import_stack`（gdb 已定位 SIGSEGV）；不得只用 `module_initializing`（仅覆盖 795/30605 个 storm）；不得只用 `early_window`（时间窗口仅作辅助）。正式接入 gate/cache/policy 前必须实现安全 import signal provider（例如 import machinery 侧轻量 depth/counter 或线程本地 import 状态），再用 dump 证明覆盖主要可达 ImportInit storm 且误伤可解释。
+R12. **初始化路径分流（替代原 `ImportInit` family，审校 T3.4/T3.5 + Phase 0 C++ 证据修订）。** 现有 AutoJIT 的 `jitVectorcall` gate 只覆盖通过 `required_code_flags = CO_OPTIMIZED | CO_NEWLOCALS` 的 `PyFunctionObject`；缺这些 flags 或 `co_name == "<module>"` 的 module/class body 在 v1 gate 上不可达。故 v1 不再把它们编码为 `structure_key` family，而是在 Phase 0 dump 中单独标为 **`InitCodeDiagnostic`**（诊断桶，不落 `skey_word`、不参与 `computeThreshold`）。startup/import compile storm 的 v1 收益目标仍是**可达的** `startup_init_candidate`：`gate_context.startup_phase == true`，且 `structure_key` 显示为低收益初始化形态（无 loop、非 static，主族偏 dynamic/dispatch/object/control，或已是 `Trivial`/窄 synthetic 低 ROI）。`startup_phase` 只作为 gate 当次上下文输入，不并入 `structure_key`，不切碎聚合统计。Phase 0 C++ 证据要求 `startup_phase` 来源按以下约束实现：不得在 `jitVectorcall` 内遍历 Python frame/code metadata 计算 `import_stack`（gdb 已定位 SIGSEGV）；不得只用 `module_initializing`（仅覆盖 795/30605 个 storm）；不得只用 `early_window`（时间窗口仅作辅助）。正式接入 startup-init 分支前必须实现安全 import signal provider（优先在 import machinery C 入口或等价安全点维护轻量 thread-local import depth/counter，例如围绕 `_PyEval_ImportName` / `_PyEval_LazyImportName` 及 from-import 对应入口；`readGateContext()` 只做 O(1) 读取），再用 dump 证明覆盖主要可达 ImportInit storm 且误伤可解释。provider 选择、gdb smoke 与 Phase 0.5 复跑是 v1 release gate；provider 未通过时 `startup_phase=false` 且 startup-init branch 不可用。
 
 R13. **Trivial 预过滤。** 全部工作维度低于 floor（getter、forwarder、薄包装）→ 直接判 `Trivial`。
 
 ### E. 分桶（Bucketing）
 
-R14. **基于密度而非原始计数；bootstrap defaults 只作 Phase 0 起跑（审校 T3.9/T3.11）。** 每个工作维度 `density = 维度计数 / 有效指令总数`，按 cutoff 离散为 `0/1/2/3`，并设**绝对计数下限 floor**，避免极小函数因 1 条指令触发假信号。bootstrap 初值：`count_floor=2`；density bucket cutoff 为 `0.10/0.25/0.50`（低/中/高）；`Mixed` 判定要求 top-1/top-2 bucket gap `<=1` 且二者 bucket `>=2`。这些值集中配置、可按部署覆盖，但覆盖只在 Phase 0 dump / 进程启动 / 进入 gate 前生效；进入 `jitVectorcall`/cache/policy 前必须通过 T3.2 的 pyperformance + 真实 workload dump 冻结最终默认值，进程内不再变化，否则不得声称 v1 默认策略已标定。
+R14. **基于密度而非原始计数；bootstrap defaults 只作 Phase 0 起跑（审校 T3.9/T3.11）。** 每个工作维度 `density = 维度计数 / 有效指令总数`，按 cutoff 离散为 `0/1/2/3`，并设**绝对计数下限 floor**，避免极小函数因 1 条指令触发假信号。bootstrap 初值：`count_floor=2`；density bucket cutoff 为 `0.10/0.25/0.50`（低/中/高）；`Mixed` 判定要求 top-1/top-2 bucket gap `<=1` 且二者 bucket `>=2`。这些值集中配置、可按部署覆盖，但覆盖只在 Phase 0 dump / 进程启动 / 进入 gate 前生效；Phase 0 C++ 只冻结 schema/evidence 与编码起点，不冻结生产 policy/default。进入 `jitVectorcall`/cache/policy 前，必须通过 pyperformance + import/dispatch 密集真实 workload 的 A/B，并至少比较一组相邻 cutoff/floor/δ/loop 设置，才能冻结生产默认值；冻结后进程内不再变化，否则不得声称 v1 默认策略已标定。
 
 ### F. Pattern Key 派生（Approach C）
 
@@ -119,7 +121,7 @@ R20. **聚合身份完全确定；gate 上下文 / 特化观测均不入聚合�
 
 R21. **廉价：** `structure_key` 为对 `co_code` 的单次 O(n) 扫描，按 R26 发布进 `codeExtra`（与 `countCalls` 同处，`cinderx/Jit/pyjit.cpp:101`），每 code object 仅算一次。`specialization_presence` 可在 gate 时低成本重读（再扫特化位，或缓存上次值 + 惰性刷新）。准入判断本身不得成为新热点（issue 开放问题三）。
 
-R22. **指令化 / 特化处理（双用，审校 T1.2 修正）：** 工作维度归类用**公有** `BytecodeInstruction::opcode()`（`cinderx/Jit/bytecode.cpp:106`，已 unspecialize 且对 SP 复合 `EXTENDED_OPCODE_FLAG`，喂 `structure_key`）——**不要**用 `private` 的 `uninstrumentedOpcode()`（返回未复合 flag 的 ≤255 原始字节，会漏掉全部 SP opcode）；**同时**用 `specializedOpcode() != opcode()` 旁路记录该 opcode 是否处于特化态（喂 `specialization_presence`，R11）。两路互不污染。`EXTENDED_ARG`/`EXTENDED_OPCODE` 作非语义跳过。
+R22. **指令化 / 特化处理（双用，审校 T1.2 修正）：** 工作维度归类用**公有** `BytecodeInstruction::opcode()`（`cinderx/Jit/bytecode.cpp:106`，已 unspecialize 且对 SP 复合 `EXTENDED_OPCODE_FLAG`，喂 `structure_key`）——**不要**用 `private` 的 `uninstrumentedOpcode()`（返回未复合 flag 的 ≤255 原始字节，会漏掉全部 SP opcode）。Phase-3 才用 `specializedOpcode() != opcode()` 旁路记录该 opcode 是否处于特化态（喂 `specialization_presence`，R11）；v1 不采集、不缓存、不读取特化观测。两路互不污染。`EXTENDED_ARG`/`EXTENDED_OPCODE` 作非语义跳过。
 
 R23. **版本鲁棒：** 单一"opcode 家族 → 维度"映射表，按家族匹配（KD5）。新增版本只扩表。
 
@@ -203,7 +205,7 @@ structure_key 结构核 (确定，聚合身份)      特化观测 (弱旁路，�
 
 - **AE6. 薄 getter**（`return self._x`）→ 全维度低于 floor → 预过滤判 `Trivial`。覆盖 R13/R19。
 
-- **AE7. synthetic 生成代码**（`co_filename=="<lambdifygenerated>"`，高 `LOAD_GLOBAL`/format）→ `structure_key=ReflectionMeta|synthetic`（可同时带 `risk`），以"更高阈值"替代当前对 synthetic code 的硬延迟护栏；普通 `high_risk` 不因此被一刀切视为低 ROI。覆盖 R6/R8/T3.6。
+- **AE7. synthetic 生成代码**（`co_filename=="<lambdifygenerated>"`，高 `LOAD_GLOBAL`/format，无 loop、非 static）→ `structure_key=ReflectionMeta|synthetic`（可同时带 `risk`），作为 v1 synthetic 低 ROI candidate 抬阈值；synthetic NumericLoop、static synthetic、或高 loop synthetic 不因 `is_synthetic` 单独抬阈值，需 A/B 证明后再纳入。普通 `high_risk` 不因此被一刀切视为低 ROI。覆盖 R6/R8/T3.6。
 
 - **AE8. `structure_key` 确定性回归：** 同一 code object 在不同预热程度下分类，**`structure_key`（family + Mixed-only `mixed_shape` + 结构修饰位）必须完全一致**，不随解释器特化形态变化而漂移。覆盖 R18/R20/R22。`specialization_band` 迁移验证 defer 到 Phase-3/AE10。
 
@@ -217,7 +219,7 @@ structure_key 结构核 (确定，聚合身份)      特化观测 (弱旁路，�
 
 ## Scope Boundaries
 
-**本次交付（v1 = 分类法 + 最小策略，审校决策 + Phase 0 C++ 证据后）：** R1–R10、R12–R26（**R11 特化观测 defer**）+ Known Accuracy Limits + AE1–AE9、AE11–AE12（**AE10 defer**）+ 最小策略 `computeThreshold(structure_key, gate_context, global)`（T3.1b/T3.4/T3.5/T3.6/T3.7/T3.8/T3.9/T3.10）+ 复用 `PYTHONJITAUTO=auto[:N]` 启用（不新增环境变量，T2.3）。family 枚举 8 个（去 `ScalarCompute` 与不可达 `ImportInit`；不可达初始化代码进 `InitCodeDiagnostic` 诊断桶），`Mixed` 子形态最多 15 个；未落 `Mixed` 的并列选族用 benefit-first tie-break；bootstrap cutoff/floor/loop defaults 已通过 C++ gate-side 红线，可作为 v1 编码默认起点；`structure_key` 物理缓存固定为 32-bit `skey_word`，字符串仅用于诊断。**仍未冻结：`startup_phase` 的安全 import signal 来源。若 v1 声称覆盖 ImportInit 收益，必须先实现 provider 并复跑 Phase 0 dump。**
+**本次交付（v1 = 分类法 + 最小策略，审校决策 + Phase 0 C++ 证据后）：** R1–R10、R12–R26（**R11 特化观测 defer**）+ Known Accuracy Limits + AE1–AE9、AE11–AE12（**AE10 defer**）+ 最小策略 `computeThreshold(structure_key, gate_context, global)`（T3.1b/T3.4/T3.5/T3.6/T3.7/T3.8/T3.9/T3.10）+ 复用 `PYTHONJITAUTO=auto[:N]` 启用（不新增环境变量，T2.3）。family 枚举 8 个（去 `ScalarCompute` 与不可达 `ImportInit`；不可达初始化代码进 `InitCodeDiagnostic` 诊断桶），`Mixed` 子形态最多 15 个；未落 `Mixed` 的并列选族用 benefit-first tie-break；bootstrap cutoff/floor/loop defaults 已通过 C++ gate-side 红线，可作为 v1 编码起点；`structure_key` 物理缓存固定为 32-bit `skey_word`，字符串仅用于诊断。**v1 release gates：** (1) 安全 import signal provider 通过 gdb smoke + Phase 0.5 dump 后，startup-init 分支才可启用，v1 才能宣称覆盖 ImportInit 收益；(2) `PYTHONJITAUTO=auto[:N]` 相对数值 `N` 的 A/B 必须证明 compile storm 场景减少 `raise_threshold_candidate` 编译次数和编译总耗时，且启动/吞吐无显著回归、非 candidate 编译行为不变；(3) 至少比较一组相邻 cutoff/floor/δ/loop 配置后，才能冻结生产 policy/default；(4) synthetic 高 loop/static/generated 与 risk-defer candidate 需分别证明 saved compile cost 大于 lost execution acceleration，否则默认禁用或收窄。
 
 **Deferred for later（明确后续）：**
 - 完整阈值映射 `threshold = f(structure_key, ...)`（每族编译方向与具体值；v1 仅做最小策略）。
@@ -246,8 +248,9 @@ structure_key 结构核 (确定，聚合身份)      特化观测 (弱旁路，�
 
 ## Outstanding Questions
 
-**Resolve before planning：**
-- **安全 import signal provider。** Phase 0 C++ + gdb 已关闭分类 schema 红线，但没有关闭 `startup_phase` 来源：原始 `import_stack` frame/code metadata 遍历在 `jitVectorcall` 中 SIGSEGV，`module_initializing` 覆盖不足，`early_window` 不能单独作为默认来源。实现计划必须先选择并验证安全 provider，再把它作为 `readGateContext().startup_phase` 的来源。
+**Resolve before v1 release / before enabling startup-init：**
+- **安全 import signal provider。** Phase 0 C++ + gdb 已关闭分类 schema 红线，但没有关闭 `startup_phase` 来源：原始 `import_stack` frame/code metadata 遍历在 `jitVectorcall` 中 SIGSEGV，`module_initializing` 覆盖不足，`early_window` 不能单独作为默认来源。实现可先编码非 startup 分支，但 startup-init 分支、ImportInit 收益声明和 v1 release 必须先选择并验证安全 provider，再把它作为 `readGateContext().startup_phase` 的来源。
+- **生产 policy/default 冻结。** `schema_freeze` 已有 Phase 0 C++ 证据；`policy/default_freeze` 仍需 A/B 与相邻配置比较，不能由 Mixed/family 红线直接推出。
 - 已关闭：默认 bucket cutoff / floor / `loop_score` 嵌套阈值采用 bootstrap defaults + Phase 0 C++ gate-side dump 通过红线；`structure_key` 缓存无运行期失效，分类配置进程内冻结（T3.11）。
 
 **Deferred to planning：**
@@ -258,24 +261,26 @@ structure_key 结构核 (确定，聚合身份)      特化观测 (弱旁路，�
 > 来自一轮四 persona 审校。T1（源码事实错误）与 T4（一致性/锚点）已在文档内直接修复；**T2（范围裁剪）** 与 **T3（前提/分期）** 经逐项决策，结论如下，并已回灌正文。
 
 **T3 — 前提/分期（决定整体形态）：**
-- **T3.1 ✅ 采纳 (b)：v1 带最小有用策略。** 默认策略不再是 no-op，而是对明确 `raise_threshold_candidate` 抬阈值：低 ROI 形态（`Trivial`、synthetic/generated）、`startup_init_candidate`（startup/import 阶段可达的初始化形态函数）、以及受限的 `compile_risk_defer_candidate`（`high_risk && loop_score==0 && !is_static`）。其余族走现状阈值。这把 v1 从"零收益脚手架"变为"最小可用切片"，端到端验证管线。**KD2 的"只分类"边界相应放宽为"分类 + 最小阈值策略"。**
-- **T3.2 ✅ Phase 0 C++ gate-side dump 已完成；startup/import signal 仍需补证。** C++ clean summary（`scratch/autojit_phase0/results/blue-98-20260602-cpp/summary-clean/summary.json`）跑过 pyperformance subset + django 专项，`Mixed(storm)=2.9%`、最大 storm family 未超过 50%、`gate_reachable=99.8%`，因此 family/Mixed schema、gate observation 口径和 bootstrap cutoff/floor/δ/loop defaults 可进入 v1 编码默认起点。红线未通过的部分是 startup/import signal：`module_initializing` 只覆盖 795/30605 个 storm；`import_stack` 原始 C++ frame 遍历由 gdb 定位为 SIGSEGV；`early_window` 只能作辅助。若 v1 继续宣称解决 ImportInit 收益目标，必须补实现安全 import signal provider 并复跑 dump。
-- **T3.3 ✅ 定轻量标定协议。** (1) 标定语料用混合集（pyperformance + import/dispatch 密集的真实 workload，平衡目标按后者）；(2) cutoff/floor/δ/risk 比率做成**可按部署覆盖**（env/config），非编译期硬编码；(3) 文档记录 CPython 版本升级触发重标定。与 T3.2 实验合并跑。
+- **T3.1 ✅ 采纳 (b)：v1 带最小有用策略。** 默认策略不再是 no-op，而是对明确 `raise_threshold_candidate` 抬阈值：低 ROI 形态（`Trivial`、窄 synthetic 低 ROI：`is_synthetic && loop_score==0 && !is_static && family ∈ {ReflectionMeta, Trivial}`）、`startup_init_candidate`（startup/import 阶段可达的初始化形态函数）、以及受限的 `compile_risk_defer_candidate`（`high_risk && loop_score==0 && !is_static`）。其余族走现状阈值。这把 v1 从"零收益脚手架"变为"最小可用切片"，端到端验证管线。**KD2 的"只分类"边界相应放宽为"分类 + 最小阈值策略"。**
+- **T3.2 ✅ Phase 0 C++ gate-side dump 已完成；startup/import signal 仍需补证。** C++ clean summary（`scratch/autojit_phase0/results/blue-98-20260602-cpp/summary-clean/summary.json`）跑过 pyperformance subset + django 专项，`Mixed(storm)=2.9%`、最大 storm family 未超过 50%、`gate_reachable=99.8%`，因此 family/Mixed schema、gate observation 口径和 bootstrap cutoff/floor/δ/loop defaults 可进入 v1 编码起点。它冻结的是 `schema_freeze`，不是 `policy/default_freeze`。红线未通过的部分是 startup/import signal：`module_initializing` 只覆盖 795/30605 个 storm；`import_stack` 原始 C++ frame 遍历由 gdb 定位为 SIGSEGV；`early_window` 只能作辅助。若 v1 继续宣称解决 ImportInit 收益目标，必须补实现安全 import signal provider 并复跑 dump。
+- **T3.3 ✅ 定轻量标定协议。** (1) 标定语料用混合集（pyperformance + import/dispatch 密集的真实 workload，平衡目标按后者）；(2) cutoff/floor/δ/risk 比率做成**可按部署覆盖**（env/config），非编译期硬编码；(3) 文档记录 CPython 版本升级触发重标定；(4) policy/default freeze 必须跑 `PYTHONJITAUTO=auto[:N]` vs 数值 `N` A/B，并至少比较一组相邻 cutoff/floor/δ/loop 配置。与 T3.2/Phase 0.5 实验合并跑。
 
 **T2 — 范围裁剪：**
 - **T2.1 ✅ `AutoJitPolicy` 虚类降为自由函数** `computeThreshold(structure_key, gate_context, ...)`，内含 T3.1(b)/T3.4/T3.5/T3.6 最小策略；出现第二种策略再提升为接口（YAGNI）。
 - **T2.2 ✅ v1 整体砍掉特化观测。** 因 T3.1(b)/T3.4/T3.5/T3.6 最小策略不读 `specialization_band`，整条旁路（`spec_band` 字段、`readSpecializationBand`、滞回、AE10）v1 无消费者，**整体 defer 到 Phase-3**，与其后继的计数式真稳定性信号一起做。`gate_view` 在 v1 简化为 `structure_key + gate_context`。
 - **T2.3 ✅ 不新增环境变量，复用 `PYTHONJITAUTO`（扩展取值）。** 把 `PYTHONJITAUTO` 从纯数值改为可接受 `auto[:N]`（已核实 FlagProcessor 有 `void(const std::string&)` 重载，`jit_flag_processor.h:84`）：
+  - `-X jit-auto`（空 X-option）→ 保留现状：阈值 1、**分类关**；注意空 env（`PYTHONJITAUTO=`）不等价于 1；
   - `PYTHONJITAUTO=<N>`（整数）→ 现状：固定阈值 N、**分类关**（不变，既有测试 `PYTHONJITAUTO=10` 不受影响）；
   - `PYTHONJITAUTO=auto` → **分类开**，base 阈值取默认；`PYTHONJITAUTO=auto:N` → 分类开、base=N。
+  - malformed / negative / empty env / overflow → 记录 invalid，字段保持原值，不静默开启分类，也不静默转成阈值 1。
   - A/B 对照 / 热路径止血 = 把值改回数字（分类关）。语义比独立布尔开关更融入现有使用场景，且与 INVALID 回退（仅分类失败时）正交。
 - **T2.4 ✅ 砍掉 `ScalarCompute` 族。** compute 主导一律归 `NumericLoop`，由 `loop_score` modifier 区分有无循环（`NumericLoop|loop0` 即原 ScalarCompute）。结合 T3.4 移除不可达 `ImportInit` 后，v1 family 枚举为 8 个。
 - **T3.4 ✅ 修正 ImportInit 可达性。** startup/import compile storm 是本特性主收益目标之一，但当前 `ImportInit` 定义（缺 required flags / `<module>`）在 `jitVectorcall` gate 上不可达。文档改为：不可达初始化代码进入 Phase 0 `InitCodeDiagnostic` 诊断桶；v1 策略命中可达的 `startup_init_candidate`，通过 `gate_context.startup_phase` 参与 `computeThreshold`，但不并入 `structure_key`。
 - **T3.5 ✅ `startup_phase` 来源先采样后冻结；C++ 原始 `import_stack` 实现禁止进入热路径。** 不在设计期把 `startup_phase` 绑定到单一信号。Phase 0 dump 同时采样 importlib/module initializing、安全 import 状态 provider、早期进程窗口等候选信号；早期进程窗口只作对照，不得单独成为默认策略来源。2026-06-02 gdb 证据证明，在 `jitVectorcall` 中遍历 Python frame/code metadata 计算 `import_stack` 不安全；正式实现必须改为 import machinery 侧轻量 depth/counter、thread-local import state 或等价安全来源。只有当候选信号覆盖主要可达 compile storm 且误伤可解释时，才冻结为 `readGateContext()` 的 bool 输入并接入热路径。
-- **T3.6 ✅ `high_risk` 不等同低 ROI。** `risk` 是编译成本/安全信号，不再一刀切抬阈值。v1 抬阈值条件改为 `raise_threshold_candidate = low_roi_candidate || startup_init_candidate || compile_risk_defer_candidate`；其中 `low_roi_candidate = Trivial || is_synthetic`，`compile_risk_defer_candidate = high_risk && loop_score==0 && !is_static`。为保持可实现性，synthetic/generated 从 `high_risk` 中拆出为独立 `is_synthetic` modifier。
+- **T3.6 ✅ `high_risk` 不等同低 ROI。** `risk` 是编译成本/安全信号，不再一刀切抬阈值。v1 抬阈值条件改为 `raise_threshold_candidate = low_roi_candidate || startup_init_candidate || compile_risk_defer_candidate`；其中 `low_roi_candidate = Trivial || (is_synthetic && loop_score==0 && !is_static && family ∈ {ReflectionMeta, Trivial})`，`compile_risk_defer_candidate = high_risk && loop_score==0 && !is_static`。为保持可实现性，synthetic/generated 从 `high_risk` 中拆出为独立 `is_synthetic` modifier；synthetic 高 loop/static/generated 与 risk-defer 的默认启用都必须有 ROI 证据。
 - **T3.7 ✅ Mixed 保留 top-2 形态。** `Mixed` 仍是近并列兜底，但 v1 在 `structure_key` 中记录 canonical top-2 工作维度组合 `mixed_shape`（非 Mixed 为 `none`，最多 15 个子形态）。这避免 `Mixed` 聚合过粗，又不把完整 bucket tuple 扩散到所有 family。
 - **T3.8 ✅ tie-break 改为 benefit-first。** `Mixed` 已承接近并列，剩余并列场景按 `compute > dispatch > object > control > dynamic > suspend` 选主族；风险/成本不再通过 tie-break 抢主族，而由 `is_suspendable`、`high_risk`、`is_synthetic`、`gate_context` 等 modifier/context 进入策略。
-- **T3.9 ✅ 给 bootstrap defaults，并由 Phase 0 C++ gate-side dump 通过分类红线。** 文档给 `count_floor=2`、density cutoff `0.10/0.25/0.50`、Mixed bucket gap `<=1` 且双方 bucket `>=2`、`loop_score=max(nesting_score,count_score)`（backedge 数 `0/1/2–3/>=4` → `0/1/2/3`）作为 scanner 起跑值；2026-06-02 C++ clean summary 未触发 Mixed/family 红线，可作为 v1 编码默认起点。实现里这些常量集中配置并可按部署覆盖；后续重新标定必须在新进程或清空 code objects 后进入 gate/cache/policy。
+- **T3.9 ✅ 给 bootstrap defaults，并由 Phase 0 C++ gate-side dump 通过分类红线。** 文档给 `count_floor=2`、density cutoff `0.10/0.25/0.50`、Mixed bucket gap `<=1` 且双方 bucket `>=2`、`loop_score=max(nesting_score,count_score)`（backedge 数 `0/1/2–3/>=4` → `0/1/2/3`）作为 scanner 起跑值；2026-06-02 C++ clean summary 未触发 Mixed/family 红线，可作为 v1 编码起点。实现里这些常量集中配置并可按部署覆盖；生产默认值必须由 A/B 与相邻参数比较冻结。后续重新标定必须在新进程或清空 code objects 后进入 gate/cache/policy。
 - **T3.10 ✅ `structure_key` 物理表示固定为 32-bit `skey_word`。** 逻辑 `StructureKey` 是聚合身份；物理缓存/发布使用 `uint32_t skey_word`（bit31 valid + 低 16 bit payload：`mixed_shape + family + modifiers`）。热路径、缓存、统计键使用紧凑整数或解码后的结构值；字符串只在 Phase 0 dump、日志和诊断中由 payload 解码生成，不作为缓存或聚合主表示。
 - **T3.11 ✅ `structure_key` 缓存无运行期失效。** Phase 0 scanner/dump 可用 bootstrap/覆盖参数反复采样；一旦进入 gate/cache/policy，分类 schema/config（opcode 表、cutoff/floor/δ/loop 阈值、tie-break、payload 布局）在进程内冻结。`skey_word` valid 后不失效、不版本比对、不重算；配置变更需要新进程或清空 code objects。
 
