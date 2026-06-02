@@ -194,6 +194,20 @@ size_t countStaticCallsTo(const Function& func, void* addr) {
   return count;
 }
 
+const CallStatic* findStaticCallTo(const Function& func, void* addr) {
+  for (const auto& block : func.cfg.blocks) {
+    for (const auto& instr : block) {
+      if (instr.IsCallStatic()) {
+        const auto& call = static_cast<const CallStatic&>(instr);
+        if (call.addr() == addr) {
+          return &call;
+        }
+      }
+    }
+  }
+  return nullptr;
+}
+
 bool hasSpecializedOpcode(BorrowedRef<PyFunctionObject> func, int opcode) {
   BorrowedRef<PyCodeObject> code{func->func_code};
   for (const auto& instr : BytecodeInstructionBlock{code}) {
@@ -1619,6 +1633,42 @@ def test(obj):
   EXPECT_GE(countOpcode(*irfunc, Opcode::kGuard), 1) << hir;
 }
 
+#if PY_VERSION_HEX >= 0x030E0000
+TEST_F(HIRBuildTest, SlotSpecializedLoadAttrWithHeaderOffsetFallsBack) {
+  const char* src = R"(
+class SlotValue:
+    __slots__ = ("value",)
+
+obj = SlotValue()
+obj.value = 1
+
+def test(obj):
+    return obj.__class__
+)";
+
+  Ref<PyFunctionObject> func(compileAndGet(src, "test"));
+  ASSERT_NE(func.get(), nullptr);
+  Ref<> obj(getGlobal("obj"));
+  ASSERT_NE(obj.get(), nullptr);
+
+  for (int i = 0; i < 100; i++) {
+    auto result = Ref<>::steal(PyObject_CallFunctionObjArgs(
+        reinterpret_cast<PyObject*>(func.get()), obj.get(), nullptr));
+    ASSERT_NE(result.get(), nullptr);
+    ASSERT_TRUE(PyType_Check(result));
+  }
+  ASSERT_TRUE(hasSpecializedOpcode(func, LOAD_ATTR_SLOT));
+
+  std::unique_ptr<Function> irfunc(buildHIR(func));
+  ASSERT_NE(irfunc, nullptr);
+
+  std::string hir = fullPrinter().ToString(*irfunc);
+  EXPECT_EQ(countOpcode(*irfunc, Opcode::kLoadField), 0) << hir;
+  EXPECT_EQ(countOpcode(*irfunc, Opcode::kGuard), 0) << hir;
+  EXPECT_EQ(countOpcode(*irfunc, Opcode::kLoadAttr), 1) << hir;
+}
+#endif
+
 #if PY_VERSION_HEX >= 0x030E0000 && !defined(Py_GIL_DISABLED)
 TEST_F(HIRBuildTest, ManagedDictOnlySelfAttrDoesNotUseInlineValuesFastPath) {
   const char* src = R"(
@@ -1727,6 +1777,15 @@ def test(obj, value):
           *irfunc, reinterpret_cast<void*>(JITRT_LoadAttrMethodWithValues)),
       1)
       << hir;
+  const CallStatic* helper_call = findStaticCallTo(
+      *irfunc, reinterpret_cast<void*>(JITRT_LoadAttrMethodWithValues));
+  ASSERT_NE(helper_call, nullptr) << hir;
+  ASSERT_EQ(helper_call->NumArgs(), 5);
+  Instr* descr_instr = helper_call->arg(3)->instr();
+  ASSERT_NE(descr_instr, nullptr) << hir;
+  ASSERT_TRUE(descr_instr->IsLoadConst()) << hir;
+  const auto& descr_load = static_cast<const LoadConst&>(*descr_instr);
+  EXPECT_EQ(descr_load.type().toString().rfind("CPtr[", 0), 0) << hir;
   EXPECT_EQ(countOpcode(*irfunc, Opcode::kLoadAttr), 0) << hir;
   EXPECT_EQ(countOpcode(*irfunc, Opcode::kLoadMethod), 0) << hir;
   EXPECT_EQ(countOpcode(*irfunc, Opcode::kLoadMethodCached), 0) << hir;
