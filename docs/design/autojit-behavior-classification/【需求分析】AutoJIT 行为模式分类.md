@@ -69,7 +69,7 @@ R6. **`dynamic_score` — 反射 / 模板 / 动态代码。** 高密度 `LOAD/ST
 
 R7. **`loop_score`（0–3，分级，取代原 has_loop）—— 最高价值的 benefit 信号。** JIT 收益由"循环内时间"主导，故循环结构必须分级而非 1 bit：`0`=无后向边；`1`=单层平坦循环；`2`=嵌套或多个平坦循环；`3`=深嵌套 / 多循环。**bootstrap 映射（审校 T3.9，Phase 0 起跑用）：** `score = max(nesting_score, count_score)`；`nesting_score = min(max_static_nesting_depth, 3)`；`count_score = 0/1/2/3` 对应 backedge 数 `0 / 1 / 2–3 / >=4`。该映射进入 gate/cache/policy 前必须由 Phase 0 分布 dump 冻结或调整，不是永久调参结论。**实现路径（审校 T1.3 修正）**：既有 `collectBackedgeTargetOffsets`（`cinderx/Jit/osr.cpp:327` / `osr.h:159`）只返回 backedge 的 target 偏移（去重、上限 16），**不提供 `{source,target}` 端点对**；而嵌套深度需要源+目标区间。故 `loop_score` 不复用该 API，而在分类器**自身单次字节码扫描内就地收集** `(source, getJumpTarget())`（扫描本就逐指令遍历），既避免第二遍扫描，又不引入不存在的依赖。`loop_score` 既参与 family 细分（compute + loop → NumericLoop），又是下游阈值的首要输入。
 
-R8. **`risk_score` 与 synthetic modifier（派生 modifier，非 family）。** `high_risk` 由已分配计数派生（**不重复计原始 opcode**，KD7/R25）：高 `suspend_score`（async 状态机）+ 高 `dynamic_score` + control 的异常子计数 + 极大 code（`co_codelen`，编译成本）。synthetic / generated code 由 `co_filename` 等稳定元数据映射为独立 `is_synthetic` 位，避免把"生成代码低 ROI"和"一般编译风险高"混在一个 `high_risk` bit 里。v1 只把 `is_synthetic && loop_score==0 && !is_static && family ∈ {ReflectionMeta, Trivial}` 作为 synthetic 低 ROI candidate；synthetic NumericLoop、static synthetic、或高 loop synthetic 仍走全局阈值，除非 A/B 证明其编译收益低于编译成本。`high_risk` 只在 `loop_score==0 && !is_static` 时作为 `compile_risk_defer_candidate`，并需用 top call-count risk-defer candidate 的 saved compile cost 与 lost execution acceleration 对比来验证；若不能证明正 ROI，默认应禁用或按 family/code size 收窄。
+R8. **`risk_score` 与 synthetic modifier（派生 modifier，非 family）。** `high_risk` 由已分配计数派生（**不重复计原始 opcode**，KD7/R25）：高 `suspend_score`（async 状态机）+ 高 `dynamic_score` + control 的异常子计数 + 极大 code（`co_codelen`，编译成本）。synthetic / generated code 由 `co_filename` 等稳定元数据映射为独立 `is_synthetic` 位，避免把"生成代码低 ROI"和"一般编译风险高"混在一个 `high_risk` bit 里。**（T3.6 对齐）`high_risk` 是编译成本/安全信号，不等于低 ROI**——其低 ROI 含义仅在下文 `loop_score==0 && !is_static` 的受限准入条件下成立，详见本条后半与 T3.6。v1 只把 `is_synthetic && loop_score==0 && !is_static && family ∈ {ReflectionMeta, Trivial}` 作为 synthetic 低 ROI candidate；synthetic NumericLoop、static synthetic、或高 loop synthetic 仍走全局阈值，除非 A/B 证明其编译收益低于编译成本。`high_risk` 只在 `loop_score==0 && !is_static` 时作为 `compile_risk_defer_candidate`，并需用 top call-count risk-defer candidate 的 saved compile cost 与 lost execution acceleration 对比来验证；若不能证明正 ROI，默认应禁用或按 family/code size 收窄。
 
 R9. **`is_static`（modifier）。** 由 `CI_CO_STATICALLY_COMPILED`（已核实：`cinderx/Jit/hir/preload.cpp:449`、`inliner.cpp:172`）。Static Python 类型化函数编译收益高且可靠——独立成高置信修饰位，不再溶解进 compute/dispatch。
 
@@ -255,6 +255,16 @@ structure_key 结构核 (确定，聚合身份)      特化观测 (弱旁路，�
 
 **Deferred to planning：**
 - **Phase-3：** `specialization_band` 边界与滞回宽度、`specialization_presence` 重读频率（每次 gate 重扫特化位，还是缓存 + 每 N 次惰性刷新）。
+
+### From 2026-06-02 ce-doc-review（待决，best-judgment 批处理后移交）
+
+> 本轮 5 persona 审校（coherence/feasibility/product-lens/scope-guardian/adversarial）的判断/前提类发现。同步与缺省值类修复已直接回灌正文；以下 5 项是判断/前提题，需作者定夺。
+
+- **[P1] v1 价值主张依赖未建成的 import provider（product-lens+adversarial）。** Problem Frame 以 startup/import compile-storm 立项，但唯一命中它的 `startup_init_candidate` 被未实现的安全 import signal provider 挡住，可 ship 的只剩 Trivial/synthetic/risk-defer。建议在 Summary/Scope 用“provider 缺席时 v1 实际交付什么”重述价值主张，使其可独立证伪。
+  - **↳ [P2] startup-init 关闭时 storm-reduction A/B 不可测（product-lens）。** Release gate(2) 要求证明减少 candidate 编译，但最大 storm 源在 v1 关闭；应说明 provider 缺席下可达成的 storm 削减量级，或把该 gate 拆成“provider 前/后”两档。（随上条一并处理。）
+- **[P2] Phase-3 设计是否移出 v1 接口工件（scope-guardian）。** `isSpecializableOpcode` 声明在 v1 公有接口、`Signature` 带 Phase-3 字段注释、详细 §11 含完整 Phase-3 C++ 伪代码。若有意保留为 forward-reference 可不动；若担心实现者混淆，建议把这些移入 Phase-3 段或独立 stub 文档。
+- **[P2] `Mixed` 是否纳入 `startup_init_candidate`（scope-guardian）。** R12 说 startup-init 覆盖“主族偏 dynamic/dispatch/object/control”的无 loop/非 static 函数，但 §13.2 family 白名单不含 `Mixed`，符合条件的 Mixed 启动函数会漏判。二选一：(a) 把无 loop/非 static 的 Mixed 纳入；(b) 显式文档化排除并补一条 AE。
+- **[P2] 静态签名弱预测 ROI 的核心前提（product-lens+adversarial）。** 文档自承 L1（静态≠执行构成）、L3（纯动态不可静态识别），且 loop_score 是唯一可靠热度信号；v1 对非 loop 族的抬阈值建立在未证明的相关性上，且 v1 内无反馈回路纠正误判。建议界定/量化误判率（mis-defer 上界），或在 Scope 明确“v1 不保证 ROI 预测精度，仅削减明确低收益形态”。
 
 ## 审校决策（ce-doc-review 2026-06-01，已定）
 

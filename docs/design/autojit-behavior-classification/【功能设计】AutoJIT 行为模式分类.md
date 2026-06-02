@@ -14,7 +14,7 @@
 
 | 角色 | 信息 |
 |---|---|
-| 拟制 | CinderX 性能优化组 |
+| 拟制 | @sisibeloved |
 | 日期 | 2026-06-01 |
 | 上游需求 | `docs/design/autojit-behavior-classification/【需求分析】AutoJIT 行为模式分类.md` |
 | 关联 Issue | sisibeloved/cinderx#3《探索基于行为模式的自适应 AutoJIT 阈值策略》 |
@@ -24,9 +24,13 @@
 
 | 版本 | 日期 | 修订人 | 修订说明 |
 |---|---|---|---|
-| v0.1 | 2026-06-01 | 性能优化组 | 首版。依据需求文档 R1–R26 与源码实测，拆分 4 个功能项，定义逻辑接口、调用路径与 DFX。 |
-| v0.2 | 2026-06-02 | 性能优化组 | 根据 Phase 0 C++ dump 与 gdb 定位更新证据边界：冻结 gate-side 分类 schema/Mixed 红线，禁止 `jitVectorcall` 内 frame/code metadata import-stack 采样，并将安全 import signal provider 与策略/default A/B 列为 v1 release gate。 |
-| v0.3 | 2026-06-02 | 性能优化组 | 按功能设计模板优化表达：前置功能目标、使用边界、模块关系和验收口径，弱化代码级实现细节。 |
+| v0.1 | 2026-06-01 | @sisibeloved | 首版。依据需求文档 R1–R26 与源码实测，拆分 4 个功能项，定义逻辑接口、调用路径与 DFX。 |
+| v0.2 | 2026-06-02 | @sisibeloved | 根据 Phase 0 C++ dump 与 gdb 定位更新证据边界：冻结 gate-side 分类 schema/Mixed 红线，禁止 `jitVectorcall` 内 frame/code metadata import-stack 采样，并将安全 import signal provider 与策略/default A/B 列为 v1 release gate。 |
+| v0.3 | 2026-06-02 | @sisibeloved | 按功能设计模板优化表达：前置功能目标、使用边界、模块关系和验收口径，弱化代码级实现细节。 |
+| v0.4 | 2026-06-02 | @sisibeloved | 优化 4+1 视图表达：开发视图重画为分层依赖图（准入层→分类器模块→基础能力，标注新增/复用与代码归属）；逻辑视图的数据流水线图上移至 §8.1.1 整体流程，逻辑视图聚焦模块协作时序；核心分类模型补充“5 个修饰位”表与三段式 `structure_key` 公式及分类决策图。 |
+| v0.5 | 2026-06-02 | @sisibeloved | 补充特化时序边界：§8.1.2 说明 `structure_key` 走 canonical `opcode()`（`unspecialize(uninstrument(...))`），对自适应特化构造性不变（R20/AE8）；§8.5 说明 `specialization_band` 是 gate 前解释执行累积的滞后信号，且与阈值策略存在 policy↔band 反馈耦合，须 Phase-3 单独评估。 |
+| v0.6 | 2026-06-02 | @sisibeloved | 补充开销与收益论证：§8.7.3.1 准入点改为先判 `calls >= global` 再分类（严格行为等价，被扫描函数数 ~416k→~30k）；§8.4.3.2 补 loop_score 开销分解（count≈免费、nesting 为 ≤16 区间定长后处理、4 档可早饱和）与三个前提（禁堆分配/只认明确后向跳转/16-cap）；§8.4.7.4 补单函数扫描开销分解表；§8.8.1 新增性能收益论证模型（净收益不等式、`calls>=global` 门控、R21 细化为测什么/达标线）。 |
+| v0.7 | 2026-06-02 | @sisibeloved | ce-doc-review 回灌：§8.1.2 “9 分类结果”副标题改为“8 个正式 family（策略可见）+ 1 诊断分类（仅 Phase 0）”消除歧义；§8.7.3.2 补 `gate_view`(概念)=`structure_key`+`gate_context` 术语对齐注。 |
 
 ## 4 Keywords 关键词
 
@@ -96,6 +100,20 @@ flowchart LR
   G --> H
 ```
 
+从数据视角看，同一条流程是一次确定的数据变换：code object 被依次扫描、派生、缓存，最终与运行上下文一起决定本次阈值。这条处理流水线贯穿后文各功能项（扫描派生＝功能项 1，缓存＝功能项 3，阈值决策＝功能项 4）：
+
+```mermaid
+flowchart LR
+  Code[Code Object] --> Scan[SignatureScanner<br/>提取 6 个工作维度]
+  Scan --> Derive[KeyDeriver<br/>映射到 9 个分类结果]
+  Derive --> Key[structure_key<br/>8 个正式 family + 修饰位]
+  Key --> Cache[StructureKeyCache<br/>每 code object 缓存]
+  Cache --> Gate[PolicyGate]
+  Context[gate_context<br/>startup_phase 等] --> Gate
+  Global[global threshold] --> Gate
+  Gate --> Limit[本次 threshold]
+```
+
 弱特化观测、完整阈值映射以及 pattern 级在线反馈属下游功能域；本设计仅保留 Phase-3 参考接口，v1 不实现、不读取 `specialization_band`。
 
 ### 8.1.2 核心分类模型
@@ -113,7 +131,7 @@ flowchart LR
 | `suspend` | generator/coroutine/async | yield/send/await/async 状态迁移 | 状态机复杂，常作为风险/延迟信号 |
 | `dynamic` | 名字查找、反射、模板/动态代码 | global/name/deref、format/template、生成代码元数据 | 静态可预测性弱，startup/import 中常见 |
 
-**9 个分类结果：策略最终看到什么**
+**9 个分类结果：8 个正式 family（v1 策略可见）+ 1 个诊断分类（仅 Phase 0 报告，不进 gate/策略）**
 
 | 分类结果 | 类型 | 来源/触发条件 | 策略含义 |
 |---|---|---|---|
@@ -127,7 +145,36 @@ flowchart LR
 | `Mixed` | 正式 family | 两个强维度接近，无法安全选单一主族 | 保守兜底，同时记录 top-2 `mixed_shape` 保留解释力 |
 | `InitCodeDiagnostic` | 诊断分类 | module/class body 等不可达 AutoJIT gate 的初始化代码 | 只出现在 Phase 0 诊断，不生成 v1 `structure_key` |
 
-工作原理可以概括为：先按六个维度计数和分桶；如果全都弱，进入 `Trivial`；如果两个强维度接近，进入 `Mixed`；否则由最强维度映射到主 family；最后附加 `loop_score/is_static/is_suspendable/high_risk/is_synthetic` 等修饰位，形成稳定 `structure_key`。
+**5 个修饰位：在主族之上补充收益/风险信号**
+
+主族只回答“像哪类工作”，但同一主族里“值不值得马上编译”还要靠下面这些与主族**正交**的修饰位。它们不改变主族归属，只参与阈值策略判断与统计解释：
+
+| 修饰位 | 含义 | 典型信号 | 对阈值策略的意义 |
+|---|---|---|---|
+| `loop_score` (0–3) | 循环强度 | OSR 后向边、循环嵌套深度 | JIT 收益主要来自循环；高 loop 应避免被误后移 |
+| `is_static` | 是否 Static Python 类型化 | `CI_CO_STATICALLY_COMPILED` | 类型化函数收益稳定，倾向保留全局阈值 |
+| `is_suspendable` | 是否可挂起 | generator/coroutine/async 结构 | 状态机编译风险偏高，常作延迟信号 |
+| `high_risk` | 编译风险偏高 | 异常密度、动态结构等已计信号派生 | 与“无 loop/非 static”叠加时构成 risk-defer 依据 |
+| `is_synthetic` | 是否生成/模板代码 | 生成代码元数据 | 无 loop、非 static 的 synthetic 是 low ROI 默认覆盖对象 |
+
+由此，一个完整的 `structure_key` 是**三段式**的——**主族 `family`（必要时附 `mixed_shape`）＋ 5 个修饰位**：`family` 给出“像哪类工作”，修饰位给出“这一类里值不值得马上编译”。例如同样落 `NumericLoop`，`loop_score=3` 与 `loop_score=0` 在策略上意义截然不同。
+
+**工作原理**：先按六个维度计数和分桶；如果全都弱，进入 `Trivial`；如果两个强维度接近，进入 `Mixed`；否则由最强维度映射到主 family；最后附加修饰位，形成稳定 `structure_key`。
+
+```mermaid
+flowchart TB
+  Dims["6 个工作维度<br/>计数 + 密度分桶"] --> Q1{全部低于 floor?}
+  Q1 -- 是 --> Trivial["Trivial<br/>薄包装/低 ROI"]
+  Q1 -- 否 --> Q2{top-2 强维度接近?}
+  Q2 -- 是 --> Mixed["Mixed<br/>记录 top-2 mixed_shape"]
+  Q2 -- 否 --> Main["最强维度 → 主 family"]
+  Trivial --> Mod["附加 5 个修饰位<br/>loop/static/suspend/risk/synthetic"]
+  Mixed --> Mod
+  Main --> Mod
+  Mod --> Key["稳定 structure_key<br/>（聚合身份）"]
+```
+
+> **为什么对特化不变（设计保证，非约定）：** 解释器的自适应特化（PEP 659，对应 `Interpreter/3.14/.../ceval_macros.h` 的 `DEOPT_IF`/`backoff_counter`）会在解释执行中把 `LOAD_ATTR`/`CALL`/`BINARY_OP` 等指令就地改写成特化形态。但本分类器扫描走的 `opcode()` 实为 `unspecialize(uninstrument(...))`（见 `cinderx/Jit/bytecode.cpp` `opcode()`/`word()`），始终读**规范化、去特化、去插桩**的 opcode。因此无论函数预热到何种程度、特化成何种形态，六维计数与 `structure_key` 都不漂移——这是 R20/AE8“身份不随预热改变”的**构造性保证**。特化态本身留给 Phase-3 的 `specialization_band`（§8.5），与身份严格隔离。
 
 ## 8.2 功能域总体方案
 
@@ -154,19 +201,7 @@ flowchart LR
 
 **逻辑视图（Logical）**
 
-逻辑视图关注模块间调用关系和行为流转。第一幅图说明数据如何从 code object 变成阈值，第二幅图说明一次 gate 中各逻辑模块如何协作。
-
-```mermaid
-flowchart LR
-  Code[Code Object] --> Scan[SignatureScanner<br/>提取 6 个工作维度]
-  Scan --> Derive[KeyDeriver<br/>映射到 9 个分类结果]
-  Derive --> Key[structure_key<br/>8 个正式 family + 修饰位]
-  Key --> Cache[StructureKeyCache<br/>每 code object 缓存]
-  Cache --> Gate[PolicyGate]
-  Context[gate_context<br/>startup_phase 等] --> Gate
-  Global[global threshold] --> Gate
-  Gate --> Limit[本次 threshold]
-```
+逻辑视图关注一次 gate 中各逻辑模块如何协作。数据从 code object 变成阈值的处理流水线已在 §8.1.1 给出，这里只描述模块间的调用与回退关系。
 
 ```mermaid
 sequenceDiagram
@@ -187,7 +222,7 @@ sequenceDiagram
   P-->>G: 返回本次 threshold
 ```
 
-code object 先被扫描成 6 个工作维度，再派生为分类结果和 `structure_key`，最后和 `gate_context/global threshold` 一起进入阈值决策。缓存命中时不会重新扫描；分类关闭或缓存失败时返回 INVALID，由 gate 回退现状阈值。
+AutoJIT gate 先向缓存请求 `structure_key`：缓存未命中且分类开启时，由扫描派生计算并发布；缓存命中或分类关闭时直接返回缓存值或 INVALID。随后 gate 携 `structure_key、gate_context、global threshold` 调用 PolicyGate 得到本次阈值。任意环节返回 INVALID（分类关闭、缓存失败）时，gate 回退现状全局阈值，不读取半初始化状态。
 
 **进程视图（Process）**
 
@@ -195,28 +230,40 @@ code object 先被扫描成 6 个工作维度，再派生为分类结果和 `str
 
 **开发视图（Development）**
 
+开发视图关注代码的分层组织与**依赖/从属**方向（不是运行期调用时序——后者由逻辑视图的时序图表达）。三层自上而下逐层依赖：准入层依赖新增的 BehaviorClassifier 模块，分类器模块再复用既有基础能力；既有能力层语义不变。下图中实线箭头表示“依赖/复用”，蓝色为本特性新增、灰色为既有复用，每个盒子标注其代码归属。
+
 ```mermaid
 flowchart TB
-  subgraph Layer1["AutoJIT 准入层"]
-    GateEntry["AutoJIT gate / classifyAndThreshold"]
+  subgraph L1["① AutoJIT 准入层（既有热路径）"]
+    Gate["jitVectorcall — 唯一注入点<br/>cinderx/Jit/pyjit.cpp"]
   end
 
-  subgraph Layer2["BehaviorClassifier 模块"]
-    direction LR
-    Scanner["SignatureScanner + KeyDeriver"]
-    Cache["StructureKeyCache"]
-    Policy["PolicyGate / computeThreshold"]
+  subgraph L2["② BehaviorClassifier 模块（新增 cinderx/Jit/behavior_classifier.*）"]
+    Policy["PolicyGate · computeThreshold<br/>本次阈值决策"]
+    Cache["StructureKeyCache<br/>每 code object 缓存一次"]
+    Scanner["SignatureScanner + KeyDeriver<br/>6 维扫描 → 9 类派生"]
+    Policy -.内部依赖.-> Cache
+    Cache -.内部依赖.-> Scanner
   end
 
-  subgraph Layer3["既有基础能力"]
-    direction LR
-    Bytecode["字节码遍历能力"]
-    CodeStore["per-code-object 存储"]
-    Config["JIT 配置与开关"]
+  subgraph L3["③ 既有基础能力（复用，语义不变）"]
+    Bytecode["字节码遍历<br/>cinderx/Jit/bytecode.*"]
+    CodeStore["per-code-object 存储<br/>code_extra.* · code.cpp"]
+    Config["JIT 配置/开关<br/>jit_flag_processor.*"]
   end
+
+  Gate ==>|依赖| Policy
+  Scanner ==>|复用| Bytecode
+  Cache ==>|复用| CodeStore
+  Gate ==>|读取| Config
+
+  classDef newmod fill:#e8f0fe,stroke:#1a73e8,color:#174ea6;
+  classDef existmod fill:#f1f3f4,stroke:#9aa0a6,color:#3c4043;
+  class Gate,Bytecode,CodeStore,Config existmod;
+  class Policy,Cache,Scanner newmod;
 ```
 
-开发视图关注代码组织和从属关系：AutoJIT 准入层调用 BehaviorClassifier；BehaviorClassifier 内部由扫描派生、缓存、策略门三个子部件组成；底层复用既有字节码遍历、per-code-object 存储和 JIT 配置能力。图中不画调用箭头，调用关系由逻辑视图表达。
+读图要点：(1) **分层** —— 准入层（既有）→ 分类器模块（新增）→ 基础能力（既有），上层依赖下层；(2) **新增边界** —— 全部新增代码集中在单一模块 `behavior_classifier.*`，准入层只新增一个注入点；(3) **复用边界** —— 模块不自带字节码遍历、存储或配置能力，分别复用 `bytecode.*`、`code_extra.*/code.cpp`、`jit_flag_processor.*`，不改其语义。
 
 **物理/部署视图（Physical）**
 
@@ -295,24 +342,32 @@ Phase 0 诊断 scanner 额外识别不可达 module/class body 为 `InitCodeDiag
 
 #### 8.4.3.1 工作维度设计
 
-工作维度描述函数“主要在做什么”，不是描述具体 opcode 实现。具体 opcode 清单、Static Python 编码和版本差异由详细设计和源码表维护；功能设计只规定分类语义。
+六个工作维度的语义已在 §8.1.2 给出（compute / control / object / dispatch / suspend / dynamic），此处不重复，只约定其**实现边界**：
 
-| 工作维度 | 通俗含义 | 典型收益/风险含义 |
-|---|---|---|
-| compute | 算术、比较、数值处理 | 如果有 loop，通常 JIT 收益高 |
-| control | 分支、异常、状态机式控制流 | CFG 复杂度可能提高编译成本 |
-| object | 属性、容器、对象搬运 | 收益依赖访问形态和对象稳定性 |
-| dispatch | Python 调用、分发器 | 调用密度高但本体可能较薄 |
-| suspend | generator/coroutine/async | 状态机复杂，编译风险更高 |
-| dynamic | 全局/名字/模板/动态代码 | 静态可预测性较弱 |
-
-未体现业务语义的指令归为中性。旧版本 opcode 不进入目标 3.14+ 家族表；新增版本通过扩表保持兼容。
+- 工作维度描述函数“主要在做什么”，不描述具体 opcode 实现；具体 opcode 清单、Static Python 编码和版本差异由详细设计与源码家族表维护，功能设计只规定分类语义。
+- 未体现业务语义的指令归为中性：计入密度分母，但不偏向任何维度。
+- 旧版本 opcode 不进入目标 3.14+ 家族表；新增版本通过扩表保持兼容。
 
 #### 8.4.3.2 loop_score 派生设计
 
 `loop_score` 是 v1 最重要的收益信号之一，因为 JIT 收益通常来自循环内反复执行的代码。v1 把 loop 分为 0–3 四档：无 loop、简单 loop、多 loop/浅嵌套、深嵌套/大量 loop。
 
 实现上只要求分类器能在同一次字节码遍历中收集 loop 结构信息，不触发 OSR 编译，不额外引入第二条扫描链路。bootstrap 映射使用 Phase 0 起点值；进入生产默认策略前按 release gate 重新验证。
+
+**开销分解。** `loop_score = max(count_score, nesting_score)`，两部分成本量级不同：
+
+- **count_score（backedge 数）≈ 免费。** 主扫描本就逐条解码 opcode 并查家族表；识别 backedge 只是在已有 switch 上多认 `JUMP_BACKWARD`/`JUMP_BACKWARD_NO_INTERRUPT`（3.14 还有 `JUMP_BACKWARD_JIT`/`JUMP_BACKWARD_NO_JIT`）。命中时由 `oparg`（主扫描已解码）做一次 `target = nextInstrOffset() - oparg` 的 O(1) 算术。边际成本 ≈ 每指令一个可预测分支 + 命中时一次 O(1) 写入。
+- **nesting_score（嵌套深度）= 唯一“算法”部分，但是定长常数。** 单趟前向遍历无法直接得到嵌套，故：扫描中把每个 backedge 的区间 `[target, here]` 压入**栈上定长数组**（≤16 槽，对齐 `CI_OSR_MAX_BACKEDGES=16`）；扫描结束后对 ≤16 个区间求最大重叠层数（排序 ≤32 端点 + 一次扫线）。该后处理为 `O(b log b), b≤16`，是与函数大小 `n` **无关的定长常数**。
+
+**4 档输出可提前饱和。** `loop_score ∈ {0,1,2,3}` 仅 2 bit，不需精确计数/嵌套：count 累到桶上限（如 ≥3）即可早停、不再存区间；nesting 算到深度 3 即可停。故上面那个后处理在多数函数上跑不满。
+
+**三个必须守住的前提（否则上述估算不成立）：**
+
+1. **不调 `collectBackedgeTargetOffsets`（`osr.cpp`）。** 它用 `std::vector` + `sort` + `unique`，会**堆分配**；gate 路径必须就地用定长栈数组收端点（审校 T1.3），否则每函数一次 malloc，开销性质完全改变。
+2. **只认语义明确的后向跳转。** 异常跳转归 control、不计 loop（§8.4.7.1 FMEA）；backedge opcode 集合本就干净，无需额外 CFG 分析——省且对。
+3. **backedge 数 >16 按 cap 截断**，对 0–3 的 score 无害（≥3 个已顶最高桶）。
+
+结论：loop_score 完全骑在扫描器已解码的 `opcode`/`oparg` 之上，只多一个定长后处理，**不改 O(n) 阶、不显著改常数因子、不分配**。每函数扫描成本仍由主扫描 O(n) 主导，loop_score 只是其中不改阶的常数项；总开销的主导项是“被扫描函数数”（见 §8.4.7.4、§8.8.1），而非 loop_score。
 
 #### 8.4.3.3 派生流水线设计
 
@@ -410,7 +465,18 @@ interface deriveStructureKey(code: ReadOnlyCode) -> StructureKey      # 确定�
 
 #### 8.4.7.4 可用性/性能分析
 
-单次扫描在首次调用发生一次；命中缓存后该功能项不再执行（功能项 3）。扫描成本相对"被推迟的一次编译"可忽略，须以启动期 micro-bench 实测确认（R21，Outstanding）。
+单次扫描在首个 `calls >= global` 的 gate 发生一次；命中缓存后该功能项不再执行（功能项 3）。扫描成本相对"被推迟的一次编译"可忽略，须以启动期 micro-bench 实测确认（R21，Outstanding）。
+
+**单函数扫描开销分解（分析估算，未实测）：**
+
+| 组成 | 复杂度 | 随 n 增长 | 分配 |
+|---|---|---|---|
+| 主扫描（家族查表，六维共用） | O(n) | 是 | 否 |
+| loop_score 每指令边际（backedge 分支 + 命中 O(1) 捕获） | 折叠进 O(n) 常数 | 常数因子，不改阶 | 否（定长 16 槽栈数组） |
+| nesting 后处理（≤16 区间求重叠） | O(b log b), b≤16 | 否（定长常数） | 否 |
+| 修饰位/risk 子信号 | 与主扫描同遍历 | 折叠进 O(n) | 否 |
+
+单函数总开销 ≈ `c · n`（`c` = 每指令家族查表 + loop_score 边际，近似不变），单次编译为 µs–ms 量级、比单次扫描高几个数量级。因此**每函数维度上扫描相对编译可忽略**；真正能放大总开销的是“被扫描函数数”，由 §8.7.3.1 的 `calls >= global` 门控收敛到编译候选量级（详见 §8.8.1 预算公式）。
 
 ### 8.4.8 影响点列表
 
@@ -437,6 +503,12 @@ interface deriveStructureKey(code: ReadOnlyCode) -> StructureKey      # 确定�
 本节只保留 Phase-3 设计意图，不属于 v1 交付。它想解决的问题是：解释器特化状态能不能作为“这个函数可能更适合 JIT”的旁路提示。
 
 结论是谨慎使用。特化状态只能说明“这个函数曾经热过或曾经单态”，不能证明“现在仍稳定”。因此 Phase-3 即使恢复该信号，也只能作为本次 gate 的小幅微调输入，不能进入 `structure_key`，不能作为统计聚合键。
+
+这一谨慎来自它的**时序本质**，有两点必须在引入前认清：
+
+1. **band 是 gate 前解释执行累积的滞后信号。** 特化按“单条指令执行次数”触发（与 AutoJIT 按“函数调用次数”计数的 gate 是两个解耦的计数器），且只能发生在 gate 放行后的解释执行体内。因此 gate 读到的特化态，反映的永远是**此前若干次解释执行已经沉淀下来的过去行为**，而非当次的实时类型稳定性——这正是“只能证明曾经热/曾经单态”的根因。
+
+2. **band 与阈值策略存在反馈耦合。** v1 策略“抬阈值后移编译”会让函数多解释跑若干轮，到（被推迟的）编译时刻累积的特化态更多。对 v1 无害（`structure_key` 走 canonical opcode，对特化不变，见 §8.1.2）；但 Phase-3 一旦用 band 做微调，band 的取值就会被阈值策略本身影响，形成 policy↔band 回路。该回路的稳定性必须在 Phase-3 单独评估，不能假设 band 是策略的独立外生输入。
 
 | 项 | Phase-3 参考边界 |
 |---|---|
@@ -699,13 +771,16 @@ jitVectorcall(func):
   return 编译路径
 ```
 
-**改造后：分类失败仍然等价现状**
+**改造后：分类失败等价现状，且仅对够到基准阈值的函数分类**
 
 ```
 jitVectorcall(func):
   state  = readAutoJitGateState(code)
   global = config.compile_after_n_calls
-  sk     = classifier.getOrComputeStructureKey(code, state.cache_handle)
+  # 短路：v1 策略只会维持或抬高阈值（computeThreshold >= global），
+  # 故 calls < global 时无论分类结果如何都必然解释，分类是死功，跳过。
+  if state.calls < global: return 解释路径
+  sk = classifier.getOrComputeStructureKey(code, state.cache_handle)
   if sk == INVALID or not config.auto_classify:
       limit = global
   else:
@@ -714,9 +789,13 @@ jitVectorcall(func):
   return 编译路径
 ```
 
+**为什么先判 `calls < global` 再分类（行为等价 + 开销有界）：** v1 `computeThreshold` 是关于 `global` 的**单调非降**策略，恒满足 `limit >= global`。因此 `calls < global` 的函数无论落哪一类都会走解释路径，对它们分类是纯损耗。把分类下沉到 `calls >= global` 之后是**严格行为等价**的改写，却把"被扫描函数数"从全部 gate 可达函数压到"够到基准阈值的编译候选"（Phase 0：约 416k → 30k），使分类开销与它要优化的编译工作量同阶。该短路的前提是策略单调非降；若未来策略（含 Phase-3）可能把阈值降到 `global` 以下，须重新评估此处顺序。
+
 #### 8.7.3.2 策略边界设计
 
 `computeThreshold(structure_key, gate_context, global)` 是功能域对下游的**唯一阈值决策点**。分类器只提供稳定身份；策略只决定本次阈值。这样后续从启发式升级到在线反馈时，可以替换策略而不重写分类器。
+
+> **术语对齐：** 需求文档的 `gate_view` 是**概念名**，v1 中等于 `structure_key + gate_context`（不含 SpecBand，T2.2），它**不是持久化结构体**；功能/详细设计统一用 `gate_context` 指代“当次上下文”部分，用 `structure_key` 指代“聚合身份”部分。只有 `structure_key` 落库与聚合，`gate_context`/`gate_view` 均不落库。
 
 统计聚合**必须**以 `structure_key` 为键（R18）；`gate_context` 不落库、不聚合。特化观测 `specialization_band` 为 Phase-3 输入，v1 不参与（T2.2）。
 
@@ -823,6 +902,36 @@ interface classifyAndThreshold(code, gate_state) -> uint
 | AE12 | 功能项 1+3 | Mixed top-2 shape 编码/缓存/聚合身份保真 |
 | Provider gate | 功能项 4 | import-time JIT gdb smoke 正常退出；Phase 0.5 dump 证明 startup signal 覆盖率/误伤率 |
 | Policy A/B | 功能项 4 | `auto[:N]` 相对数值 `N` 减少 candidate 编译次数/编译耗时，非 candidate 等价，启动/吞吐无显著回归 |
+
+### 8.8.1 性能收益论证模型（开销 vs 收益）
+
+**先纠正一个直觉：收益不在让单个函数更快**——JIT 产出的机器码与现状一致。收益来自**编译预算的重新分配**：把编译力气花在能回本的函数上，省掉回不了本的。所以衡量口径不是“函数 X 快了”，而是一组成本账。
+
+**净收益不等式（发布须证明）：**
+
+```
+净收益 = Σ(被后移的低 ROI 函数省下的编译耗时)
+        − Σ(全部被扫描函数的分类开销)
+        − Σ(误伤：本该编译却被后移的函数损失)
+```
+
+```
+总分类开销 ≈ (被扫描函数数) × (c · 平均指令数)         # c 见 §8.4.7.4，近似不变
+```
+
+`§8.7.3.1` 的 `calls >= global` 门控把“被扫描函数数”从全部 gate 可达（Phase 0 ~416k）收敛到编译候选（~30k），使每次扫描都挂在一次“做或不做”的编译决策上——净收益不等式因此几乎自动成立：每个被扫函数要么本就要编译、要么是我们要省掉的编译。
+
+**R21 细化为“测什么 / 达标线”**（`auto[:N]` vs 数值 `N`，后者为分类关=基线）：
+
+| 维度 | 指标 | 达标线 |
+|---|---|---|
+| 主收益 | candidate 编译次数、累计编译耗时 | 显著下降 |
+| 启动 | 启动时延 / 到稳态时间 | 改善或持平 |
+| 内存 | JIT code cache 峰值 | 不上升（预期下降） |
+| 守门 | 稳态吞吐 | **不回归**（回归即说明误伤了应编译的函数） |
+| 开销 | 扫描 micro-bench（单函数 + 启动期总量） | 远小于省下的编译耗时 |
+
+发布门槛是同时满足：`Σ省下的编译耗时 > Σ分类扫描开销`，**且**稳态吞吐不回归。门控之后前者由结构保证，验证重心落在“吞吐不回归”与“启动/内存确有改善”。
 
 ## 8.9 待决项（与需求 Outstanding 对齐）
 

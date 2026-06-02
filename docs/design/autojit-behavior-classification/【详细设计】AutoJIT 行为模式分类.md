@@ -14,7 +14,7 @@
 
 | 角色 | 信息 |
 |---|---|
-| 拟制 | CinderX 性能优化组 |
+| 拟制 | @sisibeloved |
 | 日期 | 2026-06-01 |
 | 上游功能设计 | `docs/design/autojit-behavior-classification/【功能设计】AutoJIT 行为模式分类.md` |
 | 上游需求 | `docs/design/autojit-behavior-classification/【需求分析】AutoJIT 行为模式分类.md` |
@@ -23,8 +23,10 @@
 
 | 版本 | 日期 | 修订人 | 修订说明 |
 |---|---|---|---|
-| v0.1 | 2026-06-01 | 性能优化组 | 首版。落地 5 个实现单元的数据结构、算法、行为/异常模型、内部接口与代码实现要点（C++）。 |
-| v0.2 | 2026-06-02 | 性能优化组 | 根据 Phase 0 C++ dump 与 gdb 定位更新实现约束：分类 schema/evidence 可冻结，`startup_phase` 来源必须改为安全 import signal provider，禁止在 `jitVectorcall` 中遍历 frame/code metadata；policy/default 需 A/B release gate。 |
+| v0.1 | 2026-06-01 | @sisibeloved | 首版。落地 5 个实现单元的数据结构、算法、行为/异常模型、内部接口与代码实现要点（C++）。 |
+| v0.2 | 2026-06-02 | @sisibeloved | 根据 Phase 0 C++ dump 与 gdb 定位更新实现约束：分类 schema/evidence 可冻结，`startup_phase` 来源必须改为安全 import signal provider，禁止在 `jitVectorcall` 中遍历 frame/code metadata；policy/default 需 A/B release gate。 |
+| v0.3 | 2026-06-02 | @sisibeloved | 与功能设计 v0.6 同步：§13 `jitVectorcall` 伪代码加入 `calls >= global` 才分类的短路（正收益前提，被扫描函数数 ~416k→~30k）；§14.3 补"被扫描函数数有界"分析并回指功能设计 §8.8.1 收益模型；§10.2.2 补 loop_score 4 档提前饱和的可选优化说明。 |
+| v0.4 | 2026-06-02 | @sisibeloved | ce-doc-review 回灌：§13.2 废弃 `kNoAutoJit` 哨兵，改用 `compile_after_n_calls.has_value()` 显式分流（无阈值=即时编译，消除 interpret-forever 回归）；§13.6 更正 PYTHONJITAUTO 注册重载为 `void(int)`→`void(const std::string&)`；§13.6 给 `kDeferThresholdFactor` 补 bootstrap ×8；§10.6 给 `kExcRatio=0.25`/`kHugeCodeLen=500`/synthetic 文件名集补 bootstrap 值并纳入 T3.11 冻结契约。 |
 
 ## 4 Keywords 关键词
 
@@ -303,6 +305,8 @@ uint8_t loopScore(const llvm::SmallVectorImpl<std::pair<int,int>>& edges) {
 
 > 注：既有 `collectBackedgeTargetOffsets`（`cinderx/Jit/osr.cpp:327`）的 16 条上限语义在此保留（`s.backedges.size() < 16`），深嵌套（>16 边）截顶到 `loop_score=3`，对 0–3 分级无影响。
 
+> 提前饱和（可选优化）：`loop_score ∈ {0,1,2,3}` 仅 2 bit，`count_score` 累到 `>=4`、`nesting` 达到 3 即已顶最高桶，故扫描中边数达 4 后可不再 `push_back`、`loopScore` 的扫线达深度 3 即可短路返回。该优化只省常数、不改语义，实现可选。
+
 ### 10.2.3 派生（预过滤 → 分桶 → 选族）
 
 ```cpp
@@ -390,7 +394,8 @@ StructureKey deriveStructureKey(BorrowedRef<PyCodeObject> code);   // 纯函数
 - **opcode 取值必须用公有 `BytecodeInstruction::opcode()`**（`bytecode.cpp:106`，已 unspecialize 且对 SP 复合 `EXTENDED_OPCODE_FLAG`）——**不要**用 `private` 的 `uninstrumentedOpcode()`（编译不可见，且返回未复合 flag 的 ≤255 原始字节，会漏掉全部 SP opcode，审校 T1.2）。（Phase-3 才加特化判定 `specializedOpcode() != opcode()`，与工作维度同遍历、互不污染，R22；v1 不做，T2.2。）
 - 后向边在同一遍历内就地收集（10.2.1），不调用第二遍 `collectBackedgeTargetOffsets`，使"单次 O(n) 扫描"成立（审校 T1.3）。
 - `bucketize` 必须对 `n_eff==0` 与低于 floor 短路，杜绝除零与微函数假信号（R14）。
-- bootstrap 常量集中为可调常量：`kDimCountFloor=2`、density cutoff `0.10/0.25/0.50`、`kMixedBucketDelta=1`、`kMixedMinBucket=2`、loop count score 阈值 `1/2/4`。这些常量已由 2026-06-02 Phase 0 C++ gate-side dump 通过 Mixed/family 红线，可作为 v1 编码起点；它们不是生产 policy/default 冻结结论。正式默认值需经 `auto[:N]` vs 数值 `N` A/B 和相邻 cutoff/floor/δ/loop 配置比较后冻结；后续重新标定必须在新进程或清空 code objects 后进入 gate/cache/policy，并保留部署覆盖入口（T3.3/T3.9）。
+- bootstrap 常量集中为可调常量：`kDimCountFloor=2`、density cutoff `0.10/0.25/0.50`、`kMixedBucketDelta=1`、`kMixedMinBucket=2`、loop count score 阈值 `1/2/4`、`kExcRatio=0.25`（异常子计数密度上限，`deriveRisk` 用）、`kHugeCodeLen=500`（`co_codelen` 上限，`deriveRisk` 用）、synthetic 文件名集 `{"<string>", "<lambdifygenerated>", …}`（`isSyntheticFilename` 用）。这些常量已由 2026-06-02 Phase 0 C++ gate-side dump 通过 Mixed/family 红线，可作为 v1 编码起点；它们不是生产 policy/default 冻结结论。
+- **冻结契约补全（审校 scope-guardian/adversarial）**：`kExcRatio`、`kHugeCodeLen`、synthetic 文件名集喂入 key-bearing modifier（`high_risk`、`is_synthetic`），因此与 cutoff/floor/δ/loop 一样属于 T3.11 进程内冻结的分类 schema——`skey_word` valid 后不得运行期变化，否则破坏“同一 code object 恒定身份”不变量（R20）。正式默认值需经 `auto[:N]` vs 数值 `N` A/B 和相邻 cutoff/floor/δ/loop 配置比较后冻结；后续重新标定必须在新进程或清空 code objects 后进入 gate/cache/policy，并保留部署覆盖入口（T3.3/T3.9）。
 
 ---
 
@@ -599,7 +604,23 @@ BorrowedRef<PyCodeObject> code{func->func_code};
 AutoJitGateState state = readAutoJitGateState(code);           // 内部只做一次 codeExtra get
 CodeExtra* ex = state.extra;
 uint64_t calls = state.calls;
-uint32_t global = getConfig().compile_after_n_calls.value_or(kNoAutoJit);
+
+// AutoJIT 未启用（compile_after_n_calls 无值）：保持现状——不进入分类/短路，直接走 forced 编译路径。
+// 对齐 pyjit.cpp:197 的 has_value() 语义；`value_or(sentinel)` 会把“无阈值=即时编译”误转成
+// “interpret-forever”，故显式分流（审校 feasibility/adversarial）。
+if (!getConfig().compile_after_n_calls.has_value()) {
+  return forcedJitVectorcall(func_obj, stack, nargsf, kwnames);  // 无阈值=即时编译（现状）
+}
+uint32_t global = *getConfig().compile_after_n_calls;
+
+// 短路（正收益前提，对齐功能设计 §8.7.3.1）：computeThreshold 关于 global 单调非降，恒有
+// limit >= global，故 calls < global 必然走解释路径，对其分类是死功。仅对 calls >= global
+// 的编译候选分类，把"被扫描函数数"从全部 gate 可达收敛到编译候选（Phase 0 ~416k→~30k），
+// 使分类开销与它要优化的编译工作量同阶。与现状等价：auto 关时此判等同原 `calls<limit`(limit=global)。
+// 前提是策略单调非降；若未来策略（含 Phase-3）可把阈值降到 global 以下，须重审此处顺序。
+if (calls < global) {
+  return getInterpretedVectorcall(func)(func_obj, stack, nargsf, kwnames);  // 解释（现状）
+}
 
 uint32_t limit;
 if (!getConfig().auto_classify) {                        // PYTHONJITAUTO=数值 → 分类关，等价现状（T2.3）
@@ -665,7 +686,7 @@ uint32_t computeThreshold(const StructureKey& sk, const GateContext& ctx, uint32
 
 ### 13.4.1 数据结构定义
 
-`computeThreshold` 为自由函数（T2.1，无策略对象/单例）；新增配置项 `config.auto_classify`（bool，由 `PYTHONJITAUTO=auto[:N]` 解析置真，T2.3）；`GateContext` 为当次 gate 上下文（v1 热路径仅 `startup_phase`，来源为安全 import signal provider，不入 `structure_key` / 不聚合）；`StartupSignalMask` 只属于 Phase 0 诊断 dump，用于比较 importlib/module initializing、安全 import 状态 provider、早期进程窗口等候选信号，早期进程窗口不得单独成为默认策略来源；`kDeferThresholdFactor` 为抬阈值倍数（可 env 覆盖，T3.3）；`kNoAutoJit` 表"AutoJIT 未启用"的哨兵。
+`computeThreshold` 为自由函数（T2.1，无策略对象/单例）；新增配置项 `config.auto_classify`（bool，由 `PYTHONJITAUTO=auto[:N]` 解析置真，T2.3）；`GateContext` 为当次 gate 上下文（v1 热路径仅 `startup_phase`，来源为安全 import signal provider，不入 `structure_key` / 不聚合）；`StartupSignalMask` 只属于 Phase 0 诊断 dump，用于比较 importlib/module initializing、安全 import 状态 provider、早期进程窗口等候选信号，早期进程窗口不得单独成为默认策略来源；`kDeferThresholdFactor` 为抬阈值倍数（bootstrap 默认 **×8**，保守起点、A/B 前临时；可 env 覆盖，T3.3）。`kNoAutoJit` 哨兵已废弃：§13.2 改为以 `compile_after_n_calls.has_value()` 显式分流（无阈值=即时编译，保持现状），不再用 `value_or(sentinel)`。
 
 **Import signal provider 约束：**
 - 禁止在 `jitVectorcall` 中遍历 Python frame stack 或读取上层 frame code metadata 来判断 import stack；该路径已由 gdb 定位为 SIGSEGV。
@@ -713,7 +734,7 @@ AutoJitGateState readAutoJitGateState(BorrowedRef<PyCodeObject> code);
 ## 13.6 代码实现要点
 
 - 改造仅限 `jitVectorcall` 内"求 limit"一段；解释/编译两条返回路径完全沿用现状（`getInterpretedVectorcall`/`forcedJitVectorcall`），降低回归面。
-- **复用 `PYTHONJITAUTO`（不新增 env，T2.3）**：把其注册从 `void(uint32_t)` 改为 `void(const std::string&)`（FlagProcessor 已有该重载，`jit_flag_processor.h:84`），解析 `auto[:N]` 设 `config.auto_classify` + base 阈值，数值仍走原路径。`=N`（数值）= 分类关、等价现状，即 A/B 对照/止血手段。parser contract：
+- **复用 `PYTHONJITAUTO`（不新增 env，T2.3）**：把其注册从 `void(int)`（当前 `pyjit.cpp:300` 以 `[](uint32_t val)` lambda 绑定 `void(int)` 重载，FlagProcessor 无 `void(uint32_t)` 重载）改为 `void(const std::string&)`（FlagProcessor 已有该重载，`jit_flag_processor.h:84`），解析 `auto[:N]` 设 `config.auto_classify` + base 阈值，数值仍走原路径。`=N`（数值）= 分类关、等价现状，即 A/B 对照/止血手段。parser contract：
 
 | 输入 | 解析结果 | 说明 |
 |---|---|---|
@@ -756,6 +777,7 @@ AutoJitGateState readAutoJitGateState(BorrowedRef<PyCodeObject> code);
 
 - 命中路径：一次 `codeExtra` 取 + 一次 acquire 读 + 一次策略调用（默认 O(1)）。相对现状 `countCalls` 已做的 `codeExtra` 取，仅多一次 acquire-load + 一次（默认内联）策略调用。
 - 首次路径：**单次** O(n) 扫描（n=指令数，工作维度 + 后向边一遍完成，T1.3）+ 一次 release 发布。**不再有第二遍 backedge 扫描。** 特化计数随 Phase-3 恢复。
+- **被扫描函数数有界（正收益前提）：** §13 gate 仅在 `calls >= global` 时才调 `getOrComputeStructureKey`（短路见 §13 伪代码），故首扫只发生在编译候选上、不覆盖全部 gate 可达函数（Phase 0 ~416k→~30k）。总分类开销 ≈ 被扫描函数数 × 单函数 O(n)，主导项是被扫描函数数而非单函数成本（loop_score 等修饰位为 O(n) 内的常数项，§10.2）；净收益论证模型见功能设计 §8.8.1。
 - FT 良性重复：最多 O(线程数) 次首扫，概率低、每次 O(n)，可接受；如实测偏高改 `compare_exchange` 单发布。
 - **验收标准（R21，审校 T4.6 补全）：**
   - (V1) 稳态命中路径：准入路径单次开销相对基线回归 **≤ 2%**（startup micro-bench，以 `compile_after_n_calls` 现状为基线）。
