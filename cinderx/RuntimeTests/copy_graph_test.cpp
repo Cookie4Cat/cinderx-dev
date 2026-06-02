@@ -3,6 +3,7 @@
 
 #include "cinderx/Jit/codegen/copy_graph.h"
 
+#include <algorithm>
 #include <fmt/format.h>
 
 #include <ostream>
@@ -110,4 +111,22 @@ TEST(CopyGraphTest, CopyGraphWithTypeMultiCycles) {
     }
     EXPECT_EQ(op.type, jit::map_get(expected, op.to));
   }
+}
+
+struct PreferWiderType {
+  int operator()(int from, int to) const {
+    return std::max(from, to);
+  }
+};
+
+TEST(CopyGraphTest, CopyGraphWithTypeResolvesExchangeType) {
+  CopyGraphWithType<int, PreferWiderType> cg;
+  cg.addEdge(0, 1, 32);
+  cg.addEdge(1, 0, 64);
+
+  auto ops = cg.process();
+
+  ASSERT_EQ(ops.size(), 1);
+  EXPECT_EQ(ops[0], Op(Op::Kind::kExchange, 0, 1));
+  EXPECT_EQ(ops[0].type, 64);
 }

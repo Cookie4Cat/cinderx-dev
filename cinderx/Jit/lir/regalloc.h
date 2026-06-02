@@ -134,7 +134,12 @@ class LinearScanAllocator {
       std::vector<LiveInterval*>,
       LiveIntervalPtrGreater>;
 
-  using CopyGraphWithOperand = codegen::CopyGraphWithType<const DataType>;
+  struct CopyGraphDataTypeResolver {
+    DataType operator()(DataType from, DataType to) const;
+  };
+
+  using CopyGraphWithOperand =
+      codegen::CopyGraphWithType<const DataType, CopyGraphDataTypeResolver>;
 
   // Get the interval for an operand.
   LiveInterval& getInterval(const Operand* operand);

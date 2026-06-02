@@ -8,6 +8,7 @@
 #include <limits>
 #include <map>
 #include <tuple>
+#include <type_traits>
 #include <unordered_map>
 #include <utility>
 #include <vector>
@@ -98,14 +99,27 @@ class CopyGraph {
   IntrusiveList<Node, &Node::leaf_node> leaf_nodes_;
 };
 
-// the same as CopyGraph, but preserves certain types of `from` nodes.
 template <typename FromType>
+struct CopyGraphTypeResolver {
+  using StoredType = std::remove_cv_t<FromType>;
+
+  StoredType operator()(StoredType from, StoredType /* to */) const {
+    return from;
+  }
+};
+
+// the same as CopyGraph, but preserves certain types of `from` nodes.
+template <
+    typename FromType,
+    typename TypeResolver = CopyGraphTypeResolver<FromType>>
 class CopyGraphWithType : public CopyGraph {
  public:
-  struct Op : CopyGraph::Op {
-    Op(const CopyGraph::Op& op, FromType t) : CopyGraph::Op(op), type(t) {}
+  using StoredType = std::remove_cv_t<FromType>;
 
-    const FromType type;
+  struct Op : CopyGraph::Op {
+    Op(const CopyGraph::Op& op, StoredType t) : CopyGraph::Op(op), type(t) {}
+
+    const StoredType type;
   };
 
   void addEdge(int from, int to, FromType type) {
@@ -125,6 +139,10 @@ class CopyGraphWithType : public CopyGraph {
 
     for (auto& op : ops) {
       auto from_type = map_get(from_types_, op.from);
+      if (op.kind == CopyGraph::Op::Kind::kExchange) {
+        auto to_type = map_get(from_types_, op.to);
+        from_type = type_resolver_(from_type, to_type);
+      }
       ret.emplace_back(op, from_type);
 
       if (op.to == kTempLoc) {
@@ -136,7 +154,8 @@ class CopyGraphWithType : public CopyGraph {
   }
 
  private:
-  std::unordered_map<int, std::remove_cv_t<FromType>> from_types_;
+  TypeResolver type_resolver_;
+  std::unordered_map<int, StoredType> from_types_;
 };
 
 } // namespace jit::codegen
