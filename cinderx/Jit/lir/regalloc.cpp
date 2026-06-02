@@ -84,6 +84,23 @@ bool isTreeIterHelperCall(Instruction::Opcode opcode) {
 
 } // namespace
 
+DataType LinearScanAllocator::CopyGraphDataTypeResolver::operator()(
+    DataType from,
+    DataType to) const {
+  if (from == to) {
+    return from;
+  }
+
+  JIT_DCHECK(
+      from != DataType::kDouble && to != DataType::kDouble,
+      "Cannot exchange different register classes");
+
+  if (from == DataType::kObject || to == DataType::kObject) {
+    return DataType::kObject;
+  }
+  return DataType::k64bit;
+}
+
 RegallocBlockState::RegallocBlockState(
     const BasicBlock* b,
     int index,
