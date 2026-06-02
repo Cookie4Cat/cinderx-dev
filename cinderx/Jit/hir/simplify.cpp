@@ -16,6 +16,7 @@
 #include "cinderx/Jit/hir/copy_propagation.h"
 #include "cinderx/Jit/hir/printer.h"
 #include "cinderx/Jit/hir/type.h"
+#include "cinderx/Jit/jit_rt.h"
 #include "cinderx/Jit/threaded_compile.h"
 #include "cinderx/StaticPython/strictmoduleobject.h"
 
@@ -1042,9 +1043,29 @@ Register* simplifyBinaryOp(Env& env, const BinaryOp* instr) {
     }
   }
 
+  // Mixed float/int true divide where the int is NOT a known constant and is
+  // on the left: use a helper that handles arbitrary-size ints without a
+  // compact-long guard. This avoids repeated deopts for elapsed nanosecond
+  // values in logging.LogRecord.__init__.
+  if (op == BinaryOpKind::kTrueDivide && lhs->isA(TLongExact) &&
+      rhs->isA(TFloatExact) && !lhs->type().hasObjectSpec()) {
+    env.emit<UseType>(lhs, TLongExact);
+    env.emit<UseType>(rhs, TFloatExact);
+    Register* result = env.emitVariadic<CallStatic>(
+        2,
+        reinterpret_cast<void*>(JITRT_LongFloatTrueDivide),
+        TFloatExact | TNullptr,
+        lhs,
+        rhs);
+    return env.emit<CheckExc>(result, *instr->frameState());
+  }
+
   // Mixed float/int binary ops where the int is NOT a known constant: guard
   // that the int is compact (fits in a single 30-bit digit, thus losslessly
   // convertible to double), unbox both to CDouble, and emit DoubleBinaryOp.
+  // For true divide, int / float is handled above with a helper because values
+  // such as elapsed nanoseconds in logging.LogRecord.__init__ commonly exceed
+  // the compact-long range. Keep the compact-long fast path for float / int.
   if ((op == BinaryOpKind::kAdd || op == BinaryOpKind::kSubtract ||
        op == BinaryOpKind::kMultiply || op == BinaryOpKind::kTrueDivide ||
        op == BinaryOpKind::kPower)) {

@@ -322,6 +322,8 @@ PyObject* JITRT_BoxI64(int64_t i);
 PyObject* JITRT_BoxU64(uint64_t i);
 PyObject* JITRT_BoxDouble(double_t d);
 
+PyObject* JITRT_LongFloatTrueDivide(PyObject* left, PyObject* right);
+
 double JITRT_PowerDouble(double x, double y);
 double JITRT_SqrtDouble(double x);
 double JITRT_Power32(int32_t x, int32_t y);
