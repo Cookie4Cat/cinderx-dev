@@ -220,6 +220,12 @@ struct Config {
   // inline caches used by the JIT.
   uint32_t attr_cache_size{4};
   std::optional<uint32_t> compile_after_n_calls;
+  // Enable AutoJIT behavior classification for PYTHONJITAUTO=auto[:N]. Plain
+  // numeric PYTHONJITAUTO and Python APIs keep this disabled.
+  bool auto_classify{false};
+  // Provider-before v1 keeps startup/import deferral disabled. This is only
+  // for a later import-depth provider-backed slice.
+  bool enable_startup_init_policy{false};
   GdbOptions gdb;
   JitListOptions jit_list;
   LogOptions log;

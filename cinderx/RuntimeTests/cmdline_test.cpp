@@ -349,13 +349,97 @@ TEST_F(CmdLineTest, JITEnable) {
       try_flag_and_envvar_effect(
           L"jit-all",
           "PYTHONJITALL",
-          []() {},
+          []() {
+            getMutableConfig().compile_after_n_calls.reset();
+            getMutableConfig().auto_classify = true;
+          },
           []() {
             ASSERT_TRUE(isJitUsable());
             ASSERT_EQ(getConfig().compile_after_n_calls, 0);
+            ASSERT_FALSE(getConfig().auto_classify);
             ASSERT_EQ(
                 getConfig().asm_syntax,
                 AsmSyntax::ATT); // default to AT&T syntax
+          }),
+      0);
+}
+
+TEST_F(CmdLineTest, JITAutoNumericKeepsClassificationOff) {
+  ASSERT_EQ(
+      try_flag_and_envvar_effect(
+          L"jit-auto=2",
+          "PYTHONJITAUTO=2",
+          []() {
+            getMutableConfig().compile_after_n_calls.reset();
+            getMutableConfig().auto_classify = true;
+          },
+          []() {
+            ASSERT_EQ(getConfig().compile_after_n_calls, 2);
+            ASSERT_FALSE(getConfig().auto_classify);
+          }),
+      0);
+}
+
+TEST_F(CmdLineTest, JITAutoEmptyXOptionKeepsLegacyThresholdOne) {
+  ASSERT_EQ(
+      try_flag_and_envvar_effect(
+          L"jit-auto",
+          nullptr,
+          []() {
+            getMutableConfig().compile_after_n_calls.reset();
+            getMutableConfig().auto_classify = true;
+          },
+          []() {
+            ASSERT_EQ(getConfig().compile_after_n_calls, 1);
+            ASSERT_FALSE(getConfig().auto_classify);
+          }),
+      0);
+}
+
+TEST_F(CmdLineTest, JITAutoKeywordEnablesClassification) {
+  ASSERT_EQ(
+      try_flag_and_envvar_effect(
+          L"jit-auto=auto:7",
+          "PYTHONJITAUTO=auto:7",
+          []() {
+            getMutableConfig().compile_after_n_calls.reset();
+            getMutableConfig().auto_classify = false;
+          },
+          []() {
+            ASSERT_EQ(getConfig().compile_after_n_calls, 7);
+            ASSERT_TRUE(getConfig().auto_classify);
+          }),
+      0);
+}
+
+TEST_F(CmdLineTest, JITAutoKeywordUsesDefaultThreshold) {
+  ASSERT_EQ(
+      try_flag_and_envvar_effect(
+          L"jit-auto=auto",
+          "PYTHONJITAUTO=auto",
+          []() {
+            getMutableConfig().compile_after_n_calls.reset();
+            getMutableConfig().auto_classify = false;
+          },
+          []() {
+            ASSERT_EQ(getConfig().compile_after_n_calls, 2);
+            ASSERT_TRUE(getConfig().auto_classify);
+          }),
+      0);
+}
+
+TEST_F(CmdLineTest, JITAutoMalformedInputPreservesExistingConfig) {
+  ASSERT_EQ(
+      try_flag_and_envvar_effect(
+          L"jit-auto=auto:not-a-number",
+          "PYTHONJITAUTO=auto:not-a-number",
+          []() {
+            getMutableConfig().compile_after_n_calls.reset();
+            getMutableConfig().auto_classify = false;
+          },
+          []() {
+            ASSERT_FALSE(getConfig().compile_after_n_calls.has_value());
+            ASSERT_FALSE(getConfig().auto_classify);
           }),
       0);
 }

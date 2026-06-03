@@ -17,6 +17,7 @@
 #include "cinderx/Common/type.h"
 #include "cinderx/Common/util.h"
 #include "cinderx/Interpreter/interpreter.h"
+#include "cinderx/Jit/behavior_classifier.h"
 #include "cinderx/Jit/code_allocator.h"
 #include "cinderx/Jit/codegen/arch/detection.h"
 #include "cinderx/Jit/codegen/tls.h"
@@ -101,6 +102,23 @@ bool hasRequiredFlags(BorrowedRef<PyCodeObject> code) {
 uint64_t countCalls(PyCodeObject* code) {
   auto extra = codeExtra(code);
   return extra != nullptr ? Ci_code_extra_get_calls(extra) : 0;
+}
+
+GateContext readGateContext() {
+  // Provider-before v1 has no production-safe import-depth provider yet.
+  return GateContext{false};
+}
+
+struct AutoJitGateState {
+  CodeExtra* extra{nullptr};
+  uint64_t calls{0};
+  GateContext context;
+};
+
+AutoJitGateState readAutoJitGateState(BorrowedRef<PyCodeObject> code) {
+  CodeExtra* extra = codeExtra(code);
+  uint64_t calls = extra != nullptr ? Ci_code_extra_get_calls(extra) : 0;
+  return {extra, calls, readGateContext()};
 }
 
 void setInterpreterJitFlag(bool enabled) {
@@ -195,8 +213,21 @@ PyObject* jitVectorcall(
   // If there's a call count limit, interpret the function as usual until the
   // limit is reached.
   if (auto limit = getConfig().compile_after_n_calls; limit.has_value()) {
-    auto const calls = countCalls(code);
-    if (calls < *limit) {
+    AutoJitGateState state = readAutoJitGateState(code);
+    if (state.calls < *limit) {
+      auto entry = getInterpretedVectorcall(func);
+      return entry(func_obj, stack, nargsf, kwnames);
+    }
+
+    uint32_t effective_limit = *limit;
+    if (getConfig().auto_classify) {
+      if (auto key = getOrComputeStructureKey(code, state.extra);
+          key.has_value()) {
+        effective_limit =
+            computeThreshold(*key, state.context, *limit).limit;
+      }
+    }
+    if (state.calls < effective_limit) {
       auto entry = getInterpretedVectorcall(func);
       return entry(func_obj, stack, nargsf, kwnames);
     }
@@ -278,6 +309,58 @@ size_t parse_sized_argument(const std::string& val) {
   return ret_value * scale;
 }
 
+constexpr uint32_t kAutoJitClassifyDefaultThreshold = 2;
+
+bool parse_uint32_arg(std::string_view value, uint32_t* parsed) {
+  if (value.empty()) {
+    return false;
+  }
+  uint64_t tmp = 0;
+  auto first = value.data();
+  auto last = value.data() + value.size();
+  auto result = std::from_chars(first, last, tmp);
+  if (result.ec != std::errc() || result.ptr != last ||
+      tmp > std::numeric_limits<uint32_t>::max()) {
+    return false;
+  }
+  *parsed = static_cast<uint32_t>(tmp);
+  return true;
+}
+
+void configureCompileAfterNCalls(uint32_t calls, bool auto_classify) {
+  getMutableConfig().compile_after_n_calls = calls;
+  getMutableConfig().auto_classify = auto_classify;
+}
+
+void parseAutoJitOption(const std::string& value) {
+  if (value.empty()) {
+    configureCompileAfterNCalls(1, false);
+    return;
+  }
+
+  uint32_t threshold = 0;
+  if (value == "auto") {
+    configureCompileAfterNCalls(kAutoJitClassifyDefaultThreshold, true);
+    return;
+  }
+  constexpr std::string_view kAutoPrefix{"auto:"};
+  if (value.starts_with(kAutoPrefix)) {
+    std::string_view threshold_text{value.data() + kAutoPrefix.size(),
+                                    value.size() - kAutoPrefix.size()};
+    if (parse_uint32_arg(threshold_text, &threshold)) {
+      configureCompileAfterNCalls(threshold, true);
+    } else {
+      JIT_LOG("Invalid value for jit-auto/PYTHONJITAUTO: {}", value);
+    }
+    return;
+  }
+  if (parse_uint32_arg(value, &threshold)) {
+    configureCompileAfterNCalls(threshold, false);
+  } else {
+    JIT_LOG("Invalid value for jit-auto/PYTHONJITAUTO: {}", value);
+  }
+}
+
 FlagProcessor initFlagProcessor() {
   FlagProcessor flag_processor;
 
@@ -292,14 +375,14 @@ FlagProcessor initFlagProcessor() {
   flag_processor.addOption(
       "jit-all",
       "PYTHONJITALL",
-      [](uint32_t) { getMutableConfig().compile_after_n_calls = 0; },
+      [](uint32_t) { configureCompileAfterNCalls(0, false); },
       "Enable the JIT and set it to compile all functions as soon as they are "
       "called");
 
   flag_processor.addOption(
       "jit-auto",
       "PYTHONJITAUTO",
-      [](uint32_t val) { getMutableConfig().compile_after_n_calls = val; },
+      [](const std::string& val) { parseAutoJitOption(val); },
       "Enable auto-JIT mode, which compiles functions after the given "
       "threshold");
 
@@ -1611,19 +1694,20 @@ PyObject* patched_sys_settrace(
   return result;
 }
 
-int compile_after_n_calls_impl(uint32_t calls) {
-  if (Ci_InitFrameEvalFunc() < 0) {
-    return -1;
-  }
-
-  getMutableConfig().compile_after_n_calls = calls;
-
+void schedule_existing_functions_for_jit(uint32_t calls) {
   // Schedule all pre-existing functions for compilation.
   walkFunctionObjects(
       [](BorrowedRef<PyFunctionObject> func) { scheduleJitCompile(func); });
 
   JIT_DLOG("Configuring JIT to compile functions after {} calls", calls);
+}
 
+int compile_after_n_calls_impl(uint32_t calls) {
+  if (Ci_InitFrameEvalFunc() < 0) {
+    return -1;
+  }
+  configureCompileAfterNCalls(calls, false);
+  schedule_existing_functions_for_jit(calls);
   return 0;
 }
 
@@ -3611,9 +3695,7 @@ int initialize() {
   // startup, start scheduling functions for compilation now.
   if (auto compile_n = getConfig().compile_after_n_calls;
       compile_n.has_value()) {
-    if (compile_after_n_calls_impl(*compile_n) < 0) {
-      return -1;
-    }
+    schedule_existing_functions_for_jit(*compile_n);
   } else if (mod_state->jit_list.get() != nullptr) {
     if (rescheduleJitList() < 0) {
       return -1;

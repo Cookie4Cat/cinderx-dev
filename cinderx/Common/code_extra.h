@@ -28,6 +28,9 @@ typedef struct CodeExtra {
   void* jit_compiled;
   void* jit_globals;
   void* jit_builtins;
+  // Cached AutoJIT behavior classification. bit31 is the valid bit; the low
+  // 24 bits are a StructureKey payload. Zero-initialized means unclassified.
+  uint32_t skey_word;
 } CodeExtra;
 
 // Thread-safe accessors for CodeExtra::calls.
@@ -46,6 +49,17 @@ static inline uint64_t Ci_code_extra_get_calls(const CodeExtra* extra) {
   return _Py_atomic_load_uint64_relaxed(&extra->calls);
 }
 
+static inline uint32_t Ci_code_extra_load_skey_acquire(
+    const CodeExtra* extra) {
+  return __atomic_load_n(&extra->skey_word, __ATOMIC_ACQUIRE);
+}
+
+static inline void Ci_code_extra_store_skey_release(
+    CodeExtra* extra,
+    uint32_t word) {
+  __atomic_store_n(&extra->skey_word, word, __ATOMIC_RELEASE);
+}
+
 #else
 
 static inline void Ci_code_extra_incr_calls(CodeExtra* extra) {
@@ -54,6 +68,17 @@ static inline void Ci_code_extra_incr_calls(CodeExtra* extra) {
 
 static inline uint64_t Ci_code_extra_get_calls(const CodeExtra* extra) {
   return extra->calls;
+}
+
+static inline uint32_t Ci_code_extra_load_skey_acquire(
+    const CodeExtra* extra) {
+  return extra->skey_word;
+}
+
+static inline void Ci_code_extra_store_skey_release(
+    CodeExtra* extra,
+    uint32_t word) {
+  extra->skey_word = word;
 }
 
 #endif
