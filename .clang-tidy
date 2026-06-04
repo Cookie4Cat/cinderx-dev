@@ -1,0 +1,25 @@
+---
+HeaderFilterRegex: '^cinderx/(?!ThirdParty/|UpstreamBorrow/|Interpreter/[^/]+/Includes/).*'
+
+Checks:
+  - -*
+  - bugprone-*
+  - -bugprone-easily-swappable-parameters
+  - clang-analyzer-*
+  - misc-redundant-expression
+  - modernize-use-nullptr
+  - modernize-use-override
+  - performance-*
+  - readability-duplicate-include
+  - readability-redundant-string-init
+
+WarningsAsErrors: ''
+
+CheckOptions:
+  - key: performance-move-const-arg.CheckTriviallyCopyableMove
+    value: false
+  - key: performance-unnecessary-copy-initialization.AllowedTypes
+    value: '[Pp]ointer$;[Pp]tr$;[Rr]ef(erence)?$'
+  - key: performance-unnecessary-value-param.AllowedTypes
+    value: '[Pp]ointer$;[Pp]tr$;[Rr]ef(erence)?$'
+...
