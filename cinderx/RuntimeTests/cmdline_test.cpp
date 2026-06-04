@@ -538,6 +538,59 @@ TEST_F(CmdLineTest, JITAutoXOptionAutoModeInstallsFrameEvaluator) {
   jit::shutdown_jit_genobject_type();
 }
 
+TEST_F(CmdLineTest, JITAutoImportProviderEnablesStartupInitPolicy) {
+  ScopedAutoJitConfigState config_guard;
+  ScopedEnvVar auto_env{"PYTHONJITAUTO"};
+  ScopedEnvVar provider_env{"CINDERX_AUTOJIT_IMPORT_PROVIDER"};
+  resetJitForAutoJitEntryTest();
+  auto_env.set("auto:2");
+  ASSERT_EQ(jit::initialize(), 0);
+  EXPECT_EQ(getConfig().compile_after_n_calls, 2);
+  EXPECT_TRUE(getConfig().auto_classify);
+  EXPECT_TRUE(getConfig().enable_startup_init_policy);
+
+  jit::finalize();
+  jit::shutdown_jit_genobject_type();
+
+  resetJitForAutoJitEntryTest();
+  auto_env.set("auto:2");
+  provider_env.set("builtins");
+  ASSERT_EQ(jit::initialize(), 0);
+  EXPECT_EQ(getConfig().compile_after_n_calls, 2);
+  EXPECT_TRUE(getConfig().auto_classify);
+  EXPECT_TRUE(getConfig().enable_startup_init_policy);
+
+  jit::finalize();
+  jit::shutdown_jit_genobject_type();
+
+  resetJitForAutoJitEntryTest();
+  auto_env.set("auto:2");
+  provider_env.set("find_and_load");
+  ASSERT_EQ(jit::initialize(), 0);
+  EXPECT_EQ(getConfig().compile_after_n_calls, 2);
+  EXPECT_TRUE(getConfig().auto_classify);
+  EXPECT_TRUE(getConfig().enable_startup_init_policy);
+
+  jit::finalize();
+  jit::shutdown_jit_genobject_type();
+}
+
+TEST_F(CmdLineTest, JITAutoImportProviderOffKeepsStartupInitPolicyDisabled) {
+  ScopedAutoJitConfigState config_guard;
+  ScopedEnvVar auto_env{"PYTHONJITAUTO"};
+  ScopedEnvVar provider_env{"CINDERX_AUTOJIT_IMPORT_PROVIDER"};
+  resetJitForAutoJitEntryTest();
+  auto_env.set("auto:2");
+  provider_env.set("off");
+  ASSERT_EQ(jit::initialize(), 0);
+  EXPECT_EQ(getConfig().compile_after_n_calls, 2);
+  EXPECT_TRUE(getConfig().auto_classify);
+  EXPECT_FALSE(getConfig().enable_startup_init_policy);
+
+  jit::finalize();
+  jit::shutdown_jit_genobject_type();
+}
+
 TEST_F(CmdLineTest, JITAutoMalformedInputPreservesExistingConfig) {
   ASSERT_EQ(
       try_flag_and_envvar_effect(

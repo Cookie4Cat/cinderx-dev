@@ -270,6 +270,182 @@ assert jit.is_jit_compiled(gen)
 )");
 }
 
+TEST_F(BehaviorClassifierRuntimeTest, ImportDepthDefersStartupLikeFunctions) {
+  ScopedAutoJitConfig config_guard;
+  getMutableConfig().compile_after_n_calls = 2;
+  getMutableConfig().auto_classify = true;
+  getMutableConfig().enable_startup_init_policy = true;
+
+  runStockCode(R"(
+import _cinderx
+import cinderx.jit as jit
+
+def callback():
+    return 1
+
+def dispatch(func):
+    return func()
+
+_cinderx._autojit_import_enter()
+try:
+    dispatch(callback)
+    dispatch(callback)
+    dispatch(callback)
+    assert not jit.is_jit_compiled(dispatch)
+finally:
+    _cinderx._autojit_import_leave()
+
+assert _cinderx._autojit_import_depth() == 0
+dispatch(callback)
+assert jit.is_jit_compiled(dispatch)
+)");
+}
+
+TEST_F(BehaviorClassifierRuntimeTest, DefaultImportProviderTracksFindAndLoadDepth) {
+  runStockCode(R"(
+import os
+import sys
+os.environ.pop("CINDERX_AUTOJIT_IMPORT_PROVIDER", None)
+import cinderx
+import _cinderx
+bootstrap = sys.modules["importlib._bootstrap"]
+
+observed_depths = []
+
+class ProbeFinder:
+    def find_spec(self, fullname, path=None, target=None):
+        if fullname == "autojit_probe_missing_default":
+            observed_depths.append(_cinderx._autojit_import_depth())
+        return None
+
+finder = ProbeFinder()
+sys.meta_path.insert(0, finder)
+try:
+    try:
+        __import__("autojit_probe_missing_default")
+    except ModuleNotFoundError:
+        pass
+finally:
+    sys.meta_path.remove(finder)
+
+assert getattr(
+    bootstrap._find_and_load,
+    "_cinderx_autojit_import_provider",
+    None,
+) == "find_and_load"
+assert observed_depths, observed_depths
+assert all(depth > 0 for depth in observed_depths), observed_depths
+assert _cinderx._autojit_import_depth() == 0
+)");
+}
+
+TEST_F(BehaviorClassifierRuntimeTest, ImportProviderOffLeavesDepthZero) {
+  runStockCode(R"(
+import os
+import sys
+os.environ["CINDERX_AUTOJIT_IMPORT_PROVIDER"] = "off"
+import cinderx
+import _cinderx
+
+observed_depths = []
+
+class ProbeFinder:
+    def find_spec(self, fullname, path=None, target=None):
+        if fullname == "autojit_probe_missing_off":
+            observed_depths.append(_cinderx._autojit_import_depth())
+        return None
+
+finder = ProbeFinder()
+sys.meta_path.insert(0, finder)
+try:
+    try:
+        __import__("autojit_probe_missing_off")
+    except ModuleNotFoundError:
+        pass
+finally:
+    sys.meta_path.remove(finder)
+
+assert observed_depths and all(depth == 0 for depth in observed_depths)
+assert _cinderx._autojit_import_depth() == 0
+)");
+}
+
+TEST_F(BehaviorClassifierRuntimeTest, BuiltinsImportProviderTracksDepth) {
+  runStockCode(R"(
+import os
+import sys
+os.environ["CINDERX_AUTOJIT_IMPORT_PROVIDER"] = "builtins"
+import cinderx
+import _cinderx
+builtins = sys.modules["builtins"]
+
+observed_depths = []
+
+class ProbeFinder:
+    def find_spec(self, fullname, path=None, target=None):
+        if fullname == "autojit_probe_missing_builtins":
+            observed_depths.append(_cinderx._autojit_import_depth())
+        return None
+
+finder = ProbeFinder()
+sys.meta_path.insert(0, finder)
+try:
+    try:
+        __import__("autojit_probe_missing_builtins")
+    except ModuleNotFoundError:
+        pass
+finally:
+    sys.meta_path.remove(finder)
+
+assert getattr(
+    builtins.__import__,
+    "_cinderx_autojit_import_provider",
+    None,
+) == "builtins"
+assert observed_depths, observed_depths
+assert all(depth > 0 for depth in observed_depths), observed_depths
+assert _cinderx._autojit_import_depth() == 0
+)");
+}
+
+TEST_F(BehaviorClassifierRuntimeTest, FindAndLoadImportProviderTracksDepth) {
+  runStockCode(R"(
+import os
+import sys
+os.environ["CINDERX_AUTOJIT_IMPORT_PROVIDER"] = "find_and_load"
+import cinderx
+import _cinderx
+bootstrap = sys.modules["importlib._bootstrap"]
+
+observed_depths = []
+
+class ProbeFinder:
+    def find_spec(self, fullname, path=None, target=None):
+        if fullname == "autojit_probe_missing_find_and_load":
+            observed_depths.append(_cinderx._autojit_import_depth())
+        return None
+
+finder = ProbeFinder()
+sys.meta_path.insert(0, finder)
+try:
+    try:
+        __import__("autojit_probe_missing_find_and_load")
+    except ModuleNotFoundError:
+        pass
+finally:
+    sys.meta_path.remove(finder)
+
+assert getattr(
+    bootstrap._find_and_load,
+    "_cinderx_autojit_import_provider",
+    None,
+) == "find_and_load"
+assert observed_depths, observed_depths
+assert all(depth > 0 for depth in observed_depths), observed_depths
+assert _cinderx._autojit_import_depth() == 0
+)");
+}
+
 TEST_F(
     BehaviorClassifierRuntimeTest,
     CompileAfterNCallsApiDisablesClassificationAndSchedulesExistingFunctions) {

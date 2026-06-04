@@ -33,7 +33,8 @@ constexpr uint8_t kRiskSuspendBucket = 2;
 constexpr uint8_t kRiskDynamicBucket = 2;
 constexpr uint32_t kRiskExceptionFloor = 2;
 constexpr uint32_t kRiskEffectiveInstructionFloor = 200;
-constexpr uint32_t kDeferThresholdFactor = 8;
+constexpr uint32_t kLowRoiThresholdFactor = 2;
+constexpr uint32_t kStartupDeferThresholdFactor = 8;
 constexpr uint8_t kWorkDimCount = static_cast<uint8_t>(WorkDim::kCount);
 
 struct Signature {
@@ -850,25 +851,32 @@ ThresholdDecision computeThreshold(
   bool startup_init_candidate = getConfig().enable_startup_init_policy &&
       context.startup_phase && !key.is_static && key.loop_score == 0 &&
       (startup_like_family || startup_like_mixed);
+  bool low_roi_base = key.loop_score == 0 && !key.is_static &&
+      !key.is_suspendable && !key.highRisk();
+  bool trivial_low_roi_candidate =
+      low_roi_base && key.family == Family::Trivial;
   bool synthetic_low_roi_candidate = key.is_synthetic && key.loop_score == 0 &&
-      !key.is_static &&
+      low_roi_base &&
       (key.family == Family::ReflectionMeta || key.family == Family::Trivial);
   bool low_roi_candidate =
-      key.family == Family::Trivial || synthetic_low_roi_candidate;
-  bool risk_defer_candidate =
-      key.highRisk() && key.loop_score == 0 && !key.is_static;
+      trivial_low_roi_candidate || synthetic_low_roi_candidate;
+  bool risk_defer_candidate = getConfig().enable_startup_init_policy &&
+      context.startup_phase &&
+      key.highRisk() && key.loop_score == 0 && !key.is_static &&
+      !key.is_suspendable;
 
   if (startup_init_candidate) {
     return {
-        saturatingMul(global, kDeferThresholdFactor),
+        saturatingMul(global, kStartupDeferThresholdFactor),
         BranchReason::StartupInit};
   }
   if (low_roi_candidate) {
-    return {saturatingMul(global, kDeferThresholdFactor), BranchReason::LowRoi};
+    return {
+        saturatingMul(global, kLowRoiThresholdFactor), BranchReason::LowRoi};
   }
   if (risk_defer_candidate) {
     return {
-        saturatingMul(global, kDeferThresholdFactor),
+        saturatingMul(global, kStartupDeferThresholdFactor),
         BranchReason::RiskDefer};
   }
   return {global, BranchReason::None};

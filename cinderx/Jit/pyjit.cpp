@@ -18,6 +18,7 @@
 #include "cinderx/Common/util.h"
 #include "cinderx/Interpreter/interpreter.h"
 #include "cinderx/Jit/behavior_classifier.h"
+#include "cinderx/Jit/autojit_import.h"
 #include "cinderx/Jit/code_allocator.h"
 #include "cinderx/Jit/codegen/arch/detection.h"
 #include "cinderx/Jit/codegen/tls.h"
@@ -105,8 +106,7 @@ uint64_t countCalls(PyCodeObject* code) {
 }
 
 GateContext readGateContext() {
-  // Provider-before v1 has no production-safe import-depth provider yet.
-  return GateContext{false};
+  return GateContext{autoJitImportDepth() > 0};
 }
 
 struct AutoJitGateState {
@@ -330,6 +330,8 @@ bool parse_uint32_arg(std::string_view value, uint32_t* parsed) {
 void configureCompileAfterNCalls(uint32_t calls, bool auto_classify) {
   getMutableConfig().compile_after_n_calls = calls;
   getMutableConfig().auto_classify = auto_classify;
+  getMutableConfig().enable_startup_init_policy =
+      auto_classify && autoJitImportProviderEnabledFromEnv();
 }
 
 void parseAutoJitOption(const std::string& value) {
@@ -3695,6 +3697,9 @@ int initialize() {
   // startup, start scheduling functions for compilation now.
   if (auto compile_n = getConfig().compile_after_n_calls;
       compile_n.has_value()) {
+    if (Ci_InitFrameEvalFunc() < 0) {
+      return -1;
+    }
     schedule_existing_functions_for_jit(*compile_n);
   } else if (mod_state->jit_list.get() != nullptr) {
     if (rescheduleJitList() < 0) {

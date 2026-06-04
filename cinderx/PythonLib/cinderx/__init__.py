@@ -67,6 +67,9 @@ try:
         )
 
     from _cinderx import (
+        _autojit_import_depth,
+        _autojit_import_enter,
+        _autojit_import_leave,
         _compile_perf_trampoline_pre_fork,
         _is_compile_perf_trampoline_pre_fork_enabled,
         async_cached_classproperty,
@@ -131,6 +134,15 @@ except ImportError as e:
 
     def _is_compile_perf_trampoline_pre_fork_enabled() -> bool:
         return False
+
+    def _autojit_import_enter() -> None:
+        pass
+
+    def _autojit_import_leave() -> None:
+        pass
+
+    def _autojit_import_depth() -> int:
+        return 0
 
     def is_lightweight_frames_enabled() -> bool:
         return False
@@ -574,6 +586,46 @@ def maybe_enable_parallel_gc() -> None:
 _is_init: bool = False
 
 
+_AUTOJIT_IMPORT_PROVIDER_MARKER = "_cinderx_autojit_import_provider"
+
+
+def _make_autojit_import_wrapper(original: object, provider: str) -> object:
+    def wrapper(*args: object, **kwargs: object) -> object:
+        _autojit_import_enter()
+        try:
+            # pyre-ignore[29]: The wrapped import callable is dynamically chosen.
+            return original(*args, **kwargs)
+        finally:
+            _autojit_import_leave()
+
+    setattr(wrapper, _AUTOJIT_IMPORT_PROVIDER_MARKER, provider)
+    return wrapper
+
+
+def _install_autojit_import_provider() -> None:
+    provider = environ.get("CINDERX_AUTOJIT_IMPORT_PROVIDER", "find_and_load")
+    if provider in ("", "0", "off"):
+        return
+
+    if provider == "builtins":
+        target = sys.modules.get("builtins")
+        attr = "__import__"
+    elif provider == "find_and_load":
+        target = sys.modules.get("importlib._bootstrap")
+        attr = "_find_and_load"
+    else:
+        return
+
+    if target is None:
+        return
+
+    current = getattr(target, attr)
+    if getattr(current, _AUTOJIT_IMPORT_PROVIDER_MARKER, None) == provider:
+        return
+
+    setattr(target, attr, _make_autojit_import_wrapper(current, provider))
+
+
 def init() -> None:
     """Initialize CinderX."""
     global _is_init
@@ -587,6 +639,7 @@ def init() -> None:
         return
 
     maybe_enable_parallel_gc()
+    _install_autojit_import_provider()
 
     _is_init = True
 

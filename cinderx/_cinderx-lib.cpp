@@ -12,6 +12,7 @@
 #include "cinderx/Immortalize/immortalize.h"
 #include "cinderx/Interpreter/interpreter.h"
 #include "cinderx/Jit/anextawaitable.h"
+#include "cinderx/Jit/autojit_import.h"
 #include "cinderx/Jit/compiled_function.h"
 #include "cinderx/Jit/config.h"
 #include "cinderx/Jit/frame.h"
@@ -811,6 +812,20 @@ static PyObject* clear_strict_modules(PyObject*, PyObject*) {
   Py_RETURN_NONE;
 }
 
+static PyObject* autojit_import_enter(PyObject*, PyObject*) {
+  jit::autoJitImportEnter();
+  Py_RETURN_NONE;
+}
+
+static PyObject* autojit_import_leave(PyObject*, PyObject*) {
+  jit::autoJitImportLeave();
+  Py_RETURN_NONE;
+}
+
+static PyObject* autojit_import_depth(PyObject*, PyObject*) {
+  return PyLong_FromUnsignedLong(jit::autoJitImportDepth());
+}
+
 PyMethodDef _cinderx_methods[] = {
     {"install_frame_evaluator",
      install_frame_evaluator,
@@ -877,6 +892,18 @@ PyMethodDef _cinderx_methods[] = {
      clear_strict_modules,
      METH_NOARGS,
      "Clears all strict modules for shutdown"},
+    {"_autojit_import_enter",
+     autojit_import_enter,
+     METH_NOARGS,
+     PyDoc_STR("Enter AutoJIT import-depth provider scope.")},
+    {"_autojit_import_leave",
+     autojit_import_leave,
+     METH_NOARGS,
+     PyDoc_STR("Leave AutoJIT import-depth provider scope.")},
+    {"_autojit_import_depth",
+     autojit_import_depth,
+     METH_NOARGS,
+     PyDoc_STR("Return current AutoJIT import-depth provider depth.")},
     {"_compile_perf_trampoline_pre_fork",
      compile_perf_trampoline_pre_fork,
      METH_NOARGS,

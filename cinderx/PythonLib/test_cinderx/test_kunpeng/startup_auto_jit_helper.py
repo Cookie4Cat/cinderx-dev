@@ -7,7 +7,7 @@ def auto_jit_target(value):
 
 
 result = None
-for value in range(5):
+for value in range(10):
     result = auto_jit_target(value)
 
 cinderx = sys.modules.get("cinderx")
@@ -22,7 +22,41 @@ if os.environ.get("CINDERX_PLUGIN_ENABLE", "0") == "1":
     assert cinderjit.is_enabled(), "cinderx JIT is not enabled"
     assert cinderjit.is_jit_compiled(auto_jit_target), "auto_jit_target was not compiled"
     assert cinderjit.get_compiled_size(auto_jit_target) > 0
+
+    provider = os.environ.get("CINDERX_AUTOJIT_IMPORT_PROVIDER", "find_and_load")
+    if provider in {"builtins", "find_and_load"}:
+        import _cinderx
+
+        if provider == "builtins":
+            wrapped = sys.modules["builtins"].__import__
+        else:
+            wrapped = sys.modules["importlib._bootstrap"]._find_and_load
+        assert (
+            getattr(wrapped, "_cinderx_autojit_import_provider", None) == provider
+        ), f"{provider} import provider was not installed"
+
+        observed_depths = []
+
+        class ProbeFinder:
+            def find_spec(self, fullname, path=None, target=None):
+                if fullname == f"startup_auto_jit_probe_{provider}":
+                    observed_depths.append(_cinderx._autojit_import_depth())
+                return None
+
+        finder = ProbeFinder()
+        sys.meta_path.insert(0, finder)
+        try:
+            try:
+                __import__(f"startup_auto_jit_probe_{provider}")
+            except ModuleNotFoundError:
+                pass
+        finally:
+            sys.meta_path.remove(finder)
+
+        assert observed_depths, "import provider probe did not run"
+        assert all(depth > 0 for depth in observed_depths), observed_depths
+        assert _cinderx._autojit_import_depth() == 0
 else:
     assert cinderx is None, "cinderx was auto-loaded"
     assert cinderjit is None, "cinderjit was auto-loaded"
-assert result == 5
+assert result == 10
