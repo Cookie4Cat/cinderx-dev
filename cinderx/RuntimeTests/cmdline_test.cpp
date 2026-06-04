@@ -82,6 +82,42 @@ class ScopedJitConfigState {
   int cinderx_osr_state_;
 };
 
+class ScopedAutoJitConfigState {
+ public:
+  ScopedAutoJitConfigState()
+      : compile_after_n_calls_{getMutableConfig().compile_after_n_calls},
+        auto_classify_{getMutableConfig().auto_classify},
+        enable_startup_init_policy_{
+            getMutableConfig().enable_startup_init_policy} {}
+
+  ~ScopedAutoJitConfigState() {
+    getMutableConfig().compile_after_n_calls = compile_after_n_calls_;
+    getMutableConfig().auto_classify = auto_classify_;
+    getMutableConfig().enable_startup_init_policy =
+        enable_startup_init_policy_;
+  }
+
+ private:
+  std::optional<uint32_t> compile_after_n_calls_;
+  bool auto_classify_;
+  bool enable_startup_init_policy_;
+};
+
+class ScopedXOption {
+ public:
+  explicit ScopedXOption(const wchar_t* flag) : key_{addToXargsDict(flag)} {}
+
+  ~ScopedXOption() {
+    if (key_ != nullptr) {
+      PyDict_DelItem(PySys_GetXOptions(), key_);
+      Py_DECREF(key_);
+    }
+  }
+
+ private:
+  PyObject* key_;
+};
+
 void resetFrameModeAndOSRConfig() {
   getMutableConfig().frame_mode = FrameMode::kNormal;
   getMutableConfig().osr_enabled = false;
@@ -89,6 +125,36 @@ void resetFrameModeAndOSRConfig() {
   cinderx_osr_enabled = 0;
   cinderx_osr_capable = 0;
   cinderx_osr_state = 0;
+}
+
+void resetJitForAutoJitEntryTest() {
+  jit::finalize();
+  jit::shutdown_jit_genobject_type();
+  Ci_FiniFrameEvalFunc();
+  getMutableConfig().compile_after_n_calls.reset();
+  getMutableConfig().auto_classify = false;
+  getMutableConfig().enable_startup_init_policy = false;
+}
+
+void assertNewFunctionCountsAndCompiles(RuntimeTest& test) {
+  test.runStockCode(R"(
+import cinderx.jit as jit
+
+def target(n):
+    total = 0
+    for value in range(n):
+        total += value
+    return total
+
+assert jit.get_compile_after_n_calls() == 2
+assert jit.count_interpreted_calls(target) == 0
+target(5)
+target(5)
+assert not jit.is_jit_compiled(target)
+assert jit.count_interpreted_calls(target) == 2
+target(5)
+assert jit.is_jit_compiled(target)
+)");
 }
 
 } // namespace
@@ -426,6 +492,50 @@ TEST_F(CmdLineTest, JITAutoKeywordUsesDefaultThreshold) {
             ASSERT_TRUE(getConfig().auto_classify);
           }),
       0);
+}
+
+TEST_F(CmdLineTest, JITAutoNumericEnvInstallsFrameEvaluator) {
+  ScopedAutoJitConfigState config_guard;
+  ScopedEnvVar env{"PYTHONJITAUTO"};
+  resetJitForAutoJitEntryTest();
+  env.set("2");
+  ASSERT_EQ(jit::initialize(), 0);
+  EXPECT_EQ(getConfig().compile_after_n_calls, 2);
+  EXPECT_FALSE(getConfig().auto_classify);
+
+  assertNewFunctionCountsAndCompiles(*this);
+
+  jit::finalize();
+  jit::shutdown_jit_genobject_type();
+}
+
+TEST_F(CmdLineTest, JITAutoEnvAutoModeInstallsFrameEvaluator) {
+  ScopedAutoJitConfigState config_guard;
+  ScopedEnvVar env{"PYTHONJITAUTO"};
+  resetJitForAutoJitEntryTest();
+  env.set("auto:2");
+  ASSERT_EQ(jit::initialize(), 0);
+  EXPECT_EQ(getConfig().compile_after_n_calls, 2);
+  EXPECT_TRUE(getConfig().auto_classify);
+
+  assertNewFunctionCountsAndCompiles(*this);
+
+  jit::finalize();
+  jit::shutdown_jit_genobject_type();
+}
+
+TEST_F(CmdLineTest, JITAutoXOptionAutoModeInstallsFrameEvaluator) {
+  ScopedAutoJitConfigState config_guard;
+  ScopedXOption xoption{L"jit-auto=auto:2"};
+  resetJitForAutoJitEntryTest();
+  ASSERT_EQ(jit::initialize(), 0);
+  EXPECT_EQ(getConfig().compile_after_n_calls, 2);
+  EXPECT_TRUE(getConfig().auto_classify);
+
+  assertNewFunctionCountsAndCompiles(*this);
+
+  jit::finalize();
+  jit::shutdown_jit_genobject_type();
 }
 
 TEST_F(CmdLineTest, JITAutoMalformedInputPreservesExistingConfig) {

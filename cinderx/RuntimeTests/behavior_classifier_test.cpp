@@ -91,20 +91,47 @@ TEST(BehaviorClassifierTest, ComputeThresholdDefersOnlyExplicitCandidates) {
 
   StructureKey trivial{Family::Trivial};
   auto trivial_decision = computeThreshold(trivial, ctx, 2);
-  EXPECT_EQ(trivial_decision.limit, 16);
+  EXPECT_EQ(trivial_decision.limit, 4);
   EXPECT_EQ(trivial_decision.branch_reason, BranchReason::LowRoi);
 
   StructureKey static_trivial{Family::Trivial};
   static_trivial.is_static = true;
   auto static_decision = computeThreshold(static_trivial, ctx, 2);
-  EXPECT_EQ(static_decision.limit, 16);
-  EXPECT_EQ(static_decision.branch_reason, BranchReason::LowRoi);
+  EXPECT_EQ(static_decision.limit, 2);
+  EXPECT_EQ(static_decision.branch_reason, BranchReason::None);
+
+  StructureKey suspendable_trivial{Family::Trivial};
+  suspendable_trivial.is_suspendable = true;
+  auto suspendable_trivial_decision =
+      computeThreshold(suspendable_trivial, ctx, 2);
+  EXPECT_EQ(suspendable_trivial_decision.limit, 2);
+  EXPECT_EQ(suspendable_trivial_decision.branch_reason, BranchReason::None);
+
+  StructureKey risky_trivial{Family::Trivial};
+  risky_trivial.risk_reason = kRiskHugeCode;
+  auto risky_trivial_decision = computeThreshold(risky_trivial, ctx, 2);
+  EXPECT_EQ(risky_trivial_decision.limit, 2);
+  EXPECT_EQ(risky_trivial_decision.branch_reason, BranchReason::None);
 
   StructureKey risk_dispatch{Family::CallDispatcher};
   risk_dispatch.risk_reason = kRiskDynamic;
   auto risk_decision = computeThreshold(risk_dispatch, ctx, 2);
-  EXPECT_EQ(risk_decision.limit, 16);
-  EXPECT_EQ(risk_decision.branch_reason, BranchReason::RiskDefer);
+  EXPECT_EQ(risk_decision.limit, 2);
+  EXPECT_EQ(risk_decision.branch_reason, BranchReason::None);
+
+  StructureKey suspendable{Family::AsyncStateMachine};
+  suspendable.is_suspendable = true;
+  suspendable.risk_reason = kRiskSuspend;
+  auto suspendable_decision = computeThreshold(suspendable, ctx, 2);
+  EXPECT_EQ(suspendable_decision.limit, 2);
+  EXPECT_EQ(suspendable_decision.branch_reason, BranchReason::None);
+
+  StructureKey huge_code{Family::ObjectManipulator};
+  huge_code.risk_reason = kRiskHugeCode;
+  huge_code.code_size_bucket = 3;
+  auto huge_code_decision = computeThreshold(huge_code, ctx, 2);
+  EXPECT_EQ(huge_code_decision.limit, 2);
+  EXPECT_EQ(huge_code_decision.branch_reason, BranchReason::None);
 
   StructureKey hot_loop{Family::NumericLoop};
   hot_loop.loop_score = 2;
@@ -133,6 +160,13 @@ TEST(BehaviorClassifierTest, StartupInitPolicyOnlyDefersStartupLikeWork) {
   auto loop_decision = computeThreshold(loop, startup, 2);
   EXPECT_EQ(loop_decision.limit, 2);
   EXPECT_EQ(loop_decision.branch_reason, BranchReason::None);
+
+  StructureKey suspendable{Family::AsyncStateMachine};
+  suspendable.is_suspendable = true;
+  suspendable.risk_reason = kRiskSuspend;
+  auto suspendable_decision = computeThreshold(suspendable, startup, 2);
+  EXPECT_EQ(suspendable_decision.limit, 2);
+  EXPECT_EQ(suspendable_decision.branch_reason, BranchReason::None);
 
   StructureKey static_dispatcher{Family::CallDispatcher};
   static_dispatcher.is_static = true;
@@ -203,12 +237,36 @@ thin(1)
 thin(2)
 assert not jit.is_jit_compiled(thin)
 
-for value in range(3, 17):
-    thin(value)
+thin(3)
+thin(4)
 assert not jit.is_jit_compiled(thin)
 
-thin(17)
+for value in range(5, 17):
+    thin(value)
+    assert jit.is_jit_compiled(thin)
+
 assert jit.is_jit_compiled(thin)
+)");
+}
+
+TEST_F(BehaviorClassifierRuntimeTest, AutoClassifyDoesNotDeferGenerators) {
+  ScopedAutoJitConfig config_guard;
+  getMutableConfig().compile_after_n_calls = 2;
+  getMutableConfig().auto_classify = true;
+  getMutableConfig().enable_startup_init_policy = false;
+
+  runStockCode(R"(
+import cinderx.jit as jit
+
+def gen():
+    yield 1
+
+assert not jit.is_jit_compiled(gen)
+gen()
+gen()
+assert not jit.is_jit_compiled(gen)
+gen()
+assert jit.is_jit_compiled(gen)
 )");
 }
 
