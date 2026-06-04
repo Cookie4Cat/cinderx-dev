@@ -31,6 +31,10 @@ CHECKOUT_ROOT_DIR = os.path.dirname(os.path.abspath(__file__))
 SOURCE_DIR = "cinderx"
 PYTHON_LIB_DIR = "cinderx/PythonLib"
 
+if CHECKOUT_ROOT_DIR not in sys.path:
+    sys.path.insert(0, CHECKOUT_ROOT_DIR)
+from ci_pipeline.cmake_options import cmake_feature_options, compute_py_version
+
 MIN_GCC_VERSION = 13
 CINDERX_LOCAL_DEPS_ENV = "CINDERX_LOCAL_DEPS"
 
@@ -142,20 +146,20 @@ class PgoStage(Enum):
     USE = 3
 
 
-def compute_py_version() -> str:
-    return f"{sys.version_info.major}.{sys.version_info.minor}"
-
-
 def should_enable_lightweight_frames(
     py_version: str,
     meta_python: bool,
     machine: str | None = None,
 ) -> bool:
-    if meta_python and py_version == "3.12":
-        return True
-    if machine is None:
-        machine = platform.machine()
-    return py_version == "3.14" and machine.lower() in {"aarch64", "arm64"}
+    from ci_pipeline.cmake_options import (
+        should_enable_lightweight_frames as shared_should_enable_lightweight_frames,
+    )
+
+    return shared_should_enable_lightweight_frames(
+        py_version,
+        meta_python=meta_python,
+        machine=machine,
+    )
 
 
 class BuildCommand(build):
@@ -498,56 +502,7 @@ class BuildExt(build_ext):
         else:
             cmake_args.append("-DENABLE_COVERAGE=OFF")
 
-        options: dict[str, str] = {}
-
-        def set_option(var: str, default: object) -> None:
-            if type(default) == bool:
-                default = int(default)
-            if type(default) == int:
-                default = str(default)
-            if type(default) != str:
-                raise ValueError(f"Not sure what to do with default value {default}")
-
-            value = os.environ.get(var, default)
-            options[var] = value
-
-        # Python version is always the same as what's running setuptools.
-        py_version = compute_py_version()
-        options["PY_VERSION"] = py_version
-        options["Python_ROOT_DIR"] = self._find_python()
-
-        meta_python = "+meta" in sys.version
-        linux = sys.platform == "linux"
-        mac = sys.platform == "darwin"
-        meta_312 = meta_python and py_version == "3.12"
-        is_314plus = py_version == "3.14" or py_version == "3.15"
-
-        set_option("META_PYTHON", meta_python)
-        set_option("ENABLE_ADAPTIVE_STATIC_PYTHON", meta_312)
-        set_option("ENABLE_DISASSEMBLER", True)
-        set_option("ENABLE_ELF_READER", linux)
-        set_option("ENABLE_EVAL_HOOK", meta_312)
-        set_option("ENABLE_FUNC_EVENT_MODIFY_QUALNAME", meta_312)
-        set_option("ENABLE_GENERATOR_AWAITER", meta_312)
-        set_option("ENABLE_INTERPRETER_LOOP", meta_312 or is_314plus)
-        set_option("ENABLE_LAZY_IMPORTS", meta_312)
-        set_option(
-            "ENABLE_LIGHTWEIGHT_FRAMES",
-            should_enable_lightweight_frames(
-                py_version,
-                meta_python,
-                platform.machine(),
-            ),
-        )
-        set_option("ENABLE_PARALLEL_GC", meta_312)
-        set_option("ENABLE_PEP523_HOOK", meta_312 or is_314plus)
-        set_option("ENABLE_PERF_TRAMPOLINE", meta_312)
-        set_option("ENABLE_SYMBOLIZER", linux)
-        set_option("ENABLE_USDT", linux)
-        set_option("ENABLE_XXCLASSLOADER", False)
-        set_option("ENABLE_ZLIB", linux or mac)
-
-        for name, value in options.items():
+        for name, value in cmake_feature_options(python_root=self._find_python()).items():
             cmake_args.append(f"-D{name}={value}")
 
         build_args = [

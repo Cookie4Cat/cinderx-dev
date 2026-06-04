@@ -1,0 +1,11 @@
+﻿ThirdParty/**
+cinderx/ThirdParty/**
+cinderx/Interpreter/*/Includes/**
+cinderx/UpstreamBorrow/**
+
+# Ignore HIR text snapshot inputs/expectations only.
+# RuntimeTests C++ test sources under cinderx/RuntimeTests/*.cpp are still checked.
+cinderx/RuntimeTests/hir_tests/*.txt
+
+**/*.gen.*
+**/generated_*
