@@ -142,6 +142,22 @@ bool allBucketsZero(
   });
 }
 
+uint8_t activeDimMask(
+    const std::array<uint8_t, static_cast<size_t>(WorkDim::kCount)>& buckets) {
+  uint8_t mask = 0;
+  for (WorkDim dim :
+       {WorkDim::Compute,
+        WorkDim::Control,
+        WorkDim::Object,
+        WorkDim::Dispatch,
+        WorkDim::Dynamic}) {
+    if (buckets[dimIndex(dim)] > 0) {
+      mask |= activeDimMaskFor(dim);
+    }
+  }
+  return mask;
+}
+
 uint8_t tieRank(WorkDim dim) {
   switch (dim) {
     case WorkDim::Compute:
@@ -356,6 +372,14 @@ bool mixedShapeAllIn(MixedShape shape, std::initializer_list<WorkDim> dims) {
   return dimInSet(decoded->first, dims) && dimInSet(decoded->second, dims);
 }
 
+bool mixedShapeContains(MixedShape shape, WorkDim dim) {
+  auto decoded = decodeMixedShape(shape);
+  if (!decoded.has_value()) {
+    return false;
+  }
+  return decoded->first == dim || decoded->second == dim;
+}
+
 } // namespace
 
 WorkDim toWorkDim(OpcodeClass cls) {
@@ -380,6 +404,49 @@ WorkDim toWorkDim(OpcodeClass cls) {
   return WorkDim::Compute;
 }
 
+uint8_t activeDimMaskFor(WorkDim dim) {
+  switch (dim) {
+    case WorkDim::Compute:
+      return 1u << 0;
+    case WorkDim::Control:
+      return 1u << 1;
+    case WorkDim::Object:
+      return 1u << 2;
+    case WorkDim::Dispatch:
+      return 1u << 3;
+    case WorkDim::Dynamic:
+      return 1u << 4;
+    case WorkDim::Suspend:
+    case WorkDim::kCount:
+      break;
+  }
+  return 0;
+}
+
+bool StructureKey::hasActiveDim(WorkDim dim) const {
+  return (active_dim_mask & activeDimMaskFor(dim)) != 0;
+}
+
+bool StructureKey::computeHint() const {
+  return hasActiveDim(WorkDim::Compute);
+}
+
+bool StructureKey::computeDominantHint() const {
+  return family == Family::NumericLoop ||
+      (family == Family::Mixed &&
+       mixedShapeContains(mixed_shape, WorkDim::Compute));
+}
+
+uint8_t StructureKey::activeDimCount() const {
+  uint8_t count = 0;
+  uint8_t mask = active_dim_mask;
+  while (mask != 0) {
+    count += mask & 1u;
+    mask >>= 1;
+  }
+  return count;
+}
+
 uint32_t StructureKey::pack() const {
   uint32_t payload = 0;
   payload |= (static_cast<uint32_t>(mixed_shape) & 0xFu) << 20;
@@ -390,6 +457,7 @@ uint32_t StructureKey::pack() const {
   payload |= (is_synthetic ? 1u : 0u) << 11;
   payload |= (static_cast<uint32_t>(risk_reason) & 0xFu) << 7;
   payload |= (static_cast<uint32_t>(code_size_bucket) & 0x3u) << 5;
+  payload |= static_cast<uint32_t>(active_dim_mask) & 0x1Fu;
   return payload & kSkeyPayloadMask;
 }
 
@@ -404,6 +472,7 @@ StructureKey StructureKey::unpack(uint32_t payload) {
   key.is_synthetic = ((payload >> 11) & 0x1u) != 0;
   key.risk_reason = static_cast<uint8_t>((payload >> 7) & 0xFu);
   key.code_size_bucket = static_cast<uint8_t>((payload >> 5) & 0x3u);
+  key.active_dim_mask = static_cast<uint8_t>(payload & 0x1Fu);
   if (key.family != Family::Mixed) {
     key.mixed_shape = kMixedShapeNone;
   }
@@ -808,6 +877,7 @@ std::optional<StructureKey> deriveStructureKey(
   key.is_synthetic = isSyntheticFilename(code);
   key.risk_reason = deriveRiskReason(*sig, buckets);
   key.code_size_bucket = codeSizeBucket(sig->n_eff);
+  key.active_dim_mask = activeDimMask(buckets);
 
   if (allBucketsZero(buckets)) {
     key.family = Family::Trivial;
@@ -865,20 +935,15 @@ ThresholdDecision computeThreshold(
            WorkDim::Dispatch,
            WorkDim::Object,
            WorkDim::Control});
-  bool startup_import_candidate = getConfig().enable_startup_init_policy &&
-      context.startup_phase && !key.is_static &&
-      (key.is_suspendable || startup_like_family || startup_like_mixed);
-  bool startup_risk_candidate = startup_import_candidate && key.highRisk() &&
-      key.family != Family::NumericLoop;
-  if (startup_risk_candidate) {
+  bool high_cost_nonnumeric_import_candidate =
+      getConfig().enable_startup_init_policy && context.startup_phase &&
+      !key.is_static && key.family != Family::NumericLoop &&
+      !key.computeDominantHint() &&
+      (key.highRisk() || key.code_size_bucket > 0);
+  if (high_cost_nonnumeric_import_candidate) {
     return {
         saturatingMul(global, kStartupDeferThresholdFactor),
-        BranchReason::RiskDefer};
-  }
-  if (startup_import_candidate) {
-    return {
-        saturatingMul(global, kStartupDeferThresholdFactor),
-        BranchReason::StartupInit};
+        key.highRisk() ? BranchReason::RiskDefer : BranchReason::StartupInit};
   }
 
   bool steady_nonnumeric_warmup_candidate = !key.is_static &&

@@ -587,16 +587,61 @@ _is_init: bool = False
 
 
 _AUTOJIT_IMPORT_PROVIDER_MARKER = "_cinderx_autojit_import_provider"
+_AUTOJIT_SETUP_PROVIDER_MARKER = "_cinderx_autojit_setup_provider"
+
+
+def _make_autojit_setup_wrapper(original: object, provider: str) -> object:
+    def wrapper(*args: object, **kwargs: object) -> object:
+        _autojit_import_enter()
+        try:
+            # pyre-ignore[29]: The wrapped setup callable is dynamically chosen.
+            return original(*args, **kwargs)
+        finally:
+            _autojit_import_leave()
+
+    setattr(wrapper, _AUTOJIT_SETUP_PROVIDER_MARKER, provider)
+    setattr(wrapper, "__wrapped__", original)
+    return wrapper
+
+
+def _maybe_install_autojit_setup_provider_for_module(
+    fullname: str, provider: str | None = None
+) -> None:
+    if provider is None:
+        provider = environ.get("CINDERX_AUTOJIT_SETUP_PROVIDER", "")
+    if provider in ("", "0", "off"):
+        return
+    if provider != "lib2to3_main" or fullname != "lib2to3.main":
+        return
+
+    module = sys.modules.get("lib2to3.main")
+    if module is None:
+        return
+
+    current = getattr(module, "main", None)
+    if current is None:
+        return
+    if getattr(current, _AUTOJIT_SETUP_PROVIDER_MARKER, None) == provider:
+        return
+
+    setattr(module, "main", _make_autojit_setup_wrapper(current, provider))
 
 
 def _make_autojit_import_wrapper(original: object, provider: str) -> object:
+    setup_provider = environ.get("CINDERX_AUTOJIT_SETUP_PROVIDER", "")
+
     def wrapper(*args: object, **kwargs: object) -> object:
         _autojit_import_enter()
         try:
             # pyre-ignore[29]: The wrapped import callable is dynamically chosen.
-            return original(*args, **kwargs)
+            module = original(*args, **kwargs)
         finally:
             _autojit_import_leave()
+        if setup_provider and args and isinstance(args[0], str):
+            _maybe_install_autojit_setup_provider_for_module(
+                args[0], setup_provider
+            )
+        return module
 
     setattr(wrapper, _AUTOJIT_IMPORT_PROVIDER_MARKER, provider)
     return wrapper
@@ -640,6 +685,7 @@ def init() -> None:
 
     maybe_enable_parallel_gc()
     _install_autojit_import_provider()
+    _maybe_install_autojit_setup_provider_for_module("lib2to3.main")
 
     _is_init = True
 

@@ -56,6 +56,8 @@ WorkDim toWorkDim(OpcodeClass cls);
 using MixedShape = uint8_t;
 constexpr MixedShape kMixedShapeNone = 0;
 
+uint8_t activeDimMaskFor(WorkDim dim);
+
 enum RiskReason : uint8_t {
   kRiskNone = 0,
   kRiskSuspend = 1u << 0,
@@ -73,10 +75,16 @@ struct StructureKey {
   bool is_synthetic{false};
   uint8_t risk_reason{kRiskNone};
   uint8_t code_size_bucket{0};
+  uint8_t active_dim_mask{0};
 
   bool highRisk() const {
     return risk_reason != kRiskNone;
   }
+
+  bool hasActiveDim(WorkDim dim) const;
+  bool computeHint() const;
+  bool computeDominantHint() const;
+  uint8_t activeDimCount() const;
 
   uint32_t pack() const;
   static StructureKey unpack(uint32_t payload);

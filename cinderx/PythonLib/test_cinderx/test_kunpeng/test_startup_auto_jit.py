@@ -76,6 +76,18 @@ def test_installed_cinderx_auto_import_find_and_load_provider_tracks_depth(tmp_p
     )
 
 
+def test_installed_cinderx_auto_setup_provider_tracks_depth(tmp_path):
+    """Requires cinderx to be installed into the tested interpreter."""
+    env = _startup_provider_env("find_and_load")
+    env["CINDERX_AUTOJIT_SETUP_PROVIDER"] = "lib2to3_main"
+
+    _run_startup_auto_jit_helper(
+        tmp_path,
+        env,
+        "installed cinderx setup provider subprocess failed",
+    )
+
+
 def test_installed_cinderx_auto_import_disabled_when_plugin_env_unset(tmp_path):
     """Requires cinderx to be installed into the tested interpreter."""
     env = _startup_auto_jit_env()

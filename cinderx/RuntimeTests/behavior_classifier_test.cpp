@@ -53,6 +53,10 @@ TEST(BehaviorClassifierTest, StructureKeyPackRoundTripsAllFields) {
       true,
       static_cast<uint8_t>(kRiskDynamic | kRiskException | kRiskHugeCode),
       2,
+      static_cast<uint8_t>(
+          activeDimMaskFor(WorkDim::Compute) |
+          activeDimMaskFor(WorkDim::Object) |
+          activeDimMaskFor(WorkDim::Dispatch)),
   };
 
   uint32_t payload = key.pack();
@@ -71,6 +75,10 @@ TEST(BehaviorClassifierTest, StructureKeyPackRoundTripsAllFields) {
   EXPECT_TRUE(decoded.highRisk());
   EXPECT_EQ(decoded.risk_reason, key.risk_reason);
   EXPECT_EQ(decoded.code_size_bucket, 2);
+  EXPECT_EQ(decoded.active_dim_mask, key.active_dim_mask);
+  EXPECT_TRUE(decoded.computeHint());
+  EXPECT_FALSE(decoded.computeDominantHint());
+  EXPECT_EQ(decoded.activeDimCount(), 3);
 }
 
 TEST(BehaviorClassifierTest, OpcodeClassGoldenExamples) {
@@ -149,8 +157,8 @@ TEST(BehaviorClassifierTest, StartupContextPreservesStartupReasonForImportLikeWo
   GateContext startup{true};
   StructureKey dispatcher{Family::CallDispatcher};
   auto startup_decision = computeThreshold(dispatcher, startup, 2);
-  EXPECT_GE(startup_decision.limit, 65536);
-  EXPECT_EQ(startup_decision.branch_reason, BranchReason::StartupInit);
+  EXPECT_EQ(startup_decision.limit, 1000);
+  EXPECT_EQ(startup_decision.branch_reason, BranchReason::LowRoi);
 
   GateContext steady_state{false};
   auto steady_state_decision = computeThreshold(dispatcher, steady_state, 2);
@@ -197,6 +205,110 @@ TEST(BehaviorClassifierTest, StartupPolicyDefersRiskyImportWork) {
   auto numeric_decision = computeThreshold(numeric_loop, startup, 2);
   EXPECT_EQ(numeric_decision.limit, 2);
   EXPECT_EQ(numeric_decision.branch_reason, BranchReason::None);
+}
+
+TEST(BehaviorClassifierTest, ImportWindowDefersHighCostNonnumericWork) {
+  ScopedAutoJitConfig config_guard;
+  getMutableConfig().enable_startup_init_policy = true;
+
+  GateContext import_window{true};
+  GateContext steady_state{false};
+
+  StructureKey large_branch{Family::BranchFSM};
+  large_branch.loop_score = 2;
+  large_branch.code_size_bucket = 2;
+  large_branch.active_dim_mask = activeDimMaskFor(WorkDim::Control) |
+      activeDimMaskFor(WorkDim::Dispatch);
+  auto large_branch_decision =
+      computeThreshold(large_branch, import_window, 2);
+  EXPECT_GE(large_branch_decision.limit, 65536);
+  EXPECT_EQ(large_branch_decision.branch_reason, BranchReason::StartupInit);
+
+  auto steady_state_decision = computeThreshold(large_branch, steady_state, 2);
+  EXPECT_EQ(steady_state_decision.limit, 1000);
+  EXPECT_EQ(steady_state_decision.branch_reason, BranchReason::LowRoi);
+
+  StructureKey medium_branch{Family::BranchFSM};
+  medium_branch.loop_score = 1;
+  medium_branch.code_size_bucket = 1;
+  medium_branch.active_dim_mask = activeDimMaskFor(WorkDim::Control) |
+      activeDimMaskFor(WorkDim::Dispatch);
+  auto medium_branch_decision =
+      computeThreshold(medium_branch, import_window, 2);
+  EXPECT_GE(medium_branch_decision.limit, 65536);
+  EXPECT_EQ(medium_branch_decision.branch_reason, BranchReason::StartupInit);
+
+  auto post_import_medium_branch =
+      computeThreshold(medium_branch, steady_state, 2);
+  EXPECT_EQ(post_import_medium_branch.limit, 2);
+  EXPECT_EQ(post_import_medium_branch.branch_reason, BranchReason::None);
+
+  StructureKey risky_object{Family::ObjectManipulator};
+  risky_object.loop_score = 1;
+  risky_object.risk_reason = kRiskHugeCode;
+  risky_object.code_size_bucket = 3;
+  risky_object.active_dim_mask = activeDimMaskFor(WorkDim::Object);
+  auto risky_object_decision =
+      computeThreshold(risky_object, import_window, 2);
+  EXPECT_GE(risky_object_decision.limit, 65536);
+  EXPECT_EQ(risky_object_decision.branch_reason, BranchReason::RiskDefer);
+
+  StructureKey low_cost_dispatcher{Family::CallDispatcher};
+  low_cost_dispatcher.code_size_bucket = 0;
+  low_cost_dispatcher.active_dim_mask = activeDimMaskFor(WorkDim::Dispatch);
+  auto low_cost_decision =
+      computeThreshold(low_cost_dispatcher, import_window, 2);
+  EXPECT_EQ(low_cost_decision.limit, 1000);
+  EXPECT_EQ(low_cost_decision.branch_reason, BranchReason::LowRoi);
+
+  StructureKey numeric_loop{Family::NumericLoop};
+  numeric_loop.loop_score = 2;
+  numeric_loop.risk_reason = kRiskHugeCode;
+  numeric_loop.code_size_bucket = 3;
+  numeric_loop.active_dim_mask = activeDimMaskFor(WorkDim::Compute) |
+      activeDimMaskFor(WorkDim::Control);
+  auto numeric_loop_decision =
+      computeThreshold(numeric_loop, import_window, 2);
+  EXPECT_EQ(numeric_loop_decision.limit, 2);
+  EXPECT_EQ(numeric_loop_decision.branch_reason, BranchReason::None);
+
+  StructureKey compute_mixed{Family::Mixed};
+  compute_mixed.mixed_shape =
+      encodeMixedShape(WorkDim::Compute, WorkDim::Object);
+  compute_mixed.loop_score = 2;
+  compute_mixed.risk_reason = kRiskHugeCode;
+  compute_mixed.code_size_bucket = 2;
+  compute_mixed.active_dim_mask = activeDimMaskFor(WorkDim::Compute) |
+      activeDimMaskFor(WorkDim::Object) | activeDimMaskFor(WorkDim::Control);
+  auto compute_mixed_decision =
+      computeThreshold(compute_mixed, import_window, 2);
+  EXPECT_EQ(compute_mixed_decision.limit, 2);
+  EXPECT_EQ(compute_mixed_decision.branch_reason, BranchReason::None);
+
+  StructureKey compute_object{Family::ObjectManipulator};
+  compute_object.loop_score = 2;
+  compute_object.risk_reason = kRiskHugeCode;
+  compute_object.code_size_bucket = 2;
+  compute_object.active_dim_mask = activeDimMaskFor(WorkDim::Object) |
+      activeDimMaskFor(WorkDim::Compute) | activeDimMaskFor(WorkDim::Control);
+  auto compute_object_decision =
+      computeThreshold(compute_object, import_window, 2);
+  EXPECT_GE(compute_object_decision.limit, 65536);
+  EXPECT_EQ(compute_object_decision.branch_reason, BranchReason::RiskDefer);
+
+  StructureKey small_object{Family::ObjectManipulator};
+  small_object.loop_score = 1;
+  small_object.code_size_bucket = 0;
+  small_object.active_dim_mask = activeDimMaskFor(WorkDim::Object);
+  auto small_object_decision =
+      computeThreshold(small_object, import_window, 2);
+  EXPECT_EQ(small_object_decision.limit, 2);
+  EXPECT_EQ(small_object_decision.branch_reason, BranchReason::None);
+
+  auto post_import_risky_object =
+      computeThreshold(risky_object, steady_state, 2);
+  EXPECT_EQ(post_import_risky_object.limit, 2);
+  EXPECT_EQ(post_import_risky_object.branch_reason, BranchReason::None);
 }
 
 TEST(BehaviorClassifierTest, SteadyStateAllowsStructuredNonBranchWork) {
@@ -731,6 +843,41 @@ assert getattr(
 ) == "find_and_load"
 assert observed_depths, observed_depths
 assert all(depth > 0 for depth in observed_depths), observed_depths
+assert _cinderx._autojit_import_depth() == 0
+)");
+}
+
+TEST_F(
+    BehaviorClassifierRuntimeTest,
+    Lib2to3SetupProviderWrapsMainAndTracksDepth) {
+  runStockCode(R"(
+import os
+import sys
+import types
+os.environ["CINDERX_AUTOJIT_SETUP_PROVIDER"] = "lib2to3_main"
+
+import cinderx
+import _cinderx
+
+observed_depths = []
+
+def main():
+    observed_depths.append(_cinderx._autojit_import_depth())
+    return 42
+
+module = types.ModuleType("lib2to3.main")
+module.main = main
+sys.modules["lib2to3.main"] = module
+
+cinderx._maybe_install_autojit_setup_provider_for_module("lib2to3.main")
+
+assert getattr(
+    module.main,
+    "_cinderx_autojit_setup_provider",
+    None,
+) == "lib2to3_main"
+assert module.main() == 42
+assert observed_depths and observed_depths[0] > 0
 assert _cinderx._autojit_import_depth() == 0
 )");
 }
