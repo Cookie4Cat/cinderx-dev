@@ -157,6 +157,26 @@ assert jit.is_jit_compiled(target)
 )");
 }
 
+void assertNewFunctionCountsAndDefersTrivialWork(RuntimeTest& test) {
+  test.runStockCode(R"(
+import cinderx.jit as jit
+
+def target(value):
+    return value
+
+assert jit.get_compile_after_n_calls() == 2
+assert jit.count_interpreted_calls(target) == 0
+target(1)
+target(2)
+assert not jit.is_jit_compiled(target)
+assert jit.count_interpreted_calls(target) == 2
+target(3)
+target(4)
+assert not jit.is_jit_compiled(target)
+assert jit.count_interpreted_calls(target) == 4
+)");
+}
+
 } // namespace
 
 int try_flag_and_envvar_effect(
@@ -518,7 +538,7 @@ TEST_F(CmdLineTest, JITAutoEnvAutoModeInstallsFrameEvaluator) {
   EXPECT_EQ(getConfig().compile_after_n_calls, 2);
   EXPECT_TRUE(getConfig().auto_classify);
 
-  assertNewFunctionCountsAndCompiles(*this);
+  assertNewFunctionCountsAndDefersTrivialWork(*this);
 
   jit::finalize();
   jit::shutdown_jit_genobject_type();
@@ -532,7 +552,7 @@ TEST_F(CmdLineTest, JITAutoXOptionAutoModeInstallsFrameEvaluator) {
   EXPECT_EQ(getConfig().compile_after_n_calls, 2);
   EXPECT_TRUE(getConfig().auto_classify);
 
-  assertNewFunctionCountsAndCompiles(*this);
+  assertNewFunctionCountsAndDefersTrivialWork(*this);
 
   jit::finalize();
   jit::shutdown_jit_genobject_type();

@@ -34,7 +34,8 @@ constexpr uint8_t kRiskDynamicBucket = 2;
 constexpr uint32_t kRiskExceptionFloor = 2;
 constexpr uint32_t kRiskEffectiveInstructionFloor = 200;
 constexpr uint32_t kLowRoiThresholdFactor = 2;
-constexpr uint32_t kStartupDeferThresholdFactor = 8;
+constexpr uint32_t kStartupDeferThresholdFactor = 1u << 20;
+constexpr uint32_t kSteadyNonnumericWarmupThreshold = 1000;
 constexpr uint8_t kWorkDimCount = static_cast<uint8_t>(WorkDim::kCount);
 
 struct Signature {
@@ -218,7 +219,7 @@ uint8_t codeSizeBucket(uint32_t n_eff) {
   if (n_eff >= 500) {
     return 3;
   }
-  if (n_eff >= 200) {
+  if (n_eff >= 100) {
     return 2;
   }
   if (n_eff >= 50) {
@@ -769,6 +770,22 @@ bool isAutoJitClassifiable(BorrowedRef<PyCodeObject> code) {
   return true;
 }
 
+bool shouldDeferSuspendableAutoJitWithoutStructureKey(
+    BorrowedRef<PyCodeObject> code,
+    const GateContext& context) {
+  if (!getConfig().enable_startup_init_policy || !context.startup_phase) {
+    return false;
+  }
+  if (!isAutoJitClassifiable(code)) {
+    return false;
+  }
+  if (code->co_flags & CI_CO_STATICALLY_COMPILED) {
+    return false;
+  }
+  return (code->co_flags & (CO_GENERATOR | CO_COROUTINE | CO_ASYNC_GENERATOR)) !=
+      0;
+}
+
 std::optional<StructureKey> deriveStructureKey(
     BorrowedRef<PyCodeObject> code) {
   if (!isAutoJitClassifiable(code)) {
@@ -848,36 +865,55 @@ ThresholdDecision computeThreshold(
            WorkDim::Dispatch,
            WorkDim::Object,
            WorkDim::Control});
-  bool startup_init_candidate = getConfig().enable_startup_init_policy &&
-      context.startup_phase && !key.is_static && key.loop_score == 0 &&
-      (startup_like_family || startup_like_mixed);
-  bool low_roi_base = key.loop_score == 0 && !key.is_static &&
-      !key.is_suspendable && !key.highRisk();
-  bool trivial_low_roi_candidate =
-      low_roi_base && key.family == Family::Trivial;
-  bool synthetic_low_roi_candidate = key.is_synthetic && key.loop_score == 0 &&
-      low_roi_base &&
-      (key.family == Family::ReflectionMeta || key.family == Family::Trivial);
-  bool low_roi_candidate =
-      trivial_low_roi_candidate || synthetic_low_roi_candidate;
-  bool risk_defer_candidate = getConfig().enable_startup_init_policy &&
-      context.startup_phase &&
-      key.highRisk() && key.loop_score == 0 && !key.is_static &&
-      !key.is_suspendable;
-
-  if (startup_init_candidate) {
+  bool startup_import_candidate = getConfig().enable_startup_init_policy &&
+      context.startup_phase && !key.is_static &&
+      (key.is_suspendable || startup_like_family || startup_like_mixed);
+  bool startup_risk_candidate = startup_import_candidate && key.highRisk() &&
+      key.family != Family::NumericLoop;
+  if (startup_risk_candidate) {
+    return {
+        saturatingMul(global, kStartupDeferThresholdFactor),
+        BranchReason::RiskDefer};
+  }
+  if (startup_import_candidate) {
     return {
         saturatingMul(global, kStartupDeferThresholdFactor),
         BranchReason::StartupInit};
   }
-  if (low_roi_candidate) {
+
+  bool steady_nonnumeric_warmup_candidate = !key.is_static &&
+      key.loop_score == 0 &&
+      (key.is_suspendable || startup_like_family || startup_like_mixed);
+  if (steady_nonnumeric_warmup_candidate) {
+    if (key.highRisk() || key.code_size_bucket > 0) {
+      return {
+          saturatingMul(global, kStartupDeferThresholdFactor),
+          key.highRisk() ? BranchReason::RiskDefer : BranchReason::LowRoi};
+    }
+    if (key.family == Family::ObjectManipulator) {
+      return {global, BranchReason::None};
+    }
+    return {std::max(global, kSteadyNonnumericWarmupThreshold),
+            BranchReason::LowRoi};
+  }
+
+  bool large_branch_warmup_candidate = !key.is_static &&
+      key.loop_score > 0 && key.family == Family::BranchFSM &&
+      (key.highRisk() || key.code_size_bucket >= 2);
+  if (large_branch_warmup_candidate) {
+    return {std::max(global, kSteadyNonnumericWarmupThreshold),
+            BranchReason::LowRoi};
+  }
+
+  bool low_roi_base = key.loop_score == 0 && !key.is_static &&
+      !key.is_suspendable && !key.highRisk();
+  bool trivial_low_roi_candidate =
+      low_roi_base && key.family == Family::Trivial;
+  bool synthetic_low_roi_candidate = key.is_synthetic && low_roi_base &&
+      (key.family == Family::ReflectionMeta || key.family == Family::Trivial);
+  if (trivial_low_roi_candidate || synthetic_low_roi_candidate) {
     return {
         saturatingMul(global, kLowRoiThresholdFactor), BranchReason::LowRoi};
-  }
-  if (risk_defer_candidate) {
-    return {
-        saturatingMul(global, kStartupDeferThresholdFactor),
-        BranchReason::RiskDefer};
   }
   return {global, BranchReason::None};
 }

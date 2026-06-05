@@ -67,6 +67,8 @@ using namespace jit;
 
 namespace {
 
+constexpr uint32_t kAutoJitInterpretOnlyThreshold = 65536;
+
 // RAII device for disabling GIL checking.
 class DisableGilCheck {
  public:
@@ -221,14 +223,20 @@ PyObject* jitVectorcall(
 
     uint32_t effective_limit = *limit;
     if (getConfig().auto_classify) {
-      if (auto key = getOrComputeStructureKey(code, state.extra);
+      if (shouldDeferSuspendableAutoJitWithoutStructureKey(
+              code, state.context)) {
+        effective_limit = kAutoJitInterpretOnlyThreshold;
+      } else if (auto key = getOrComputeStructureKey(code, state.extra);
           key.has_value()) {
-        effective_limit =
-            computeThreshold(*key, state.context, *limit).limit;
+        effective_limit = computeThreshold(*key, state.context, *limit).limit;
       }
     }
     if (state.calls < effective_limit) {
       auto entry = getInterpretedVectorcall(func);
+      if (getConfig().auto_classify &&
+          effective_limit >= kAutoJitInterpretOnlyThreshold) {
+        setVectorcall(func, entry);
+      }
       return entry(func_obj, stack, nargsf, kwnames);
     }
   }

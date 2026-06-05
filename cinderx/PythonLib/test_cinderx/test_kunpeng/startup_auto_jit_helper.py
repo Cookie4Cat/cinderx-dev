@@ -20,8 +20,17 @@ if os.environ.get("CINDERX_PLUGIN_ENABLE", "0") == "1":
     assert cinderjit is not None, "cinderjit was not auto-loaded"
     assert cinderx.is_initialized(), "cinderx was not initialized"
     assert cinderjit.is_enabled(), "cinderx JIT is not enabled"
-    assert cinderjit.is_jit_compiled(auto_jit_target), "auto_jit_target was not compiled"
-    assert cinderjit.get_compiled_size(auto_jit_target) > 0
+    auto_mode = os.environ.get("PYTHONJITAUTO", "").startswith("auto")
+    if auto_mode:
+        assert not cinderjit.is_jit_compiled(
+            auto_jit_target
+        ), "auto_jit_target should be deferred by AutoJIT classification"
+        assert cinderjit.count_interpreted_calls(auto_jit_target) == 10
+    else:
+        assert cinderjit.is_jit_compiled(
+            auto_jit_target
+        ), "auto_jit_target was not compiled"
+        assert cinderjit.get_compiled_size(auto_jit_target) > 0
 
     provider = os.environ.get("CINDERX_AUTOJIT_IMPORT_PROVIDER", "find_and_load")
     if provider in {"builtins", "find_and_load"}:

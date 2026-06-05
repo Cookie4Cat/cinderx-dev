@@ -107,6 +107,9 @@ OpcodeClass opcodeClassOf(int canonical_opcode);
 bool isExceptionControlOpcode(int canonical_opcode);
 
 bool isAutoJitClassifiable(BorrowedRef<PyCodeObject> code);
+bool shouldDeferSuspendableAutoJitWithoutStructureKey(
+    BorrowedRef<PyCodeObject> code,
+    const GateContext& context);
 std::optional<StructureKey> deriveStructureKey(
     BorrowedRef<PyCodeObject> code);
 std::optional<StructureKey> getOrComputeStructureKey(
@@ -115,6 +118,6 @@ std::optional<StructureKey> getOrComputeStructureKey(
 ThresholdDecision computeThreshold(
     const StructureKey& key,
     const GateContext& context,
-uint32_t global);
+    uint32_t global);
 
 } // namespace jit
