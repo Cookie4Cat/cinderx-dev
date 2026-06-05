@@ -81,7 +81,7 @@ class SlotAttrFieldAccessTests(unittest.TestCase):
         self.assertGreaterEqual(ops.get("LoadField", 0), 1)
         self.assertGreaterEqual(ops.get("StoreField", 0), 1)
         self.assertGreaterEqual(ops.get("Guard", 0), 2)
-        self.assertEqual(ops.get("CheckField", 0), 0)
+        self.assertGreaterEqual(ops.get("CheckField", 0), 1)
         self.assertEqual(ops.get("LoadAttrCached", 0), 0)
         self.assertEqual(ops.get("StoreAttrCached", 0), 0)
 
@@ -108,7 +108,7 @@ class SlotAttrFieldAccessTests(unittest.TestCase):
         ops = cinderx.jit.get_function_hir_opcode_counts(Point.norm)
         self.assertGreaterEqual(ops.get("LoadField", 0), 2)
         self.assertGreaterEqual(ops.get("Guard", 0), 2)
-        self.assertEqual(ops.get("CheckField", 0), 0)
+        self.assertGreaterEqual(ops.get("CheckField", 0), 2)
         self.assertEqual(ops.get("LoadAttrCached", 0), 0)
         self.assertEqual(point.norm(), 25)
 
@@ -154,7 +154,7 @@ class SlotAttrFieldAccessTests(unittest.TestCase):
         self.assertTrue(cinderx.jit.is_jit_compiled(CallableSlot.call))
         ops = cinderx.jit.get_function_hir_opcode_counts(CallableSlot.call)
         self.assertGreaterEqual(ops.get("LoadField", 0), 1)
-        self.assertEqual(ops.get("CheckField", 0), 0)
+        self.assertGreaterEqual(ops.get("CheckField", 0), 1)
         self.assertEqual(ops.get("LoadAttrCached", 0), 0)
         self.assertEqual(obj.call(), 42)
 

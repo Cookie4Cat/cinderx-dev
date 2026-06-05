@@ -64,6 +64,42 @@ PyObject* readCacheObj(
       sizeof(obj));
   return obj;
 }
+
+PyMemberDef* attrSlotMemberDef(
+    PyCodeObject* code,
+    const BytecodeInstruction& bc_instr,
+    int name_idx) {
+  uint32_t type_version = bc_instr.attrCacheTypeVersion();
+  if (type_version == 0) {
+    return nullptr;
+  }
+
+  PyInterpreterState* interp = _PyInterpreterState_GET();
+  PyTypeObject* type =
+      interp->types.type_version_cache[type_version % TYPE_VERSION_CACHE_SIZE];
+  if (type == nullptr || type->tp_version_tag != type_version) {
+    return nullptr;
+  }
+
+  BorrowedRef<> name = PyTuple_GET_ITEM(code->co_names, name_idx);
+  BorrowedRef<> descr = _PyType_Lookup(type, name);
+  if (descr == nullptr || Py_TYPE(descr) != &PyMemberDescr_Type) {
+    return nullptr;
+  }
+
+  PyMemberDef* def =
+      reinterpret_cast<PyMemberDescrObject*>(descr.get())->d_member;
+  if (def->flags & READ_RESTRICTED) {
+    return nullptr;
+  }
+  if (def->type != T_OBJECT && def->type != T_OBJECT_EX) {
+    return nullptr;
+  }
+  if (def->offset != bc_instr.attrCacheIndex()) {
+    return nullptr;
+  }
+  return def;
+}
 #endif
 
 void rotateStackTop(OperandStack& stack, int count) {
@@ -1130,7 +1166,7 @@ void HIRBuilder::translate(
           break;
         }
         case LOAD_ATTR: {
-          emitLoadAttr(tc, bc_instr);
+          emitLoadAttr(irfunc.cfg, tc, bc_instr);
           break;
         }
         case LOAD_METHOD: {
@@ -2960,6 +2996,7 @@ void HIRBuilder::emitSlotTypeVersionGuard(
 }
 
 void HIRBuilder::emitLoadAttr(
+    CFG& cfg,
     TranslationContext& tc,
     const jit::BytecodeInstruction& bc_instr) {
   int oparg = bc_instr.oparg();
@@ -3000,6 +3037,16 @@ void HIRBuilder::emitLoadAttr(
         if (!slot_fast_path_enabled) {
           break;
         }
+        PyMemberDef* member_def =
+            attrSlotMemberDef(code_, bc_instr, name_idx);
+        if (member_def == nullptr) {
+          if (is_method) {
+            tc.frame.stack.push(receiver);
+            emitLoadMethod(tc, name_idx);
+            return;
+          }
+          break;
+        }
         BorrowedRef<PyUnicodeObject> name =
             PyTuple_GET_ITEM(code_->co_names, name_idx);
         const char* field_name = PyUnicode_AsUTF8(name);
@@ -3009,17 +3056,39 @@ void HIRBuilder::emitLoadAttr(
         }
         emitSlotTypeVersionGuard(
             tc, receiver, bc_instr.attrCacheTypeVersion(), "LOAD_ATTR_SLOT");
-        Register* result = temps_.AllocateStack();
+        Register* field = temps_.AllocateStack();
         tc.emit<LoadField>(
-            result,
+            field,
             receiver,
             field_name,
-            bc_instr.attrCacheIndex(),
+            member_def->offset,
             TOptObject);
-        auto* guard = tc.emit<Guard>(result, tc.frame);
-        guard->setGuiltyReg(receiver);
-        guard->setDescr("LOAD_ATTR_SLOT");
-        tc.emit<RefineType>(result, TObject, result);
+        Register* result = temps_.AllocateStack();
+        if (member_def->type == T_OBJECT_EX) {
+          auto* check = tc.emit<CheckField>(field, field, name, tc.frame);
+          check->setGuiltyReg(receiver);
+          tc.emit<Assign>(result, check->output());
+        } else {
+          BasicBlock* set_block = cfg.AllocateBlock();
+          BasicBlock* none_block = cfg.AllocateBlock();
+          BasicBlock* done_block = cfg.AllocateBlock();
+
+          tc.emit<CondBranch>(field, set_block, none_block);
+
+          tc.block = set_block;
+          Register* checked_result = temps_.AllocateNonStack();
+          tc.emit<RefineType>(checked_result, TObject, field);
+          tc.emit<Assign>(result, checked_result);
+          tc.emit<Branch>(done_block);
+
+          tc.block = none_block;
+          Register* none = temps_.AllocateNonStack();
+          tc.emit<LoadConst>(none, Type::fromObject(Py_None));
+          tc.emit<Assign>(result, none);
+          tc.emit<Branch>(done_block);
+
+          tc.block = done_block;
+        }
         tc.frame.stack.push(result);
         if (is_method) {
           emitPushNull(tc);
@@ -4098,6 +4167,12 @@ void HIRBuilder::emitStoreAttr(
       bc_instr.specializedOpcode() == STORE_ATTR_SLOT) {
     // STORE_ATTR oparg is always the co_names index; unlike LOAD_ATTR it does
     // not reserve a low bit for method-call stack shaping.
+    PyMemberDef* member_def =
+        attrSlotMemberDef(code_, bc_instr, bc_instr.oparg());
+    if (member_def == nullptr) {
+      tc.emit<StoreAttr>(receiver, value, bc_instr.oparg(), tc.frame);
+      return;
+    }
     BorrowedRef<PyUnicodeObject> name =
         PyTuple_GET_ITEM(code_->co_names, bc_instr.oparg());
     const char* field_name = PyUnicode_AsUTF8(name);
@@ -4107,19 +4182,18 @@ void HIRBuilder::emitStoreAttr(
     }
     emitSlotTypeVersionGuard(
         tc, receiver, bc_instr.attrCacheTypeVersion(), "STORE_ATTR_SLOT");
-    uint16_t field_offset = bc_instr.attrCacheIndex();
     Register* previous = temps_.AllocateStack();
     tc.emit<LoadField>(
         previous,
         receiver,
         field_name,
-        field_offset,
+        member_def->offset,
         TOptObject,
         /* borrowed= */ false);
     tc.emit<StoreField>(
         receiver,
         field_name,
-        field_offset,
+        member_def->offset,
         value,
         TOptObject,
         previous);
