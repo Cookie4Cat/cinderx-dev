@@ -43,6 +43,7 @@ native suite 时，还需要：
 提交前推荐运行 PR 门禁，并打开 native C/C++ 覆盖率：
 
 ```bash
+CINDERX_LOCAL_DEPS=/path/to/cinderx-local-deps \
 python3.14 ci_pipeline/run_gate.py pr --coverage
 ```
 
@@ -59,6 +60,7 @@ python3.14 ci_pipeline/run_gate.py pr --coverage
 `daily` 复用 PR 门禁的主体流程，并额外展开 wheel 兼容性矩阵：
 
 ```bash
+CINDERX_LOCAL_DEPS=/path/to/cinderx-local-deps \
 CINDERX_TEST_WHEEL=/path/to/cinderx.whl \
 python3.14 ci_pipeline/run_gate.py daily
 ```
@@ -95,6 +97,7 @@ python3.14 ci_pipeline/run_gate.py --suite wheel_compat_negative
 Lib/test 时显式设置：
 
 ```bash
+CINDERX_LOCAL_DEPS=/path/to/cinderx-local-deps \
 CINDERX_LOCAL_RUN_LIBTEST=1 \
 python3.14 ci_pipeline/run_gate.py --suite cinderx_local
 ```
