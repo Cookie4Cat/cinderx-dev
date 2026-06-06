@@ -6,6 +6,39 @@ This directory maintains the local gate flow for ARM64 Linux CPython 3.14
 CinderX JIT work. The entry point is `ci_pipeline/run_gate.py`; suite
 configuration lives in `ci_pipeline/suites/*.toml`.
 
+## Software Dependencies
+
+Before running `run_gate.py`, prepare the target Python, build toolchain, CMake,
+and test tools. `pr --coverage` also needs native coverage tools; `daily` and
+compat suites need an external wheel and the Python interpreters listed in the
+compatibility matrix.
+
+### Base Dependencies
+
+| Dependency | Purpose |
+|---|---|
+| `pip`, `venv`, `setuptools >= 77.0.3` | Build and install the local wheel; `pyproject.toml` defines the setuptools lower bound |
+| `pytest` | Used by `cinderx_local`, `wheel_compat`, and Lib/test runs |
+| `bash`, `coreutils`, `findutils`, `git` | Needed by suite shell commands, source-state checks, and file handling |
+| `cmake`, `ctest` | Configure, build, and run the `runtime` suite |
+| `make` or another CMake generator backend | `cmake --build` needs an actual build backend; when no generator is set explicitly, this is usually `make` |
+
+### Coverage Dependencies
+
+Running `python3.14 ci_pipeline/run_gate.py pr --coverage` or any native suite
+with `--coverage` also requires:
+
+| Dependency | Purpose |
+|---|---|
+| GCC/G++ | CMake coverage mode only supports GNU compilers |
+| `gcov` | Generate native coverage data |
+| `lcov` | Collect and filter the coverage tracefile |
+| `genhtml` | Generate the HTML coverage report |
+
+Coverage mode cannot be combined with LTO/PGO. `run_gate.py` enables
+`ENABLE_COVERAGE=ON` for the `runtime` suite, and CMake rejects non-GCC/gcov
+coverage builds.
+
 ## Quick Start
 
 ### PR Gate
@@ -13,6 +46,7 @@ configuration lives in `ci_pipeline/suites/*.toml`.
 Before submitting changes, run the PR gate with native C/C++ coverage enabled:
 
 ```bash
+CINDERX_LOCAL_DEPS=/path/to/cinderx-local-deps \
 python3.14 ci_pipeline/run_gate.py pr --coverage
 ```
 
@@ -34,6 +68,7 @@ running later suites.
 matrix:
 
 ```bash
+CINDERX_LOCAL_DEPS=/path/to/cinderx-local-deps \
 CINDERX_TEST_WHEEL=/path/to/cinderx.whl \
 python3.14 ci_pipeline/run_gate.py daily
 ```
@@ -72,6 +107,7 @@ The normal `cinderx_local` suite only builds a local release wheel and runs the
 CinderX Python tests. Set this explicitly when Lib/test should run too:
 
 ```bash
+CINDERX_LOCAL_DEPS=/path/to/cinderx-local-deps \
 CINDERX_LOCAL_RUN_LIBTEST=1 \
 python3.14 ci_pipeline/run_gate.py --suite cinderx_local
 ```

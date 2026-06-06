@@ -62,7 +62,7 @@ python3.14 -m pip install --no-index cinderx-*_aarch64.whl
 安装成功后，目标 Python 的 `site-packages` 下会新增 CinderX 相关文件和目录。主要文件说明如下：
 
 | 文件/目录 | 说明 |
-|---|---|---|
+|---|---|
 | `cinderx/` | CinderX Python 包，包含 `cinderx.jit`、缓存属性、Strict/Static 辅助接口等 | 
 | `__static__/`、`__strict__/` | Static Python 和 Strict Modules 的兼容包入口 | 
 | `opcodes/` | CinderX opcode 辅助模块 |

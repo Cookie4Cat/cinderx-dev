@@ -44,21 +44,6 @@ python3.14 setup.py build --local=/path/to/cinderx-local-deps
 CINDERX_LOCAL_DEPS=/path/to/cinderx-local-deps \
 python3.14 -m pip install .
 ```
-
-### 本地 gate 默认路径
-
-`ci_pipeline` 的本地构建 suite 默认使用源码仓平行路径下的缓存目录：
-
-```text
-<repo_path>/../cinderx-local-deps
-```
-
-运行下面的本地门禁时会自动使用该路径：
-
-```bash
-python3.14 ci_pipeline/run_gate.py pr --coverage
-```
-
 ---
 
 ## 性能测试
@@ -131,10 +116,10 @@ sed -i 's/^include-system-site-packages = false/include-system-site-packages = t
 
 ``` bash
 // 命令示例
-CINDERX_PLUGIN_ENABLE=1 PYTHONJITAUTO=2 PYTHONJITLIGHTWEIGHTFRAME=1 python3.14 -m pyperformance run \ 
-    --affinity=300 \ 
-    --warmup 3 \ 
-    --inherit-environ http_proxy,https_proxy,LD_LIBRARY_PATH,CINDERX_PLUGIN_ENABLE,PYTHONJITAUTO,PYTHONJITLIGHTWEIGHTFRAME \ 
+CINDERX_PLUGIN_ENABLE=1 PYTHONJITAUTO=2 PYTHONJITLIGHTWEIGHTFRAME=1 python3.14 -m pyperformance run \
+    --affinity=300 \
+    --warmup 3 \
+    --inherit-environ http_proxy,https_proxy,LD_LIBRARY_PATH,CINDERX_PLUGIN_ENABLE,PYTHONJITAUTO,PYTHONJITLIGHTWEIGHTFRAME \
     -o test.json
 ```
 pyperformance可通过`-b`参数指定用例范围，也可通过`--fast`方式快速验证，更多使用方式参考[pyperformance Docs](https://pyperformance.readthedocs.io)
@@ -170,3 +155,9 @@ CinderX 提供了丰富的环境变量用于调试和性能分析：
 ### 1. 如何简单确认pyperformance可正常使能CinderX插件
 - 确认`venv/<venv_name>/pyvenv.cfg`中的 `include-system-site-packages = true`
 
+### 2. 构建时发生 OOM 怎么处理
+
+如果构建过程中出现 `Killed`、`cc1plus`/`c++` 子进程退出，或系统日志中能看到 OOM killer 记录，通常说明并行编译或链接阶段超过了当前机器/容器的内存上限。
+- 单独构建 CinderX wheel 时，可以通过 `PYTHON_CPU_COUNT` 降低 `setup.py` 触发的 CMake 构建并发，或通过`taskset -c`限制可调度的CPU范围。
+- 运行本地门禁，也可以通过`CINDERX_TEST_JOBS`显式限制 `runtime_tests` 的 `cmake --build --parallel` 并发。
+- 小规格容器建议避免 PGO/LTO，必要时加 swap、提高内存上限或换更大构建环境。
