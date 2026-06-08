@@ -10,6 +10,8 @@
 
 | 版本 | 日期 | 修订人 | 修订说明 |
 |---|---|---|---|
+| v0.8 | 2026-06-08 | @sisibeloved | 根据生产实现 A/B 修正 `deepcopy` 策略：只新增 `_deepcopy_tuple` 对应的 looped expected-exception 形状延迟；`_keep_alive` 放宽会让 `deepcopy_reduce` 明显回归，最终保持既有 `RiskDefer`。 |
+| v0.7 | 2026-06-08 | @sisibeloved | 补充 `deepcopy/deepcopy_memo/deepcopy_reduce` deopt 与正式 pyperformance 穿刺：`_deepcopy_tuple` 的 expected `KeyError` deopt 是可收窄对象；`_keep_alive` 虽有 deopt 但保留 JIT 可能有净收益，不能按 try/except 或 deopt 数一刀切。 |
 | v0.6 | 2026-06-05 | @sisibeloved | 补充 L3 典型子集 A/B：同一 candidate wheel 上比较 `PYTHONJITAUTO=2` 与 `PYTHONJITAUTO=auto:2 + find_and_load + lib2to3_main`，确认 `2to3`/startup 强收益，严重 JIT 误伤已收敛为小幅回归/噪声项。 |
 | v0.5 | 2026-06-05 | @sisibeloved | 补充 `2to3` compute-dominant 策略与 `lib2to3_main` setup provider 复跑证据：incidental `Compute` 不能保护 object/refactor 形状；真实 `python -m lib2to3` setup window 将编译事件从 158 降到 122，性能从 1.315s 提升到 0.968s。 |
 | v0.4 | 2026-06-05 | @sisibeloved | 补充 `pickle_pure_python`、`deepcopy` 系列真实 worker gate 证据；明确纯 Python 序列化和深拷贝是 steady 对象图遍历 workload，`LowRoi/RiskDefer` 需要区分“热后编译”和“风险延迟”。 |
@@ -40,6 +42,7 @@
 | 只是 active dims 中出现 `Compute` | 不能当成数值收益保护；若 family 仍是 `ObjectManipulator` / `BranchFSM`，应按主导形状判断 |
 | suspendable 状态机 | 不能一刀切拦死；可提高阈值，热度足够时仍应编译 |
 | 纯 `ObjectManipulator` 大函数 | import window 可延迟；steady-state 中可能是核心热点，不能全局拦 |
+| expected exception 作为正常控制流 | 需要结合 deopt 和 A/B 单独判断；不能只因有 try/except、`risk=Exception` 或 deopt 数高就禁编 |
 | `RiskDefer` | 只说明风险成本高；上线前必须证明省下的静态成本大于丢掉的动态收益 |
 
 ## 5 口径索引
@@ -71,6 +74,7 @@
 | `sympy_str` | direct worker，同上，`bm_sympy str` | `blue-98:/results/autojit-logging-sympy-shapes-20260605/worker-gate-shapes/sympy_str.*.jit.log` | 有真实 C++ gate 形状；debug 口径 |
 | `pickle_pure_python` | direct worker，`--fast --values=3 --warmups=1`，`PYTHONJITAUTO=auto:2`，`CINDERX_AUTOJIT_IMPORT_PROVIDER=find_and_load`，`bm_pickle --pure-python pickle` | `blue-98:/results/autojit-pickle-deepcopy-shapes-20260605/worker-gate-shapes/pickle_pure_python.*.jit.log` | 有真实 C++ gate 形状；debug 口径，不作为性能数值 |
 | `deepcopy` | direct worker，同上，`bm_deepcopy` 一次 run 覆盖 `deepcopy/deepcopy_reduce/deepcopy_memo` | `blue-98:/results/autojit-pickle-deepcopy-shapes-20260605/worker-gate-shapes/deepcopy.*.jit.log` | 有真实 C++ gate 形状；debug 口径；函数表按 benchmark-self 归因 |
+| `deepcopy` | deopt probe + 正式 pyperformance，`PYTHONJITAUTO=2`、`PYTHONJITAUTO=auto:2 + find_and_load`、只抑制 `_deepcopy_tuple` 三组对照 | `blue-98:cinderx-test:/results/autojit-deepcopy-deopt-20260608/{deopt-auto2.log,deopt-auto-classify.log,current.log,suppress_tuple.log,suppress_tuple_keep.log,formal-*.json,compare-*.txt}` | 验证 `_deepcopy_tuple` 与 `_keep_alive` 都会因 `DictSubscr` expected `KeyError` 产生 `UnhandledException` deopt；但策略收益不同，不能用一个异常风险规则同时处理 |
 
 ### 5.1 L3 典型子集 A/B 结论
 
@@ -458,6 +462,8 @@
 
 这组样本进一步说明：对象图 workload 不能按“非数值 + 控制/对象 + highcost”全局粗拦。`copy._reconstruct` 被 `LowRoi` 延迟到 1000，但 gate 数接近 7992 且最终编译；`copy.deepcopy` 入口本身在本口径下没有编译，说明当前策略会把热点放到更具体的内部函数，而不是盲目编译所有入口。
 
+2026-06-08 的 deopt 穿刺补充了一个更细的结论：`deepcopy` 系列确实是典型 JIT 用例，但 CinderX 当前对“用 `try/except KeyError` 表示正常 miss 路径”的处理有动态成本。`copy._deepcopy_tuple` 和 `copy._keep_alive` 都会在 JIT 中产生 `UnhandledException/DictSubscr` deopt；但二者的策略含义不同。只抑制 `_deepcopy_tuple` 在正式 pyperformance 中有小幅正收益；尝试放宽 `_keep_alive` 虽然让 `deepcopy_memo` 有非显著小幅改善，但会让 `deepcopy_reduce` 明显回归。因此，最终生产策略只新增 looped expected-exception 形状延迟，`_keep_alive` 保持既有 `RiskDefer`。
+
 ### 16.2 摘要
 
 | 用例 | 编译事件 | unique compiled | target unique compiled | gate 事件 | unique gated | gate family top | gate reason top |
@@ -473,12 +479,12 @@
 | `deepcopy` | `copy:_deepcopy_dict` | 12 | 31.2ms | `CallDispatcher`, dims=`Control+Object+Dispatch`, `loop=1`, `codeB=0`, `risk=None`, `startup=false` | `2/None` | dict 深拷贝核心函数，放行合理 |
 | `deepcopy` | `__main__:benchmark_reduce` | 4 | 14.1ms | `CallDispatcher`, dims=`Object+Dispatch+Dynamic`, `loop=1`, `codeB=0`, `risk=None`, `startup=false` | `2/None` | `__reduce__` 子场景驱动函数，应放行 |
 | `deepcopy` | `copy:_deepcopy_list` | 8 | 13.6ms | `CallDispatcher`, dims=`Control+Object+Dispatch`, `loop=1`, `codeB=0`, `risk=None`, `startup=false` | `2/None` | list 深拷贝核心函数，放行合理 |
-| `deepcopy` | `copy:_deepcopy_tuple` | 8 | 13.2ms | `BranchFSM`, dims=`Control`, `loop=2`, `codeB=1`, `risk=Exception`, `startup=false` | `1000/LowRoi` | tuple 深拷贝路径；异常边导致延迟，但热后编译 |
+| `deepcopy` | `copy:_deepcopy_tuple` | 8 | 13.2ms | `BranchFSM`, dims=`Control`, `loop=2`, `codeB=1`, `risk=Exception`, `startup=false` | `1000/LowRoi` | tuple memo miss 用 expected `KeyError` 表达；正式穿刺显示只抑制该函数有小幅正收益，是 expected-exception 收窄候选 |
 | `deepcopy` | `__main__:benchmark_memo` | 4 | 12.6ms | `ObjectManipulator`, dims=`Object+Dispatch`, `loop=1`, `codeB=0`, `risk=None`, `startup=false` | `2/None` | memo 子场景驱动函数，应放行 |
 | `deepcopy` | `copy:_reconstruct.<locals>.<genexpr>` | 4 | 7.0ms | `BranchFSM`, dims=`Control+Dispatch+Dynamic`, `loop=1`, `codeB=0`, `risk=None`, `suspend=true`, `startup=false` | `2/None` | suspendable 小热路径，不能因为 suspendable 一刀切禁编 |
 | `deepcopy` | `copyreg:__newobj__` | 4 | 4.4ms | `Mixed`, dims=`Object+Dispatch`, `loop=0`, `codeB=0`, `risk=None`, `startup=false` | `1000/LowRoi` | reduce 重建辅助函数，低 ROI 延迟后热度足够时编译 |
 | `deepcopy` | `copy:deepcopy` | 0 | 0.0ms | `BranchFSM`, dims=`Control+Dispatch`, `loop=0`, `codeB=2`, `risk=None`, `startup=false` | `2097152/LowRoi` | 入口函数未编译，当前策略更偏向内部热点 |
-| `deepcopy` | `copy:_keep_alive` | 0 | 0.0ms | `BranchFSM`, dims=`Control`, `loop=0`, `codeB=0`, `risk=Exception`, `startup=false` | `2097152/RiskDefer` | 低热异常边辅助函数，风险延迟合理 |
+| `deepcopy` | `copy:_keep_alive` | 0 | 0.0ms | `BranchFSM`, dims=`Control`, `loop=0`, `codeB=0`, `risk=Exception`, `startup=false` | `2097152/RiskDefer` | 同样有 expected `KeyError` deopt；生产 A/B 证明放宽它会让 `deepcopy_reduce` 明显回归，最终保持 `RiskDefer` |
 | `deepcopy` | `dataclasses:_process_class` | 0 | 0.0ms | `BranchFSM`, dims=`Control+Object+Dynamic`, `loop=3`, `codeB=3`, `risk=Exception+HugeCode`, `startup=true` | `2097152/RiskDefer` | dataclass 初始化噪声，import/setup 风险延迟正确 |
 
 ### 16.4 策略判断
@@ -490,6 +496,30 @@
 | `copy.deepcopy` 入口未编译，内部热点编译 | 当前策略不会盲目编译所有入口函数，这对对象图 workload 是有利边界 |
 | `copy._reconstruct.<locals>.<genexpr>` 是 suspendable 但放行 | suspendable 只能作为风险信号，不能单独决定禁编 |
 | dataclass startup 样本走 `RiskDefer/StartupInit` | import/setup 保护有效，但不应用来否定 steady deepcopy 热路径 |
+| `_deepcopy_tuple` 的 deopt 来自 memo miss 的 expected `KeyError` | 这是 AutoJIT 可优化对象；只抑制该函数相对原始 `PYTHONJITAUTO=2` 几何均值约 1.02x faster |
+| `_keep_alive` 的 deopt 数更高，但 loop-free 小 helper 与 `_deepcopy_tuple` 的 looped miss 形状不同 | deopt 数不是策略条件；最终保持既有 `RiskDefer`，避免 `deepcopy_reduce` 回归 |
+
+### 16.5 deopt 与正式 A/B 穿刺
+
+以下 deopt 数来自固定迭代数 probe，用来定位动态成本来源，不直接当作正式耗时。`DictSubscr` 对应 `copy.py` 中在 `try/except KeyError` 内访问 memo 字典，KeyError 是正常控制流，不是业务异常。
+
+| 口径 | `deepcopy` deopt | `deepcopy_memo` deopt | `deepcopy_reduce` deopt | 结论 |
+|---|---:|---:|---:|---|
+| 原始 CinderX：`PYTHONJITAUTO=2` | 360000：`_keep_alive` 240000，`_deepcopy_tuple` 120000 | 40000：二者各 20000 | 60000：`_keep_alive` | 验证 try/except miss 路径确实造成大量 JIT deopt |
+| 当前 AutoJIT：`auto:2 + find_and_load` | 120000：`_deepcopy_tuple` | 20000：`_deepcopy_tuple` | 0 | 当前策略已经避开 `_keep_alive`，但仍放行 `_deepcopy_tuple` |
+| 原始 CinderX + 只抑制 `_deepcopy_tuple` | 240000：`_keep_alive` | 20000：`_keep_alive` | 60000：`_keep_alive` | `_deepcopy_tuple` deopt 可单独清除，且不影响 `_keep_alive` 的 JIT 收益 |
+
+正式 pyperformance 口径为 `--warmup 3 --affinity=30 -b deepcopy`，同一 candidate wheel、同一 venv，对比 `PYTHONJITAUTO=2`、当前 AutoJIT 和只抑制 `_deepcopy_tuple` 的原型：
+
+| 对照 | `deepcopy` | `deepcopy_memo` | `deepcopy_reduce` | 几何均值 |
+|---|---:|---:|---:|---:|
+| `PYTHONJITAUTO=2` -> 当前 AutoJIT | 891us -> 904us，1.01x slower | 85.7us -> 96.0us，1.12x slower | not significant | 1.04x slower |
+| 当前 AutoJIT -> 当前 AutoJIT + 抑制 `_deepcopy_tuple` | 904us -> 871us，1.04x faster | 96.0us -> 95.0us，1.01x faster | not significant | 1.02x faster |
+| `PYTHONJITAUTO=2` -> `PYTHONJITAUTO=2` + 抑制 `_deepcopy_tuple` | 891us -> 875us，1.02x faster | 85.7us -> 83.5us，1.03x faster | 9.25us -> 9.13us，1.01x faster | 1.02x faster |
+
+策略结论：`deepcopy` 有 AutoJIT 优化潜力，但幅度是小到中等，主要来自避免 `_deepcopy_tuple` 的 expected-exception deopt。不要把该结论泛化成“所有异常风险函数延迟”：`_keep_alive` 反例说明，异常边成本可能被函数本身的动态收益覆盖。
+
+生产实现复测进一步收敛了策略边界：只新增 `BranchFSM + loop_score>=2 + code_size_bucket=1 + risk=Exception + active_dim=Control` 的 steady-state 延迟；不放宽 `loop_score=0 + code_size_bucket=0 + risk=Exception` 的小 helper。`blue-98:/results/autojit-exception-policy-20260608` 中，tuple-only 策略相对旧 wheel 的小子集结果为：`2to3` 1.37x faster，`deepcopy` 1.04x faster，`deepcopy_memo` 和 `deepcopy_reduce` 均 not significant；错误放宽 `_keep_alive` 的对照中，tuple-only 对 `deepcopy_reduce` 反而 1.10x faster，证明 `_keep_alive` 不应放行。`nbody` 在本轮出现 4%-6% slower 且方差较大，同一 wheel 的 `PYTHONJITAUTO=2` 为 111ms，`auto:2` 为 115-118ms，标记为独立待查，不归因于 `_deepcopy_tuple` 形状规则。
 
 ## 17 当前策略判断汇总
 
@@ -509,7 +539,9 @@
 | benchmark-self 优先于全局 top 编译耗时 | `logging` 系列 | 成立。全局 top 可能混入 `importlib.metadata`、`argparse`、driver/setup 函数，策略判断必须回到本体函数 |
 | pure-python 对象图序列化不能全局拦 `BranchFSM + codeB=2` | `pickle_pure_python` | 成立。`save_tuple/save_global/_batch_*` 是主体路径，LowRoi 延迟后仍编译 |
 | 对象图重建热点应允许热后编译 | `deepcopy` | 成立。`copy._reconstruct` 延迟到 1000 后仍进入 JIT，内部热点优先于入口函数 |
-| `RiskDefer` 对低热大函数有效，但不能替代收益判断 | `pickle_pure_python`、`deepcopy` | 成立。部分入口/通用函数未编译是保护，但上线前仍需非 debug A/B 确认收益是否丢失 |
+| expected-exception deopt 需要精确到函数形状 | `deepcopy` | 成立。`_deepcopy_tuple` 抑制后正式 A/B 有小幅收益；`_keep_alive` 放宽会让 `deepcopy_reduce` 回归，应保持 `RiskDefer` |
+| deopt 数不能单独驱动准入策略 | `deepcopy` | 成立。必须同时看函数形状、子场景和正式 A/B；否则会误伤 `deepcopy_memo` |
+| `RiskDefer` 对低热大函数有效，但不能替代收益判断 | `pickle_pure_python`、`deepcopy` | 成立。部分入口/通用函数未编译是保护，但上线前仍需非 debug A/B 确认收益是否丢失；`_keep_alive` 是“风险高且放宽会回归”的反例 |
 
 ## 18 待补清单
 
@@ -523,6 +555,6 @@
 | P1 | 给 `logging` 三个子用例分别补非 debug A/B | 区分 silent 微路径、simple 输出路径、format 格式化路径是否需要差异化阈值 |
 | P1 | 给 `sympy` 四个子用例分别补非 debug A/B | 判断符号计算 highcost 函数的动态收益是否覆盖编译成本 |
 | P1 | 给 `pickle_pure_python` 补非 debug A/B | 判断纯 Python 序列化大分支函数热后编译收益是否覆盖编译成本 |
-| P1 | 将 `deepcopy` 拆成 `deepcopy/deepcopy_reduce/deepcopy_memo` 三个子场景分别取证 | 当前 run 聚合了三类子场景，后续需要拆分细看对象重建、reduce、memo 的差异 |
+| P1 | 将 `deepcopy/deepcopy_reduce/deepcopy_memo` 三个子场景补完整函数形状表 | deopt 和正式 A/B 已拆分；后续还需要按子场景列完整编译函数，确认 `_deepcopy_tuple` 收窄规则是否有其它同形状候选 |
 | P1 | 给 `dask`、`dulwich_log`、`bench_mp_pool` 补同格式表 | 扩大非 JIT 用例样本，避免只围绕 `2to3` 调参 |
 | P2 | 给 `scimark_fft/scimark_lu/scimark_sor/scimark_monte_carlo` 补同格式表 | 验证 JIT 用例误伤边界 |

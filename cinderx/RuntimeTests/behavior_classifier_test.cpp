@@ -382,6 +382,35 @@ TEST(BehaviorClassifierTest, SteadyStateWarmsUpLargeBranchStateMachines) {
   EXPECT_EQ(object_decision.branch_reason, BranchReason::None);
 }
 
+TEST(
+    BehaviorClassifierTest,
+    SteadyStateRiskDefersExpectedExceptionLoopShape) {
+  GateContext steady_state{false};
+
+  StructureKey tuple_memo_miss{Family::BranchFSM};
+  tuple_memo_miss.loop_score = 2;
+  tuple_memo_miss.code_size_bucket = 1;
+  tuple_memo_miss.risk_reason = kRiskException;
+  tuple_memo_miss.active_dim_mask = activeDimMaskFor(WorkDim::Control);
+  auto tuple_memo_miss_decision =
+      computeThreshold(tuple_memo_miss, steady_state, 2);
+  EXPECT_GE(tuple_memo_miss_decision.limit, 65536);
+  EXPECT_EQ(tuple_memo_miss_decision.branch_reason, BranchReason::RiskDefer);
+
+  StructureKey dispatching_exception_loop{Family::BranchFSM};
+  dispatching_exception_loop.loop_score = 2;
+  dispatching_exception_loop.code_size_bucket = 1;
+  dispatching_exception_loop.risk_reason = kRiskException;
+  dispatching_exception_loop.active_dim_mask =
+      activeDimMaskFor(WorkDim::Control) |
+      activeDimMaskFor(WorkDim::Dispatch);
+  auto dispatching_exception_loop_decision =
+      computeThreshold(dispatching_exception_loop, steady_state, 2);
+  EXPECT_EQ(dispatching_exception_loop_decision.limit, 1000);
+  EXPECT_EQ(
+      dispatching_exception_loop_decision.branch_reason, BranchReason::LowRoi);
+}
+
 TEST(BehaviorClassifierTest, SteadyStateWarmsUpTinyStartupLikeWork) {
   GateContext steady_state{false};
 

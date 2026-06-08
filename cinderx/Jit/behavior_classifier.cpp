@@ -380,6 +380,11 @@ bool mixedShapeContains(MixedShape shape, WorkDim dim) {
   return decoded->first == dim || decoded->second == dim;
 }
 
+bool isPureControlExceptionRisk(const StructureKey& key) {
+  return key.risk_reason == kRiskException &&
+      key.active_dim_mask == activeDimMaskFor(WorkDim::Control);
+}
+
 } // namespace
 
 WorkDim toWorkDim(OpcodeClass cls) {
@@ -944,6 +949,16 @@ ThresholdDecision computeThreshold(
     return {
         saturatingMul(global, kStartupDeferThresholdFactor),
         key.highRisk() ? BranchReason::RiskDefer : BranchReason::StartupInit};
+  }
+
+  bool expected_exception_loop_candidate = !context.startup_phase &&
+      !key.is_static && !key.is_suspendable &&
+      key.family == Family::BranchFSM && key.loop_score >= 2 &&
+      key.code_size_bucket == 1 && isPureControlExceptionRisk(key);
+  if (expected_exception_loop_candidate) {
+    return {
+        saturatingMul(global, kStartupDeferThresholdFactor),
+        BranchReason::RiskDefer};
   }
 
   bool steady_nonnumeric_warmup_candidate = !key.is_static &&
