@@ -544,6 +544,29 @@ TEST_F(CmdLineTest, JITAutoEnvAutoModeInstallsFrameEvaluator) {
   jit::shutdown_jit_genobject_type();
 }
 
+TEST_F(CmdLineTest, JITAutoEnvAutoModeDoesNotScheduleExistingFunctions) {
+  ScopedAutoJitConfigState config_guard;
+  ScopedEnvVar env{"PYTHONJITAUTO"};
+  resetJitForAutoJitEntryTest();
+  runStockCode(R"(
+def existing_function(value):
+    return value
+)");
+  Ref<> existing_function = getGlobal("existing_function");
+  ASSERT_TRUE(PyFunction_Check(existing_function));
+  BorrowedRef<PyFunctionObject> func{existing_function};
+  vectorcallfunc original_vectorcall = func->vectorcall;
+
+  env.set("auto:2");
+  ASSERT_EQ(jit::initialize(), 0);
+  EXPECT_EQ(getConfig().compile_after_n_calls, 2);
+  EXPECT_TRUE(getConfig().auto_classify);
+  EXPECT_EQ(func->vectorcall, original_vectorcall);
+
+  jit::finalize();
+  jit::shutdown_jit_genobject_type();
+}
+
 TEST_F(CmdLineTest, JITAutoXOptionAutoModeInstallsFrameEvaluator) {
   ScopedAutoJitConfigState config_guard;
   ScopedXOption xoption{L"jit-auto=auto:2"};

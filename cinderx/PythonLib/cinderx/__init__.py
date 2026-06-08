@@ -4,8 +4,6 @@
 
 from __future__ import annotations
 
-import gc
-import platform
 import sys
 from os import environ
 
@@ -558,6 +556,8 @@ def maybe_enable_parallel_gc() -> None:
     is_parallel_gc_enabled = environ.get("PARALLEL_GC_ENABLED", "0") == "1"
     if not has_parallel_gc() or not is_parallel_gc_enabled:
         return
+    import gc
+
     thresholds = gc.get_threshold()
     parallel_gc_threshold_gen0 = int(
         environ.get("PARALLEL_GC_THRESHOLD_GEN0", thresholds[0])

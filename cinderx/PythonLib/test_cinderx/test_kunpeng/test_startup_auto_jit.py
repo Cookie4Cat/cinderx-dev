@@ -76,6 +76,17 @@ def test_installed_cinderx_auto_import_find_and_load_provider_tracks_depth(tmp_p
     )
 
 
+def test_installed_cinderx_auto_import_uses_lazy_bootstrap(tmp_path):
+    """Requires cinderx to be installed into the tested interpreter."""
+    env = _startup_provider_env("find_and_load")
+
+    _run_startup_auto_jit_helper(
+        tmp_path,
+        env,
+        "installed cinderx lazy startup bootstrap subprocess failed",
+    )
+
+
 def test_installed_cinderx_auto_setup_provider_tracks_depth(tmp_path):
     """Requires cinderx to be installed into the tested interpreter."""
     env = _startup_provider_env("find_and_load")

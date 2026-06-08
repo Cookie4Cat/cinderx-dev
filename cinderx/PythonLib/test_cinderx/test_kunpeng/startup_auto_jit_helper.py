@@ -15,13 +15,18 @@ for value in range(call_count):
 
 cinderx = sys.modules.get("cinderx")
 cinderjit = sys.modules.get("cinderjit")
+expect_lazy_bootstrap = os.environ.get("EXPECT_CINDERX_EAGER_BOOTSTRAP") != "1"
 
 assert "_cinderx_auto" in sys.modules, "_cinderx_auto startup hook was not loaded"
 
 if os.environ.get("CINDERX_PLUGIN_ENABLE", "0") == "1":
-    assert cinderx is not None, "cinderx was not auto-loaded"
     assert cinderjit is not None, "cinderjit was not auto-loaded"
-    assert cinderx.is_initialized(), "cinderx was not initialized"
+    if expect_lazy_bootstrap:
+        assert cinderx is None, "cinderx package should not be auto-loaded"
+        import _cinderx  # noqa: F401
+    else:
+        assert cinderx is not None, "cinderx was not auto-loaded"
+        assert cinderx.is_initialized(), "cinderx was not initialized"
     assert cinderjit.is_enabled(), "cinderx JIT is not enabled"
     if auto_mode:
         assert not cinderjit.is_jit_compiled(
@@ -70,6 +75,9 @@ if os.environ.get("CINDERX_PLUGIN_ENABLE", "0") == "1":
 
     setup_provider = os.environ.get("CINDERX_AUTOJIT_SETUP_PROVIDER", "")
     if setup_provider == "lib2to3_main":
+        if cinderx is None:
+            import cinderx
+
         observed_depths = []
 
         def main():

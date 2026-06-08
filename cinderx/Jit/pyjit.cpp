@@ -3708,7 +3708,13 @@ int initialize() {
     if (Ci_InitFrameEvalFunc() < 0) {
       return -1;
     }
-    schedule_existing_functions_for_jit(*compile_n);
+    if (getConfig().auto_classify) {
+      JIT_DLOG(
+          "Configuring AutoJIT to classify new functions after {} calls",
+          *compile_n);
+    } else {
+      schedule_existing_functions_for_jit(*compile_n);
+    }
   } else if (mod_state->jit_list.get() != nullptr) {
     if (rescheduleJitList() < 0) {
       return -1;
