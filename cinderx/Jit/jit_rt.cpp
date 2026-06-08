@@ -1382,6 +1382,24 @@ PyObject* JITRT_BoxDouble(double_t d) {
   return PyFloat_FromDouble(d);
 }
 
+PyObject* JITRT_LongFloatTrueDivide(PyObject* left, PyObject* right) {
+  JIT_DCHECK(PyLong_CheckExact(left), "left operand must be exact int");
+  JIT_DCHECK(PyFloat_CheckExact(right), "right operand must be exact float");
+
+  double lhs = PyLong_AsDouble(left);
+  if (lhs == -1.0 && PyErr_Occurred()) {
+    return nullptr;
+  }
+
+  double rhs = PyFloat_AS_DOUBLE(right);
+  if (rhs == 0.0) {
+    PyErr_SetString(PyExc_ZeroDivisionError, "division by zero");
+    return nullptr;
+  }
+
+  return PyFloat_FromDouble(lhs / rhs);
+}
+
 double JITRT_PowerDouble(double x, double y) {
   return pow(x, y);
 }

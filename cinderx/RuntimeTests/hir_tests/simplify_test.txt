@@ -5322,6 +5322,172 @@ fun test {
   }
 }
 --- Test Name ---
+BinaryOpTrueDivideNonConstLongExactAndFloatExactUsesHelper
+--- Input ---
+# HIR
+fun test {
+  bb 0 {
+    v1 = LoadArg<0>
+    v2 = LoadArg<1>
+    v3 = RefineType<LongExact> v1
+    v4 = RefineType<FloatExact> v2
+    v5 = BinaryOp<TrueDivide> v3 v4
+    Return v5
+  }
+}
+--- Expected 3.12 ---
+fun test {
+  bb 0 {
+    v1:Object = LoadArg<0>
+    v2:Object = LoadArg<1>
+    v3:LongExact = RefineType<LongExact> v1
+    v4:FloatExact = RefineType<FloatExact> v2
+    UseType<LongExact> v3
+    UseType<FloatExact> v4
+    v6:OptFloatExact = CallStatic<JITRT_LongFloatTrueDivide(_object*, _object*)@0xdeadbeef, 2> v3 v4
+    v7:FloatExact = CheckExc v6 {
+      FrameState {
+        CurInstrOffset -2
+      }
+    }
+    Return v7
+  }
+}
+--- Expected 3.14 ---
+fun test {
+  bb 0 {
+    v1:Object = LoadArg<0>
+    v2:Object = LoadArg<1>
+    v3:LongExact = RefineType<LongExact> v1
+    v4:FloatExact = RefineType<FloatExact> v2
+    UseType<LongExact> v3
+    UseType<FloatExact> v4
+    v6:OptFloatExact = CallStatic<JITRT_LongFloatTrueDivide(_object*, _object*)@0xdeadbeef, 2> v3 v4
+    v7:FloatExact = CheckExc v6 {
+      FrameState {
+        CurInstrOffset -2
+      }
+    }
+    Return v7
+  }
+}
+--- Expected 3.15 ---
+fun test {
+  bb 0 {
+    v1:Object = LoadArg<0>
+    v2:Object = LoadArg<1>
+    v3:LongExact = RefineType<LongExact> v1
+    v4:FloatExact = RefineType<FloatExact> v2
+    UseType<LongExact> v3
+    UseType<FloatExact> v4
+    v6:OptFloatExact = CallStatic<JITRT_LongFloatTrueDivide(_object*, _object*)@0xdeadbeef, 2> v3 v4
+    v7:FloatExact = CheckExc v6 {
+      FrameState {
+        CurInstrOffset -2
+      }
+    }
+    Return v7
+  }
+}
+--- Test Name ---
+BinaryOpTrueDivideFloatExactAndNonConstLongExactKeepsCompactLongFastPath
+--- Input ---
+# HIR
+fun test {
+  bb 0 {
+    v1 = LoadArg<0>
+    v2 = LoadArg<1>
+    v3 = RefineType<FloatExact> v1
+    v4 = RefineType<LongExact> v2
+    v5 = BinaryOp<TrueDivide> v3 v4
+    Return v5
+  }
+}
+--- Expected 3.12 ---
+fun test {
+  bb 0 {
+    v1:Object = LoadArg<0>
+    v2:Object = LoadArg<1>
+    v3:FloatExact = RefineType<FloatExact> v1
+    v4:LongExact = RefineType<LongExact> v2
+    UseType<FloatExact> v3
+    UseType<LongExact> v4
+    v6:CBool = IsCompactLong v4
+    Guard v6 {
+    }
+    v7:CInt64 = CompactLongUnbox v4
+    v8:CDouble = PrimitiveConvert<CDouble> v7
+    v9:CDouble = PrimitiveUnbox<CDouble> v3
+    v10:CDouble[0] = LoadConst<CDouble[0]>
+    v11:CBool = PrimitiveCompare<NotEqual> v8 v10
+    Guard v11 {
+    }
+    v12:CDouble = DoubleBinaryOp<TrueDivide> v9 v8
+    v13:FloatExact = PrimitiveBox<CDouble> v12 {
+      FrameState {
+        CurInstrOffset -2
+      }
+    }
+    Return v13
+  }
+}
+--- Expected 3.14 ---
+fun test {
+  bb 0 {
+    v1:Object = LoadArg<0>
+    v2:Object = LoadArg<1>
+    v3:FloatExact = RefineType<FloatExact> v1
+    v4:LongExact = RefineType<LongExact> v2
+    UseType<FloatExact> v3
+    UseType<LongExact> v4
+    v6:CBool = IsCompactLong v4
+    Guard v6 {
+    }
+    v7:CInt64 = CompactLongUnbox v4
+    v8:CDouble = PrimitiveConvert<CDouble> v7
+    v9:CDouble = PrimitiveUnbox<CDouble> v3
+    v10:CDouble[0] = LoadConst<CDouble[0]>
+    v11:CBool = PrimitiveCompare<NotEqual> v8 v10
+    Guard v11 {
+    }
+    v12:CDouble = DoubleBinaryOp<TrueDivide> v9 v8
+    v13:FloatExact = PrimitiveBox<CDouble> v12 {
+      FrameState {
+        CurInstrOffset -2
+      }
+    }
+    Return v13
+  }
+}
+--- Expected 3.15 ---
+fun test {
+  bb 0 {
+    v1:Object = LoadArg<0>
+    v2:Object = LoadArg<1>
+    v3:FloatExact = RefineType<FloatExact> v1
+    v4:LongExact = RefineType<LongExact> v2
+    UseType<FloatExact> v3
+    UseType<LongExact> v4
+    v6:CBool = IsCompactLong v4
+    Guard v6 {
+    }
+    v7:CInt64 = CompactLongUnbox v4
+    v8:CDouble = PrimitiveConvert<CDouble> v7
+    v9:CDouble = PrimitiveUnbox<CDouble> v3
+    v10:CDouble[0] = LoadConst<CDouble[0]>
+    v11:CBool = PrimitiveCompare<NotEqual> v8 v10
+    Guard v11 {
+    }
+    v12:CDouble = DoubleBinaryOp<TrueDivide> v9 v8
+    v13:FloatExact = PrimitiveBox<CDouble> v12 {
+      FrameState {
+        CurInstrOffset -2
+      }
+    }
+    Return v13
+  }
+}
+--- Test Name ---
 BinaryOpWithObjSpecLeftAndRightLongExactTurnsIntoLoadConst
 --- Input ---
 # HIR
