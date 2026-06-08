@@ -3,7 +3,9 @@
 #include "cinderx/Jit/generators_rt.h"
 
 #include "internal/pycore_frame.h"
+#include "internal/pycore_gc.h" // _PyObject_GC_IS_TRACKED()
 #include "internal/pycore_genobject.h"
+#include "internal/pycore_object.h" // _PyObject_GC_UNTRACK()
 #include "internal/pycore_pyerrors.h" // _PyErr_ClearExcState()
 
 #include "cinderx/Common/log.h"
@@ -20,11 +22,19 @@
 
 namespace jit {
 
+bool deopt_jit_gen_with_footer(
+    JitGenObject* jit_gen,
+    GenDataFooter* gen_footer,
+    bool tree_iter_cleared);
+
 PyObject* JitGenObject::yieldFrom() {
+  if (gi_frame_state == FRAME_CREATED || FRAME_STATE_FINISHED(gi_frame_state)) {
+    return nullptr;
+  }
   GenDataFooter* gen_footer = genDataFooter();
   const GenYieldPoint* yield_point = gen_footer->yieldPoint;
   PyObject* yield_from = nullptr;
-  if (!FRAME_STATE_FINISHED(gi_frame_state) && yield_point) {
+  if (yield_point) {
     yield_from = yieldFromValue(gen_footer, yield_point);
     Py_XINCREF(yield_from);
   }
@@ -58,7 +68,9 @@ void gen_dealloc_with_custom_free(PyObject* self) {
 
   auto* gen = reinterpret_cast<PyGenObject*>(self);
 
-  PyObject_GC_UnTrack(gen);
+  if (_PyObject_GC_IS_TRACKED(self)) {
+    _PyObject_GC_UNTRACK(self);
+  }
 
   if (gen->gi_weakreflist != nullptr) {
     PyObject_ClearWeakRefs(self);
@@ -99,14 +111,89 @@ void gen_dealloc_with_custom_free(PyObject* self) {
   cinderx::getModuleState()->jit_gen_free_list->free(self);
 }
 
+void gen_dealloc_finished_coro_fast(PyObject* self) {
+  JIT_DCHECK(
+      PyCoro_CheckExact(self),
+      "gen_dealloc_finished_coro_fast called on a non-coroutine object");
+
+  auto* gen = reinterpret_cast<PyGenObject*>(self);
+  auto* coro = reinterpret_cast<PyCoroObject*>(self);
+  JIT_DCHECK(gen->gi_weakreflist == nullptr, "fast path has weakrefs");
+  JIT_DCHECK(
+      coro->cr_origin_or_finalizer == nullptr,
+      "fast path has coroutine origin/finalizer");
+  JIT_DCHECK(
+      gen->gi_frame_state == FRAME_CLEARED, "fast path frame is not cleared");
+
+  if (_PyObject_GC_IS_TRACKED(self)) {
+    _PyObject_GC_UNTRACK(self);
+  }
+
+  _PyInterpreterFrame* frame = generatorFrame(gen);
+  JIT_DCHECK(frame->previous == nullptr, "fast path frame is linked");
+
+  Ci_STACK_CLEAR(frame->FRAME_EXECUTABLE);
+  Py_CLEAR(gen->gi_name);
+  Py_CLEAR(gen->gi_qualname);
+
+#ifdef ENABLE_GENERATOR_AWAITER
+  JIT_DCHECK(gen->gi_ci_awaiter == nullptr, "fast path has awaiter");
+#endif
+
+  cinderx::getModuleState()->jit_gen_free_list->free(self);
+}
+
+void deopt_finished_coro_object_only(JitGenObject* gen) {
+  JIT_DCHECK(
+      Py_TYPE(gen) == cinderx::getModuleState()->coro_type,
+      "fast path called on a non-JIT coroutine");
+  PyTypeObject* old_type = Py_TYPE(gen);
+  Py_DECREF(old_type);
+  Py_SET_TYPE(reinterpret_cast<PyObject*>(gen), &PyCoro_Type);
+}
+
 void jitgen_dealloc(PyObject* self) {
   // Clear TreeIter state before deopt so the footer pointer is still valid.
   JitGenObject* jit_gen = JitGenObject::cast(self);
+  GenDataFooter* gen_footer = nullptr;
+  bool fast_finished_coro = false;
   if (jit_gen != nullptr) {
-    clearTreeIterState(jit_gen->genDataFooter());
+    gen_footer = jit_gen->genDataFooter();
+#if PY_VERSION_HEX >= 0x030E0000
+    // Older frame layouts need the generic deopt path's reified-frame cleanup.
+    fast_finished_coro =
+        Py_IS_TYPE(self, cinderx::getModuleState()->coro_type) &&
+        gen_footer->yieldPoint == nullptr &&
+        gen_footer->tree_iter_state == nullptr &&
+        jit_gen->gi_frame_state == FRAME_CLEARED &&
+        jit_gen->gi_weakreflist == nullptr &&
+        reinterpret_cast<PyCoroObject*>(jit_gen)->cr_origin_or_finalizer ==
+            nullptr &&
+        generatorFrame(jit_gen)->previous == nullptr;
+#endif
+    if (!fast_finished_coro) {
+      clearTreeIterState(gen_footer);
+    }
   }
 
-  if (!deopt_jit_gen(self)) {
+  if (fast_finished_coro) {
+    deopt_finished_coro_object_only(jit_gen);
+    gen_dealloc_finished_coro_fast(self);
+    return;
+  }
+
+  bool deopted = true;
+  if (jit_gen == nullptr) {
+    deopted = deopt_jit_gen(self);
+  } else if (
+      gen_footer->yieldPoint == nullptr &&
+      FRAME_STATE_FINISHED(jit_gen->gi_frame_state)) {
+    deopt_jit_gen_object_only(jit_gen);
+  } else {
+    deopted = deopt_jit_gen_with_footer(
+        jit_gen, gen_footer, true /* tree_iter_cleared */);
+  }
+  if (!deopted) {
     JIT_ABORT("Tried to dealloc a running JIT generator");
   }
 
@@ -848,15 +935,13 @@ void deopt_jit_gen_object_only(JitGenObject* gen) {
   }
 }
 
-bool deopt_jit_gen(PyObject* obj) {
-  JitGenObject* jit_gen = JitGenObject::cast(obj);
-  if (jit_gen == nullptr) {
-    return true;
-  }
+bool deopt_jit_gen_with_footer(
+    JitGenObject* jit_gen,
+    GenDataFooter* gen_footer,
+    bool tree_iter_cleared) {
   if (jit_gen->gi_frame_state == FRAME_EXECUTING) {
     return false;
   }
-  GenDataFooter* gen_footer = jit_gen->genDataFooter();
   if (gen_footer->tree_iter_state != nullptr) {
     return false;
   }
@@ -886,10 +971,21 @@ bool deopt_jit_gen(PyObject* obj) {
         "JIT generator has no yield point and is not running or completed");
   }
 
-  clearTreeIterState(gen_footer);
+  if (!tree_iter_cleared) {
+    clearTreeIterState(gen_footer);
+  }
   deopt_jit_gen_object_only(jit_gen);
 
   return true;
+}
+
+bool deopt_jit_gen(PyObject* obj) {
+  JitGenObject* jit_gen = JitGenObject::cast(obj);
+  if (jit_gen == nullptr) {
+    return true;
+  }
+  return deopt_jit_gen_with_footer(
+      jit_gen, jit_gen->genDataFooter(), false /* tree_iter_cleared */);
 }
 
 // Cache/copy features of PyGen_Type so we don't need to reimplement them.

@@ -21,7 +21,7 @@ import sys
 from typing import Iterable, TextIO
 
 
-LLVM_MAJOR_VERSION = "17"
+LLVM_MAJOR_VERSION = "12"
 
 C_FORMAT_EXTENSIONS = {
     ".c",
@@ -604,6 +604,8 @@ def main() -> int:
             format_report.close()
             if report_path is not None:
                 print(f"clang-format diff report: {report_path}")
+                if rc and report_path.is_file() and report_path.stat().st_size > 0:
+                    print(report_path.read_text(encoding="utf-8"), end="")
 
     return rc
 

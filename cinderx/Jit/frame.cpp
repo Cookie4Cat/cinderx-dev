@@ -34,6 +34,22 @@ struct FrameAndLoc {
 
 using UnitState = std::vector<FrameAndLoc>;
 
+#if defined(ENABLE_LIGHTWEIGHT_FRAMES) && PY_VERSION_HEX >= 0x030E0000
+FrameHeader* jitGenFrameGetHeader(_PyInterpreterFrame* frame) {
+  constexpr Py_ssize_t kJitGenDataOffsetFromFrameEnd = sizeof(PyGenObject) +
+      sizeof(GenDataFooter*) - offsetof(PyGenObject, gi_iframe) -
+      FRAME_SPECIALS_SIZE * sizeof(PyObject*);
+  static_assert(
+      kJitGenDataOffsetFromFrameEnd % sizeof(PyObject*) == 0,
+      "JIT generator data offset should be pointer-aligned");
+  auto footer = *reinterpret_cast<GenDataFooter**>(
+      reinterpret_cast<char*>(frame) +
+      _PyFrame_GetCode(frame)->co_framesize * sizeof(PyObject*) +
+      kJitGenDataOffsetFromFrameEnd);
+  return &footer->frame_header;
+}
+#endif
+
 CodeRuntime* getCodeRuntime(_PyInterpreterFrame* frame) {
   BorrowedRef<PyFunctionObject> func;
   if (hasRtfsFunction(frame)) {
@@ -531,9 +547,12 @@ _PyInterpreterFrame* convertInterpreterFrameFromStackToSlab(
 FrameHeader* jitFrameGetHeader(_PyInterpreterFrame* frame) {
 #ifdef ENABLE_LIGHTWEIGHT_FRAMES
   if (_PyFrame_GetCode(frame)->co_flags & kCoFlagsAnyGenerator) {
-    PyGenObject* gen = _PyGen_GetGeneratorFromFrame(frame);
-    auto footer = jitGenDataFooter(gen);
+#if PY_VERSION_HEX >= 0x030E0000
+    return jitGenFrameGetHeader(frame);
+#else
+    auto footer = jitGenDataFooter(frame);
     return (FrameHeader*)&footer->frame_header;
+#endif
   }
   return reinterpret_cast<FrameHeader*>(frame) - 1;
 #else

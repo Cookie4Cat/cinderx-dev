@@ -71,6 +71,10 @@ GenDataFooter** jitGenDataFooterPtr(PyGenObject* gen, PyCodeObject* gen_code);
 
 GenDataFooter** jitGenDataFooterPtr(PyGenObject* gen);
 
+GenDataFooter** jitGenDataFooterPtr(_PyInterpreterFrame* gen_frame);
+
 GenDataFooter* jitGenDataFooter(PyGenObject* gen);
+
+GenDataFooter* jitGenDataFooter(_PyInterpreterFrame* gen_frame);
 
 } // namespace jit

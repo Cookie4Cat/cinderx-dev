@@ -40,8 +40,18 @@ struct JitGenObject : PyGenObject {
                                 : nullptr;
   }
 
+  GenDataFooter** genDataFooterPtr(PyCodeObject* gen_code) {
+    PyTypeObject* gen_type = cinderx::getModuleState()->gen_type;
+    size_t python_frame_data_bytes =
+        _PyFrame_NumSlotsForCodeObject(gen_code) * gen_type->tp_itemsize;
+    return reinterpret_cast<GenDataFooter**>(
+        reinterpret_cast<uintptr_t>(this) + gen_type->tp_basicsize +
+        python_frame_data_bytes);
+  }
+
   GenDataFooter** genDataFooterPtr() {
-    return jitGenDataFooterPtr(this);
+    _PyInterpreterFrame* gen_frame = generatorFrame(this);
+    return genDataFooterPtr(_PyFrame_GetCode(gen_frame));
   }
 
   GenDataFooter* genDataFooter() {
