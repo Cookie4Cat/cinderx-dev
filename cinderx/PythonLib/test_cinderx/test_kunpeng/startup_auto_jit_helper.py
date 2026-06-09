@@ -56,7 +56,13 @@ if os.environ.get("CINDERX_PLUGIN_ENABLE", "0") == "1":
         class ProbeFinder:
             def find_spec(self, fullname, path=None, target=None):
                 if fullname == f"startup_auto_jit_probe_{provider}":
-                    observed_depths.append(_cinderx._autojit_import_depth())
+                    observed_depths.append(
+                        (
+                            _cinderx._autojit_import_depth(),
+                            _cinderx._autojit_import_scope_depth(),
+                            _cinderx._autojit_setup_depth(),
+                        )
+                    )
                 return None
 
         finder = ProbeFinder()
@@ -70,8 +76,12 @@ if os.environ.get("CINDERX_PLUGIN_ENABLE", "0") == "1":
             sys.meta_path.remove(finder)
 
         assert observed_depths, "import provider probe did not run"
-        assert all(depth > 0 for depth in observed_depths), observed_depths
+        assert all(depth[0] > 0 for depth in observed_depths), observed_depths
+        assert all(depth[1] > 0 for depth in observed_depths), observed_depths
+        assert all(depth[2] == 0 for depth in observed_depths), observed_depths
         assert _cinderx._autojit_import_depth() == 0
+        assert _cinderx._autojit_import_scope_depth() == 0
+        assert _cinderx._autojit_setup_depth() == 0
 
     setup_provider = os.environ.get("CINDERX_AUTOJIT_SETUP_PROVIDER", "")
     if setup_provider == "lib2to3_main":
@@ -81,7 +91,13 @@ if os.environ.get("CINDERX_PLUGIN_ENABLE", "0") == "1":
         observed_depths = []
 
         def main():
-            observed_depths.append(_cinderx._autojit_import_depth())
+            observed_depths.append(
+                (
+                    _cinderx._autojit_import_depth(),
+                    _cinderx._autojit_import_scope_depth(),
+                    _cinderx._autojit_setup_depth(),
+                )
+            )
             return 42
 
         module = types.ModuleType("lib2to3.main")
@@ -94,8 +110,12 @@ if os.environ.get("CINDERX_PLUGIN_ENABLE", "0") == "1":
             == setup_provider
         ), "lib2to3 setup provider was not installed"
         assert module.main() == 42
-        assert observed_depths and observed_depths[0] > 0, observed_depths
+        assert observed_depths and observed_depths[0][0] > 0, observed_depths
+        assert observed_depths[0][1] == 0, observed_depths
+        assert observed_depths[0][2] > 0, observed_depths
         assert _cinderx._autojit_import_depth() == 0
+        assert _cinderx._autojit_import_scope_depth() == 0
+        assert _cinderx._autojit_setup_depth() == 0
 else:
     assert cinderx is None, "cinderx was auto-loaded"
     assert cinderjit is None, "cinderjit was auto-loaded"

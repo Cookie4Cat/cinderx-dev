@@ -68,6 +68,10 @@ try:
         _autojit_import_depth,
         _autojit_import_enter,
         _autojit_import_leave,
+        _autojit_import_scope_depth,
+        _autojit_setup_depth,
+        _autojit_setup_enter,
+        _autojit_setup_leave,
         _compile_perf_trampoline_pre_fork,
         _is_compile_perf_trampoline_pre_fork_enabled,
         async_cached_classproperty,
@@ -140,6 +144,18 @@ except ImportError as e:
         pass
 
     def _autojit_import_depth() -> int:
+        return 0
+
+    def _autojit_import_scope_depth() -> int:
+        return 0
+
+    def _autojit_setup_enter() -> None:
+        pass
+
+    def _autojit_setup_leave() -> None:
+        pass
+
+    def _autojit_setup_depth() -> int:
         return 0
 
     def is_lightweight_frames_enabled() -> bool:
@@ -592,12 +608,12 @@ _AUTOJIT_SETUP_PROVIDER_MARKER = "_cinderx_autojit_setup_provider"
 
 def _make_autojit_setup_wrapper(original: object, provider: str) -> object:
     def wrapper(*args: object, **kwargs: object) -> object:
-        _autojit_import_enter()
+        _autojit_setup_enter()
         try:
             # pyre-ignore[29]: The wrapped setup callable is dynamically chosen.
             return original(*args, **kwargs)
         finally:
-            _autojit_import_leave()
+            _autojit_setup_leave()
 
     setattr(wrapper, _AUTOJIT_SETUP_PROVIDER_MARKER, provider)
     setattr(wrapper, "__wrapped__", original)

@@ -46,11 +46,11 @@ if os.environ.get("CINDERX_PLUGIN_ENABLE", "0") == "1":
 
     def _make_autojit_setup_wrapper(original, provider):
         def wrapper(*args, **kwargs):
-            _cinderx._autojit_import_enter()
+            _cinderx._autojit_setup_enter()
             try:
                 return original(*args, **kwargs)
             finally:
-                _cinderx._autojit_import_leave()
+                _cinderx._autojit_setup_leave()
 
         setattr(wrapper, _AUTOJIT_SETUP_PROVIDER_MARKER, provider)
         setattr(wrapper, "__wrapped__", original)

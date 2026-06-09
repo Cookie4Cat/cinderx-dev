@@ -795,6 +795,39 @@ assert after_calls == before_calls, (before_calls, after_calls)
 )");
 }
 
+TEST_F(
+    BehaviorClassifierRuntimeTest,
+    SetupDepthTracksSeparatelyFromImportDepth) {
+  ScopedAutoJitConfig config_guard;
+  getMutableConfig().compile_after_n_calls = 2;
+  getMutableConfig().auto_classify = true;
+  getMutableConfig().enable_startup_init_policy = true;
+
+  runStockCode(R"(
+import _cinderx
+import cinderjit
+import cinderx.jit as jit
+
+cinderjit._clear_autojit_gate_stats()
+
+def helper(x):
+    return x
+
+_cinderx._autojit_setup_enter()
+try:
+    helper(1)
+finally:
+    _cinderx._autojit_setup_leave()
+
+stats = cinderjit._autojit_gate_stats()
+assert stats["jit_vectorcall"] >= 1, stats
+assert stats["global_threshold_return"] >= 1, stats
+assert not jit.is_jit_compiled(helper)
+assert _cinderx._autojit_import_depth() == 0
+assert _cinderx._autojit_setup_depth() == 0
+)");
+}
+
 TEST_F(BehaviorClassifierRuntimeTest, DefaultImportProviderTracksFindAndLoadDepth) {
   runStockCode(R"(
 import os
@@ -809,7 +842,11 @@ observed_depths = []
 class ProbeFinder:
     def find_spec(self, fullname, path=None, target=None):
         if fullname == "autojit_probe_missing_default":
-            observed_depths.append(_cinderx._autojit_import_depth())
+            observed_depths.append((
+                _cinderx._autojit_import_depth(),
+                _cinderx._autojit_import_scope_depth(),
+                _cinderx._autojit_setup_depth(),
+            ))
         return None
 
 finder = ProbeFinder()
@@ -828,8 +865,12 @@ assert getattr(
     None,
 ) == "find_and_load"
 assert observed_depths, observed_depths
-assert all(depth > 0 for depth in observed_depths), observed_depths
+assert all(depth[0] > 0 for depth in observed_depths), observed_depths
+assert all(depth[1] > 0 for depth in observed_depths), observed_depths
+assert all(depth[2] == 0 for depth in observed_depths), observed_depths
 assert _cinderx._autojit_import_depth() == 0
+assert _cinderx._autojit_import_scope_depth() == 0
+assert _cinderx._autojit_setup_depth() == 0
 )");
 }
 
@@ -846,7 +887,11 @@ observed_depths = []
 class ProbeFinder:
     def find_spec(self, fullname, path=None, target=None):
         if fullname == "autojit_probe_missing_off":
-            observed_depths.append(_cinderx._autojit_import_depth())
+            observed_depths.append((
+                _cinderx._autojit_import_depth(),
+                _cinderx._autojit_import_scope_depth(),
+                _cinderx._autojit_setup_depth(),
+            ))
         return None
 
 finder = ProbeFinder()
@@ -859,8 +904,10 @@ try:
 finally:
     sys.meta_path.remove(finder)
 
-assert observed_depths and all(depth == 0 for depth in observed_depths)
+assert observed_depths and all(depth == (0, 0, 0) for depth in observed_depths)
 assert _cinderx._autojit_import_depth() == 0
+assert _cinderx._autojit_import_scope_depth() == 0
+assert _cinderx._autojit_setup_depth() == 0
 )");
 }
 
@@ -878,7 +925,11 @@ observed_depths = []
 class ProbeFinder:
     def find_spec(self, fullname, path=None, target=None):
         if fullname == "autojit_probe_missing_builtins":
-            observed_depths.append(_cinderx._autojit_import_depth())
+            observed_depths.append((
+                _cinderx._autojit_import_depth(),
+                _cinderx._autojit_import_scope_depth(),
+                _cinderx._autojit_setup_depth(),
+            ))
         return None
 
 finder = ProbeFinder()
@@ -897,8 +948,12 @@ assert getattr(
     None,
 ) == "builtins"
 assert observed_depths, observed_depths
-assert all(depth > 0 for depth in observed_depths), observed_depths
+assert all(depth[0] > 0 for depth in observed_depths), observed_depths
+assert all(depth[1] > 0 for depth in observed_depths), observed_depths
+assert all(depth[2] == 0 for depth in observed_depths), observed_depths
 assert _cinderx._autojit_import_depth() == 0
+assert _cinderx._autojit_import_scope_depth() == 0
+assert _cinderx._autojit_setup_depth() == 0
 )");
 }
 
@@ -916,7 +971,11 @@ observed_depths = []
 class ProbeFinder:
     def find_spec(self, fullname, path=None, target=None):
         if fullname == "autojit_probe_missing_find_and_load":
-            observed_depths.append(_cinderx._autojit_import_depth())
+            observed_depths.append((
+                _cinderx._autojit_import_depth(),
+                _cinderx._autojit_import_scope_depth(),
+                _cinderx._autojit_setup_depth(),
+            ))
         return None
 
 finder = ProbeFinder()
@@ -935,8 +994,12 @@ assert getattr(
     None,
 ) == "find_and_load"
 assert observed_depths, observed_depths
-assert all(depth > 0 for depth in observed_depths), observed_depths
+assert all(depth[0] > 0 for depth in observed_depths), observed_depths
+assert all(depth[1] > 0 for depth in observed_depths), observed_depths
+assert all(depth[2] == 0 for depth in observed_depths), observed_depths
 assert _cinderx._autojit_import_depth() == 0
+assert _cinderx._autojit_import_scope_depth() == 0
+assert _cinderx._autojit_setup_depth() == 0
 )");
 }
 
@@ -955,7 +1018,11 @@ import _cinderx
 observed_depths = []
 
 def main():
-    observed_depths.append(_cinderx._autojit_import_depth())
+    observed_depths.append((
+        _cinderx._autojit_import_depth(),
+        _cinderx._autojit_import_scope_depth(),
+        _cinderx._autojit_setup_depth(),
+    ))
     return 42
 
 module = types.ModuleType("lib2to3.main")
@@ -970,8 +1037,12 @@ assert getattr(
     None,
 ) == "lib2to3_main"
 assert module.main() == 42
-assert observed_depths and observed_depths[0] > 0
+assert observed_depths and observed_depths[0][0] > 0
+assert observed_depths[0][1] == 0
+assert observed_depths[0][2] > 0
 assert _cinderx._autojit_import_depth() == 0
+assert _cinderx._autojit_import_scope_depth() == 0
+assert _cinderx._autojit_setup_depth() == 0
 )");
 }
 

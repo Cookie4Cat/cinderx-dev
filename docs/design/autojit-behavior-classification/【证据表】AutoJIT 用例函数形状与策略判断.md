@@ -10,6 +10,7 @@
 
 | 版本 | 日期 | 修订人 | 修订说明 |
 |---|---|---|---|
+| v0.20 | 2026-06-09 | @sisibeloved | 补充 import/setup 细粒度决策穿刺：拆分 `import_phase`/`setup_phase` 诊断字段并保留 split-only 基础设施；提前 import 分类冻结无稳定收益，暂不引入 import/setup 分叉阈值策略。 |
 | v0.19 | 2026-06-08 | @sisibeloved | 补充 startup/site 成本拆解：`_cinderx_exec_impl()`、`jit::initialize()`、`importtime`、gate stats 与 import-depth skip 负向穿刺分表记录；确认 P2a 有成本但不能简单跳过计数。 |
 | v0.18 | 2026-06-08 | @sisibeloved | 补充 `2to3` refactor 热点穿刺：profile 确认 parse/pattern 函数是真热点，但 env-gated allow 编译显著负收益，suppress 基本持平；refactor 热点不作为下一步 AutoJIT 策略收益点。 |
 | v0.17 | 2026-06-08 | @sisibeloved | 更新 `2to3` 当前候选账本：以 lowROI + cold-bit 作为当前口径，补充 673ms 阶段分布、gate stats、P0 穿刺负结论和下一步优化判断。 |
@@ -71,6 +72,7 @@
 | `2to3` | phase timer + 高全局阈值诊断，`--affinity=30`，20 次 direct bench_command；`auto:2097152` 正式 pyperformance 60 values | `blue-98:/root/cinderx-lab/results/autojit-2to3-phase-20260608/{phase_summary_table.md,phase_compile_table.md,cinderx_auto2_phase.jsonl,cinderx_autojit_nocompile_2to3_aff30.json,autojit_phase_compile_summary.json}` | `PYTHONJITAUTO=2` phase timer 为 `4108.0ms`，与正式 `4097ms` 对齐；`cinderx_no_plugin=516.7ms`，`plugin_jitdisabled=527.6ms`，`auto:2097152=689.6ms/正式693ms`，`auto:2=974.0ms`；`auto:2097152` 证明“巨大全局阈值”会让每次调用反复进 `jitVectorcall`，不等价于生产 defer fast path |
 | `2to3` | 生产 no-compile fast path 穿刺：`auto:2` 达到分类点后强制 interpret-only 阈值并恢复 interpreted vectorcall | `blue-98:/root/cinderx-lab/results/autojit-2to3-phase-20260608/{cinderx_autojit_force_interpret_2to3_aff30.json,cinderx_autojit_force_interpret_phase_summary.json,autojit_force_interpret_debug.jit.log}` | phase timer `632.8ms`，正式 pyperformance `635.5ms`，debug 编译数 0；低于 CPython JIT 85% 目标线 `646ms`，证明生产 defer fast path 成本可接受 |
 | `2to3` | 当前候选：lowROI 收窄 + classified warmup return + cold-bit 计数早退 | `blue-98:/results/autojit-p0-spike-20260608/{cold-bit-provider-2to3.json,cold-bit-phase-summary.json,cleaned-retained-candidate-build.log}` | 正式 pyperformance `673ms +- 1ms`，phase timer `673.3ms`；距 CPython JIT 85% 目标线约 `+27ms`；forced compile 中位数降到 11 |
+| `2to3` | import/setup split-only：`GateContext` 拆出 `import_phase`、`setup_phase`，compile event 打细分阶段；策略仍按合并 `startup_phase` 执行 | `blue-98:/results/autojit-p0-spike-20260608/{import-setup-split-clean-2to3.json,import-setup-split-clean-phase.jsonl,import-setup-split-clean-phase-gate-stats.jsonl,import-setup-split-diag-compile-events.jsonl}` | 正式 pyperformance `679ms +- 1ms`，phase timer `675.8ms`；gate 分布与当前候选同量级；1 次诊断事件中 `phase` 可分出 `steady=7/import=7/setup=2`；作为后续分阶段决策基础保留 |
 | `2to3` | setup/main window 扩大穿刺 | `blue-98:/results/autojit-p0-spike-20260608/{p0-main-setup-provider-2to3.json,current-candidate-main-setup-phase-summary.json}` | 正式 `765ms +- 11ms`，phase timer `777.7ms`；forced compile 从 11 增到约 77-79，负收益，已回滚 |
 | `2to3` | P0 固定成本穿刺：C 侧 import wrapper、lazy `cinderjit` | `blue-98:/results/autojit-p0-spike-20260608/{c-import-wrapper-provider-2to3.json,lazy-cinderjit-provider-2to3.json,c-import-wrapper-phase-summary.json,lazy-cinderjit-phase-summary.json}` | C wrapper 正式 `673ms +- 2ms`，lazy `cinderjit` 正式 `675ms +- 2ms`；相比当前候选无稳定收益，已回滚 |
 | `2to3` | refactor 热点 allow/suppress 穿刺 | `blue-98:/results/autojit-p0-spike-20260608/refactor-hotspot-phase/*`；profile: `.../refactor-hotspot-profile/current-candidate.prof` | 当前 off phase `669.3ms`；`allow-parse=876.5ms`、`allow-pattern=885.9ms`、`allow-all=1081.0ms` 明显负收益；`suppress-all=670.5ms` 基本持平，穿刺代码已回滚 |
@@ -139,6 +141,7 @@
 | 历史 setup provider 口径 | 966-973ms | 974.0ms | +424.3ms | +328.0ms | 已被后续优化替代 |
 | force interpret-only 穿刺 | 635.5ms | 632.8ms | +83.1ms | -13.2ms | 证明 defer fast path 上限足够 |
 | 当前候选：lowROI + cold-bit | 673ms +- 1ms | 673.3ms | +123.6ms | +27.3ms | 保留候选，接近但未达标 |
+| import/setup split-only | 679ms +- 1ms | 675.8ms | +126.1ms | +29.8ms | 语义/诊断改造，性能中性，不当作优化收益 |
 
 ### 6.2 当前阶段数据
 
@@ -164,17 +167,17 @@
 
 ### 6.3 gate stats 数据
 
-数据来源：当前候选 `CINDERX_AUTOJIT_GATE_STATS=1`。这些计数回答“函数经过 gate 后走了哪条路径”。
+数据来源：当前候选与 split-only `CINDERX_AUTOJIT_GATE_STATS=1`。这些计数回答“函数经过 gate 后走了哪条路径”。
 
-| 指标 | 中位数 |
-|---|---:|
-| `jit_vectorcall` | 2919 |
-| `global_threshold_return` | 1119 |
-| `classified_warmup_return` | 10 |
-| `classified_defer_freeze` | 1780 |
-| `forced_compile` | 10 |
-| `forced_compile_ok` | 10 |
-| `fallback` | 0 |
+| 指标 | 当前候选 | split-only |
+|---|---:|---:|
+| `jit_vectorcall` | 2919 | 2871 |
+| `global_threshold_return` | 1119 | 1100 |
+| `classified_warmup_return` | 10 | 11 |
+| `classified_defer_freeze` | 1780 | 1752 |
+| `forced_compile` | 10 | 8 |
+| `forced_compile_ok` | 10 | 8 |
+| `fallback` | 0 | 0 |
 
 ### 6.4 负向穿刺数据
 
@@ -186,17 +189,20 @@
 | refactor 热点 allow 编译 | 未跑正式，phase 已明显负收益 | `allow-parse=876.5ms`；`allow-pattern=885.9ms`；`allow-all=1081.0ms` | `forced_compile` 中位数从 9 增到 17/26/34 | 负收益，已回滚 |
 | refactor 热点 suppress | 未跑正式，phase 基本持平 | `suppress-all=670.5ms`；默认 off `669.3ms` | compile events 和 gate medians 与 off 基本一致 | 无收益，已回滚 |
 | import-depth 内跳过 `CI_UPDATE_CALL_COUNT` | 未跑正式，phase 已明显负收益 | prelude `57.5ms -> 51.6ms`，但 `2to3` full `669.3ms -> 849.7ms` | `2to3` 一次 run 的 `jit_vectorcall` 从约 `2892` 暴涨到 `607856` | 不能生产化，已回滚 |
+| import 期提前分类冻结 | 未跑正式，启动微探针已退 | `-c pass` 约 `32.1ms -> 33.0ms`；prelude 约 `57.5ms -> 59.9ms`；`2to3` phase 无稳定优势 | gate 次数下降，但第一次调用就扫字节码，成本抵消收益 | 不保留 |
+| import/setup split-only | 679ms +- 1ms | `675.8ms` | gate 分布与当前候选同量级；compile event 可分 `steady/import/setup` | 保留语义和诊断基础，不单独宣称性能收益 |
 
 ### 6.5 当前读法
 
 | 问题 | 证据 | 判断 |
 |---|---|---|
-| 编译风暴是否还在 | `forced_compile` 中位数只有 10；`classified_defer_freeze` 中位数 1780 | 大编译风暴已经基本消失，继续粗拦形状收益有限 |
-| 为什么还差 27ms | 当前 673.3ms，目标约 646ms；相对 force interpret-only 还有 40.5ms | 剩余空间存在，但已经是小账，不是几百毫秒级编译风暴 |
+| 编译风暴是否还在 | 当前候选 `forced_compile` 中位数 10；split-only 中位数 8；`classified_defer_freeze` 约 1750-1780 | 大编译风暴已经基本消失，继续粗拦形状收益有限 |
+| 为什么还差 30ms 左右 | split-only phase 675.8ms，目标约 646ms；相对 force interpret-only 还有约 43ms | 剩余空间存在，但已经是小账，不是几百毫秒级编译风暴 |
 | 最大的可挤空间在哪里 | 相对 force interpret-only：startup/site +19.5ms，tool init +7.8ms，refactor +5.5ms，import +3.8ms | 若只追 85% 线，优先看 startup/site 固定成本，其次看 tool/refactor 小账 |
 | 为什么不继续扩大 setup window | setup/main 扩大后正式退到 765ms，forced compile 反而增多 | 粗粒度 setup 信号太宽，会把该编译的函数放回编译路径 |
 | 为什么不合 C wrapper/lazy `cinderjit` | 正式结果没有稳定改善 | 当前瓶颈不是 Python 层 import wrapper 或顶层 `import cinderjit` |
 | 为什么不做 refactor 热点 allow | allow-parse/pattern/all 都明显变慢 | refactor 热点是真热点，但当前 CinderX JIT 编译这些函数 ROI 为负 |
+| import/setup 是否已经可以分开定策略 | split-only 能记录 `import_phase/setup_phase`，但当前正式结果只是中性；提前 import 冻结和扩大 setup 都失败 | 先保留上下文和诊断字段，暂不把 import/setup 走成不同阈值策略 |
 
 ### 6.6 refactor 热点穿刺
 
@@ -262,11 +268,13 @@ phase timer 结果如下，使用同一新 wheel、同一 20 次 harness，因�
 |---|---:|---:|---:|---:|
 | `-c pass` 当前候选 | 410 | 247 | 152 | 3 |
 | prelude 当前候选 | 423 | 250 | 162 | 3 |
+| `-c pass` split-only | 410 | 247 | 152 | 3 |
+| prelude split-only | 423 | 250 | 162 | 3 |
 | prelude + import-depth skip | 2453 | 2407 | 37 | 1 |
 | `2to3` 当前候选，同 `phase_2to3_mode.py` | 2871 | 1100 | 1752 | 8 |
 | `2to3` + import-depth skip | 607856 | 607635 | 177 | 7 |
 
-读法：prelude 与 `-c pass` 的 gate 次数接近，说明早期 stdlib import 额外 10ms 不是大量 `jitVectorcall` 新增导致的，而更像 frame evaluator/CodeExtra/计数路径的逐帧税。import-depth skip 能减少 prelude 约 `5.9ms`，证明 P2a 有成本；但它让函数长期到不了分类冻结点，`2to3` gate 次数暴涨到 60 万级，不能生产化。
+读法：split-only 没有改变 `pass/prelude` gate 路径计数，说明 import/setup 拆分本身不是启动额外成本来源。prelude 与 `-c pass` 的 gate 次数接近，说明早期 stdlib import 额外 10ms 不是大量 `jitVectorcall` 新增导致的，而更像 frame evaluator/CodeExtra/计数路径的逐帧税。import-depth skip 能减少 prelude 约 `5.9ms`，证明 P2a 有成本；但它让函数长期到不了分类冻结点，`2to3` gate 次数暴涨到 60 万级，不能生产化。
 
 #### 6.7.5 下一步判断
 
@@ -276,14 +284,17 @@ phase timer 结果如下，使用同一新 wheel、同一 20 次 harness，因�
 | 延迟 `jit::initialize()` backend | 约 1.8ms | 空间太小，不足以解决 `python_startup` site 差距 |
 | 延迟 `_cinderx_exec_impl()` 非必要子项 | 约 1ms 级别 | 可以作为小优化，但不是主杠杆 |
 | C/native import wrapper | 既有正式结果约 0.18ms | 不是当前主瓶颈 |
-| 更细粒度 startup/import 决策 | 目标是减少逐帧计数和 gate 留存，同时保持分类冻结 | 值得继续；不能用单一 import depth 布尔直接跳过 |
+| import/setup split-only | 不直接降低耗时 | 保留；它把 `startup_phase` 拆成 `import_phase/setup_phase`，并让 compile event 可按阶段归因 |
+| import 期提前分类冻结 | gate 次数下降但启动微探针变慢 | 不保留；第一次调用扫字节码的成本抵消了 gate 次数收益 |
+| 更细粒度 startup/import 阈值策略 | 目标是减少逐帧计数和 gate 留存，同时保持分类冻结 | 暂不冻结；下一步必须基于分阶段 compile event 证明 import/setup 需要不同阈值 |
 
 ### 6.8 下一步
 
 | 优先级 | 方向 | 验证方式 | 接受标准 |
 |---|---|---|---|
 | P0 | 保留 lowROI + cold-bit，回滚 setup/main、C wrapper、lazy `cinderjit` 穿刺 | 功能测试 + `2to3` 正式 pyperformance | 不回退当前 `673ms` 水平 |
-| P1 | 继续做更细粒度 startup/import 决策，不再尝试简单跳过 import 计数 | gate stats + phase timer + `2to3` full 对照 | 降低 prelude/P2a 成本，同时不让 `jitVectorcall` 留存在十万级 |
+| P1 | 保留 import/setup split-only 诊断基础；暂不引入不同阈值策略 | gate stats + phase timer + `2to3` full 对照 | 语义正确、性能中性、compile event 能按 `steady/import/setup` 归因 |
+| P1 | 继续寻找不破坏分类冻结的 P2a/启动路径优化 | gate stats + phase timer + `2to3` full 对照 | 降低 prelude/P2a 成本，同时不让 `jitVectorcall` 留存在十万级 |
 | P1 | 小幅瘦身 `_cinderx_exec_impl()` 非必要初始化 | 模块 init timer + `python_startup` 正式 A/B | 小账优化，只接受稳定收益 |
 | P2 | refactor 热点 allow/suppress | 已完成 phase 穿刺 | 负收益/无收益，不继续 |
 | P2 | 扩大 L3 子集复测当前候选 | `2to3`、startup、deepcopy、nbody、sqlalchemy、logging/sympy 代表项 | 确认 cold-bit 不引入新的 steady-state 回归 |

@@ -11,6 +11,7 @@ namespace jit {
 namespace {
 
 thread_local uint32_t t_auto_jit_import_depth{0};
+thread_local uint32_t t_auto_jit_setup_depth{0};
 
 bool isEnabledProvider(std::string_view provider) {
   return provider == "builtins" || provider == "find_and_load";
@@ -32,6 +33,31 @@ void autoJitImportLeave() {
 
 uint32_t autoJitImportDepth() {
   return t_auto_jit_import_depth;
+}
+
+void autoJitSetupEnter() {
+  if (t_auto_jit_setup_depth != std::numeric_limits<uint32_t>::max()) {
+    ++t_auto_jit_setup_depth;
+  }
+}
+
+void autoJitSetupLeave() {
+  if (t_auto_jit_setup_depth > 0) {
+    --t_auto_jit_setup_depth;
+  }
+}
+
+uint32_t autoJitSetupDepth() {
+  return t_auto_jit_setup_depth;
+}
+
+uint32_t autoJitStartupDepth() {
+  uint32_t import_depth = autoJitImportDepth();
+  uint32_t setup_depth = autoJitSetupDepth();
+  if (std::numeric_limits<uint32_t>::max() - import_depth < setup_depth) {
+    return std::numeric_limits<uint32_t>::max();
+  }
+  return import_depth + setup_depth;
 }
 
 bool autoJitImportProviderEnabledFromEnv() {

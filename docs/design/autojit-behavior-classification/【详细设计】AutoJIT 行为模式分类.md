@@ -40,6 +40,7 @@
 | v0.15 | 2026-06-03 | @sisibeloved | ce-doc-review 决策回灌：v1 目标收敛为 Python 3.14-only；`StructureKey` payload 改为 valid+24bit，新增 `risk_reason` 与 `code_size_bucket`；unknown opcode fail-closed；`deriveStructureKey`/缓存返回 optional；`computeThreshold` 返回 `{limit, branch_reason}`，provider-before 只启用 low_roi/risk-defer。 |
 | v0.16 | 2026-06-04 | @sisibeloved | 补充 AutoJIT 入口激活契约与回归测试缺口：所有设置 `compile_after_n_calls` 的入口都必须安装 frame evaluator；详细伪代码明确初始化顺序，验收新增 env/X-option 下新定义函数计数并触发 JIT。 |
 | v0.17 | 2026-06-05 | @sisibeloved | 根据 `2to3` 穿刺更新可编码策略：payload 低 5 位改为 `active_dim_mask`；新增 `computeDominantHint()`；import/setup 分支改为高成本非数值候选；补 opt-in `lib2to3_main` setup provider。 |
+| v0.18 | 2026-06-09 | @sisibeloved | 同步 import/setup split-only 实现：`GateContext` 增加 `import_phase`/`setup_phase` 诊断位，`startup_phase` 为合并位；当前 `computeThreshold` 仍只按合并位执行，分叉策略另需 A/B 证据。 |
 
 ## 4 Keywords 关键词
 
@@ -640,10 +641,12 @@ std::optional<StructureKey> getOrComputeStructureKey(
 **改造点（最小侵入）**：把原"取全局 `compile_after_n_calls`"替换为"分类 → `computeThreshold`（失败/开关关 回退全局）"。
 
 ```cpp
-// 热路径只消费安全 import signal provider 输出的冻结 bool；
-// Phase 0 dump 另行输出 StartupSignalMask 诊断字段。
+// 热路径只消费安全 provider 输出的 O(1) depth/bool；
+// startup_phase 是策略合并位，import/setup 是诊断和 A/B 细分位。
 struct GateContext {
   bool startup_phase;
+  bool import_phase;
+  bool setup_phase;
 };
 
 enum class BranchReason : uint8_t {
@@ -668,7 +671,7 @@ struct AutoJitGateState {
 AutoJitGateState readAutoJitGateState(BorrowedRef<PyCodeObject> code) {
   CodeExtra* ex = codeExtra(code);
   uint64_t calls = ex != nullptr ? Ci_code_extra_get_calls(ex) : 0;
-  return {ex, calls, readGateContext()}; // startup_phase 读取安全 provider；不入 StructureKey
+  return {ex, calls, readGateContext()}; // GateContext 不入 StructureKey
 }
 
 // pyjit.cpp jitVectorcall —— 改造后核心片段
@@ -801,7 +804,7 @@ ThresholdDecision computeThreshold(const StructureKey& sk, const GateContext& ct
 
 ### 13.4.1 数据结构定义
 
-`computeThreshold` 为自由函数（T2.1，无策略对象/单例），返回 `ThresholdDecision{limit, branch_reason}`；新增配置项 `config.auto_classify`（bool，由 `PYTHONJITAUTO=auto[:N]` 解析置真，T2.3）与 `config.enable_startup_init_policy`（provider 可用时置真）；`GateContext` 为当次 gate 上下文（v1 热路径仅 `startup_phase`，来源为 provider 的 O(1) depth/bool，不入 `structure_key` / 不聚合）；`StartupSignalMask` 只属于 Phase 0 诊断 dump，用于比较 importlib/module initializing、安全 import 状态 provider、早期进程窗口等候选信号，早期进程窗口不得单独成为默认策略来源；`kDeferThresholdFactor` / `kStartupDeferThresholdFactor` / `kSteadyNonnumericWarmupThreshold` 为 coding/experiment defaults，生产默认冻结前不作为推荐默认值。`kNoAutoJit` 哨兵已废弃：§13.2 改为以 `compile_after_n_calls.has_value()` 显式分流（无阈值=即时编译，保持现状），不再用 `value_or(sentinel)`。
+`computeThreshold` 为自由函数（T2.1，无策略对象/单例），返回 `ThresholdDecision{limit, branch_reason}`；新增配置项 `config.auto_classify`（bool，由 `PYTHONJITAUTO=auto[:N]` 解析置真，T2.3）与 `config.enable_startup_init_policy`（provider 可用时置真）；`GateContext` 为当次 gate 上下文，不入 `structure_key` / 不聚合。当前实现保留 `startup_phase = import_phase || setup_phase` 作为策略合并位，`import_phase` 与 `setup_phase` 先用于 compile event、phase A/B 和后续策略分叉评估；`computeThreshold` 暂不按二者分别给阈值。`StartupSignalMask` 只属于 Phase 0 诊断 dump，用于比较 importlib/module initializing、安全 import 状态 provider、早期进程窗口等候选信号，早期进程窗口不得单独成为默认策略来源；`kDeferThresholdFactor` / `kStartupDeferThresholdFactor` / `kSteadyNonnumericWarmupThreshold` 为 coding/experiment defaults，生产默认冻结前不作为推荐默认值。`kNoAutoJit` 哨兵已废弃：§13.2 改为以 `compile_after_n_calls.has_value()` 显式分流（无阈值=即时编译，保持现状），不再用 `value_or(sentinel)`。
 
 **Import signal provider 约束：**
 
@@ -819,7 +822,8 @@ ThresholdDecision computeThreshold(const StructureKey& sk, const GateContext& ct
 ```text
 进入 import 执行域: import_depth++
   执行 importlib/module top-level/import 嵌套调用
-  jitVectorcall: startup_phase = (import_depth > 0)  # O(1) 读取
+  jitVectorcall: import_phase = (import_depth > 0)  # O(1) 读取
+  jitVectorcall: startup_phase = import_phase || setup_phase
 退出 import 执行域: import_depth--
 ```
 
@@ -828,6 +832,7 @@ ThresholdDecision computeThreshold(const StructureKey& sk, const GateContext& ct
 - `module_initializing` 可作为辅助诊断信号，但 clean summary 中只覆盖 795/30605 个 storm，不能单独冻结为 `startup_phase`。
 - `early_window` 可作为辅助/兜底候选，但不得单独成为默认策略来源。
 - provider 缺失时，`startup_phase=false` 且 import/setup 分支不命中；low_roi / risk-defer 分支仍可独立验证和发布。ImportInit/setup 收益声明必须等待 provider 证据通过。
+- `import_phase/setup_phase` 先只作为诊断字段：compile event 默认 `phase` 可输出 `import`、`setup`、`import_setup`、`startup` 或 `steady`。生产阈值策略是否按 import/setup 分叉，必须由分阶段 A/B 证明；当前提前 import 分类冻结和粗扩 setup/main window 均未通过。
 - provider 通过线：gdb 下 import/setup-time JIT smoke 与代表性 workload 正常退出；dump 对 gate-reachable startup/import/setup storm candidate 达到 compile-time 加权覆盖率 ≥80%，或覆盖 top-20 candidate 并逐项解释未覆盖原因；post-import steady-state 中 provider 误置 `startup_phase=true` 的 candidate 数量与 compile-time 加权占比均 ≤5%；`readGateContext()` 热路径保持 O(1)。
 - provider A/B 使用三组：`PYTHONJITAUTO=N` 固定阈值、provider-only deferral（只按 provider 统一延迟 candidate，不使用行为 family/Mixed 细分）、完整 `PYTHONJITAUTO=auto[:N]`。完整策略必须证明相对 provider-only 仍有增量价值，否则 v1 收益口径收窄为 provider-only 可解决的部分。
 
@@ -846,10 +851,12 @@ ThresholdDecision computeThreshold(const StructureKey& sk, const GateContext& ct
 ### 13.5.2 内部接口定义
 
 ```cpp
-// startup_phase 是安全 import signal provider 冻结后的热路径输入；
-// 候选信号 mask 只在诊断 dump 中出现。
+// startup_phase 是 import/setup provider 合并后的热路径策略输入；
+// import_phase/setup_phase 用于诊断和后续 A/B，不进入 StructureKey。
 struct GateContext {
   bool startup_phase;
+  bool import_phase;
+  bool setup_phase;
 };
 struct AutoJitGateState {
   CodeExtra* extra;

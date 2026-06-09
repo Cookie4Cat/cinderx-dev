@@ -823,7 +823,25 @@ static PyObject* autojit_import_leave(PyObject*, PyObject*) {
 }
 
 static PyObject* autojit_import_depth(PyObject*, PyObject*) {
+  return PyLong_FromUnsignedLong(jit::autoJitStartupDepth());
+}
+
+static PyObject* autojit_import_scope_depth(PyObject*, PyObject*) {
   return PyLong_FromUnsignedLong(jit::autoJitImportDepth());
+}
+
+static PyObject* autojit_setup_enter(PyObject*, PyObject*) {
+  jit::autoJitSetupEnter();
+  Py_RETURN_NONE;
+}
+
+static PyObject* autojit_setup_leave(PyObject*, PyObject*) {
+  jit::autoJitSetupLeave();
+  Py_RETURN_NONE;
+}
+
+static PyObject* autojit_setup_depth(PyObject*, PyObject*) {
+  return PyLong_FromUnsignedLong(jit::autoJitSetupDepth());
 }
 
 PyMethodDef _cinderx_methods[] = {
@@ -903,7 +921,23 @@ PyMethodDef _cinderx_methods[] = {
     {"_autojit_import_depth",
      autojit_import_depth,
      METH_NOARGS,
-     PyDoc_STR("Return current AutoJIT import-depth provider depth.")},
+     PyDoc_STR("Return current AutoJIT startup provider depth.")},
+    {"_autojit_import_scope_depth",
+     autojit_import_scope_depth,
+     METH_NOARGS,
+     PyDoc_STR("Return current AutoJIT import provider depth.")},
+    {"_autojit_setup_enter",
+     autojit_setup_enter,
+     METH_NOARGS,
+     PyDoc_STR("Enter AutoJIT setup-depth provider scope.")},
+    {"_autojit_setup_leave",
+     autojit_setup_leave,
+     METH_NOARGS,
+     PyDoc_STR("Leave AutoJIT setup-depth provider scope.")},
+    {"_autojit_setup_depth",
+     autojit_setup_depth,
+     METH_NOARGS,
+     PyDoc_STR("Return current AutoJIT setup provider depth.")},
     {"_compile_perf_trampoline_pre_fork",
      compile_perf_trampoline_pre_fork,
      METH_NOARGS,

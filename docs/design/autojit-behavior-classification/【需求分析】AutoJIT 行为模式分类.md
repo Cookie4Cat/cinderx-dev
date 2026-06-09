@@ -9,7 +9,7 @@ topic: autojit-behavior-classification
 
 为自适应 AutoJIT 定义一套**证据充分、可生产化推进**的函数行为分类方案：从字节码 + `co_flags` 提取一个**确定性的结构核**（衡量"做哪类工作 + 有多少热工作"），收敛为一个**有界、版本与特化鲁棒**的稳定 `structure_key`，作为下游策略 / 统计 / profile 的**唯一聚合身份**。`structure_key` 把当前全局固定的 `compile_after_n_calls` 阈值，替换为"按行为模式区分"的编译准入依据；弱特化观测（specialization observation）仅作为 Phase-3 旁路信号保留设计意图，v1 不实现、不进入聚合键。
 
-本文档 v1 **交付分类法 + 最小阈值策略 + opt-in provider 验证路径**：产出稳定 `structure_key`，并通过 `computeThreshold(structure_key, gate_context, global)` 只对明确 `raise_threshold_candidate` 抬阈值以削减 compile storm。2026-06-05 的 `2to3` 穿刺证明：只调静态分类只能部分减少编译风暴；若 `startup_phase` 只来自 import depth，覆盖不了 `lib2to3.main.main()` 里的 refactor/setup 初始化窗口。因此当前实现允许先用 CinderX-only wrapper provider 验证：`CINDERX_AUTOJIT_IMPORT_PROVIDER=find_and_load` 覆盖 import 窗口，`CINDERX_AUTOJIT_SETUP_PROVIDER=lib2to3_main` 覆盖明确的 `lib2to3` setup/main 窗口。生产默认仍需安全 provider 的 gdb smoke、覆盖率和误伤率证据。完整阈值映射（`threshold = f(pattern)`）、弱特化观测、pattern 级在线反馈、profile 持久化是明确的下游工作（见 Scope Boundaries）。
+本文档 v1 **交付分类法 + 最小阈值策略 + opt-in provider 验证路径**：产出稳定 `structure_key`，并通过 `computeThreshold(structure_key, gate_context, global)` 只对明确 `raise_threshold_candidate` 抬阈值以削减 compile storm。2026-06-05 的 `2to3` 穿刺证明：只调静态分类只能部分减少编译风暴；若 `startup_phase` 只来自 import depth，覆盖不了 `lib2to3.main.main()` 里的 refactor/setup 初始化窗口。因此当前实现允许先用 CinderX-only wrapper provider 验证：`CINDERX_AUTOJIT_IMPORT_PROVIDER=find_and_load` 覆盖 import 窗口，`CINDERX_AUTOJIT_SETUP_PROVIDER=lib2to3_main` 覆盖明确的 `lib2to3` setup/main 窗口。2026-06-09 的 split-only 穿刺进一步明确：`gate_context.startup_phase` 是现有策略使用的合并位，`import_phase/setup_phase` 先只作为诊断和 A/B 细分位；生产默认按 import/setup 分叉阈值前，必须证明它比合并位更好。生产默认仍需安全 provider 的 gdb smoke、覆盖率和误伤率证据。完整阈值映射（`threshold = f(pattern)`）、弱特化观测、pattern 级在线反馈、profile 持久化是明确的下游工作（见 Scope Boundaries）。
 
 ## Evidence Update（2026-06-02 Phase 0 C++ dump）
 
@@ -145,13 +145,13 @@ R17. **结构修饰位 = `{loop_score(0–3), is_suspendable, is_static, risk_re
 
 R18. **两个明确分离的标识（审查 Finding 1 修订）：**
 - **`structure_key = "{family}[mixed_shape]|{结构修饰位}"`**（如 `NumericLoop|loop3,static`、`AsyncStateMachine|susp,risk=suspend`、`ReflectionMeta|synthetic,size1`、`Mixed(dynamic+dispatch)|loop0,risk=dynamic`）——**完全确定，是下游策略 / 统计 / profile 的唯一聚合身份**。candidate/compile/reuse/deopt 一律按 `structure_key` 聚合。
-- **`gate_view = (structure_key, gate_context)`**——仅用于**当次**编译准入的即时阈值选择，**不落库、不作聚合维度**。v1 的 `gate_context` 仅含 startup/import 上下文（如 `startup_phase`）；Phase-3 才追加 `specialization_band` 旁路。把上下文/特化带从聚合键中剥离，确保同一函数的统计永远归并到同一 `structure_key`。
+- **`gate_view = (structure_key, gate_context)`**——仅用于**当次**编译准入的即时阈值选择，**不落库、不作聚合维度**。v1 的 `gate_context` 至少含 startup/import/setup 上下文：`startup_phase` 是策略合并位，`import_phase/setup_phase` 是诊断和 A/B 细分位；Phase-3 才追加 `specialization_band` 旁路。把上下文/特化带从聚合键中剥离，确保同一函数的统计永远归并到同一 `structure_key`。
 
 ### G. 覆盖性、确定性与生产契约
 
 R19. **穷尽：** 每个 `isAutoJitClassifiable == true` 的 code object 恰好映射一个 family；`Trivial`/`Mixed` 作 catch-all，零空洞。不满足 classifiable predicate 的 module/class body、async generator、suppressed-JIT code 等只进入诊断/现状回退，不生成 v1 `structure_key`。
 
-R20. **聚合身份完全确定；gate 上下文 / 特化观测均不入聚合（审查 Finding 1 + T3.4/T3.7 修订）：** v1 交付部分是 **`structure_key`**（family + Mixed-only `mixed_shape` + 结构修饰位）：它是静态字节码 + `co_flags` 的纯函数，对同一 code object 恒定，**就是聚合身份**。`gate_context.startup_phase` 随调用时机变化，v1 仅进 `gate_view` 做当次阈值选择，**永不参与聚合**。**`specialization_band`** 随函数预热演进、gate 时读取，Phase-3 才加入 `gate_view` 做即时微调，**永不参与聚合**；其 low/mid/high 跃迁须用**滞回阈值**（进入高带与跌出高带用不同 cutoff），避免边界反复抖动导致阈值在两次相邻 gate 间翻转。即：v1 只实现结构身份稳定；Phase-3 再实现特化 band 的阻尼微调。
+R20. **聚合身份完全确定；gate 上下文 / 特化观测均不入聚合（审查 Finding 1 + T3.4/T3.7 修订）：** v1 交付部分是 **`structure_key`**（family + Mixed-only `mixed_shape` + 结构修饰位）：它是静态字节码 + `co_flags` 的纯函数，对同一 code object 恒定，**就是聚合身份**。`gate_context.startup_phase/import_phase/setup_phase` 随调用时机变化，v1 仅进 `gate_view` 做当次阈值选择或诊断，**永不参与聚合**。当前最小策略只消费 `startup_phase` 合并位；若后续按 `import_phase/setup_phase` 分叉阈值，也仍不得进入 `structure_key`。**`specialization_band`** 随函数预热演进、gate 时读取，Phase-3 才加入 `gate_view` 做即时微调，**永不参与聚合**；其 low/mid/high 跃迁须用**滞回阈值**（进入高带与跌出高带用不同 cutoff），避免边界反复抖动导致阈值在两次相邻 gate 间翻转。即：v1 只实现结构身份稳定；Phase-3 再实现特化 band 的阻尼微调。
 
 R21. **廉价：** `structure_key` 为对 `co_code` 的单次 O(n) 扫描，按 R26 发布进 `codeExtra`（与 `countCalls` 同处，`cinderx/Jit/pyjit.cpp:101`），每 code object 仅算一次。v1 不采集、不缓存、不读取 `specialization_presence`；Phase-3 若恢复，可在 gate 时低成本重读（再扫特化位，或缓存上次值 + 惰性刷新），但必须重新评估热路径开销。准入判断本身不得成为新热点（issue 开放问题三）。
 
@@ -175,7 +175,7 @@ R27. **AutoJIT 入口激活契约：设置阈值必须同时安装 frame evaluat
 
 - **L2. 维度非完全正交（Gap E）。** 概念上相关的维度（如高 control 常伴高 risk）会让维度排序对小扰动敏感。**去重规则：** (a) 每 opcode 仅归一个表项（R25）；(b) risk 从已分配计数派生而非重复计原始 opcode（R8）；(c) module/class 体在 Phase 0 走 `InitCodeDiagnostic` 诊断桶而非进 dynamic 排序（R12）；(d) 近似并列时落 `Mixed` 并记录 canonical top-2 `mixed_shape`（R16），而非强行夺标或把所有 Mixed 混成单桶。
 
-- **L4. startup/import/setup 上下文不是结构身份。** `startup_phase` 影响"此刻是否值得编译"，但不是 code object 的静态结构属性，故不得并入 `structure_key`。CinderX-only wrapper 可以作为 opt-in 验证路径，但生产默认必须证明 provider 覆盖率、误伤率和 gdb 安全性。报告必须分列 startup/setup 与 steady 指标，不能只用总体编译次数下降证明 targeted ImportInit 收益。
+- **L4. startup/import/setup 上下文不是结构身份。** `startup_phase/import_phase/setup_phase` 影响"此刻是否值得编译"或帮助解释"此刻处在哪个阶段"，但不是 code object 的静态结构属性，故不得并入 `structure_key`。CinderX-only wrapper 可以作为 opt-in 验证路径，但生产默认必须证明 provider 覆盖率、误伤率和 gdb 安全性。报告必须分列 import/setup/startup 与 steady 指标，不能只用总体编译次数下降证明 targeted ImportInit 收益。
 
 - **L5. v1 静态签名不保证完整 ROI 预测。** bytecode-only 结构无法知道真实执行路径占比、类型稳定性和 workload 生命周期；`loop_score` 是 v1 最可靠的收益信号，非 loop family 的抬阈值必须被视为**明确低收益/高成本形态削减**，而非普遍 ROI 预测。opt-in 发布前必须做 mis-defer 守门：对每个被后移分支，按 top call-count、top compile-time、以及 top lost-dynamic-benefit/runtime-regression 样本证明 saved static cost 大于 lost dynamic benefit；否则按 `risk_reason` / `code_size_bucket` / family / `mixed_shape` / `active_dim_mask` 收窄或禁用。pyperformance `warmups=3` 可能遮住编译、首次进入和一次性 OSR 等静态/一次性成本，因此生产证据必须同时报告编译次数、累计编译耗时、code cache、启动/首轮耗时以及正式 values 中的动态成本/收益。
 

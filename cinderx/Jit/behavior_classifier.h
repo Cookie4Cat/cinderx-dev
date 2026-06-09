@@ -97,6 +97,8 @@ constexpr uint32_t kSkeyPayloadMask = CI_CODE_EXTRA_SKEY_PAYLOAD_MASK;
 
 struct GateContext {
   bool startup_phase{false};
+  bool import_phase{false};
+  bool setup_phase{false};
 };
 
 enum class BranchReason : uint8_t {

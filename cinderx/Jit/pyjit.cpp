@@ -219,6 +219,15 @@ const char* currentAutoJitPhaseName(const GateContext& context) {
   if (phase != nullptr && phase[0] != '\0') {
     return phase;
   }
+  if (context.import_phase && context.setup_phase) {
+    return "import_setup";
+  }
+  if (context.import_phase) {
+    return "import";
+  }
+  if (context.setup_phase) {
+    return "setup";
+  }
   if (context.startup_phase) {
     return "startup";
   }
@@ -259,6 +268,8 @@ void writeAutoJitCompileEvent(
       << ",\"calls\":" << state.calls
       << ",\"effective_limit\":" << effective_limit
       << ",\"startup_phase\":" << (state.context.startup_phase ? "true" : "false")
+      << ",\"import_phase\":" << (state.context.import_phase ? "true" : "false")
+      << ",\"setup_phase\":" << (state.context.setup_phase ? "true" : "false")
       << ",\"branch_reason\":\"" << branchReasonName(decision.branch_reason)
       << "\"";
   if (key.has_value()) {
@@ -319,7 +330,9 @@ uint64_t countCalls(PyCodeObject* code) {
 }
 
 GateContext readGateContext() {
-  return GateContext{autoJitImportDepth() > 0};
+  bool import_phase = autoJitImportDepth() > 0;
+  bool setup_phase = autoJitSetupDepth() > 0;
+  return GateContext{import_phase || setup_phase, import_phase, setup_phase};
 }
 
 AutoJitGateState readAutoJitGateState(BorrowedRef<PyCodeObject> code) {
