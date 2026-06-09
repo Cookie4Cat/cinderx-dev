@@ -338,7 +338,7 @@ TEST(BehaviorClassifierTest, SteadyStateAllowsStructuredNonBranchWork) {
 
   StructureKey branch_big{Family::BranchFSM};
   branch_big.loop_score = 3;
-  branch_big.risk_reason = kRiskException | kRiskHugeCode;
+  branch_big.risk_reason = kRiskHugeCode;
   branch_big.code_size_bucket = 2;
   auto branch_decision = computeThreshold(branch_big, steady_state, 2);
   EXPECT_EQ(branch_decision.limit, 1000);
@@ -402,6 +402,64 @@ TEST(BehaviorClassifierTest, SteadyStateWarmsUpLargeBranchStateMachines) {
   auto object_decision = computeThreshold(object_loop, steady_state, 2);
   EXPECT_EQ(object_decision.limit, 2);
   EXPECT_EQ(object_decision.branch_reason, BranchReason::None);
+}
+
+TEST(
+    BehaviorClassifierTest,
+    SteadyStateRiskDefersHighCostExceptionFrameworkShapes) {
+  GateContext steady_state{false};
+
+  StructureKey branch_shape{Family::BranchFSM};
+  branch_shape.loop_score = 3;
+  branch_shape.code_size_bucket = 2;
+  branch_shape.risk_reason = kRiskException | kRiskHugeCode;
+  branch_shape.active_dim_mask =
+      activeDimMaskFor(WorkDim::Control) | activeDimMaskFor(WorkDim::Object);
+  auto branch_decision = computeThreshold(branch_shape, steady_state, 2);
+  EXPECT_GE(branch_decision.limit, 65536);
+  EXPECT_EQ(branch_decision.branch_reason, BranchReason::RiskDefer);
+
+  StructureKey object_shape{Family::ObjectManipulator};
+  object_shape.loop_score = 2;
+  object_shape.code_size_bucket = 2;
+  object_shape.risk_reason = kRiskException | kRiskHugeCode;
+  object_shape.active_dim_mask =
+      activeDimMaskFor(WorkDim::Control) | activeDimMaskFor(WorkDim::Object);
+  auto object_decision = computeThreshold(object_shape, steady_state, 2);
+  EXPECT_GE(object_decision.limit, 65536);
+  EXPECT_EQ(object_decision.branch_reason, BranchReason::RiskDefer);
+
+  StructureKey reflection_shape{Family::ReflectionMeta};
+  reflection_shape.loop_score = 3;
+  reflection_shape.code_size_bucket = 3;
+  reflection_shape.risk_reason = kRiskException | kRiskHugeCode;
+  reflection_shape.active_dim_mask =
+      activeDimMaskFor(WorkDim::Control) | activeDimMaskFor(WorkDim::Object) |
+      activeDimMaskFor(WorkDim::Dynamic);
+  auto reflection_decision =
+      computeThreshold(reflection_shape, steady_state, 2);
+  EXPECT_GE(reflection_decision.limit, 65536);
+  EXPECT_EQ(reflection_decision.branch_reason, BranchReason::RiskDefer);
+
+  StructureKey huge_only_object{Family::ObjectManipulator};
+  huge_only_object.loop_score = 3;
+  huge_only_object.code_size_bucket = 3;
+  huge_only_object.risk_reason = kRiskHugeCode;
+  huge_only_object.active_dim_mask = activeDimMaskFor(WorkDim::Object);
+  auto huge_only_decision =
+      computeThreshold(huge_only_object, steady_state, 2);
+  EXPECT_EQ(huge_only_decision.limit, 2);
+  EXPECT_EQ(huge_only_decision.branch_reason, BranchReason::None);
+
+  StructureKey numeric_shape{Family::NumericLoop};
+  numeric_shape.loop_score = 3;
+  numeric_shape.code_size_bucket = 2;
+  numeric_shape.risk_reason = kRiskException | kRiskHugeCode;
+  numeric_shape.active_dim_mask =
+      activeDimMaskFor(WorkDim::Compute) | activeDimMaskFor(WorkDim::Control);
+  auto numeric_decision = computeThreshold(numeric_shape, steady_state, 2);
+  EXPECT_EQ(numeric_decision.limit, 2);
+  EXPECT_EQ(numeric_decision.branch_reason, BranchReason::None);
 }
 
 TEST(

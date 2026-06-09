@@ -961,6 +961,17 @@ ThresholdDecision computeThreshold(
         key.highRisk() ? BranchReason::RiskDefer : BranchReason::StartupInit};
   }
 
+  bool steady_exception_high_cost_framework_candidate =
+      !context.startup_phase && !key.is_static && !key.is_suspendable &&
+      !key.computeHint() && key.code_size_bucket >= 2 &&
+      (key.risk_reason & kRiskException) != 0 &&
+      (startup_like_family || startup_like_mixed);
+  if (steady_exception_high_cost_framework_candidate) {
+    return {
+        saturatingMul(global, kStartupDeferThresholdFactor),
+        BranchReason::RiskDefer};
+  }
+
   bool expected_exception_loop_candidate = !context.startup_phase &&
       !key.is_static && !key.is_suspendable &&
       key.family == Family::BranchFSM && key.loop_score >= 2 &&
