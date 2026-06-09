@@ -10,6 +10,8 @@
 
 | 版本 | 日期 | 修订人 | 修订说明 |
 |---|---|---|---|
+| v0.24 | 2026-06-09 | @sisibeloved | 重写 `sqlalchemy_declarative` 分析：按 CPython JIT 基线拆出 CinderX 解释器基底、插件固定成本、CinderX JIT 动态成本和 AutoJIT 延迟编译长尾；补 worker-only gate/compile/deopt 证据，确认当前回归不是 import/setup 风暴，而是 `LowRoi=1000` 编译债溢出测量窗口 + ORM steady deopt/guard 动态负 ROI。 |
+| v0.23 | 2026-06-09 | @sisibeloved | 新增 `dask` 章节：按 CPython JIT 基线拆成解释器基底、插件固定成本、JIT 动态成本三个增量项，补 gate stats、编译形状和 deopt 动态成本；确认 dask 不是 startup/import compile storm，而是 steady 异步调度 + 序列化路径的 JIT 动态 ROI 负样本。 |
 | v0.22 | 2026-06-09 | @sisibeloved | 重写 `2to3` 章节为总/分结构：总表平铺 CPython JIT、优化前、当前候选和 force-interpret 差距；分表拆 gate 函数形状与非 gate 阶段成本，删除旧流水账。 |
 | v0.21 | 2026-06-09 | @sisibeloved | 重写 `python_startup` 章节为分阶段平铺账本：四口径（CPython 基线 / `PYTHONJITAUTO=2` 优化前 / 当前 AutoJIT / force interpret-only）逐阶段列 优化前差距/已优化掉/剩余差距/可挖空间，一眼看出差距在哪、优化了多少、还剩多少；后接**全量 17 个 gate 函数形状与策略表**（8 StartupInit + 6 RiskDefer + 2 LowRoi + 1 编译）。实测确认 bc347c29 优化掉 93%（212.6→14.5ms），大头是插件加载 init 期 `schedule_existing_functions` 编译风暴；剩余 +14.5ms（插件地板 ~8 + import 运行税 ~6）无干净单点杠杆。A（逐 def tracking）~0.16ms、C（逐帧计数）硬上界 ≤0.46%、native wrapper ~0.18ms、`jit::initialize` 惰性 ~1.6ms 均穿刺否决。 |
 | v0.20 | 2026-06-09 | @sisibeloved | 补充 import/setup 细粒度决策穿刺：拆分 `import_phase`/`setup_phase` 诊断字段并保留 split-only 基础设施；提前 import 分类冻结无稳定收益，暂不引入 import/setup 分叉阈值策略。 |
@@ -85,6 +87,8 @@
 | `python_startup` | Python bootstrap 懒加载 + AutoJIT 初始化跳过已有函数扫描，`auto:2 + find_and_load` | `blue-98:/root/cinderx-lab/results/autojit-startup-init-spike-20260608/{cinderx_auto_classify_startup_init_spike_aff30_valid.json,importtime/*,process_time_init_spike.tsv}` | 正式均值：`python_startup=38.617ms`，`python_startup_no_site=13.358ms`；no-site 已达 CPython JIT 87.9%，site 仍只有 46.9% |
 | `python_startup` | `find_and_load` provider 改为 `_cinderx` native C wrapper 穿刺 | `blue-98:/root/cinderx-lab/results/autojit-native-import-provider-20260608/{cinderx_auto_native_provider_startup_aff30.json,cinderx_auto_native_provider_2to3_aff30.json,importtime/*}` | 功能可行，但正式 `python_startup=38.440ms`，只比上一轮快约 0.18ms；`2to3=956ms` 与既有 966/973ms 同量级，暂不作为优先合入项 |
 | `python_startup` | §7 分阶段账本 + 全量 gate 形状（四口径 wall 中位数 + importtime 窗口 + 17 函数 shape，debug 口径） | `blue-98:cinderx-test:/results/autojit-startup-ledger-20260609/{startup_totals.tsv,importtime_windows.tsv,python_startup.gate-shapes.raw.log,python_startup.gate-shapes.tsv,README.md}` | 同一 `_cinderx.so` 只改环境：base/jit2/auto/nocompile = 21.8/234.4/35.9/31.7ms（site）；`_cinderx_auto` importtime 累计 0.4/185.5/8.5/8.1ms；全量 17 个 gate 函数 = 8 StartupInit + 6 RiskDefer + 2 LowRoi + 1 编译。README 含复现命令与枚举映射 |
+| `dask` | 正式 pyperformance 五口径：CPython 3.14.3 JIT、CinderX no-plugin、CinderX plugin-no-JIT、`PYTHONJITAUTO=2`、当前 AutoJIT；`--warmup 3 --affinity=30` | `blue-98:cinderx-test:/results/autojit-dask-ledger-20260609/{cpython_jit_dask_aff30.json,cinderx_no_plugin_dask_aff30.json,cinderx_plugin_nojit_dask_aff30.json,cinderx_auto2_dask_aff30.json,cinderx_autojit_dask_aff30.json,logs/*}` | CPython JIT `1.360s`；CinderX no-plugin `1.289s`；plugin-no-JIT `1.355s`；`auto=2` `2.005s`；当前 AutoJIT `2.022s`。差距主要来自启用 CinderX JIT 后新增约 `+650ms`，不是插件固定成本 |
+| `dask` | debug shape/gate/deopt：`--fast -n 3 -w 1`，`PYTHONJITLOGFILE` + `CINDERX_AUTOJIT_GATE_STATS_FILE` + `CINDERX_AUTOJIT_COMPILE_EVENTS_FILE` | `blue-98:cinderx-test:/results/autojit-dask-ledger-20260609/{dask-gate-stats.jsonl,dask-compile-events.jsonl,worker-gate-shapes/*.jit.log,dask-debug-fast.json}` | 4 个 worker 合计约 `962700` 次 gate、`3408` 次 forced compile、`161135` 次 defer freeze；编译事件 `3485` 条中 `3440` 条在 steady 阶段；deopt 合计 `1020754` 次，主要是 `GuardFailure` 和 expected exception |
 | `coverage` | direct worker，`PYTHONJITAUTO=auto:2`，`CINDERX_AUTOJIT_IMPORT_PROVIDER=find_and_load` | `blue-98:/results/autojit-import-highcost-bucket1-20260605/worker-gate-shapes/coverage.*.jit.log` | 有真实 C++ gate 形状；debug 口径，不作为性能数值 |
 | `generators` | direct worker，同上 | `blue-98:/results/autojit-import-highcost-bucket1-20260605/worker-gate-shapes/generators.*.jit.log` | 有真实 C++ gate 形状；debug 口径 |
 | `unpack_sequence` | direct worker，同上 | `blue-98:/results/autojit-import-highcost-bucket1-20260605/worker-gate-shapes/unpack_sequence.*.jit.log` | 有真实 C++ gate 形状；debug 口径 |
@@ -94,6 +98,8 @@
 | `sqlalchemy` 系列 | CinderX plugin，JIT disabled | `blue-98:/results/autojit-sqlalchemy-analysis-20260608/cinderx_plugin_jitdisabled.json` | 关闭 CinderX JIT 后 `declarative=245ms`、`imperative=40.9ms`，说明本组用例对 CinderX JIT 是负 ROI，解释器/plugin 路径本身已超过 CPython JIT 目标 |
 | `sqlalchemy` 系列 | CinderX `PYTHONJITAUTO=2` | `blue-98:/results/autojit-sqlalchemy-analysis-20260608/auto2.json` | `declarative=388ms`、`imperative=73.7ms`，相对 CPython JIT 几何均值约 1.50x slower |
 | `sqlalchemy` 系列 | high-cost object/control 静态延迟穿刺 | `blue-98:/results/autojit-sqlalchemy-object-branch-spike-20260608/{candidate_sqlalchemy_spike.json,candidate_sqlalchemy_v4.json,shape-logs-v4/*}` | v1 只延迟 `BranchFSM`，v4 扩到 `BranchFSM/ObjectManipulator/ReflectionMeta/Mixed`；正式结果仅相对 `auto=2` 约 1.06x faster，仍相对 CPython JIT 约 1.42x slower |
+| `sqlalchemy_declarative` | 正式 pyperformance 五口径：CPython 3.14.3 JIT、CinderX no-plugin、CinderX plugin-no-JIT、`PYTHONJITAUTO=2`、当前 AutoJIT；`--warmup 3 --affinity=30` | `blue-98:cinderx-test:/results/autojit-sqlalchemy-declarative-ledger-20260609/{cpython_jit_sqlalchemy_declarative_aff30.json,cinderx_no_plugin_sqlalchemy_declarative_aff30.json,cinderx_plugin_nojit_sqlalchemy_declarative_aff30.json,cinderx_auto2_sqlalchemy_declarative_aff30.json,cinderx_autojit_sqlalchemy_declarative_aff30.json}` | CPython JIT `269.2ms`；CinderX no-plugin `245.5ms`；plugin-no-JIT `249.8ms`；`auto=2` `387.8ms`；当前 AutoJIT mean `434.4ms` / median `377.5ms`。回归来自 CinderX JIT 动态成本和 AutoJIT 延迟编译长尾，不是插件固定成本 |
+| `sqlalchemy_declarative` | debug shape/gate/deopt：`--fast --warmup 1`，`PYTHONJITLOGFILE` + `CINDERX_AUTOJIT_GATE_STATS_FILE` + `CINDERX_AUTOJIT_COMPILE_EVENTS_FILE` | `blue-98:cinderx-test:/results/autojit-sqlalchemy-declarative-ledger-20260609/{sqlalchemy_declarative-gate-stats.jsonl,sqlalchemy_declarative-compile-events.jsonl,worker-gate-shapes/sqlalchemy_declarative.%p.jit.log,sqlalchemy_declarative-debug-fast.json}` | worker-only 合计约 `403291` 次 gate、`2127` 次 forced compile、`358240` 次 classified warmup；编译事件 `2134` 条中 `2099` 条在 steady；deopt 合计 `22133` 次，`GuardFailure` 占 `21714` |
 | `sqlglot_v2` | direct worker，同上，`bm_sqlglot_v2 normalize` | `blue-98:/results/autojit-sql-shapes-20260605/worker-gate-shapes/sqlglot_v2.*.jit.log` | 有真实 C++ gate 形状；debug 口径 |
 | `sqlglot_v2_parse` | direct worker，同上，`bm_sqlglot_v2 parse` | `blue-98:/results/autojit-sql-shapes-20260605/worker-gate-shapes/sqlglot_v2_parse.*.jit.log` | 有真实 C++ gate 形状；debug 口径 |
 | `sqlglot_v2_transpile` | direct worker，同上，`bm_sqlglot_v2 transpile` | `blue-98:/results/autojit-sql-shapes-20260605/worker-gate-shapes/sqlglot_v2_transpile.*.jit.log` | 有真实 C++ gate 形状；debug 口径 |
@@ -125,7 +131,7 @@
 | 轻微回归/待查 | `generators` | 17.5ms -> 20.0ms，1.14x slower | candidate 方差较大，需复跑或看 gate log |
 | 轻微回归/待查 | `dulwich_log` | 171ms -> 180ms，1.05x slower | 业务型样本轻微回归，优先看 steady object/dispatch helper 是否被延迟 |
 | 轻微回归/待查 | `sqlglot_v2_normalize` | 382ms -> 432ms，1.13x slower | steady parser/optimizer 高成本函数可能被策略过度延迟 |
-| 轻微回归/待查 | `sqlalchemy_declarative` | 387ms -> 451ms，1.16x slower | candidate 方差 94ms，先复跑确认再定策略 |
+| 长尾回归/待优化 | `sqlalchemy_declarative` | `auto=2` 387.8ms -> AutoJIT 434.4ms mean / 377.5ms median | 复跑确认是双峰长尾：低位值快于 `auto=2`，但 `LowRoi=1000` 延迟编译债溢出 measured values；不是 import/setup 风暴 |
 | 轻微回归/待查 | `logging_silent` | 363ns -> 420ns，1.16x slower | 纳秒级用例，可能是测量噪声或低 ROI 延迟的固定成本 |
 | 噪声/基本持平 | `dask`、`deepcopy_reduce` | hidden as not significant | 暂不作为策略调整依据 |
 
@@ -438,43 +444,124 @@ bc347c29（lazy bootstrap + 跳过已有函数扫描）已优化掉 93%（212.6�
 
 ### 11.1 总体判断
 
-`sqlalchemy` 系列是 ORM/框架型用例，不是单纯 startup/import 风暴。真实 worker gate 证据显示，大量 gate 事件落在 `BranchFSM`、`CallDispatcher`、`Mixed`、`ReflectionMeta` 上；其中一部分是 import/setup 阶段的装饰器、签名生成、事件注册，另一部分是 steady 阶段反复执行的 ORM persistence、engine context、SQL compiler。
+`sqlalchemy_declarative` 是 ORM declarative class 构建、mapper 配置、SQL 编译、unit of work flush/commit 混合在一起的框架型 steady workload。它不是 startup/import 编译风暴：当前 debug worker 的编译事件里 `2099/2134` 发生在 steady，import 只有 `35`。
 
-因此它支撑两个策略边界：第一，`startup=true` 的 import/setup 高成本非数值函数可以延迟；第二，steady-state 的 ORM/engine 热路径不能只因 `codeB` 大或 `risk` 非空就全局粗拦，否则会把真实工作负载一起挡掉。
+当前 AutoJIT 分类确实让这个用例的 **mean** 明显劣化，但不是每个 measured value 都慢。正式 `warmup=3` 结果呈双峰：低位值约 `364-382ms`，比 `PYTHONJITAUTO=2` 的 `372-398ms` 还好；慢值固定冲到 `458-626ms`，把均值拉到 `434.4ms`。这说明当前策略有两个问题叠加：
 
-### 11.2 摘要
+- `LowRoi=1000` 把一批函数的编译延后，但没有禁止编译；编译债溢出到 pyperf measured values，形成长尾。
+- 即使把长尾部分消化掉，CinderX JIT 本身对 SQLAlchemy ORM steady 路径仍是负 ROI；plugin-no-JIT 已经快于 CPython JIT。
 
-| 用例 | 编译事件 | unique compiled | target unique compiled | gate 事件 | unique gated | gate family top | gate reason top |
-|---|---:|---:|---:|---:|---:|---|---|
-| `sqlalchemy_declarative` | 2775 | 635 | 445 | 451516 | 1335 | `BranchFSM:353999`, `CallDispatcher:41218`, `Mixed:34974`, `ReflectionMeta:18039` | `LowRoi:436003`, `RiskDefer:12105`, `None:1818`, `StartupInit:1590` |
-| `sqlalchemy_imperative` | 1645 | 370 | 189 | 217927 | 902 | `BranchFSM:143769`, `Mixed:28353`, `CallDispatcher:24464`, `ReflectionMeta:19105` | `LowRoi:206615`, `RiskDefer:8698`, `StartupInit:1560`, `None:1054` |
+### 11.2 总表：差距账本
 
-### 11.3 代表函数形状表
+口径：`blue-98`，`--warmup 3 --affinity=30`，正式 pyperformance 60 values。CPython JIT 使用 `/opt/python314-jit/bin/python3.14`；CinderX 口径使用同一 `/opt/python314` 和同一 SQLAlchemy venv，只改变 `CINDERX_PLUGIN_ENABLE` / `PYTHONJITAUTO` / provider 环境变量。
 
-| 用例 | 函数 | 编译次数 | 编译耗时 | 形状 | 策略 | 判断 |
-|---|---|---:|---:|---|---|---|
-| `sqlalchemy_declarative` | `sqlalchemy.orm.persistence:_emit_insert_statements` | 4 | 408.3ms | `BranchFSM`, dims=`Control+Object`, `loop=3`, `codeB=2`, `risk=Exception+HugeCode`, `startup=false` | `1000/LowRoi` | steady ORM 写入热路径；延迟到高热度合理，但不能 import-only 粗拦 |
-| `sqlalchemy_declarative` | `sqlalchemy.orm.loading:_instance_processor` | 4 | 386.5ms | `ReflectionMeta`, dims=`Control+Object+Dynamic`, `loop=3`, `codeB=3`, `risk=Exception+HugeCode`, `startup=false` | `2/None` | 高成本反射/对象处理；若有回归，应做 steady ROI 专项，而不是扩大 import window |
-| `sqlalchemy_declarative` | `sqlalchemy.engine.default:DefaultExecutionContext._init_compiled` | 4 | 216.1ms | `ObjectManipulator`, dims=`Control+Object`, `loop=3`, `codeB=2`, `risk=Exception+HugeCode`, `startup=false` | `2/None` | engine 执行上下文核心路径；当前放行，需要用非 debug A/B 判断收益 |
-| `sqlalchemy_declarative` | `sqlalchemy.util.deprecations:deprecated_params.<locals>.decorate.<locals>.warned` | 4 | 67.5ms | `CallDispatcher`, dims=`Object+Dispatch+Dynamic`, `loop=0`, `codeB=2`, `risk=None`, `startup=true` | `2097152/StartupInit` | import/setup 装饰器包装，延迟正确 |
-| `sqlalchemy_declarative` | `__main__:bench_sqlalchemy` | 4 | 44.3ms | `CallDispatcher`, dims=`Object+Dispatch+Dynamic`, `loop=2`, `codeB=2`, `risk=None`, `startup=false` | `2/None` | benchmark 本体驱动函数，应放行 |
-| `sqlalchemy_imperative` | `sqlalchemy.engine.default:DefaultExecutionContext._init_compiled` | 4 | 219.1ms | `ObjectManipulator`, dims=`Control+Object`, `loop=3`, `codeB=2`, `risk=Exception+HugeCode`, `startup=false` | `2/None` | 与 declarative 相同，属于 steady engine 热路径 |
-| `sqlalchemy_imperative` | `sqlalchemy.engine.base:Connection._execute_context` | 4 | 148.0ms | `BranchFSM`, dims=`Control+Object`, `loop=3`, `codeB=2`, `risk=Exception+HugeCode`, `startup=false` | `1000/LowRoi` | SQL 执行路径；低 ROI 延迟合理，但不应禁止 |
-| `sqlalchemy_imperative` | `sqlalchemy.util.langhelpers:format_argspec_plus` | 5 | 125.4ms | `NumericLoop`, dims=`Compute+Control`, `loop=0`, `codeB=2`, `risk=HugeCode`, `startup=true`, `compute=true` | `2/None` | 启动期但有 compute 提示；验证了 import 策略不能拦 `compute=true` |
-| `sqlalchemy_imperative` | `__main__:bench_sqlalchemy` | 4 | 39.2ms | `CallDispatcher`, dims=`Control+Object+Dispatch+Dynamic`, `loop=2`, `codeB=1`, `risk=None`, `startup=false` | `2/None` | benchmark 本体驱动函数，应放行 |
+基线：CPython 3.14.3 JIT **269.2ms**，85% 目标线约 **316.8ms**。优化前：CinderX `PYTHONJITAUTO=2` **387.8ms**，慢 **+118.6ms**。当前 AutoJIT：`auto:2 + provider` **434.4ms mean / 377.5ms median**，按 mean 慢 **+165.2ms**。
 
-### 11.4 策略判断
+| 成本项 | 取数方式 | 优化前差距 | 当前剩余差距 | 已优化掉 | 继续可挖空间 | 下一步判断 |
+|---|---|---:|---:|---:|---:|---|
+| CinderX 解释器基底 | CinderX no-plugin `245.5ms` - CPython JIT `269.2ms` | -23.7ms | -23.7ms | 0.0ms | 0.0ms | 不是瓶颈；不开插件时 CinderX 路径更快 |
+| 插件固定加载/初始化 | CinderX plugin-no-JIT `249.8ms` - CinderX no-plugin `245.5ms` | +4.3ms | +4.3ms | 0.0ms | 小 | 插件固定成本很小，plugin-no-JIT 已快于 CPython JIT |
+| CinderX JIT 动态成本 | `PYTHONJITAUTO=2` - plugin-no-JIT | +138.0ms | +138.0ms | 0.0ms | ~138ms | steady ORM/SQL 编译/unit-of-work 路径进入 JIT 后整体负 ROI |
+| AutoJIT 延迟编译长尾 | 当前 AutoJIT mean - `PYTHONJITAUTO=2` | 0.0ms | +46.6ms | -46.6ms | ~46.6ms | `LowRoi=1000` 编译债溢出 measured values；应专项处理 delayed compile，而不是继续调 import provider |
+| import/startup 编译风暴 | debug worker 编译事件：import `35`，steady `2099` | 非主项 | 非主项 | 0.0ms | 不作为主线 | import 只占 `35/2134` 个 worker 编译事件 |
+| **合计** | 总耗时减 CPython JIT | **+118.6ms** | **+165.2ms** | **-46.6ms** | **~184.6ms 到 plugin-no-JIT** | 当前 AutoJIT 低位值有改善，但 mean 被延迟编译长尾拖垮；根问题仍是 SQLAlchemy 对当前 CinderX JIT 动态负 ROI |
+
+读表三条结论：
+
+- `sqlalchemy_declarative` 不需要 CinderX JIT 才能达标：plugin-no-JIT `249.8ms`，已经优于 CPython JIT `269.2ms` 和 85% 目标线 `316.8ms`。
+- 当前 AutoJIT 比 `auto=2` 多慢 `46.6ms`，主因不是多编译 import，而是 `LowRoi=1000` 推迟编译后在测量窗口内还会继续编译。
+- 即使拿回这 `46.6ms`，`auto=2` 本身仍有 `+138.0ms` JIT 动态成本；SQLAlchemy 后续优化应走 deopt/guard/expected-exception 或 deopt-aware 禁编，不应靠 startup/import 泛化。
+
+### 11.3 分表一：双峰与 warmup 证据
+
+| 口径 | mean | median | stdev | p75 | p90 | max | 判断 |
+|---|---:|---:|---:|---:|---:|---:|---|
+| `PYTHONJITAUTO=2`，`warmup=3` | 387.8ms | 389.4ms | 5.7ms | 392.0ms | 394.7ms | 398.1ms | 慢，但分布稳定 |
+| 当前 AutoJIT，`warmup=3` | 434.4ms | 377.5ms | 89.1ms | 475.5ms | 567.9ms | 625.7ms | 双峰长尾；mean 严重劣化，median 略好于 `auto=2` |
+| 当前 AutoJIT，`warmup=10 --fast` | 386.3ms | 368.5ms | 41.9ms | 369.5ms | 476.4ms | 478.6ms | 长尾明显收敛，但仍有首个 measured value 偏慢；只作机制验证，不替代正式口径 |
+
+正式 `warmup=3` 的当前 AutoJIT 每个 pyperf run 都有固定位置慢值，例如第一组 values 为 `616.5, 457.9, 559.4, 366.4, 365.9, 365.7, 380.7, 474.1, 365.9, 364.9ms`。这不是随机噪声：低位平台说明延迟策略能减少一部分无收益 JIT，慢位说明延迟后仍然发生的编译/状态切换进入了 measured values。
+
+### 11.4 分表二：gate 与编译规模
+
+debug 口径：当前 AutoJIT，`--fast --warmup 1`，只用于函数形状和路径计数，不作为性能数值。过滤掉 pip/venv 准备进程后，5 个 benchmark worker 合计：
+
+| gate 路径 | 次数 | 含义 |
+|---|---:|---|
+| `jit_vectorcall` | 403291 | 进入 AutoJIT gate 的总次数 |
+| `global_threshold_return` | 17305 | 还没到全局阈值，返回解释执行 |
+| `classified_warmup_return` | 358240 | 已分类，但 `LowRoi` 等策略要求继续解释等待更高热度 |
+| `classified_defer_freeze` | 25619 | 判定延迟/解释执行，并恢复 interpreted vectorcall |
+| `forced_compile` / `forced_compile_ok` | 2127 / 2127 | 仍然进入 CinderX JIT 编译的次数 |
+| `forced_compile_fallback` | 0 | 没有编译失败回退 |
+
+worker 编译事件按阶段和策略分布：
+
+| 维度 | 分布 | 读法 |
+|---|---|---|
+| 阶段 | `steady=2099`，`import=35` | SQLAlchemy declarative 的 JIT 成本几乎全在 steady 阶段 |
+| 策略原因 | `None=1450`，`LowRoi=684` | `LowRoi` 不是禁编；热度足够后仍会编译，形成 delayed compile 债 |
+| family | `ObjectManipulator=885`，`BranchFSM=745`，`Trivial=364`，`Mixed=69`，`CallDispatcher=28`，`NumericLoop=26`，`ReflectionMeta=17` | 主体是对象/控制/ORM 框架形状，不是数值循环 |
+| unique compiled | 516 | 编译面宽，单一 family 粗拦风险高 |
+
+代表性 SQLAlchemy 编译函数：
+
+| 函数 | 编译事件 | 阶段 | 形状 | 策略 | 判断 |
+|---|---:|---|---|---|---|
+| `<invalid>:_generated_copy_internals_traversal` | 12 | steady | `ObjectManipulator`, dims=`Object`, `loop=0`, `codeB=0`, `risk=-` | `2/None` | SQLAlchemy 生成的 traversal helper；小函数但数量多 |
+| `<invalid>:_generated_cache_key_traversal` | 12 | steady | `ObjectManipulator`, dims=`Object`, `loop=0`, `codeB=0`, `risk=-` | `2/None` | cache key 生成 helper，后续 deopt 也集中在 cache key 路径 |
+| `sqlalchemy.orm.mapper:Mapper._configure_pks.<locals>.<genexpr>` | 10 | steady | `BranchFSM`, dims=`Control`, `loop=2`, `codeB=0`, `risk=-` | `2/None` | declarative mapper 配置路径 |
+| `sqlalchemy.sql.compiler:DDLCompiler.create_table_constraints.<locals>.<genexpr>` | 10 | steady | `BranchFSM`, dims=`Control+Object+Dynamic`, `loop=3`, `codeB=0`, `risk=-` | `2/None` | SQL/DDL 构造路径 |
+| `sqlalchemy.sql.compiler:SQLCompiler._bind_processors.<locals>.<genexpr>` | 8 | steady | `ObjectManipulator`, dims=`Control+Object+Dispatch+Dynamic`, `loop=2`, `codeB=1`, `risk=-` | `2/None` | SQL compiler 绑定处理器 |
+| `sqlalchemy.util.langhelpers:format_argspec_plus` | 5 | import | `NumericLoop`, dims=`Compute+Control`, `loop=0`, `codeB=2`, `risk=HugeCode` | `2/None` | 启动期但 compute=true；不能被 startup 非数值规则误伤 |
+| `sqlalchemy.engine.default:DefaultExecutionContext._init_statement` | 5 | steady | `ObjectManipulator`, dims=`Control+Object`, `loop=2`, `codeB=2`, `risk=Exception+HugeCode` | `2/None` | engine 执行上下文核心路径，直接放行仍可能负 ROI |
+| `sqlalchemy.sql.traversals:HasCacheKey._gen_cache_key` | 4 | steady | `BranchFSM`, dims=`Control+Object`, `loop=3`, `codeB=2`, `risk=Exception+HugeCode` | `1000/LowRoi` | cache key 热路径；延迟后仍编译，且 deopt 高 |
+| `sqlalchemy.sql.coercions:expect` | 4 | steady | `BranchFSM`, dims=`Control+Object`, `loop=2`, `codeB=2`, `risk=Exception+HugeCode` | `1000/LowRoi` | SQL coercion 多态路径，deopt 高 |
+| `sqlalchemy.orm.session:Session._flush` | 4 | steady | `BranchFSM`, dims=`Control+Object+Dispatch`, `loop=3`, `codeB=2`, `risk=Exception+HugeCode` | `1000/LowRoi` | ORM flush 核心路径；不能 import-only 粗拦 |
+| `sqlalchemy.orm.persistence:_emit_insert_statements` | 4 | steady | `BranchFSM`, dims=`Control+Object`, `loop=3`, `codeB=2`, `risk=Exception+HugeCode` | `1000/LowRoi` | ORM insert 核心路径；当前延迟到热后仍编译 |
+| `sqlalchemy.orm.loading:_instance_processor` | 4 | steady | `ReflectionMeta`, dims=`Control+Object+Dynamic`, `loop=3`, `codeB=3`, `risk=Exception+HugeCode` | `2/None` | 高成本反射/对象处理，直接放行但动态 ROI 可疑 |
+
+### 11.5 分表三：JIT 动态成本
+
+`PYTHONJITDUMPSTATS=1` 的 debug worker 统计显示，SQLAlchemy declarative 的 deopt 数量没有 dask 那么大，但集中在 ORM/SQL 核心路径，足以解释 `auto=2` 相对 plugin-no-JIT 的 `+138.0ms` 动态成本。
+
+| deopt 类别 | 次数 | 占比 | 读法 |
+|---|---:|---:|---|
+| `GuardFailure` | 21714 | 98.1% | SQLAlchemy 的 mapper、event、cache key、attribute、row 类型高度多态，JIT guard 经常失效 |
+| `UnhandledException` | 402 | 1.8% | pool connect 等路径存在 JIT 未覆盖慢路径 |
+| `Raise` | 17 | 0.1% | 少量正常控制流 |
+| **合计** | **22133** | **100%** | 动态成本集中在 steady ORM/SQL 路径 |
+
+top deopt site：
+
+| 函数 | 次数 | 原因 | 说明 |
+|---|---:|---|---|
+| `sqlalchemy.sql.traversals:HasCacheKey._gen_cache_key` | 4616 | `GuardFailure/LOAD_ATTR_SLOT` + `GuardType` | cache key 生成对象形态多态；同时有属性 slot 和类型 guard 失败 |
+| `sqlalchemy.orm.unitofwork:UOWTransaction.execute.<locals>.<lambda>` | 3498 | `GuardFailure/LOAD_ATTR_SLOT` | unit-of-work action 类型多态 |
+| `sqlalchemy.event.base:_Dispatch._for_instance` | 2162 | `GuardFailure/LOAD_ATTR_SLOT` | event dispatch target 类型多态 |
+| `sqlalchemy.event.base:_Dispatch._for_class` | 2135 | `GuardFailure/LOAD_ATTR_SLOT` | class-level dispatch 类型多态 |
+| `sqlalchemy.sql.coercions:expect` | 1890 | `GuardFailure/LOAD_ATTR_SLOT` | SQL expression coercion 多态 |
+| `sqlalchemy.orm.attributes:AttributeImpl.get` | 1600 | `GuardFailure/LOAD_ATTR_SLOT` | ORM attribute impl 多态 |
+| `sqlalchemy.engine.row:BaseRow.__init__` | 1399 | `GuardFailure/GuardType` | row 构造类型 guard 失败 |
+| `sqlalchemy.orm.state:InstanceState._expire` | 1393 | `GuardFailure/LOAD_ATTR_SLOT` | instance state/attribute impl 多态 |
+| `sqlalchemy.sql.annotation:Annotated.__new__` | 749 | `GuardFailure/LOAD_ATTR_SLOT` | annotated SQL element 多态 |
+| `sqlalchemy.sql.elements:ClauseElement._clone` | 700 | `GuardFailure/LOAD_ATTR_SLOT` | SQL AST clone 多态 |
+| `sqlalchemy.pool.impl:SingletonThreadPool.connect` | 402 | `UnhandledException/LoadMethodCached` | pool connect 慢路径/异常路径 |
+
+### 11.6 策略判断
 
 | 观察 | 结论 |
 |---|---|
-| `BranchFSM` 占 gate 主体，且多数 `LowRoi` 来自 ORM/engine steady 热路径 | 不能把 `BranchFSM + codeB>0` 解释成“一律低收益”；只能提高低 ROI 阈值，让热度证明自己 |
-| `deprecated_params...warned` 这类 `startup=true` 装饰器包装被 `StartupInit` 延迟 | import/setup 延迟条件有效，适合拦启动期框架初始化 |
-| `format_argspec_plus` 是 `startup=true` 但 `compute=true` | startup/import 策略必须保留 compute 例外 |
-| benchmark 本体 `bench_sqlalchemy` 为 `CallDispatcher` 且 `limit=2` | 本体驱动函数不应被 import-window 策略误伤 |
+| plugin-no-JIT `249.8ms` 已优于 CPython JIT `269.2ms` | SQLAlchemy declarative 不需要 CinderX JIT 才能达标；CinderX JIT 是净负担 |
+| worker 编译事件 `2099/2134` 在 steady | 不是 startup/import 问题，不应扩大 provider 或 import-window 策略 |
+| `classified_warmup_return=358240`，但仍有 `2127` 次 forced compile | `LowRoi=1000` 是“延迟编译”，不是“避免编译”；在 pyperf `warmup=3` 下会把编译债推入 measured values |
+| 当前 AutoJIT median 好于 `auto=2`，mean 差很多 | 分类方向并非完全错误；问题是延迟后仍编译造成长尾，需要把部分形状从“晚编”改成“严格不编/动态禁编” |
+| deopt 主要是 SQLAlchemy cache key、event dispatch、unit-of-work、attribute/path 多态 | 下一步应做 deopt-aware 负 ROI 策略：优先验证 top deopt 函数禁编，或在高 deopt 形状上 freeze，而不是继续调静态 family 粗规则 |
+| `format_argspec_plus` 是 import 阶段 `compute=true` 高成本函数 | startup/import 策略仍必须保留 compute 保护；不能因 SQLAlchemy 回归而扩大 import 非数值拦截面 |
 
-### 11.5 2026-06-08 负 ROI 穿刺
+### 11.7 历史穿刺对照
 
-本轮穿刺的目标不是证明某条静态规则“看起来合理”，而是回答一个可量化问题：`sqlalchemy` 系列在启用 CinderX JIT 后能否追到 CPython 3.14.3 JIT 的 85% 以上。结论是：**只靠当前静态形状延迟不够；本轮穿刺代码不建议合入。**
+2026-06-08 的 SQLAlchemy 系列穿刺已经证明：单纯扩大静态 highcost 形状延迟只能拿到小收益，不能把本组用例拉回 CPython JIT 85% 线。
 
 | 口径 | `sqlalchemy_declarative` | `sqlalchemy_imperative` | 判断 |
 |---|---:|---:|---|
@@ -485,17 +572,7 @@ bc347c29（lazy bootstrap + 跳过已有函数扫描）已优化掉 93%（212.6�
 | 穿刺 v1：只延迟大 `BranchFSM + Control/Object` | 382ms | 70.7ms | 只有小收益，未达目标 |
 | 穿刺 v4：扩大到大 `BranchFSM/ObjectManipulator/ReflectionMeta/Mixed + Control/Object` | 375ms | 68.3ms | 相对 `auto=2` 约 1.06x faster；仍相对 CPython JIT 约 1.42x slower |
 
-v1 的规则只覆盖 `BranchFSM + Control/Object + loop>0 + codeB>=2 + !startup + !static + !compute`。v4 扩大到 `BranchFSM`、`ObjectManipulator`、`ReflectionMeta`、`Mixed` 四类高成本非数值对象/控制状态机。两者都能跑通功能测试，但性能收益很小，说明 `sqlalchemy` 的问题不是“再拦一类形状”就能解决。
-
-| 证据点 | 说明 | 策略含义 |
-|---|---|---|
-| JIT disabled 已快于 CPython JIT 基线 | `245ms/40.9ms` 均优于 `271ms/47.1ms` | SQLAlchemy 对当前 CinderX JIT 是整体负 ROI；如果产品允许禁编该类 workload，收益上限明确 |
-| v4 后仍有大量 SQLAlchemy 函数被编译 | debug 口径 `Finished compiling sqlalchemy` 约 3045 次 | 静态形状规则只挡住一小部分编译风暴 |
-| v4 debug 未看到 `AutoJIT compile skip` | `shape-logs-v4` 中 skip 计数为 0 | 当前 hook 放在 `jitVectorcall`/局部 compile helper 还不够，真实 worker 的主要编译入口没有被统一 gate |
-| 代表剩余编译热点仍分散 | `format_argspec_plus`、`deprecated_params...warned`、`_only_one_row`、`_collect_delete_commands`、`ManyToOneDP.presort_saves`、`SessionTransaction.commit` 等 | 剩余成本分布在签名生成、装饰器、result、dependency、session 等框架基础设施，不能靠一个 family 粗拦 |
-| `format_argspec_plus` 带 `compute=true` 且处于 startup | 它是启动期高成本函数，但有 compute 提示 | 继续扩大非数值规则会漏掉这类热点；去掉 compute 保护又可能误伤数值/JIT 用例 |
-
-后续如果继续优化 SQLAlchemy，优先级应从“调一个更宽的静态分类条件”转到“统一准入入口”。也就是让 `scheduleJitCompile`、`forcedJitVectorcall`、`compile_func` 依赖编译、`compile_all`/preload 这几类路径都经过同一套 AutoJIT admission，并且在没有 `CodeExtra` 时也能派生 structure key。只有先确认真实编译入口都被 gate 覆盖，再继续讨论 SQLAlchemy 是否需要 workload/package 级负 ROI 策略；否则静态分类再细，也挡不住绕过 gate 的编译入口。
+v1/v4 与本次当前 AutoJIT 结果一致：延迟一部分 ORM highcost 函数可以降低低位平台，但如果这些函数最终仍然编译，或者其它 ORM 多态路径继续进 JIT，整体 mean 仍会被动态成本和延迟编译长尾拖垮。
 
 ## 12 用例：sqlglot_v2 系列
 
@@ -736,7 +813,114 @@ v1 的规则只覆盖 `BranchFSM + Control/Object + loop>0 + codeB>=2 + !startup
 
 生产实现复测进一步收敛了策略边界：只新增 `BranchFSM + loop_score>=2 + code_size_bucket=1 + risk=Exception + active_dim=Control` 的 steady-state 延迟；不放宽 `loop_score=0 + code_size_bucket=0 + risk=Exception` 的小 helper。`blue-98:/results/autojit-exception-policy-20260608` 中，tuple-only 策略相对旧 wheel 的小子集结果为：`2to3` 1.37x faster，`deepcopy` 1.04x faster，`deepcopy_memo` 和 `deepcopy_reduce` 均 not significant；错误放宽 `_keep_alive` 的对照中，tuple-only 对 `deepcopy_reduce` 反而 1.10x faster，证明 `_keep_alive` 不应放行。`nbody` 在本轮出现 4%-6% slower 且方差较大，同一 wheel 的 `PYTHONJITAUTO=2` 为 111ms，`auto:2` 为 115-118ms，标记为独立待查，不归因于 `_deepcopy_tuple` 形状规则。
 
-## 17 当前策略判断汇总
+## 17 用例：dask
+
+### 17.1 总体判断
+
+`dask` 是 steady-state 异步调度、消息序列化、状态机更新和事件循环 workload，不是 startup/import compile storm。`CinderX no-plugin` 本身不慢，`plugin-no-JIT` 也基本追平 CPython JIT；真正把用例拉慢的是启用 CinderX JIT 后的动态成本。当前 AutoJIT 分类对它没有稳定收益：`auto:2` 到当前 AutoJIT 的均值差只有 `+16.3ms`，小于本用例 `~106ms` 标准差。
+
+结论先写在前面：`dask` 不应驱动 import/setup 策略继续泛化。它是 JIT 动态 ROI 负样本，优化方向应是 deopt/guard/expected-exception 专项，或更细的 steady-state 动态反馈，而不是把 startup provider 或静态 highcost 规则继续放大。
+
+### 17.2 总表：差距账本
+
+口径：`blue-98`，`--warmup 3 --affinity=30`，正式 pyperformance 60 values。CPython JIT 使用 `/opt/python314-jit/bin/python3.14`；CinderX 口径使用同一 `/opt/python314` 和同一 dask venv，只改变 `CINDERX_PLUGIN_ENABLE` / `PYTHONJITAUTO` / provider 环境变量。
+
+基线：CPython 3.14.3 JIT **1360.2ms**。优化前：CinderX `PYTHONJITAUTO=2` **2005.5ms**，慢 **+645.2ms**。当前 AutoJIT：`auto:2 + provider` **2021.8ms**，慢 **+661.5ms**。
+
+下表把这 `+661.5ms` 按成本来源平铺。`已优化掉` = 优化前差距 - 当前剩余差距；负数表示当前 AutoJIT 在该项没有收益，差值在本用例方差内但不能算正收益。
+
+| 成本项 | 取数方式 | 优化前差距 | 当前剩余差距 | 已优化掉 | 继续可挖空间 | 下一步判断 |
+|---|---|---:|---:|---:|---:|---|
+| CinderX 解释器基底 | CinderX no-plugin `1289.2ms` - CPython JIT `1360.2ms` | -71.0ms | -71.0ms | 0.0ms | 0.0ms | 不是瓶颈；不开插件时 CinderX 路径反而略快 |
+| 插件固定加载/初始化 | CinderX plugin-no-JIT `1355.4ms` - CinderX no-plugin `1289.2ms` | +66.2ms | +66.2ms | 0.0ms | 小 | 有固定成本，但被解释器基底的 -71.0ms 抵消后，plugin-no-JIT 已基本追平 CPython JIT |
+| CinderX JIT 动态成本 | `PYTHONJITAUTO=2` / 当前 AutoJIT 分别减 plugin-no-JIT | +650.1ms | +666.4ms | -16.3ms | ~666ms 上界 | **主差距**；来自 steady 阶段编译后运行期 deopt/guard/expected exception，不是 startup/import |
+| import/startup 编译风暴 | debug 编译事件：import `45`，steady `3440` | 非主项 | 非主项 | 0.0ms | 不作为主线 | import 只占 `45/3485` 个编译事件，不应继续泛化 startup/import 规则 |
+| **合计** | 总耗时减 CPython JIT | **+645.2ms** | **+661.5ms** | **-16.3ms** | **~666ms 上界** | 当前 AutoJIT 没解决 dask；下一步只能看 JIT 动态成本专项，或做 deopt-aware 禁编策略 |
+
+读表三条结论：
+
+- dask 的基底不慢：CinderX no-plugin 比 CPython JIT 快 `71.0ms`；即使加上插件固定成本，plugin-no-JIT 也只比 CPython JIT 快 `4.8ms`。
+- 真正差距只有一项：启用 CinderX JIT 后新增 `+650ms` 级动态成本；当前 AutoJIT 没把它降下来。
+- 下一步不该继续调 startup/import/provider，而应围绕 `distributed`/`asyncio`/`cloudpickle`/`zict` 的 deopt、slot guard 多态、expected exception 慢路径做专项 A/B。
+
+### 17.3 分表一：gate 与编译规模
+
+debug 口径：`--fast -n 3 -w 1`，只用于函数形状和路径计数，不作为性能数值。4 个 pyperf worker 的合计数据如下。
+
+| gate 路径 | 次数 | 含义 |
+|---|---:|---|
+| `jit_vectorcall` | 962700 | 进入 AutoJIT gate 的总次数 |
+| `global_threshold_return` | 50864 | 还没到全局阈值，返回解释执行 |
+| `classified_warmup_return` | 747293 | 已分类，但继续解释等待更高热度 |
+| `classified_defer_freeze` | 161135 | 判定延迟/解释执行，并恢复 interpreted vectorcall |
+| `forced_compile` / `forced_compile_ok` | 3408 / 3404 | 仍然进入 CinderX JIT 编译的次数 |
+| `forced_compile_fallback` | 4 | 编译失败/回退 |
+
+编译事件按阶段和策略分布：
+
+| 维度 | 分布 | 读法 |
+|---|---|---|
+| 阶段 | `steady=3440`，`import=45` | dask 的 JIT 成本几乎都发生在 steady 阶段 |
+| 策略原因 | `None=2027`，`LowRoi=1458`，`StartupInit=0`，`RiskDefer=0` | import/setup 风暴规则基本不是主路径；`LowRoi` 仍会在热度足够后编译 |
+| family | `BranchFSM=1273`，`ObjectManipulator=1266`，`Trivial=577`，`CallDispatcher=128`，`Mixed=92`，`NumericLoop=73`，`ReflectionMeta=68`，`AsyncStateMachine=4` | 主体是控制/对象/调度形状，不是数值循环 |
+| unique compiled | 812 | 编译面很宽，属于框架型异步 workload |
+
+代表性编译函数：
+
+| 函数 | 编译事件 | 阶段 | 形状 | 策略 | 判断 |
+|---|---:|---|---|---|---|
+| `asyncio.futures:_chain_future.<locals>._set_state` | 77 | steady | `BranchFSM`, dims=`Control+Dispatch+Dynamic`, `loop=0`, `codeB=0`, `risk=-` | `1000/LowRoi` | 热到越过 LowRoi 阈值；继续编译 |
+| `asyncio.futures:_chain_future.<locals>._call_check_cancel` | 77 | steady | `BranchFSM`, dims=`Control+Object+Dispatch+Dynamic`, `loop=0`, `codeB=0`, `risk=-` | `1000/LowRoi` | 同上，异步 future 状态传播热点 |
+| `distributed.metrics:ContextMeter.meter.<locals>.callback` | 43 | steady | `BranchFSM`, dims=`Control+Dynamic`, `loop=0`, `codeB=0`, `risk=-` | `1000/LowRoi` | 高频回调；静态看低 ROI，但热度足够 |
+| `distributed.worker:Worker.execute` | 12 | steady | `BranchFSM`, dims=`Control+Object+Dispatch+Dynamic`, `loop=3`, `codeB=3`, `risk=Exception+HugeCode` | `1000/LowRoi` | dask worker 核心执行路径；高成本但不是 startup |
+| `distributed.scheduler:Scheduler.add_worker` | 8 | steady | `BranchFSM`, dims=`Control+Dispatch`, `loop=2`, `codeB=1`, `risk=Exception` | `1000/LowRoi` | scheduler 生命周期路径；热后仍编译 |
+| `distributed.scheduler:Scheduler.remove_worker` | 8 | steady | `BranchFSM`, dims=`Control+Dispatch`, `loop=2`, `codeB=1`, `risk=Exception` | `1000/LowRoi` | 同上 |
+| `distributed.worker:Worker.handle_scheduler` | 8 | steady | `Mixed`, dims=`Control`, `loop=3`, `codeB=1`, `risk=Suspend+Exception` | `2/None` | suspend/exception 状态机，当前直接放行 |
+| `distributed.client:Client.map` | 4 | steady | `ReflectionMeta`, dims=`Control+Dispatch+Dynamic`, `loop=3`, `codeB=2`, `risk=Exception+HugeCode` | `2/None` | benchmark 主体映射入口，不能用 import 规则拦 |
+| `dask.highlevelgraph:HighLevelGraph.from_collections` | 4 | steady | `CallDispatcher`, dims=`Control+Object+Dispatch+Dynamic`, `loop=2`, `codeB=2`, `risk=-` | `2/None` | dask 图构建核心路径 |
+| `distributed.comm.core:connect` | 4 | steady | `ObjectManipulator`, dims=`Control+Object+Dispatch+Dynamic`, `loop=3`, `codeB=2`, `risk=Exception+HugeCode` | `2/None` | 通信连接路径，高成本但属主体工作 |
+
+### 17.4 分表二：JIT 动态成本
+
+`PYTHONJITDUMPSTATS=1` 的 debug worker 统计显示，dask 的主要问题不是“编译了几个 import 函数”，而是 JIT 后运行期反复 deopt。4 个 worker 合计：
+
+| deopt 类别 | 次数 | 占比 | 读法 |
+|---|---:|---:|---|
+| `GuardFailure` | 747087 | 73.2% | 类型/slot 形态多态，JIT guard 经常失效 |
+| `UnhandledException` | 245480 | 24.0% | 字典/删除/调用等 expected exception 或慢路径被 JIT 当异常成本处理 |
+| `Raise` | 28187 | 2.8% | 业务中正常 raise/control path |
+| **合计** | **1020754** | **100%** | 动态成本规模远大于 import 编译小账 |
+
+top deopt site：
+
+| 函数 | 次数 | 原因 | 说明 |
+|---|---:|---|---|
+| `distributed.scheduler:TaskCollection.transition` | 152512 | `GuardFailure/LOAD_ATTR_SLOT` | scheduler 状态对象 slot guard 多态 |
+| `distributed.worker_state_machine:StateMachineEvent.__new__` | 92490 | `GuardFailure/STORE_ATTR_SLOT` | worker 状态机事件对象构造多态 |
+| `distributed.worker_state_machine:WorkerState.handle_stimulus` | 61690 | `GuardFailure/LOAD_ATTR_SLOT` | 多种 stimulus/event 类型进入同一路径 |
+| `functools:_singledispatchmethod_get.__call__` | 61690 | `GuardFailure/LOAD_ATTR_SLOT` | singledispatch 绑定目标多态 |
+| `distributed.core:Server.digest_metric` | 56731 | `GuardFailure/GuardType` | metric value/type 不稳定 |
+| `asyncio.events:Handle.__init__` | 44193 | `GuardFailure/STORE_ATTR_SLOT` | asyncio handle 类型变化 |
+| `cloudpickle:_function_getstate` | 31716 | `GuardFailure/LOAD_ATTR_SLOT` | 函数序列化属性访问多态 |
+| `cloudpickle:Pickler._function_getnewargs` | 31716 | `GuardFailure/LOAD_ATTR_SLOT` | 同上 |
+| `zict.cache/lru/func:__delitem__` | 92376 | `UnhandledException/DeleteSubscr` | cache/lru 删除路径 expected miss/慢路径 |
+| `distributed.worker_state_machine:WorkerState._handle_compute_task` | 30792 | `UnhandledException/DictSubscr` | 状态字典访问 miss 路径 |
+| `distributed.protocol.pickle:dumps` | 29087 | `UnhandledException/CallEx` + `GuardFailure/GuardType` | 序列化调用形态复杂 |
+| `distributed.client:Future._verify_initialized` | 28000 | `Raise/Raise` | Future 状态校验中的正常控制流 |
+
+### 17.5 策略判断
+
+| 观察 | 结论 |
+|---|---|
+| `auto=2` 到当前 AutoJIT 没有稳定收益 | 当前分类器主要解决 startup/import 或低热 compile storm；dask 的成本在 steady 动态执行期 |
+| import 编译事件只有 `45/3485` | provider/import window 对 dask 不是主要杠杆 |
+| `classified_defer_freeze` 已有 `161135` 次，但仍有 `3408` 次编译和 `1020754` 次 deopt | 静态分类已经挡了一部分低收益函数，但挡不住热到阈值后的动态负 ROI |
+| 代表函数是 scheduler/worker/client/asyncio/cloudpickle/zict 的主体路径 | 不能简单全局拦 `BranchFSM/ObjectManipulator/ReflectionMeta + codeB>0`，否则会把 dask 主体工作禁编 |
+| deopt 主要来自 slot guard 多态、expected exception、状态机事件多态 | 真正优化路线是 JIT 动态成本专项：slot guard 多态处理、expected exception 慢路径、状态机/序列化路径的 deopt-aware 策略 |
+
+策略结论：`dask` 应作为 **steady async/framework 动态负 ROI 样本** 进入证据集。当前 AutoJIT v1 不根据 dask 扩大 startup/import 规则；若后续要优化 dask，应该单独做 deopt-aware A/B，例如先针对 `distributed.worker_state_machine` / `distributed.scheduler.TaskCollection` / `zict.__delitem__` / `cloudpickle` 热点验证“禁编或优化 JIT deopt”哪条更有效。
+
+## 18 当前策略判断汇总
 
 | 规则 | 支撑用例 | 结论 |
 |---|---|---|
@@ -746,7 +930,8 @@ v1 的规则只覆盖 `BranchFSM + Control/Object + loop>0 + codeB>=2 + !startup
 | suspendable 不能一刀切禁止 | `generators` | 成立。`Tree.__iter__` 延迟到 1000 后仍可热后编译 |
 | `compute=true` 默认放行 | `coverage:fibonacci`、`generators:tree` | 成立。数值/compute 提示是收益信号 |
 | coverage 回归不能直接驱动 import-window 策略收窄 | `coverage` | 成立。其高成本函数多在 steady worker，属于单独 ROI 问题 |
-| 框架型 steady highcost 需要单独 ROI 判断 | `sqlalchemy_declarative`、`sqlalchemy_imperative` | 成立。ORM/engine 热路径里存在 `BranchFSM`、`ObjectManipulator`、`ReflectionMeta` 大函数，不能由 import-window 规则直接拦 |
+| 框架型 steady highcost 需要单独 ROI 判断 | `sqlalchemy_declarative`、`sqlalchemy_imperative` | 成立。ORM/engine 热路径里存在 `BranchFSM`、`ObjectManipulator`、`ReflectionMeta` 大函数；`sqlalchemy_declarative` 复跑确认 plugin-no-JIT 已达标，而 CinderX JIT/AutoJIT 都是负 ROI |
+| `LowRoi` 延迟不是禁编，会产生测量窗口长尾 | `sqlalchemy_declarative` | 成立。当前 AutoJIT median `377.5ms` 好于 `auto=2`，但 mean `434.4ms` 被 `458-626ms` 慢值拉高；`classified_warmup_return=358240` 后仍有 `2127` 次编译 |
 | parser/optimizer 树处理不能按 `ObjectManipulator + codeB=2` 全局延迟 | `sqlglot_v2` 系列 | 成立。`Parser._parse`、`pushdown_projections`、`optimize_joins` 等是 benchmark 主体工作 |
 | `StartupInit` 是阶段条件，不是单独拦截理由 | `sqlalchemy`、`sqlglot` startup 样本 | 成立。只有 startup/import 内高成本、非数值、非 compute 形状才是目标；小函数和 compute 函数不应被误伤 |
 | `LowRoi` 是热度延迟，不是禁编 | `logging_simple`、`logging_format`、`sympy_expand`、`sympy_str` | 成立。日志输出和符号计算核心函数会在 gate 数足够高后编译 |
@@ -757,19 +942,21 @@ v1 的规则只覆盖 `BranchFSM + Control/Object + loop>0 + codeB>=2 + !startup
 | expected-exception deopt 需要精确到函数形状 | `deepcopy` | 成立。`_deepcopy_tuple` 抑制后正式 A/B 有小幅收益；`_keep_alive` 放宽会让 `deepcopy_reduce` 回归，应保持 `RiskDefer` |
 | deopt 数不能单独驱动准入策略 | `deepcopy` | 成立。必须同时看函数形状、子场景和正式 A/B；否则会误伤 `deepcopy_memo` |
 | `RiskDefer` 对低热大函数有效，但不能替代收益判断 | `pickle_pure_python`、`deepcopy` | 成立。部分入口/通用函数未编译是保护，但上线前仍需非 debug A/B 确认收益是否丢失；`_keep_alive` 是“风险高且放宽会回归”的反例 |
+| steady async/framework 动态负 ROI 不能靠 startup/import 泛化解决 | `dask`、`sqlalchemy_declarative` | 成立。`dask` 的主因是 `distributed`/`asyncio`/`cloudpickle`/`zict` deopt；`sqlalchemy_declarative` 的主因是 ORM steady guard failure 加 delayed compile 长尾 |
 
-## 18 待补清单
+## 19 待补清单
 
 | 优先级 | 项 | 目的 |
 |---|---|---|
 | P0 | 生成当前 `highcost > 0` 口径下 `2to3` 的完整 shape TSV | 让 `2to3` 主目标与当前策略完全对齐 |
 | P0 | 将 `2to3` 拆成 `import lib2to3.main` 与 `main() refactor` 两阶段函数表 | 区分 import-window 应延迟与 steady/refactor 应放行 |
 | P1 | 给 `coverage` 补非 debug 性能 A/B 与候选级动态收益 | 判断是否需要 steady coverage 专项策略，而不是污染 import-window 策略 |
-| P1 | 给 `sqlalchemy` 系列补非 debug A/B 与候选级动态收益 | 判断 ORM/engine steady highcost 函数是否需要专项阈值，而不是扩大 import-window 策略 |
+| P1 | 给 `sqlalchemy_imperative` 补同格式表 | `sqlalchemy_declarative` 已补当前五口径账本；imperative 仍需按同样口径拆分 |
+| P1 | 对 `sqlalchemy_declarative` top deopt/LowRoi 函数做严格禁编穿刺 | 验证把部分 ORM 多态路径从“延迟后仍编译”改成“不编译/动态禁编”能否拿回 mean 长尾 |
 | P1 | 给 `sqlglot_v2` 四个子用例分别补非 debug A/B | 区分 parse/transpile/optimize 的真实收益和误伤边界 |
 | P1 | 给 `logging` 三个子用例分别补非 debug A/B | 区分 silent 微路径、simple 输出路径、format 格式化路径是否需要差异化阈值 |
 | P1 | 给 `sympy` 四个子用例分别补非 debug A/B | 判断符号计算 highcost 函数的动态收益是否覆盖编译成本 |
 | P1 | 给 `pickle_pure_python` 补非 debug A/B | 判断纯 Python 序列化大分支函数热后编译收益是否覆盖编译成本 |
 | P1 | 将 `deepcopy/deepcopy_reduce/deepcopy_memo` 三个子场景补完整函数形状表 | deopt 和正式 A/B 已拆分；后续还需要按子场景列完整编译函数，确认 `_deepcopy_tuple` 收窄规则是否有其它同形状候选 |
-| P1 | 给 `dask`、`dulwich_log`、`bench_mp_pool` 补同格式表 | 扩大非 JIT 用例样本，避免只围绕 `2to3` 调参 |
+| P1 | 给 `dulwich_log`、`bench_mp_pool` 补同格式表 | 扩大非 JIT 用例样本，避免只围绕 `2to3`/`dask` 调参 |
 | P2 | 给 `scimark_fft/scimark_lu/scimark_sor/scimark_monte_carlo` 补同格式表 | 验证 JIT 用例误伤边界 |
