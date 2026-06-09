@@ -100,6 +100,21 @@ PyMemberDef* attrSlotMemberDef(
   }
   return def;
 }
+
+bool attrSlotTypeDefinesGetattr(const BytecodeInstruction& bc_instr) {
+  uint32_t type_version = bc_instr.attrCacheTypeVersion();
+  if (type_version == 0) {
+    return false;
+  }
+
+  PyInterpreterState* interp = _PyInterpreterState_GET();
+  PyTypeObject* type =
+      interp->types.type_version_cache[type_version % TYPE_VERSION_CACHE_SIZE];
+  if (type == nullptr || type->tp_version_tag != type_version) {
+    return false;
+  }
+  return _PyType_Lookup(type, &_Py_ID(__getattr__)) != nullptr;
+}
 #endif
 
 void rotateStackTop(OperandStack& stack, int count) {
@@ -3054,6 +3069,7 @@ void HIRBuilder::emitLoadAttr(
           PyErr_Clear();
           field_name = "<unknown>";
         }
+        bool may_need_getattr_fallback = attrSlotTypeDefinesGetattr(bc_instr);
         emitSlotTypeVersionGuard(
             tc, receiver, bc_instr.attrCacheTypeVersion(), "LOAD_ATTR_SLOT");
         Register* field = temps_.AllocateStack();
@@ -3065,9 +3081,31 @@ void HIRBuilder::emitLoadAttr(
             TOptObject);
         Register* result = temps_.AllocateStack();
         if (member_def->type == T_OBJECT_EX) {
-          auto* check = tc.emit<CheckField>(field, field, name, tc.frame);
-          check->setGuiltyReg(receiver);
-          tc.emit<Assign>(result, check->output());
+          if (may_need_getattr_fallback) {
+            BasicBlock* set_block = cfg.AllocateBlock();
+            BasicBlock* fallback_block = cfg.AllocateBlock();
+            BasicBlock* done_block = cfg.AllocateBlock();
+
+            tc.emit<CondBranch>(field, set_block, fallback_block);
+
+            tc.block = set_block;
+            Register* checked_result = temps_.AllocateNonStack();
+            tc.emit<RefineType>(checked_result, TObject, field);
+            tc.emit<Assign>(result, checked_result);
+            tc.emit<Branch>(done_block);
+
+            tc.block = fallback_block;
+            Register* fallback = temps_.AllocateNonStack();
+            tc.emit<LoadAttr>(fallback, receiver, name_idx, tc.frame);
+            tc.emit<Assign>(result, fallback);
+            tc.emit<Branch>(done_block);
+
+            tc.block = done_block;
+          } else {
+            auto* check = tc.emit<CheckField>(field, field, name, tc.frame);
+            check->setGuiltyReg(receiver);
+            tc.emit<Assign>(result, check->output());
+          }
         } else {
           BasicBlock* set_block = cfg.AllocateBlock();
           BasicBlock* none_block = cfg.AllocateBlock();

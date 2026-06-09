@@ -1174,6 +1174,9 @@ LoadMethodResult __attribute__((noinline)) LoadMethodCache::lookupSlowPath(
             cache_stats_, tp, name, CacheMissReason::kPyDescrIsData);
         PyObject* result = f(descr, obj, (PyObject*)obj->ob_type);
         Py_DECREF(descr);
+        if (result == nullptr) {
+          return {nullptr, nullptr};
+        }
         Py_INCREF(Py_None);
         return {Py_None, result};
       }
@@ -1207,6 +1210,9 @@ LoadMethodResult __attribute__((noinline)) LoadMethodCache::lookupSlowPath(
         cache_stats_, tp, name, CacheMissReason::kUncategorized);
     PyObject* result = f(descr, obj, (PyObject*)Py_TYPE(obj));
     Py_DECREF(descr);
+    if (result == nullptr) {
+      return {nullptr, nullptr};
+    }
     Py_INCREF(Py_None);
     return {Py_None, result};
   }
