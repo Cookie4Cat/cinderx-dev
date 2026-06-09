@@ -10,6 +10,7 @@
 
 | 版本 | 日期 | 修订人 | 修订说明 |
 |---|---|---|---|
+| v0.21 | 2026-06-09 | @sisibeloved | 重写 `python_startup` 章节为分阶段平铺账本：四口径（CPython 基线 / `PYTHONJITAUTO=2` 优化前 / 当前 AutoJIT / force interpret-only）逐阶段列 优化前差距/已优化掉/剩余差距/可挖空间，一眼看出差距在哪、优化了多少、还剩多少；后接**全量 17 个 gate 函数形状与策略表**（8 StartupInit + 6 RiskDefer + 2 LowRoi + 1 编译）。实测确认 bc347c29 优化掉 93%（212.6→14.5ms），大头是插件加载 init 期 `schedule_existing_functions` 编译风暴；剩余 +14.5ms（插件地板 ~8 + import 运行税 ~6）无干净单点杠杆。A（逐 def tracking）~0.16ms、C（逐帧计数）硬上界 ≤0.46%、native wrapper ~0.18ms、`jit::initialize` 惰性 ~1.6ms 均穿刺否决。 |
 | v0.20 | 2026-06-09 | @sisibeloved | 补充 import/setup 细粒度决策穿刺：拆分 `import_phase`/`setup_phase` 诊断字段并保留 split-only 基础设施；提前 import 分类冻结无稳定收益，暂不引入 import/setup 分叉阈值策略。 |
 | v0.19 | 2026-06-08 | @sisibeloved | 补充 startup/site 成本拆解：`_cinderx_exec_impl()`、`jit::initialize()`、`importtime`、gate stats 与 import-depth skip 负向穿刺分表记录；确认 P2a 有成本但不能简单跳过计数。 |
 | v0.18 | 2026-06-08 | @sisibeloved | 补充 `2to3` refactor 热点穿刺：profile 确认 parse/pattern 函数是真热点，但 env-gated allow 编译显著负收益，suppress 基本持平；refactor 热点不作为下一步 AutoJIT 策略收益点。 |
@@ -82,6 +83,7 @@
 | `python_startup` | CPython 3.14.3 JIT 基线，`--warmup 3 --affinity=30` | `blue-98:/root/cinderx-lab/results/autojit-startup-breakdown-20260608/cpython_jit_startup_aff30.json` | 基线：`python_startup=18.128ms`，`python_startup_no_site=11.740ms` |
 | `python_startup` | Python bootstrap 懒加载 + AutoJIT 初始化跳过已有函数扫描，`auto:2 + find_and_load` | `blue-98:/root/cinderx-lab/results/autojit-startup-init-spike-20260608/{cinderx_auto_classify_startup_init_spike_aff30_valid.json,importtime/*,process_time_init_spike.tsv}` | 正式均值：`python_startup=38.617ms`，`python_startup_no_site=13.358ms`；no-site 已达 CPython JIT 87.9%，site 仍只有 46.9% |
 | `python_startup` | `find_and_load` provider 改为 `_cinderx` native C wrapper 穿刺 | `blue-98:/root/cinderx-lab/results/autojit-native-import-provider-20260608/{cinderx_auto_native_provider_startup_aff30.json,cinderx_auto_native_provider_2to3_aff30.json,importtime/*}` | 功能可行，但正式 `python_startup=38.440ms`，只比上一轮快约 0.18ms；`2to3=956ms` 与既有 966/973ms 同量级，暂不作为优先合入项 |
+| `python_startup` | §7 分阶段账本 + 全量 gate 形状（四口径 wall 中位数 + importtime 窗口 + 17 函数 shape，debug 口径） | `blue-98:cinderx-test:/results/autojit-startup-ledger-20260609/{startup_totals.tsv,importtime_windows.tsv,python_startup.gate-shapes.raw.log,python_startup.gate-shapes.tsv,README.md}` | 同一 `_cinderx.so` 只改环境：base/jit2/auto/nocompile = 21.8/234.4/35.9/31.7ms（site）；`_cinderx_auto` importtime 累计 0.4/185.5/8.5/8.1ms；全量 17 个 gate 函数 = 8 StartupInit + 6 RiskDefer + 2 LowRoi + 1 编译。README 含复现命令与枚举映射 |
 | `coverage` | direct worker，`PYTHONJITAUTO=auto:2`，`CINDERX_AUTOJIT_IMPORT_PROVIDER=find_and_load` | `blue-98:/results/autojit-import-highcost-bucket1-20260605/worker-gate-shapes/coverage.*.jit.log` | 有真实 C++ gate 形状；debug 口径，不作为性能数值 |
 | `generators` | direct worker，同上 | `blue-98:/results/autojit-import-highcost-bucket1-20260605/worker-gate-shapes/generators.*.jit.log` | 有真实 C++ gate 形状；debug 口径 |
 | `unpack_sequence` | direct worker，同上 | `blue-98:/results/autojit-import-highcost-bucket1-20260605/worker-gate-shapes/unpack_sequence.*.jit.log` | 有真实 C++ gate 形状；debug 口径 |
@@ -303,33 +305,61 @@ phase timer 结果如下，使用同一新 wheel、同一 20 次 harness，因�
 
 ### 7.1 总体判断
 
-当前形状表只看到 2 个编译函数，均为启动期小型 `ObjectManipulator`。这说明 `python_startup` 的剩余差距不能只用“编译函数很多”解释，还需要继续分解 CinderX plugin 初始化、frame evaluator、import provider 包装和启动路径本身的固定成本。
+`python_startup` 是“开 CinderX JIT 后启动变慢”的固定开销用例，不是 JIT 收益用例。下面的分阶段平铺账本一眼说明：开 CinderX（优化前 `PYTHONJITAUTO=2`）相对 CPython JIT 基线慢在哪、当前 AutoJIT 候选优化掉了多少、还剩多少；后接全量 gate 函数形状表。
 
-2026-06-08 的启动瘦身穿刺把剩余成本拆成三层：第一层是 Python bootstrap 不再 eager `import cinderx`，只加载 `_cinderx`/`cinderjit` 和轻量 provider；第二层是 `PYTHONJITAUTO=auto:*` 初始化时只安装 frame evaluator，不再扫描并 schedule 已存在函数；第三层是把 Python 层 `find_and_load` wrapper 改为 `_cinderx` native C wrapper。前两层收益明确，第三层收益很小且改动面较大，先暂缓。
+- 基线：CPython 3.14.3 JIT，**21.8ms**（site）/ 13.6ms（`no_site`）
+- 优化前：CinderX JIT `PYTHONJITAUTO=2`，**234.4ms**
+- 优化后：当前 AutoJIT 候选（`auto:2` + `find_and_load`），**36.3ms**
+- 继续可挖空间：当前候选对比 force interpret-only（`auto:2097152`，gate 但不编译）**31.8ms** 的差值，表示“AutoJIT 准入/gate 路径理论上还能挤多少”，不保证全部可拿。
 
-### 7.2 启动耗时分布与穿刺结论
+口径：同一 `_cinderx.so`、`/opt/python314`、`taskset -c 30`、wall 中位数，只改环境变量；各阶段由 `-X importtime` 交叉 wall 总耗时拆出。wall harness 比 §5 的 pyperf 口径（base 18.1 / 优化前 224.9 / 优化后 38.6ms）高约 3ms 固定开销，但该开销在四口径相同，**下表的差距列（优化前差距/已优化掉/剩余/可挖空间）与 harness 无关**。
 
-| 口径 | `python_startup` | `python_startup_no_site` | 相对 CPython JIT | 判断 |
-|---|---:|---:|---:|---|
-| CPython 3.14.3 JIT 基线 | 18.128ms | 11.740ms | 1.000x / 1.000x | 对标目标 |
-| 原始 CinderX `PYTHONJITAUTO=2` | 224.894ms | 90.810ms | 0.081x / 0.129x | 低阈值 JIT 编译风暴 |
-| AutoJIT 分类 + provider，早期候选 | 55.800ms | 15.061ms | 0.325x / 0.780x | import/startup 编译风暴基本压住，但 plugin/init 残留明显 |
-| Python bootstrap 懒加载 | 51.365ms | 15.046ms | 0.353x / 0.780x | 移除 full `import cinderx` 有收益，主要影响 site 启动 |
-| AutoJIT 初始化跳过已有函数扫描 | 38.617ms | 13.358ms | 0.469x / 0.879x | 主要有效穿刺；no-site 达到 85% 目标，site 仍未到 0.5x |
-| `find_and_load` native C wrapper | 38.440ms | 13.397ms | 0.472x / 0.876x | 只改善约 0.18ms；功能可行但不值得优先合入 |
+### 7.2 分阶段耗时账本
 
-native wrapper 的 import-time 证据也支持该结论：`site` 累计仅从约 21.586ms 变为 21.468ms，`_cinderx_auto` 累计仍约 8.7ms；说明 Python `find_and_load` wrapper 的 trampoline 不是当前主要残留。
+| 耗时项 | CPython JIT 基线 | CinderX JIT 优化前 | 优化前差距 | 当前优化后 | 已优化掉 | 当前剩余差距 | 继续可挖空间 | 下一步判断 |
+|---|---:|---:|---:|---:|---:|---:|---:|---|
+| 解释器核心（pre-site, `-S`） | 13.6ms | 13.7ms | +0.1ms | 13.7ms | 0.0ms | +0.1ms | ~0ms | CPython 自身；plugin 不在 `-S` 下加载，已追平，无可挖 |
+| `_cinderx` 插件加载 + JIT init | 0.4ms | 186.0ms | +185.6ms | 8.5ms | 177.4ms | +8.1ms | ~0.5ms | **最大单项**：`PYTHONJITAUTO=2` 在 init 扫描+调度全部已有函数→编译风暴；bc347c29 跳过已有函数扫描=最大收益；剩 dlopen+exec ~5.4ms + `jit::initialize()` ~1.6ms 地板 |
+| site/stdlib import + 逐帧/gate 税 | 7.7ms | 34.8ms | +27.1ms | 14.0ms | 20.7ms | +6.3ms | ~4.1ms | per-frame 计数/gate/少量编译摊在 import 上；import 提前分类冻结实测负收益 |
+| **合计（site）** | **21.8ms** | **234.4ms** | **+212.6ms** | **36.3ms** | **198.1ms** | **+14.5ms** | **~4.5ms** | 已解决 93%；当前 0.60x，距 CPython JIT 还差 +14.5ms = 插件地板 ~8 + import 运行税 ~6 |
 
-2026-06-08 进一步拆解后，`-c pass` 显示 plugin 固定启动税约 `13.6ms`，早期 stdlib import 净税约 `10.7ms`。`_cinderx_exec_impl()` 自身约 `3.3ms`，其中 `jit::initialize()` 约 `1.84ms`。这修正了之前的直觉：单纯延迟 JIT backend 初始化不是主杠杆，它最多解释 1-2ms；`python_startup` site 的大缺口来自动态加载/import 机制、frame evaluator 后的逐帧计数/CodeExtra 路径，以及 Python 启动期间的 provider/gate 摊销。
+注：`_cinderx` 插件加载列取 `-X importtime` 的 `_cinderx_auto` 累计（编译风暴由 init 期 `schedule_existing_functions` 触发，importtime 归在此项）；核心/合计为 wall 中位数；import 行 = 合计 − 核心 − 插件加载，吸收口径差。
 
-按当前数据，`python_startup` 达到 0.5x 需要低于 36.256ms，还差约 2.2ms；达到 0.85x 需要低于 21.327ms，还差约 17.1ms。下一步不应再押注单点 backend lazy，而应做更细粒度 startup/import 决策：减少逐帧计数成本，但不能像 import-depth skip 穿刺那样让函数长期停留在未分类 gate 状态。
+读表三条结论：
 
-### 7.3 函数形状表
+- 优化前（`PYTHONJITAUTO=2`）+212.6ms 差距里 **+185.6ms 全在插件加载/JIT init**——低阈值在 init 扫描并调度所有已存在函数，造成编译风暴；不是 benchmark 本体慢。
+- bc347c29（跳过已有函数扫描 + lazy bootstrap）**已优化掉 198.1ms（93%）**，几乎全部来自上面这一项。
+- 当前剩余 +14.5ms 无干净单点杠杆：插件地板 ~8ms（dlopen+exec ~5.4 不可削、`jit::initialize` ~1.6 可惰性化但太小）+ import 逐帧/gate 运行税 ~6ms（frame evaluator 承重）。继续可挖空间仅 ~4.5ms（来自完全不编译），但 python_startup 本就只编译 1 个函数（见 7.3），且 import 提前分类冻结穿刺为负收益。
 
-| 函数 | 编译耗时 | 形状 | 策略 | 判断 |
-|---|---:|---|---|---|
-| `_sitebuiltins:_Printer.__init__` | 3.376ms | `ObjectManipulator`, dims=`Object+Control+Dispatch+Dynamic`, `loop=2`, `codeB=0`, `risk=None`, `synthetic=true` | `2/None` | 小规模启动函数；不是当前 compile storm 主因 |
-| `_frozen_importlib:_ModuleLockManager.__exit__` | 1.552ms | `ObjectManipulator`, dims=`Object+Dispatch+Control`, `loop=0`, `codeB=0`, `risk=None`, `synthetic=true` | `2/None` | 小规模 import 管理函数；继续优化时应先看固定启动成本 |
+### 7.3 全量 gate 函数形状与策略
+
+`python -c pass`（含 site）下进入 AutoJIT gate 的**全部 17 个函数**（`auto:2` + `find_and_load`，shape 日志口径）。绝大多数是 import 机制函数，被正确判为延迟；只有 1 个达阈值被编译。
+
+| 函数 | 形状 | 策略 | 判断 |
+|---|---|---|---|
+| `_sitebuiltins:_Printer.__init__` | `ObjectManipulator`, dims=`Control+Object`, `loop=2`, `codeB=0`, `risk=None`, `startup=false`, `synthetic=true` | `2/None` | **唯一编译**；site 期小对象构造，`loop=2` 达阈值即编译，非 compile storm 主因 |
+| `_frozen_importlib:_verbose_message` | `BranchFSM`, dims=`Control+Object+Dispatch`, `loop=0`, `codeB=0`, `risk=None`, `startup=false`, `synthetic=true` | `1000/LowRoi` | import 调试输出；低 ROI 延迟到 1000，启动期热度不足不编译 |
+| `posixpath:join` | `BranchFSM`, dims=`Control+Object+Dispatch`, `loop=3`, `codeB=1`, `risk=Exception`, `startup=false`, `synthetic=true` | `1000/LowRoi` | 路径拼接，带异常边+循环；低 ROI 延迟，启动期不编译 |
+| `_frozen_importlib:BuiltinImporter.find_spec` | `BranchFSM`, dims=`Control+Object+Dispatch+Suspend`, `loop=0`, `codeB=0`, `risk=None`, `startup=true`, `synthetic=true` | `2097152/StartupInit` | import 查找核心；import 窗口延迟正确 |
+| `_frozen_importlib_external:PathFinder.find_spec` | `BranchFSM`, dims=`Control+Object`, `loop=0`, `codeB=0`, `risk=None`, `startup=true`, `synthetic=true` | `2097152/StartupInit` | 路径查找；import 窗口延迟 |
+| `_frozen_importlib:ModuleSpec.__init__` | `ObjectManipulator`, dims=`Control+Object`, `loop=0`, `codeB=0`, `risk=None`, `startup=true`, `synthetic=true` | `2097152/StartupInit` | 模块 spec 构造；import 窗口对象构造延迟 |
+| `_frozen_importlib:_ModuleLockManager.__exit__` | `ObjectManipulator`, dims=`Object`, `loop=0`, `codeB=0`, `risk=None`, `startup=true`, `synthetic=true` | `2097152/StartupInit` | import 锁管理；旧口径曾编译，现按 startup 窗口延迟 |
+| `_frozen_importlib:_WeakValueDictionary.__init__.<locals>.KeyedRef.__new__` | `ReflectionMeta`, dims=`Object+Dispatch+Suspend`, `loop=0`, `codeB=0`, `risk=None`, `startup=true`, `synthetic=true` | `2097152/StartupInit` | weakref 分配；import 窗口延迟 |
+| `_frozen_importlib:_WeakValueDictionary.__init__.<locals>.KeyedRef.remove` | `BranchFSM`, dims=`Control+Object+Dispatch`, `loop=0`, `codeB=0`, `risk=None`, `startup=true`, `synthetic=true` | `2097152/StartupInit` | weakref 回调；import 窗口延迟 |
+| `_distutils_hack:DistutilsMetaFinder.find_spec` | `CallDispatcher`, dims=`Control+Object+Dispatch`, `loop=0`, `codeB=0`, `risk=None`, `startup=true`, `synthetic=false` | `2097152/StartupInit` | setuptools import hook；import 窗口高成本分发延迟 |
+| `_distutils_hack:DistutilsMetaFinder.find_spec.<locals>.<lambda>` | `Trivial`, dims=`-`, `loop=0`, `codeB=0`, `risk=None`, `startup=true`, `synthetic=false` | `2097152/StartupInit` | 启动期 trivial lambda；延迟无害 |
+| `_frozen_importlib:_find_and_load` | `BranchFSM`, dims=`Control+Dispatch+Suspend`, `loop=1`, `codeB=1`, `risk=Exception`, `startup=true`, `synthetic=true` | `2097152/RiskDefer` | import 主入口，带异常边+循环；风险延迟，import 窗口核心被保护函数 |
+| `importlib._bootstrap:_get_module_lock.<locals>.cb` | `BranchFSM`, dims=`Control+Object+Dispatch+Suspend`, `loop=0`, `codeB=0`, `risk=Exception`, `startup=true`, `synthetic=true` | `2097152/RiskDefer` | import 锁回调带异常边；风险延迟 |
+| `_frozen_importlib:_get_module_lock.<locals>.cb` | `BranchFSM`, dims=`Control+Object+Dispatch+Suspend`, `loop=0`, `codeB=0`, `risk=Exception`, `startup=false`, `synthetic=true` | `2097152/RiskDefer` | 同上（另一 import 名空间）；风险延迟 |
+| `_frozen_importlib:_WeakValueDictionary.__init__.<locals>.KeyedRef.__init__` | `ReflectionMeta`, dims=`Dispatch+Suspend`, `loop=0`, `codeB=0`, `risk=Dynamic`, `startup=true`, `synthetic=true` | `2097152/RiskDefer` | weakref 反射构造带动态风险；风险延迟 |
+| `collections.abc:Mapping.get` | `BranchFSM`, dims=`Control`, `loop=0`, `codeB=0`, `risk=Exception`, `startup=false`, `synthetic=true` | `2097152/RiskDefer` | 带异常边的 `Mapping.get`；风险延迟 |
+| `_cinderx_auto:_make_autojit_import_wrapper.<locals>.wrapper` | `BranchFSM`, dims=`Control+Dispatch+Suspend`, `loop=0`, `codeB=1`, `risk=Exception`, `startup=false`, `synthetic=false` | `2097152/RiskDefer` | AutoJIT 自己装的 import provider wrapper；带异常边，风险延迟（不编译自身基础设施） |
+
+全表反证 7.2 的结论：17 个 gate 函数 = **8 StartupInit + 6 RiskDefer + 2 LowRoi + 1 编译（`2/None`）**。它们都是 import 机制小函数（`codeB` 多为 0、`risk` 多为 Exception/None），分类策略把它们全部正确判为延迟——**python_startup 的差距确实不在“编译了什么”，而在 7.2 的固定加载 + 逐帧簿记税**。（被编译集只有 1–2 个，随 `startup_phase` 边界时序略有抖动。）
+
+### 7.4 优化结论
+
+bc347c29（lazy bootstrap + 跳过已有函数扫描）已优化掉 93%（212.6→14.5ms），几乎全部来自插件加载/JIT init 的编译风暴。当前剩余 +14.5ms 无干净单点杠杆：插件地板 ~8ms（dlopen+exec 不可削、`jit::initialize` ~1.6ms 太小）、import 逐帧/gate 税 ~6ms（frame evaluator 承重）。已穿刺否决：A 逐 def tracking 延后（~0.16ms）、native C wrapper（~0.18ms）、跳过逐帧计数 C（硬上界 ≤0.46%，亚噪声）、import 提前分类冻结（负收益）、延迟 `jit::initialize()`（~1.6ms 太小）。唯一未做的真杠杆是 import 窗口更细粒度分类（改动大，需分阶段 compile event 证明），ROI 低于换方向。
 
 ## 8 用例：coverage
 
