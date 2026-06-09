@@ -1672,6 +1672,51 @@ def test(obj):
   EXPECT_GE(countOpcode(*irfunc, Opcode::kCheckField), 1) << hir;
 }
 
+TEST_F(HIRBuildTest, SlotSpecializedLoadAttrUnsetSlotWithGetattrFallsBack) {
+  const char* src = R"(
+class SlotValue:
+    __slots__ = ("value",)
+
+    def __getattr__(self, name):
+        if name == "value":
+            return 42
+        raise AttributeError(name)
+
+obj = SlotValue()
+obj.value = 1
+
+def test(obj):
+    return obj.value
+)";
+
+  Ref<PyFunctionObject> func(compileAndGet(src, "test"));
+  ASSERT_NE(func.get(), nullptr);
+  Ref<> obj(getGlobal("obj"));
+  ASSERT_NE(obj.get(), nullptr);
+
+  for (int i = 0; i < 100; i++) {
+    auto result = Ref<>::steal(PyObject_CallFunctionObjArgs(
+        reinterpret_cast<PyObject*>(func.get()), obj.get(), nullptr));
+    ASSERT_NE(result.get(), nullptr);
+    ASSERT_TRUE(isIntEquals(result, 1));
+  }
+  ASSERT_TRUE(hasSpecializedOpcode(func, LOAD_ATTR_SLOT));
+  ASSERT_TRUE(PyObject_DelAttrString(obj.get(), "value") == 0);
+
+  std::unique_ptr<Function> irfunc(buildHIR(func));
+  ASSERT_NE(irfunc, nullptr);
+
+  std::string hir = fullPrinter().ToString(*irfunc);
+  EXPECT_GE(countOpcode(*irfunc, Opcode::kLoadField), 1) << hir;
+  EXPECT_GE(countOpcode(*irfunc, Opcode::kCondBranch), 1) << hir;
+  EXPECT_EQ(countOpcode(*irfunc, Opcode::kCheckField), 0) << hir;
+  EXPECT_GE(
+      countOpcode(*irfunc, Opcode::kLoadAttr) +
+          countOpcode(*irfunc, Opcode::kLoadAttrCached),
+      1)
+      << hir;
+}
+
 #if PY_VERSION_HEX >= 0x030E0000
 TEST_F(HIRBuildTest, SlotSpecializedLoadAttrWithHeaderOffsetFallsBack) {
   const char* src = R"(
