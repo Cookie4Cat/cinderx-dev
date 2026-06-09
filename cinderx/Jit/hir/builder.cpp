@@ -2982,11 +2982,10 @@ void HIRBuilder::emitDeleteAttr(
   tc.emit<DeleteAttr>(receiver, bc_instr.oparg(), tc.frame);
 }
 
-void HIRBuilder::emitSlotTypeVersionGuard(
+Register* HIRBuilder::emitSlotTypeVersionMatches(
     TranslationContext& tc,
     Register* receiver,
-    uint32_t type_version,
-    const char* descr) {
+    uint32_t type_version) {
   Register* obj_type = temps_.AllocateStack();
   tc.emit<LoadField>(
       obj_type, receiver, "ob_type", offsetof(PyObject, ob_type), TType);
@@ -3005,6 +3004,15 @@ void HIRBuilder::emitSlotTypeVersionGuard(
   Register* matches = temps_.AllocateStack();
   tc.emit<PrimitiveCompare>(
       matches, PrimitiveCompareOp::kEqual, version, expected);
+  return matches;
+}
+
+void HIRBuilder::emitSlotTypeVersionGuard(
+    TranslationContext& tc,
+    Register* receiver,
+    uint32_t type_version,
+    const char* descr) {
+  Register* matches = emitSlotTypeVersionMatches(tc, receiver, type_version);
   auto* guard = tc.emit<Guard>(matches, tc.frame);
   guard->setGuiltyReg(receiver);
   guard->setDescr(descr);
@@ -3070,8 +3078,15 @@ void HIRBuilder::emitLoadAttr(
           field_name = "<unknown>";
         }
         bool may_need_getattr_fallback = attrSlotTypeDefinesGetattr(bc_instr);
-        emitSlotTypeVersionGuard(
-            tc, receiver, bc_instr.attrCacheTypeVersion(), "LOAD_ATTR_SLOT");
+        Register* matches = emitSlotTypeVersionMatches(
+            tc, receiver, bc_instr.attrCacheTypeVersion());
+        BasicBlock* fast_path = cfg.AllocateBlock();
+        BasicBlock* slow_path = cfg.AllocateBlock();
+        BasicBlock* done = cfg.AllocateBlock();
+        Register* result = temps_.AllocateStack();
+        tc.emit<CondBranch>(matches, fast_path, slow_path);
+
+        tc.block = fast_path;
         Register* field = temps_.AllocateStack();
         tc.emit<LoadField>(
             field,
@@ -3079,12 +3094,10 @@ void HIRBuilder::emitLoadAttr(
             field_name,
             member_def->offset,
             TOptObject);
-        Register* result = temps_.AllocateStack();
         if (member_def->type == T_OBJECT_EX) {
           if (may_need_getattr_fallback) {
             BasicBlock* set_block = cfg.AllocateBlock();
             BasicBlock* fallback_block = cfg.AllocateBlock();
-            BasicBlock* done_block = cfg.AllocateBlock();
 
             tc.emit<CondBranch>(field, set_block, fallback_block);
 
@@ -3092,24 +3105,22 @@ void HIRBuilder::emitLoadAttr(
             Register* checked_result = temps_.AllocateNonStack();
             tc.emit<RefineType>(checked_result, TObject, field);
             tc.emit<Assign>(result, checked_result);
-            tc.emit<Branch>(done_block);
+            tc.emit<Branch>(done);
 
             tc.block = fallback_block;
             Register* fallback = temps_.AllocateNonStack();
             tc.emit<LoadAttr>(fallback, receiver, name_idx, tc.frame);
             tc.emit<Assign>(result, fallback);
-            tc.emit<Branch>(done_block);
-
-            tc.block = done_block;
+            tc.emit<Branch>(done);
           } else {
             auto* check = tc.emit<CheckField>(field, field, name, tc.frame);
             check->setGuiltyReg(receiver);
             tc.emit<Assign>(result, check->output());
+            tc.emit<Branch>(done);
           }
         } else {
           BasicBlock* set_block = cfg.AllocateBlock();
           BasicBlock* none_block = cfg.AllocateBlock();
-          BasicBlock* done_block = cfg.AllocateBlock();
 
           tc.emit<CondBranch>(field, set_block, none_block);
 
@@ -3117,16 +3128,25 @@ void HIRBuilder::emitLoadAttr(
           Register* checked_result = temps_.AllocateNonStack();
           tc.emit<RefineType>(checked_result, TObject, field);
           tc.emit<Assign>(result, checked_result);
-          tc.emit<Branch>(done_block);
+          tc.emit<Branch>(done);
 
           tc.block = none_block;
           Register* none = temps_.AllocateNonStack();
           tc.emit<LoadConst>(none, Type::fromObject(Py_None));
           tc.emit<Assign>(result, none);
-          tc.emit<Branch>(done_block);
-
-          tc.block = done_block;
+          tc.emit<Branch>(done);
         }
+
+        tc.block = slow_path;
+        tc.emit<LoadAttr>(
+            result,
+            receiver,
+            name_idx,
+            tc.frame,
+            /* already_optimized= */ true);
+        tc.emit<Branch>(done);
+
+        tc.block = done;
         tc.frame.stack.push(result);
         if (is_method) {
           emitPushNull(tc);

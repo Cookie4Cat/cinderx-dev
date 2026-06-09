@@ -1586,14 +1586,16 @@ def test(obj):
   ASSERT_NE(irfunc, nullptr);
 
   std::string hir = fullPrinter().ToString(*irfunc);
-  EXPECT_EQ(countOpcode(*irfunc, Opcode::kLoadAttr), 0) << hir;
+  EXPECT_GE(countOpcode(*irfunc, Opcode::kLoadAttr), 2) << hir;
   EXPECT_EQ(countOpcode(*irfunc, Opcode::kLoadAttrCached), 0) << hir;
   EXPECT_EQ(countOpcode(*irfunc, Opcode::kStoreAttr), 0) << hir;
   EXPECT_EQ(countOpcode(*irfunc, Opcode::kStoreAttrCached), 0) << hir;
   EXPECT_GE(countOpcode(*irfunc, Opcode::kLoadField), 3) << hir;
   EXPECT_GE(countOpcode(*irfunc, Opcode::kStoreField), 1) << hir;
   EXPECT_GE(countOpcode(*irfunc, Opcode::kCheckField), 2) << hir;
-  EXPECT_GE(countOpcode(*irfunc, Opcode::kGuard), 2) << hir;
+  EXPECT_GE(countOpcode(*irfunc, Opcode::kPrimitiveCompare), 2) << hir;
+  EXPECT_GE(countOpcode(*irfunc, Opcode::kCondBranch), 2) << hir;
+  EXPECT_GE(countOpcode(*irfunc, Opcode::kGuard), 1) << hir;
 }
 
 TEST_F(HIRBuildTest, SlotSpecializedLoadMethodUsesFieldOps) {
@@ -1629,11 +1631,12 @@ def test(obj):
   ASSERT_NE(irfunc, nullptr);
 
   std::string hir = fullPrinter().ToString(*irfunc);
-  EXPECT_EQ(countOpcode(*irfunc, Opcode::kLoadAttr), 0) << hir;
+  EXPECT_EQ(countOpcode(*irfunc, Opcode::kLoadAttr), 1) << hir;
   EXPECT_EQ(countOpcode(*irfunc, Opcode::kLoadAttrCached), 0) << hir;
   EXPECT_EQ(countOpcode(*irfunc, Opcode::kLoadMethod), 0) << hir;
   EXPECT_GE(countOpcode(*irfunc, Opcode::kLoadField), 1) << hir;
-  EXPECT_GE(countOpcode(*irfunc, Opcode::kGuard), 1) << hir;
+  EXPECT_GE(countOpcode(*irfunc, Opcode::kPrimitiveCompare), 1) << hir;
+  EXPECT_GE(countOpcode(*irfunc, Opcode::kCondBranch), 1) << hir;
 }
 
 TEST_F(HIRBuildTest, SlotSpecializedLoadAttrUnsetSlotUsesCheckField) {
@@ -1666,10 +1669,12 @@ def test(obj):
   ASSERT_NE(irfunc, nullptr);
 
   std::string hir = fullPrinter().ToString(*irfunc);
-  EXPECT_EQ(countOpcode(*irfunc, Opcode::kLoadAttr), 0) << hir;
+  EXPECT_EQ(countOpcode(*irfunc, Opcode::kLoadAttr), 1) << hir;
   EXPECT_EQ(countOpcode(*irfunc, Opcode::kLoadAttrCached), 0) << hir;
   EXPECT_GE(countOpcode(*irfunc, Opcode::kLoadField), 2) << hir;
   EXPECT_GE(countOpcode(*irfunc, Opcode::kCheckField), 1) << hir;
+  EXPECT_GE(countOpcode(*irfunc, Opcode::kPrimitiveCompare), 1) << hir;
+  EXPECT_GE(countOpcode(*irfunc, Opcode::kCondBranch), 1) << hir;
 }
 
 TEST_F(HIRBuildTest, SlotSpecializedLoadAttrUnsetSlotWithGetattrFallsBack) {
@@ -1820,10 +1825,10 @@ def test(stat_result):
   ASSERT_NE(irfunc, nullptr);
 
   std::string hir = fullPrinter().ToString(*irfunc);
-  EXPECT_EQ(countOpcode(*irfunc, Opcode::kLoadAttr), 0) << hir;
+  EXPECT_EQ(countOpcode(*irfunc, Opcode::kLoadAttr), 1) << hir;
   EXPECT_GE(countOpcode(*irfunc, Opcode::kLoadField), 1) << hir;
   EXPECT_GE(countOpcode(*irfunc, Opcode::kCondBranch), 1) << hir;
-  EXPECT_GE(countOpcode(*irfunc, Opcode::kGuard), 1) << hir;
+  EXPECT_GE(countOpcode(*irfunc, Opcode::kPrimitiveCompare), 1) << hir;
 
   ASSERT_EQ(jit::compileFunction(func), jit::Result::OK);
   auto result = Ref<>::steal(PyObject_CallFunctionObjArgs(

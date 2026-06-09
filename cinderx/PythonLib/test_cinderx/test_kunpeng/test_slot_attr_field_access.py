@@ -1,5 +1,6 @@
 # Copyright (c) Meta Platforms, Inc. and affiliates.
 
+import sys
 import unittest
 
 import cinderx
@@ -33,6 +34,20 @@ class SlotAttrFieldAccessTests(unittest.TestCase):
 
     def tearDown(self) -> None:
         cinderx.jit.disable_specialized_opcodes()
+
+    def assert_deopt_count(self, expected: int) -> None:
+        stats = cinderx.jit.get_and_clear_runtime_stats()
+        self.assertEqual(len(stats.get("deopt") or ()), expected)
+
+    def assert_single_deopt(
+        self, reason: str, description: str, lineno: int
+    ) -> None:
+        stats = cinderx.jit.get_and_clear_runtime_stats()
+        deopts = stats.get("deopt") or ()
+        self.assertEqual(len(deopts), 1)
+        self.assertEqual(deopts[0]["normal"]["reason"], reason)
+        self.assertEqual(deopts[0]["normal"]["description"], description)
+        self.assertEqual(deopts[0]["int"]["lineno"], lineno)
 
     def test_member_descriptor_store_simplifies_to_store_field(self) -> None:
         cinderx.jit.force_uncompile(store_member_descriptor_value)
@@ -80,7 +95,10 @@ class SlotAttrFieldAccessTests(unittest.TestCase):
         ops = cinderx.jit.get_function_hir_opcode_counts(Counter.increment)
         self.assertGreaterEqual(ops.get("LoadField", 0), 1)
         self.assertGreaterEqual(ops.get("StoreField", 0), 1)
-        self.assertGreaterEqual(ops.get("Guard", 0), 2)
+        self.assertGreaterEqual(ops.get("LoadAttr", 0), 1)
+        self.assertGreaterEqual(ops.get("PrimitiveCompare", 0), 1)
+        self.assertGreaterEqual(ops.get("CondBranch", 0), 1)
+        self.assertGreaterEqual(ops.get("Guard", 0), 1)
         self.assertGreaterEqual(ops.get("CheckField", 0), 1)
         self.assertEqual(ops.get("LoadAttrCached", 0), 0)
         self.assertEqual(ops.get("StoreAttrCached", 0), 0)
@@ -107,7 +125,9 @@ class SlotAttrFieldAccessTests(unittest.TestCase):
 
         ops = cinderx.jit.get_function_hir_opcode_counts(Point.norm)
         self.assertGreaterEqual(ops.get("LoadField", 0), 2)
-        self.assertGreaterEqual(ops.get("Guard", 0), 2)
+        self.assertGreaterEqual(ops.get("LoadAttr", 0), 2)
+        self.assertGreaterEqual(ops.get("PrimitiveCompare", 0), 2)
+        self.assertGreaterEqual(ops.get("CondBranch", 0), 2)
         self.assertGreaterEqual(ops.get("CheckField", 0), 2)
         self.assertEqual(ops.get("LoadAttrCached", 0), 0)
         self.assertEqual(point.norm(), 25)
@@ -214,6 +234,88 @@ class SlotAttrFieldAccessTests(unittest.TestCase):
         )
         self.assertEqual(obj.write(42), "done")
         self.assertEqual(events, [42])
+
+    def test_slot_subclass_receiver_load_falls_back_without_deopt(self) -> None:
+        class Base:
+            __slots__ = ("value",)
+
+            def read(self) -> object:
+                return self.value
+
+        class Sub(Base):
+            pass
+
+        base = Base()
+        base.value = 1
+        sub = Sub()
+        sub.value = 2
+
+        specialize(Base.read, lambda: base.read())
+        self.assertIn("LOAD_ATTR_SLOT", opnames(Base.read))
+
+        cinderx.jit.clear_runtime_stats()
+        self.assertEqual(Base.read(sub), 2)
+        self.assert_deopt_count(0)
+
+    def test_slot_subclass_unset_load_fallback_exception_handler(self) -> None:
+        class Base:
+            __slots__ = ("fallback", "value")
+
+            def read_or_fallback(self) -> tuple[object, int]:
+                try:
+                    return self.value, -1
+                except AttributeError as exc:
+                    return self.fallback, exc.__traceback__.tb_lineno
+
+        class Sub(Base):
+            pass
+
+        base = Base()
+        base.value = 1
+        base.fallback = 0
+        sub = Sub()
+        sub.fallback = 2
+
+        specialize(Base.read_or_fallback, lambda: base.read_or_fallback())
+        self.assertIn("LOAD_ATTR_SLOT", opnames(Base.read_or_fallback))
+
+        expected_lineno = Base.read_or_fallback.__code__.co_firstlineno + 2
+        cinderx.jit.clear_runtime_stats()
+        self.assertEqual(Base.read_or_fallback(sub), (2, expected_lineno))
+        self.assert_single_deopt(
+            "UnhandledException", "LoadAttr", expected_lineno
+        )
+
+    def test_slot_subclass_fallback_load_refcount_is_balanced(self) -> None:
+        class Payload:
+            pass
+
+        class Base:
+            __slots__ = ("value",)
+
+            def read(self) -> object:
+                return self.value
+
+        class Sub(Base):
+            pass
+
+        base = Base()
+        base.value = Payload()
+        payload = Payload()
+        sub = Sub()
+        sub.value = payload
+
+        specialize(Base.read, lambda: base.read())
+        self.assertIn("LOAD_ATTR_SLOT", opnames(Base.read))
+
+        cinderx.jit.clear_runtime_stats()
+        refcount = sys.getrefcount(payload)
+        for _ in range(100):
+            result = Base.read(sub)
+            self.assertIs(result, payload)
+            del result
+        self.assertEqual(sys.getrefcount(payload), refcount)
+        self.assert_deopt_count(0)
 
     def test_slot_subclass_receiver_deopts(self) -> None:
         class Base:

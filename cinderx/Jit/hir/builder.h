@@ -175,6 +175,10 @@ class HIRBuilder {
       CFG& cfg,
       TranslationContext& tc,
       const jit::BytecodeInstruction& bc_instr);
+  Register* emitSlotTypeVersionMatches(
+      TranslationContext& tc,
+      Register* receiver,
+      uint32_t type_version);
   void emitSlotTypeVersionGuard(
       TranslationContext& tc,
       Register* receiver,
