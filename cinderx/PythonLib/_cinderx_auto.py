@@ -7,6 +7,42 @@ if os.environ.get("CINDERX_PLUGIN_ENABLE", "0") == "1":
 
     _AUTOJIT_IMPORT_PROVIDER_MARKER = "_cinderx_autojit_import_provider"
     _AUTOJIT_SETUP_PROVIDER_MARKER = "_cinderx_autojit_setup_provider"
+    _AUTOJIT_GATE_STATS_PREFIX = "CINDERX_AUTOJIT_GATE_STATS: "
+
+    def _env_flag_enabled(name):
+        return os.environ.get(name, "0").lower() in ("1", "true", "yes", "on")
+
+    def _maybe_enable_autojit_gate_stats():
+        if not _env_flag_enabled("CINDERX_AUTOJIT_GATE_STATS"):
+            return
+        clear_stats = getattr(cinderjit, "_clear_autojit_gate_stats", None)
+        read_stats = getattr(cinderjit, "_autojit_gate_stats", None)
+        if clear_stats is None or read_stats is None:
+            return
+
+        clear_stats()
+
+        def dump_autojit_gate_stats():
+            import json
+
+            payload = {
+                "argv": sys.argv,
+                "executable": sys.executable,
+                "pid": os.getpid(),
+                "stats": read_stats(),
+            }
+            line = json.dumps(payload, sort_keys=True)
+            stats_file = os.environ.get("CINDERX_AUTOJIT_GATE_STATS_FILE")
+            if stats_file:
+                with open(stats_file, "a", encoding="utf-8") as out:
+                    out.write(line)
+                    out.write("\n")
+            else:
+                print(_AUTOJIT_GATE_STATS_PREFIX + line, file=sys.stderr)
+
+        import atexit
+
+        atexit.register(dump_autojit_gate_stats)
 
     def _make_autojit_setup_wrapper(original, provider):
         def wrapper(*args, **kwargs):
@@ -115,6 +151,7 @@ if os.environ.get("CINDERX_PLUGIN_ENABLE", "0") == "1":
             num_threads=parallel_gc_num_threads,
         )
 
+    _maybe_enable_autojit_gate_stats()
     _maybe_enable_parallel_gc()
     _install_autojit_import_provider()
     _maybe_install_autojit_setup_provider_for_module("lib2to3.main")

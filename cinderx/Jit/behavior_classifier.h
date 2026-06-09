@@ -90,8 +90,10 @@ struct StructureKey {
   static StructureKey unpack(uint32_t payload);
 };
 
-constexpr uint32_t kSkeyValidBit = 0x80000000u;
-constexpr uint32_t kSkeyPayloadMask = 0x00FFFFFFu;
+constexpr uint32_t kSkeyValidBit = CI_CODE_EXTRA_SKEY_VALID_BIT;
+constexpr uint32_t kSkeyDecidedColdBit =
+    CI_CODE_EXTRA_SKEY_DECIDED_COLD_BIT;
+constexpr uint32_t kSkeyPayloadMask = CI_CODE_EXTRA_SKEY_PAYLOAD_MASK;
 
 struct GateContext {
   bool startup_phase{false};

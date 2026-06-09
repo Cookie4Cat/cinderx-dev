@@ -4,6 +4,10 @@
 
 #include <stdint.h>
 
+#define CI_CODE_EXTRA_SKEY_VALID_BIT 0x80000000u
+#define CI_CODE_EXTRA_SKEY_DECIDED_COLD_BIT 0x40000000u
+#define CI_CODE_EXTRA_SKEY_PAYLOAD_MASK 0x00FFFFFFu
+
 #ifdef __cplusplus
 extern "C" {
 #endif
@@ -60,6 +64,12 @@ static inline void Ci_code_extra_store_skey_release(
   __atomic_store_n(&extra->skey_word, word, __ATOMIC_RELEASE);
 }
 
+static inline void Ci_code_extra_or_skey_release(
+    CodeExtra* extra,
+    uint32_t word) {
+  __atomic_fetch_or(&extra->skey_word, word, __ATOMIC_RELEASE);
+}
+
 #else
 
 static inline void Ci_code_extra_incr_calls(CodeExtra* extra) {
@@ -79,6 +89,12 @@ static inline void Ci_code_extra_store_skey_release(
     CodeExtra* extra,
     uint32_t word) {
   extra->skey_word = word;
+}
+
+static inline void Ci_code_extra_or_skey_release(
+    CodeExtra* extra,
+    uint32_t word) {
+  extra->skey_word |= word;
 }
 
 #endif

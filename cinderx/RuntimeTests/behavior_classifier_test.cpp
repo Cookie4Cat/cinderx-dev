@@ -150,15 +150,21 @@ TEST(BehaviorClassifierTest, ComputeThresholdWarmsUpSteadyStateStartupLikeWork) 
   EXPECT_EQ(loop_decision.branch_reason, BranchReason::None);
 }
 
-TEST(BehaviorClassifierTest, StartupContextPreservesStartupReasonForImportLikeWork) {
+TEST(BehaviorClassifierTest, StartupContextDefersImportLikeWork) {
   ScopedAutoJitConfig config_guard;
   getMutableConfig().enable_startup_init_policy = true;
 
   GateContext startup{true};
+  StructureKey trivial{Family::Trivial};
+  auto trivial_startup_decision = computeThreshold(trivial, startup, 2);
+  EXPECT_GE(trivial_startup_decision.limit, 65536);
+  EXPECT_EQ(
+      trivial_startup_decision.branch_reason, BranchReason::StartupInit);
+
   StructureKey dispatcher{Family::CallDispatcher};
   auto startup_decision = computeThreshold(dispatcher, startup, 2);
-  EXPECT_EQ(startup_decision.limit, 1000);
-  EXPECT_EQ(startup_decision.branch_reason, BranchReason::LowRoi);
+  EXPECT_GE(startup_decision.limit, 65536);
+  EXPECT_EQ(startup_decision.branch_reason, BranchReason::StartupInit);
 
   GateContext steady_state{false};
   auto steady_state_decision = computeThreshold(dispatcher, steady_state, 2);
@@ -258,8 +264,14 @@ TEST(BehaviorClassifierTest, ImportWindowDefersHighCostNonnumericWork) {
   low_cost_dispatcher.active_dim_mask = activeDimMaskFor(WorkDim::Dispatch);
   auto low_cost_decision =
       computeThreshold(low_cost_dispatcher, import_window, 2);
-  EXPECT_EQ(low_cost_decision.limit, 1000);
-  EXPECT_EQ(low_cost_decision.branch_reason, BranchReason::LowRoi);
+  EXPECT_GE(low_cost_decision.limit, 65536);
+  EXPECT_EQ(low_cost_decision.branch_reason, BranchReason::StartupInit);
+
+  auto post_import_low_cost_dispatcher =
+      computeThreshold(low_cost_dispatcher, steady_state, 2);
+  EXPECT_EQ(post_import_low_cost_dispatcher.limit, 1000);
+  EXPECT_EQ(
+      post_import_low_cost_dispatcher.branch_reason, BranchReason::LowRoi);
 
   StructureKey numeric_loop{Family::NumericLoop};
   numeric_loop.loop_score = 2;
@@ -302,8 +314,18 @@ TEST(BehaviorClassifierTest, ImportWindowDefersHighCostNonnumericWork) {
   small_object.active_dim_mask = activeDimMaskFor(WorkDim::Object);
   auto small_object_decision =
       computeThreshold(small_object, import_window, 2);
-  EXPECT_EQ(small_object_decision.limit, 2);
-  EXPECT_EQ(small_object_decision.branch_reason, BranchReason::None);
+  EXPECT_GE(small_object_decision.limit, 65536);
+  EXPECT_EQ(small_object_decision.branch_reason, BranchReason::StartupInit);
+
+  StructureKey compute_hint_object{Family::ObjectManipulator};
+  compute_hint_object.loop_score = 1;
+  compute_hint_object.code_size_bucket = 0;
+  compute_hint_object.active_dim_mask = activeDimMaskFor(WorkDim::Object) |
+      activeDimMaskFor(WorkDim::Compute);
+  auto compute_hint_object_decision =
+      computeThreshold(compute_hint_object, import_window, 2);
+  EXPECT_EQ(compute_hint_object_decision.limit, 2);
+  EXPECT_EQ(compute_hint_object_decision.branch_reason, BranchReason::None);
 
   auto post_import_risky_object =
       computeThreshold(risky_object, steady_state, 2);
@@ -725,9 +747,51 @@ finally:
     _cinderx._autojit_import_leave()
 
 assert _cinderx._autojit_import_depth() == 0
+before_calls = jit.count_interpreted_calls(dispatch)
 dispatch(callback)
 assert not jit.is_jit_compiled(dispatch)
-assert jit.count_interpreted_calls(dispatch) == 4
+assert jit.count_interpreted_calls(dispatch) == before_calls
+	)");
+}
+
+TEST_F(BehaviorClassifierRuntimeTest, AutoJitGateStatsCountDeferFreezePath) {
+  ScopedAutoJitConfig config_guard;
+  getMutableConfig().compile_after_n_calls = 2;
+  getMutableConfig().auto_classify = true;
+  getMutableConfig().enable_startup_init_policy = true;
+
+  runStockCode(R"(
+import _cinderx
+import cinderjit
+import cinderx.jit as jit
+
+cinderjit._clear_autojit_gate_stats()
+
+def helper(x):
+    return x
+
+_cinderx._autojit_import_enter()
+try:
+    for _ in range(3):
+        helper(1)
+finally:
+    _cinderx._autojit_import_leave()
+
+stats = cinderjit._autojit_gate_stats()
+assert stats["jit_vectorcall"] >= 1, stats
+assert stats["global_threshold_return"] >= 1, stats
+assert stats["classified_defer_freeze"] >= 1, stats
+assert stats["forced_compile"] == 0, stats
+assert not jit.is_jit_compiled(helper)
+
+before = dict(stats)
+before_calls = jit.count_interpreted_calls(helper)
+for _ in range(5):
+    helper(1)
+after = cinderjit._autojit_gate_stats()
+after_calls = jit.count_interpreted_calls(helper)
+assert after["jit_vectorcall"] == before["jit_vectorcall"], (before, after)
+assert after_calls == before_calls, (before_calls, after_calls)
 )");
 }
 

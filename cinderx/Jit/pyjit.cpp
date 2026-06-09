@@ -56,8 +56,12 @@
 #include <cstdlib>
 #include <fstream>
 #include <iostream>
+#include <iterator>
 #include <limits>
 #include <memory>
+#include <optional>
+#include <string>
+#include <string_view>
 #include <thread>
 #include <unordered_set>
 #include <utility>
@@ -68,6 +72,213 @@ using namespace jit;
 namespace {
 
 constexpr uint32_t kAutoJitInterpretOnlyThreshold = 65536;
+
+struct AutoJitGateStats {
+  std::atomic<uint64_t> jit_vectorcall{0};
+  std::atomic<uint64_t> global_threshold_return{0};
+  std::atomic<uint64_t> classified_warmup_return{0};
+  std::atomic<uint64_t> classified_defer_freeze{0};
+  std::atomic<uint64_t> forced_compile{0};
+  std::atomic<uint64_t> forced_compile_ok{0};
+  std::atomic<uint64_t> forced_compile_fallback{0};
+};
+
+struct AutoJitGateState {
+  CodeExtra* extra{nullptr};
+  uint64_t calls{0};
+  GateContext context;
+};
+
+AutoJitGateStats g_auto_jit_gate_stats;
+std::atomic<bool> g_auto_jit_gate_stats_enabled{false};
+
+void incAutoJitGateStat(std::atomic<uint64_t>& stat) {
+  if (g_auto_jit_gate_stats_enabled.load(std::memory_order_relaxed)) {
+    stat.fetch_add(1, std::memory_order_relaxed);
+  }
+}
+
+void clearAutoJitGateStats() {
+  g_auto_jit_gate_stats.jit_vectorcall.store(0, std::memory_order_relaxed);
+  g_auto_jit_gate_stats.global_threshold_return.store(
+      0, std::memory_order_relaxed);
+  g_auto_jit_gate_stats.classified_warmup_return.store(
+      0, std::memory_order_relaxed);
+  g_auto_jit_gate_stats.classified_defer_freeze.store(
+      0, std::memory_order_relaxed);
+  g_auto_jit_gate_stats.forced_compile.store(0, std::memory_order_relaxed);
+  g_auto_jit_gate_stats.forced_compile_ok.store(0, std::memory_order_relaxed);
+  g_auto_jit_gate_stats.forced_compile_fallback.store(
+      0, std::memory_order_relaxed);
+}
+
+int setAutoJitGateStat(
+    PyObject* dict,
+    const char* name,
+    const std::atomic<uint64_t>& stat) {
+  auto value = Ref<>::steal(PyLong_FromUnsignedLongLong(
+      stat.load(std::memory_order_relaxed)));
+  if (value == nullptr) {
+    return -1;
+  }
+  return PyDict_SetItemString(dict, name, value);
+}
+
+const char* familyName(Family family) {
+  switch (family) {
+    case Family::NumericLoop:
+      return "NumericLoop";
+    case Family::BranchFSM:
+      return "BranchFSM";
+    case Family::ObjectManipulator:
+      return "ObjectManipulator";
+    case Family::CallDispatcher:
+      return "CallDispatcher";
+    case Family::AsyncStateMachine:
+      return "AsyncStateMachine";
+    case Family::ReflectionMeta:
+      return "ReflectionMeta";
+    case Family::Trivial:
+      return "Trivial";
+    case Family::Mixed:
+      return "Mixed";
+    case Family::kCount:
+      break;
+  }
+  return "Unknown";
+}
+
+const char* branchReasonName(BranchReason reason) {
+  switch (reason) {
+    case BranchReason::None:
+      return "None";
+    case BranchReason::LowRoi:
+      return "LowRoi";
+    case BranchReason::StartupInit:
+      return "StartupInit";
+    case BranchReason::RiskDefer:
+      return "RiskDefer";
+    case BranchReason::FallbackInvalid:
+      return "FallbackInvalid";
+  }
+  return "Unknown";
+}
+
+std::string jsonEscape(std::string_view value) {
+  std::string escaped;
+  escaped.reserve(value.size() + 8);
+  for (unsigned char ch : value) {
+    switch (ch) {
+      case '"':
+        escaped += "\\\"";
+        break;
+      case '\\':
+        escaped += "\\\\";
+        break;
+      case '\b':
+        escaped += "\\b";
+        break;
+      case '\f':
+        escaped += "\\f";
+        break;
+      case '\n':
+        escaped += "\\n";
+        break;
+      case '\r':
+        escaped += "\\r";
+        break;
+      case '\t':
+        escaped += "\\t";
+        break;
+      default:
+        if (ch < 0x20) {
+          fmt::format_to(std::back_inserter(escaped), "\\u{:04x}", ch);
+        } else {
+          escaped.push_back(static_cast<char>(ch));
+        }
+        break;
+    }
+  }
+  return escaped;
+}
+
+std::string pyStringOrInvalid(BorrowedRef<PyObject> obj) {
+  if (obj == nullptr || !PyUnicode_Check(obj)) {
+    return "<invalid>";
+  }
+  const char* utf8 = PyUnicode_AsUTF8(obj);
+  if (utf8 == nullptr) {
+    PyErr_Clear();
+    return "<invalid>";
+  }
+  return utf8;
+}
+
+const char* currentAutoJitPhaseName(const GateContext& context) {
+  const char* phase = std::getenv("CINDERX_AUTOJIT_PHASE");
+  if (phase != nullptr && phase[0] != '\0') {
+    return phase;
+  }
+  if (context.startup_phase) {
+    return "startup";
+  }
+  return "steady";
+}
+
+void writeAutoJitCompileEvent(
+    BorrowedRef<PyFunctionObject> func,
+    const AutoJitGateState& state,
+    const std::optional<StructureKey>& key,
+    const ThresholdDecision& decision,
+    uint32_t effective_limit) {
+  const char* path = std::getenv("CINDERX_AUTOJIT_COMPILE_EVENTS_FILE");
+  if (path == nullptr || path[0] == '\0') {
+    return;
+  }
+
+  BorrowedRef<PyCodeObject> code{func->func_code};
+  auto now_ns = std::chrono::duration_cast<std::chrono::nanoseconds>(
+                    std::chrono::steady_clock::now().time_since_epoch())
+                    .count();
+  std::ofstream out(path, std::ios::app);
+  if (!out) {
+    return;
+  }
+
+  out << "{\"event\":\"forced_compile\""
+      << ",\"ts_ns\":" << now_ns
+      << ",\"pid\":" << getpid()
+      << ",\"phase\":\""
+      << jsonEscape(currentAutoJitPhaseName(state.context)) << "\""
+      << ",\"fullname\":\"" << jsonEscape(funcFullname(func)) << "\""
+      << ",\"filename\":\"" << jsonEscape(pyStringOrInvalid(code->co_filename))
+      << "\""
+      << ",\"qualname\":\"" << jsonEscape(pyStringOrInvalid(code->co_qualname))
+      << "\""
+      << ",\"firstlineno\":" << code->co_firstlineno
+      << ",\"calls\":" << state.calls
+      << ",\"effective_limit\":" << effective_limit
+      << ",\"startup_phase\":" << (state.context.startup_phase ? "true" : "false")
+      << ",\"branch_reason\":\"" << branchReasonName(decision.branch_reason)
+      << "\"";
+  if (key.has_value()) {
+    out << ",\"shape\":{"
+        << "\"family\":\"" << familyName(key->family) << "\""
+        << ",\"mixed_shape\":" << static_cast<int>(key->mixed_shape)
+        << ",\"loop_score\":" << static_cast<int>(key->loop_score)
+        << ",\"is_suspendable\":" << (key->is_suspendable ? "true" : "false")
+        << ",\"is_static\":" << (key->is_static ? "true" : "false")
+        << ",\"is_synthetic\":" << (key->is_synthetic ? "true" : "false")
+        << ",\"risk_reason\":" << static_cast<int>(key->risk_reason)
+        << ",\"code_size_bucket\":"
+        << static_cast<int>(key->code_size_bucket)
+        << ",\"active_dim_mask\":" << static_cast<int>(key->active_dim_mask)
+        << "}";
+  } else {
+    out << ",\"shape\":null";
+  }
+  out << "}\n";
+}
 
 // RAII device for disabling GIL checking.
 class DisableGilCheck {
@@ -110,12 +321,6 @@ uint64_t countCalls(PyCodeObject* code) {
 GateContext readGateContext() {
   return GateContext{autoJitImportDepth() > 0};
 }
-
-struct AutoJitGateState {
-  CodeExtra* extra{nullptr};
-  uint64_t calls{0};
-  GateContext context;
-};
 
 AutoJitGateState readAutoJitGateState(BorrowedRef<PyCodeObject> code) {
   CodeExtra* extra = codeExtra(code);
@@ -172,6 +377,7 @@ PyObject* forcedJitVectorcall(
 
   auto result = compileFunction(func);
   if (result == Result::OK) {
+    incAutoJitGateStat(g_auto_jit_gate_stats.forced_compile_ok);
     JIT_DCHECK(
         isJitCompiled(func),
         "JIT succeeded for function {} but it is not recognized as compiled",
@@ -184,6 +390,7 @@ PyObject* forcedJitVectorcall(
   // Python errors shouldn't happen during compilation, but if they do, bubble
   // them up without calling the function.
   if (result == Result::PYTHON_EXCEPTION) {
+    incAutoJitGateStat(g_auto_jit_gate_stats.forced_compile_fallback);
     setVectorcall(func, interp_entry);
     return nullptr;
   }
@@ -196,6 +403,7 @@ PyObject* forcedJitVectorcall(
 
   // There's been some kind of compilation error, explicitly call the
   // interpreted entrypoint instead.
+  incAutoJitGateStat(g_auto_jit_gate_stats.forced_compile_fallback);
   return interp_entry(func_obj, stack, nargsf, kwnames);
 }
 
@@ -212,35 +420,51 @@ PyObject* jitVectorcall(
   BorrowedRef<PyFunctionObject> func{func_obj};
   BorrowedRef<PyCodeObject> code{func->func_code};
 
+  incAutoJitGateStat(g_auto_jit_gate_stats.jit_vectorcall);
+
   // If there's a call count limit, interpret the function as usual until the
   // limit is reached.
   if (auto limit = getConfig().compile_after_n_calls; limit.has_value()) {
     AutoJitGateState state = readAutoJitGateState(code);
     if (state.calls < *limit) {
+      incAutoJitGateStat(g_auto_jit_gate_stats.global_threshold_return);
       auto entry = getInterpretedVectorcall(func);
       return entry(func_obj, stack, nargsf, kwnames);
     }
 
     uint32_t effective_limit = *limit;
+    std::optional<StructureKey> key;
+    ThresholdDecision decision{*limit, BranchReason::None};
     if (getConfig().auto_classify) {
       if (shouldDeferSuspendableAutoJitWithoutStructureKey(
               code, state.context)) {
         effective_limit = kAutoJitInterpretOnlyThreshold;
-      } else if (auto key = getOrComputeStructureKey(code, state.extra);
-          key.has_value()) {
-        effective_limit = computeThreshold(*key, state.context, *limit).limit;
+      } else if (auto computed_key = getOrComputeStructureKey(code, state.extra);
+          computed_key.has_value()) {
+        decision = computeThreshold(*computed_key, state.context, *limit);
+        effective_limit = decision.limit;
+        key = *computed_key;
       }
     }
     if (state.calls < effective_limit) {
       auto entry = getInterpretedVectorcall(func);
       if (getConfig().auto_classify &&
           effective_limit >= kAutoJitInterpretOnlyThreshold) {
+        incAutoJitGateStat(g_auto_jit_gate_stats.classified_defer_freeze);
+        if (state.extra != nullptr) {
+          Ci_code_extra_or_skey_release(state.extra, kSkeyDecidedColdBit);
+        }
         setVectorcall(func, entry);
+      } else {
+        incAutoJitGateStat(g_auto_jit_gate_stats.classified_warmup_return);
       }
       return entry(func_obj, stack, nargsf, kwnames);
     }
+
+    writeAutoJitCompileEvent(func, state, key, decision, effective_limit);
   }
 
+  incAutoJitGateStat(g_auto_jit_gate_stats.forced_compile);
   return forcedJitVectorcall(func_obj, stack, nargsf, kwnames);
 }
 
@@ -2572,6 +2796,48 @@ PyObject* clear_runtime_stats(PyObject* /* self */, PyObject*) {
   Py_RETURN_NONE;
 }
 
+PyObject* autojit_gate_stats(PyObject* /* self */, PyObject*) {
+  auto stats = Ref<>::steal(PyDict_New());
+  if (stats == nullptr) {
+    return nullptr;
+  }
+
+  if (setAutoJitGateStat(
+          stats, "jit_vectorcall", g_auto_jit_gate_stats.jit_vectorcall) != 0 ||
+      setAutoJitGateStat(
+          stats,
+          "global_threshold_return",
+          g_auto_jit_gate_stats.global_threshold_return) != 0 ||
+      setAutoJitGateStat(
+          stats,
+          "classified_warmup_return",
+          g_auto_jit_gate_stats.classified_warmup_return) != 0 ||
+      setAutoJitGateStat(
+          stats,
+          "classified_defer_freeze",
+          g_auto_jit_gate_stats.classified_defer_freeze) != 0 ||
+      setAutoJitGateStat(
+          stats, "forced_compile", g_auto_jit_gate_stats.forced_compile) != 0 ||
+      setAutoJitGateStat(
+          stats,
+          "forced_compile_ok",
+          g_auto_jit_gate_stats.forced_compile_ok) != 0 ||
+      setAutoJitGateStat(
+          stats,
+          "forced_compile_fallback",
+          g_auto_jit_gate_stats.forced_compile_fallback) != 0) {
+    return nullptr;
+  }
+
+  return stats.release();
+}
+
+PyObject* clear_autojit_gate_stats(PyObject* /* self */, PyObject*) {
+  clearAutoJitGateStats();
+  g_auto_jit_gate_stats_enabled.store(true, std::memory_order_relaxed);
+  Py_RETURN_NONE;
+}
+
 PyObject* get_compiled_size(PyObject* /* self */, PyObject* func) {
   if (jitCtx() == nullptr) {
     return PyLong_FromLong(0);
@@ -3151,6 +3417,14 @@ PyMethodDef jit_methods[] = {
      PyDoc_STR(
          "Clears runtime stats about JIT-compiled code without returning "
          "a value.")},
+    {"_autojit_gate_stats",
+     autojit_gate_stats,
+     METH_NOARGS,
+     PyDoc_STR("Return AutoJIT gate path counters.")},
+    {"_clear_autojit_gate_stats",
+     clear_autojit_gate_stats,
+     METH_NOARGS,
+     PyDoc_STR("Clear and enable AutoJIT gate path counters.")},
     {"get_and_clear_inline_cache_stats",
      get_and_clear_inline_cache_stats,
      METH_NOARGS,

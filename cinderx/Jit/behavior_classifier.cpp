@@ -944,8 +944,18 @@ ThresholdDecision computeThreshold(
       getConfig().enable_startup_init_policy && context.startup_phase &&
       !key.is_static && key.family != Family::NumericLoop &&
       !key.computeDominantHint() &&
-      (key.highRisk() || key.code_size_bucket > 0);
-  if (high_cost_nonnumeric_import_candidate) {
+      (key.highRisk() || key.code_size_bucket > 0 ||
+       key.family == Family::CallDispatcher ||
+       key.family == Family::ReflectionMeta || key.family == Family::BranchFSM ||
+       startup_like_mixed);
+  bool startup_low_roi_nonnumeric_candidate =
+      getConfig().enable_startup_init_policy && context.startup_phase &&
+      !key.is_static &&
+      (key.family == Family::Trivial ||
+       (key.family == Family::ObjectManipulator && key.loop_score <= 1 &&
+        !key.computeHint()));
+  if (high_cost_nonnumeric_import_candidate ||
+      startup_low_roi_nonnumeric_candidate) {
     return {
         saturatingMul(global, kStartupDeferThresholdFactor),
         key.highRisk() ? BranchReason::RiskDefer : BranchReason::StartupInit};
