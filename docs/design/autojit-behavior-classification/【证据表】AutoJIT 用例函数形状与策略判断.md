@@ -10,6 +10,7 @@
 
 | 版本 | 日期 | 修订人 | 修订说明 |
 |---|---|---|---|
+| v0.22 | 2026-06-09 | @sisibeloved | 重写 `2to3` 章节为总/分结构：总表平铺 CPython JIT、优化前、当前候选和 force-interpret 差距；分表拆 gate 函数形状与非 gate 阶段成本，删除旧流水账。 |
 | v0.21 | 2026-06-09 | @sisibeloved | 重写 `python_startup` 章节为分阶段平铺账本：四口径（CPython 基线 / `PYTHONJITAUTO=2` 优化前 / 当前 AutoJIT / force interpret-only）逐阶段列 优化前差距/已优化掉/剩余差距/可挖空间，一眼看出差距在哪、优化了多少、还剩多少；后接**全量 17 个 gate 函数形状与策略表**（8 StartupInit + 6 RiskDefer + 2 LowRoi + 1 编译）。实测确认 bc347c29 优化掉 93%（212.6→14.5ms），大头是插件加载 init 期 `schedule_existing_functions` 编译风暴；剩余 +14.5ms（插件地板 ~8 + import 运行税 ~6）无干净单点杠杆。A（逐 def tracking）~0.16ms、C（逐帧计数）硬上界 ≤0.46%、native wrapper ~0.18ms、`jit::initialize` 惰性 ~1.6ms 均穿刺否决。 |
 | v0.20 | 2026-06-09 | @sisibeloved | 补充 import/setup 细粒度决策穿刺：拆分 `import_phase`/`setup_phase` 诊断字段并保留 split-only 基础设施；提前 import 分类冻结无稳定收益，暂不引入 import/setup 分叉阈值策略。 |
 | v0.19 | 2026-06-08 | @sisibeloved | 补充 startup/site 成本拆解：`_cinderx_exec_impl()`、`jit::initialize()`、`importtime`、gate stats 与 import-depth skip 负向穿刺分表记录；确认 P2a 有成本但不能简单跳过计数。 |
@@ -132,174 +133,171 @@
 
 ## 6 用例：2to3
 
-### 6.1 当前总账
+### 6.1 总表：差距账本
 
-`2to3` 的目标不是“比 CinderX `PYTHONJITAUTO=2` 快”，而是开启 CinderX JIT 后恢复到 CPython 3.14.3 JIT 的 85% 以上。CPython JIT phase 基线是 `549.7ms`，85% 目标线约为 `646ms`。
+`2to3` 的对标目标是：开启 CinderX JIT 后，性能恢复到 CPython 3.14.3 JIT 的 85% 以上。CPython JIT phase 基线是 `549.7ms`，85% 目标线约 `646.7ms`；当前候选是 `673.3ms`，还差约 `26.6ms`。
 
-| 口径 | 正式 pyperformance | phase timer | 距 CPython JIT | 距 85% 目标线 | 状态 |
-|---|---:|---:|---:|---:|---|
-| CPython 3.14.3 JIT | 549ms | 549.7ms | 0ms | -96ms | 对标基线 |
-| CinderX `PYTHONJITAUTO=2` | 4.097s | 4.108s | +3.558s | +3.462s | 优化前，低阈值编译风暴 |
-| 历史 setup provider 口径 | 966-973ms | 974.0ms | +424.3ms | +328.0ms | 已被后续优化替代 |
-| force interpret-only 穿刺 | 635.5ms | 632.8ms | +83.1ms | -13.2ms | 证明 defer fast path 上限足够 |
-| 当前候选：lowROI + cold-bit | 673ms +- 1ms | 673.3ms | +123.6ms | +27.3ms | 保留候选，接近但未达标 |
-| import/setup split-only | 679ms +- 1ms | 675.8ms | +126.1ms | +29.8ms | 语义/诊断改造，性能中性，不当作优化收益 |
+下表统一使用 phase timer 中位数，单位为 `ms`。`force interpret-only` 是“达到分类点后不编译并恢复解释执行”的穿刺下限，用来估算当前候选还剩多少 AutoJIT/gate 成本可挖，不代表承诺收益。
 
-### 6.2 当前阶段数据
+| 阶段 | CPython JIT 基线 | CinderX JIT 优化前<br/>`PYTHONJITAUTO=2` | 优化前差距 | 当前候选<br/>lowROI + cold-bit | 已优化掉 | 当前剩余差距 | 相对 force interpret-only<br/>仍可挖 | 下一步判断 |
+|---|---:|---:|---:|---:|---:|---:|---:|---|
+| startup/site | 75.2 | 1385.7 | +1310.5 | 108.1 | 1277.6 | +32.9 | 19.5 | 继续拆固定启动税、frame evaluator/计数税 |
+| import `lib2to3.main` | 53.9 | 747.9 | +694.0 | 64.9 | 683.0 | +11.0 | 3.8 | 大头已解决，不做提前 import 分类冻结 |
+| tool init / fixer setup | 128.9 | 834.5 | +705.6 | 161.9 | 672.5 | +33.0 | 8.6 | 还有小账；粗扩 setup window 已证明负收益 |
+| refactor 输入文件 | 289.0 | 1032.5 | +743.5 | 332.3 | 700.2 | +43.3 | 5.4 | 剩余差距最大，但白名单 parse/pattern JIT 已证明负收益 |
+| 其它 glue | 2.7 | 107.5 | +104.8 | 6.1 | 101.3 | +3.4 | 3.3 | 小项，低优先级 |
+| 合计 | 549.7 | 4108.0 | +3558.3 | 673.3 | 3434.7 | +123.6 | 40.5 | 已解决原始差距约 96.5%，还差 85% 线约 26.6ms |
 
-数据来源：`blue-98:/results/autojit-p0-spike-20260608/cold-bit-phase-summary.json`。下表只列数据；读法见 6.5。
+| 关键问题 | 当前答案 |
+|---|---|
+| CinderX JIT 优化前为什么慢 | 不是单一阶段慢，而是 startup/import/tool/refactor 都被低阈值编译风暴放大。 |
+| 当前为什么还没到 85% 线 | 大编译风暴已经消失，剩下是 `+123.6ms` 小账；其中能被 force-interpret 下限解释的只有约 `40.5ms`。 |
+| 下一步最该看哪里 | 若只追 85% 线，优先看 startup/site 的 `19.5ms` 可挖空间，其次是 tool init 的 `8.6ms`。 |
+| 当前不该继续做什么 | 不该粗扩 setup window，不该白名单放行 refactor parse/pattern 热点，不该简单跳过 import 期间计数。 |
 
-| 阶段 | 当前耗时 | 当前占比 | 比 CPython JIT 多 | 比 force interpret-only 多 |
-|---|---:|---:|---:|---:|
-| refactor 输入文件 | 332.652ms | 49.4% | +43.449ms | +5.508ms |
-| tool init / fixer setup | 160.163ms | 23.8% | +32.055ms | +7.760ms |
-| startup/site | 108.083ms | 16.1% | +32.867ms | +19.544ms |
-| import `lib2to3.main` | 64.878ms | 9.6% | +10.956ms | +3.782ms |
-| 其它 glue | 7.548ms | 1.1% | +4.273ms | +3.943ms |
-| 合计 | 673.324ms | 100.0% | +123.600ms | +40.537ms |
+### 6.2 分表一：进入 gate 的函数形状
 
-当前 refactor 耗时主要集中在少数输入文件，先看这些文件比继续扩大全局规则更稳。
+数据来源：`blue-98:/results/autojit-p0-spike-20260608/cold-bit-compile-events.jsonl` 与同轮 gate stats。当前候选单次 `2to3` phase run 的典型 gate 路径如下。
 
-| 输入文件 | `refactor_file` | `refactor_string` |
-|---|---:|---:|
-| `urlresolvers.py.txt` | 136.100ms | 131.633ms |
-| `mail.py.txt` | 119.156ms | 115.267ms |
-| `paginator.py.txt` | 34.760ms | 32.925ms |
-| `context_processors.py.txt` | 28.124ms | 26.522ms |
+| gate 路径 | 次数 | 含义 |
+|---|---:|---|
+| `jit_vectorcall` | 2919 | 进入 AutoJIT gate 的总次数 |
+| `global_threshold_return` | 1119 | 还没到全局阈值，只计数后返回解释执行 |
+| `classified_warmup_return` | 10 | 已分类，但阈值判断要求继续解释等待 |
+| `classified_defer_freeze` | 1780 | 分类后判定延迟/解释执行，并恢复 interpreted vectorcall |
+| `forced_compile` / `forced_compile_ok` | 10 / 10 | 真正进入 CinderX JIT 编译 |
+| `fallback` | 0 | 没有 gate 异常回退 |
 
-### 6.3 gate stats 数据
+分类本身的开销主要来自 structure key cache miss 扫描。
 
-数据来源：当前候选与 split-only `CINDERX_AUTOJIT_GATE_STATS=1`。这些计数回答“函数经过 gate 后走了哪条路径”。
+| 分类路径 | 次数 | 总耗时 | 单次约 | 判断 |
+|---|---:|---:|---:|---|
+| `classify_block` | 1771 | 16.9ms | 9.5us | 分类总成本有账，但不是几百毫秒主因 |
+| `structure_key_lookup` | 1700 | 16.1ms | 9.4us | lookup 成本基本等于 miss 扫描成本 |
+| `structure_key_cache_hit` | 1294 | 0.08ms | 0.07us | 命中成本可忽略 |
+| `structure_key_cache_miss` | 406 | 16.0ms | 39.4us | 当前唯一值得继续看的 gate 内小账 |
+| `compute_threshold` | 1700 | 0.15ms | 0.09us | 阈值计算不是瓶颈 |
 
-| 指标 | 当前候选 | split-only |
-|---|---:|---:|
-| `jit_vectorcall` | 2919 | 2871 |
-| `global_threshold_return` | 1119 | 1100 |
-| `classified_warmup_return` | 10 | 11 |
-| `classified_defer_freeze` | 1780 | 1752 |
-| `forced_compile` | 10 | 8 |
-| `forced_compile_ok` | 10 | 8 |
-| `fallback` | 0 | 0 |
+scanner 微优化穿刺已经验证：`opcode` 查表化 + 只在 Control 类 opcode 上调用 `isBranch()`，把 miss 扫描从约 `15.98ms` 降到 `15.05ms`，只省约 `0.9ms`，暂不作为主线提交。
 
-### 6.4 负向穿刺数据
+当前候选真正被编译的函数如下。多数是 `codeB=0` 的小函数；当前编译列表里没有 refactor parse/pattern 大热点。
 
-| 穿刺项 | 正式 pyperformance | phase timer | gate 变化 | 结论 |
-|---|---:|---:|---|---|
-| setup/main window 扩大 | 765ms +- 11ms | 777.7ms | `forced_compile` 从 11 增到约 77-79 | 负收益，已回滚 |
-| C 侧 import wrapper | 673ms +- 2ms | 约 667.6ms | 未改变主要 gate 分布 | 无稳定收益，已回滚 |
-| lazy `cinderjit` import | 675ms +- 2ms | 约 664.0ms | 未改变主要 gate 分布 | 无稳定收益，已回滚 |
-| refactor 热点 allow 编译 | 未跑正式，phase 已明显负收益 | `allow-parse=876.5ms`；`allow-pattern=885.9ms`；`allow-all=1081.0ms` | `forced_compile` 中位数从 9 增到 17/26/34 | 负收益，已回滚 |
-| refactor 热点 suppress | 未跑正式，phase 基本持平 | `suppress-all=670.5ms`；默认 off `669.3ms` | compile events 和 gate medians 与 off 基本一致 | 无收益，已回滚 |
-| import-depth 内跳过 `CI_UPDATE_CALL_COUNT` | 未跑正式，phase 已明显负收益 | prelude `57.5ms -> 51.6ms`，但 `2to3` full `669.3ms -> 849.7ms` | `2to3` 一次 run 的 `jit_vectorcall` 从约 `2892` 暴涨到 `607856` | 不能生产化，已回滚 |
-| import 期提前分类冻结 | 未跑正式，启动微探针已退 | `-c pass` 约 `32.1ms -> 33.0ms`；prelude 约 `57.5ms -> 59.9ms`；`2to3` phase 无稳定优势 | gate 次数下降，但第一次调用就扫字节码，成本抵消收益 | 不保留 |
-| import/setup split-only | 679ms +- 1ms | `675.8ms` | gate 分布与当前候选同量级；compile event 可分 `steady/import/setup` | 保留语义和诊断基础，不单独宣称性能收益 |
+| 阶段 | 函数 | 事件数 | family | dims | loop | codeB | risk | limit | reason |
+|---|---|---:|---|---|---:|---:|---|---:|---|
+| `steady` | `_frozen_importlib_external:FileLoader.__init__` | 21 | `ObjectManipulator` | `Object` | 0 | 0 | `-` | 2 | `None` |
+| `steady` | `_sitebuiltins:_Printer.__init__` | 21 | `ObjectManipulator` | `Control+Object` | 2 | 0 | `-` | 2 | `None` |
+| `startup` | `enum:_is_single_bit` | 21 | `Mixed` | `Compute+Control` | 0 | 0 | `-` | 2 | `None` |
+| `steady` | `json.encoder:JSONEncoder.__init__` | 21 | `ObjectManipulator` | `Control+Object` | 0 | 0 | `-` | 2 | `None` |
+| `startup` | `re._compiler:_combine_flags` | 21 | `Mixed` | `Compute+Control` | 0 | 0 | `-` | 2 | `None` |
+| `setup` | `__main__:add_metric` | 20 | `NumericLoop` | `Compute+Object+Dynamic` | 0 | 0 | `-` | 2 | `None` |
+| `steady` | `codecs:IncrementalEncoder.__init__` | 20 | `ObjectManipulator` | `Object` | 0 | 0 | `-` | 2 | `None` |
+| `steady` | `glob:_ishidden` | 20 | `NumericLoop` | `Compute` | 0 | 0 | `-` | 2 | `None` |
+| `startup` | `importlib.machinery:all_suffixes` | 20 | `Mixed` | `Compute+Dynamic` | 0 | 0 | `Exception` | 2 | `None` |
+| `setup` | `lib2to3.fixes.fix_imports:alternates` | 20 | `NumericLoop` | `Compute+Dispatch+Dynamic` | 0 | 0 | `-` | 2 | `None` |
+| `startup` | `lib2to3.pgen2.tokenize:group` | 20 | `NumericLoop` | `Compute` | 0 | 0 | `-` | 2 | `None` |
+| `startup` | `tokenize:group` | 20 | `NumericLoop` | `Compute` | 0 | 0 | `-` | 2 | `None` |
+| `steady` | `__main__:med` | 1 | `BranchFSM` | `Control+Object` | 2 | 0 | `-` | 2 | `None` |
+| `steady` | `abc:ABCMeta.__instancecheck__` | 1 | `Trivial` | `-` | 0 | 0 | `-` | 4 | `LowRoi` |
+| `steady` | `codecs:BufferedIncrementalDecoder.__init__` | 1 | `ObjectManipulator` | `Object` | 0 | 0 | `-` | 2 | `None` |
+| `steady` | `codecs:IncrementalDecoder.__init__` | 1 | `Trivial` | `-` | 0 | 0 | `-` | 4 | `LowRoi` |
+| `steady` | `contextlib:ExitStack.__enter__` | 1 | `Trivial` | `-` | 0 | 0 | `-` | 4 | `LowRoi` |
+| `steady` | `contextlib:_BaseExitStack.__init__` | 1 | `Trivial` | `-` | 0 | 0 | `-` | 4 | `LowRoi` |
+| `steady` | `contextlib:_BaseExitStack._push_exit_callback` | 1 | `ObjectManipulator` | `Object` | 0 | 0 | `-` | 2 | `None` |
+| `steady` | `contextlib:_BaseExitStack.callback` | 1 | `ObjectManipulator` | `Object+Dispatch` | 0 | 0 | `-` | 2 | `None` |
+| `steady` | `contextlib:_GeneratorContextManagerBase.__init__` | 1 | `ObjectManipulator` | `Object+Dispatch` | 0 | 0 | `-` | 2 | `None` |
+| `startup` | `enum:EnumType._convert_.<locals>.<lambda>` | 1 | `NumericLoop` | `Compute` | 0 | 0 | `-` | 2 | `None` |
+| `steady` | `namedtuple_SelectorKey:SelectorKey.__new__` | 1 | `Trivial` | `-` | 0 | 0 | `-` | 4 | `LowRoi` |
+| `steady` | `selectors:BaseSelector.__enter__` | 1 | `Trivial` | `-` | 0 | 0 | `-` | 4 | `LowRoi` |
+| `steady` | `selectors:BaseSelector.__exit__` | 1 | `Trivial` | `-` | 0 | 0 | `-` | 4 | `LowRoi` |
+| `steady` | `selectors:_BaseSelectorImpl.__init__` | 1 | `ObjectManipulator` | `Object` | 0 | 0 | `-` | 2 | `None` |
+| `steady` | `selectors:_BaseSelectorImpl.close` | 1 | `ObjectManipulator` | `Object` | 0 | 0 | `-` | 2 | `None` |
+| `steady` | `selectors:_BaseSelectorImpl.get_map` | 1 | `Trivial` | `-` | 0 | 0 | `-` | 4 | `LowRoi` |
+| `steady` | `selectors:_SelectorMapping.__init__` | 1 | `Trivial` | `-` | 0 | 0 | `-` | 4 | `LowRoi` |
+| `steady` | `selectors:_SelectorMapping.__len__` | 1 | `ObjectManipulator` | `Object` | 0 | 0 | `-` | 2 | `None` |
+| `steady` | `statistics:median` | 1 | `NumericLoop` | `Compute+Control` | 0 | 0 | `-` | 2 | `None` |
+| `steady` | `subprocess:Popen.__enter__` | 1 | `Trivial` | `-` | 0 | 0 | `-` | 4 | `LowRoi` |
+| `steady` | `subprocess:Popen._handle_exitstatus` | 1 | `ObjectManipulator` | `Control+Object+Dispatch` | 0 | 0 | `-` | 2 | `None` |
+| `steady` | `subprocess:Popen._posix_spawn` | 1 | `ObjectManipulator` | `Control+Object` | 3 | 2 | `-` | 2 | `None` |
+| `steady` | `subprocess:Popen.poll` | 1 | `Trivial` | `-` | 0 | 0 | `-` | 4 | `LowRoi` |
+| `steady` | `subprocess:_text_encoding` | 1 | `BranchFSM` | `Control+Object+Dispatch+Dynamic` | 1 | 1 | `-` | 2 | `None` |
 
-### 6.5 当前读法
+| 形状读法 | 判断 |
+|---|---|
+| 高频编译函数几乎都是 `codeB=0` 的小函数 | 当前不是大函数编译风暴；继续按 `codeB>0` 粗拦收益很低。 |
+| setup 阶段被编译的两个高频函数都是 `NumericLoop` | 粗暴扩大 setup window 会误伤该放行的小型 compute 函数，已有负收益数据验证。 |
+| refactor parse/pattern 热点不在当前编译列表中 | 当前剩余 refactor 差距不是“还有大量 refactor 热点被编译”导致。 |
+| `LowRoi` 单次函数仍出现，但数量小 | 属于尾部小账，不是 `2to3` 下一轮主优化点。 |
 
-| 问题 | 证据 | 判断 |
-|---|---|---|
-| 编译风暴是否还在 | 当前候选 `forced_compile` 中位数 10；split-only 中位数 8；`classified_defer_freeze` 约 1750-1780 | 大编译风暴已经基本消失，继续粗拦形状收益有限 |
-| 为什么还差 30ms 左右 | split-only phase 675.8ms，目标约 646ms；相对 force interpret-only 还有约 43ms | 剩余空间存在，但已经是小账，不是几百毫秒级编译风暴 |
-| 最大的可挤空间在哪里 | 相对 force interpret-only：startup/site +19.5ms，tool init +7.8ms，refactor +5.5ms，import +3.8ms | 若只追 85% 线，优先看 startup/site 固定成本，其次看 tool/refactor 小账 |
-| 为什么不继续扩大 setup window | setup/main 扩大后正式退到 765ms，forced compile 反而增多 | 粗粒度 setup 信号太宽，会把该编译的函数放回编译路径 |
-| 为什么不合 C wrapper/lazy `cinderjit` | 正式结果没有稳定改善 | 当前瓶颈不是 Python 层 import wrapper 或顶层 `import cinderjit` |
-| 为什么不做 refactor 热点 allow | allow-parse/pattern/all 都明显变慢 | refactor 热点是真热点，但当前 CinderX JIT 编译这些函数 ROI 为负 |
-| import/setup 是否已经可以分开定策略 | split-only 能记录 `import_phase/setup_phase`，但当前正式结果只是中性；提前 import 冻结和扩大 setup 都失败 | 先保留上下文和诊断字段，暂不把 import/setup 走成不同阈值策略 |
+### 6.3 分表二：不进入 gate 的阶段拆解
 
-### 6.6 refactor 热点穿刺
+这里拆的是 phase timer 中能看到、但不能只靠 `jitVectorcall` gate 次数解释的阶段成本。
 
-profile 用来定位热点，不用来判断绝对性能。当前候选下，`2to3` refactor 内部的主要热点集中在 parser 和 pattern matching 两组。
+#### 6.3.1 口径对照
 
-| 热点组 | 代表函数 | profile 现象 | 穿刺动作 |
-|---|---|---|---|
-| parse/tokenize | `Parser.addtoken`、`Parser.pop`、`Parser.shift`、`Parser.push`、`generate_tokens`、`Driver.parse_tokens` | parse/tokenize 累计和 self time 都靠前 | `allow-parse`：把这些函数恢复到全局阈值 2，允许 CinderX JIT 编译 |
-| pattern/tree matching | `WildcardPattern.generate_matches`、`WildcardPattern._recursive_matches`、`BasePattern.match`、`NodePattern._submatch`、`Node.pre_order/post_order`、`convert`、`BottomMatcher.run` | pattern matching 是 refactor 主体循环 | `allow-pattern`：把这些函数恢复到全局阈值 2，允许 CinderX JIT 编译 |
-| 全部 refactor 热点 | parse + pattern 两组 | 验证“是否需要白名单放行 refactor 热点” | `allow-all` / `suppress-all` 对照 |
+| 口径 | total | startup/site | import `lib2to3.main` | tool init | refactor file | glue | 用途 |
+|---|---:|---:|---:|---:|---:|---:|---|
+| CPython 3.14.3 JIT | 549.7 | 75.2 | 53.9 | 128.9 | 289.0 | 2.7 | 对标基线 |
+| CinderX no plugin | 516.7 | 75.7 | 53.6 | 126.5 | 258.4 | 2.5 | 证明 CinderX 解释器本身不是差距来源 |
+| CinderX plugin, JIT disabled | 527.6 | 112.3 | 26.8 | 128.7 | 257.3 | 2.5 | 只用于看 plugin/frame evaluator 固定成本 |
+| force interpret-only | 632.8 | 88.5 | 61.1 | 153.4 | 326.9 | 2.9 | 当前 AutoJIT fast path 理想下限 |
+| 当前候选 | 673.3 | 108.1 | 64.9 | 161.9 | 332.3 | 6.1 | 当前主线结果 |
 
-phase timer 结果如下，使用同一新 wheel、同一 20 次 harness，因此用默认 off 作为同轮对照。
-
-| 模式 | outer total | tool init | refactor total | forced compile 中位数 | 结论 |
-|---|---:|---:|---:|---:|---|
-| off | 669.3ms | 160.8ms | 331.2ms | 9 | 当前候选 |
-| allow-parse | 876.5ms | 364.7ms | 332.9ms | 17 | 明显负收益，主要增加 tool/init 编译成本 |
-| allow-pattern | 885.9ms | 235.3ms | 465.7ms | 26 | 明显负收益，refactor 本体变慢 |
-| allow-all | 1081.0ms | 437.6ms | 463.5ms | 34 | 叠加负收益 |
-| suppress-all | 670.5ms | 161.4ms | 331.1ms | 9 | 与 off 基本一致 |
-
-结论：refactor 热点是真热点，但不是当前 AutoJIT 策略的可放行收益点。当前策略已经基本没有 refactor forced compile；把 parse/pattern 热点重新放进 CinderX JIT 会把编译静态成本和 JIT 动态成本放大，收益覆盖不了成本。继续追 `2to3` 的 27ms 目标差距，不应从“refactor 热点白名单”入手。
-
-### 6.7 startup/site 成本拆解
-
-本节只回答 `2to3` 当前剩余差距里 startup/site 这块钱花在哪里。数据来源见第 5 节 startup-site 两行。
-
-#### 6.7.1 阶段总账
-
-| 口径 | outer total | startup/site | import `lib2to3.main` | tool init | refactor |
-|---|---:|---:|---:|---:|---:|
-| CPython 3.14.3 JIT | 549.7ms | 75.2ms | 53.9ms | 128.9ms | 289.2ms |
-| CinderX no plugin | 516.7ms | 75.7ms | 53.6ms | 126.5ms | 258.7ms |
-| force interpret-only | 632.8ms | 88.5ms | 61.1ms | 153.4ms | 327.1ms |
-| 当前候选 cold-bit | 673.3ms | 108.1ms | 64.9ms | 160.2ms | 332.7ms |
-| 当前候选同轮 off | 669.3ms | 103.8ms | 67.8ms | 160.8ms | 331.2ms |
-
-读法：CinderX no-plugin 的 startup/site 和 CPython JIT 基本同量级，说明 Python 解释器和 `site` 本身不是差距来源。当前候选比 CPython JIT 多约 `28-33ms`，主要是启用 CinderX plugin + AutoJIT 后引入的固定成本和逐帧成本。
-
-#### 6.7.2 微测数据
+#### 6.3.2 startup/site 细账
 
 | 探针 | no plugin | AutoJIT + provider | 差值 | 说明 |
 |---|---:|---:|---:|---|
-| `-c pass` | 18.5ms | 32.1ms | +13.6ms | plugin 固定启动税 |
-| `-c "import contextlib, glob, json, os, sys, time"` | 33.3ms | 57.5ms | +24.3ms | 固定启动税 + 早期 stdlib import 税 |
-| 早期 stdlib import 净税 | 14.7ms | 25.4ms | +10.7ms | 扣除 `-c pass` 后的额外成本 |
-| provider off + prelude | - | 310.8ms | - | 关闭 import provider 会重新触发 import/prelude 编译风暴 |
+| `-c pass` | 18.5 | 32.1 | +13.6 | plugin 固定启动税 |
+| `-c "import contextlib, glob, json, os, sys, time"` | 33.3 | 57.5 | +24.3 | 固定启动税 + 早期 stdlib import 税 |
+| 早期 stdlib import 净税 | 14.7 | 25.4 | +10.7 | 扣除 `-c pass` 后的额外成本 |
+| provider off + prelude | - | 310.8 | - | 关闭 import provider 会重新触发 import/prelude 编译风暴 |
 
-#### 6.7.3 C++ 初始化数据
-
-| 计时点 | 中位数 | 最大子项 |
+| C++ / import 计时点 | 中位数 | 读法 |
 |---|---:|---|
-| `_cinderx_exec_impl()` | 3.31ms | `jit_initialize=1.92ms`，`init_existing_objects=0.52ms`，`upstream_borrow=0.26ms` |
-| `jit::initialize()` | 1.84ms | `compiler_context=0.85ms`，`create_cinderjit_module=0.50ms`，`init_types=0.35ms` |
-| `importtime: _cinderx` | 7.69ms | 包含动态加载、模块 exec 和 import 机制成本 |
-| `importtime: _cinderx_auto` | 8.33ms | 包含 `_cinderx` 加载、`cinderjit` 可用化和 provider 安装 |
+| `_cinderx_exec_impl()` | 3.31 | C 扩展 exec 本体，不足以解释全部 startup/site 缺口 |
+| `jit::initialize()` | 1.84 | 延迟 backend 初始化最多是 1-2ms 小账 |
+| `importtime: _cinderx` | 7.69 | 动态加载、模块 exec、import 机制一起摊出的成本 |
+| `importtime: _cinderx_auto` | 8.33 | 包含 `_cinderx` 加载、`cinderjit` 可用化和 provider 安装 |
 
-读法：单纯延迟 JIT backend 初始化最多只看得到约 `1.8ms`，延迟 `_cinderx_exec_impl()` 里的非必要子项最多也只是约 `1ms` 级别。startup/site 的主要缺口不是某个 C++ init 函数独占，而是动态加载/import 机制、frame evaluator 后逐帧计数、以及 Python 层启动路径共同摊出来的。
+#### 6.3.3 tool/refactor 细账
 
-#### 6.7.4 gate 数据
-
-| 探针 | `jit_vectorcall` | `global_threshold_return` | `classified_defer_freeze` | `forced_compile` |
-|---|---:|---:|---:|---:|
-| `-c pass` 当前候选 | 410 | 247 | 152 | 3 |
-| prelude 当前候选 | 423 | 250 | 162 | 3 |
-| `-c pass` split-only | 410 | 247 | 152 | 3 |
-| prelude split-only | 423 | 250 | 162 | 3 |
-| prelude + import-depth skip | 2453 | 2407 | 37 | 1 |
-| `2to3` 当前候选，同 `phase_2to3_mode.py` | 2871 | 1100 | 1752 | 8 |
-| `2to3` + import-depth skip | 607856 | 607635 | 177 | 7 |
-
-读法：split-only 没有改变 `pass/prelude` gate 路径计数，说明 import/setup 拆分本身不是启动额外成本来源。prelude 与 `-c pass` 的 gate 次数接近，说明早期 stdlib import 额外 10ms 不是大量 `jitVectorcall` 新增导致的，而更像 frame evaluator/CodeExtra/计数路径的逐帧税。import-depth skip 能减少 prelude 约 `5.9ms`，证明 P2a 有成本；但它让函数长期到不了分类冻结点，`2to3` gate 次数暴涨到 60 万级，不能生产化。
-
-#### 6.7.5 下一步判断
-
-| 方向 | 可解释空间 | 当前结论 |
+| 子阶段 | 当前候选中位数 | 说明 |
 |---|---:|---|
-| 简单跳过 import 期间计数 | prelude 可省约 5.9ms | 负收益，因 gate 不冻结导致 2to3 大幅变慢 |
-| 延迟 `jit::initialize()` backend | 约 1.8ms | 空间太小，不足以解决 `python_startup` site 差距 |
-| 延迟 `_cinderx_exec_impl()` 非必要子项 | 约 1ms 级别 | 可以作为小优化，但不是主杠杆 |
-| C/native import wrapper | 既有正式结果约 0.18ms | 不是当前主瓶颈 |
-| import/setup split-only | 不直接降低耗时 | 保留；它把 `startup_phase` 拆成 `import_phase/setup_phase`，并让 compile event 可按阶段归因 |
-| import 期提前分类冻结 | gate 次数下降但启动微探针变慢 | 不保留；第一次调用扫字节码的成本抵消了 gate 次数收益 |
-| 更细粒度 startup/import 阈值策略 | 目标是减少逐帧计数和 gate 留存，同时保持分类冻结 | 暂不冻结；下一步必须基于分阶段 compile event 证明 import/setup 需要不同阈值 |
+| `RefactoringTool.__init__` | 161.9 | tool init 主账 |
+| `RefactoringTool.get_fixers` | 113.4 | fixer 加载/构造占 tool init 大头 |
+| `get_fixers_from_package` | 1.8 | 包扫描本身不是大头 |
+| `RefactoringTool.refactor_file` 合计 | 332.3 | 9 个输入文件处理总账 |
+| `RefactoringTool.refactor_string` 合计 | 319.8 | 解析/转换字符串主体 |
+| `RefactoringTool.summarize` | 0.2 | 可忽略 |
 
-### 6.8 下一步
+| 输入文件 | `refactor_file` | `refactor_string` |
+|---|---:|---:|
+| `urlresolvers.py.txt` | 136.1 | 131.6 |
+| `mail.py.txt` | 119.2 | 115.3 |
+| `paginator.py.txt` | 34.8 | 32.9 |
+| `context_processors.py.txt` | 28.1 | 26.5 |
 
-| 优先级 | 方向 | 验证方式 | 接受标准 |
-|---|---|---|---|
-| P0 | 保留 lowROI + cold-bit，回滚 setup/main、C wrapper、lazy `cinderjit` 穿刺 | 功能测试 + `2to3` 正式 pyperformance | 不回退当前 `673ms` 水平 |
-| P1 | 保留 import/setup split-only 诊断基础；暂不引入不同阈值策略 | gate stats + phase timer + `2to3` full 对照 | 语义正确、性能中性、compile event 能按 `steady/import/setup` 归因 |
-| P1 | 继续寻找不破坏分类冻结的 P2a/启动路径优化 | gate stats + phase timer + `2to3` full 对照 | 降低 prelude/P2a 成本，同时不让 `jitVectorcall` 留存在十万级 |
-| P1 | 小幅瘦身 `_cinderx_exec_impl()` 非必要初始化 | 模块 init timer + `python_startup` 正式 A/B | 小账优化，只接受稳定收益 |
-| P2 | refactor 热点 allow/suppress | 已完成 phase 穿刺 | 负收益/无收益，不继续 |
-| P2 | 扩大 L3 子集复测当前候选 | `2to3`、startup、deepcopy、nbody、sqlalchemy、logging/sympy 代表项 | 确认 cold-bit 不引入新的 steady-state 回归 |
+#### 6.3.4 已排除方向
+
+| 方向 | 数据 | 判断 |
+|---|---|---|
+| setup/main window 扩大 | 正式 `765ms +- 11ms`，phase `777.7ms`，`forced_compile` 从约 10 增到 77-79 | 负收益，已回滚 |
+| refactor parse/pattern 热点放行 | `allow-parse=876.5ms`，`allow-pattern=885.9ms`，`allow-all=1081.0ms` | 热点是真热点，但 CinderX JIT 当前 ROI 为负 |
+| refactor 热点 suppress | `suppress-all=670.5ms`，默认 off `669.3ms` | 基本无收益 |
+| C 侧 import wrapper | 正式 `673ms +- 2ms`，与当前候选同量级 | 对 `2to3` 无稳定收益，先暂缓 |
+| lazy `cinderjit` import | 正式 `675ms +- 2ms`，与当前候选同量级 | 对 `2to3` 无稳定收益，先暂缓 |
+| import-depth 内跳过计数 | prelude `57.5ms -> 51.6ms`，但 `2to3` full `669.3ms -> 849.7ms`，`jit_vectorcall` 暴涨到 `607856` | 不能生产化；会让函数长期停在未分类 gate 状态 |
+| import 期提前分类冻结 | `-c pass` `32.1ms -> 33.0ms`，prelude `57.5ms -> 59.9ms` | 第一次调用扫字节码，成本抵消 gate 次数收益 |
+| structure key scanner 微优化 | miss 扫描 `15.98ms -> 15.05ms` | 只省约 `0.9ms`，不是当前 85% 目标主杠杆 |
+
+### 6.4 当前结论和下一步
+
+| 问题 | 结论 | 下一步 |
+|---|---|---|
+| `2to3` 开启 CinderX JIT 后为什么慢 | 优化前是全阶段低阈值编译风暴：startup/import/tool/refactor 都被放大。 | 已由 import provider、lowROI、classified warmup return、cold-bit 等策略解决大头。 |
+| 当前还差在哪里 | 当前比 CPython JIT 多 `123.6ms`，比 85% 目标线慢约 `26.6ms`；可由 force-interpret 下限解释的空间约 `40.5ms`。 | 先打 startup/site 和 tool init 小账，不再追几百毫秒级编译风暴。 |
+| gate 内还有什么可挖 | structure key cache miss 扫描约 `16ms`，但前两个 scanner 微优化只省约 `0.9ms`。 | 除非有更大粒度的缓存/复用方案，否则不优先提交 scanner 微优化。 |
+| refactor 本体是否该放行 JIT 热点 | 不该。parse/pattern 是真热点，但放行后 phase 退到 `876-1081ms`。 | 保持当前策略；refactor 差距先当作 CinderX JIT ROI 负的小账，而不是白名单目标。 |
+| import/setup 是否需要分开决策 | split-only 诊断字段可保留，但当前没有证明分叉阈值有收益。 | 保留阶段归因能力；只有拿到明确阶段特有形状和 A/B 收益，再改策略。 |
 
 ## 7 用例：python_startup
 
