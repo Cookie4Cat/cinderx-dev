@@ -695,7 +695,7 @@ JITRT_AllocateAndLinkGenAndInterpreterFrame(
       reinterpret_cast<jit::GenDataFooter*>( // NOLINT performance-no-int-to-ptr
           reinterpret_cast<uintptr_t>(gen) + gen_size -
           sizeof(jit::GenDataFooter));
-  *jitGenDataFooterPtr(gen, co) = footer;
+  *gen->genDataFooterPtr(co) = footer;
   init_and_link_interpreter_frame(
       func, co, tstate, FRAME_OWNED_BY_GENERATOR, frame, code_rt);
 
