@@ -27,6 +27,10 @@ struct TypeWatcher {
   jit::UnorderedMap<BorrowedRef<PyTypeObject>, jit::UnorderedSet<T*>> caches;
 
   void watch(BorrowedRef<PyTypeObject> type, T* cache) {
+    if (PyType_HasFeature(type, Py_TPFLAGS_IMMUTABLETYPE) &&
+        !PyType_HasFeature(type, Py_TPFLAGS_HEAPTYPE)) {
+      return;
+    }
     JIT_CHECK(
         cinderx::getModuleState()->watcher_state.watchType(type) == 0,
         "Failed to watch type {} for attribute cache",
@@ -43,7 +47,8 @@ struct TypeWatcher {
     // don't unwatch type; other watchers may still be watching it
   }
 
-  void typeChanged(BorrowedRef<PyTypeObject> type) {
+  template <typename Callback>
+  void typeChanged(BorrowedRef<PyTypeObject> type, Callback cb) {
     auto it = caches.find(type);
     if (it == caches.end()) {
       return;
@@ -51,12 +56,19 @@ struct TypeWatcher {
     jit::UnorderedSet<T*> to_notify = std::move(it->second);
     caches.erase(it);
     for (T* cache : to_notify) {
-      cache->typeChanged(type);
+      cb(cache, type);
     }
+  }
+
+  void typeChanged(BorrowedRef<PyTypeObject> type) {
+    typeChanged(type, [](T* cache, BorrowedRef<PyTypeObject> tp) {
+      cache->typeChanged(tp);
+    });
   }
 };
 
 TypeWatcher<AttributeCache> ac_watcher;
+TypeWatcher<AttributeCache> ac_descr_watcher;
 TypeWatcher<LoadTypeAttrCache> ltac_watcher;
 TypeWatcher<LoadMethodCache> lm_watcher;
 TypeWatcher<LoadTypeMethodCache> ltm_watcher;
@@ -563,6 +575,7 @@ void AttributeMutator::set_combined(PyTypeObject* type) {
 void AttributeMutator::set_data_descr(PyTypeObject* type, PyObject* descr) {
   set_type(type, Kind::kDataDescr);
   data_descr_.descr = descr;
+  data_descr_.descr_type = Py_TYPE(descr);
 }
 
 void AttributeMutator::set_member_descr(PyTypeObject* type, PyObject* descr) {
@@ -587,6 +600,13 @@ void AttributeMutator::set_split(
   set_type(type, inline_values ? Kind::kSplitInline : Kind::kSplit);
   split_.val_offset = val_offset;
   split_.keys = keys;
+}
+
+BorrowedRef<PyTypeObject> AttributeMutator::watchedDescrType() const {
+  if (get_kind() == Kind::kDataDescr) {
+    return data_descr_.descr_type;
+  }
+  return nullptr;
 }
 
 inline int
@@ -675,14 +695,47 @@ AttributeCache::~AttributeCache() {
   for (auto& entry : entries()) {
     if (entry.type() != nullptr) {
       ac_watcher.unwatch(entry.type(), this);
+      BorrowedRef<PyTypeObject> descr_tp = entry.watchedDescrType();
+      if (descr_tp != nullptr) {
+        ac_descr_watcher.unwatch(descr_tp, this);
+      }
       entry.reset();
     }
   }
 }
 
-void AttributeCache::typeChanged(PyTypeObject*) {
+void AttributeCache::typeChanged(PyTypeObject* tp) {
   for (auto& entry : entries()) {
-    entry.reset();
+    if (entry.type() == tp) {
+      BorrowedRef<PyTypeObject> descr_tp = entry.watchedDescrType();
+      entry.reset();
+      if (descr_tp != nullptr) {
+        bool found = false;
+        for (auto& other : entries()) {
+          if (other.watchedDescrType() == descr_tp) {
+            found = true;
+            break;
+          }
+        }
+        if (!found) {
+          ac_descr_watcher.unwatch(descr_tp, this);
+        }
+      }
+    }
+  }
+}
+
+void AttributeCache::descrTypeChanged(PyTypeObject* tp) {
+  bool found = false;
+  for (auto& entry : entries()) {
+    if (entry.watchedDescrType() == tp) {
+      ac_watcher.unwatch(entry.type(), this);
+      entry.reset();
+      if (!found) {
+        ac_descr_watcher.unwatch(tp, this);
+        found = true;
+      }
+    }
   }
 }
 
@@ -759,10 +812,6 @@ void AttributeCache::fill(
   }
 
   if (descr != nullptr) {
-    // Not yet working.
-    if (PY_VERSION_HEX >= 0x030E0000) {
-      return;
-    }
     BorrowedRef<PyTypeObject> descr_type(Py_TYPE(descr));
     if (descr_type->tp_descr_get != nullptr &&
         descr_type->tp_descr_set != nullptr) {
@@ -770,9 +819,12 @@ void AttributeCache::fill(
       if (descr_type == &PyMemberDescr_Type) {
         mut->set_member_descr(type, descr);
       } else {
-        // If someone deletes descr_types's __set__ method, it will no longer
-        // be a data descriptor, and the cache kind has to change.
-        ac_watcher.watch(descr_type, this);
+        if (!ensureVersionTag(descr_type)) {
+          return;
+        }
+        // If someone modifies descr_type (e.g., deletes __set__), it may no
+        // longer be a data descriptor, and the cache kind has to change.
+        ac_descr_watcher.watch(descr_type, this);
         mut->set_data_descr(type, descr);
       }
     } else {
@@ -1612,6 +1664,10 @@ LoadModuleMethodCache::lookupSlowPath(BorrowedRef<> obj, BorrowedRef<> name) {
 
 void notifyICsTypeChanged(BorrowedRef<PyTypeObject> type) {
   ac_watcher.typeChanged(type);
+  ac_descr_watcher.typeChanged(
+      type, [](AttributeCache* cache, PyTypeObject* tp) {
+        cache->descrTypeChanged(tp);
+      });
   ltac_watcher.typeChanged(type);
   lm_watcher.typeChanged(type);
   ltm_watcher.typeChanged(type);
