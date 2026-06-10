@@ -12,6 +12,21 @@ if os.environ.get("CINDERX_PLUGIN_ENABLE", "0") == "1":
     def _env_flag_enabled(name):
         return os.environ.get(name, "0").lower() in ("1", "true", "yes", "on")
 
+    def _is_autojit_classification_value(value):
+        return isinstance(value, str) and (
+            value == "auto" or value.startswith("auto:")
+        )
+
+    def _autojit_import_provider():
+        provider = os.environ.get("CINDERX_AUTOJIT_IMPORT_PROVIDER")
+        if provider is not None:
+            return provider
+        if _is_autojit_classification_value(
+            os.environ.get("PYTHONJITAUTO")
+        ) or _is_autojit_classification_value(sys._xoptions.get("jit-auto")):
+            return "find_and_load"
+        return "off"
+
     def _maybe_enable_autojit_gate_stats():
         if not _env_flag_enabled("CINDERX_AUTOJIT_GATE_STATS"):
             return
@@ -95,7 +110,7 @@ if os.environ.get("CINDERX_PLUGIN_ENABLE", "0") == "1":
         return wrapper
 
     def _install_autojit_import_provider():
-        provider = os.environ.get("CINDERX_AUTOJIT_IMPORT_PROVIDER", "find_and_load")
+        provider = _autojit_import_provider()
         if provider in ("", "0", "off"):
             return
 

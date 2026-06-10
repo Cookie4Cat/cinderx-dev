@@ -44,7 +44,9 @@ if os.environ.get("CINDERX_PLUGIN_ENABLE", "0") == "1":
         ), "auto_jit_target was not compiled"
         assert cinderjit.get_compiled_size(auto_jit_target) > 0
 
-    provider = os.environ.get("CINDERX_AUTOJIT_IMPORT_PROVIDER", "find_and_load")
+    provider = os.environ.get("CINDERX_AUTOJIT_IMPORT_PROVIDER")
+    if provider is None and auto_mode:
+        provider = "find_and_load"
     if provider in {"builtins", "find_and_load"}:
         import _cinderx
 

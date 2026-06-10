@@ -534,6 +534,20 @@ TEST_F(CmdLineTest, JITAutoNumericEnvInstallsFrameEvaluator) {
   jit::shutdown_jit_genobject_type();
 }
 
+TEST_F(CmdLineTest, JITAutoNumericEnvKeepsStartupInitPolicyDisabled) {
+  ScopedAutoJitConfigState config_guard;
+  ScopedEnvVar env{"PYTHONJITAUTO"};
+  resetJitForAutoJitEntryTest();
+  env.set("2");
+  ASSERT_EQ(jit::initialize(), 0);
+  EXPECT_EQ(getConfig().compile_after_n_calls, 2);
+  EXPECT_FALSE(getConfig().auto_classify);
+  EXPECT_FALSE(getConfig().enable_startup_init_policy);
+
+  jit::finalize();
+  jit::shutdown_jit_genobject_type();
+}
+
 TEST_F(CmdLineTest, JITAutoEnvAutoModeCountsWithoutFrameEvaluator) {
   ScopedAutoJitConfigState config_guard;
   ScopedEnvVar env{"PYTHONJITAUTO"};
@@ -542,6 +556,7 @@ TEST_F(CmdLineTest, JITAutoEnvAutoModeCountsWithoutFrameEvaluator) {
   ASSERT_EQ(jit::initialize(), 0);
   EXPECT_EQ(getConfig().compile_after_n_calls, 2);
   EXPECT_TRUE(getConfig().auto_classify);
+  EXPECT_TRUE(getConfig().enable_startup_init_policy);
 
   assertNewFunctionCountsAndDefersTrivialWork(*this);
 
@@ -566,6 +581,7 @@ def existing_function(value):
   ASSERT_EQ(jit::initialize(), 0);
   EXPECT_EQ(getConfig().compile_after_n_calls, 2);
   EXPECT_TRUE(getConfig().auto_classify);
+  EXPECT_TRUE(getConfig().enable_startup_init_policy);
   EXPECT_EQ(func->vectorcall, original_vectorcall);
 
   jit::finalize();
@@ -579,6 +595,7 @@ TEST_F(CmdLineTest, JITAutoXOptionAutoModeCountsWithoutFrameEvaluator) {
   ASSERT_EQ(jit::initialize(), 0);
   EXPECT_EQ(getConfig().compile_after_n_calls, 2);
   EXPECT_TRUE(getConfig().auto_classify);
+  EXPECT_TRUE(getConfig().enable_startup_init_policy);
 
   assertNewFunctionCountsAndDefersTrivialWork(*this);
 

@@ -15,11 +15,87 @@ def _plugin_env() -> dict[str, str]:
 
     env["CINDERX_PLUGIN_ENABLE"] = "1"
     env["PYTHONJITAUTO"] = "auto:2"
-    env["CINDERX_AUTOJIT_IMPORT_PROVIDER"] = "find_and_load"
+    env.pop("PYTHONJITALL", None)
+    env.pop("CINDERX_AUTOJIT_IMPORT_PROVIDER", None)
+    return env
+
+
+def _plugin_env_without_auto_classify() -> dict[str, str]:
+    env = os.environ.copy()
+    env.pop("PYTHONPATH", None)
+    for name in (
+        "CINDERX_DISABLE",
+        "CINDERX_JIT_DISABLE",
+        "PYTHONJITDISABLE",
+        "PYTHONJITALL",
+        "PYTHONJITAUTO",
+        "CINDERX_AUTOJIT_IMPORT_PROVIDER",
+    ):
+        env.pop(name, None)
+
+    env["CINDERX_PLUGIN_ENABLE"] = "1"
     return env
 
 
 class AutoJitGateStatsDumpTests(unittest.TestCase):
+    def test_auto_classify_defaults_import_provider_to_find_and_load(self) -> None:
+        with tempfile.TemporaryDirectory() as temp:
+            env = _plugin_env()
+
+            completed = subprocess.run(
+                [
+                    sys.executable,
+                    "-c",
+                    "import sys\n"
+                    "bootstrap = sys.modules['importlib._bootstrap']\n"
+                    "assert getattr(\n"
+                    "    bootstrap._find_and_load,\n"
+                    "    '_cinderx_autojit_import_provider',\n"
+                    "    None,\n"
+                    ") == 'find_and_load'\n",
+                ],
+                cwd=temp,
+                env=env,
+                capture_output=True,
+                text=True,
+                timeout=60,
+            )
+
+            self.assertEqual(
+                completed.returncode,
+                0,
+                f"stdout:\n{completed.stdout}\nstderr:\n{completed.stderr}",
+            )
+
+    def test_plugin_without_auto_classify_keeps_import_provider_off(self) -> None:
+        with tempfile.TemporaryDirectory() as temp:
+            env = _plugin_env_without_auto_classify()
+
+            completed = subprocess.run(
+                [
+                    sys.executable,
+                    "-c",
+                    "import sys\n"
+                    "bootstrap = sys.modules['importlib._bootstrap']\n"
+                    "assert getattr(\n"
+                    "    bootstrap._find_and_load,\n"
+                    "    '_cinderx_autojit_import_provider',\n"
+                    "    None,\n"
+                    ") is None\n",
+                ],
+                cwd=temp,
+                env=env,
+                capture_output=True,
+                text=True,
+                timeout=60,
+            )
+
+            self.assertEqual(
+                completed.returncode,
+                0,
+                f"stdout:\n{completed.stdout}\nstderr:\n{completed.stderr}",
+            )
+
     def test_plugin_dumps_gate_stats_when_enabled(self) -> None:
         with tempfile.TemporaryDirectory() as temp:
             stats_path = Path(temp) / "gate-stats.jsonl"

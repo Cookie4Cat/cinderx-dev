@@ -606,6 +606,21 @@ _AUTOJIT_IMPORT_PROVIDER_MARKER = "_cinderx_autojit_import_provider"
 _AUTOJIT_SETUP_PROVIDER_MARKER = "_cinderx_autojit_setup_provider"
 
 
+def _is_autojit_classification_value(value: object) -> bool:
+    return isinstance(value, str) and (value == "auto" or value.startswith("auto:"))
+
+
+def _autojit_import_provider() -> str:
+    provider = environ.get("CINDERX_AUTOJIT_IMPORT_PROVIDER")
+    if provider is not None:
+        return provider
+    if _is_autojit_classification_value(
+        environ.get("PYTHONJITAUTO")
+    ) or _is_autojit_classification_value(sys._xoptions.get("jit-auto")):
+        return "find_and_load"
+    return "off"
+
+
 def _make_autojit_setup_wrapper(original: object, provider: str) -> object:
     def wrapper(*args: object, **kwargs: object) -> object:
         _autojit_setup_enter()
@@ -664,7 +679,7 @@ def _make_autojit_import_wrapper(original: object, provider: str) -> object:
 
 
 def _install_autojit_import_provider() -> None:
-    provider = environ.get("CINDERX_AUTOJIT_IMPORT_PROVIDER", "find_and_load")
+    provider = _autojit_import_provider()
     if provider in ("", "0", "off"):
         return
 
