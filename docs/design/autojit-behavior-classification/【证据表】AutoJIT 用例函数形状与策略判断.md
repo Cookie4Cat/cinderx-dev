@@ -10,6 +10,9 @@
 
 | 版本 | 日期 | 修订人 | 修订说明 |
 |---|---|---|---|
+| v0.27 | 2026-06-10 | @sisibeloved | 补 LowRoi 冻结正式化结果：去掉 spike 环境变量，将 Trivial LowRoi 与长 LowRoi 解释冻结纳入生产策略；正式子集 `pickle_pure_python=800us`、`2to3=991ms`、`nbody=119ms`，相对 v0.26 分别为 `1.16x faster`、`1.16x faster`、`1.07x slower`（nbody/pickle 本轮样本提示不稳），几何均值 `1.08x faster`。 |
+| v0.26 | 2026-06-10 | @sisibeloved | 补 `pickle_pure_python` 正式化后数据：AutoJIT 改为不安装 CinderX frame evaluator，并在 `jitVectorcall` 解释返回路径计数；正式子集 `pickle_pure_python=925us`，较优化前 `1056.7us` 拿回约 `131.7us`，但仍未达到 CPython JIT 85% 线。 |
+| v0.25 | 2026-06-09 | @sisibeloved | 重写 `pickle_pure_python` 分析：补 CPython JIT / CinderX no-plugin / plugin-no-JIT / `PYTHONJITAUTO=2` / AutoJIT 五口径账本；修正早期未加载 `_cinderx_auto` hook 的无效 CinderX 口径；确认当前劣化主因是 CinderX plugin/frame evaluator 逐帧税，而不是 AutoJIT 分类、import 风暴或 JIT deopt。 |
 | v0.24 | 2026-06-09 | @sisibeloved | 重写 `sqlalchemy_declarative` 分析：按 CPython JIT 基线拆出 CinderX 解释器基底、插件固定成本、CinderX JIT 动态成本和 AutoJIT 延迟编译长尾；补 worker-only gate/compile/deopt 证据，确认当前回归不是 import/setup 风暴，而是 `LowRoi=1000` 编译债溢出测量窗口 + ORM steady deopt/guard 动态负 ROI。 |
 | v0.23 | 2026-06-09 | @sisibeloved | 新增 `dask` 章节：按 CPython JIT 基线拆成解释器基底、插件固定成本、JIT 动态成本三个增量项，补 gate stats、编译形状和 deopt 动态成本；确认 dask 不是 startup/import compile storm，而是 steady 异步调度 + 序列化路径的 JIT 动态 ROI 负样本。 |
 | v0.22 | 2026-06-09 | @sisibeloved | 重写 `2to3` 章节为总/分结构：总表平铺 CPython JIT、优化前、当前候选和 force-interpret 差距；分表拆 gate 函数形状与非 gate 阶段成本，删除旧流水账。 |
@@ -112,6 +115,10 @@
 | `sympy_sum` | direct worker，同上，`bm_sympy sum` | `blue-98:/results/autojit-logging-sympy-shapes-20260605/worker-gate-shapes/sympy_sum.*.jit.log` | 有真实 C++ gate 形状；debug 口径 |
 | `sympy_str` | direct worker，同上，`bm_sympy str` | `blue-98:/results/autojit-logging-sympy-shapes-20260605/worker-gate-shapes/sympy_str.*.jit.log` | 有真实 C++ gate 形状；debug 口径 |
 | `pickle_pure_python` | direct worker，`--fast --values=3 --warmups=1`，`PYTHONJITAUTO=auto:2`，`CINDERX_AUTOJIT_IMPORT_PROVIDER=find_and_load`，`bm_pickle --pure-python pickle` | `blue-98:/results/autojit-pickle-deepcopy-shapes-20260605/worker-gate-shapes/pickle_pure_python.*.jit.log` | 有真实 C++ gate 形状；debug 口径，不作为性能数值 |
+| `pickle_pure_python` | 正式 pyperformance 五口径：CPython 3.14.3 JIT、CinderX no-plugin、CinderX plugin-no-JIT、`PYTHONJITAUTO=2`、当前 AutoJIT；`--warmup 3 --affinity=30` | `blue-98:{cpython-baseline,cinderx-test}:/results/autojit-pickle-ledger-20260609/{cpython_jit_pickle_pure_python_aff30.json,cinderx_no_plugin_pickle_pure_python_real_aff30.json,cinderx_plugin_nojit_pickle_pure_python_autohook_aff30.json,cinderx_auto2_pickle_pure_python_autohook_aff30.json,cinderx_autojit_pickle_pure_python_autohook_aff30.json}` | CPython JIT `684.0us`；CinderX no-plugin `643.8us`；plugin-no-JIT `1058.9us`；`auto=2` `1058.4us`；当前 AutoJIT `1056.7us`。差距来自启用 CinderX plugin 后的逐帧税；JIT/AutoJIT 基本没有增量影响 |
+| `pickle_pure_python` / `2to3` / `nbody` | 正式化后 pyperformance 子集：`PYTHONJITAUTO=auto:2`，`CINDERX_AUTOJIT_IMPORT_PROVIDER=find_and_load`，`--warmup 3 --affinity=30`，无 `CINDERX_SPIKE_*` | `blue-98:cinderx-test:/results/autojit-formal-vectorcall-count-20260610/{candidate_auto2_find_pickle_2to3_nbody.json,logs/candidate_subset_pickle_2to3_nbody_v2.log}` | `pickle_pure_python=925us`，`2to3=1.15s`，`nbody=111ms`；worker venv 已确认 `include-system-site-packages=true`，系统 `cinderx.pth` 生效，`_cinderx_auto` 自动加载 |
+| `pickle_pure_python` / `2to3` / `nbody` | LowRoi 冻结正式化后 pyperformance 子集：`PYTHONJITAUTO=auto:2`，`CINDERX_AUTOJIT_IMPORT_PROVIDER=find_and_load`，`--warmup 3 --affinity=30`，无 `CINDERX_SPIKE_*` | `blue-98:cinderx-test:/results/autojit-lowroi-freeze-formal-20260610/candidate_auto2_find_pickle_2to3_nbody_cinderx.json` | `pickle_pure_python=800us`，`2to3=991ms`，`nbody=119ms`；同轮先发现无效结果来自新 venv `include-system-site-packages=false`，修正并 smoke 确认 `_cinderx_auto=True`、`cinderjit=True`、provider=`find_and_load` 后重跑 |
+| `pickle_pure_python` | debug shape/gate/deopt：临时 autohook `sitecustomize.py` 只 `import _cinderx_auto`，`bm_pickle --pure-python pickle --fast -n 3 -w 1`，`PYTHONJITLOGFILE` + `CINDERX_AUTOJIT_GATE_STATS_FILE` + `CINDERX_AUTOJIT_COMPILE_EVENTS_FILE` | `blue-98:cinderx-test:/results/autojit-pickle-ledger-20260609/{pickle_pure_python-gate-stats.jsonl,pickle_pure_python-compile-events.jsonl,worker-gate-shapes/pickle_pure_python.%p.jit.log,pickle_pure_python-debug-fast-autohook.json}` | 5 个 worker/driver 记录合计 `49024` 次 gate、`39002` 次 classified warmup、`372` 次 forced compile；编译事件 `377` 条中 `352` 条在 steady；deopt 只有 pyperf harness 的 3 次 `Raise`，没有 pickle 主体 deopt |
 | `deepcopy` | direct worker，同上，`bm_deepcopy` 一次 run 覆盖 `deepcopy/deepcopy_reduce/deepcopy_memo` | `blue-98:/results/autojit-pickle-deepcopy-shapes-20260605/worker-gate-shapes/deepcopy.*.jit.log` | 有真实 C++ gate 形状；debug 口径；函数表按 benchmark-self 归因 |
 | `deepcopy` | deopt probe + 正式 pyperformance，`PYTHONJITAUTO=2`、`PYTHONJITAUTO=auto:2 + find_and_load`、只抑制 `_deepcopy_tuple` 三组对照 | `blue-98:cinderx-test:/results/autojit-deepcopy-deopt-20260608/{deopt-auto2.log,deopt-auto-classify.log,current.log,suppress_tuple.log,suppress_tuple_keep.log,formal-*.json,compare-*.txt}` | 验证 `_deepcopy_tuple` 与 `_keep_alive` 都会因 `DictSubscr` expected `KeyError` 产生 `UnhandledException` deopt；但策略收益不同，不能用一个异常风险规则同时处理 |
 
@@ -711,40 +718,94 @@ v1/v4 与本次当前 AutoJIT 结果一致：延迟一部分 ORM highcost 函数
 
 ### 15.1 总体判断
 
-`pickle_pure_python` 是纯 Python 序列化 workload，主体不是 C 加速模块，而是 `pickle._Pickler` 内部的大量对象图遍历、分支判断、动态分发和 memo 操作。真实 worker gate 证据显示，gate 主体是 `BranchFSM`，核心函数如 `save_tuple`、`save_global`、`_batch_setitems`、`_batch_appends` 都是 `startup=false + codeB=2 + LowRoi`，gate 数接近 3996 后仍会编译。
+`pickle_pure_python` 是纯 Python 序列化 workload，主体不是 C 加速模块，而是 `pickle._Pickler` 内部的大量对象图遍历、分支判断、动态分发和 memo 操作。它和 `dask/sqlalchemy_declarative` 的负 ROI 形态不同：当前正式 A/B 显示，`pickle_pure_python` 的大差距不是 import/setup 编译风暴，也不是 JIT 后 deopt，而是**一开启 CinderX plugin/frame evaluator 就多出来的逐帧税**。
 
-这组样本说明：纯 Python 序列化不是 import 风暴；它是 steady 对象图处理。`LowRoi` 应被理解为热度过滤，不能把 `pickle._Pickler` 的大分支函数全局拦掉。同时，`save/save_reduce/save_str` 这类更大或带异常风险的函数在本口径下没有热到编译，`RiskDefer` 对这些风险函数起到了保护作用。
+正式口径里，CinderX no-plugin 已经比 CPython JIT 快；优化前 plugin-no-JIT、`PYTHONJITAUTO=2` 和 AutoJIT 都稳定在 `1.06ms` 左右。第一次正式化后，AutoJIT 不再安装 CinderX frame evaluator，并把计数移动到 `jitVectorcall` 的解释返回路径，`pickle_pure_python` 降到 `925us`。继续把 Trivial LowRoi 与长 LowRoi 的等待路径改成分类后解释冻结后，`pickle_pure_python` 降到 `800us`，达到 CPython JIT 85% 目标线；`2to3` 同时从 `1.15s` 降到 `991ms`。
 
-### 15.2 摘要
+### 15.2 总表：差距账本
 
-| 用例 | 编译事件 | unique compiled | target unique compiled | gate 事件 | unique gated | gate family top | gate reason top |
-|---|---:|---:|---:|---:|---:|---|---|
-| `pickle_pure_python` | 678 | 175 | 22 | 88631 | 503 | `BranchFSM:66669`, `Mixed:9619`, `CallDispatcher:7936`, `ReflectionMeta:3462` | `LowRoi:86366`, `RiskDefer:1672`, `None:433`, `StartupInit:160` |
+口径：`blue-98`，`--warmup 3 --affinity=30`，正式 pyperformance 60 values。CPython JIT 使用 `cpython-baseline:/opt/python314-jit`；CinderX 口径使用 `cinderx-test:/opt/python314`。CinderX plugin/JIT 口径必须通过 `_cinderx_auto` 启动 hook；未加载该 hook 的早期结果不作为结论。
 
-### 15.3 代表函数形状表
+基线：CPython 3.14.3 JIT **684.0us**，85% 目标线约 **804.7us**。优化前 AutoJIT：`auto:2 + provider` **1056.7us**，慢 **+372.7us**。不装 frame evaluator 后 AutoJIT 为 **925us**；LowRoi 冻结正式化后 AutoJIT 为 **800us**，慢 **+116.0us**，已达到 85% 目标线。
 
-| 用例 | 函数 | 编译次数 | 编译耗时 | 形状 | 策略 | 判断 |
-|---|---|---:|---:|---|---|---|
-| `pickle_pure_python` | `pickle:_Pickler.save_tuple` | 4 | 70.8ms | `BranchFSM`, dims=`Control+Dispatch+Dynamic`, `loop=2`, `codeB=2`, `risk=Exception+HugeCode`, `startup=false` | `1000/LowRoi` | 纯 Python pickle 核心路径；延迟到高热度后编译，不能禁编 |
-| `pickle_pure_python` | `pickle:_Pickler.save_global` | 4 | 52.4ms | `BranchFSM`, dims=`Control+Dispatch`, `loop=2`, `codeB=2`, `risk=HugeCode`, `startup=false` | `1000/LowRoi` | 全局对象序列化路径；高成本但属于主体工作 |
-| `pickle_pure_python` | `pickle:_Pickler._batch_setitems` | 4 | 40.8ms | `BranchFSM`, dims=`Control+Dispatch+Dynamic`, `loop=3`, `codeB=2`, `risk=Exception`, `startup=false` | `1000/LowRoi` | dict 批量写入路径；LowRoi 热度过滤合理 |
-| `pickle_pure_python` | `pickle:_Pickler._batch_appends` | 4 | 39.4ms | `BranchFSM`, dims=`Control+Dispatch+Dynamic`, `loop=2`, `codeB=2`, `risk=Exception`, `startup=false` | `1000/LowRoi` | list 批量写入路径；热后编译 |
-| `pickle_pure_python` | `pickle:whichmodule` | 4 | 31.9ms | `BranchFSM`, dims=`Control+Dynamic`, `loop=3`, `codeB=2`, `risk=Exception`, `startup=false` | `1000/LowRoi` | 动态模块定位路径；延迟但热后编译 |
-| `pickle_pure_python` | `__main__:bench_pickle` | 4 | 24.2ms | `CallDispatcher`, dims=`Dispatch`, `loop=2`, `codeB=2`, `risk=None`, `startup=false` | `2/None` | benchmark 本体驱动函数，应放行 |
-| `pickle_pure_python` | `pickle:_Pickler.memoize` | 4 | 13.6ms | `ObjectManipulator`, dims=`Control+Object+Dispatch`, `loop=0`, `codeB=0`, `risk=None`, `startup=false` | `2/None` | memo 操作小函数，放行合理 |
-| `pickle_pure_python` | `pickle:_Pickler.put` | 4 | 10.4ms | `BranchFSM`, dims=`Compute+Control+Dynamic`, `loop=0`, `codeB=0`, `risk=None`, `startup=false`, `compute=true` | `1000/LowRoi` | 轻量 compute 混合路径；当前延迟但热后编译 |
-| `pickle_pure_python` | `pickle:_Pickler.save_reduce` | 0 | 0.0ms | `BranchFSM`, dims=`Control+Dispatch+Dynamic`, `loop=0`, `codeB=3`, `risk=Exception+HugeCode`, `startup=false` | `2097152/RiskDefer` | 高风险大函数，本口径下未热到编译；风险延迟合理 |
-| `pickle_pure_python` | `pickle:_Pickler.save` | 0 | 0.0ms | `BranchFSM`, dims=`Control+Dispatch+Dynamic`, `loop=0`, `codeB=2`, `risk=Exception+HugeCode`, `startup=false` | `2097152/RiskDefer` | 通用入口风险高；需非 debug A/B 判断是否需要专项放宽 |
-| `pickle_pure_python` | `dataclasses:_process_class` | 0 | 0.0ms | `BranchFSM`, dims=`Control+Object+Dynamic`, `loop=3`, `codeB=3`, `risk=Exception+HugeCode`, `startup=true` | `2097152/RiskDefer` | driver/setup 导入噪声，风险延迟正确；不应和 pickle 本体混在一起判断 |
+| 成本项 | 取数方式 | 优化前差距 | 当前剩余差距 | 已优化掉 | 继续可挖空间 | 下一步判断 |
+|---|---|---:|---:|---:|---:|---|
+| CinderX 解释器基底 | CinderX no-plugin `643.8us` - CPython JIT `684.0us` | -40.2us | -40.2us | 0.0us | 0.0us | 不是瓶颈；不开插件时 CinderX 路径更快 |
+| 旧 plugin/frame evaluator 逐帧税 | 优化前 AutoJIT `1056.7us` - no-plugin `643.8us` | +412.9us | 不再完整存在 | +131.7us | 仍有残留 | auto 模式不再安装 CinderX frame evaluator，但没有消除全部 plugin/gate 成本 |
+| LowRoi 等待路径成本 | frame-evaluator 正式化后 `925us` - LowRoi 冻结后 `800us` | +125.0us | 已消除 | +125.0us | 0.0us | Trivial LowRoi 与长 LowRoi 不再执行 classified warmup 等待 |
+| 正式 AutoJIT 残留成本 | LowRoi 冻结后 AutoJIT `800us` - no-plugin `643.8us` | 不适用 | +156.2us | 不适用 | ~156us 上界 | 下一步要拆 `jitVectorcall` gate、startup hook、compiled-entry 动态成本 |
+| CinderX JIT 动态收益/成本 | `PYTHONJITAUTO=2` - plugin-no-JIT | -0.4us | 未单独复测 | 0.0us | 小 | 优化前 JIT 基本没有改变结果；正式化后需用 gate/compile stats 继续拆 |
+| AutoJIT 正式化收益 | LowRoi 冻结后 AutoJIT `800us` - 优化前 AutoJIT `1056.7us` | 0.0us | -256.7us | +256.7us | 已达到 85% 线 | 本次改动有效，但仍可继续挖 plugin/gate 残留 |
+| import/setup 编译风暴 | debug 编译事件：import `25`，steady `352` | 非主项 | 非主项 | 0.0us | 不作为主线 | import 编译少，且正式差距在 plugin-no-JIT 已出现 |
+| JIT deopt 动态成本 | `PYTHONJITDUMPSTATS=1` | 非主项 | 非主项 | 0.0us | 不作为主线 | 只看到 pyperf harness 的 3 次 `Raise`，没有 pickle 主体 deopt |
+| **合计** | 总耗时减 CPython JIT | **+372.7us** | **+116.0us** | **+256.7us** | **已过 85% 线约 4.7us** | 继续优化要拆正式 AutoJIT 残留成本，而不是回到静态分类泛化 |
 
-### 15.4 策略判断
+读表三条结论：
+
+- 本次正式化有效：auto 模式不装 frame evaluator + `jitVectorcall` 解释返回计数 + LowRoi 冻结，合计拿回约 `256.7us`。
+- 这个用例已经达到 CPython JIT 85% 线：`800us` 对目标线 `804.7us`，约快 `4.7us`。
+- 后续不要回到“大范围禁编 pickle 函数”的方向；应拆正式 AutoJIT 残留的 gate/compiled-entry/startup hook 成本。
+
+### 15.3 分表一：gate 与编译规模
+
+debug 口径：临时 autohook 只 `import _cinderx_auto`，`bm_pickle --pure-python pickle --fast -n 3 -w 1`，只用于函数形状和路径计数，不作为性能数值。5 个 worker/driver 记录合计：
+
+| gate 路径 | 次数 | 含义 |
+|---|---:|---|
+| `jit_vectorcall` | 49024 | 进入 AutoJIT gate 的总次数 |
+| `global_threshold_return` | 6286 | 还没到全局阈值，返回解释执行 |
+| `classified_warmup_return` | 39002 | 已分类，但 `LowRoi` 等策略要求继续解释等待更高热度 |
+| `classified_defer_freeze` | 3364 | 判定延迟/解释执行，并恢复 interpreted vectorcall |
+| `forced_compile` / `forced_compile_ok` | 372 / 372 | 仍然进入 CinderX JIT 编译的次数 |
+| `forced_compile_fallback` | 0 | 没有编译失败回退 |
+
+编译事件按阶段和策略分布：
+
+| 维度 | 分布 | 读法 |
+|---|---|---|
+| 阶段 | `steady=352`，`import=25` | pickle 的 JIT 成本主要在 steady；不是 import 风暴 |
+| 策略原因 | `None=258`，`LowRoi=119` | 主要是小对象操作直接放行，少量 pickle helper 延迟到 1000 后仍编译 |
+| family | `ObjectManipulator=128`，`BranchFSM=113`，`Trivial=87`，`Mixed=23`，`NumericLoop=18`，`CallDispatcher=8` | 主体是对象图遍历和分支/dispatch，不是数值循环 |
+| risk | `risk=0` 为 372 条，`HugeCode=8` 为 5 条 | 当前 debug 口径没有大量 exception-risk 编译 |
+| 文件 | `pickle.py=52`，`bm_pickle/run_benchmark.py=10`，其余多为 `argparse/importlib.metadata/contextlib/pyperf` | 只有一部分编译发生在 pickle 主体 |
+
+### 15.4 分表二：代表函数形状
+
+| 函数 | 编译事件 | 阶段 | 形状 | 策略 | 判断 |
+|---|---:|---|---|---|---|
+| `__main__:bench_pickle` | 5 | steady | `CallDispatcher`, dims=`Dispatch`, `loop=2`, `codeB=2`, `risk=None` | `2/None` | benchmark 本体驱动函数，应放行 |
+| `pickle:_Pickler.memoize` | 5 | steady | `ObjectManipulator`, dims=`Control+Object+Dispatch`, `loop=0`, `codeB=0`, `risk=None` | `2/None` | memo 小函数，放行合理 |
+| `pickle:_Pickler.save_dict` | 5 | steady | `ObjectManipulator`, dims=`Control+Object+Dispatch`, `loop=0`, `codeB=0`, `risk=None` | `2/None` | dict 序列化核心小函数 |
+| `pickle:_Pickler.save_list` | 5 | steady | `ObjectManipulator`, dims=`Control+Object+Dispatch+Dynamic`, `loop=0`, `codeB=0`, `risk=None` | `2/None` | list 序列化核心小函数 |
+| `pickle:_getattribute` | 5 | steady | `BranchFSM`, dims=`Control`, `loop=1`, `codeB=0`, `risk=None` | `2/None` | 属性查找分支小函数 |
+| `pickle:_Pickler.persistent_id` | 5 | steady | `Trivial`, dims=`-`, `loop=0`, `codeB=0`, `risk=None` | `4/LowRoi` | 极小函数轻延迟；不是主成本 |
+| `pickle:_Framer.write` | 5 | steady | `Mixed`, dims=`Control+Object+Dispatch`, `loop=0`, `codeB=0`, `risk=None` | `1000/LowRoi` | framing 写路径，热后编译 |
+| `pickle:_Pickler.put` | 5 | steady | `BranchFSM`, dims=`Control+Dispatch+Dynamic`, `loop=0`, `codeB=0`, `risk=None` | `1000/LowRoi` | memo id 输出路径，热后编译 |
+| `pickle:_Pickler.get` | 5 | steady | `BranchFSM`, dims=`Control+Object+Dispatch+Dynamic`, `loop=0`, `codeB=0`, `risk=None` | `1000/LowRoi` | memo id 读取路径，热后编译 |
+| `pickle:_dumps` | 5 | steady | `CallDispatcher`, dims=`Control+Object+Dispatch+Dynamic`, `loop=0`, `codeB=0`, `risk=None` | `1000/LowRoi` | dumps 包装函数，热后编译 |
+| `pickle:_Pickler.save_global` | 5 | steady | `BranchFSM`, dims=`Control+Dispatch`, `loop=2`, `codeB=2`, `risk=HugeCode` | `1000/LowRoi` | 全局对象序列化路径；高成本但属于主体工作 |
+| `pickle:_Pickler.save_bytes` | 5 | steady | `BranchFSM`, dims=`Control+Object+Dispatch`, `loop=0`, `codeB=0`, `risk=None` | `1000/LowRoi` | bytes 序列化路径，热后编译 |
+
+### 15.5 分表三：deopt 与负面结论
+
+`PYTHONJITDUMPSTATS=1` 的 debug worker 只记录到 3 次 deopt：
+
+| 函数 | 次数 | 原因 | 判断 |
+|---|---:|---|---|
+| `pyperf._bench:BenchmarkSuite.get_benchmark` | 3 | `Raise` | pyperf harness 正常控制流；不是 pickle 主体 |
+
+负面结论很重要：**不要把 `pickle_pure_python` 归入 dask/sqlalchemy 那类“JIT 后 deopt/guard 动态成本”样本。** 这个用例的劣化在 plugin-no-JIT 已经出现，JIT/AutoJIT 没有明显增量；如果后续做优化，优先级应给 frame evaluator/逐帧计数/gate 早退，而不是针对 pickle 函数继续调分类阈值。
+
+### 15.6 策略判断
 
 | 观察 | 结论 |
 |---|---|
-| `pickle._Pickler` 核心函数多为 `startup=false + BranchFSM + codeB=2` | pure-python pickle 是 steady 对象图遍历，不是 import-window 拦截对象 |
-| 多个 `LowRoi` 函数 gate 数接近 3996 且最终编译 | `LowRoi` 在该用例中保留热后收益 |
-| `save/save_reduce/save_str` 等大函数未编译，走 `RiskDefer` 或超高 `LowRoi` 阈值 | 风险延迟可减少低热大函数编译成本，但是否影响收益要看非 debug A/B |
-| `dataclasses` startup 样本来自 setup/driver | 策略判断要优先看 benchmark-self，不能被全局 top 编译耗时带偏 |
+| 正式 plugin-no-JIT 已从 `643.8us` 慢到 `1058.9us` | 主差距是 CinderX plugin/frame evaluator 逐帧税 |
+| `auto=2` 和 AutoJIT 都约 `1.06ms` | JIT 和 AutoJIT 分类没有解决主差距，也没有新增可观劣化 |
+| debug 编译事件 `steady=352`、`import=25` | 不是 startup/import 编译风暴 |
+| deopt 只有 pyperf harness 的 3 次 `Raise` | 不是 pickle 主体 deopt/guard 问题 |
+| `pickle.py` 主体编译只有 52 条，且多为小对象操作或 LowRoi helper | 继续调 `BranchFSM/codeB` 静态分类不是主杠杆 |
+| no-plugin 已快于 CPython JIT | CinderX 解释器基底不是问题；问题发生在装上 plugin 后 |
 
 ## 16 用例：deepcopy 系列
 
@@ -938,10 +999,11 @@ top deopt site：
 | highcost 符号计算不能全局延迟 | `sympy` 系列 | 成立。`Mul.flatten`、`Expr.expand`、`simplify`、`Printer._print` 等是主体工作，不是 startup/import 噪声 |
 | benchmark-self 优先于全局 top 编译耗时 | `logging` 系列 | 成立。全局 top 可能混入 `importlib.metadata`、`argparse`、driver/setup 函数，策略判断必须回到本体函数 |
 | pure-python 对象图序列化不能全局拦 `BranchFSM + codeB=2` | `pickle_pure_python` | 成立。`save_tuple/save_global/_batch_*` 是主体路径，LowRoi 延迟后仍编译 |
+| plugin/frame evaluator 逐帧税可以压倒 JIT 收益 | `pickle_pure_python` | 成立。no-plugin `643.8us`，plugin-no-JIT/`auto=2`/AutoJIT 都约 `1.06ms`；主差距不是分类策略 |
 | 对象图重建热点应允许热后编译 | `deepcopy` | 成立。`copy._reconstruct` 延迟到 1000 后仍进入 JIT，内部热点优先于入口函数 |
 | expected-exception deopt 需要精确到函数形状 | `deepcopy` | 成立。`_deepcopy_tuple` 抑制后正式 A/B 有小幅收益；`_keep_alive` 放宽会让 `deepcopy_reduce` 回归，应保持 `RiskDefer` |
 | deopt 数不能单独驱动准入策略 | `deepcopy` | 成立。必须同时看函数形状、子场景和正式 A/B；否则会误伤 `deepcopy_memo` |
-| `RiskDefer` 对低热大函数有效，但不能替代收益判断 | `pickle_pure_python`、`deepcopy` | 成立。部分入口/通用函数未编译是保护，但上线前仍需非 debug A/B 确认收益是否丢失；`_keep_alive` 是“风险高且放宽会回归”的反例 |
+| `RiskDefer` 对低热大函数有效，但不能替代收益判断 | `pickle_pure_python`、`deepcopy` | 成立。部分入口/通用函数未编译是保护，但如果主差距在逐帧税或特定 deopt 上，继续调 `RiskDefer` 不会解决问题 |
 | steady async/framework 动态负 ROI 不能靠 startup/import 泛化解决 | `dask`、`sqlalchemy_declarative` | 成立。`dask` 的主因是 `distributed`/`asyncio`/`cloudpickle`/`zict` deopt；`sqlalchemy_declarative` 的主因是 ORM steady guard failure 加 delayed compile 长尾 |
 
 ## 19 待补清单
@@ -956,7 +1018,7 @@ top deopt site：
 | P1 | 给 `sqlglot_v2` 四个子用例分别补非 debug A/B | 区分 parse/transpile/optimize 的真实收益和误伤边界 |
 | P1 | 给 `logging` 三个子用例分别补非 debug A/B | 区分 silent 微路径、simple 输出路径、format 格式化路径是否需要差异化阈值 |
 | P1 | 给 `sympy` 四个子用例分别补非 debug A/B | 判断符号计算 highcost 函数的动态收益是否覆盖编译成本 |
-| P1 | 给 `pickle_pure_python` 补非 debug A/B | 判断纯 Python 序列化大分支函数热后编译收益是否覆盖编译成本 |
+| P1 | 对 `pickle_pure_python` 做 plugin/frame evaluator 逐帧税穿刺 | 验证计数早退、frame evaluator 轻量化或 interpreted fast path 能否拿回约 `415us` 主差距 |
 | P1 | 将 `deepcopy/deepcopy_reduce/deepcopy_memo` 三个子场景补完整函数形状表 | deopt 和正式 A/B 已拆分；后续还需要按子场景列完整编译函数，确认 `_deepcopy_tuple` 收窄规则是否有其它同形状候选 |
 | P1 | 给 `dulwich_log`、`bench_mp_pool` 补同格式表 | 扩大非 JIT 用例样本，避免只围绕 `2to3`/`dask` 调参 |
 | P2 | 给 `scimark_fft/scimark_lu/scimark_sor/scimark_monte_carlo` 补同格式表 | 验证 JIT 用例误伤边界 |

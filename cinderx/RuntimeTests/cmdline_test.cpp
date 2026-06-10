@@ -138,6 +138,7 @@ void resetJitForAutoJitEntryTest() {
 
 void assertNewFunctionCountsAndCompiles(RuntimeTest& test) {
   test.runStockCode(R"(
+import cinderx
 import cinderx.jit as jit
 
 def target(n):
@@ -147,6 +148,7 @@ def target(n):
     return total
 
 assert jit.get_compile_after_n_calls() == 2
+assert cinderx.is_frame_evaluator_installed()
 assert jit.count_interpreted_calls(target) == 0
 target(5)
 target(5)
@@ -159,12 +161,14 @@ assert jit.is_jit_compiled(target)
 
 void assertNewFunctionCountsAndDefersTrivialWork(RuntimeTest& test) {
   test.runStockCode(R"(
+import cinderx
 import cinderx.jit as jit
 
 def target(value):
     return value
 
 assert jit.get_compile_after_n_calls() == 2
+assert not cinderx.is_frame_evaluator_installed()
 assert jit.count_interpreted_calls(target) == 0
 target(1)
 target(2)
@@ -172,8 +176,9 @@ assert not jit.is_jit_compiled(target)
 assert jit.count_interpreted_calls(target) == 2
 target(3)
 target(4)
+target(5)
 assert not jit.is_jit_compiled(target)
-assert jit.count_interpreted_calls(target) == 4
+assert jit.count_interpreted_calls(target) == 2
 )");
 }
 
@@ -529,7 +534,7 @@ TEST_F(CmdLineTest, JITAutoNumericEnvInstallsFrameEvaluator) {
   jit::shutdown_jit_genobject_type();
 }
 
-TEST_F(CmdLineTest, JITAutoEnvAutoModeInstallsFrameEvaluator) {
+TEST_F(CmdLineTest, JITAutoEnvAutoModeCountsWithoutFrameEvaluator) {
   ScopedAutoJitConfigState config_guard;
   ScopedEnvVar env{"PYTHONJITAUTO"};
   resetJitForAutoJitEntryTest();
@@ -567,7 +572,7 @@ def existing_function(value):
   jit::shutdown_jit_genobject_type();
 }
 
-TEST_F(CmdLineTest, JITAutoXOptionAutoModeInstallsFrameEvaluator) {
+TEST_F(CmdLineTest, JITAutoXOptionAutoModeCountsWithoutFrameEvaluator) {
   ScopedAutoJitConfigState config_guard;
   ScopedXOption xoption{L"jit-auto=auto:2"};
   resetJitForAutoJitEntryTest();

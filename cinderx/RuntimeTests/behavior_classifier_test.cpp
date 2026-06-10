@@ -853,6 +853,65 @@ assert after_calls == before_calls, (before_calls, after_calls)
 )");
 }
 
+TEST_F(BehaviorClassifierRuntimeTest, AutoClassifyFreezesTrivialLowRoiWork) {
+  ScopedAutoJitConfig config_guard;
+  getMutableConfig().compile_after_n_calls = 2;
+  getMutableConfig().auto_classify = true;
+  getMutableConfig().enable_startup_init_policy = false;
+
+  runStockCode(R"(
+import cinderjit
+import cinderx.jit as jit
+
+cinderjit._clear_autojit_gate_stats()
+
+def trivial(value):
+    return value
+
+for value in range(20):
+    trivial(value)
+
+stats = cinderjit._autojit_gate_stats()
+assert stats["global_threshold_return"] >= 1, stats
+assert stats["classified_defer_freeze"] >= 1, stats
+assert stats["classified_warmup_return"] == 0, stats
+assert stats["forced_compile"] == 0, stats
+assert jit.count_interpreted_calls(trivial) <= 2
+assert not jit.is_jit_compiled(trivial)
+)");
+}
+
+TEST_F(BehaviorClassifierRuntimeTest, AutoClassifyFreezesLongLowRoiWork) {
+  ScopedAutoJitConfig config_guard;
+  getMutableConfig().compile_after_n_calls = 2;
+  getMutableConfig().auto_classify = true;
+  getMutableConfig().enable_startup_init_policy = false;
+
+  runStockCode(R"(
+import cinderjit
+import cinderx.jit as jit
+
+cinderjit._clear_autojit_gate_stats()
+
+def identity(value):
+    return value
+
+def dispatch(func, value):
+    return func(value)
+
+for value in range(2000):
+    dispatch(identity, value)
+
+stats = cinderjit._autojit_gate_stats()
+assert stats["global_threshold_return"] >= 1, stats
+assert stats["classified_defer_freeze"] >= 1, stats
+assert stats["classified_warmup_return"] == 0, stats
+assert stats["forced_compile"] == 0, stats
+assert jit.count_interpreted_calls(dispatch) <= 2
+assert not jit.is_jit_compiled(dispatch)
+)");
+}
+
 TEST_F(
     BehaviorClassifierRuntimeTest,
     SetupDepthTracksSeparatelyFromImportDepth) {

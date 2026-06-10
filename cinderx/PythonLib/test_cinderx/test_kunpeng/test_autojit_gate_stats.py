@@ -15,6 +15,7 @@ def _plugin_env() -> dict[str, str]:
 
     env["CINDERX_PLUGIN_ENABLE"] = "1"
     env["PYTHONJITAUTO"] = "auto:2"
+    env["CINDERX_AUTOJIT_IMPORT_PROVIDER"] = "find_and_load"
     return env
 
 
@@ -82,6 +83,65 @@ class AutoJitGateStatsDumpTests(unittest.TestCase):
                 f"stdout:\n{completed.stdout}\nstderr:\n{completed.stderr}",
             )
             self.assertFalse(stats_path.exists())
+
+    def test_plugin_freezes_low_roi_functions(self) -> None:
+        with tempfile.TemporaryDirectory() as temp:
+            env = _plugin_env()
+
+            completed = subprocess.run(
+                [
+                    sys.executable,
+                    "-c",
+                    "import cinderjit\n"
+                    "import cinderx.jit as jit\n"
+                    "\n"
+                    "cinderjit._clear_autojit_gate_stats()\n"
+                    "\n"
+                    "def trivial(value):\n"
+                    "    return value\n"
+                    "\n"
+                    "for value in range(20):\n"
+                    "    trivial(value)\n"
+                    "\n"
+                    "trivial_stats = cinderjit._autojit_gate_stats()\n"
+                    "assert trivial_stats['global_threshold_return'] >= 1, trivial_stats\n"
+                    "assert trivial_stats['classified_defer_freeze'] >= 1, trivial_stats\n"
+                    "assert trivial_stats['classified_warmup_return'] == 0, trivial_stats\n"
+                    "assert trivial_stats['forced_compile'] == 0, trivial_stats\n"
+                    "assert jit.count_interpreted_calls(trivial) <= 2\n"
+                    "assert not jit.is_jit_compiled(trivial)\n"
+                    "\n"
+                    "cinderjit._clear_autojit_gate_stats()\n"
+                    "\n"
+                    "def identity(value):\n"
+                    "    return value\n"
+                    "\n"
+                    "def dispatch(func, value):\n"
+                    "    return func(value)\n"
+                    "\n"
+                    "for value in range(2000):\n"
+                    "    dispatch(identity, value)\n"
+                    "\n"
+                    "dispatch_stats = cinderjit._autojit_gate_stats()\n"
+                    "assert dispatch_stats['global_threshold_return'] >= 1, dispatch_stats\n"
+                    "assert dispatch_stats['classified_defer_freeze'] >= 1, dispatch_stats\n"
+                    "assert dispatch_stats['classified_warmup_return'] == 0, dispatch_stats\n"
+                    "assert dispatch_stats['forced_compile'] == 0, dispatch_stats\n"
+                    "assert jit.count_interpreted_calls(dispatch) <= 2\n"
+                    "assert not jit.is_jit_compiled(dispatch)\n",
+                ],
+                cwd=temp,
+                env=env,
+                capture_output=True,
+                text=True,
+                timeout=60,
+            )
+
+            self.assertEqual(
+                completed.returncode,
+                0,
+                f"stdout:\n{completed.stdout}\nstderr:\n{completed.stderr}",
+            )
 
 
 if __name__ == "__main__":

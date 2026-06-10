@@ -29,6 +29,11 @@ if os.environ.get("CINDERX_PLUGIN_ENABLE", "0") == "1":
         assert cinderx.is_initialized(), "cinderx was not initialized"
     assert cinderjit.is_enabled(), "cinderx JIT is not enabled"
     if auto_mode:
+        import _cinderx
+
+        assert (
+            not _cinderx.is_frame_evaluator_installed()
+        ), "AutoJIT classification should not install the frame evaluator"
         assert not cinderjit.is_jit_compiled(
             auto_jit_target
         ), "auto_jit_target should be deferred by AutoJIT classification"

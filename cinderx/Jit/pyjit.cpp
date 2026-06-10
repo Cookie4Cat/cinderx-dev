@@ -72,6 +72,7 @@ using namespace jit;
 namespace {
 
 constexpr uint32_t kAutoJitInterpretOnlyThreshold = 65536;
+constexpr uint32_t kAutoJitLongLowRoiFreezeThreshold = 1000;
 
 struct AutoJitGateStats {
   std::atomic<uint64_t> jit_vectorcall{0};
@@ -341,6 +342,18 @@ AutoJitGateState readAutoJitGateState(BorrowedRef<PyCodeObject> code) {
   return {extra, calls, readGateContext()};
 }
 
+// Auto classification avoids installing Ci_EvalFrame, so the gate records the
+// calls that it keeps on the interpreted path.
+void recordAutoJitInterpretedCall(const AutoJitGateState& state) {
+  if (!getConfig().auto_classify || state.extra == nullptr) {
+    return;
+  }
+  uint32_t skey_word = Ci_code_extra_load_skey_acquire(state.extra);
+  if (!(skey_word & kSkeyDecidedColdBit)) {
+    Ci_code_extra_incr_calls(state.extra);
+  }
+}
+
 void setInterpreterJitFlag(bool enabled) {
   PyThreadState* tstate = _PyThreadState_UncheckedGet();
   if (tstate != nullptr && tstate->interp != nullptr) {
@@ -442,6 +455,7 @@ PyObject* jitVectorcall(
     if (state.calls < *limit) {
       incAutoJitGateStat(g_auto_jit_gate_stats.global_threshold_return);
       auto entry = getInterpretedVectorcall(func);
+      recordAutoJitInterpretedCall(state);
       return entry(func_obj, stack, nargsf, kwnames);
     }
 
@@ -461,8 +475,13 @@ PyObject* jitVectorcall(
     }
     if (state.calls < effective_limit) {
       auto entry = getInterpretedVectorcall(func);
+      bool freeze_low_roi =
+          decision.branch_reason == BranchReason::LowRoi &&
+          (effective_limit >= kAutoJitLongLowRoiFreezeThreshold ||
+           (key.has_value() && key->family == Family::Trivial));
       if (getConfig().auto_classify &&
-          effective_limit >= kAutoJitInterpretOnlyThreshold) {
+          (effective_limit >= kAutoJitInterpretOnlyThreshold ||
+           freeze_low_roi)) {
         incAutoJitGateStat(g_auto_jit_gate_stats.classified_defer_freeze);
         if (state.extra != nullptr) {
           Ci_code_extra_or_skey_release(state.extra, kSkeyDecidedColdBit);
@@ -470,6 +489,7 @@ PyObject* jitVectorcall(
         setVectorcall(func, entry);
       } else {
         incAutoJitGateStat(g_auto_jit_gate_stats.classified_warmup_return);
+        recordAutoJitInterpretedCall(state);
       }
       return entry(func_obj, stack, nargsf, kwnames);
     }
@@ -3992,14 +4012,14 @@ int initialize() {
   // startup, start scheduling functions for compilation now.
   if (auto compile_n = getConfig().compile_after_n_calls;
       compile_n.has_value()) {
-    if (Ci_InitFrameEvalFunc() < 0) {
-      return -1;
-    }
     if (getConfig().auto_classify) {
       JIT_DLOG(
           "Configuring AutoJIT to classify new functions after {} calls",
           *compile_n);
     } else {
+      if (Ci_InitFrameEvalFunc() < 0) {
+        return -1;
+      }
       schedule_existing_functions_for_jit(*compile_n);
     }
   } else if (mod_state->jit_list.get() != nullptr) {
