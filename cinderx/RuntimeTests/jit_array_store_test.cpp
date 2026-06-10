@@ -71,8 +71,8 @@ TEST_F(ArrayStoreTest, StoreSubscrArrayDoubleGeneratesStoreArrayItem) {
   CompileToHIR(
       R"(
 from array import array
-def store_array_double(a, i, v):
-    a[i] = v
+def store_array_double(a):
+    a[0] = 1.5
 )",
       "store_array_double",
       irfunc);
@@ -97,10 +97,8 @@ def store_array_double(a, i, v):
       << "Expected StoreArrayItem(TCDouble) in HIR for array('d') store";
 }
 
-// Test that STORE_SUBSCR on any type generates both fast and slow paths.
-// The array fast path is always emitted with a CondBranchCheckType guard;
-// non-array containers will take the slow path at runtime.
-TEST_F(ArrayStoreTest, StoreSubscrGeneratesBothPaths) {
+// Test that STORE_SUBSCR with unknown index/value shapes stays generic.
+TEST_F(ArrayStoreTest, StoreSubscrUnknownShapeGeneratesGenericPath) {
   std::unique_ptr<jit::hir::Function> irfunc;
   CompileToHIR(
       R"(
@@ -112,7 +110,6 @@ def store_list(a, i, v):
 
   ASSERT_NE(irfunc, nullptr);
 
-  // Should find both StoreArrayItem (fast path) and StoreSubscr (slow path)
   bool found_store_array_item = false;
   bool found_store_subscr = false;
   for (auto& block : irfunc->cfg.blocks) {
@@ -127,10 +124,10 @@ def store_list(a, i, v):
     }
   }
 
-  EXPECT_TRUE(found_store_array_item)
-      << "Expected StoreArrayItem (fast path) in HIR";
+  EXPECT_FALSE(found_store_array_item)
+      << "Did not expect StoreArrayItem for unknown store shapes";
   EXPECT_TRUE(found_store_subscr)
-      << "Expected StoreSubscr (slow path) in HIR";
+      << "Expected StoreSubscr in HIR";
 }
 
 TEST_F(ArrayStoreTest, CompiledStoreArrayDoubleFastPathUpdatesArray) {
@@ -140,18 +137,18 @@ import cinderx.jit as jit
 
 jit.enable_specialized_opcodes()
 
-def store_array_double(a, i, v):
-    a[i] = v
+def store_array_double(a):
+    a[1] = 42.5
 
 for _ in range(20):
-    store_array_double(array("d", [1.0, 2.0, 3.0]), 1, 4.5)
+    store_array_double(array("d", [1.0, 2.0, 3.0]))
 
 assert jit.force_compile(store_array_double)
 counts = jit.get_function_hir_opcode_counts(store_array_double)
 assert counts.get("StoreArrayItem", 0) > 0
 
 arr = array("d", [1.0, 2.0, 3.0])
-store_array_double(arr, 1, 42.5)
+store_array_double(arr)
 assert list(arr) == [1.0, 42.5, 3.0]
 )");
 }
@@ -163,11 +160,11 @@ import cinderx.jit as jit
 
 jit.enable_specialized_opcodes()
 
-def store_any(a, i, v):
-    a[i] = v
+def store_any(a):
+    a[1] = 4.5
 
-def generic_store(a, i, v):
-    a[i] = v
+def generic_store(a):
+    a[1] = 4.5
 
 def exception_info(func, *args):
     try:
@@ -177,22 +174,23 @@ def exception_info(func, *args):
     return None, None
 
 for _ in range(20):
-    store_any(array("d", [1.0, 2.0, 3.0]), 1, 4.5)
+    store_any(array("d", [1.0, 2.0, 3.0]))
 
 assert jit.force_compile(store_any)
 counts = jit.get_function_hir_opcode_counts(store_any)
 assert counts.get("StoreArrayItem", 0) > 0
 
 lst = [1, 2, 3]
-store_any(lst, 1, 99)
-assert lst == [1, 99, 3]
+store_any(lst)
+assert lst == [1, 4.5, 3]
 
-arr_i = array("i", [1, 2, 3])
-store_any(arr_i, 2, 77)
-assert list(arr_i) == [1, 2, 77]
+jit_error = exception_info(store_any, array("i", [1, 2, 3]))
+generic_error = exception_info(generic_store, array("i", [1, 2, 3]))
+assert jit_error[0] is generic_error[0]
+assert jit_error[1] == generic_error[1]
 
-jit_error = exception_info(store_any, (1, 2, 3), 0, 99)
-generic_error = exception_info(generic_store, (1, 2, 3), 0, 99)
+jit_error = exception_info(store_any, (1, 2, 3))
+generic_error = exception_info(generic_store, (1, 2, 3))
 assert jit_error[0] is generic_error[0]
 assert jit_error[1] == generic_error[1]
 )");

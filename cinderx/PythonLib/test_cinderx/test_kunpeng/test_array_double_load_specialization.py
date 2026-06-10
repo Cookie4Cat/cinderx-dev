@@ -74,15 +74,27 @@ class ArrayDoubleLoadSpecializationTests(unittest.TestCase):
         arr = array("d", [1.5, 2.5, 3.5])
         self.assertEqual(f(arr, 3), 7.5)
 
-    def test_array_double_load_fast_path_emitted_in_hir(self):
-        """array('d') load compilation emits LoadArrayItem."""
+    def test_array_double_load_fast_path_emitted_for_known_index_in_hir(self):
+        """array('d') load emits LoadArrayItem when the index shape is known."""
+
+        def f(a):
+            return a[0]
+
+        self._compile_func(f, lambda: f(array("d", [1.0, 2.0, 3.0])))
+        counts = cinderx.jit.get_function_hir_opcode_counts(f)
+        self.assertGreater(counts.get("LoadArrayItem", 0), 0)
+
+    def test_array_double_load_unknown_index_uses_generic_hir(self):
+        """Unknown index shape should not speculate on array.array."""
 
         def f(a, i):
             return a[i]
 
         self._compile_func(f, lambda: f(array("d", [1.0, 2.0, 3.0]), 0))
         counts = cinderx.jit.get_function_hir_opcode_counts(f)
-        self.assertGreater(counts.get("LoadArrayItem", 0), 0)
+        self.assertEqual(counts.get("LoadArrayItem", 0), 0)
+        self.assertGreater(counts.get("BinaryOp", 0), 0)
+        self.assertEqual(f(array("d", [1.0, 2.0, 3.0]), 1), 2.0)
 
     # -----------------------------------------------------------------------
     # Slow path fallback

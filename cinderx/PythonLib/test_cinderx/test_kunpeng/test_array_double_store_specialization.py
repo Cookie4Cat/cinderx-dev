@@ -73,15 +73,30 @@ class ArrayDoubleStoreSpecializationTests(unittest.TestCase):
         f(arr, 1, 20.0)
         self.assertEqual(arr[1], 20.0)
 
-    def test_array_double_store_fast_path_emitted_in_hir(self):
-        """array('d') store compilation emits StoreArrayItem."""
+    def test_array_double_store_fast_path_emitted_for_known_shapes_in_hir(self):
+        """array('d') store emits StoreArrayItem for known index/value shapes."""
+
+        def f(a):
+            a[0] = 3.0
+
+        self._compile_func(f, lambda: f(array("d", [1.0, 2.0])))
+        counts = cinderx.jit.get_function_hir_opcode_counts(f)
+        self.assertGreater(counts.get("StoreArrayItem", 0), 0)
+
+    def test_array_double_store_unknown_shapes_use_generic_hir(self):
+        """Unknown store index/value shapes should not speculate on array.array."""
 
         def f(a, i, v):
             a[i] = v
 
         self._compile_func(f, lambda: f(array("d", [1.0, 2.0]), 0, 3.0))
         counts = cinderx.jit.get_function_hir_opcode_counts(f)
-        self.assertGreater(counts.get("StoreArrayItem", 0), 0)
+        self.assertEqual(counts.get("StoreArrayItem", 0), 0)
+        self.assertGreater(counts.get("StoreSubscr", 0), 0)
+
+        arr = array("d", [1.0, 2.0])
+        f(arr, 1, 4.0)
+        self.assertEqual(arr[1], 4.0)
 
     # -----------------------------------------------------------------------
     # Slow path fallback
@@ -100,7 +115,7 @@ class ArrayDoubleStoreSpecializationTests(unittest.TestCase):
         self.assertEqual(lst, [1, 99, 3])
 
     def test_array_double_store_float_value(self):
-        """Storing a float value to array('d') via fast path."""
+        """Storing a float value to array('d') preserves Python semantics."""
 
         def f(a, i, v):
             a[i] = v

@@ -730,17 +730,24 @@ Register* simplifyLoadMethod(Env& env, const LoadMethod* load_meth) {
       *load_meth->frameState());
 }
 
+bool hasArraySubscrFastPathEvidence(
+    Register* container,
+    Register* sub,
+    Type array_guard) {
+  return container->isA(array_guard) || sub->isA(TLongExact);
+}
+
 // Emit the array.array('d') BINARY_SUBSCR fast path. When the container's
-// static type cannot be proven to exclude array.array, speculatively guard on
-// it being an array.array('d') and lower the load to an inlined
-// LoadArrayItem(TCDouble) + PrimitiveBox; otherwise fall back to a generic
-// BinaryOp<Subscript>. Returns the merged value, or nullptr if the fast path
-// does not apply (caller continues with the normal subscript lowering).
+// static type is already array.array, or the index is already known to be a
+// Python int, speculatively guard on array.array('d') and lower the load to an
+// inlined LoadArrayItem(TCDouble) + PrimitiveBox. Otherwise fall back to a
+// generic BinaryOp<Subscript>. Returns the merged value, or nullptr if the fast
+// path does not apply (caller continues with the normal subscript lowering).
 //
 // This runs in the Simplify pass rather than the HIR builder so that it only
-// fires for containers whose type is unknown at this point (e.g. array.array
-// arguments). Subscripts on statically-typed list/tuple/dict/str containers are
-// already lowered by simplifyBinaryOp and never reach here.
+// fires after earlier type propagation has had a chance to prove either the
+// container or index shape. Subscripts on statically-typed list/tuple/dict/str
+// containers are already lowered by simplifyBinaryOp and never reach here.
 Register* trySimplifyArraySubscr(Env& env, const BinaryOp* instr) {
   if (!getConfig().specialized_opcodes) {
     return nullptr;
@@ -760,6 +767,9 @@ Register* trySimplifyArraySubscr(Env& env, const BinaryOp* instr) {
   // Skip containers whose type already rules out array.array (list, tuple,
   // dict, str, or any other known-exact type).
   if (!container->type().couldBe(array_guard)) {
+    return nullptr;
+  }
+  if (!hasArraySubscrFastPathEvidence(container, sub, array_guard)) {
     return nullptr;
   }
 
