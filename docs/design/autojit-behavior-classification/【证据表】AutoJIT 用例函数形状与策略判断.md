@@ -10,6 +10,8 @@
 
 | 版本 | 日期 | 修订人 | 修订说明 |
 |---|---|---|---|
+| v0.29 | 2026-06-10 | @sisibeloved | 补 `richards` 误伤修复证据：steady-state 低风险状态 predicate/mutator 与窄 protocol dispatch core 不能按 LowRoi 冻结；只放行带状态写入或 raise 分支的 protocol core，避免把 `pickle_pure_python` setup/call-only wrapper 一起放开。最终子集：`richards=109ms`、`pickle_pure_python=800us`、`2to3=577ms`、`nbody=118ms`；相对 state-helper-only，`richards` `1.14x faster`，`pickle/2to3` 不劣化。BehaviorClassifier 42/42、`test_autojit_gate_stats` 8/8 通过。 |
+| v0.28 | 2026-06-10 | @sisibeloved | 补 `generators` 误伤修复证据：`Tree.__iter__` 的 `risk=Exception` 来自 `yield from` generator cleanup，不应按业务异常/动态风险冻结；steady-state 普通 generator 在仅含 `Suspend/Exception` 风险时恢复全局阈值。正式 A/B：破损 AutoJIT `generators=60.2ms`，修复后 `21.7ms`，相对破损 `2.78x faster`，与 `PYTHONJITAUTO=2` 不显著；同口径 `2to3` 改动前 `578ms`、改动后 `579ms`，`pyperf compare_to` 不显著。同步修正 RuntimeTests：BehaviorClassifier 36/36 通过，`test_autojit_gate_stats` 8/8 通过。 |
 | v0.27 | 2026-06-10 | @sisibeloved | 补 LowRoi 冻结正式化结果：去掉 spike 环境变量，将 Trivial LowRoi 与长 LowRoi 解释冻结纳入生产策略；正式子集 `pickle_pure_python=800us`、`2to3=991ms`、`nbody=119ms`，相对 v0.26 分别为 `1.16x faster`、`1.16x faster`、`1.07x slower`（nbody/pickle 本轮样本提示不稳），几何均值 `1.08x faster`。 |
 | v0.26 | 2026-06-10 | @sisibeloved | 补 `pickle_pure_python` 正式化后数据：AutoJIT 改为不安装 CinderX frame evaluator，并在 `jitVectorcall` 解释返回路径计数；正式子集 `pickle_pure_python=925us`，较优化前 `1056.7us` 拿回约 `131.7us`，但仍未达到 CPython JIT 85% 线。 |
 | v0.25 | 2026-06-09 | @sisibeloved | 重写 `pickle_pure_python` 分析：补 CPython JIT / CinderX no-plugin / plugin-no-JIT / `PYTHONJITAUTO=2` / AutoJIT 五口径账本；修正早期未加载 `_cinderx_auto` hook 的无效 CinderX 口径；确认当前劣化主因是 CinderX plugin/frame evaluator 逐帧税，而不是 AutoJIT 分类、import 风暴或 JIT deopt。 |
@@ -60,6 +62,9 @@
 | `NumericLoop` 或 top-2 `Mixed` 含 `Compute` | 默认放行，除非有明确动态成本证据 |
 | 只是 active dims 中出现 `Compute` | 不能当成数值收益保护；若 family 仍是 `ObjectManipulator` / `BranchFSM`，应按主导形状判断 |
 | suspendable 状态机 | 不能一刀切拦死；可提高阈值，热度足够时仍应编译 |
+| steady-state 普通 generator | 若风险只来自 `Suspend/Exception`，应恢复全局阈值；`yield from` cleanup 产生的 `Exception` 不是业务异常 ROI 负证据 |
+| steady-state 状态 predicate/mutator | 低风险、小 code、纯状态读/写/布尔判断应恢复全局阈值；这是 `richards` 的核心收益点之一 |
+| steady-state protocol dispatch core | 只放行小型、低风险、有对象状态访问、控制流和返回值，并且有状态写入或 raise 分支的核心方法；call-only wrapper 继续 LowRoi |
 | 纯 `ObjectManipulator` 大函数 | import window 可延迟；steady-state 中可能是核心热点，不能全局拦 |
 | expected exception 作为正常控制流 | 需要结合 deopt 和 A/B 单独判断；不能只因有 try/except、`risk=Exception` 或 deopt 数高就禁编 |
 | `RiskDefer` | 只说明风险成本高；上线前必须证明省下的静态成本大于丢掉的动态收益 |
@@ -83,6 +88,7 @@
 | `2to3` | setup/main window 扩大穿刺 | `blue-98:/results/autojit-p0-spike-20260608/{p0-main-setup-provider-2to3.json,current-candidate-main-setup-phase-summary.json}` | 正式 `765ms +- 11ms`，phase timer `777.7ms`；forced compile 从 11 增到约 77-79，负收益，已回滚 |
 | `2to3` | P0 固定成本穿刺：C 侧 import wrapper、lazy `cinderjit` | `blue-98:/results/autojit-p0-spike-20260608/{c-import-wrapper-provider-2to3.json,lazy-cinderjit-provider-2to3.json,c-import-wrapper-phase-summary.json,lazy-cinderjit-phase-summary.json}` | C wrapper 正式 `673ms +- 2ms`，lazy `cinderjit` 正式 `675ms +- 2ms`；相比当前候选无稳定收益，已回滚 |
 | `2to3` | refactor 热点 allow/suppress 穿刺 | `blue-98:/results/autojit-p0-spike-20260608/refactor-hotspot-phase/*`；profile: `.../refactor-hotspot-profile/current-candidate.prof` | 当前 off phase `669.3ms`；`allow-parse=876.5ms`、`allow-pattern=885.9ms`、`allow-all=1081.0ms` 明显负收益；`suppress-all=670.5ms` 基本持平，穿刺代码已回滚 |
+| `2to3` | `generators` 修复对 `2to3` 的提交前后 A/B：同一 `cinderx-test` 容器、同一 `/opt/python314`、`CINDERX_PLUGIN_ENABLE=1 PYTHONJITAUTO=auto:2 PYTHONJITHUGEPAGES=0`、`--warmup 3 --affinity=30`，只切换 plain generator steady-state 放行策略 | `blue-98:cinderx-test:/results/autojit-generators-regression-20260610/{2to3-before-generator-policy.json,2to3-after-generator-policy.json}` | 改动前 `578ms +- 1ms`，改动后 `579ms +- 5ms`；`pyperf compare_to` 标记 hidden as not significant。结论：plain generator 放行没有测出 `2to3` 劣化 |
 | `2to3` / startup-site | startup/site 微拆解：`-c pass`、早期 stdlib prelude、`importtime`、`_cinderx_exec_impl()`、`jit::initialize()` | `blue-98:/results/autojit-p0-spike-20260608/startup-site-breakdown/*` | 当前候选下 plugin 固定启动税约 `13.6ms`，早期 stdlib import 额外税约 `10.7ms`；`_cinderx_exec_impl()` 约 `3.3ms`，`jit::initialize()` 约 `1.84ms` |
 | `2to3` / startup-site | import-depth skip 计数早退穿刺 | `blue-98:/results/autojit-p0-spike-20260608/startup-site-breakdown/{import_skip_*.json,import-skip-2to3-*-summary.json,gate-import-skip-*.jsonl,import-skip-2to3-gate.jsonl}` | prelude 从 `57.5ms` 降到 `51.6ms`，但 `2to3` full 退到 `849.7ms`；`jit_vectorcall` 暴涨到 `607856`，穿刺已回滚 |
 | `python_startup` | `PYTHONJITAUTO=auto:2` | `blue-98:/results/autojit-compile-lists-20260605/python_startup.shape.tsv` | 有完整函数形状，共 2 个编译事件 |
@@ -94,6 +100,9 @@
 | `dask` | debug shape/gate/deopt：`--fast -n 3 -w 1`，`PYTHONJITLOGFILE` + `CINDERX_AUTOJIT_GATE_STATS_FILE` + `CINDERX_AUTOJIT_COMPILE_EVENTS_FILE` | `blue-98:cinderx-test:/results/autojit-dask-ledger-20260609/{dask-gate-stats.jsonl,dask-compile-events.jsonl,worker-gate-shapes/*.jit.log,dask-debug-fast.json}` | 4 个 worker 合计约 `962700` 次 gate、`3408` 次 forced compile、`161135` 次 defer freeze；编译事件 `3485` 条中 `3440` 条在 steady 阶段；deopt 合计 `1020754` 次，主要是 `GuardFailure` 和 expected exception |
 | `coverage` | direct worker，`PYTHONJITAUTO=auto:2`，`CINDERX_AUTOJIT_IMPORT_PROVIDER=find_and_load` | `blue-98:/results/autojit-import-highcost-bucket1-20260605/worker-gate-shapes/coverage.*.jit.log` | 有真实 C++ gate 形状；debug 口径，不作为性能数值 |
 | `generators` | direct worker，同上 | `blue-98:/results/autojit-import-highcost-bucket1-20260605/worker-gate-shapes/generators.*.jit.log` | 有真实 C++ gate 形状；debug 口径 |
+| `generators` | 误伤复现与修复 A/B：`PYTHONJITAUTO=auto:2`，默认 provider；对照 `PYTHONJITAUTO=2`、破损 AutoJIT、修复后 AutoJIT；附 compile-events 验证 `Tree.__iter__` 是否进入 JIT | `blue-98:cinderx-test:/results/autojit-generators-regression-20260610/{generators-cinderx-auto2.json,generators-cinderx-autojit.json,generators-cinderx-autojit-fixed.json,generators-autojit-compile-events.jsonl,generators-autojit-fixed-compile-events.jsonl}` | `PYTHONJITAUTO=2` `21.7ms +- 6.2ms`；破损 AutoJIT `60.2ms +- 0.3ms`；修复后 `21.7ms +- 5.8ms`。修复后相对破损 `2.78x faster`，与 `auto=2` 不显著；compile-events 确认修复后 `Tree.__iter__ limit=2 reason=None` |
+| `richards` / `pickle_pure_python` / `2to3` / `nbody` | protocol dispatch core 收窄后的正式子集：`PYTHONJITAUTO=auto:2`，默认 import/setup provider，`PYTHONJITHUGEPAGES=0`，`--warmup 3 --affinity=30` | `blue-98:cinderx-test:/results/autojit-protocol-core-20260610/protocol-core-store-or-raise-richards-pickle-2to3-nbody.json` | 最终结果：`richards=109ms +- 7ms`、`pickle_pure_python=800us +- 3us`、`2to3=577ms +- 1ms`、`nbody=118ms +- 14ms`。相对 state-helper-only：`richards` `1.14x faster`，`pickle/2to3` 不显著劣化；`nbody` 样本不稳 |
+| `richards` | protocol dispatch core 编译事件复核 | `blue-98:cinderx-test:/results/autojit-protocol-core-20260610/{richards-store-or-raise-compile-events.jsonl,richards-store-or-raise-events-run.json}` | 最终策略新增编译 7 个 benchmark 主体函数：`DeviceTask.fn`、`HandlerTask.fn`、`IdleTask.fn`、`Task.addPacket`、`Task.findtcb`、`TaskState.isTaskHoldingOrWaiting`、`TaskState.isWaitingWithPacket`；单用例 event run `104ms +- 1ms` |
 | `unpack_sequence` | direct worker，同上 | `blue-98:/results/autojit-import-highcost-bucket1-20260605/worker-gate-shapes/unpack_sequence.*.jit.log` | 有真实 C++ gate 形状；debug 口径 |
 | `sqlalchemy_declarative` | direct worker，`--fast --values=3 --warmups=1`，`PYTHONJITAUTO=auto:2`，`CINDERX_AUTOJIT_IMPORT_PROVIDER=find_and_load` | `blue-98:/results/autojit-sql-shapes-20260605/worker-gate-shapes/sqlalchemy_declarative.*.jit.log` | 有真实 C++ gate 形状；debug 口径，不作为性能数值 |
 | `sqlalchemy_imperative` | direct worker，同上 | `blue-98:/results/autojit-sql-shapes-20260605/worker-gate-shapes/sqlalchemy_imperative.*.jit.log` | 有真实 C++ gate 形状；debug 口径 |
@@ -148,7 +157,7 @@
 
 ### 6.1 总表：差距账本
 
-`2to3` 的对标目标是：开启 CinderX JIT 后，性能恢复到 CPython 3.14.3 JIT 的 85% 以上。CPython JIT phase 基线是 `549.7ms`，85% 目标线约 `646.7ms`；当前候选是 `673.3ms`，还差约 `26.6ms`。
+`2to3` 的对标目标是：开启 CinderX JIT 后，性能恢复到 CPython 3.14.3 JIT 的 85% 以上。CPython JIT phase 基线是 `549.7ms`，85% 目标线约 `646.7ms`。本节 phase 账本对应 v0.17 cold-bit 候选：`673.3ms`，当时还差约 `26.6ms`。最新 v0.28 pyperformance 口径已降到约 `578-579ms`，但本轮没有重打 phase timer，因此这里只保留旧 phase 分解，并在 §5 记录最新提交前后 A/B。
 
 下表统一使用 phase timer 中位数，单位为 `ms`。`force interpret-only` 是“达到分类点后不编译并恢复解释执行”的穿刺下限，用来估算当前候选还剩多少 AutoJIT/gate 成本可挖，不代表承诺收益。
 
@@ -421,16 +430,28 @@ bc347c29（lazy bootstrap + 跳过已有函数扫描）已优化掉 93%（212.6�
 
 ### 9.1 总体判断
 
-`generators` 是 JIT 用例误伤检查样本。它的核心收益来自递归构造和 generator 遍历，尤其 `Tree.__iter__`。证据显示 `Tree.__iter__` 被分类为 suspendable `BranchFSM`，当前策略把阈值提高到 1000，但不会拦死；热度足够后仍编译。这个结论很重要：**suspendable 可以延迟，但不能一刀切禁止。**
+`generators` 是 JIT 用例误伤检查样本。它的核心收益来自递归构造和 generator 遍历，尤其 `Tree.__iter__`。最新回归证明：`Tree.__iter__` 的 `yield from` 会生成 `CLEANUP_THROW/RERAISE`，分类器看到 `risk=Exception`，但这是 generator 协议清理路径，不是业务异常、动态派发或 deopt 负 ROI 证据。把普通 generator 按 `RiskDefer/interpret-only` 冻结会直接把 `generators` 从约 `21.7ms` 打到 `60.2ms`。
+
+当前策略边界：steady-state 普通 generator 只要风险位没有超出 `Suspend|Exception`，恢复全局阈值；startup window、static code、coroutine/async 状态机、`Dynamic/HugeCode` 等其它风险仍按原策略延迟。这个结论很重要：**suspendable 可以延迟，但不能把普通 generator 的 cleanup exception 当成禁编证据。**
 
 ### 9.2 函数形状表
 
 | 函数 | 编译次数 | 编译耗时 | 形状 | 策略 | 判断 |
 |---|---:|---:|---|---|---|
-| `__main__:Tree.__iter__` | 7 | 35.4ms | `BranchFSM`, dims=`Control+Object`, `loop=3`, `codeB=0`, `risk=Exception`, `suspend=true`, `startup=false`, `compute=false` | `1000/LowRoi` | 延迟但允许热后编译；不能拦死 |
+| `__main__:Tree.__iter__` | 7 | 35.4ms | `BranchFSM`, dims=`Control+Object`, `loop=3`, `codeB=0`, `risk=Exception`, `suspend=true`, `startup=false`, `compute=false` | `2/None`（plain generator steady-state override） | 必须放行；`risk=Exception` 来自 `yield from` cleanup，破损策略冻结它会导致 `generators` 2.78x slower |
 | `__main__:bench_generators` | 7 | 27.7ms | `CallDispatcher`, dims=`Control+Dispatch+Dynamic`, `loop=2`, `codeB=1`, `risk=None`, `startup=false` | `2/None` | 放行；驱动循环有热度 |
 | `__main__:tree` | 7 | 21.6ms | `NumericLoop`, dims=`Compute+Control+Dispatch+Dynamic`, `loop=0`, `codeB=0`, `risk=None`, `compute=true`, `startup=false` | `2/None` | 放行；compute 提示明确 |
 | `__main__:Tree.__init__` | 7 | 4.8ms | `ObjectManipulator`, dims=`Object`, `loop=0`, `codeB=0`, `risk=None`, `startup=false` | `2/None` | 小对象构造，放行 |
+
+### 9.3 2026-06-10 误伤修复证据
+
+| 口径 | `Tree.__iter__` 是否编译 | `generators` 结果 | 读法 |
+|---|---|---:|---|
+| `PYTHONJITAUTO=2` | 是，after one probe `True` | `21.7ms +- 6.2ms` | CinderX JIT 原始低阈值会编译核心 generator 热点 |
+| 破损 AutoJIT | 否，after one probe `False`，count 停在 2 | `60.2ms +- 0.3ms` | `Tree.__iter__` 被解释冻结，核心收益丢失 |
+| 修复后 AutoJIT | 是，compile-events 显示 `limit=2 reason=None` | `21.7ms +- 5.8ms` | 恢复到 `auto=2` 水平；相对破损 `2.78x faster`，相对 `auto=2` 不显著 |
+
+同轮用 `2to3` 做误伤检查：同一容器、同一 `/opt/python314`、同一 `CINDERX_PLUGIN_ENABLE=1 PYTHONJITAUTO=auto:2 PYTHONJITHUGEPAGES=0 --warmup 3 --affinity=30`，只切换 generator override。改动前 `578ms +- 1ms`，改动后 `579ms +- 5ms`，`pyperf compare_to` 不显著。结论：plain generator steady-state 放行修复了 `generators` 误伤，未测出 `2to3` 回归。
 
 ## 10 用例：unpack_sequence
 
@@ -807,6 +828,17 @@ debug 口径：临时 autohook 只 `import _cinderx_auto`，`bm_pickle --pure-py
 | `pickle.py` 主体编译只有 52 条，且多为小对象操作或 LowRoi helper | 继续调 `BranchFSM/codeB` 静态分类不是主杠杆 |
 | no-plugin 已快于 CPython JIT | CinderX 解释器基底不是问题；问题发生在装上 plugin 后 |
 
+### 15.7 protocol-core 误伤边界
+
+本轮为修复 `richards` 引入了 steady-state protocol dispatch core 放行条件。中间版本只看“低风险 + 对象/控制/调用”会把 `pickle_pure_python` 的 setup/call-only wrapper 一起放开，导致 `pickle_pure_python` 从 `802us` 退到 `883us-903us`。最终生产条件要求 protocol core 同时满足：
+
+- 小型 steady 低风险实例方法，`code_size_bucket <= 1`，`loop_score = 0`。
+- `LOAD_GLOBAL*` 不超过 4 个，调用分发不超过 8 个。
+- 有对象状态访问、控制流和返回值。
+- 必须有 `STORE_ATTR*` 状态写入，或最多一个 `RAISE_VARARGS` 异常分支。
+
+这条“状态写入或 raise 分支”是关键边界：`richards` 的任务调度核心会改写任务状态或用 assert/raise 表达协议约束；`pickle_pure_python` 里被误放行的多是 call-only wrapper、环境探测和 harness/setup 函数，没有状态更新。最终正式子集里 `pickle_pure_python=800us +- 3us`，与 LowRoi 冻结后的最好结果持平。
+
 ## 16 用例：deepcopy 系列
 
 ### 16.1 总体判断
@@ -981,14 +1013,65 @@ top deopt site：
 
 策略结论：`dask` 应作为 **steady async/framework 动态负 ROI 样本** 进入证据集。当前 AutoJIT v1 不根据 dask 扩大 startup/import 规则；若后续要优化 dask，应该单独做 deopt-aware A/B，例如先针对 `distributed.worker_state_machine` / `distributed.scheduler.TaskCollection` / `zict.__delitem__` / `cloudpickle` 热点验证“禁编或优化 JIT deopt”哪条更有效。
 
-## 18 当前策略判断汇总
+## 18 用例：richards
+
+### 18.1 总体判断
+
+`richards` 是典型 JIT 用例：主体是任务调度器，反复读写 `Task`、`TaskState` 和各类 `TaskRec` 对象状态。它不像 `2to3` 那样慢在 startup/import 编译风暴，也不像 `pickle_pure_python` 那样主要慢在 plugin/frame evaluator 逐帧税；它的问题是 AutoJIT 分类把一批小而热的状态机方法按 `LowRoi` 冻结，导致 CinderX JIT 原本应该拿到的对象状态机收益丢失。
+
+本轮策略只补两个窄口：
+
+- 状态 predicate/mutator：纯状态读、纯状态写、组合布尔状态判断，在 steady-state 低风险小 code 下恢复全局阈值。
+- protocol dispatch core：小型 steady 低风险实例方法，有对象状态访问、控制流、返回值，并且有状态写入或 raise 分支；call-only wrapper 仍然延迟或冻结。
+
+最终结果不是“放开所有对象/控制函数”，而是只把 `richards` 任务调度核心放回 JIT，同时避免误伤 `pickle_pure_python` 的 setup/call-only wrapper。
+
+### 18.2 总表：收益与误伤边界
+
+口径：`blue-98:cinderx-test`，`CINDERX_PLUGIN_ENABLE=1 PYTHONJITAUTO=auto:2 PYTHONJITHUGEPAGES=0`，默认 import/setup provider，`--warmup 3 --affinity=30`。
+
+| 口径 | `richards` | `pickle_pure_python` | `2to3` | `nbody` | 结论 |
+|---|---:|---:|---:|---:|---|
+| state-helper-only | `124ms` | `802us` | `578ms` | `119ms` | 只修复 trivial/composite state helper，`richards` 主调度函数仍缺失 |
+| protocol core 早期版 | `108ms` | `883us` | `577ms` | `111ms` | `richards` 已恢复，但误放 `pickle` call-only/setup wrapper |
+| global-cap 早期版 | `111ms` | `903us` | `578ms` | `115ms` | 限制 `LOAD_GLOBAL* <= 4` 仍不足以保护 `pickle` |
+| 最终 store-or-raise | `109ms +- 7ms` | `800us +- 3us` | `577ms +- 1ms` | `118ms +- 14ms` | 保留 `richards` 收益，`pickle/2to3` 不劣化；`nbody` 样本不稳 |
+
+相对 state-helper-only，最终策略让 `richards` `1.14x faster`。`pickle_pure_python` 与 `2to3` 没有测出负收益，说明新增放行条件已经收窄到“状态机核心”，没有回到全局放行 `BranchFSM/ObjectManipulator`。
+
+### 18.3 函数形状表
+
+最终策略相对 state-helper-only 新增编译 7 个 benchmark 主体函数：
+
+| 函数 | 形状 | 放行原因 | 判断 |
+|---|---|---|---|
+| `TaskState.isTaskHoldingOrWaiting` | `BranchFSM`, `loop=0`, `codeB=0`, `risk=0`, dims=`Control+Object` | composite state predicate：多状态位组合布尔判断 | 应恢复 `2/None`；这是任务调度状态查询 |
+| `TaskState.isWaitingWithPacket` | `BranchFSM`, `loop=0`, `codeB=0`, `risk=0`, dims=`Control+Object` | composite state predicate：多状态位组合布尔判断 | 应恢复 `2/None` |
+| `Task.addPacket` | `Mixed`, `loop=0`, `codeB=0`, `risk=0`, dims=`Control+Object+Dispatch` | protocol core：读写队列/状态并返回下一个 task | 应恢复 `2/None` |
+| `Task.findtcb` | `BranchFSM`, `loop=0`, `codeB=0`, `risk=0`, dims=`Control+Dispatch+Dynamic` | protocol core：查表失败走 raise 分支，属于协议约束 | 应恢复 `2/None`，但 `LOAD_GLOBAL*` 必须有上限 |
+| `DeviceTask.fn` | `BranchFSM`, `loop=0`, `codeB=0`, `risk=0`, dims=`Control+Object+Dispatch+Dynamic` | protocol core：按 packet/state 分派并写 `pending` | 应恢复 `2/None` |
+| `HandlerTask.fn` | `BranchFSM`, `loop=0`, `codeB=1`, `risk=0`, dims=`Control+Object+Dispatch` | protocol core：消费 work/device 队列，更新内部状态 | 应恢复 `2/None` |
+| `IdleTask.fn` | `ObjectManipulator`, `loop=0`, `codeB=1`, `risk=0`, dims=`Control+Object+Dispatch` | protocol core：更新计数和控制位，调度下一个 task | 应恢复 `2/None` |
+
+### 18.4 负面边界
+
+| 边界 | 原因 |
+|---|---|
+| 不放行 `__init__` | 构造函数容易出现在 setup/import 阶段，且对 steady 调度循环收益不直接 |
+| 不放行 call-only wrapper | `pickle_pure_python` 证明只看对象/控制/调用会误放 setup 和 harness wrapper |
+| `LOAD_GLOBAL*` 必须有限制 | `Task.findtcb` 需要少量全局异常/表访问，但全局探测过多更像环境/setup 逻辑 |
+| 必须有状态写入或 raise 分支 | 区分真正的状态机 protocol core 与普通包装/转发函数 |
+
+## 19 当前策略判断汇总
 
 | 规则 | 支撑用例 | 结论 |
 |---|---|---|
 | `highcost > 0` 包含 `>= 2` | `2to3` | 成立。直接 JIT debug 口径显示 `>0` 相比 `>=2` 进一步减少编译数和编译耗时；pyperformance 墙钟噪声不能用来否定集合包含关系 |
 | import window 内高成本非数值形状应延迟 | `2to3`、`coverage` startup=true 样本 | 成立。目标是削减 startup/import compile storm |
 | steady-state highcost 不能全局延迟 | `unpack_sequence` | 成立。`do_unpacking` 是 `ObjectManipulator + codeB=3 + risk=HugeCode`，但必须放行 |
-| suspendable 不能一刀切禁止 | `generators` | 成立。`Tree.__iter__` 延迟到 1000 后仍可热后编译 |
+| suspendable 不能一刀切禁止 | `generators` | 成立。`Tree.__iter__` 是 steady-state 普通 generator；`yield from` cleanup 带来的 `Exception` 风险不能触发解释冻结，修复后恢复 `2/None` |
+| steady 低风险状态 predicate/mutator 不能按 LowRoi 冻结 | `richards` | 成立。`TaskState` 状态查询/状态写入是任务调度核心，小 code 低风险时应恢复全局阈值 |
+| protocol dispatch core 需要窄放行 | `richards`、`pickle_pure_python` | 成立。`richards` 需要放行有状态写入或 raise 分支的任务调度核心；`pickle_pure_python` 证明 call-only/setup wrapper 不能一起放开 |
 | `compute=true` 默认放行 | `coverage:fibonacci`、`generators:tree` | 成立。数值/compute 提示是收益信号 |
 | coverage 回归不能直接驱动 import-window 策略收窄 | `coverage` | 成立。其高成本函数多在 steady worker，属于单独 ROI 问题 |
 | 框架型 steady highcost 需要单独 ROI 判断 | `sqlalchemy_declarative`、`sqlalchemy_imperative` | 成立。ORM/engine 热路径里存在 `BranchFSM`、`ObjectManipulator`、`ReflectionMeta` 大函数；`sqlalchemy_declarative` 复跑确认 plugin-no-JIT 已达标，而 CinderX JIT/AutoJIT 都是负 ROI |
@@ -1006,7 +1089,7 @@ top deopt site：
 | `RiskDefer` 对低热大函数有效，但不能替代收益判断 | `pickle_pure_python`、`deepcopy` | 成立。部分入口/通用函数未编译是保护，但如果主差距在逐帧税或特定 deopt 上，继续调 `RiskDefer` 不会解决问题 |
 | steady async/framework 动态负 ROI 不能靠 startup/import 泛化解决 | `dask`、`sqlalchemy_declarative` | 成立。`dask` 的主因是 `distributed`/`asyncio`/`cloudpickle`/`zict` deopt；`sqlalchemy_declarative` 的主因是 ORM steady guard failure 加 delayed compile 长尾 |
 
-## 19 待补清单
+## 20 待补清单
 
 | 优先级 | 项 | 目的 |
 |---|---|---|
@@ -1018,7 +1101,7 @@ top deopt site：
 | P1 | 给 `sqlglot_v2` 四个子用例分别补非 debug A/B | 区分 parse/transpile/optimize 的真实收益和误伤边界 |
 | P1 | 给 `logging` 三个子用例分别补非 debug A/B | 区分 silent 微路径、simple 输出路径、format 格式化路径是否需要差异化阈值 |
 | P1 | 给 `sympy` 四个子用例分别补非 debug A/B | 判断符号计算 highcost 函数的动态收益是否覆盖编译成本 |
-| P1 | 对 `pickle_pure_python` 做 plugin/frame evaluator 逐帧税穿刺 | 验证计数早退、frame evaluator 轻量化或 interpreted fast path 能否拿回约 `415us` 主差距 |
+| P1 | 拆 `pickle_pure_python` 正式 AutoJIT 残留成本 | auto 模式已不装 frame evaluator 且 LowRoi 冻结后达到 85% 线；后续只需继续拆 gate/compiled-entry/startup hook 的约 `156us` 残留上界 |
 | P1 | 将 `deepcopy/deepcopy_reduce/deepcopy_memo` 三个子场景补完整函数形状表 | deopt 和正式 A/B 已拆分；后续还需要按子场景列完整编译函数，确认 `_deepcopy_tuple` 收窄规则是否有其它同形状候选 |
 | P1 | 给 `dulwich_log`、`bench_mp_pool` 补同格式表 | 扩大非 JIT 用例样本，避免只围绕 `2to3`/`dask` 调参 |
 | P2 | 给 `scimark_fft/scimark_lu/scimark_sor/scimark_monte_carlo` 补同格式表 | 验证 JIT 用例误伤边界 |

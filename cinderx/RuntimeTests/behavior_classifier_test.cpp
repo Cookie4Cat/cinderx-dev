@@ -559,6 +559,44 @@ assert jit.is_jit_compiled(Grid.__getitem__), jit.count_interpreted_calls(Grid._
 
 TEST_F(
     BehaviorClassifierRuntimeTest,
+    AutoClassifyCompilesSteadyStateTrivialStateHelpers) {
+  ScopedAutoJitConfig config_guard;
+  getMutableConfig().compile_after_n_calls = 2;
+  getMutableConfig().auto_classify = true;
+  getMutableConfig().enable_startup_init_policy = false;
+
+  runStockCode(R"(
+import cinderjit
+import cinderx.jit as jit
+
+cinderjit._clear_autojit_gate_stats()
+
+class TaskState:
+    def __init__(self):
+        self.packetPending = False
+        self.taskWaiting = False
+
+    def isPacketPending(self):
+        return self.packetPending
+
+    def waitTask(self):
+        self.taskWaiting = True
+        return self
+
+state = TaskState()
+for _ in range(16):
+    TaskState.isPacketPending(state)
+    TaskState.waitTask(state)
+
+stats = cinderjit._autojit_gate_stats()
+assert jit.is_jit_compiled(TaskState.isPacketPending), stats
+assert jit.is_jit_compiled(TaskState.waitTask), stats
+assert stats["forced_compile"] >= 2, stats
+)");
+}
+
+TEST_F(
+    BehaviorClassifierRuntimeTest,
     AutoClassifyCompilesLowRiskSparseBranchLoops) {
   ScopedAutoJitConfig config_guard;
   getMutableConfig().compile_after_n_calls = 2;
@@ -615,6 +653,213 @@ def thin(x):
   EXPECT_EQ(key->mixed_shape, kMixedShapeNone);
   EXPECT_EQ(key->loop_score, 0);
   EXPECT_FALSE(key->highRisk());
+}
+
+TEST_F(
+    BehaviorClassifierRuntimeTest,
+    AllowsSteadyStateTrivialStatePredicatesAndMutators) {
+  Ref<> predicate = compileStockAndGet(
+      R"(
+class TaskState:
+    def isPacketPending(self):
+        return self.packetPending
+
+target = TaskState.isPacketPending
+)",
+      "target");
+  Ref<> mutator = compileStockAndGet(
+      R"(
+class TaskState:
+    def waitTask(self):
+        self.taskWaiting = True
+        return self
+
+target = TaskState.waitTask
+)",
+      "target");
+
+  GateContext steady_state{false};
+  for (auto code : {codeFromFunc(predicate), codeFromFunc(mutator)}) {
+    auto key = deriveStructureKey(code);
+    ASSERT_TRUE(key.has_value());
+    EXPECT_EQ(key->family, Family::Trivial);
+    EXPECT_EQ(key->loop_score, 0);
+    EXPECT_FALSE(key->highRisk());
+
+    auto decision = computeThresholdForCode(code, *key, steady_state, 2);
+    EXPECT_EQ(decision.limit, 2);
+    EXPECT_EQ(decision.branch_reason, BranchReason::None);
+  }
+}
+
+TEST_F(
+    BehaviorClassifierRuntimeTest,
+    AllowsSteadyStateCompositeStatePredicates) {
+  Ref<> holding_or_waiting = compileStockAndGet(
+      R"(
+class TaskState:
+    def isTaskHoldingOrWaiting(self):
+        return self.task_holding or (
+            not self.packet_pending and self.task_waiting
+        )
+
+target = TaskState.isTaskHoldingOrWaiting
+)",
+      "target");
+  Ref<> waiting_with_packet = compileStockAndGet(
+      R"(
+class TaskState:
+    def isWaitingWithPacket(self):
+        return (
+            self.packet_pending
+            and self.task_waiting
+            and not self.task_holding
+        )
+
+target = TaskState.isWaitingWithPacket
+)",
+      "target");
+
+  GateContext steady_state{false};
+  for (auto code :
+       {codeFromFunc(holding_or_waiting), codeFromFunc(waiting_with_packet)}) {
+    auto key = deriveStructureKey(code);
+    ASSERT_TRUE(key.has_value());
+    EXPECT_EQ(key->family, Family::BranchFSM);
+    EXPECT_EQ(key->loop_score, 0);
+    EXPECT_FALSE(key->highRisk());
+
+    auto decision = computeThresholdForCode(code, *key, steady_state, 2);
+    EXPECT_EQ(decision.limit, 2);
+    EXPECT_EQ(decision.branch_reason, BranchReason::None);
+  }
+}
+
+TEST_F(
+    BehaviorClassifierRuntimeTest,
+    AllowsSteadyStateProtocolDispatchCores) {
+  Ref<> add_packet = compileStockAndGet(
+      R"(
+class Task:
+    def addPacket(self, p, old):
+        if self.input is None:
+            self.input = p
+            self.packet_pending = True
+            if self.priority > old.priority:
+                return self
+        else:
+            p.append_to(self.input)
+        return old
+
+target = Task.addPacket
+)",
+      "target");
+  Ref<> device_fn = compileStockAndGet(
+      R"(
+tracing = False
+
+class DeviceTaskRec:
+    pass
+
+class Task:
+    def fn(self, pkt, r):
+        d = r
+        assert isinstance(d, DeviceTaskRec)
+        if pkt is None:
+            pkt = d.pending
+            if pkt is None:
+                return self.waitTask()
+            d.pending = None
+            return self.qpkt(pkt)
+        d.pending = pkt
+        if tracing:
+            trace(pkt.datum)
+        return self.hold()
+
+target = Task.fn
+)",
+      "target");
+
+  GateContext steady_state{false};
+  for (auto code : {codeFromFunc(add_packet), codeFromFunc(device_fn)}) {
+    auto key = deriveStructureKey(code);
+    ASSERT_TRUE(key.has_value());
+    EXPECT_EQ(key->loop_score, 0);
+    EXPECT_FALSE(key->highRisk());
+
+    auto decision = computeThresholdForCode(code, *key, steady_state, 2);
+    EXPECT_EQ(decision.limit, 2);
+    EXPECT_EQ(decision.branch_reason, BranchReason::None);
+  }
+}
+
+TEST_F(
+    BehaviorClassifierRuntimeTest,
+    DefersGlobalHeavyProtocolLikeWork) {
+  Ref<> global_heavy = compileStockAndGet(
+      R"(
+G1 = True
+G2 = False
+G3 = False
+G4 = False
+G5 = False
+
+class Helper:
+    def globalHeavy(self, value):
+        if G1 and self.enabled:
+            return value
+        if G2:
+            return value
+        if G3:
+            return value
+        if G4:
+            return value
+        if G5:
+            return value
+        return None
+
+target = Helper.globalHeavy
+)",
+      "target");
+
+  auto key = deriveStructureKey(codeFromFunc(global_heavy));
+  ASSERT_TRUE(key.has_value());
+  EXPECT_EQ(key->loop_score, 0);
+  EXPECT_FALSE(key->highRisk());
+
+  auto decision =
+      computeThresholdForCode(codeFromFunc(global_heavy), *key, {}, 2);
+  EXPECT_NE(decision.branch_reason, BranchReason::None);
+}
+
+TEST_F(
+    BehaviorClassifierRuntimeTest,
+    DefersCallOnlyProtocolLikeWrappers) {
+  Ref<> call_only = compileStockAndGet(
+      R"(
+class Wrapper:
+    def default(self):
+        return None
+
+    def convert(self, value):
+        return value
+
+    def callOnly(self, value):
+        if value is None:
+            return self.default()
+        return self.convert(value)
+
+target = Wrapper.callOnly
+)",
+      "target");
+
+  auto key = deriveStructureKey(codeFromFunc(call_only));
+  ASSERT_TRUE(key.has_value());
+  EXPECT_EQ(key->loop_score, 0);
+  EXPECT_FALSE(key->highRisk());
+
+  auto decision = computeThresholdForCode(codeFromFunc(call_only), *key, {}, 2);
+  EXPECT_NE(decision.branch_reason, BranchReason::None);
 }
 
 TEST_F(
@@ -709,7 +954,7 @@ def thin(x):
   EXPECT_EQ(second->pack(), first->pack());
 }
 
-TEST_F(BehaviorClassifierRuntimeTest, AutoClassifyDefersThinFunctions) {
+TEST_F(BehaviorClassifierRuntimeTest, AutoClassifyFreezesThinFunctions) {
   ScopedAutoJitConfig config_guard;
   getMutableConfig().compile_after_n_calls = 2;
   getMutableConfig().auto_classify = true;
@@ -730,11 +975,13 @@ thin(3)
 thin(4)
 assert not jit.is_jit_compiled(thin)
 
+frozen_calls = jit.count_interpreted_calls(thin)
 for value in range(5, 33):
     thin(value)
-    assert jit.is_jit_compiled(thin)
+    assert not jit.is_jit_compiled(thin)
 
-assert jit.is_jit_compiled(thin)
+assert jit.count_interpreted_calls(thin) == frozen_calls
+assert not jit.is_jit_compiled(thin)
 )");
 }
 
@@ -874,6 +1121,44 @@ target = ns["BaseEventLoop"].call_soon
   EXPECT_EQ(decision.branch_reason, BranchReason::None);
 }
 
+TEST_F(
+    BehaviorClassifierRuntimeTest,
+    SteadyStateAllowsPlainGeneratorSuspendRisk) {
+  Ref<> gen = compileStockAndGet(
+      R"(
+def gen():
+    yield 1
+)",
+      "gen");
+  Ref<> coro = compileStockAndGet(
+      R"(
+async def coro():
+    return 1
+)",
+      "coro");
+
+  StructureKey suspendable{Family::AsyncStateMachine};
+  suspendable.is_suspendable = true;
+  suspendable.risk_reason = kRiskSuspend | kRiskException;
+
+  GateContext steady_state{false};
+  auto gen_decision =
+      computeThresholdForCode(codeFromFunc(gen), suspendable, steady_state, 2);
+  EXPECT_EQ(gen_decision.limit, 2);
+  EXPECT_EQ(gen_decision.branch_reason, BranchReason::None);
+
+  auto coro_decision =
+      computeThresholdForCode(codeFromFunc(coro), suspendable, steady_state, 2);
+  EXPECT_GE(coro_decision.limit, 65536);
+  EXPECT_EQ(coro_decision.branch_reason, BranchReason::RiskDefer);
+
+  GateContext startup{true};
+  auto startup_decision =
+      computeThresholdForCode(codeFromFunc(gen), suspendable, startup, 2);
+  EXPECT_GE(startup_decision.limit, 65536);
+  EXPECT_EQ(startup_decision.branch_reason, BranchReason::RiskDefer);
+}
+
 TEST_F(BehaviorClassifierRuntimeTest, AutoClassifyAllowsGeneratorsInSteadyState) {
   ScopedAutoJitConfig config_guard;
   getMutableConfig().compile_after_n_calls = 2;
@@ -889,9 +1174,7 @@ def gen():
 assert not jit.is_jit_compiled(gen)
 gen()
 gen()
-assert not jit.is_jit_compiled(gen)
-for _ in range(1100):
-    gen()
+gen()
 assert jit.is_jit_compiled(gen)
 )");
 }
@@ -1067,44 +1350,52 @@ TEST_F(BehaviorClassifierRuntimeTest, DefaultImportProviderTracksFindAndLoadDept
 import os
 import sys
 os.environ.pop("CINDERX_AUTOJIT_IMPORT_PROVIDER", None)
-import cinderx
-import _cinderx
-bootstrap = sys.modules["importlib._bootstrap"]
-
-observed_depths = []
-
-class ProbeFinder:
-    def find_spec(self, fullname, path=None, target=None):
-        if fullname == "autojit_probe_missing_default":
-            observed_depths.append((
-                _cinderx._autojit_import_depth(),
-                _cinderx._autojit_import_scope_depth(),
-                _cinderx._autojit_setup_depth(),
-            ))
-        return None
-
-finder = ProbeFinder()
-sys.meta_path.insert(0, finder)
+old_jit_auto = os.environ.get("PYTHONJITAUTO")
+os.environ["PYTHONJITAUTO"] = "auto:2"
 try:
-    try:
-        __import__("autojit_probe_missing_default")
-    except ModuleNotFoundError:
-        pass
-finally:
-    sys.meta_path.remove(finder)
+    import cinderx
+    import _cinderx
+    bootstrap = sys.modules["importlib._bootstrap"]
 
-assert getattr(
-    bootstrap._find_and_load,
-    "_cinderx_autojit_import_provider",
-    None,
-) == "find_and_load"
-assert observed_depths, observed_depths
-assert all(depth[0] > 0 for depth in observed_depths), observed_depths
-assert all(depth[1] > 0 for depth in observed_depths), observed_depths
-assert all(depth[2] == 0 for depth in observed_depths), observed_depths
-assert _cinderx._autojit_import_depth() == 0
-assert _cinderx._autojit_import_scope_depth() == 0
-assert _cinderx._autojit_setup_depth() == 0
+    observed_depths = []
+
+    class ProbeFinder:
+        def find_spec(self, fullname, path=None, target=None):
+            if fullname == "autojit_probe_missing_default":
+                observed_depths.append((
+                    _cinderx._autojit_import_depth(),
+                    _cinderx._autojit_import_scope_depth(),
+                    _cinderx._autojit_setup_depth(),
+                ))
+            return None
+
+    finder = ProbeFinder()
+    sys.meta_path.insert(0, finder)
+    try:
+        try:
+            __import__("autojit_probe_missing_default")
+        except ModuleNotFoundError:
+            pass
+    finally:
+        sys.meta_path.remove(finder)
+
+    assert getattr(
+        bootstrap._find_and_load,
+        "_cinderx_autojit_import_provider",
+        None,
+    ) == "find_and_load"
+    assert observed_depths, observed_depths
+    assert all(depth[0] > 0 for depth in observed_depths), observed_depths
+    assert all(depth[1] > 0 for depth in observed_depths), observed_depths
+    assert all(depth[2] == 0 for depth in observed_depths), observed_depths
+    assert _cinderx._autojit_import_depth() == 0
+    assert _cinderx._autojit_import_scope_depth() == 0
+    assert _cinderx._autojit_setup_depth() == 0
+finally:
+    if old_jit_auto is None:
+        os.environ.pop("PYTHONJITAUTO", None)
+    else:
+        os.environ["PYTHONJITAUTO"] = old_jit_auto
 )");
 }
 

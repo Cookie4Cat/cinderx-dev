@@ -36,6 +36,8 @@ constexpr uint32_t kRiskEffectiveInstructionFloor = 200;
 constexpr uint32_t kLowRoiThresholdFactor = 2;
 constexpr uint32_t kStartupDeferThresholdFactor = 1u << 20;
 constexpr uint32_t kSteadyNonnumericWarmupThreshold = 1000;
+constexpr uint32_t kProtocolDispatchMaxDynamicLoads = 4;
+constexpr uint32_t kProtocolDispatchMaxCalls = 8;
 constexpr uint8_t kWorkDimCount = static_cast<uint8_t>(WorkDim::kCount);
 
 struct Signature {
@@ -448,6 +450,309 @@ bool isStdlibAsyncioEventLoopFrameworkHelper(
     return false;
   }
   return isStdlibAsyncioEventLoopFrameworkFilename(filename);
+}
+
+bool shouldAllowSteadyStatePlainGenerator(
+    BorrowedRef<PyCodeObject> code,
+    const StructureKey& key,
+    const GateContext& context) {
+  if (context.startup_phase || key.is_static) {
+    return false;
+  }
+  if ((code->co_flags & CO_GENERATOR) == 0) {
+    return false;
+  }
+  return (key.risk_reason & ~(kRiskSuspend | kRiskException)) == 0;
+}
+
+bool isLoadAttrOpcode(int opcode) {
+  switch (opcode) {
+    case LOAD_ATTR:
+    case LOAD_ATTR_CLASS:
+    case LOAD_ATTR_CLASS_WITH_METACLASS_CHECK:
+    case LOAD_ATTR_GETATTRIBUTE_OVERRIDDEN:
+    case LOAD_ATTR_INSTANCE_VALUE:
+    case LOAD_ATTR_METHOD_LAZY_DICT:
+    case LOAD_ATTR_METHOD_NO_DICT:
+    case LOAD_ATTR_METHOD_WITH_VALUES:
+    case LOAD_ATTR_MODULE:
+    case LOAD_ATTR_NONDESCRIPTOR_NO_DICT:
+    case LOAD_ATTR_NONDESCRIPTOR_WITH_VALUES:
+    case LOAD_ATTR_PROPERTY:
+    case LOAD_ATTR_SLOT:
+    case LOAD_ATTR_WITH_HINT:
+      return true;
+    default:
+      return false;
+  }
+}
+
+bool isStoreAttrOpcode(int opcode) {
+  switch (opcode) {
+    case STORE_ATTR:
+    case STORE_ATTR_INSTANCE_VALUE:
+    case STORE_ATTR_SLOT:
+    case STORE_ATTR_WITH_HINT:
+      return true;
+    default:
+      return false;
+  }
+}
+
+bool isReturnOpcode(int opcode) {
+  return opcode == RETURN_VALUE || opcode == INSTRUMENTED_RETURN_VALUE ||
+      opcode == RETURN_CONST || opcode == RETURN_PRIMITIVE;
+}
+
+bool isBooleanPredicateControlOpcode(
+    const BytecodeInstruction& instr,
+    int opcode) {
+  if (instr.isBranch()) {
+    return true;
+  }
+  switch (opcode) {
+    case NOT_TAKEN:
+    case TO_BOOL:
+    case TO_BOOL_ALWAYS_TRUE:
+    case TO_BOOL_BOOL:
+    case TO_BOOL_INT:
+    case TO_BOOL_LIST:
+    case TO_BOOL_NONE:
+    case TO_BOOL_STR:
+      return true;
+    default:
+      return false;
+  }
+}
+
+bool isAllowedProtocolDynamicOpcode(int opcode) {
+  switch (opcode) {
+    case LOAD_GLOBAL:
+    case LOAD_GLOBAL_BUILTIN:
+    case LOAD_GLOBAL_MODULE:
+      return true;
+    default:
+      return false;
+  }
+}
+
+bool isAllowedProtocolControlOpcode(
+    const BytecodeInstruction& instr,
+    int opcode) {
+  if (instr.isBranch()) {
+    return true;
+  }
+  switch (opcode) {
+    case JUMP:
+    case JUMP_FORWARD:
+    case NOT_TAKEN:
+    case NOP:
+    case RAISE_VARARGS:
+    case TO_BOOL:
+    case TO_BOOL_ALWAYS_TRUE:
+    case TO_BOOL_BOOL:
+    case TO_BOOL_INT:
+    case TO_BOOL_LIST:
+    case TO_BOOL_NONE:
+    case TO_BOOL_STR:
+      return true;
+    default:
+      return false;
+  }
+}
+
+bool isSteadyLowRiskUserMethodShape(
+    BorrowedRef<PyCodeObject> code,
+    const StructureKey& key,
+    const GateContext& context) {
+  return !context.startup_phase && code != nullptr && code->co_argcount > 0 &&
+      !nameEquals(code->co_name, "__init__") && !key.is_static &&
+      !key.is_suspendable && !key.highRisk() && key.loop_score == 0 &&
+      !key.is_synthetic;
+}
+
+bool shouldAllowSteadyStateTrivialStateHelper(
+    BorrowedRef<PyCodeObject> code,
+    const StructureKey& key,
+    const GateContext& context) {
+  if (!isSteadyLowRiskUserMethodShape(code, key, context) ||
+      key.family != Family::Trivial || key.code_size_bucket != 0 ||
+      key.active_dim_mask != 0) {
+    return false;
+  }
+
+  uint32_t load_attr_count = 0;
+  uint32_t store_attr_count = 0;
+  uint32_t return_count = 0;
+  BytecodeInstructionBlock block{code};
+  for (auto it = block.begin(); it != block.end(); ++it) {
+    int opcode = (*it).opcode();
+    OpcodeClass cls = opcodeClassOf(opcode);
+    if (cls == OpcodeClass::Invalid || cls == OpcodeClass::Dispatch ||
+        cls == OpcodeClass::Dynamic || cls == OpcodeClass::Suspend ||
+        isExceptionControlOpcode(opcode)) {
+      return false;
+    }
+    if (cls == OpcodeClass::Ignored || cls == OpcodeClass::Neutral) {
+      continue;
+    }
+    if (isLoadAttrOpcode(opcode)) {
+      load_attr_count++;
+      continue;
+    }
+    if (isStoreAttrOpcode(opcode)) {
+      store_attr_count++;
+      continue;
+    }
+    if (isReturnOpcode(opcode)) {
+      return_count++;
+      continue;
+    }
+    return false;
+  }
+
+  bool state_predicate = load_attr_count > 0 && store_attr_count == 0;
+  bool state_mutator = store_attr_count > 0 && load_attr_count == 0;
+  return return_count == 1 && (state_predicate || state_mutator);
+}
+
+bool shouldAllowSteadyStateCompositeStatePredicate(
+    BorrowedRef<PyCodeObject> code,
+    const StructureKey& key,
+    const GateContext& context) {
+  const uint8_t kAllowedDims =
+      activeDimMaskFor(WorkDim::Control) | activeDimMaskFor(WorkDim::Object);
+  if (!isSteadyLowRiskUserMethodShape(code, key, context) ||
+      key.family != Family::BranchFSM || key.code_size_bucket != 0 ||
+      (key.active_dim_mask & ~kAllowedDims) != 0) {
+    return false;
+  }
+
+  uint32_t load_attr_count = 0;
+  uint32_t return_count = 0;
+  BytecodeInstructionBlock block{code};
+  for (auto it = block.begin(); it != block.end(); ++it) {
+    BytecodeInstruction instr = *it;
+    int opcode = instr.opcode();
+    if (isReturnOpcode(opcode)) {
+      return_count++;
+      continue;
+    }
+    OpcodeClass cls = opcodeClassOf(opcode);
+    if (cls == OpcodeClass::Invalid || cls == OpcodeClass::Dispatch ||
+        cls == OpcodeClass::Dynamic || cls == OpcodeClass::Suspend ||
+        isExceptionControlOpcode(opcode)) {
+      return false;
+    }
+    if (cls == OpcodeClass::Ignored || cls == OpcodeClass::Neutral) {
+      continue;
+    }
+    if (isLoadAttrOpcode(opcode)) {
+      load_attr_count++;
+      continue;
+    }
+    if (isStoreAttrOpcode(opcode)) {
+      return false;
+    }
+    if (opcode == UNARY_NOT) {
+      continue;
+    }
+    if (cls == OpcodeClass::Control &&
+        isBooleanPredicateControlOpcode(instr, opcode)) {
+      continue;
+    }
+    return false;
+  }
+
+  return load_attr_count >= 2 && return_count == 1;
+}
+
+bool shouldAllowSteadyStateProtocolDispatchCore(
+    BorrowedRef<PyCodeObject> code,
+    const StructureKey& key,
+    const GateContext& context) {
+  if (!isSteadyLowRiskUserMethodShape(code, key, context) ||
+      code->co_argcount < 2 || key.code_size_bucket > 1) {
+    return false;
+  }
+  if (key.family != Family::BranchFSM && key.family != Family::Mixed &&
+      key.family != Family::ObjectManipulator &&
+      key.family != Family::CallDispatcher) {
+    return false;
+  }
+
+  uint32_t object_access_count = 0;
+  uint32_t store_attr_count = 0;
+  uint32_t control_count = 0;
+  uint32_t call_count = 0;
+  uint32_t dynamic_count = 0;
+  uint32_t return_count = 0;
+  uint32_t raise_count = 0;
+  BytecodeInstructionBlock block{code};
+  for (auto it = block.begin(); it != block.end(); ++it) {
+    BytecodeInstruction instr = *it;
+    int opcode = instr.opcode();
+    if (isReturnOpcode(opcode)) {
+      return_count++;
+      continue;
+    }
+    OpcodeClass cls = opcodeClassOf(opcode);
+    if (cls == OpcodeClass::Invalid || cls == OpcodeClass::Suspend ||
+        isExceptionControlOpcode(opcode)) {
+      return false;
+    }
+    if (cls == OpcodeClass::Ignored || cls == OpcodeClass::Neutral) {
+      continue;
+    }
+    if (cls == OpcodeClass::Dynamic) {
+      if (!isAllowedProtocolDynamicOpcode(opcode)) {
+        return false;
+      }
+      dynamic_count++;
+      if (dynamic_count > kProtocolDispatchMaxDynamicLoads) {
+        return false;
+      }
+      continue;
+    }
+    if (cls == OpcodeClass::Dispatch) {
+      call_count++;
+      continue;
+    }
+    if (isStoreAttrOpcode(opcode)) {
+      object_access_count++;
+      store_attr_count++;
+      continue;
+    }
+    if (isLoadAttrOpcode(opcode)) {
+      object_access_count++;
+      continue;
+    }
+    if (cls == OpcodeClass::Object) {
+      object_access_count++;
+      continue;
+    }
+    if (cls == OpcodeClass::Compute) {
+      continue;
+    }
+    if (cls == OpcodeClass::Control &&
+        isAllowedProtocolControlOpcode(instr, opcode)) {
+      control_count++;
+      if (opcode == RAISE_VARARGS) {
+        raise_count++;
+        if (raise_count > 1) {
+          return false;
+        }
+      }
+      continue;
+    }
+    return false;
+  }
+
+  // This keeps state-machine cores while rejecting call-only wrappers that
+  // looked similar in pickle_pure_python's setup path.
+  return object_access_count > 0 && control_count > 0 && return_count > 0 &&
+      call_count <= kProtocolDispatchMaxCalls &&
+      (store_attr_count > 0 || raise_count > 0);
 }
 
 } // namespace
@@ -1090,6 +1395,19 @@ ThresholdDecision computeThresholdForCode(
     const GateContext& context,
     uint32_t global) {
   auto decision = computeThreshold(key, context, global);
+  if (decision.branch_reason != BranchReason::None &&
+      shouldAllowSteadyStatePlainGenerator(code, key, context)) {
+    return {global, BranchReason::None};
+  }
+  if (decision.branch_reason == BranchReason::LowRoi &&
+      shouldAllowSteadyStateTrivialStateHelper(code, key, context)) {
+    return {global, BranchReason::None};
+  }
+  if (decision.branch_reason == BranchReason::LowRoi &&
+      (shouldAllowSteadyStateCompositeStatePredicate(code, key, context) ||
+       shouldAllowSteadyStateProtocolDispatchCore(code, key, context))) {
+    return {global, BranchReason::None};
+  }
   if (decision.branch_reason == BranchReason::None &&
       decision.limit == global &&
       isStdlibAsyncioEventLoopFrameworkHelper(code, key, context)) {
