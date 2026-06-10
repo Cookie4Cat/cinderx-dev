@@ -17,6 +17,7 @@ def _plugin_env() -> dict[str, str]:
     env["PYTHONJITAUTO"] = "auto:2"
     env.pop("PYTHONJITALL", None)
     env.pop("CINDERX_AUTOJIT_IMPORT_PROVIDER", None)
+    env.pop("CINDERX_AUTOJIT_SETUP_PROVIDER", None)
     return env
 
 
@@ -30,6 +31,7 @@ def _plugin_env_without_auto_classify() -> dict[str, str]:
         "PYTHONJITALL",
         "PYTHONJITAUTO",
         "CINDERX_AUTOJIT_IMPORT_PROVIDER",
+        "CINDERX_AUTOJIT_SETUP_PROVIDER",
     ):
         env.pop(name, None)
 
@@ -38,6 +40,42 @@ def _plugin_env_without_auto_classify() -> dict[str, str]:
 
 
 class AutoJitGateStatsDumpTests(unittest.TestCase):
+    _FAKE_LIB2TO3_IMPORTER = (
+        "import importlib.abc\n"
+        "import importlib.machinery\n"
+        "import sys\n"
+        "\n"
+        "class FakeLib2to3Loader(importlib.abc.Loader):\n"
+        "    def create_module(self, spec):\n"
+        "        return None\n"
+        "\n"
+        "    def exec_module(self, module):\n"
+        "        if module.__name__ == 'lib2to3':\n"
+        "            module.__path__ = []\n"
+        "            return\n"
+        "        if module.__name__ == 'lib2to3.main':\n"
+        "            def main():\n"
+        "                return 42\n"
+        "            module.main = main\n"
+        "\n"
+        "class FakeLib2to3Finder(importlib.abc.MetaPathFinder):\n"
+        "    def find_spec(self, fullname, path=None, target=None):\n"
+        "        if fullname == 'lib2to3':\n"
+        "            return importlib.machinery.ModuleSpec(\n"
+        "                fullname,\n"
+        "                FakeLib2to3Loader(),\n"
+        "                is_package=True,\n"
+        "            )\n"
+        "        if fullname == 'lib2to3.main':\n"
+        "            return importlib.machinery.ModuleSpec(\n"
+        "                fullname,\n"
+        "                FakeLib2to3Loader(),\n"
+        "            )\n"
+        "        return None\n"
+        "\n"
+        "sys.meta_path.insert(0, FakeLib2to3Finder())\n"
+    )
+
     def test_auto_classify_defaults_import_provider_to_find_and_load(self) -> None:
         with tempfile.TemporaryDirectory() as temp:
             env = _plugin_env()
@@ -53,6 +91,106 @@ class AutoJitGateStatsDumpTests(unittest.TestCase):
                     "    '_cinderx_autojit_import_provider',\n"
                     "    None,\n"
                     ") == 'find_and_load'\n",
+                ],
+                cwd=temp,
+                env=env,
+                capture_output=True,
+                text=True,
+                timeout=60,
+            )
+
+            self.assertEqual(
+                completed.returncode,
+                0,
+                f"stdout:\n{completed.stdout}\nstderr:\n{completed.stderr}",
+            )
+
+    def test_auto_classify_defaults_setup_provider_to_lib2to3_main(self) -> None:
+        with tempfile.TemporaryDirectory() as temp:
+            env = _plugin_env()
+
+            completed = subprocess.run(
+                [
+                    sys.executable,
+                    "-c",
+                    (
+                        self._FAKE_LIB2TO3_IMPORTER
+                        + "import lib2to3.main\n"
+                        "assert getattr(\n"
+                        "    lib2to3.main.main,\n"
+                        "    '_cinderx_autojit_setup_provider',\n"
+                        "    None,\n"
+                        ") == 'lib2to3_main'\n"
+                    ),
+                ],
+                cwd=temp,
+                env=env,
+                capture_output=True,
+                text=True,
+                timeout=60,
+            )
+
+            self.assertEqual(
+                completed.returncode,
+                0,
+                f"stdout:\n{completed.stdout}\nstderr:\n{completed.stderr}",
+            )
+
+    def test_auto_classify_defaults_setup_provider_for_cinderx_init(self) -> None:
+        with tempfile.TemporaryDirectory() as temp:
+            env = _plugin_env()
+
+            completed = subprocess.run(
+                [
+                    sys.executable,
+                    "-c",
+                    "import sys\n"
+                    "import types\n"
+                    "import cinderx\n"
+                    "module = types.ModuleType('lib2to3.main')\n"
+                    "def main():\n"
+                    "    return 42\n"
+                    "module.main = main\n"
+                    "sys.modules['lib2to3.main'] = module\n"
+                    "cinderx._maybe_install_autojit_setup_provider_for_module(\n"
+                    "    'lib2to3.main'\n"
+                    ")\n"
+                    "assert getattr(\n"
+                    "    module.main,\n"
+                    "    '_cinderx_autojit_setup_provider',\n"
+                    "    None,\n"
+                    ") == 'lib2to3_main'\n",
+                ],
+                cwd=temp,
+                env=env,
+                capture_output=True,
+                text=True,
+                timeout=60,
+            )
+
+            self.assertEqual(
+                completed.returncode,
+                0,
+                f"stdout:\n{completed.stdout}\nstderr:\n{completed.stderr}",
+            )
+
+    def test_plugin_without_auto_classify_keeps_setup_provider_off(self) -> None:
+        with tempfile.TemporaryDirectory() as temp:
+            env = _plugin_env_without_auto_classify()
+
+            completed = subprocess.run(
+                [
+                    sys.executable,
+                    "-c",
+                    (
+                        self._FAKE_LIB2TO3_IMPORTER
+                        + "import lib2to3.main\n"
+                        "assert getattr(\n"
+                        "    lib2to3.main.main,\n"
+                        "    '_cinderx_autojit_setup_provider',\n"
+                        "    None,\n"
+                        ") is None\n"
+                    ),
                 ],
                 cwd=temp,
                 env=env,

@@ -621,6 +621,17 @@ def _autojit_import_provider() -> str:
     return "off"
 
 
+def _autojit_setup_provider() -> str:
+    provider = environ.get("CINDERX_AUTOJIT_SETUP_PROVIDER")
+    if provider is not None:
+        return provider
+    if _is_autojit_classification_value(
+        environ.get("PYTHONJITAUTO")
+    ) or _is_autojit_classification_value(sys._xoptions.get("jit-auto")):
+        return "lib2to3_main"
+    return "off"
+
+
 def _make_autojit_setup_wrapper(original: object, provider: str) -> object:
     def wrapper(*args: object, **kwargs: object) -> object:
         _autojit_setup_enter()
@@ -639,7 +650,7 @@ def _maybe_install_autojit_setup_provider_for_module(
     fullname: str, provider: str | None = None
 ) -> None:
     if provider is None:
-        provider = environ.get("CINDERX_AUTOJIT_SETUP_PROVIDER", "")
+        provider = _autojit_setup_provider()
     if provider in ("", "0", "off"):
         return
     if provider != "lib2to3_main" or fullname != "lib2to3.main":
@@ -659,7 +670,7 @@ def _maybe_install_autojit_setup_provider_for_module(
 
 
 def _make_autojit_import_wrapper(original: object, provider: str) -> object:
-    setup_provider = environ.get("CINDERX_AUTOJIT_SETUP_PROVIDER", "")
+    setup_provider = _autojit_setup_provider()
 
     def wrapper(*args: object, **kwargs: object) -> object:
         _autojit_import_enter()

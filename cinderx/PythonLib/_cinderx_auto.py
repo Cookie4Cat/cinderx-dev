@@ -27,6 +27,16 @@ if os.environ.get("CINDERX_PLUGIN_ENABLE", "0") == "1":
             return "find_and_load"
         return "off"
 
+    def _autojit_setup_provider():
+        provider = os.environ.get("CINDERX_AUTOJIT_SETUP_PROVIDER")
+        if provider is not None:
+            return provider
+        if _is_autojit_classification_value(
+            os.environ.get("PYTHONJITAUTO")
+        ) or _is_autojit_classification_value(sys._xoptions.get("jit-auto")):
+            return "lib2to3_main"
+        return "off"
+
     def _maybe_enable_autojit_gate_stats():
         if not _env_flag_enabled("CINDERX_AUTOJIT_GATE_STATS"):
             return
@@ -73,7 +83,7 @@ if os.environ.get("CINDERX_PLUGIN_ENABLE", "0") == "1":
 
     def _maybe_install_autojit_setup_provider_for_module(fullname, provider=None):
         if provider is None:
-            provider = os.environ.get("CINDERX_AUTOJIT_SETUP_PROVIDER", "")
+            provider = _autojit_setup_provider()
         if provider in ("", "0", "off"):
             return
         if provider != "lib2to3_main" or fullname != "lib2to3.main":
@@ -92,7 +102,7 @@ if os.environ.get("CINDERX_PLUGIN_ENABLE", "0") == "1":
         setattr(module, "main", _make_autojit_setup_wrapper(current, provider))
 
     def _make_autojit_import_wrapper(original, provider):
-        setup_provider = os.environ.get("CINDERX_AUTOJIT_SETUP_PROVIDER", "")
+        setup_provider = _autojit_setup_provider()
 
         def wrapper(*args, **kwargs):
             _cinderx._autojit_import_enter()
