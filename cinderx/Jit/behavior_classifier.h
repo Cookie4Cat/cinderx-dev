@@ -131,5 +131,10 @@ ThresholdDecision computeThreshold(
     const StructureKey& key,
     const GateContext& context,
     uint32_t global);
+ThresholdDecision computeThresholdForCode(
+    BorrowedRef<PyCodeObject> code,
+    const StructureKey& key,
+    const GateContext& context,
+    uint32_t global);
 
 } // namespace jit

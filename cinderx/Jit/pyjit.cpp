@@ -468,7 +468,8 @@ PyObject* jitVectorcall(
         effective_limit = kAutoJitInterpretOnlyThreshold;
       } else if (auto computed_key = getOrComputeStructureKey(code, state.extra);
           computed_key.has_value()) {
-        decision = computeThreshold(*computed_key, state.context, *limit);
+        decision =
+            computeThresholdForCode(code, *computed_key, state.context, *limit);
         effective_limit = decision.limit;
         key = *computed_key;
       }

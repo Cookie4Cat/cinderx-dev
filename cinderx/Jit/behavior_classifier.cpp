@@ -75,6 +75,18 @@ bool nameEquals(BorrowedRef<PyObject> name, const char* expected) {
   return std::strcmp(utf8, expected) == 0;
 }
 
+const char* unicodeUtf8OrNull(BorrowedRef<PyObject> obj) {
+  if (obj == nullptr || !PyUnicode_Check(obj)) {
+    return nullptr;
+  }
+  const char* utf8 = PyUnicode_AsUTF8(obj);
+  if (utf8 == nullptr) {
+    PyErr_Clear();
+    return nullptr;
+  }
+  return utf8;
+}
+
 std::string lowerAscii(std::string_view value) {
   std::string lowered;
   lowered.reserve(value.size());
@@ -86,6 +98,27 @@ std::string lowerAscii(std::string_view value) {
 
 bool contains(std::string_view haystack, std::string_view needle) {
   return haystack.find(needle) != std::string_view::npos;
+}
+
+bool endsWith(std::string_view value, std::string_view suffix) {
+  return value.size() >= suffix.size() &&
+      value.compare(value.size() - suffix.size(), suffix.size(), suffix) == 0;
+}
+
+bool isStdlibFilename(std::string_view filename) {
+  return contains(filename, "/lib/python3.");
+}
+
+bool isStdlibAsyncioEventLoopFrameworkFilename(std::string_view filename) {
+  if (!isStdlibFilename(filename)) {
+    return false;
+  }
+  return endsWith(filename, "/asyncio/base_events.py") ||
+      endsWith(filename, "/asyncio/events.py") ||
+      endsWith(filename, "/asyncio/selector_events.py") ||
+      endsWith(filename, "/asyncio/tasks.py") ||
+      endsWith(filename, "/asyncio/unix_events.py") ||
+      endsWith(filename, "/selectors.py");
 }
 
 bool isSyntheticFilename(BorrowedRef<PyCodeObject> code) {
@@ -383,6 +416,38 @@ bool mixedShapeContains(MixedShape shape, WorkDim dim) {
 bool isPureControlExceptionRisk(const StructureKey& key) {
   return key.risk_reason == kRiskException &&
       key.active_dim_mask == activeDimMaskFor(WorkDim::Control);
+}
+
+bool isLowRoiAsyncioEventLoopFrameworkShape(const StructureKey& key) {
+  if (key.is_static || key.is_suspendable || key.highRisk() ||
+      key.computeHint()) {
+    return false;
+  }
+  if (key.family == Family::ObjectManipulator) {
+    return key.loop_score == 0 && key.code_size_bucket == 0;
+  }
+  if (key.family == Family::BranchFSM) {
+    return key.loop_score > 0 && key.code_size_bucket <= 1;
+  }
+  if (key.family == Family::ReflectionMeta) {
+    return key.loop_score >= 2 && key.code_size_bucket <= 2;
+  }
+  return false;
+}
+
+bool isStdlibAsyncioEventLoopFrameworkHelper(
+    BorrowedRef<PyCodeObject> code,
+    const StructureKey& key,
+    const GateContext& context) {
+  if (context.startup_phase ||
+      !isLowRoiAsyncioEventLoopFrameworkShape(key)) {
+    return false;
+  }
+  const char* filename = unicodeUtf8OrNull(code->co_filename);
+  if (filename == nullptr) {
+    return false;
+  }
+  return isStdlibAsyncioEventLoopFrameworkFilename(filename);
 }
 
 } // namespace
@@ -1017,6 +1082,21 @@ ThresholdDecision computeThreshold(
         saturatingMul(global, kLowRoiThresholdFactor), BranchReason::LowRoi};
   }
   return {global, BranchReason::None};
+}
+
+ThresholdDecision computeThresholdForCode(
+    BorrowedRef<PyCodeObject> code,
+    const StructureKey& key,
+    const GateContext& context,
+    uint32_t global) {
+  auto decision = computeThreshold(key, context, global);
+  if (decision.branch_reason == BranchReason::None &&
+      decision.limit == global &&
+      isStdlibAsyncioEventLoopFrameworkHelper(code, key, context)) {
+    return {saturatingMul(global, kStartupDeferThresholdFactor),
+            BranchReason::LowRoi};
+  }
+  return decision;
 }
 
 } // namespace jit

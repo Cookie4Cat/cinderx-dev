@@ -757,6 +757,123 @@ assert jit.is_jit_compiled(straight_compute)
 )");
 }
 
+TEST_F(
+    BehaviorClassifierRuntimeTest,
+    SteadyStateDefersStdlibAsyncioEventLoopFrameworkHelpers) {
+  Ref<> func = compileStockAndGet(
+      R"(
+src = """
+class BaseEventLoop:
+    def call_soon(self, callback):
+        return self._call_soon(callback)
+"""
+ns = {}
+exec(compile(src, "/opt/python314/lib/python3.14/asyncio/base_events.py", "exec"), ns)
+target = ns["BaseEventLoop"].call_soon
+)",
+      "target");
+
+  StructureKey event_loop_helper{Family::ObjectManipulator};
+  event_loop_helper.loop_score = 0;
+  event_loop_helper.code_size_bucket = 0;
+  event_loop_helper.active_dim_mask =
+      activeDimMaskFor(WorkDim::Control) | activeDimMaskFor(WorkDim::Object) |
+      activeDimMaskFor(WorkDim::Dispatch);
+
+  auto decision =
+      computeThresholdForCode(codeFromFunc(func), event_loop_helper, {}, 2);
+  EXPECT_GE(decision.limit, 65536);
+  EXPECT_EQ(decision.branch_reason, BranchReason::LowRoi);
+}
+
+TEST_F(
+    BehaviorClassifierRuntimeTest,
+    SteadyStateDefersStdlibAsyncioBranchFrameworkHelpers) {
+  Ref<> func = compileStockAndGet(
+      R"(
+src = """
+class BaseSelectorEventLoop:
+    def _process_events(self, event_list):
+        for key, mask in event_list:
+            if mask:
+                self._ready.append((key, mask))
+"""
+ns = {}
+exec(compile(src, "/opt/python314/lib/python3.14/asyncio/selector_events.py", "exec"), ns)
+target = ns["BaseSelectorEventLoop"]._process_events
+)",
+      "target");
+
+  StructureKey selector_helper{Family::BranchFSM};
+  selector_helper.loop_score = 3;
+  selector_helper.code_size_bucket = 1;
+  selector_helper.active_dim_mask =
+      activeDimMaskFor(WorkDim::Control) | activeDimMaskFor(WorkDim::Object);
+
+  auto decision =
+      computeThresholdForCode(codeFromFunc(func), selector_helper, {}, 2);
+  EXPECT_GE(decision.limit, 65536);
+  EXPECT_EQ(decision.branch_reason, BranchReason::LowRoi);
+}
+
+TEST_F(
+    BehaviorClassifierRuntimeTest,
+    SteadyStateDefersStdlibAsyncioReflectionFrameworkHelpers) {
+  Ref<> func = compileStockAndGet(
+      R"(
+src = """
+def gather(*aws):
+    return tuple(aws)
+"""
+ns = {}
+exec(compile(src, "/opt/python314/lib/python3.14/asyncio/tasks.py", "exec"), ns)
+target = ns["gather"]
+)",
+      "target");
+
+  StructureKey task_helper{Family::ReflectionMeta};
+  task_helper.loop_score = 2;
+  task_helper.code_size_bucket = 2;
+  task_helper.active_dim_mask =
+      activeDimMaskFor(WorkDim::Control) | activeDimMaskFor(WorkDim::Object) |
+      activeDimMaskFor(WorkDim::Dispatch) |
+      activeDimMaskFor(WorkDim::Dynamic);
+
+  auto decision =
+      computeThresholdForCode(codeFromFunc(func), task_helper, {}, 2);
+  EXPECT_GE(decision.limit, 65536);
+  EXPECT_EQ(decision.branch_reason, BranchReason::LowRoi);
+}
+
+TEST_F(
+    BehaviorClassifierRuntimeTest,
+    SteadyStateKeepsUserAsyncioLikePathsOnNormalPolicy) {
+  Ref<> func = compileStockAndGet(
+      R"(
+src = """
+class BaseEventLoop:
+    def call_soon(self, callback):
+        return self._call_soon(callback)
+"""
+ns = {}
+exec(compile(src, "/tmp/project/asyncio/base_events.py", "exec"), ns)
+target = ns["BaseEventLoop"].call_soon
+)",
+      "target");
+
+  StructureKey user_helper{Family::ObjectManipulator};
+  user_helper.loop_score = 0;
+  user_helper.code_size_bucket = 0;
+  user_helper.active_dim_mask =
+      activeDimMaskFor(WorkDim::Control) | activeDimMaskFor(WorkDim::Object) |
+      activeDimMaskFor(WorkDim::Dispatch);
+
+  auto decision =
+      computeThresholdForCode(codeFromFunc(func), user_helper, {}, 2);
+  EXPECT_EQ(decision.limit, 2);
+  EXPECT_EQ(decision.branch_reason, BranchReason::None);
+}
+
 TEST_F(BehaviorClassifierRuntimeTest, AutoClassifyAllowsGeneratorsInSteadyState) {
   ScopedAutoJitConfig config_guard;
   getMutableConfig().compile_after_n_calls = 2;
