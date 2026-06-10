@@ -545,6 +545,16 @@ if (${MACOS})
   target_link_options(${PROJECT_NAME} PRIVATE -undefined dynamic_lookup)
 endif()
 
+# Bind intra-DSO function calls at link time instead of routing them through
+# the PLT. The JIT runtime helpers (inline caches, frame setup, JITRT_*) call
+# each other on every attribute access / function call from JIT-compiled code,
+# and the PLT indirection shows up prominently in profiles (~9% of cycles on
+# call-heavy workloads like sqlalchemy_imperative). Nothing interposes
+# _cinderx.so's internal symbols, so this is safe.
+if (${CMAKE_SYSTEM_NAME} MATCHES "Linux")
+  target_link_options(${PROJECT_NAME} PRIVATE -Wl,-Bsymbolic-functions)
+endif()
+
 set_target_properties(${PROJECT_NAME} PROPERTIES PREFIX "")
 set_target_properties(${PROJECT_NAME} PROPERTIES SUFFIX "")
 if (WINDOWS)
