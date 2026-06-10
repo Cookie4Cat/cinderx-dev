@@ -1136,6 +1136,15 @@ async def coro():
     return 1
 )",
       "coro");
+  Ref<> iterable_coro = compileStockAndGet(
+      R"(
+import types
+
+@types.coroutine
+def iterable_coro():
+    yield
+)",
+      "iterable_coro");
 
   StructureKey suspendable{Family::AsyncStateMachine};
   suspendable.is_suspendable = true;
@@ -1151,6 +1160,11 @@ async def coro():
       computeThresholdForCode(codeFromFunc(coro), suspendable, steady_state, 2);
   EXPECT_GE(coro_decision.limit, 65536);
   EXPECT_EQ(coro_decision.branch_reason, BranchReason::RiskDefer);
+
+  auto iterable_coro_decision = computeThresholdForCode(
+      codeFromFunc(iterable_coro), suspendable, steady_state, 2);
+  EXPECT_GE(iterable_coro_decision.limit, 65536);
+  EXPECT_EQ(iterable_coro_decision.branch_reason, BranchReason::RiskDefer);
 
   GateContext startup{true};
   auto startup_decision =

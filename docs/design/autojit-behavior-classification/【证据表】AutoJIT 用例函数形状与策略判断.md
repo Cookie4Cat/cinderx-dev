@@ -10,6 +10,7 @@
 
 | 版本 | 日期 | 修订人 | 修订说明 |
 |---|---|---|---|
+| v0.30 | 2026-06-10 | @sisibeloved | 补 `dask` 直接失败修复证据：plain generator steady-state override 误把 `@types.coroutine` 生成的 generator-based coroutine 当普通 generator 放行，导致 `asyncio.tasks:__sleep0` 在 `calls=2 limit=2 reason=None` 下进入 JIT，随后 `asyncio.sleep(0)` 抛 `TypeError: 'generator' object can't be awaited`。修复后排除 `CO_ITERABLE_COROUTINE`/coroutine/async-generator flags；`dask --fast` 通过，compile-events 中不再出现 `__sleep0`，正式 `dask=1.77s +- 0.05s`，相对旧 AutoJIT `1.15x faster`，但仍比 CPython JIT/plugin-no-JIT `1.30x slower`。BehaviorClassifier 42/42、`test_autojit_gate_stats` 8/8 通过。 |
 | v0.29 | 2026-06-10 | @sisibeloved | 补 `richards` 误伤修复证据：steady-state 低风险状态 predicate/mutator 与窄 protocol dispatch core 不能按 LowRoi 冻结；只放行带状态写入或 raise 分支的 protocol core，避免把 `pickle_pure_python` setup/call-only wrapper 一起放开。最终子集：`richards=109ms`、`pickle_pure_python=800us`、`2to3=577ms`、`nbody=118ms`；相对 state-helper-only，`richards` `1.14x faster`，`pickle/2to3` 不劣化。BehaviorClassifier 42/42、`test_autojit_gate_stats` 8/8 通过。 |
 | v0.28 | 2026-06-10 | @sisibeloved | 补 `generators` 误伤修复证据：`Tree.__iter__` 的 `risk=Exception` 来自 `yield from` generator cleanup，不应按业务异常/动态风险冻结；steady-state 普通 generator 在仅含 `Suspend/Exception` 风险时恢复全局阈值。正式 A/B：破损 AutoJIT `generators=60.2ms`，修复后 `21.7ms`，相对破损 `2.78x faster`，与 `PYTHONJITAUTO=2` 不显著；同口径 `2to3` 改动前 `578ms`、改动后 `579ms`，`pyperf compare_to` 不显著。同步修正 RuntimeTests：BehaviorClassifier 36/36 通过，`test_autojit_gate_stats` 8/8 通过。 |
 | v0.27 | 2026-06-10 | @sisibeloved | 补 LowRoi 冻结正式化结果：去掉 spike 环境变量，将 Trivial LowRoi 与长 LowRoi 解释冻结纳入生产策略；正式子集 `pickle_pure_python=800us`、`2to3=991ms`、`nbody=119ms`，相对 v0.26 分别为 `1.16x faster`、`1.16x faster`、`1.07x slower`（nbody/pickle 本轮样本提示不稳），几何均值 `1.08x faster`。 |
@@ -62,7 +63,7 @@
 | `NumericLoop` 或 top-2 `Mixed` 含 `Compute` | 默认放行，除非有明确动态成本证据 |
 | 只是 active dims 中出现 `Compute` | 不能当成数值收益保护；若 family 仍是 `ObjectManipulator` / `BranchFSM`，应按主导形状判断 |
 | suspendable 状态机 | 不能一刀切拦死；可提高阈值，热度足够时仍应编译 |
-| steady-state 普通 generator | 若风险只来自 `Suspend/Exception`，应恢复全局阈值；`yield from` cleanup 产生的 `Exception` 不是业务异常 ROI 负证据 |
+| steady-state 普通 generator | 若风险只来自 `Suspend/Exception`，应恢复全局阈值；但必须排除 `CO_ITERABLE_COROUTINE`/coroutine/async-generator，`asyncio.tasks:__sleep0` 是反例 |
 | steady-state 状态 predicate/mutator | 低风险、小 code、纯状态读/写/布尔判断应恢复全局阈值；这是 `richards` 的核心收益点之一 |
 | steady-state protocol dispatch core | 只放行小型、低风险、有对象状态访问、控制流和返回值，并且有状态写入或 raise 分支的核心方法；call-only wrapper 继续 LowRoi |
 | 纯 `ObjectManipulator` 大函数 | import window 可延迟；steady-state 中可能是核心热点，不能全局拦 |
@@ -98,6 +99,7 @@
 | `python_startup` | §7 分阶段账本 + 全量 gate 形状（四口径 wall 中位数 + importtime 窗口 + 17 函数 shape，debug 口径） | `blue-98:cinderx-test:/results/autojit-startup-ledger-20260609/{startup_totals.tsv,importtime_windows.tsv,python_startup.gate-shapes.raw.log,python_startup.gate-shapes.tsv,README.md}` | 同一 `_cinderx.so` 只改环境：base/jit2/auto/nocompile = 21.8/234.4/35.9/31.7ms（site）；`_cinderx_auto` importtime 累计 0.4/185.5/8.5/8.1ms；全量 17 个 gate 函数 = 8 StartupInit + 6 RiskDefer + 2 LowRoi + 1 编译。README 含复现命令与枚举映射 |
 | `dask` | 正式 pyperformance 五口径：CPython 3.14.3 JIT、CinderX no-plugin、CinderX plugin-no-JIT、`PYTHONJITAUTO=2`、当前 AutoJIT；`--warmup 3 --affinity=30` | `blue-98:cinderx-test:/results/autojit-dask-ledger-20260609/{cpython_jit_dask_aff30.json,cinderx_no_plugin_dask_aff30.json,cinderx_plugin_nojit_dask_aff30.json,cinderx_auto2_dask_aff30.json,cinderx_autojit_dask_aff30.json,logs/*}` | CPython JIT `1.360s`；CinderX no-plugin `1.289s`；plugin-no-JIT `1.355s`；`auto=2` `2.005s`；当前 AutoJIT `2.022s`。差距主要来自启用 CinderX JIT 后新增约 `+650ms`，不是插件固定成本 |
 | `dask` | debug shape/gate/deopt：`--fast -n 3 -w 1`，`PYTHONJITLOGFILE` + `CINDERX_AUTOJIT_GATE_STATS_FILE` + `CINDERX_AUTOJIT_COMPILE_EVENTS_FILE` | `blue-98:cinderx-test:/results/autojit-dask-ledger-20260609/{dask-gate-stats.jsonl,dask-compile-events.jsonl,worker-gate-shapes/*.jit.log,dask-debug-fast.json}` | 4 个 worker 合计约 `962700` 次 gate、`3408` 次 forced compile、`161135` 次 defer freeze；编译事件 `3485` 条中 `3440` 条在 steady 阶段；deopt 合计 `1020754` 次，主要是 `GuardFailure` 和 expected exception |
+| `dask` | plain generator override 误伤复现与修复：`PYTHONJITAUTO=auto:2`，默认 provider，`PYTHONJITHUGEPAGES=0`；失败/修复均附 compile-events | `blue-98:cinderx-test:/results/autojit-dask-failure-20260610/{dask-fast-autojit.log,dask-fail-compile-events.jsonl,dask-fast-autojit-fixed.json,dask-fixed-compile-events.jsonl,dask-formal-autojit-fixed.json,logs/*}` | 失败口径中 `asyncio.tasks:__sleep0` 以 `calls=2 limit=2 reason=None` forced compile，触发 `TypeError: 'generator' object can't be awaited`；修复后 `dask --fast` 通过且 fixed compile-events 不再含 `__sleep0`；正式 `dask=1.77s +- 0.05s`，相对旧 AutoJIT `1.15x faster`，仍比 CPython JIT/plugin-no-JIT `1.30x slower` |
 | `coverage` | direct worker，`PYTHONJITAUTO=auto:2`，`CINDERX_AUTOJIT_IMPORT_PROVIDER=find_and_load` | `blue-98:/results/autojit-import-highcost-bucket1-20260605/worker-gate-shapes/coverage.*.jit.log` | 有真实 C++ gate 形状；debug 口径，不作为性能数值 |
 | `generators` | direct worker，同上 | `blue-98:/results/autojit-import-highcost-bucket1-20260605/worker-gate-shapes/generators.*.jit.log` | 有真实 C++ gate 形状；debug 口径 |
 | `generators` | 误伤复现与修复 A/B：`PYTHONJITAUTO=auto:2`，默认 provider；对照 `PYTHONJITAUTO=2`、破损 AutoJIT、修复后 AutoJIT；附 compile-events 验证 `Tree.__iter__` 是否进入 JIT | `blue-98:cinderx-test:/results/autojit-generators-regression-20260610/{generators-cinderx-auto2.json,generators-cinderx-autojit.json,generators-cinderx-autojit-fixed.json,generators-autojit-compile-events.jsonl,generators-autojit-fixed-compile-events.jsonl}` | `PYTHONJITAUTO=2` `21.7ms +- 6.2ms`；破损 AutoJIT `60.2ms +- 0.3ms`；修复后 `21.7ms +- 5.8ms`。修复后相对破损 `2.78x faster`，与 `auto=2` 不显著；compile-events 确认修复后 `Tree.__iter__ limit=2 reason=None` |
@@ -910,9 +912,11 @@ debug 口径：临时 autohook 只 `import _cinderx_auto`，`bm_pickle --pure-py
 
 ### 17.1 总体判断
 
-`dask` 是 steady-state 异步调度、消息序列化、状态机更新和事件循环 workload，不是 startup/import compile storm。`CinderX no-plugin` 本身不慢，`plugin-no-JIT` 也基本追平 CPython JIT；真正把用例拉慢的是启用 CinderX JIT 后的动态成本。当前 AutoJIT 分类对它没有稳定收益：`auto:2` 到当前 AutoJIT 的均值差只有 `+16.3ms`，小于本用例 `~106ms` 标准差。
+`dask` 是 steady-state 异步调度、消息序列化、状态机更新和事件循环 workload，不是 startup/import compile storm。`CinderX no-plugin` 本身不慢，`plugin-no-JIT` 也基本追平 CPython JIT；真正把用例拉慢的是启用 CinderX JIT 后的动态成本。v0.23 账本里，`auto=2` 到当时 AutoJIT 的均值差只有 `+16.3ms`，小于本用例 `~106ms` 标准差。
 
 结论先写在前面：`dask` 不应驱动 import/setup 策略继续泛化。它是 JIT 动态 ROI 负样本，优化方向应是 deopt/guard/expected-exception 专项，或更细的 steady-state 动态反馈，而不是把 startup provider 或静态 highcost 规则继续放大。
+
+2026-06-10 的新结论是另一个层面：`generators` 修复引入的 plain generator steady-state override 不能覆盖 `@types.coroutine` 生成的 generator-based coroutine。`asyncio.tasks:__sleep0` 就是这种函数，它服务于 `asyncio.sleep(0)`；一旦被 JIT 编译，会破坏 awaitable 语义并让 dask 直接失败。修复后 `dask` 可以跑完，但正式结果仍是 `1.77s +- 0.05s`，比 CPython JIT/plugin-no-JIT 慢 `1.30x`，所以性能主问题仍未根治。
 
 ### 17.2 总表：差距账本
 
@@ -1001,7 +1005,31 @@ top deopt site：
 | `distributed.protocol.pickle:dumps` | 29087 | `UnhandledException/CallEx` + `GuardFailure/GuardType` | 序列化调用形态复杂 |
 | `distributed.client:Future._verify_initialized` | 28000 | `Raise/Raise` | Future 状态校验中的正常控制流 |
 
-### 17.5 策略判断
+### 17.5 2026-06-10 直接失败链路
+
+| 阶段 | 证据 | 判断 |
+|---|---|---|
+| 失败现象 | `dask --fast` 失败，worker/scheduler 断连，日志中 `asyncio.sleep(0)` -> `__sleep0()` 抛 `TypeError: 'generator' object can't be awaited` | 这是功能性回归，不是单纯性能劣化 |
+| 触发函数 | `asyncio.tasks:__sleep0`，`co_flags=0x4000123`，同时有 `CO_GENERATOR` 和 `CO_ITERABLE_COROUTINE` | 它不是普通 generator，而是 generator-based coroutine |
+| 错误准入 | 失败 compile-events：`fullname=asyncio.tasks:__sleep0`，`calls=2`，`effective_limit=2`，`branch_reason=None`，`family=BranchFSM`，`is_suspendable=true` | plain generator override 只看 `CO_GENERATOR`，把 `CO_ITERABLE_COROUTINE` 误放行 |
+| 运行后果 | JIT 编译后返回的 generator 不能被 `await` 接受，dask worker 执行中的 `asyncio.sleep(0)` 失败 | scheduler 连接丢失只是连锁反应 |
+| 修复 | plain generator override 排除 `CO_ITERABLE_COROUTINE`、`CO_COROUTINE`、`CO_ASYNC_GENERATOR` | 普通 `generators:Tree.__iter__` 仍可放行；asyncio coroutine 不再误编译 |
+| 修复验证 | fixed compile-events 共 `2838` 条，无 `asyncio.tasks:__sleep0`；`dask --fast` 通过，正式 `dask=1.77s +- 0.05s` | 功能失败已修复 |
+
+这条链路说明 plain generator 的边界必须按 code flags 判定：`CO_GENERATOR` 只说明实现形态，不说明语义上可按普通 generator 处理。只要带 `CO_ITERABLE_COROUTINE`，它就属于 await 协议的一部分，不能用 `generators` 用例的收益结论泛化放行。
+
+### 17.6 修复后性能状态
+
+| 对比口径 | 旧结果 | 修复后 | 读法 |
+|---|---:|---:|---|
+| 旧 AutoJIT -> 修复后 AutoJIT | `2.02s` | `1.77s`，`1.15x faster` | 本轮修复和近期 LowRoi 冻结/steady 收窄叠加后，dask 比旧账本更好 |
+| `PYTHONJITAUTO=2` -> 修复后 AutoJIT | `2.01s` | `1.77s`，`1.14x faster` | AutoJIT 对 dask 已不是纯负收益，但仍未达标 |
+| CPython JIT -> 修复后 AutoJIT | `1.36s` | `1.77s`，`1.30x slower` | 距 CPython JIT 85% 目标仍很远 |
+| CinderX plugin-no-JIT -> 修复后 AutoJIT | `1.36s` | `1.77s`，`1.30x slower` | 主差距仍来自启用 CinderX JIT 后的动态成本 |
+
+修复后的 compile-events 摘要：旧 debug 事件为 `3485` 条、`unique=812`；修复后 fixed fast 事件为 `2838` 条、`unique=764`，且 `LowRoi` 长等待路径不再进入 compile-events。被移除的高频编译包括 `asyncio.futures:_set_state/_call_check_cancel`、`distributed.metrics` callback、`distributed.worker:Worker.execute` 等一批框架异步路径。这个方向解释了 `1.15x faster`，但不是 dask 的终局优化：只要仍有大量 scheduler/worker/cloudpickle/zict 动态 deopt，dask 仍会落后 CPython JIT/plugin-no-JIT。
+
+### 17.7 策略判断
 
 | 观察 | 结论 |
 |---|---|
@@ -1009,6 +1037,7 @@ top deopt site：
 | import 编译事件只有 `45/3485` | provider/import window 对 dask 不是主要杠杆 |
 | `classified_defer_freeze` 已有 `161135` 次，但仍有 `3408` 次编译和 `1020754` 次 deopt | 静态分类已经挡了一部分低收益函数，但挡不住热到阈值后的动态负 ROI |
 | 代表函数是 scheduler/worker/client/asyncio/cloudpickle/zict 的主体路径 | 不能简单全局拦 `BranchFSM/ObjectManipulator/ReflectionMeta + codeB>0`，否则会把 dask 主体工作禁编 |
+| `asyncio.tasks:__sleep0` 是 `CO_ITERABLE_COROUTINE` | plain generator 放行规则必须排除 generator-based coroutine；否则会从性能误伤升级为功能失败 |
 | deopt 主要来自 slot guard 多态、expected exception、状态机事件多态 | 真正优化路线是 JIT 动态成本专项：slot guard 多态处理、expected exception 慢路径、状态机/序列化路径的 deopt-aware 策略 |
 
 策略结论：`dask` 应作为 **steady async/framework 动态负 ROI 样本** 进入证据集。当前 AutoJIT v1 不根据 dask 扩大 startup/import 规则；若后续要优化 dask，应该单独做 deopt-aware A/B，例如先针对 `distributed.worker_state_machine` / `distributed.scheduler.TaskCollection` / `zict.__delitem__` / `cloudpickle` 热点验证“禁编或优化 JIT deopt”哪条更有效。
@@ -1070,6 +1099,7 @@ top deopt site：
 | import window 内高成本非数值形状应延迟 | `2to3`、`coverage` startup=true 样本 | 成立。目标是削减 startup/import compile storm |
 | steady-state highcost 不能全局延迟 | `unpack_sequence` | 成立。`do_unpacking` 是 `ObjectManipulator + codeB=3 + risk=HugeCode`，但必须放行 |
 | suspendable 不能一刀切禁止 | `generators` | 成立。`Tree.__iter__` 是 steady-state 普通 generator；`yield from` cleanup 带来的 `Exception` 风险不能触发解释冻结，修复后恢复 `2/None` |
+| `CO_ITERABLE_COROUTINE` 不能按普通 generator 放行 | `dask` | 成立。`asyncio.tasks:__sleep0` 同时带 `CO_GENERATOR` 和 `CO_ITERABLE_COROUTINE`，误编译会让 `asyncio.sleep(0)` 抛 `TypeError: 'generator' object can't be awaited` |
 | steady 低风险状态 predicate/mutator 不能按 LowRoi 冻结 | `richards` | 成立。`TaskState` 状态查询/状态写入是任务调度核心，小 code 低风险时应恢复全局阈值 |
 | protocol dispatch core 需要窄放行 | `richards`、`pickle_pure_python` | 成立。`richards` 需要放行有状态写入或 raise 分支的任务调度核心；`pickle_pure_python` 证明 call-only/setup wrapper 不能一起放开 |
 | `compute=true` 默认放行 | `coverage:fibonacci`、`generators:tree` | 成立。数值/compute 提示是收益信号 |

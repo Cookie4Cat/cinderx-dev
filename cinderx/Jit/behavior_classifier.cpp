@@ -462,6 +462,10 @@ bool shouldAllowSteadyStatePlainGenerator(
   if ((code->co_flags & CO_GENERATOR) == 0) {
     return false;
   }
+  if (code->co_flags &
+      (CO_COROUTINE | CO_ITERABLE_COROUTINE | CO_ASYNC_GENERATOR)) {
+    return false;
+  }
   return (key.risk_reason & ~(kRiskSuspend | kRiskException)) == 0;
 }
 
