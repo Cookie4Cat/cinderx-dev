@@ -73,6 +73,7 @@ namespace {
 
 constexpr uint32_t kAutoJitInterpretOnlyThreshold = 65536;
 constexpr uint32_t kAutoJitLongLowRoiFreezeThreshold = 1000;
+constexpr uint32_t kAutoJitClassifyDefaultThreshold = 2;
 
 struct AutoJitGateStats {
   std::atomic<uint64_t> jit_vectorcall{0};
@@ -83,6 +84,9 @@ struct AutoJitGateStats {
   std::atomic<uint64_t> forced_compile{0};
   std::atomic<uint64_t> forced_compile_ok{0};
   std::atomic<uint64_t> forced_compile_fallback{0};
+  std::atomic<uint64_t> roi_uncompile{0};
+  std::atomic<uint64_t> roi_recompile{0};
+  std::atomic<uint64_t> roi_frozen{0};
 };
 
 struct AutoJitGateState {
@@ -114,6 +118,9 @@ void clearAutoJitGateStats() {
   g_auto_jit_gate_stats.forced_compile_ok.store(0, std::memory_order_relaxed);
   g_auto_jit_gate_stats.forced_compile_fallback.store(
       0, std::memory_order_relaxed);
+  g_auto_jit_gate_stats.roi_uncompile.store(0, std::memory_order_relaxed);
+  g_auto_jit_gate_stats.roi_recompile.store(0, std::memory_order_relaxed);
+  g_auto_jit_gate_stats.roi_frozen.store(0, std::memory_order_relaxed);
 }
 
 int setAutoJitGateStat(
@@ -162,6 +169,8 @@ const char* branchReasonName(BranchReason reason) {
       return "StartupInit";
     case BranchReason::RiskDefer:
       return "RiskDefer";
+    case BranchReason::RoiBackoff:
+      return "RoiBackoff";
     case BranchReason::FallbackInvalid:
       return "FallbackInvalid";
   }
@@ -357,6 +366,117 @@ void recordAutoJitInterpretedCall(const AutoJitGateState& state) {
   }
 }
 
+bool shouldAlwaysScheduleCompile(BorrowedRef<PyCodeObject> code);
+
+uint32_t roiBackoffRound(uint32_t ctl) {
+  return (ctl & CI_CODE_EXTRA_ROI_ROUND_MASK) >>
+      CI_CODE_EXTRA_ROI_ROUND_SHIFT;
+}
+
+uint32_t roiBackoffCtlForRound(uint32_t round) {
+  constexpr uint32_t kMaxRound =
+      CI_CODE_EXTRA_ROI_ROUND_MASK >> CI_CODE_EXTRA_ROI_ROUND_SHIFT;
+  return (std::min(round, kMaxRound) << CI_CODE_EXTRA_ROI_ROUND_SHIFT) &
+      CI_CODE_EXTRA_ROI_ROUND_MASK;
+}
+
+uint64_t saturatingAddU64(uint64_t lhs, uint64_t rhs) {
+  uint64_t max = std::numeric_limits<uint64_t>::max();
+  return lhs > max - rhs ? max : lhs + rhs;
+}
+
+uint64_t saturatingMulU64(uint64_t lhs, uint64_t rhs) {
+  uint64_t max = std::numeric_limits<uint64_t>::max();
+  if (lhs != 0 && rhs > max / lhs) {
+    return max;
+  }
+  return lhs * rhs;
+}
+
+uint32_t roiBackoffBudgetForRound(uint32_t round) {
+  size_t base = std::max<size_t>(getConfig().roi_deopt_budget_base, 1);
+  uint64_t budget = static_cast<uint64_t>(
+      std::min(base, static_cast<size_t>(std::numeric_limits<uint32_t>::max())));
+  for (uint32_t i = 0; i < round; ++i) {
+    budget = saturatingMulU64(budget, 2);
+    if (budget >= std::numeric_limits<uint32_t>::max()) {
+      return std::numeric_limits<uint32_t>::max();
+    }
+  }
+  return static_cast<uint32_t>(budget);
+}
+
+uint64_t roiBackoffRecompileFloor(uint64_t calls, uint32_t round) {
+  uint32_t threshold = getConfig().compile_after_n_calls.value_or(
+      kAutoJitClassifyDefaultThreshold);
+  uint64_t delta = std::max<uint64_t>(threshold, 1);
+  delta = saturatingMulU64(
+      delta, std::max<uint64_t>(getConfig().roi_rewarm_factor, 1));
+  for (uint32_t i = 0; i < round; ++i) {
+    delta = saturatingMulU64(delta, 2);
+  }
+  return saturatingAddU64(calls, delta);
+}
+
+bool roiBackoffReasonCounts(
+    DeoptReason reason,
+    bool is_instrumentation_deopt) {
+  if (is_instrumentation_deopt) {
+    return false;
+  }
+  return reason != DeoptReason::kPeriodicTaskFailure;
+}
+
+bool roiBackoffCtlFrozen(uint32_t ctl) {
+  return (ctl & CI_CODE_EXTRA_ROI_FROZEN_BIT) != 0;
+}
+
+bool roiBackoffCtlPending(uint32_t ctl) {
+  return (ctl & CI_CODE_EXTRA_ROI_PENDING_BIT) != 0;
+}
+
+bool roiBackoffStateAllowsCompile(CodeExtra* extra) {
+  if (!getConfig().roi_backoff_enabled || extra == nullptr) {
+    return true;
+  }
+
+  uint32_t ctl = Ci_code_extra_load_roi_ctl_relaxed(extra);
+  if (roiBackoffCtlFrozen(ctl)) {
+    return false;
+  }
+
+  uint64_t floor = Ci_code_extra_load_roi_recompile_floor_relaxed(extra);
+  if (floor == 0) {
+    return true;
+  }
+
+  uint64_t calls = Ci_code_extra_get_calls(extra);
+  if (calls < floor) {
+    return false;
+  }
+
+  Ci_code_extra_store_roi_recompile_floor_release(extra, 0);
+  incAutoJitGateStat(g_auto_jit_gate_stats.roi_recompile);
+  return true;
+}
+
+bool shouldSkipAutoJitScheduleForRoiBackoffFrozen(
+    BorrowedRef<PyFunctionObject> func) {
+  if (!getConfig().roi_backoff_enabled ||
+      cinderx::getModuleState()->jit_list != nullptr) {
+    return false;
+  }
+  if (shouldAlwaysScheduleCompile(BorrowedRef<PyCodeObject>{func->func_code})) {
+    return false;
+  }
+  CodeExtra* extra =
+      codeExtraIfExists(reinterpret_cast<PyCodeObject*>(func->func_code));
+  if (extra == nullptr) {
+    return false;
+  }
+  return roiBackoffCtlFrozen(Ci_code_extra_load_roi_ctl_relaxed(extra));
+}
+
 void setInterpreterJitFlag(bool enabled) {
   PyThreadState* tstate = _PyThreadState_UncheckedGet();
   if (tstate != nullptr && tstate->interp != nullptr) {
@@ -460,6 +580,20 @@ PyObject* jitVectorcall(
       auto entry = getInterpretedVectorcall(func);
       recordAutoJitInterpretedCall(state);
       return entry(func_obj, stack, nargsf, kwnames);
+    }
+
+    if (getConfig().roi_backoff_enabled && state.extra != nullptr) {
+      uint32_t roi_ctl = Ci_code_extra_load_roi_ctl_relaxed(state.extra);
+      if (roiBackoffCtlFrozen(roi_ctl)) {
+        auto entry = getInterpretedVectorcall(func);
+        setVectorcall(func, entry);
+        return entry(func_obj, stack, nargsf, kwnames);
+      }
+      if (!roiBackoffStateAllowsCompile(state.extra)) {
+        auto entry = getInterpretedVectorcall(func);
+        recordAutoJitInterpretedCall(state);
+        return entry(func_obj, stack, nargsf, kwnames);
+      }
     }
 
     uint32_t effective_limit = *limit;
@@ -578,8 +712,6 @@ size_t parse_sized_argument(const std::string& val) {
   return ret_value * scale;
 }
 
-constexpr uint32_t kAutoJitClassifyDefaultThreshold = 2;
-
 bool parse_uint32_arg(std::string_view value, uint32_t* parsed) {
   if (value.empty()) {
     return false;
@@ -656,6 +788,30 @@ FlagProcessor initFlagProcessor() {
       [](const std::string& val) { parseAutoJitOption(val); },
       "Enable auto-JIT mode, which compiles functions after the given "
       "threshold");
+
+  flag_processor.addOption(
+      "jit-auto-roi-backoff",
+      "CINDERX_AUTOJIT_ROI_BACKOFF",
+      getMutableConfig().roi_backoff_enabled,
+      "Enable AutoJIT dynamic negative-ROI backoff after repeated deopts");
+
+  flag_processor.addOption(
+      "jit-auto-roi-backoff-budget",
+      "CINDERX_AUTOJIT_ROI_BACKOFF_BUDGET",
+      getMutableConfig().roi_deopt_budget_base,
+      "Base deopt budget before AutoJIT ROI backoff uncompile");
+
+  flag_processor.addOption(
+      "jit-auto-roi-backoff-max-rounds",
+      "CINDERX_AUTOJIT_ROI_BACKOFF_MAX_ROUNDS",
+      getMutableConfig().roi_backoff_max_rounds,
+      "Maximum AutoJIT ROI backoff rounds before freezing");
+
+  flag_processor.addOption(
+      "jit-auto-roi-rewarm-factor",
+      "CINDERX_AUTOJIT_ROI_REWARM_FACTOR",
+      getMutableConfig().roi_rewarm_factor,
+      "Multiplier for AutoJIT ROI backoff recompile floor");
 
   flag_processor.addOption(
       "jit-debug",
@@ -2866,7 +3022,13 @@ PyObject* autojit_gate_stats(PyObject* /* self */, PyObject*) {
       setAutoJitGateStat(
           stats,
           "forced_compile_fallback",
-          g_auto_jit_gate_stats.forced_compile_fallback) != 0) {
+          g_auto_jit_gate_stats.forced_compile_fallback) != 0 ||
+      setAutoJitGateStat(
+          stats, "roi_uncompile", g_auto_jit_gate_stats.roi_uncompile) != 0 ||
+      setAutoJitGateStat(
+          stats, "roi_recompile", g_auto_jit_gate_stats.roi_recompile) != 0 ||
+      setAutoJitGateStat(
+          stats, "roi_frozen", g_auto_jit_gate_stats.roi_frozen) != 0) {
     return nullptr;
   }
 
@@ -3896,6 +4058,128 @@ void unregisterFunctionCodes(BorrowedRef<PyFunctionObject> func) {
 
 namespace jit {
 
+bool roiBackoffAllowsCompile(BorrowedRef<PyCodeObject> code) {
+  if (!getConfig().roi_backoff_enabled) {
+    return true;
+  }
+  CodeExtra* extra = codeExtraIfExists(code);
+  return roiBackoffStateAllowsCompile(extra);
+}
+
+namespace {
+
+class PreservePythonError {
+ public:
+  PreservePythonError() {
+    PyErr_Fetch(&type_, &value_, &traceback_);
+  }
+
+  ~PreservePythonError() {
+    PyErr_Restore(type_, value_, traceback_);
+  }
+
+  PreservePythonError(const PreservePythonError&) = delete;
+  PreservePythonError& operator=(const PreservePythonError&) = delete;
+
+ private:
+  PyObject* type_{nullptr};
+  PyObject* value_{nullptr};
+  PyObject* traceback_{nullptr};
+};
+
+void triggerRoiBackoff(
+    BorrowedRef<PyCodeObject> code,
+    CodeExtra* extra,
+    uint32_t ctl) {
+  uint32_t expected = ctl;
+  uint32_t pending = (ctl & CI_CODE_EXTRA_ROI_ROUND_MASK) |
+      CI_CODE_EXTRA_ROI_PENDING_BIT;
+  if (!Ci_code_extra_cas_roi_ctl_release(extra, &expected, pending)) {
+    return;
+  }
+
+  FreeThreadedJITEntrypointGuard guard;
+
+  std::vector<Ref<PyFunctionObject>> funcs;
+  if (jitCtx() != nullptr) {
+    for (auto& entry : jitCtx()->compiledFuncs()) {
+      BorrowedRef<PyFunctionObject> func = entry.first;
+      if (reinterpret_cast<PyCodeObject*>(func->func_code) == code.get()) {
+        funcs.emplace_back(Ref<PyFunctionObject>::create(func.get()));
+      }
+    }
+  }
+
+  if (funcs.empty()) {
+    Ci_code_extra_store_roi_ctl_release(extra, ctl);
+    return;
+  }
+
+  uint32_t round = roiBackoffRound(ctl);
+  uint32_t next_round = round + 1;
+  bool frozen = getConfig().roi_backoff_max_rounds == 0 ||
+      next_round >= getConfig().roi_backoff_max_rounds;
+
+  for (auto& func : funcs) {
+    ::uncompileImpl(func);
+  }
+
+  Ci_code_extra_store_roi_deopt_count_relaxed(extra, 0);
+  if (frozen) {
+    Ci_code_extra_store_roi_recompile_floor_release(extra, 0);
+    Ci_code_extra_or_skey_release(extra, kSkeyDecidedColdBit);
+    Ci_code_extra_store_roi_ctl_release(
+        extra, CI_CODE_EXTRA_ROI_FROZEN_BIT | roiBackoffCtlForRound(next_round));
+    incAutoJitGateStat(g_auto_jit_gate_stats.roi_frozen);
+    return;
+  }
+
+  uint64_t calls = Ci_code_extra_get_calls(extra);
+  Ci_code_extra_store_roi_recompile_floor_release(
+      extra, roiBackoffRecompileFloor(calls, round));
+  Ci_code_extra_store_roi_ctl_release(extra, roiBackoffCtlForRound(next_round));
+  incAutoJitGateStat(g_auto_jit_gate_stats.roi_uncompile);
+
+  for (auto& func : funcs) {
+    scheduleJitCompile(func);
+  }
+}
+
+} // namespace
+
+void recordDeoptForRoiBackoff(
+    CodeRuntime* code_runtime,
+    DeoptReason reason,
+    bool is_instrumentation_deopt) {
+  if (!getConfig().roi_backoff_enabled ||
+      !getConfig().compile_after_n_calls.has_value() ||
+      code_runtime == nullptr ||
+      !roiBackoffReasonCounts(reason, is_instrumentation_deopt)) {
+    return;
+  }
+
+  BorrowedRef<PyCodeObject> code = code_runtime->frameState()->code();
+  CodeExtra* extra = codeExtra(code);
+  if (extra == nullptr) {
+    return;
+  }
+
+  uint32_t ctl = Ci_code_extra_load_roi_ctl_relaxed(extra);
+  if (roiBackoffCtlFrozen(ctl) || roiBackoffCtlPending(ctl)) {
+    return;
+  }
+
+  uint32_t round = roiBackoffRound(ctl);
+  uint32_t budget = roiBackoffBudgetForRound(round);
+  uint32_t count = Ci_code_extra_incr_roi_deopt_count(extra);
+  if (count < budget) {
+    return;
+  }
+
+  PreservePythonError preserve_error;
+  triggerRoiBackoff(code, extra, ctl);
+}
+
 int initialize() {
   JIT_CHECK(
       getConfig().state != State::kFinalizing,
@@ -4200,6 +4484,10 @@ bool tryAttachCachedCompiledEntry(BorrowedRef<PyFunctionObject> func) {
 
 bool scheduleJitCompile(BorrowedRef<PyFunctionObject> func) {
   FreeThreadedJITEntrypointGuard guard;
+
+  if (shouldSkipAutoJitScheduleForRoiBackoffFrozen(func)) {
+    return true;
+  }
 
   if (tryAttachCachedCompiledEntry(func)) {
     return true;

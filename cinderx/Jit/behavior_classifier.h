@@ -106,6 +106,7 @@ enum class BranchReason : uint8_t {
   LowRoi,
   StartupInit,
   RiskDefer,
+  RoiBackoff,
   FallbackInvalid,
 };
 

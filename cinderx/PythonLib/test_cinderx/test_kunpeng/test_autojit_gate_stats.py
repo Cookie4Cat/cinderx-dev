@@ -298,6 +298,57 @@ class AutoJitGateStatsDumpTests(unittest.TestCase):
             )
             self.assertFalse(stats_path.exists())
 
+    def test_plugin_roi_backoff_uncompiles_deopt_storm(self) -> None:
+        with tempfile.TemporaryDirectory() as temp:
+            env = _plugin_env()
+            env["PYTHONJITAUTO"] = "auto:100"
+            env["CINDERX_AUTOJIT_ROI_BACKOFF"] = "1"
+            env["CINDERX_AUTOJIT_ROI_BACKOFF_BUDGET"] = "8"
+
+            completed = subprocess.run(
+                [
+                    sys.executable,
+                    "-c",
+                    "import cinderjit\n"
+                    "import cinderx.jit as jit\n"
+                    "\n"
+                    "cinderjit._clear_autojit_gate_stats()\n"
+                    "\n"
+                    "def numeric_loop(value):\n"
+                    "    total = 0\n"
+                    "    for _ in range(8):\n"
+                    "        total += value\n"
+                    "    return total\n"
+                    "\n"
+                    "for _ in range(120):\n"
+                    "    numeric_loop(1)\n"
+                    "\n"
+                    "assert jit.is_jit_compiled(numeric_loop), (\n"
+                    "    jit.count_interpreted_calls(numeric_loop)\n"
+                    ")\n"
+                    "\n"
+                    "for _ in range(32):\n"
+                    "    numeric_loop(1.5)\n"
+                    "\n"
+                    "stats = cinderjit._autojit_gate_stats()\n"
+                    "assert stats['roi_uncompile'] >= 1, stats\n"
+                    "assert stats['roi_recompile'] == 0, stats\n"
+                    "assert stats['roi_frozen'] == 0, stats\n"
+                    "assert not jit.is_jit_compiled(numeric_loop), stats\n",
+                ],
+                cwd=temp,
+                env=env,
+                capture_output=True,
+                text=True,
+                timeout=60,
+            )
+
+            self.assertEqual(
+                completed.returncode,
+                0,
+                f"stdout:\n{completed.stdout}\nstderr:\n{completed.stderr}",
+            )
+
     def test_plugin_freezes_low_roi_functions(self) -> None:
         with tempfile.TemporaryDirectory() as temp:
             env = _plugin_env()

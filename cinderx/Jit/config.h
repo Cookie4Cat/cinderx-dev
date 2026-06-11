@@ -226,6 +226,13 @@ struct Config {
   // Provider-before v1 keeps startup/import deferral disabled. This is only
   // for a later import-depth provider-backed slice.
   bool enable_startup_init_policy{false};
+  // Minimal dynamic feedback for code that compiles successfully but then
+  // repeatedly deopts. Disabled by default; enabled independently from
+  // auto_classify so A/B can isolate its effect.
+  bool roi_backoff_enabled{false};
+  size_t roi_deopt_budget_base{256};
+  size_t roi_backoff_max_rounds{2};
+  size_t roi_rewarm_factor{64};
   GdbOptions gdb;
   JitListOptions jit_list;
   LogOptions log;

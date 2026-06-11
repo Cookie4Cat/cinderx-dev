@@ -343,6 +343,9 @@ std::vector<BCOffset> collectBackedgeTargetOffsets(
 }
 
 bool osrCompileBudgetCheck(BorrowedRef<PyCodeObject> code) {
+  if (!jit::roiBackoffAllowsCompile(code)) {
+    return false;
+  }
   return Py_SIZE(code) <= getConfig().osr_compile_budget_code_units;
 }
 

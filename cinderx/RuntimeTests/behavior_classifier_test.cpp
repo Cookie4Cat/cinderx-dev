@@ -26,19 +26,31 @@ class ScopedAutoJitConfig {
       : compile_after_n_calls_{getMutableConfig().compile_after_n_calls},
         auto_classify_{getMutableConfig().auto_classify},
         enable_startup_init_policy_{
-            getMutableConfig().enable_startup_init_policy} {}
+            getMutableConfig().enable_startup_init_policy},
+        roi_backoff_enabled_{getMutableConfig().roi_backoff_enabled},
+        roi_deopt_budget_base_{getMutableConfig().roi_deopt_budget_base},
+        roi_backoff_max_rounds_{getMutableConfig().roi_backoff_max_rounds},
+        roi_rewarm_factor_{getMutableConfig().roi_rewarm_factor} {}
 
   ~ScopedAutoJitConfig() {
     getMutableConfig().compile_after_n_calls = compile_after_n_calls_;
     getMutableConfig().auto_classify = auto_classify_;
     getMutableConfig().enable_startup_init_policy =
         enable_startup_init_policy_;
+    getMutableConfig().roi_backoff_enabled = roi_backoff_enabled_;
+    getMutableConfig().roi_deopt_budget_base = roi_deopt_budget_base_;
+    getMutableConfig().roi_backoff_max_rounds = roi_backoff_max_rounds_;
+    getMutableConfig().roi_rewarm_factor = roi_rewarm_factor_;
   }
 
  private:
   std::optional<uint32_t> compile_after_n_calls_;
   bool auto_classify_;
   bool enable_startup_init_policy_;
+  bool roi_backoff_enabled_;
+  size_t roi_deopt_budget_base_;
+  size_t roi_backoff_max_rounds_;
+  size_t roi_rewarm_factor_;
 };
 
 } // namespace
@@ -1065,6 +1077,49 @@ stats = cinderjit._autojit_gate_stats()
 assert stats["classified_schedule_cold_skip"] >= 32, stats
 assert stats["jit_vectorcall"] == 0, stats
 assert stats["classified_defer_freeze"] == 0, stats
+)");
+}
+
+TEST_F(BehaviorClassifierRuntimeTest, RoiBackoffUncompilesDeoptStorm) {
+  ScopedAutoJitConfig config_guard;
+  getMutableConfig().compile_after_n_calls = 100;
+  getMutableConfig().auto_classify = false;
+  getMutableConfig().enable_startup_init_policy = false;
+  getMutableConfig().roi_backoff_enabled = true;
+  getMutableConfig().roi_deopt_budget_base = 32;
+  getMutableConfig().roi_backoff_max_rounds = 2;
+  getMutableConfig().roi_rewarm_factor = 64;
+
+  runStockCode(R"(
+import cinderjit
+import cinderx.jit as jit
+
+cinderjit._clear_autojit_gate_stats()
+
+def numeric_loop(value):
+    total = 0
+    for _ in range(8):
+        total += value
+    return total
+
+for _ in range(120):
+    numeric_loop(1)
+
+assert jit.is_jit_compiled(numeric_loop), jit.count_interpreted_calls(numeric_loop)
+
+for _ in range(80):
+    numeric_loop(1.5)
+
+stats = cinderjit._autojit_gate_stats()
+assert stats["roi_uncompile"] >= 1, stats
+assert stats["roi_frozen"] == 0, stats
+assert not jit.is_jit_compiled(numeric_loop), stats
+
+calls = jit.count_interpreted_calls(numeric_loop)
+for _ in range(8):
+    numeric_loop(1.5)
+assert not jit.is_jit_compiled(numeric_loop), cinderjit._autojit_gate_stats()
+assert jit.count_interpreted_calls(numeric_loop) > calls
 )");
 }
 
