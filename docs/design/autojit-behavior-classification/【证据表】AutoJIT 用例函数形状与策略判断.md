@@ -10,6 +10,7 @@
 
 | 版本 | 日期 | 修订人 | 修订说明 |
 |---|---|---|---|
+| v0.33 | 2026-06-11 | @sisibeloved | 复核 `dask` 后续优化方向：按串行同核 `--affinity=30` 正式复跑默认 AutoJIT 与 `PYTHONJITATTRCACHES=0`，结果 `1.68s -> 1.61s`，`1.04x faster`，确认 noattr 是小正信号但属于全局 JIT 行为变化，不能直接默认化。补 per-site deopt 字段复核：RoiBackoff on 后当前 dask deopt 从 `64164` 降到 `129`，历史 LOAD_ATTR_SLOT 风暴已不是当前主项；关闭 LOAD_ATTR fallback、关闭 array double fastpath 均无收益。策略结论更新为：不继续扩大 startup/provider，也不做全局 slot fallback；下一步只考虑局部 attr-cache/PIC/expected-exception 等 JIT 动态成本专项。 |
 | v0.32 | 2026-06-11 | @sisibeloved | 重写 `logging_silent` 复核证据：正式五口径和 HIR/LIR 证明 `Logger.isEnabledFor` 与外层 `bench_silent` call-only loop 进入 CinderX JIT 均为负收益。删除 cached-predicate 静态放行，新增 `CallDispatcher + dims=Object|Dispatch + loop=1 + codeB=1 + risk=None` 的 LowRoi 延迟。正式 `logging_silent` 从原 AutoJIT `328ns` 降到 `212ns`，相对 CPython JIT `219ns` 为 `1.03x faster`；新增 `test_plugin_defers_logging_disabled_fast_path` 与 `test_plugin_defers_call_only_dispatch_loop`。同步补 dask RoiBackoff 复核：`1.67s -> 1.62s`，小收益但非根治。 |
 | v0.31 | 2026-06-11 | @guo | 补 `logging_silent` cached predicate 误伤修复证据：`logging.Logger.isEnabledFor` 是 steady-state 缓存命中立即返回、异常慢路径填充 cache 的小 predicate；原 `RiskDefer` 把它冻结在解释器中会放大 disabled logging 百纳秒级快路径成本。新增通用 cached-predicate-with-exception-slow-path 形状放行，不按 logging 文件名/函数名白名单。验证：gate probe 显示 `classified_defer_freeze=0`、`forced_compile>=1`、`Logger.isEnabledFor` 已 JIT；本地复测达到 `logging_silent` 112ns 目标，且修复分支相对同事实验分支只新增该形状规则和测试。 |
 | v0.30 | 2026-06-10 | @sisibeloved | 补 `dask` 直接失败修复证据：plain generator steady-state override 误把 `@types.coroutine` 生成的 generator-based coroutine 当普通 generator 放行，导致 `asyncio.tasks:__sleep0` 在 `calls=2 limit=2 reason=None` 下进入 JIT，随后 `asyncio.sleep(0)` 抛 `TypeError: 'generator' object can't be awaited`。修复后排除 `CO_ITERABLE_COROUTINE`/coroutine/async-generator flags；`dask --fast` 通过，compile-events 中不再出现 `__sleep0`，正式 `dask=1.77s +- 0.05s`，相对旧 AutoJIT `1.15x faster`，但仍比 CPython JIT/plugin-no-JIT `1.30x slower`。BehaviorClassifier 42/42、`test_autojit_gate_stats` 8/8 通过。 |
@@ -102,6 +103,7 @@
 | `dask` | 正式 pyperformance 五口径：CPython 3.14.3 JIT、CinderX no-plugin、CinderX plugin-no-JIT、`PYTHONJITAUTO=2`、当前 AutoJIT；`--warmup 3 --affinity=30` | `blue-98:cinderx-test:/results/autojit-dask-ledger-20260609/{cpython_jit_dask_aff30.json,cinderx_no_plugin_dask_aff30.json,cinderx_plugin_nojit_dask_aff30.json,cinderx_auto2_dask_aff30.json,cinderx_autojit_dask_aff30.json,logs/*}` | CPython JIT `1.360s`；CinderX no-plugin `1.289s`；plugin-no-JIT `1.355s`；`auto=2` `2.005s`；当前 AutoJIT `2.022s`。差距主要来自启用 CinderX JIT 后新增约 `+650ms`，不是插件固定成本 |
 | `dask` | debug shape/gate/deopt：`--fast -n 3 -w 1`，`PYTHONJITLOGFILE` + `CINDERX_AUTOJIT_GATE_STATS_FILE` + `CINDERX_AUTOJIT_COMPILE_EVENTS_FILE` | `blue-98:cinderx-test:/results/autojit-dask-ledger-20260609/{dask-gate-stats.jsonl,dask-compile-events.jsonl,worker-gate-shapes/*.jit.log,dask-debug-fast.json}` | 4 个 worker 合计约 `962700` 次 gate、`3408` 次 forced compile、`161135` 次 defer freeze；编译事件 `3485` 条中 `3440` 条在 steady 阶段；deopt 合计 `1020754` 次，主要是 `GuardFailure` 和 expected exception |
 | `dask` | plain generator override 误伤复现与修复：`PYTHONJITAUTO=auto:2`，默认 provider，`PYTHONJITHUGEPAGES=0`；失败/修复均附 compile-events | `blue-98:cinderx-test:/results/autojit-dask-failure-20260610/{dask-fast-autojit.log,dask-fail-compile-events.jsonl,dask-fast-autojit-fixed.json,dask-fixed-compile-events.jsonl,dask-formal-autojit-fixed.json,logs/*}` | 失败口径中 `asyncio.tasks:__sleep0` 以 `calls=2 limit=2 reason=None` forced compile，触发 `TypeError: 'generator' object can't be awaited`；修复后 `dask --fast` 通过且 fixed compile-events 不再含 `__sleep0`；正式 `dask=1.77s +- 0.05s`，相对旧 AutoJIT `1.15x faster`，仍比 CPython JIT/plugin-no-JIT `1.30x slower` |
+| `dask` | RoiBackoff 后 per-site deopt 与 noattr 正式复核：默认 AutoJIT vs `PYTHONJITATTRCACHES=0`，串行同核 `--affinity=30 --warmup 3`，无 dump/HIR/debug 变量 | `blue-98:cinderx-test:/results/autojit-dask-site-fields-{roion,roioff}-20260611_203926`；`blue-98:cinderx-test:/results/autojit-dask-noattr-serial-aff30-20260611_212203/{default.json,noattr.json,compare-noattr-vs-default.txt,*.stats.txt,logs/*}` | 当前 RoiBackoff on 后 deopt 只剩 `129`，off 为 `64164`；历史 LOAD_ATTR_SLOT 风暴已不是当前主项。正式同核复跑默认 `1.68s +- 0.05s`，noattr `1.61s +- 0.04s`，`1.04x faster`；noattr 是小正信号但为全局 JIT 开关，不能直接作为生产默认 |
 | `coverage` | direct worker，`PYTHONJITAUTO=auto:2`，`CINDERX_AUTOJIT_IMPORT_PROVIDER=find_and_load` | `blue-98:/results/autojit-import-highcost-bucket1-20260605/worker-gate-shapes/coverage.*.jit.log` | 有真实 C++ gate 形状；debug 口径，不作为性能数值 |
 | `generators` | direct worker，同上 | `blue-98:/results/autojit-import-highcost-bucket1-20260605/worker-gate-shapes/generators.*.jit.log` | 有真实 C++ gate 形状；debug 口径 |
 | `generators` | 误伤复现与修复 A/B：`PYTHONJITAUTO=auto:2`，默认 provider；对照 `PYTHONJITAUTO=2`、破损 AutoJIT、修复后 AutoJIT；附 compile-events 验证 `Tree.__iter__` 是否进入 JIT | `blue-98:cinderx-test:/results/autojit-generators-regression-20260610/{generators-cinderx-auto2.json,generators-cinderx-autojit.json,generators-cinderx-autojit-fixed.json,generators-autojit-compile-events.jsonl,generators-autojit-fixed-compile-events.jsonl}` | `PYTHONJITAUTO=2` `21.7ms +- 6.2ms`；破损 AutoJIT `60.2ms +- 0.3ms`；修复后 `21.7ms +- 5.8ms`。修复后相对破损 `2.78x faster`，与 `auto=2` 不显著；compile-events 确认修复后 `Tree.__iter__ limit=2 reason=None` |
@@ -946,6 +948,8 @@ debug 口径：临时 autohook 只 `import _cinderx_auto`，`bm_pickle --pure-py
 
 ### 17.2 总表：差距账本
 
+注意：本小节保留 v0.23 初始账本，用来说明 dask 的原始差距来源；它不是 v0.32 的最新主线性能。RoiBackoff、per-site deopt 和 noattr 复核见 §17.2.1 与 §17.4.1。
+
 口径：`blue-98`，`--warmup 3 --affinity=30`，正式 pyperformance 60 values。CPython JIT 使用 `/opt/python314-jit/bin/python3.14`；CinderX 口径使用同一 `/opt/python314` 和同一 dask venv，只改变 `CINDERX_PLUGIN_ENABLE` / `PYTHONJITAUTO` / provider 环境变量。
 
 基线：CPython 3.14.3 JIT **1360.2ms**。优化前：CinderX `PYTHONJITAUTO=2` **2005.5ms**，慢 **+645.2ms**。当前 AutoJIT：`auto:2 + provider` **2021.8ms**，慢 **+661.5ms**。
@@ -968,25 +972,38 @@ debug 口径：临时 autohook 只 `import _cinderx_auto`，`bm_pickle --pure-py
 
 ### 17.2.1 2026-06-11 复核
 
-本轮按“先 RoiBackoff A/B，再看剩余成本”的顺序复核 dask：
+本轮按“先确认 deopt 风暴是否还在，再复核小收益开关”的顺序执行。正式性能复核使用串行同核口径：两轮都在 `blue-98:cinderx-test`，同一 worker venv `/root/venv/cpython3.14-43f131f998a6-compat-31b33d68c68a`，同一 `--affinity=30 --warmup 3 -b dask`，唯一差异是第二轮额外设置 `PYTHONJITATTRCACHES=0`。CPU 0-47 可用，CPU 30 对应 core 30；本轮没有并行抢同一核。
 
-| 口径 | 结果 | 结论 |
-|---|---:|---|
-| `CINDERX_AUTOJIT_ROI_BACKOFF=0` | `1.67s +- 0.05s` | 旧 AutoJIT steady JIT 成本仍明显 |
-| `CINDERX_AUTOJIT_ROI_BACKOFF=1` | `1.62s +- 0.04s` | RoiBackoff 约 `1.03x faster`，有小收益但不是根治 |
-| 撤销 cached-predicate 后复测 | `1.63s +- 0.04s` | 对 dask 无显著回归 |
+环境契约：
 
-产物：
+| 项 | 证据 |
+|---|---|
+| worker 命令 | `/root/venv/cpython3.14-43f131f998a6-compat-31b33d68c68a/bin/python -u .../bm_dask/run_benchmark.py --affinity=30 --warmups=3` |
+| worker venv | `include-system-site-packages = true`，system site 包含 `/opt/python314/lib/python3.14/site-packages/cinderx.pth` 与 `__editable__.cinderx-2026.6.9.0.pth` |
+| JIT 初始化 | worker 内 `cinderx.__file__=/cinderx/cinderx/PythonLib/cinderx/__init__.py`，`_cinderx.__file__=/cinderx/cinderx/PythonLib/_cinderx.so`，`cinderx.get_import_error()=None`，`cinderx.is_initialized()=True` |
+| 继承变量 | `CINDERX_PLUGIN_ENABLE`、`PYTHONJITAUTO`、`PYTHONJITHUGEPAGES`、`PYTHONJITATTRCACHES`、`LD_LIBRARY_PATH`、`PYTHONPATH`、代理变量 |
+| 正式/诊断 | 正式性能数据清理了 `PYTHONJITLOGFILE`、`PYTHONJITDUMPSTATS`、HIR/LIR dump、gate stats、compile events 等诊断变量 |
 
-- RoiBackoff A/B：`blue-98:/results/autojit-dask-roi-ab-20260611_175540`
-- full diag：`blue-98:/results/autojit-dask-full-diag-20260611_190127`
-- cached-predicate 复测：`blue-98:/results/autojit-dask-after-cached-predicate-defer-20260611_193542`
+复核结果：
 
-新的诊断结论：
+| 实验 | 产物 | 结果 | 结论 |
+|---|---|---:|---|
+| RoiBackoff on/off 历史正式 A/B | `/results/autojit-dask-roi-ab-20260611_175540` | off `1.67s +- 0.05s`，on `1.62s +- 0.04s` | RoiBackoff 对 dask 有约 `1.03x` 小收益，但不是根治 |
+| 当前默认 AutoJIT 串行同核 | `/results/autojit-dask-noattr-serial-aff30-20260611_212203/default.json` | `1.68s +- 0.05s`，60 values，无 outlier，pyperf 提示样本不足以证明 `<1%` 稳定性 | 当前主线仍在 `1.6s+`，离 CPython JIT `1.36s` 仍有约 `+320ms` |
+| `PYTHONJITATTRCACHES=0` 串行同核 | `/results/autojit-dask-noattr-serial-aff30-20260611_212203/noattr.json` | `1.61s +- 0.04s`，相对默认 `1.04x faster` | noattr 正信号在同核串行口径下复现，但它是全局 JIT 开关，不能直接默认化 |
+| 关闭 LOAD_ATTR_SLOT mismatch fallback 穿刺 | `/results/autojit-dask-loadattr-fallbackoff-formal-20260611_204911` | `1.66s +- 0.06s`，且 site 分布仍为 `129` deopt | 关闭 fallback 没有稳定收益；LOAD_ATTR_SLOT 不是当前 dask 的主杠杆 |
+| 关闭 array double fastpath 穿刺 | `/results/autojit-dask-noarray-formal-20260611_210653` | `1.68s +- 0.05s` | 负收益，历史 worker 单值信号未复现 |
+| noattr + noarray 穿刺 | `/results/autojit-dask-noattr-noarray-formal-20260611_210653` | `1.65s +- 0.05s` | noarray 抵消 noattr 收益，不保留 |
 
-- 当前版本下旧的百万级 deopt storm 不再复现。full diag 中 RoiBackoff off/on 的 deopt 约为 `274 -> 35`，主要来自 pip/logging 元数据路径，不再是 dask 主体。
-- 当前最大的可见 AutoJIT 信号变成约 `1.95M` 次 `classified_schedule_cold_skip`，top 包括 `distributed.metrics:ContextMeter.meter.<locals>.callback`、`distributed.worker_state_machine:WorkerState._transitions.<locals>.process_recs`、`dask.tokenize:_normalize_seq_func.<locals>._inner_normalize_token` 等。冷跳过 cache spike 没有带来显著收益，因此剩余差距不应继续归因到阈值计算本身。
-- dask 仍是 steady-state JIT 动态成本样本，不是 startup/import 样本；后续优化应转向 JIT codegen 的多态 guard、expected exception 慢路径、frame/call 固定成本，而不是扩大静态 highcost 或 provider 规则。
+读表结论：
+
+| 问题 | 当前答案 |
+|---|---|
+| RoiBackoff 是否有效 | 有效。它把一类 expected-exception/调用类风暴压下去，正式性能约 `1.03x` 小收益。 |
+| 当前 dask 还慢在哪里 | 仍慢在启用 CinderX JIT 后的 steady 动态成本；不是 startup/import/provider。 |
+| LOAD/STORE slot 全局 fallback 是否是方向 | 不是。LOAD fallback-off 不改善；历史 STORE fallback 也无收益。全局改 lowering 会影响大量单态站点的精化收益。 |
+| noattr 是否值得做 | 值得继续研究，但只能做“局部策略/PIC/站点级泛化”方向；不能把 `PYTHONJITATTRCACHES=0` 作为生产默认。 |
+| noarray 是否值得做 | 不值得。正式口径负收益。 |
 
 ### 17.3 分表一：gate 与编译规模
 
@@ -1053,6 +1070,34 @@ top deopt site：
 | `distributed.protocol.pickle:dumps` | 29087 | `UnhandledException/CallEx` + `GuardFailure/GuardType` | 序列化调用形态复杂 |
 | `distributed.client:Future._verify_initialized` | 28000 | `Raise/Raise` | Future 状态校验中的正常控制流 |
 
+### 17.4.1 当前 RoiBackoff 后的 deopt 复核
+
+上表是 v0.23 历史账本，用来说明 dask 为什么是 RoiBackoff 的动机样本。当前版本启用 RoiBackoff 后，百万级 deopt storm 已经不再是当前状态。2026-06-11 用新增的 per-site 字段重新 dump：
+
+| 口径 | 产物 | 总 deopt | top 分布 | 判断 |
+|---|---|---:|---|---|
+| RoiBackoff off | `/results/autojit-dask-site-fields-roioff-20260611_203926` | `64164` | `zict.lru:LRU.__delitem__` `DeleteSubscr=30792`；`distributed.utils:set_thread_state` `VectorCall=30792`；`asyncio.base_events:BaseEventLoop.call_later` `GuardType=2367` | expected-exception/调用类风暴仍会出现；RoiBackoff 的动机成立 |
+| RoiBackoff on | `/results/autojit-dask-site-fields-roion-20260611_203926` | `129` | `distributed.spans:SpansSchedulerExtension.heartbeat` `GuardType=52`；`distributed.worker_state_machine:StateMachineEvent.to_loggable` `STORE_ATTR_SLOT=28`；`distributed.scheduler:Scheduler.heartbeat_worker` `GuardType=24`；`Scheduler.remove_worker` `CallMethod=20` | 大风暴已被压到百级，剩余 deopt 不是 LOAD_ATTR_SLOT 主导 |
+
+per-site 字段让每个 deopt 事件能落到 `bc_offset/deopt_idx/opcode/specialized_opcode`：
+
+| 代表 site | `bc_offset` | `deopt_idx` | `opcode/specialized_opcode` | 次数 | 读法 |
+|---|---:|---:|---:|---:|---|
+| `distributed.spans:SpansSchedulerExtension.heartbeat` | `182` | `23/24` | `86/86` | `28/24` | 当前 RoiBackoff on 后的最大 GuardType 小项 |
+| `distributed.worker_state_machine:StateMachineEvent.to_loggable` | `2` | `1` | `87/87` | `28` | STORE_ATTR_SLOT 小项，不支持全局 STORE fallback |
+| `distributed.scheduler:Scheduler.heartbeat_worker` | `404` | `38` | `44/133` | `24` | scheduler 心跳小项 |
+| `zict.lru:LRU.__delitem__`（RoiBackoff off） | `88` | `6` | `8/8` | `30792` | 关闭 RoiBackoff 后 expected `DeleteSubscr` 风暴立即出现 |
+| `distributed.utils:set_thread_state`（RoiBackoff off） | `44` | `8` | `52/52` | `30792` | 关闭 RoiBackoff 后调用类风暴立即出现 |
+
+这组复核改变了 dask 的下一步优先级：
+
+| 原假设 | 复核后处理 |
+|---|---|
+| LOAD_ATTR_SLOT 风暴仍是当前主项 | 否。当前 RoiBackoff on 后只有 `129` 次 deopt，LOAD_ATTR_SLOT 不再是 top 项。 |
+| 全局 slot fallback 能解决 dask | 否。LOAD fallback-off 正式 `1.66s +- 0.06s` 无收益；历史 STORE fallback 也无收益。 |
+| 禁编 top GuardFailure 函数能解决 dask | 不足。RoiBackoff 已经能压大风暴，但默认仍在 `1.6s+`，剩余差距还包含 attr cache、call/frame 固定成本、解释/JIT 切换等小账。 |
+| 继续调 AutoJIT 静态分类能解决 dask | 不足。当前最清晰的小正信号来自 `PYTHONJITATTRCACHES=0`，这是 JIT codegen/runtime 行为，不是 startup/import 分类。 |
+
 ### 17.5 2026-06-10 直接失败链路
 
 | 阶段 | 证据 | 判断 |
@@ -1087,8 +1132,18 @@ top deopt site：
 | 代表函数是 scheduler/worker/client/asyncio/cloudpickle/zict 的主体路径 | 不能简单全局拦 `BranchFSM/ObjectManipulator/ReflectionMeta + codeB>0`，否则会把 dask 主体工作禁编 |
 | `asyncio.tasks:__sleep0` 是 `CO_ITERABLE_COROUTINE` | plain generator 放行规则必须排除 generator-based coroutine；否则会从性能误伤升级为功能失败 |
 | deopt 主要来自 slot guard 多态、expected exception、状态机事件多态 | 真正优化路线是 JIT 动态成本专项：slot guard 多态处理、expected exception 慢路径、状态机/序列化路径的 deopt-aware 策略 |
+| 当前 RoiBackoff on 后 deopt 已降到百级 | 不能继续把历史百万级 deopt 当作当前主瓶颈；RoiBackoff 已止血，剩余差距需要重新拆账 |
+| `PYTHONJITATTRCACHES=0` 同核串行复核 `1.04x faster` | attr cache 是可疑小账，但全局关闭风险过大；只能继续做局部 attr-cache/PIC/站点级泛化实验 |
+| LOAD_ATTR fallback-off、STORE fallback、noarray 都没有正式收益 | 不做全局 lowering 回退；这类改动会影响大量单态站点和数组快路径，收益证据不足 |
 
-策略结论：`dask` 应作为 **steady async/framework 动态负 ROI 样本** 进入证据集。当前 AutoJIT v1 不根据 dask 扩大 startup/import 规则；若后续要优化 dask，应该单独做 deopt-aware A/B，例如先针对 `distributed.worker_state_machine` / `distributed.scheduler.TaskCollection` / `zict.__delitem__` / `cloudpickle` 热点验证“禁编或优化 JIT deopt”哪条更有效。
+策略结论：`dask` 应作为 **steady async/framework 动态负 ROI 样本** 进入证据集。当前 AutoJIT v1 不根据 dask 扩大 startup/import 规则，也不根据 dask 默认关闭全局 attr cache 或全局 slot fallback。若后续继续优化 dask，优先级是：
+
+| 优先级 | 方向 | 原因 |
+|---|---|---|
+| P1 | 局部 attr-cache/PIC/站点级泛化 | noattr 同核串行复核有 `1.04x` 正信号，但只能局部化，不能全局默认 |
+| P2 | expected-exception 慢路径专项 | RoiBackoff off 时 `DeleteSubscr`/`VectorCall` 风暴立即出现，说明这类慢路径仍是潜在大账 |
+| P3 | 重新拆当前 `1.61-1.68s` 剩余成本 | 当前 deopt 已不大，剩余差距可能在 frame/call 固定成本、attr cache 维护、JIT/解释切换等小账 |
+| 暂不做 | 扩大 provider、全局 highcost 静态拦截、全局 LOAD/STORE fallback、noarray | 已有正式或穿刺证据显示不是当前 dask 主杠杆 |
 
 ## 18 用例：richards
 

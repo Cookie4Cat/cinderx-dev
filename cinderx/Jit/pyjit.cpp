@@ -19,6 +19,7 @@
 #include "cinderx/Interpreter/interpreter.h"
 #include "cinderx/Jit/behavior_classifier.h"
 #include "cinderx/Jit/autojit_import.h"
+#include "cinderx/Jit/bytecode.h"
 #include "cinderx/Jit/code_allocator.h"
 #include "cinderx/Jit/codegen/arch/detection.h"
 #include "cinderx/Jit/codegen/tls.h"
@@ -2883,8 +2884,11 @@ int check(int ret) {
 void collect_deopt_stat(
     const DeoptStat& stat,
     const DeoptMetadata& meta,
+    std::size_t deopt_idx,
     BorrowedRef<> stats) {
+  DEFINE_STATIC_STRING(bc_offset);
   DEFINE_STATIC_STRING(count);
+  DEFINE_STATIC_STRING(deopt_idx);
   DEFINE_STATIC_STRING(description);
   DEFINE_STATIC_STRING(filename);
   DEFINE_STATIC_STRING(func_qualname);
@@ -2892,17 +2896,34 @@ void collect_deopt_stat(
   DEFINE_STATIC_STRING(lineno);
   DEFINE_STATIC_STRING(normal);
   DEFINE_STATIC_STRING(int);
+  DEFINE_STATIC_STRING(nonce);
+  DEFINE_STATIC_STRING(opcode);
   DEFINE_STATIC_STRING(reason);
+  DEFINE_STATIC_STRING(specialized_opcode);
 
   const DeoptFrameMetadata& frame_meta = meta.innermostFrame();
   BorrowedRef<PyCodeObject> code = frame_meta.code;
 
   auto func_qualname = code->co_qualname;
   BCOffset line_offset = frame_meta.cause_instr_idx;
+  int opcode_raw = -1;
+  int specialized_opcode_raw = -1;
+  if (line_offset.value() >= 0) {
+    BytecodeInstruction instr{code, line_offset};
+    opcode_raw = instr.opcode();
+    specialized_opcode_raw = instr.specializedOpcode();
+  }
   int lineno_raw = code->co_linetable != nullptr
       ? PyCode_Addr2Line(code, line_offset.value())
       : -1;
   auto lineno = Ref<>::steal(check(PyLong_FromLong(lineno_raw)));
+  auto bc_offset =
+      Ref<>::steal(check(PyLong_FromLong(line_offset.value())));
+  auto deopt_idx_obj = Ref<>::steal(check(PyLong_FromSize_t(deopt_idx)));
+  auto nonce = Ref<>::steal(check(PyLong_FromSize_t(meta.nonce)));
+  auto opcode = Ref<>::steal(check(PyLong_FromLong(opcode_raw)));
+  auto specialized_opcode =
+      Ref<>::steal(check(PyLong_FromLong(specialized_opcode_raw)));
   auto reason =
       Ref<>::steal(check(PyUnicode_FromString(deoptReasonName(meta.reason))));
   auto description = Ref<>::steal(check(PyUnicode_FromString(meta.descr)));
@@ -2918,6 +2939,11 @@ void collect_deopt_stat(
     check(PyDict_SetItem(normals, s_func_qualname, func_qualname));
     check(PyDict_SetItem(normals, s_filename, code->co_filename));
     check(PyDict_SetItem(ints, s_lineno, lineno));
+    check(PyDict_SetItem(ints, s_bc_offset, bc_offset));
+    check(PyDict_SetItem(ints, s_deopt_idx, deopt_idx_obj));
+    check(PyDict_SetItem(ints, s_nonce, nonce));
+    check(PyDict_SetItem(ints, s_opcode, opcode));
+    check(PyDict_SetItem(ints, s_specialized_opcode, specialized_opcode));
     check(PyDict_SetItem(normals, s_reason, reason));
     check(PyDict_SetItem(normals, s_description, description));
 
@@ -2958,7 +2984,7 @@ Ref<> make_deopt_stats() {
       const DeoptMetadata& meta = deopt_metadatas[deopt_idx];
 
       ctx->ifDeoptStat(code_runtime, deopt_idx, [&](const auto& stat) {
-        collect_deopt_stat(stat, meta, stats);
+        collect_deopt_stat(stat, meta, deopt_idx, stats);
       });
     }
   }
