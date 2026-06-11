@@ -77,6 +77,7 @@ constexpr uint32_t kAutoJitLongLowRoiFreezeThreshold = 1000;
 struct AutoJitGateStats {
   std::atomic<uint64_t> jit_vectorcall{0};
   std::atomic<uint64_t> global_threshold_return{0};
+  std::atomic<uint64_t> classified_schedule_cold_skip{0};
   std::atomic<uint64_t> classified_warmup_return{0};
   std::atomic<uint64_t> classified_defer_freeze{0};
   std::atomic<uint64_t> forced_compile{0};
@@ -102,6 +103,8 @@ void incAutoJitGateStat(std::atomic<uint64_t>& stat) {
 void clearAutoJitGateStats() {
   g_auto_jit_gate_stats.jit_vectorcall.store(0, std::memory_order_relaxed);
   g_auto_jit_gate_stats.global_threshold_return.store(
+      0, std::memory_order_relaxed);
+  g_auto_jit_gate_stats.classified_schedule_cold_skip.store(
       0, std::memory_order_relaxed);
   g_auto_jit_gate_stats.classified_warmup_return.store(
       0, std::memory_order_relaxed);
@@ -2844,6 +2847,10 @@ PyObject* autojit_gate_stats(PyObject* /* self */, PyObject*) {
           g_auto_jit_gate_stats.global_threshold_return) != 0 ||
       setAutoJitGateStat(
           stats,
+          "classified_schedule_cold_skip",
+          g_auto_jit_gate_stats.classified_schedule_cold_skip) != 0 ||
+      setAutoJitGateStat(
+          stats,
           "classified_warmup_return",
           g_auto_jit_gate_stats.classified_warmup_return) != 0 ||
       setAutoJitGateStat(
@@ -4108,6 +4115,40 @@ bool shouldScheduleCompile(BorrowedRef<PyFunctionObject> func) {
       getConfig().compile_after_n_calls.has_value();
 }
 
+bool shouldSkipAutoJitScheduleForSteadyColdCode(
+    BorrowedRef<PyFunctionObject> func) {
+  if (!getConfig().auto_classify ||
+      !getConfig().compile_after_n_calls.has_value() ||
+      cinderx::getModuleState()->jit_list != nullptr) {
+    return false;
+  }
+
+  BorrowedRef<PyCodeObject> code{func->func_code};
+  if (shouldAlwaysScheduleCompile(code)) {
+    return false;
+  }
+  CodeExtra* extra = codeExtraIfExists(code);
+  if (extra == nullptr) {
+    return false;
+  }
+
+  uint32_t skey_word = Ci_code_extra_load_skey_acquire(extra);
+  if ((skey_word & kSkeyDecidedColdBit) == 0 ||
+      (skey_word & kSkeyValidBit) == 0) {
+    return false;
+  }
+
+  StructureKey key = StructureKey::unpack(skey_word & kSkeyPayloadMask);
+  GateContext steady_state{};
+  ThresholdDecision decision = computeThresholdForCode(
+      code, key, steady_state, *getConfig().compile_after_n_calls);
+  bool freeze_low_roi =
+      decision.branch_reason == BranchReason::LowRoi &&
+      (decision.limit >= kAutoJitLongLowRoiFreezeThreshold ||
+       key.family == Family::Trivial);
+  return decision.limit >= kAutoJitInterpretOnlyThreshold || freeze_low_roi;
+}
+
 // Fast path for creating a function whose code object has already been
 // JIT-compiled with the same globals/builtins (e.g. a closure or generator
 // expression recreated each iteration of a hot loop). It skips the
@@ -4161,6 +4202,12 @@ bool scheduleJitCompile(BorrowedRef<PyFunctionObject> func) {
   FreeThreadedJITEntrypointGuard guard;
 
   if (tryAttachCachedCompiledEntry(func)) {
+    return true;
+  }
+
+  if (shouldSkipAutoJitScheduleForSteadyColdCode(func)) {
+    incAutoJitGateStat(
+        g_auto_jit_gate_stats.classified_schedule_cold_skip);
     return true;
   }
 

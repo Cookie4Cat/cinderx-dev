@@ -491,6 +491,54 @@ TEST(
       dispatching_exception_loop_decision.branch_reason, BranchReason::LowRoi);
 }
 
+TEST(BehaviorClassifierTest, SteadyStateDefersMultidimNonnumericObjectGraphs) {
+  GateContext steady_state{false};
+
+  StructureKey reflection_object_graph{Family::ReflectionMeta};
+  reflection_object_graph.loop_score = 1;
+  reflection_object_graph.code_size_bucket = 1;
+  reflection_object_graph.active_dim_mask =
+      activeDimMaskFor(WorkDim::Object) | activeDimMaskFor(WorkDim::Dispatch) |
+      activeDimMaskFor(WorkDim::Dynamic);
+  auto reflection_decision =
+      computeThreshold(reflection_object_graph, steady_state, 2);
+  EXPECT_GE(reflection_decision.limit, 65536);
+  EXPECT_EQ(reflection_decision.branch_reason, BranchReason::LowRoi);
+
+  StructureKey call_dispatch_graph{Family::CallDispatcher};
+  call_dispatch_graph.loop_score = 1;
+  call_dispatch_graph.active_dim_mask =
+      activeDimMaskFor(WorkDim::Control) |
+      activeDimMaskFor(WorkDim::Object) |
+      activeDimMaskFor(WorkDim::Dispatch);
+  auto call_dispatch_decision =
+      computeThreshold(call_dispatch_graph, steady_state, 2);
+  EXPECT_GE(call_dispatch_decision.limit, 65536);
+  EXPECT_EQ(call_dispatch_decision.branch_reason, BranchReason::LowRoi);
+
+  StructureKey branch_scheduler{Family::BranchFSM};
+  branch_scheduler.loop_score = 2;
+  branch_scheduler.active_dim_mask =
+      activeDimMaskFor(WorkDim::Control) |
+      activeDimMaskFor(WorkDim::Object) |
+      activeDimMaskFor(WorkDim::Dispatch) |
+      activeDimMaskFor(WorkDim::Dynamic);
+  auto branch_decision = computeThreshold(branch_scheduler, steady_state, 2);
+  EXPECT_EQ(branch_decision.limit, 2);
+  EXPECT_EQ(branch_decision.branch_reason, BranchReason::None);
+
+  StructureKey compute_object_graph{Family::ObjectManipulator};
+  compute_object_graph.loop_score = 1;
+  compute_object_graph.active_dim_mask =
+      activeDimMaskFor(WorkDim::Compute) | activeDimMaskFor(WorkDim::Object) |
+      activeDimMaskFor(WorkDim::Dispatch) |
+      activeDimMaskFor(WorkDim::Dynamic);
+  auto compute_decision =
+      computeThreshold(compute_object_graph, steady_state, 2);
+  EXPECT_EQ(compute_decision.limit, 2);
+  EXPECT_EQ(compute_decision.branch_reason, BranchReason::None);
+}
+
 TEST(BehaviorClassifierTest, SteadyStateWarmsUpTinyStartupLikeWork) {
   GateContext steady_state{false};
 
@@ -982,6 +1030,41 @@ for value in range(5, 33):
 
 assert jit.count_interpreted_calls(thin) == frozen_calls
 assert not jit.is_jit_compiled(thin)
+)");
+}
+
+TEST_F(
+    BehaviorClassifierRuntimeTest,
+    AutoClassifySkipsGateForNewFunctionsWithSteadyColdCode) {
+  ScopedAutoJitConfig config_guard;
+  getMutableConfig().compile_after_n_calls = 2;
+  getMutableConfig().auto_classify = true;
+  getMutableConfig().enable_startup_init_policy = false;
+
+  runStockCode(R"(
+import cinderjit
+
+def make_inner():
+    def inner(value):
+        return value
+    return inner
+
+first = make_inner()
+for value in range(4):
+    first(value)
+
+for _ in range(4):
+    make_inner()
+
+cinderjit._clear_autojit_gate_stats()
+
+for value in range(32):
+    make_inner()(value)
+
+stats = cinderjit._autojit_gate_stats()
+assert stats["classified_schedule_cold_skip"] >= 32, stats
+assert stats["jit_vectorcall"] == 0, stats
+assert stats["classified_defer_freeze"] == 0, stats
 )");
 }
 

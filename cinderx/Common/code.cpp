@@ -226,6 +226,32 @@ CodeExtra* codeExtra(PyCodeObject* code) {
   return extra;
 }
 
+CodeExtra* codeExtraIfExists(PyCodeObject* code) {
+  auto* state = cinderx::getModuleState();
+  // On shutdown the module state becomes inaccessible.
+  if (state == nullptr) {
+    return nullptr;
+  }
+  Py_ssize_t extra_index = state->code_extra_index;
+  if (extra_index == -1) {
+    return nullptr;
+  }
+
+  auto code_obj = reinterpret_cast<PyObject*>(code);
+
+  // Match codeExtra()'s locking discipline without allocating on misses.
+  jit::CriticalSectionGuard guard(code_obj);
+
+  void* data_ptr = nullptr;
+  if (PyUnstable_Code_GetExtra(code_obj, extra_index, &data_ptr) < 0) {
+    JIT_LOG("Failed to get code extra data for {}", codeName(code));
+    jit::printPythonException();
+    PyErr_Clear();
+    return nullptr;
+  }
+  return reinterpret_cast<CodeExtra*>(data_ptr);
+}
+
 int numLocals(PyCodeObject* code) {
   return code->co_nlocals;
 }

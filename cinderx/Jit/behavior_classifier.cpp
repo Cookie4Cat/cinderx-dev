@@ -1356,6 +1356,22 @@ ThresholdDecision computeThreshold(
         BranchReason::RiskDefer};
   }
 
+  bool steady_multidim_nonnumeric_object_graph_candidate =
+      !context.startup_phase && !key.is_static && !key.is_suspendable &&
+      !key.computeHint() && key.activeDimCount() >= 3 &&
+      (key.family == Family::ReflectionMeta ||
+       key.family == Family::CallDispatcher ||
+       (key.family == Family::ObjectManipulator &&
+        key.hasActiveDim(WorkDim::Dynamic)) ||
+       (key.family == Family::Mixed &&
+        (key.hasActiveDim(WorkDim::Dispatch) ||
+         key.hasActiveDim(WorkDim::Dynamic))));
+  if (steady_multidim_nonnumeric_object_graph_candidate) {
+    return {
+        saturatingMul(global, kStartupDeferThresholdFactor),
+        BranchReason::LowRoi};
+  }
+
   bool steady_nonnumeric_warmup_candidate = !key.is_static &&
       key.loop_score == 0 &&
       (key.is_suspendable || startup_like_family || startup_like_mixed);

@@ -59,6 +59,10 @@ void finiCodeExtraIndex();
 // Python error set.
 CodeExtra* codeExtra(PyCodeObject* code);
 
+// Get the extra data object associated with a code object if it already exists.
+// Unlike codeExtra(), this never allocates a CodeExtra.
+CodeExtra* codeExtraIfExists(PyCodeObject* code);
+
 // Count the various frame variables that a code object will use.
 int numLocals(PyCodeObject* code);
 int numCellvars(PyCodeObject* code);
