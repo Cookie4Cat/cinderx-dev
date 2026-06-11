@@ -9,7 +9,7 @@ topic: autojit-behavior-classification
 
 为自适应 AutoJIT 定义一套**证据充分、可生产化推进**的函数行为分类方案：从字节码 + `co_flags` 提取一个**确定性的结构核**（衡量"做哪类工作 + 有多少热工作"），收敛为一个**有界、版本与特化鲁棒**的稳定 `structure_key`，作为下游策略 / 统计 / profile 的**唯一聚合身份**。`structure_key` 把当前全局固定的 `compile_after_n_calls` 阈值，替换为"按行为模式区分"的编译准入依据；弱特化观测（specialization observation）仅作为 Phase-3 旁路信号保留设计意图，v1 不实现、不进入聚合键。
 
-本文档 v1 **交付分类法 + 最小阈值策略 + opt-in provider 验证路径**：产出稳定 `structure_key`，并通过 `computeThreshold(structure_key, gate_context, global)` 只对明确 `raise_threshold_candidate` 抬阈值以削减 compile storm。2026-06-05 的 `2to3` 穿刺证明：只调静态分类只能部分减少编译风暴；若 `startup_phase` 只来自 import depth，覆盖不了 `lib2to3.main.main()` 里的 refactor/setup 初始化窗口。因此当前实现允许先用 CinderX-only wrapper provider 验证：`CINDERX_AUTOJIT_IMPORT_PROVIDER=find_and_load` 覆盖 import 窗口，`CINDERX_AUTOJIT_SETUP_PROVIDER=lib2to3_main` 覆盖明确的 `lib2to3` setup/main 窗口。2026-06-09 的 split-only 穿刺进一步明确：`gate_context.startup_phase` 是现有策略使用的合并位，`import_phase/setup_phase` 先只作为诊断和 A/B 细分位；生产默认按 import/setup 分叉阈值前，必须证明它比合并位更好。生产默认仍需安全 provider 的 gdb smoke、覆盖率和误伤率证据。完整阈值映射（`threshold = f(pattern)`）、弱特化观测、pattern 级在线反馈、profile 持久化是明确的下游工作（见 Scope Boundaries）。
+本文档 v1 **交付分类法 + 最小阈值策略 + opt-in provider 验证路径**：产出稳定 `structure_key`，并通过 `computeThreshold(structure_key, gate_context, global)` 只对明确 `raise_threshold_candidate` 抬阈值以削减 compile storm。2026-06-05 的 `2to3` 穿刺证明：只调静态分类只能部分减少编译风暴；若 `startup_phase` 只来自 import depth，覆盖不了 `lib2to3.main.main()` 里的 refactor/setup 初始化窗口。因此当前实现允许先用 CinderX-only wrapper provider 验证：`CINDERX_AUTOJIT_IMPORT_PROVIDER=find_and_load` 覆盖 import 窗口，`CINDERX_AUTOJIT_SETUP_PROVIDER=lib2to3_main` 覆盖明确的 `lib2to3` setup/main 窗口。2026-06-09 的 split-only 穿刺进一步明确：`gate_context.startup_phase` 是现有策略使用的合并位，`import_phase/setup_phase` 先只作为诊断和 A/B 细分位；生产默认按 import/setup 分叉阈值前，必须证明它比合并位更好。生产默认仍需安全 provider 的 gdb smoke、覆盖率和误伤率证据。完整阈值映射（`threshold = f(pattern)`）、弱特化观测、pattern 级在线反馈、profile 持久化是明确的下游工作（见 Scope Boundaries）。2026-06-10 增补 **v1.5 最小动态反馈位 RoiBackoff**：静态分类原理上看不见的 steady 负 ROI（sqlalchemy/dask 的 deopt 风暴、deepcopy 的 expected-exception 对）由"编译 → 观测 deopt → 退避"闭环兜底；状态存 `CodeExtra`、绝不进 `structure_key`，默认关闭、独立开关（KD9、R28–R31、L6、AE14–AE16）。
 
 ## Evidence Update（2026-06-02 Phase 0 C++ dump）
 
@@ -53,6 +53,14 @@ flowchart LR
   Frames[遍历 frame/import stack] -. 禁止 .-> Gate
 ```
 
+## Decision Update（2026-06-10 最小动态反馈位 RoiBackoff）
+
+证据表已确认一类静态分类原理上解决不了的回归：**函数的静态形状相同，运行期 JIT 动态 ROI 却相反**。`sqlalchemy_declarative` worker-only 复跑 deopt 合计 22133 次（`GuardFailure` 占 21714）；`dask` 4 个 worker 合计 deopt 1020754 次；`deepcopy` 的 `_deepcopy_tuple` 与 `_keep_alive` 静态形状一致（expected `KeyError` deopt），最优策略却相反（证据表 v0.7/v0.8）。这些都发生在 steady 阶段、编译之后，bytecode-only 签名（KD1/L1/L5）在编译前看不到；继续在 `computeThreshold` 里加静态特例只会向 benchmark 白名单退化（`generators`/`richards`/`dask` 三轮修复已显此趋势）。
+
+因此把原 Phase-3 "pattern 级在线反馈"中**最小的函数级切片**提前为 v1.5：**RoiBackoff（负 ROI 退避）**——编译后在既有 deopt 出口 O(1) 计数，deopt 次数达到风暴级预算时取消编译（复用 `jit::uncompile`）、按指数抬高重编译门槛，限定轮次后进程内冻结（复用 `DECIDED_COLD` 冷位）。它是**退避控制回路而非 ROI 测量**（L6）：分子只有 deopt、没有收益项，无法区分"高 deopt 净正收益"与"净负收益"，只能用指数退避把误判成本变成有界、递减的振荡。设计见 KD9 与 R28–R31；per-`structure_key` 聚合反馈与收益侧计量仍是 Phase-3。
+
+已核实的实现前提：统一 deopt 出口 `prepareForDeopt`（`cinderx/Jit/codegen/gen_asm.cpp:149`）持有 `CodeRuntime`，可经 `CodeRuntime::code()`（`code_runtime.h:61`）回链 code object 与 `CodeExtra`；`jit::uncompile`（`context.h:161`）已被 OSR 路径用于"uncompile 后重编译"（`osr.cpp:655`）；`CI_CODE_EXTRA_SKEY_DECIDED_COLD_BIT` 冷位 fast path 已落地（`code_extra.h`）。两个待核实前提（机器码生命周期 P1、共享 code 的兄弟 function 入口 P2）列入 Outstanding Questions，核实前不得进入默认开启路径。
+
 ## Problem Frame
 
 单一固定阈值（如 `PYTHONJITAUTO=2`）过于粗糙：低阈值在启动期制造 compile storm，编译开销泄漏进 benchmark 与冷启动 / 短生命周期 worker 的真实 workload；而当前"延迟编译护栏"本质是改变了 workload，而非教会编译器"何时值得编译"。
@@ -80,6 +88,8 @@ flowchart LR
 - **KD7. 每个 opcode 只计入唯一一个表项；risk 从已分配计数派生，不重复计原始 opcode。** 六个工作维度、`neutral`、`ignored` 合计必须覆盖 KD5 的 283 条输入。落入 `ignored` 的 opcode 不计入有效指令分母；落入 `neutral` 的 opcode 只计入分母，不递增任何工作维度；落入六个维度之一的 opcode 既计入分母也递增对应维度。`risk` 从 `dim_bucket`、异常子计数和有效指令数派生，不重复计原始 opcode。这消除维度间双计数，使排序选族稳定（见 R25 与 Known Accuracy Limits）。
 
 - **KD8. `structure_key` 缓存须遵守 free-threaded 发布契约（审查 Finding 3 修订）。** CinderX 支持自由线程构建（`Py_GIL_DISABLED`，已核实 `cinderx/Common/code_extra.h:35`、`cinderx/Jit/config.h:157`）。**注（审校 T4.1）：`code_extra.h` 自身的 `calls` 访问器用的是 relaxed/seq_cst（`_Py_atomic_add_uint64`/`_load_uint64_relaxed`），并非 release/acquire；可沿用的 release/acquire 发布范式来自 `jit_compiled` 指针发布（`cinderx/Jit/context.cpp:523` `_Py_atomic_store_ptr_release`），`code_extra.h:26-27` 仅以注释描述该发布发生在别处。** `structure_key` 缓存须沿用 jit_compiled 范式，并定义初始化标志、并发首次调用的良性竞态语义、以及发布 / 分配失败时的回退（退回全局默认阈值），不得引入对部分初始化状态的读取（见 R26）。
+
+- **KD9. 动态反馈是 per-code 运行期状态，不是身份；动作只复用既有机制（2026-06-10）。** RoiBackoff 的全部状态（deopt 计数、退避轮次、重编译下限、冻结位）存 `CodeExtra`，**绝不进入 `structure_key`**，不破坏 KD3/R18 的聚合身份不变量；退避事件按 `structure_key` 标注进诊断日志，为 Phase-3 pattern 级反馈积累标注数据。观测只发生在既有 deopt 慢路径（帧重建已是主要成本，新增一次 relaxed 计数为零阶开销）；编译态正常执行、解释路径、gate 命中路径不加任何新 per-call 成本。动作复用 `jit::uncompile` + AutoJIT gate 重新计数 + `DECIDED_COLD` 冷位，不新增编译器/运行时机制。退避语义参照解释器 `backoff_counter` 模式（KD6 已核实该机制）：指数预算 + 指数重编译下限 + 有限轮次。特性默认关闭、独立开关——不要求 `auto_classify` 开启，因为 `PYTHONJITAUTO=2`（分类关）下的 sqlalchemy 回归同样适用。
 
 ## Requirements
 
@@ -167,6 +177,16 @@ R26. **`codeExtra` 缓存的 free-threaded 发布契约（审查 Finding 3 + T3.
 
 R27. **AutoJIT 入口激活契约：设置阈值必须同时安装 frame evaluator。** `PYTHONJITAUTO=<N>`、`PYTHONJITAUTO=auto[:N]`、`-X jit-auto[=...]` 与 Python API `compile_after_n_calls(calls)` 都是 AutoJIT 激活入口，不只是配置解析入口。任何入口只要让 `compile_after_n_calls.has_value()`，就必须保证 CinderX frame evaluator 已安装，然后才能调度已有函数或等待新函数计数；否则配置值会显示为已生效，但后续新定义函数仍走 CPython 默认 evaluator，不会累计 `count_interpreted_calls`，也不会到达 `jitVectorcall` 阈值门。验收不能只看 `compile_after_n_calls` / `auto_classify` 字段，必须端到端验证初始化后新定义函数在第 `N+1` 次调用触发 JIT。`auto[:N]` 路径还必须选择一个非 low-ROI 的循环函数做样例，避免策略抬阈值把入口问题误判成分类策略生效。
 
+### H. 负 ROI 动态反馈（RoiBackoff — v1.5 最小切片，per-code 运行期状态，不进 `structure_key`）
+
+R28. **观测通道：deopt 出口 O(1) 计数，快路径零新增成本。** 唯一观测点是既有 deopt 出口 `prepareForDeopt`（`gen_asm.cpp:149`），经 `CodeRuntime::code()` 取 `CodeExtra` 后对 `roi_deopt_count` 做一次 relaxed 自增（饱和）。按 `DeoptReason`（`deopt.h:86`）mask 过滤：默认计入 `GuardFailure`、`YieldFrom`、`Raise`、`RaiseStatic`、`UnhandledException`、`UnhandledUnboundLocal/Freevar/NullField`，排除 `PeriodicTaskFailure` 与 instrumentation deopt（与函数 ROI 无关）。mask 可配置，按 reason 收窄是 A/B 失败后的第一杠杆。不在编译产物内插入计数指令，不在 gate / 解释路径加新 per-call 工作。
+
+R29. **退避阶梯：指数预算 → uncompile → 指数重编译下限 → 有限轮次 → 冷位冻结。** 第 k 轮（k 从 0）当 `roi_deopt_count >= kRoiDeoptBudgetBase << k` 时触发：(a) CAS 完成状态迁移，并发 deopt 单线程胜出（KD8 同款良性竞态）；(b) 调用 `jit::uncompile` 解除该 code 关联 function 入口与 `jit_compiled` 缓存，函数回到 AutoJIT gate；(c) 置 `roi_recompile_floor = calls_now + global × kRoiRewarmFactor × 2^k`（饱和），计数清零；(d) `k+1 > kRoiBackoffMaxRounds` 时置 `DECIDED_COLD` 冷位 + frozen 位，进程内不再编译、停止计数。bootstrap coding/experiment defaults：`kRoiDeoptBudgetBase=256`、`kRoiBackoffMaxRounds=2`（每函数最多 3 次编译机会）、`kRoiRewarmFactor=64`；与 R14 同契约：集中配置、可按部署覆盖、进入 gate 后进程内冻结，生产值由 A/B 冻结。校准依据（证据表）：`pickle_pure_python` 全程仅 3 次 harness deopt（正常函数远低于首轮预算）；`sqlalchemy_declarative`/`dask` 风暴函数轻松越过任意轮预算。
+
+R30. **准入集成与等价性。** gate 在 `computeThreshold` 之后以 `roi_recompile_floor` 作为 calls 域下限（floor 生效时本次走解释，记 `branch_reason = RoiBackoff`，枚举新增一员）；OSR 编译预算检查（`osrCompileBudgetCheck`）必须同时尊重 frozen/floor，封死带循环风暴函数从 OSR 后门重编译。开关关闭时 deopt 路径与 gate 路径与现状 bit-for-bit 等价（V3 同款 CI 门）。开关独立于 `auto_classify`：数值 `PYTHONJITAUTO=N` 下同样可用；`auto_classify` 开启时事件附 `structure_key` 标注。
+
+R31. **状态、并发与诊断契约。** `CodeExtra` 新增 `roi_deopt_count`（u32，relaxed）、`roi_ctl`（u32：frozen/pending/round，CAS 迁移）、`roi_recompile_floor`（u64；退避线程在入口保护内写，gate 读 relaxed），约 +16B/code object（Phase 0 1 万 unique code 量级 ≈ 160KB，可忽略）。状态不跨进程持久化（profile 持久化仍是 Phase-4）。诊断：`AutoJitGateStats` 新增 `roi_uncompile/roi_recompile/roi_frozen` 计数；compile-events 新增 `event=roi_uncompile|roi_freeze`，记录 code identity、`structure_key`、round、deopt 计数、reason 直方图、`calls`、floor。高频触发的 `structure_key` 分支必须回灌证据表，不得静默当作"已解决"。**uncompile 安全前提 P1/P2 见 Outstanding Questions，核实前不得合入默认开启路径。**
+
 ## Known Accuracy Limits
 
 > 诚实声明 bytecode-only gating 的精度上限，并给出缓解 / 去重规则。
@@ -180,6 +200,8 @@ R27. **AutoJIT 入口激活契约：设置阈值必须同时安装 frame evaluat
 - **L5. v1 静态签名不保证完整 ROI 预测。** bytecode-only 结构无法知道真实执行路径占比、类型稳定性和 workload 生命周期；`loop_score` 是 v1 最可靠的收益信号，非 loop family 的抬阈值必须被视为**明确低收益/高成本形态削减**，而非普遍 ROI 预测。opt-in 发布前必须做 mis-defer 守门：对每个被后移分支，按 top call-count、top compile-time、以及 top lost-dynamic-benefit/runtime-regression 样本证明 saved static cost 大于 lost dynamic benefit；否则按 `risk_reason` / `code_size_bucket` / family / `mixed_shape` / `active_dim_mask` 收窄或禁用。pyperformance `warmups=3` 可能遮住编译、首次进入和一次性 OSR 等静态/一次性成本，因此生产证据必须同时报告编译次数、累计编译耗时、code cache、启动/首轮耗时以及正式 values 中的动态成本/收益。
 
 - **L3. 纯动态行为不可静态识别。** `globals()/eval` 类（R6 局限）靠密度 + synthetic 文件名启发式近似，非精确。
+
+- **L6. RoiBackoff 是退避控制回路，不是 ROI 测量。** 触发条件的分子只有 deopt 次数，没有动态收益项：无法区分"高 deopt 但净收益为正"（`deepcopy` 的 `_keep_alive`）与"高 deopt 净负收益"（`_deepcopy_tuple`、sqlalchemy ORM guard 风暴）。缓解：(a) 保守默认预算（256 起步、逐轮翻倍）使低 deopt 率函数几乎不可能触发；(b) 有限轮次内每轮都保留重编译机会，不是一击冻结；(c) mis-backoff 守门（AE15 / Outstanding Questions）把残余误伤限定在可测范围。收益侧计量（编译态调用计数/耗时采样）是 Phase-3 的真 ROI 信号，不属于本切片。
 
 ## Visualizations
 
@@ -257,15 +279,23 @@ structure_key 结构核 (确定，聚合身份)      特化观测 (弱旁路，�
 
 - **AE13. AutoJIT 入口端到端激活回归：** 在 `PYTHONJITAUTO=2`、`PYTHONJITAUTO=auto:2` 与 `-X jit-auto=auto:2` 三个入口下，JIT 初始化后新定义一个带循环的普通函数。断言：(a) `compile_after_n_calls==2`；(b) 数值入口 `auto_classify=false`，`auto:2` 入口 `auto_classify=true`；(c) 调用两次后 `count_interpreted_calls(target)==2` 且尚未编译；(d) 第三次调用后 `jit.is_jit_compiled(target)==true`。覆盖 R27/T2.3。
 
+- **AE14. deopt 风暴退避：** 构造每次调用必触发 `GuardFailure` deopt 的函数（如交替对象形态破坏 guard），`PYTHONJITAUTO=2` + RoiBackoff 开启下预热编译。断言：(a) `roi_deopt_count` 达预算后产生 `roi_uncompile` 事件，函数入口回到 gate，`calls < floor` 期间解释执行；(b) 重新达到 floor 后重编译、再次风暴，超过 `kRoiBackoffMaxRounds` 后产生 `roi_freeze` 事件并置冷位，之后无新编译事件，gate stats `roi_frozen` 递增；(c) 退避全程 `structure_key` 不变、聚合统计不切碎。覆盖 R28/R29/R30/KD9。
+
+- **AE15. 误伤守门与可恢复性：** deepcopy 形状函数（expected `KeyError` deopt、净收益不定）：(a) 保守默认预算下 pyperformance `deepcopy/deepcopy_reduce/deepcopy_memo` 不触发，或仅低轮次触发且能在 floor 后重编译（非一击冻结）；(b) RoiBackoff on/off A/B 中上述用例与守门子集（`richards`、`generators`、`2to3`、`pickle_pure_python`）无超出噪声的回归。覆盖 R29/L6。
+
+- **AE16. 等价性与并发回归：** (a) 开关关闭：deopt 路径与 gate 路径与现状 bit-for-bit 等价；(b) FT 构建下多线程并发 deopt 同一函数：退避动作恰好执行一次（CAS 单胜出），无半初始化读取；(c) 注入 `codeExtra` 缺失/分配失败时安全跳过、不崩。覆盖 R30/R31/KD8。
+
 ## Scope Boundaries
 
 **本次交付（v1 = Python 3.14 分类法 + 最小策略 + opt-in provider 验证）：** R1–R10、R12–R27 的 v1 部分（**R11 特化观测 defer；R20/R26 中 specialization band / presence 刷新语义 defer**）+ Known Accuracy Limits + AE1–AE9、AE11–AE13（**AE10 defer**）+ 最小策略 `computeThreshold(structure_key, gate_context, global)`（T3.1b/T3.4/T3.5/T3.6/T3.7/T3.8/T3.9/T3.10）+ 复用 `PYTHONJITAUTO=auto[:N]` 启用 AutoJIT 分类（T2.3），且所有 AutoJIT 激活入口满足 frame evaluator 安装契约（R27）。family 枚举 8 个，`Mixed` 子形态最多 15 个；`risk_reason`、`code_size_bucket` 与 `active_dim_mask` 进入 key-bearing payload；bootstrap cutoff/floor/δ/loop/risk defaults 已通过 C++ gate-side 红线，可作为 v1 coding/experiment defaults；`structure_key` 物理缓存固定为 32-bit `skey_word`（valid + 24-bit payload），字符串仅用于诊断。opt-in 发布必须证明 `PYTHONJITAUTO=auto[:N]` 相对数值 `N` 对后移 candidate 的 saved static cost 大于 lost dynamic benefit，且非 candidate 行为等价、启动/吞吐无显著回归；报告必须分列 startup/setup 与 steady，不能把“总体少编译了”写成 targeted ImportInit 收益。provider 路径先允许 CinderX-only wrapper 验证特定 workload；生产默认还需安全 provider 的覆盖率、误伤率和 gdb smoke。生产 policy/default 本轮不冻结，`auto[:N]` 保持 opt-in；冻结生产推荐默认值前必须至少比较一组相邻 cutoff/floor/δ/loop 配置，并按 mis-defer 协议守门。
+
+**v1.5 增量切片（2026-06-10）：RoiBackoff 函数级动态反馈（KD9、R28–R31、L6、AE14–AE16）。** 默认关闭、独立开关、不要求 `auto_classify`；P1/P2 实现前提核实、gdb smoke 与 mis-backoff 守门（见 Outstanding Questions）通过前不得默认开启；per-`structure_key` 聚合反馈与收益侧计量不在本切片内。
 
 **Deferred for later（明确后续）：**
 - 完整阈值映射 `threshold = f(structure_key, ...)`（每族编译方向与具体值；v1 仅做最小策略）。
 - **特化观测整条（审校 T2.2）**：`specialization_presence`/`spec_band`/滞回/AE10 → Phase-3，与下条计数式信号一起做。
 - **真类型稳定性信号：** 基于 hit/miss/deopt/backoff 计数的稳定性度量（比 `specialization_presence` 强，KD6/审查 Finding 2），Phase-3 一等输入。
-- pattern 级在线反馈：`candidate/compile/reuse/deopt/bailout` 统计（**一律按 `structure_key` 聚合**）与动态调阈值（issue Phase 3）。
+- pattern 级在线反馈：`candidate/compile/reuse/deopt/bailout` 统计（**一律按 `structure_key` 聚合**）与动态调阈值（issue Phase 3）。其**函数级最小切片 RoiBackoff 已提前为 v1.5**（R28–R31）；Phase-3 保留的是 per-`structure_key` 聚合反馈、收益侧计量（编译态调用计数/耗时采样）与据此的阈值自适应。RoiBackoff 事件日志按 `structure_key` 标注，即为 Phase-3 积累的标注数据。
 - 跨 run profile 持久化 / 轻量 PGO（issue Phase 4）。
 - `computeThreshold` 提升为多态策略接口（出现第二种策略时，T2.1）。
 - post-v1 经验重标定：bucket cutoff / floor / δ / loop count / risk 阈值可按 T3.3 协议随 workload 变化重新冻结；3.15 及未来 minor 版本必须先生成 per-minor opcode 表与 coverage gate。冻结后的新配置需新进程或清空 code objects 才能进入 gate/cache/policy。
@@ -292,6 +322,7 @@ structure_key 结构核 (确定，聚合身份)      特化观测 (弱旁路，�
 - **安全 provider。** Phase 0 C++ + gdb 已关闭分类 schema 红线，但没有关闭生产默认 `startup_phase` 来源：原始 `import_stack` frame/code metadata 遍历在 `jitVectorcall` 中 SIGSEGV，`module_initializing` 覆盖不足，`early_window` 不能单独作为默认来源。当前可先用 CinderX-only import/setup wrapper 验证特定 workload；生产默认必须先选择并验证安全 provider，再把它作为 `readGateContext().startup_phase` 的来源。provider gate 必须给出四条线：gdb smoke 正常退出；startup/import/setup storm 覆盖率（compile-time 加权 ≥80% 或 top-20 全覆盖/逐项解释）；post-import steady-state 误伤率（数量与 compile-time 加权均 ≤5%）；热路径 O(1) 读取且无 frame/code metadata 遍历。
 - **生产 policy/default 冻结（已决策为 release gate，不在设计期冻结）。** `schema_freeze` 已有 Phase 0 C++ 证据；bootstrap cutoff/floor/δ/loop/risk 与 `kDeferThresholdFactor` 可作为 coding/experiment defaults 进入实现；`PYTHONJITAUTO=auto[:N]` 保持 opt-in。`policy/default_freeze` 必须等 `auto[:N]` vs 数值 `N` A/B、相邻 cutoff/floor/δ/loop/risk 配置比较、mis-defer 守门和 provider A/B 通过后再冻结，不能由 Mixed/family 红线直接推出。所有 dump/A-B/report 必须携带 `autojit_config_id`，否则不同配置结果不得合并比较。
 - **mis-defer 守门协议。** A/B report 必须按 `structure_key + branch_reason + risk_reason + code_size_bucket + active_dim_mask + code identity` 记录：baseline 是否编译、auto 是否编译/延后、调用次数、baseline compile time、auto compile time、JIT code size/code cache、候选在 benchmark/top-list 中的执行时间或可复现实验代理，并记录 guard/deopt/helper/suspend/OSR 等动态成本计数；risk-defer / suspend / dynamic / exception 分支缺这些动态成本计数时，不得发布该分支，只能作为实验 FYI。`saved_static_cost = baseline_compile_time + baseline_code_cache_cost - auto_compile_time - auto_code_cache_cost`（未编译视为省下全部 baseline 静态成本）；`lost_dynamic_benefit = max(0, runtime_auto - runtime_baseline)` 或候选级 microbench/branch-ablation 的等价估计。对每个默认后移分支，top call-count、top compile-time、top lost-dynamic-benefit/runtime-regression 样本都必须满足 branch-level saved/lost 分布与 p95/worst-top 无未解释净损失；否则按 `risk_reason` / `code_size_bucket` / family / `mixed_shape` / `active_dim_mask` 收窄或禁用。
+- **RoiBackoff 实现前提与守门（v1.5，2026-06-10）。** (P1) **机器码生命周期**：必须核实 `jit::uncompile`（`context.h:161`）/`uncompileImpl`（`pyjit.cpp:4229`）只解除入口链接与 per-code 缓存、**不释放可能仍在任意线程栈上活跃的机器码**——deopt 出口调用点本身就处在该函数的编译帧内，递归/FT 并发激活同理。若该不变量不成立，退避动作降级为 pending 标志 + 安全点执行（候选：周期任务/eval-breaker 侧，或 gate 侧全局 pending 队列），并补 gdb smoke。(P2) **共享 code**：同一 code object 被多个 function 对象引用时，必须经 Context 的 per-code funcs 注册表（`pyjit.cpp:1671` `deoptFuncImpl`、`:4064` 遍历先例）解除全部入口，否则兄弟 function 持续风暴。(G) **mis-backoff 守门**：RoiBackoff on/off A/B 必须覆盖负样本（`sqlalchemy_declarative`、`dask`、`deepcopy` 子集）与守门样本（`richards`、`generators`、`2to3`、`pickle_pure_python`、`nbody`）；对每个被退避/冻结的 top 函数报告 saved dynamic cost（deopt 次数 × 帧重建/guard 失败代价）与 lost benefit（runtime delta），无未解释净损失才能进生产默认评估；失败按 reason mask → budget → rounds 顺序收窄。结果必须回灌证据表。
 - 已关闭：默认 bucket cutoff / floor / `loop_score` 嵌套阈值采用 bootstrap defaults + Phase 0 C++ gate-side dump 通过红线；这些值是 coding/experiment defaults，不是生产推荐默认值；`structure_key` 缓存无运行期失效，分类配置进程内冻结（T3.11）。
 
 **Deferred to planning：**
@@ -353,4 +384,11 @@ structure_key 结构核 (确定，聚合身份)      特化观测 (弱旁路，�
 - `cinderx/Jit/hir/preload.cpp:449`、`inliner.cpp:172` —— `CI_CO_STATICALLY_COMPILED`，`is_static`（R9）依据。
 - `cinderx/Jit/hir/hir_stats.cpp`（`PYTHONJITDUMPHIRSTATS`）—— HIR 层"按函数计指令/类型"先例；下游反馈可用，**不用于 gating 签名**（KD1）。
 - Phase 0 C++ evidence：`scratch/autojit_phase0/results/blue-98-20260602-cpp/report.md`、`summary-clean/summary.json`、`logs/autojit-phase0-gdb-debug-container-20260602-115858.log`、`logs/autojit-phase0-gdb-after-fix-20260602-120011.log`。
+- `cinderx/Jit/codegen/gen_asm.cpp:149` `prepareForDeopt` —— 统一 deopt 出口（含帧重建慢路径），RoiBackoff 唯一观测点（R28）。
+- `cinderx/Jit/code_runtime.h:61` `CodeRuntime::code()` —— deopt 出口回链 code object → `CodeExtra` 的依据（R28）。
+- `cinderx/Jit/context.h:161` `jit::uncompile`、`cinderx/Jit/osr.cpp:655`（OSR "uncompile 后重编译"先例）、`cinderx/Jit/pyjit.cpp:1671` `deoptFuncImpl` / `:4229` `uncompileImpl` —— R29 退避动作复用的既有机制与 P1/P2 核实入口。
+- `cinderx/Jit/deopt.h:86` `DeoptReason` —— R28 reason mask 的输入全集。
+- `cinderx/Common/code_extra.h` `CI_CODE_EXTRA_SKEY_DECIDED_COLD_BIT` —— R29 冻结复用的冷位 fast path。
+- `cinderx/Jit/pyjit.cpp:93` `AutoJitGateStats` —— R31 诊断计数器沿用的既有全局原子计数模式。
+- 证据表（RoiBackoff 动机样本）：`docs/design/autojit-behavior-classification/【证据表】AutoJIT 用例函数形状与策略判断.md` v0.23（dask deopt 1020754）、v0.24（sqlalchemy GuardFailure 21714）、v0.7/v0.8（deepcopy `_deepcopy_tuple` vs `_keep_alive`）。
 - GitHub issue: sisibeloved/cinderx#3《探索基于行为模式的自适应 AutoJIT 阈值策略》—— 需求母体。
