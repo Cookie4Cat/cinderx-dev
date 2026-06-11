@@ -10,6 +10,7 @@
 
 | 版本 | 日期 | 修订人 | 修订说明 |
 |---|---|---|---|
+| v0.34 | 2026-06-11 | @sisibeloved | 补 RoiBackoff 默认开启守门批次：`/results/autojit-roi-backoff-guard-20260611_221949` 对 `2to3`、`deepcopy` 子集、`generators`、`pickle_pure_python`、`sqlalchemy_declarative`、`nbody`、`richards` 做 on/off A/B；`2to3/deepcopy/generators/pickle/sqlalchemy` 无误伤，`nbody/richards` 初始并行差异经同核串行复跑转为 on 更快或持平。结论：支持 RoiBackoff 默认开启，保留 `CINDERX_AUTOJIT_ROI_BACKOFF=0` 回退；gdb smoke 在 blue-98 容器受 seccomp/ptrace 限制，作为环境补验项。 |
 | v0.33 | 2026-06-11 | @sisibeloved | 复核 `dask` 后续优化方向：按串行同核 `--affinity=30` 正式复跑默认 AutoJIT 与 `PYTHONJITATTRCACHES=0`，结果 `1.68s -> 1.61s`，`1.04x faster`，确认 noattr 是小正信号但属于全局 JIT 行为变化，不能直接默认化。补 per-site deopt 字段复核：RoiBackoff on 后当前 dask deopt 从 `64164` 降到 `129`，历史 LOAD_ATTR_SLOT 风暴已不是当前主项；关闭 LOAD_ATTR fallback、关闭 array double fastpath 均无收益。策略结论更新为：不继续扩大 startup/provider，也不做全局 slot fallback；下一步只考虑局部 attr-cache/PIC/expected-exception 等 JIT 动态成本专项。 |
 | v0.32 | 2026-06-11 | @sisibeloved | 重写 `logging_silent` 复核证据：正式五口径和 HIR/LIR 证明 `Logger.isEnabledFor` 与外层 `bench_silent` call-only loop 进入 CinderX JIT 均为负收益。删除 cached-predicate 静态放行，新增 `CallDispatcher + dims=Object|Dispatch + loop=1 + codeB=1 + risk=None` 的 LowRoi 延迟。正式 `logging_silent` 从原 AutoJIT `328ns` 降到 `212ns`，相对 CPython JIT `219ns` 为 `1.03x faster`；新增 `test_plugin_defers_logging_disabled_fast_path` 与 `test_plugin_defers_call_only_dispatch_loop`。同步补 dask RoiBackoff 复核：`1.67s -> 1.62s`，小收益但非根治。 |
 | v0.31 | 2026-06-11 | @guo | 补 `logging_silent` cached predicate 误伤修复证据：`logging.Logger.isEnabledFor` 是 steady-state 缓存命中立即返回、异常慢路径填充 cache 的小 predicate；原 `RiskDefer` 把它冻结在解释器中会放大 disabled logging 百纳秒级快路径成本。新增通用 cached-predicate-with-exception-slow-path 形状放行，不按 logging 文件名/函数名白名单。验证：gate probe 显示 `classified_defer_freeze=0`、`forced_compile>=1`、`Logger.isEnabledFor` 已 JIT；本地复测达到 `logging_silent` 112ns 目标，且修复分支相对同事实验分支只新增该形状规则和测试。 |
@@ -104,6 +105,7 @@
 | `dask` | debug shape/gate/deopt：`--fast -n 3 -w 1`，`PYTHONJITLOGFILE` + `CINDERX_AUTOJIT_GATE_STATS_FILE` + `CINDERX_AUTOJIT_COMPILE_EVENTS_FILE` | `blue-98:cinderx-test:/results/autojit-dask-ledger-20260609/{dask-gate-stats.jsonl,dask-compile-events.jsonl,worker-gate-shapes/*.jit.log,dask-debug-fast.json}` | 4 个 worker 合计约 `962700` 次 gate、`3408` 次 forced compile、`161135` 次 defer freeze；编译事件 `3485` 条中 `3440` 条在 steady 阶段；deopt 合计 `1020754` 次，主要是 `GuardFailure` 和 expected exception |
 | `dask` | plain generator override 误伤复现与修复：`PYTHONJITAUTO=auto:2`，默认 provider，`PYTHONJITHUGEPAGES=0`；失败/修复均附 compile-events | `blue-98:cinderx-test:/results/autojit-dask-failure-20260610/{dask-fast-autojit.log,dask-fail-compile-events.jsonl,dask-fast-autojit-fixed.json,dask-fixed-compile-events.jsonl,dask-formal-autojit-fixed.json,logs/*}` | 失败口径中 `asyncio.tasks:__sleep0` 以 `calls=2 limit=2 reason=None` forced compile，触发 `TypeError: 'generator' object can't be awaited`；修复后 `dask --fast` 通过且 fixed compile-events 不再含 `__sleep0`；正式 `dask=1.77s +- 0.05s`，相对旧 AutoJIT `1.15x faster`，仍比 CPython JIT/plugin-no-JIT `1.30x slower` |
 | `dask` | RoiBackoff 后 per-site deopt 与 noattr 正式复核：默认 AutoJIT vs `PYTHONJITATTRCACHES=0`，串行同核 `--affinity=30 --warmup 3`，无 dump/HIR/debug 变量 | `blue-98:cinderx-test:/results/autojit-dask-site-fields-{roion,roioff}-20260611_203926`；`blue-98:cinderx-test:/results/autojit-dask-noattr-serial-aff30-20260611_212203/{default.json,noattr.json,compare-noattr-vs-default.txt,*.stats.txt,logs/*}` | 当前 RoiBackoff on 后 deopt 只剩 `129`，off 为 `64164`；历史 LOAD_ATTR_SLOT 风暴已不是当前主项。正式同核复跑默认 `1.68s +- 0.05s`，noattr `1.61s +- 0.04s`，`1.04x faster`；noattr 是小正信号但为全局 JIT 开关，不能直接作为生产默认 |
+| RoiBackoff 默认开启守门 | off=`CINDERX_AUTOJIT_ROI_BACKOFF=0`，on=`CINDERX_AUTOJIT_ROI_BACKOFF=1`，其余 `CINDERX_PLUGIN_ENABLE=1 PYTHONJITAUTO=auto:2`，`--warmup 3`；`nbody/richards` 追加同核串行复跑 | `blue-98:cinderx-test:/results/autojit-roi-backoff-guard-20260611_221949/{off,on}` | `2to3/deepcopy/generators/pickle_pure_python/sqlalchemy_declarative` 无误伤；`nbody/richards` 初始并行差异由 CPU/NUMA 噪声解释，同核串行 on 分别为 `0.94x/0.99x` off；支持默认开启，保留 `=0` 回退 |
 | `coverage` | direct worker，`PYTHONJITAUTO=auto:2`，`CINDERX_AUTOJIT_IMPORT_PROVIDER=find_and_load` | `blue-98:/results/autojit-import-highcost-bucket1-20260605/worker-gate-shapes/coverage.*.jit.log` | 有真实 C++ gate 形状；debug 口径，不作为性能数值 |
 | `generators` | direct worker，同上 | `blue-98:/results/autojit-import-highcost-bucket1-20260605/worker-gate-shapes/generators.*.jit.log` | 有真实 C++ gate 形状；debug 口径 |
 | `generators` | 误伤复现与修复 A/B：`PYTHONJITAUTO=auto:2`，默认 provider；对照 `PYTHONJITAUTO=2`、破损 AutoJIT、修复后 AutoJIT；附 compile-events 验证 `Tree.__iter__` 是否进入 JIT | `blue-98:cinderx-test:/results/autojit-generators-regression-20260610/{generators-cinderx-auto2.json,generators-cinderx-autojit.json,generators-cinderx-autojit-fixed.json,generators-autojit-compile-events.jsonl,generators-autojit-fixed-compile-events.jsonl}` | `PYTHONJITAUTO=2` `21.7ms +- 6.2ms`；破损 AutoJIT `60.2ms +- 0.3ms`；修复后 `21.7ms +- 5.8ms`。修复后相对破损 `2.78x faster`，与 `auto=2` 不显著；compile-events 确认修复后 `Tree.__iter__ limit=2 reason=None` |
@@ -1004,6 +1006,42 @@ debug 口径：临时 autohook 只 `import _cinderx_auto`，`bm_pickle --pure-py
 | LOAD/STORE slot 全局 fallback 是否是方向 | 不是。LOAD fallback-off 不改善；历史 STORE fallback 也无收益。全局改 lowering 会影响大量单态站点的精化收益。 |
 | noattr 是否值得做 | 值得继续研究，但只能做“局部策略/PIC/站点级泛化”方向；不能把 `PYTHONJITATTRCACHES=0` 作为生产默认。 |
 | noarray 是否值得做 | 不值得。正式口径负收益。 |
+
+### 17.2.2 RoiBackoff 默认开启守门批次
+
+本批次回答一个发布问题：`CINDERX_AUTOJIT_ROI_BACKOFF=1` 能否从实验开关变成默认行为。共同口径：`blue-98:cinderx-test`，CinderX wheel 重新安装为 `2026.6.11.0`，worker venv `include-system-site-packages=true`，worker 内 `_cinderx_auto_loaded=True`，无 `PYTHONPATH` 污染；pyperformance 使用 `--warmup 3`。off/on 只切换 `CINDERX_AUTOJIT_ROI_BACKOFF=0/1`，其它核心变量固定为 `CINDERX_PLUGIN_ENABLE=1 PYTHONJITAUTO=auto:2`。
+
+产物：`/results/autojit-roi-backoff-guard-20260611_221949`。
+
+| 用例 | off | on | on/off | 结论 |
+|---|---:|---:|---:|---|
+| `2to3` | `570.765ms` | `570.079ms` | `0.999x` | 无误伤；对主用例持平 |
+| `deepcopy` | `687.708us` | `683.638us` | `0.994x` | 无误伤 |
+| `deepcopy_reduce` | `6.952us` | `6.941us` | `0.998x` | 历史 `_keep_alive` 误伤样本持平 |
+| `deepcopy_memo` | `72.019us` | `71.641us` | `0.995x` | 无误伤 |
+| `generators` | `18.587ms` | `18.533ms` | `0.997x` | 历史 `Tree.__iter__` 误伤样本未回归 |
+| `pickle_pure_python` | `803.304us` | `800.289us` | `0.996x` | 无误伤 |
+| `sqlalchemy_declarative` | `310.465ms` | `310.450ms` | `1.000x` | 负 ROI 样本持平；本批次未看到额外收益或误伤 |
+| `nbody` 初始并行 | `111.548ms` | `119.021ms` | `1.067x` | 并行绑不同 CPU 区间，疑似 NUMA/频率噪声；不作为误伤结论 |
+| `richards` 初始并行 | `102.216ms` | `103.594ms` | `1.014x` | 初始轻微劣化需同核复核 |
+| `nbody` 同核串行复跑 | `119.128ms` | `111.655ms` | `0.937x` | 初始劣化不复现，on 更快 |
+| `richards` 同核串行复跑 | `103.775ms` | `102.424ms` | `0.987x` | 初始劣化不复现，on 持平略快 |
+
+配套 smoke：
+
+| 项 | 结果 | 结论 |
+|---|---|---|
+| RuntimeTest `BehaviorClassifierRuntimeTest.RoiBackoffUncompilesDeoptStorm` | 通过 | deopt 出口触发 uncompile/退避的基本路径可用 |
+| gdb batch smoke | 容器内 `ptrace: Operation not permitted`，`Seccomp: 2`；`docker exec --privileged` 仍失败；宿主无 gdb/目标 Python | 当前环境不能证明 gdb smoke 通过，也不能证明功能失败；作为允许 ptrace 环境下的补验项 |
+
+发布判断：
+
+| 问题 | 结论 |
+|---|---|
+| 是否有明确收益 | 有。dask on/off 已证明 deopt 从 `64164` 降到 `129`，正式性能 `1.67s -> 1.62s`，RoiBackoff 对 steady deopt 风暴有止血作用 |
+| 是否误伤守门样本 | 本批次未发现。`deepcopy_reduce`、`generators`、`richards`、`nbody` 经复核不回归 |
+| 是否可以默认开启 | 可以，前提是保留 `CINDERX_AUTOJIT_ROI_BACKOFF=0` 为止血退路，并把 budget/rounds/rewarm/mask 写入 `autojit_config_id` |
+| 还缺什么 | 允许 ptrace 的环境补跑 gdb smoke；后续修改 reason mask / budget / rounds 需重新跑同类守门 |
 
 ### 17.3 分表一：gate 与编译规模
 

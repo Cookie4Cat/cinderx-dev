@@ -18,6 +18,10 @@ def _plugin_env() -> dict[str, str]:
     env.pop("PYTHONJITALL", None)
     env.pop("CINDERX_AUTOJIT_IMPORT_PROVIDER", None)
     env.pop("CINDERX_AUTOJIT_SETUP_PROVIDER", None)
+    env.pop("CINDERX_AUTOJIT_ROI_BACKOFF", None)
+    env.pop("CINDERX_AUTOJIT_ROI_BACKOFF_BUDGET", None)
+    env.pop("CINDERX_AUTOJIT_ROI_BACKOFF_MAX_ROUNDS", None)
+    env.pop("CINDERX_AUTOJIT_ROI_REWARM_FACTOR", None)
     return env
 
 
@@ -32,6 +36,10 @@ def _plugin_env_without_auto_classify() -> dict[str, str]:
         "PYTHONJITAUTO",
         "CINDERX_AUTOJIT_IMPORT_PROVIDER",
         "CINDERX_AUTOJIT_SETUP_PROVIDER",
+        "CINDERX_AUTOJIT_ROI_BACKOFF",
+        "CINDERX_AUTOJIT_ROI_BACKOFF_BUDGET",
+        "CINDERX_AUTOJIT_ROI_BACKOFF_MAX_ROUNDS",
+        "CINDERX_AUTOJIT_ROI_REWARM_FACTOR",
     ):
         env.pop(name, None)
 
@@ -354,7 +362,6 @@ class AutoJitGateStatsDumpTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as temp:
             env = _plugin_env()
             env["PYTHONJITAUTO"] = "auto:100"
-            env["CINDERX_AUTOJIT_ROI_BACKOFF"] = "1"
 
             completed = subprocess.run(
                 [
@@ -386,6 +393,56 @@ class AutoJitGateStatsDumpTests(unittest.TestCase):
                     "assert stats['roi_uncompile'] == 0, stats\n"
                     "assert stats['roi_recompile'] == 0, stats\n"
                     "assert not jit.is_jit_compiled(numeric_loop), stats\n",
+                ],
+                cwd=temp,
+                env=env,
+                capture_output=True,
+                text=True,
+                timeout=60,
+            )
+
+            self.assertEqual(
+                completed.returncode,
+                0,
+                f"stdout:\n{completed.stdout}\nstderr:\n{completed.stderr}",
+            )
+
+    def test_plugin_roi_backoff_env_zero_disables_backoff(self) -> None:
+        with tempfile.TemporaryDirectory() as temp:
+            env = _plugin_env()
+            env["PYTHONJITAUTO"] = "auto:100"
+            env["CINDERX_AUTOJIT_ROI_BACKOFF"] = "0"
+
+            completed = subprocess.run(
+                [
+                    sys.executable,
+                    "-c",
+                    "import cinderjit\n"
+                    "import cinderx.jit as jit\n"
+                    "\n"
+                    "cinderjit._clear_autojit_gate_stats()\n"
+                    "\n"
+                    "def numeric_loop(value):\n"
+                    "    total = 0\n"
+                    "    for _ in range(8):\n"
+                    "        total += value\n"
+                    "    return total\n"
+                    "\n"
+                    "for _ in range(120):\n"
+                    "    numeric_loop(1)\n"
+                    "\n"
+                    "assert jit.is_jit_compiled(numeric_loop), (\n"
+                    "    jit.count_interpreted_calls(numeric_loop)\n"
+                    ")\n"
+                    "\n"
+                    "for _ in range(64):\n"
+                    "    numeric_loop(1.5)\n"
+                    "\n"
+                    "stats = cinderjit._autojit_gate_stats()\n"
+                    "assert stats['roi_frozen'] == 0, stats\n"
+                    "assert stats['roi_uncompile'] == 0, stats\n"
+                    "assert stats['roi_recompile'] == 0, stats\n"
+                    "assert jit.is_jit_compiled(numeric_loop), stats\n",
                 ],
                 cwd=temp,
                 env=env,

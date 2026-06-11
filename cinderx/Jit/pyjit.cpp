@@ -794,7 +794,8 @@ FlagProcessor initFlagProcessor() {
       "jit-auto-roi-backoff",
       "CINDERX_AUTOJIT_ROI_BACKOFF",
       getMutableConfig().roi_backoff_enabled,
-      "Enable AutoJIT dynamic negative-ROI backoff after repeated deopts");
+      "Enable or disable AutoJIT dynamic negative-ROI backoff after "
+      "repeated deopts");
 
   flag_processor.addOption(
       "jit-auto-roi-backoff-budget",

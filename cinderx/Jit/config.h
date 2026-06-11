@@ -227,9 +227,9 @@ struct Config {
   // for a later import-depth provider-backed slice.
   bool enable_startup_init_policy{false};
   // Minimal dynamic feedback for code that compiles successfully but then
-  // repeatedly deopts. Disabled by default; enabled independently from
-  // auto_classify so A/B can isolate its effect.
-  bool roi_backoff_enabled{false};
+  // repeatedly deopts. Enabled by default; disable with
+  // CINDERX_AUTOJIT_ROI_BACKOFF=0 when isolating A/B or rolling back.
+  bool roi_backoff_enabled{true};
   size_t roi_deopt_budget_base{32};
   size_t roi_backoff_max_rounds{1};
   size_t roi_rewarm_factor{64};
