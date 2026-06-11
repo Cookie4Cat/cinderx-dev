@@ -505,7 +505,7 @@ class AutoJitGateStatsDumpTests(unittest.TestCase):
                 f"stdout:\n{completed.stdout}\nstderr:\n{completed.stderr}",
             )
 
-    def test_plugin_compiles_logging_disabled_fast_path(self) -> None:
+    def test_plugin_defers_logging_disabled_fast_path(self) -> None:
         with tempfile.TemporaryDirectory() as temp:
             env = _plugin_env()
 
@@ -528,11 +528,67 @@ class AutoJitGateStatsDumpTests(unittest.TestCase):
                     "\n"
                     "stats = cinderjit._autojit_gate_stats()\n"
                     "assert stats['global_threshold_return'] >= 1, stats\n"
-                    "assert stats['classified_defer_freeze'] == 0, stats\n"
-                    "assert stats['forced_compile'] >= 1, stats\n"
-                    "assert jit.is_jit_compiled(logging.Logger.isEnabledFor), (\n"
+                    "assert stats['classified_defer_freeze'] >= 1, stats\n"
+                    "assert stats['forced_compile'] == 0, stats\n"
+                    "assert not jit.is_jit_compiled(logging.Logger.isEnabledFor), (\n"
                     "    stats,\n"
                     "    jit.count_interpreted_calls(logging.Logger.isEnabledFor),\n"
+                    ")\n",
+                ],
+                cwd=temp,
+                env=env,
+                capture_output=True,
+                text=True,
+                timeout=60,
+            )
+
+            self.assertEqual(
+                completed.returncode,
+                0,
+                f"stdout:\n{completed.stdout}\nstderr:\n{completed.stderr}",
+            )
+
+    def test_plugin_defers_call_only_dispatch_loop(self) -> None:
+        with tempfile.TemporaryDirectory() as temp:
+            env = _plugin_env()
+
+            completed = subprocess.run(
+                [
+                    sys.executable,
+                    "-c",
+                    "import cinderjit\n"
+                    "import cinderx.jit as jit\n"
+                    "\n"
+                    "class Target:\n"
+                    "    def debug(self, msg):\n"
+                    "        return None\n"
+                    "\n"
+                    "def call_only_loop(target, msg, loops):\n"
+                    "    for _ in range(loops):\n"
+                    "        target.debug(msg)\n"
+                    "        target.debug(msg)\n"
+                    "        target.debug(msg)\n"
+                    "        target.debug(msg)\n"
+                    "        target.debug(msg)\n"
+                    "        target.debug(msg)\n"
+                    "        target.debug(msg)\n"
+                    "        target.debug(msg)\n"
+                    "        target.debug(msg)\n"
+                    "        target.debug(msg)\n"
+                    "\n"
+                    "target = Target()\n"
+                    "for _ in range(8):\n"
+                    "    target.debug('x')\n"
+                    "\n"
+                    "cinderjit._clear_autojit_gate_stats()\n"
+                    "for _ in range(8):\n"
+                    "    call_only_loop(target, 'x', 4)\n"
+                    "\n"
+                    "stats = cinderjit._autojit_gate_stats()\n"
+                    "assert stats['classified_defer_freeze'] >= 1, stats\n"
+                    "assert not jit.is_jit_compiled(call_only_loop), (\n"
+                    "    stats,\n"
+                    "    jit.count_interpreted_calls(call_only_loop),\n"
                     ")\n",
                 ],
                 cwd=temp,

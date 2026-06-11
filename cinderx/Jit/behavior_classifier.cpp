@@ -540,35 +540,6 @@ bool isAllowedProtocolDynamicOpcode(int opcode) {
   }
 }
 
-bool isCacheSubscriptOpcode(const BytecodeInstruction& instr, int opcode) {
-  if (opcode == BINARY_OP && instr.oparg() == NB_SUBSCR) {
-    return true;
-  }
-  switch (opcode) {
-    case BINARY_OP_SUBSCR_DICT:
-    case BINARY_OP_SUBSCR_GETITEM:
-      return true;
-    default:
-      return false;
-  }
-}
-
-bool nextRelevantOpcodeIsReturn(
-    BytecodeInstructionBlock::Iterator it,
-    BytecodeInstructionBlock::Iterator end) {
-  ++it;
-  while (it != end) {
-    int opcode = (*it).opcode();
-    OpcodeClass cls = opcodeClassOf(opcode);
-    if (cls == OpcodeClass::Ignored || cls == OpcodeClass::Neutral) {
-      ++it;
-      continue;
-    }
-    return isReturnOpcode(opcode);
-  }
-  return false;
-}
-
 bool isAllowedProtocolControlOpcode(
     const BytecodeInstruction& instr,
     int opcode) {
@@ -788,66 +759,15 @@ bool shouldAllowSteadyStateProtocolDispatchCore(
       (store_attr_count > 0 || raise_count > 0);
 }
 
-bool shouldAllowSteadyStateCachedPredicateWithExceptionSlowPath(
-    BorrowedRef<PyCodeObject> code,
+bool shouldDeferSteadyStateCallOnlyDispatchLoop(
     const StructureKey& key,
     const GateContext& context) {
-  if (context.startup_phase || code == nullptr || code->co_argcount == 0 ||
-      key.is_static || key.is_suspendable || key.is_synthetic ||
-      key.loop_score != 0 || key.family != Family::BranchFSM ||
-      key.risk_reason != kRiskException) {
-    return false;
-  }
-
-  uint32_t cache_subscript_count = 0;
-  uint32_t cache_subscript_fast_return_count = 0;
-  uint32_t key_error_match_count = 0;
-  uint32_t return_count = 0;
-  uint32_t store_subscr_count = 0;
-  uint32_t with_except_count = 0;
-  uint32_t explicit_raise_count = 0;
-  BytecodeInstructionBlock block{code};
-  for (auto it = block.begin(); it != block.end(); ++it) {
-    BytecodeInstruction instr = *it;
-    int opcode = instr.opcode();
-    if (isCacheSubscriptOpcode(instr, opcode)) {
-      cache_subscript_count++;
-      if (nextRelevantOpcodeIsReturn(it, block.end())) {
-        cache_subscript_fast_return_count++;
-      }
-      continue;
-    }
-    if (isReturnOpcode(opcode)) {
-      return_count++;
-      continue;
-    }
-    if (opcode == CHECK_EXC_MATCH) {
-      key_error_match_count++;
-      continue;
-    }
-    if (opcode == STORE_SUBSCR || opcode == STORE_SUBSCR_DICT ||
-        opcode == STORE_SUBSCR_LIST_INT) {
-      store_subscr_count++;
-      continue;
-    }
-    if (opcode == WITH_EXCEPT_START) {
-      with_except_count++;
-      continue;
-    }
-    if (opcode == RAISE_VARARGS) {
-      explicit_raise_count++;
-      continue;
-    }
-  }
-
-  // These predicates return immediately on the common cache-hit path, but carry
-  // an exception-protected cache-fill path that makes the static shape look like
-  // a high-cost framework helper. Keep the exception-heavy default for general
-  // code, and only re-allow the specific cache-hit/cache-fill shape.
-  return cache_subscript_count >= 1 && key_error_match_count == 1 &&
-      cache_subscript_fast_return_count >= 1 && return_count >= 2 &&
-      store_subscr_count >= 1 && with_except_count <= 1 &&
-      explicit_raise_count == 0;
+  const uint8_t kCallOnlyLoopDims =
+      activeDimMaskFor(WorkDim::Object) | activeDimMaskFor(WorkDim::Dispatch);
+  return !context.startup_phase && !key.is_static && !key.is_suspendable &&
+      !key.highRisk() && key.family == Family::CallDispatcher &&
+      key.loop_score == 1 && key.code_size_bucket == 1 &&
+      key.active_dim_mask == kCallOnlyLoopDims;
 }
 
 } // namespace
@@ -1463,6 +1383,12 @@ ThresholdDecision computeThreshold(
         BranchReason::LowRoi};
   }
 
+  if (shouldDeferSteadyStateCallOnlyDispatchLoop(key, context)) {
+    return {
+        saturatingMul(global, kStartupDeferThresholdFactor),
+        BranchReason::LowRoi};
+  }
+
   bool steady_nonnumeric_warmup_candidate = !key.is_static &&
       key.loop_score == 0 &&
       (key.is_suspendable || startup_like_family || startup_like_mixed);
@@ -1514,11 +1440,6 @@ ThresholdDecision computeThresholdForCode(
   if (decision.branch_reason == BranchReason::LowRoi &&
       (shouldAllowSteadyStateCompositeStatePredicate(code, key, context) ||
        shouldAllowSteadyStateProtocolDispatchCore(code, key, context))) {
-    return {global, BranchReason::None};
-  }
-  if (decision.branch_reason == BranchReason::RiskDefer &&
-      shouldAllowSteadyStateCachedPredicateWithExceptionSlowPath(
-          code, key, context)) {
     return {global, BranchReason::None};
   }
   if (decision.branch_reason == BranchReason::None &&

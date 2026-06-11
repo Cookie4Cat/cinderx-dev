@@ -10,6 +10,7 @@
 
 | 版本 | 日期 | 修订人 | 修订说明 |
 |---|---|---|---|
+| v0.32 | 2026-06-11 | @sisibeloved | 重写 `logging_silent` 复核证据：正式五口径和 HIR/LIR 证明 `Logger.isEnabledFor` 与外层 `bench_silent` call-only loop 进入 CinderX JIT 均为负收益。删除 cached-predicate 静态放行，新增 `CallDispatcher + dims=Object|Dispatch + loop=1 + codeB=1 + risk=None` 的 LowRoi 延迟。正式 `logging_silent` 从原 AutoJIT `328ns` 降到 `212ns`，相对 CPython JIT `219ns` 为 `1.03x faster`；新增 `test_plugin_defers_logging_disabled_fast_path` 与 `test_plugin_defers_call_only_dispatch_loop`。同步补 dask RoiBackoff 复核：`1.67s -> 1.62s`，小收益但非根治。 |
 | v0.31 | 2026-06-11 | @guo | 补 `logging_silent` cached predicate 误伤修复证据：`logging.Logger.isEnabledFor` 是 steady-state 缓存命中立即返回、异常慢路径填充 cache 的小 predicate；原 `RiskDefer` 把它冻结在解释器中会放大 disabled logging 百纳秒级快路径成本。新增通用 cached-predicate-with-exception-slow-path 形状放行，不按 logging 文件名/函数名白名单。验证：gate probe 显示 `classified_defer_freeze=0`、`forced_compile>=1`、`Logger.isEnabledFor` 已 JIT；本地复测达到 `logging_silent` 112ns 目标，且修复分支相对同事实验分支只新增该形状规则和测试。 |
 | v0.30 | 2026-06-10 | @sisibeloved | 补 `dask` 直接失败修复证据：plain generator steady-state override 误把 `@types.coroutine` 生成的 generator-based coroutine 当普通 generator 放行，导致 `asyncio.tasks:__sleep0` 在 `calls=2 limit=2 reason=None` 下进入 JIT，随后 `asyncio.sleep(0)` 抛 `TypeError: 'generator' object can't be awaited`。修复后排除 `CO_ITERABLE_COROUTINE`/coroutine/async-generator flags；`dask --fast` 通过，compile-events 中不再出现 `__sleep0`，正式 `dask=1.77s +- 0.05s`，相对旧 AutoJIT `1.15x faster`，但仍比 CPython JIT/plugin-no-JIT `1.30x slower`。BehaviorClassifier 42/42、`test_autojit_gate_stats` 8/8 通过。 |
 | v0.29 | 2026-06-10 | @sisibeloved | 补 `richards` 误伤修复证据：steady-state 低风险状态 predicate/mutator 与窄 protocol dispatch core 不能按 LowRoi 冻结；只放行带状态写入或 raise 分支的 protocol core，避免把 `pickle_pure_python` setup/call-only wrapper 一起放开。最终子集：`richards=109ms`、`pickle_pure_python=800us`、`2to3=577ms`、`nbody=118ms`；相对 state-helper-only，`richards` `1.14x faster`，`pickle/2to3` 不劣化。BehaviorClassifier 42/42、`test_autojit_gate_stats` 8/8 通过。 |
@@ -151,7 +152,7 @@
 | 轻微回归/待查 | `dulwich_log` | 171ms -> 180ms，1.05x slower | 业务型样本轻微回归，优先看 steady object/dispatch helper 是否被延迟 |
 | 轻微回归/待查 | `sqlglot_v2_normalize` | 382ms -> 432ms，1.13x slower | steady parser/optimizer 高成本函数可能被策略过度延迟 |
 | 长尾回归/待优化 | `sqlalchemy_declarative` | `auto=2` 387.8ms -> AutoJIT 434.4ms mean / 377.5ms median | 复跑确认是双峰长尾：低位值快于 `auto=2`，但 `LowRoi=1000` 延迟编译债溢出 measured values；不是 import/setup 风暴 |
-| 已定位并修复 | `logging_silent` | 363ns -> 420ns，1.16x slower；v0.31 本地复测达到 112ns 目标 | 主因是 `Logger.isEnabledFor` 的 cached predicate 被 `RiskDefer` 冻结；已用通用形状例外修复 |
+| 已定位并修复 | `logging_silent` | 原 AutoJIT 328ns -> 最终 212ns，1.55x faster；相对 CPython JIT 219ns 为 1.03x faster | 主因是 `Logger.isEnabledFor` 和外层 call-only loop 被 JIT 后负收益；最终策略改为二者解释执行 |
 | 噪声/基本持平 | `dask`、`deepcopy_reduce` | hidden as not significant | 暂不作为策略调整依据 |
 
 总体几何均值为 1.13x faster，但主要由 `2to3` 和 startup 拉动。下一步策略优化不应再围绕 startup/import 风暴泛化，而应针对 steady-state 轻微回归样本复跑 gate log，确认是否存在过度 `LowRoi/RiskDefer`。
@@ -654,51 +655,66 @@ v1/v4 与本次当前 AutoJIT 结果一致：延迟一部分 ORM highcost 函数
 
 ### 13.1 总体判断
 
-`logging` 系列分三类：`silent` 是关闭 debug 日志时的极小热路径，`simple` 和 `format` 是实际输出日志时的对象构造、调用链和格式化路径。真实 worker gate 证据显示，三类用例的 gate 主体都是 `BranchFSM`；但 `silent` 的 benchmark 本体和 `Logger.debug` 很小，应放行，输出类用例里的 `LogRecord.__init__`、`Logger.callHandlers`、`Logger.findCaller` 等 steady 热路径被 `LowRoi` 延迟到 1000 后仍会编译。
+`logging` 系列分三类：`silent` 是关闭 debug 日志时的极小热路径，`simple` 和 `format` 是实际输出日志时的对象构造、调用链和格式化路径。2026-06-11 复核后，`logging_silent` 的结论发生反转：**不是编译得不够，而是编译了不该编译的微路径**。
 
-因此 `logging` 支撑一个很具体的策略边界：`LowRoi` 是“先解释执行，热度足够再编译”，不是禁编。日志输出路径虽然不是数值循环，但可能是 benchmark 主体；不能把 steady 的日志高成本函数纳入 import-window 拦截。
+`logging_silent` 的热路径是 `bench_silent -> Logger.debug -> Logger.isEnabledFor(DEBUG)`。HIR/LIR 显示：`Logger.isEnabledFor` 编译后仍然走 `LoadAttrCached + PyObject_IsTrue + PyObject_GetItem` 这类通用 C API 路径；`bench_silent` 编译后只是把 10 次 `logger.debug()` 变成 10 组 `LoadMethodCached + CallMethod`，没有内联 `Logger.debug/isEnabledFor`。因此这两个函数进入 CinderX JIT 都是负收益。
+
+因此 `logging` 支撑两个更窄的策略边界：
+
+- `BranchFSM + risk=Exception` 的 cached predicate 不应因为“看起来像 cache-hit 快路径”就静态放行；没有更强 codegen 支撑时，`Logger.isEnabledFor` 保持 `RiskDefer` 更快。
+- `CallDispatcher + Object|Dispatch + loop=1 + codeB=1 + risk=None` 的 call-only loop，如果只是重复方法调用且没有可内联/可优化的主体工作，应按 `LowRoi` 解释执行，避免把调用 trampoline 成本放大到纳秒级微路径里。
 
 ### 13.2 摘要
 
-| 用例 | 编译事件 | unique compiled | target unique compiled | gate 事件 | unique gated | gate family top | gate reason top |
-|---|---:|---:|---:|---:|---:|---|---|
-| `logging_silent` | 620 | 159 | 3 | 41907 | 480 | `BranchFSM:31938`, `CallDispatcher:3962`, `ReflectionMeta:3477`, `Mixed:1592` | `LowRoi:39660`, `RiskDefer:1664`, `None:423`, `StartupInit:160` |
-| `logging_simple` | 704 | 180 | 19 | 101155 | 505 | `BranchFSM:75427`, `CallDispatcher:19702`, `ReflectionMeta:3480`, `Mixed:1592` | `LowRoi:98868`, `RiskDefer:1684`, `None:443`, `StartupInit:160` |
-| `logging_format` | 708 | 180 | 19 | 101211 | 506 | `BranchFSM:75474`, `CallDispatcher:19701`, `ReflectionMeta:3482`, `Mixed:1592` | `LowRoi:98924`, `RiskDefer:1684`, `None:443`, `StartupInit:160` |
+口径：`blue-98`，`--warmup 3 --affinity=30`，正式 pyperformance `logging` 组；CPython JIT 使用 `/opt/python314-jit/bin/python3.14`，CinderX 使用 `CINDERX_PLUGIN_ENABLE=1 PYTHONJITAUTO=auto:2 CINDERX_AUTOJIT_ROI_BACKOFF=1`。
+
+| 口径 | `logging_format` | `logging_silent` | `logging_simple` | 结论 |
+|---|---:|---:|---:|---|
+| CPython 3.14.3 JIT | 13.2us | 219ns | 12.0us | 对比基线 |
+| 原 AutoJIT | 16.7us | 328ns | 14.8us | `silent` 只有 CPython JIT 的约 67%，明显不达标 |
+| 只撤销 cached-predicate 放行 | 15.9us | 271ns | 14.4us | `silent` 提升 1.21x，但仍只有约 81% |
+| 撤销 cached-predicate + defer call-only loop | 16.0us | 212ns | 14.3us | `silent` 比 CPython JIT 快 1.03x；`format/simple` 没有显著回归 |
+
+产物：
+
+- 原五口径账本：`blue-98:/results/autojit-logging-ledger-20260611_180634`
+- 只撤销 cached-predicate：`blue-98:/results/autojit-logging-formal-after-cached-predicate-defer-20260611_194336`
+- 最终 call-only loop 策略：`blue-98:/results/autojit-logging-formal-after-callonly-defer-20260611_195041`
 
 ### 13.3 代表函数形状表
 
-| 用例 | 函数 | 编译次数 | 编译耗时 | 形状 | 策略 | 判断 |
-|---|---|---:|---:|---|---|---|
-| `logging_silent` | `__main__:bench_silent` | 4 | 30.4ms | `CallDispatcher`, dims=`Object+Dispatch`, `loop=1`, `codeB=1`, `risk=None`, `startup=false` | `2/None` | benchmark 本体，应放行 |
-| `logging_silent` | `logging:Logger.debug` | 4 | 7.1ms | `ObjectManipulator`, dims=`Control+Object+Dispatch`, `loop=0`, `codeB=0`, `risk=None`, `startup=false` | `2/None` | disabled debug 热路径很小，放行合理 |
-| `logging_silent` | `logging:Logger.isEnabledFor` | 0 -> hot 后编译 | 0.0ms | `BranchFSM`, dims=`Control+Object`, `loop=0`, `codeB=1`, `risk=Exception`, `startup=false`；cached predicate：cache subscript fast path 直接 `return`，`KeyError` 慢路径填充 cache | 原 `2097152/RiskDefer` -> `2/None` | 这是 disabled logging 的核心微路径；异常边是 cache miss/fill 慢路径，不代表 steady 负 ROI。允许该通用 cached-predicate 形状避免把快路径冻结在解释器中 |
-| `logging_simple` | `logging:LogRecord.__init__` | 4 | 70.6ms | `BranchFSM`, dims=`Control+Object`, `loop=2`, `codeB=2`, `risk=Exception+HugeCode`, `startup=false` | `1000/LowRoi` | 日志输出核心对象构造；延迟到高热度后仍编译，不能禁编 |
-| `logging_simple` | `__main__:bench_simple_output` | 4 | 32.0ms | `CallDispatcher`, dims=`Object+Dispatch`, `loop=1`, `codeB=2`, `risk=None`, `startup=false` | `2/None` | benchmark 本体，应放行 |
-| `logging_simple` | `logging:Logger.callHandlers` | 4 | 28.4ms | `BranchFSM`, dims=`Control+Object`, `loop=3`, `codeB=2`, `risk=None`, `startup=false` | `1000/LowRoi` | 输出调用链核心函数；LowRoi 延迟合理 |
-| `logging_simple` | `logging:Logger.findCaller` | 4 | 27.1ms | `BranchFSM`, dims=`Control+Dispatch`, `loop=2`, `codeB=2`, `risk=Exception`, `startup=false` | `1000/LowRoi` | 带异常边的调用者查找；延迟但热后编译 |
-| `logging_simple` | `logging:StreamHandler.emit` | 0 | 0.0ms | `BranchFSM`, dims=`Control+Object`, `loop=0`, `codeB=0`, `risk=Exception`, `startup=false` | `2097152/RiskDefer` | 异常边风险延迟，适合作为输出路径风险保护 |
-| `logging_format` | `logging:LogRecord.__init__` | 4 | 64.3ms | `BranchFSM`, dims=`Control+Object`, `loop=2`, `codeB=2`, `risk=Exception+HugeCode`, `startup=false` | `1000/LowRoi` | 与 simple 相同，是日志输出核心成本 |
-| `logging_format` | `__main__:bench_formatted_output` | 4 | 32.7ms | `CallDispatcher`, dims=`Object+Dispatch`, `loop=1`, `codeB=2`, `risk=None`, `startup=false` | `2/None` | benchmark 本体，应放行 |
-| `logging_format` | `logging:PercentStyle._format` | 4 | 4.5ms | `BranchFSM`, dims=`Compute+Control+Object`, `loop=0`, `codeB=0`, `risk=None`, `startup=false`, `compute=true` | `1000/LowRoi` | 轻量格式化函数，compute 提示存在但当前仍被低 ROI 延迟；是否需要放宽需看非 debug A/B |
+| 用例 | 函数 | 旧策略 | 新策略 | 形状 | 证据 | 判断 |
+|---|---|---|---|---|---|---|
+| `logging_silent` | `__main__:bench_silent` | `2/None`，编译 | `2097152/LowRoi`，解释执行 | `CallDispatcher`, dims=`Object+Dispatch`, `loop=1`, `codeB=1`, `risk=None`, `startup=false` | JIT-list 穿刺：只允许它编译时 `323ns -> 257ns`；禁掉所有 logging target 时 `212ns` | 外层只是 10 次方法调用，JIT 无法内联核心路径，编译负收益 |
+| `logging_silent` | `logging:Logger.isEnabledFor` | cached-predicate 例外放行 | `2097152/RiskDefer`，解释执行 | `BranchFSM`, dims=`Control+Object`, `loop=0`, `codeB=1`, `risk=Exception`, `startup=false` | HIR/LIR 显示仍是通用 attr/subscript C API；撤销放行后正式 `328ns -> 271ns` | cache miss 异常边不能静态证明 JIT 正收益，保持 RiskDefer |
+| `logging_silent` | `logging:Logger.debug` | 未作为 AutoJIT 主编译对象 | 不变 | `ObjectManipulator`, dims=`Control+Object+Dispatch`, `loop=0`, `codeB=0`, `risk=None`, `startup=false` | `auto=2` 会编译更多函数且整体更慢；AutoJIT compile-events 中该函数不是剩余主因 | 暂不为它加特例；先避免外层和 predicate 负收益 |
+| `logging_simple` | `logging:LogRecord.__init__` | `1000/LowRoi` | 不变 | `BranchFSM`, dims=`Control+Object`, `loop=2`, `codeB=2`, `risk=Exception+HugeCode`, `startup=false` | 最终正式 `logging_simple=14.3us`，相对原 AutoJIT 1.04x faster | 输出路径不是本次问题；LowRoi 延迟仍合理 |
+| `logging_simple` | `__main__:bench_simple_output` | `2/None` | codeB=2，不命中 call-only loop 新规则 | `CallDispatcher`, dims=`Object+Dispatch`, `loop=1`, `codeB=2`, `risk=None`, `startup=false` | 最终正式 `logging_simple` 无回归 | 只拦 codeB=1 的极小 call-only loop，避免误伤输出路径 |
 
 ### 13.4 策略判断
 
 | 观察 | 结论 |
 |---|---|
-| `silent` 的本体和 `Logger.debug` 很小，`limit=2` | disabled logging 微路径不应被高成本策略误伤 |
-| `Logger.isEnabledFor` 的异常风险来自 cache miss/fill，cache hit 路径是 subscript 后立即 return | 不能把这类 cached predicate 按一般 exception-heavy framework helper 冻结；应在满足“fast return + 单一异常匹配 + cache fill + 无显式 raise”的形状下恢复全局阈值 |
+| `silent` 的外层 benchmark 本体虽有 loop，但主体是重复方法调用 | 没有内联/专用 codegen 前，call-only dispatch loop 编译负收益；应按 LowRoi 解释执行 |
+| `Logger.isEnabledFor` 的异常风险来自 cache miss/fill，但 JIT 后仍走通用 C API | 不能只因 cache-hit 直觉就放行 cached predicate；保持 RiskDefer 更快 |
 | `simple/format` 中多个输出核心函数是 `startup=false + LowRoi + gate_count≈3996` | `LowRoi` 是热度延迟，不是禁编；热日志路径仍能进入 JIT |
-| `StreamHandler.emit/flush` 等异常边函数仍被 `RiskDefer` 延迟 | 风险延迟对异常边丰富的 logging 框架仍有保护作用；`Logger.isEnabledFor` 是 cache-hit predicate 例外，不能混入一般异常边 |
+| `StreamHandler.emit/flush` 等异常边函数仍被 `RiskDefer` 延迟 | 风险延迟对异常边丰富的 logging 框架仍有保护作用；不要用 `Logger.isEnabledFor` 反推全局放宽 |
 | logging top 编译耗时里有 `importlib.metadata`、`argparse` 等 driver/setup 噪声 | 调 logging 策略时必须看 benchmark-self，不能只看全局 top 编译耗时 |
 
-### 13.5 2026-06-11 cached predicate 修复记录
+### 13.5 2026-06-11 复核记录
 
-`logging_silent` 的 disabled debug 路径为 `bench_silent -> Logger.debug -> Logger.isEnabledFor(DEBUG)`；当 logger level 为 `WARNING` 时不会进入 `_log`。`Logger.isEnabledFor` 的 hot path 是读取 `self._cache[level]` 后立即返回，`KeyError` 分支只在 cache miss 时加锁、计算并写回 cache。旧策略只看到 `BranchFSM + risk=Exception + codeB=1`，把它归入 `RiskDefer` 并置冷位，导致该函数在 steady-state 继续解释执行。
+`logging_silent` 的 disabled debug 路径为 `bench_silent -> Logger.debug -> Logger.isEnabledFor(DEBUG)`；当 logger level 为 `WARNING` 时不会进入 `_log`。本轮用三组证据修正旧判断：
 
-本次修复没有新增 logging 专用白名单，也没有新增 `StructureKey` 修饰位；它在 `computeThresholdForCode` 的 `RiskDefer` 分支里补一个通用形状例外：steady Python method、非 static/suspendable/synthetic、`BranchFSM`、`loop=0`、`risk=Exception`，且字节码满足“cache subscript fast path 后下一个相关 opcode 是 return、恰好一个 `CHECK_EXC_MATCH`、存在 cache fill `STORE_SUBSCR`、没有显式 `RAISE_VARARGS`”。这个前提把 `Logger.isEnabledFor` 这类 cache-hit predicate 和一般 exception-heavy framework helper 区分开。
+- 五口径账本：CPython JIT `219ns`、CinderX no-plugin `211ns`、plugin-no-JIT `211ns`、`auto=2` `367ns`、原 AutoJIT `328ns`。差距只在启用 JIT 后出现。
+- HIR/LIR：`bench_silent` 是 10 组 `LoadMethodCached + CallMethod`；`Logger.isEnabledFor` 是 `LoadAttrCached + IsTruthy + BinaryOp<Subscript>`，没有把 cache-hit 路径降成比解释器更快的专用路径。
+- JIT-list 穿刺：正常 AutoJIT `323ns`；只允许 `bench_silent` 编译为 `257ns`；禁止 logging target 编译为 `212ns`。因此两个函数都负收益，其中 `isEnabledFor` 约贡献第一段改善，call-only loop 约贡献第二段改善。
 
-验证口径：gate probe 在实验分支上确认 `classified_defer_freeze=0`、`forced_compile>=1`，且 `logging.Logger.isEnabledFor` 变为 JIT compiled；新增 `test_plugin_compiles_logging_disabled_fast_path` 固化该行为。本地 `logging_silent` 复测达到 112ns 目标。该规则仍保留 `_keep_alive` 等普通 expected-exception helper 的 `RiskDefer` 边界，避免把 `deepcopy_reduce` 方向的误伤重新放开。
+生产实现不新增 logging 白名单、不新增 `StructureKey` 位，只调整两个通用策略：
+
+- 删除 cached-predicate 的 `RiskDefer -> None` 静态放行，`Logger.isEnabledFor` 回到解释执行。
+- 新增 `CallDispatcher + dims=Object|Dispatch + loop=1 + codeB=1 + risk=None + startup=false` 的 `LowRoi` 延迟，覆盖 `bench_silent` 这类极小 call-only loop。
+
+验证：新增 `test_plugin_defers_logging_disabled_fast_path` 和 `test_plugin_defers_call_only_dispatch_loop`。正式 `logging` 组最终为 `logging_silent=212ns`，相对原 AutoJIT `328ns` 为 `1.55x faster`，相对 CPython JIT `219ns` 为 `1.03x faster`。
 
 ## 14 用例：sympy 系列
 
@@ -950,6 +966,28 @@ debug 口径：临时 autohook 只 `import _cinderx_auto`，`bm_pickle --pure-py
 - 真正差距只有一项：启用 CinderX JIT 后新增 `+650ms` 级动态成本；当前 AutoJIT 没把它降下来。
 - 下一步不该继续调 startup/import/provider，而应围绕 `distributed`/`asyncio`/`cloudpickle`/`zict` 的 deopt、slot guard 多态、expected exception 慢路径做专项 A/B。
 
+### 17.2.1 2026-06-11 复核
+
+本轮按“先 RoiBackoff A/B，再看剩余成本”的顺序复核 dask：
+
+| 口径 | 结果 | 结论 |
+|---|---:|---|
+| `CINDERX_AUTOJIT_ROI_BACKOFF=0` | `1.67s +- 0.05s` | 旧 AutoJIT steady JIT 成本仍明显 |
+| `CINDERX_AUTOJIT_ROI_BACKOFF=1` | `1.62s +- 0.04s` | RoiBackoff 约 `1.03x faster`，有小收益但不是根治 |
+| 撤销 cached-predicate 后复测 | `1.63s +- 0.04s` | 对 dask 无显著回归 |
+
+产物：
+
+- RoiBackoff A/B：`blue-98:/results/autojit-dask-roi-ab-20260611_175540`
+- full diag：`blue-98:/results/autojit-dask-full-diag-20260611_190127`
+- cached-predicate 复测：`blue-98:/results/autojit-dask-after-cached-predicate-defer-20260611_193542`
+
+新的诊断结论：
+
+- 当前版本下旧的百万级 deopt storm 不再复现。full diag 中 RoiBackoff off/on 的 deopt 约为 `274 -> 35`，主要来自 pip/logging 元数据路径，不再是 dask 主体。
+- 当前最大的可见 AutoJIT 信号变成约 `1.95M` 次 `classified_schedule_cold_skip`，top 包括 `distributed.metrics:ContextMeter.meter.<locals>.callback`、`distributed.worker_state_machine:WorkerState._transitions.<locals>.process_recs`、`dask.tokenize:_normalize_seq_func.<locals>._inner_normalize_token` 等。冷跳过 cache spike 没有带来显著收益，因此剩余差距不应继续归因到阈值计算本身。
+- dask 仍是 steady-state JIT 动态成本样本，不是 startup/import 样本；后续优化应转向 JIT codegen 的多态 guard、expected exception 慢路径、frame/call 固定成本，而不是扩大静态 highcost 或 provider 规则。
+
 ### 17.3 分表一：gate 与编译规模
 
 debug 口径：`--fast -n 3 -w 1`，只用于函数形状和路径计数，不作为性能数值。4 个 pyperf worker 的合计数据如下。
@@ -1139,7 +1177,7 @@ top deopt site：
 | P1 | 给 `sqlalchemy_imperative` 补同格式表 | `sqlalchemy_declarative` 已补当前五口径账本；imperative 仍需按同样口径拆分 |
 | P1 | 对 `sqlalchemy_declarative` top deopt/LowRoi 函数做严格禁编穿刺 | 验证把部分 ORM 多态路径从“延迟后仍编译”改成“不编译/动态禁编”能否拿回 mean 长尾 |
 | P1 | 给 `sqlglot_v2` 四个子用例分别补非 debug A/B | 区分 parse/transpile/optimize 的真实收益和误伤边界 |
-| P1 | 给 `logging_simple` / `logging_format` 补非 debug A/B，并归档 `logging_silent` v0.31 正式复测产物 | silent 微路径已定位为 cached predicate 误伤；输出路径仍需判断是否需要差异化阈值 |
+| P1 | 给 `logging_simple` / `logging_format` 补更细的 codegen/调用路径分析 | `logging_silent` 已通过 defer predicate 与 call-only loop 达标；输出路径仍比 CPython JIT 慢约 1.2x，需要单独判断是否值得做 JIT codegen 优化 |
 | P1 | 给 `sympy` 四个子用例分别补非 debug A/B | 判断符号计算 highcost 函数的动态收益是否覆盖编译成本 |
 | P1 | 拆 `pickle_pure_python` 正式 AutoJIT 残留成本 | auto 模式已不装 frame evaluator 且 LowRoi 冻结后达到 85% 线；后续只需继续拆 gate/compiled-entry/startup hook 的约 `156us` 残留上界 |
 | P1 | 将 `deepcopy/deepcopy_reduce/deepcopy_memo` 三个子场景补完整函数形状表 | deopt 和正式 A/B 已拆分；后续还需要按子场景列完整编译函数，确认 `_deepcopy_tuple` 收窄规则是否有其它同形状候选 |
