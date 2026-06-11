@@ -304,6 +304,7 @@ class AutoJitGateStatsDumpTests(unittest.TestCase):
             env["PYTHONJITAUTO"] = "auto:100"
             env["CINDERX_AUTOJIT_ROI_BACKOFF"] = "1"
             env["CINDERX_AUTOJIT_ROI_BACKOFF_BUDGET"] = "8"
+            env["CINDERX_AUTOJIT_ROI_BACKOFF_MAX_ROUNDS"] = "2"
 
             completed = subprocess.run(
                 [
@@ -334,6 +335,56 @@ class AutoJitGateStatsDumpTests(unittest.TestCase):
                     "assert stats['roi_uncompile'] >= 1, stats\n"
                     "assert stats['roi_recompile'] == 0, stats\n"
                     "assert stats['roi_frozen'] == 0, stats\n"
+                    "assert not jit.is_jit_compiled(numeric_loop), stats\n",
+                ],
+                cwd=temp,
+                env=env,
+                capture_output=True,
+                text=True,
+                timeout=60,
+            )
+
+            self.assertEqual(
+                completed.returncode,
+                0,
+                f"stdout:\n{completed.stdout}\nstderr:\n{completed.stderr}",
+            )
+
+    def test_plugin_roi_backoff_defaults_freeze_first_deopt_storm(self) -> None:
+        with tempfile.TemporaryDirectory() as temp:
+            env = _plugin_env()
+            env["PYTHONJITAUTO"] = "auto:100"
+            env["CINDERX_AUTOJIT_ROI_BACKOFF"] = "1"
+
+            completed = subprocess.run(
+                [
+                    sys.executable,
+                    "-c",
+                    "import cinderjit\n"
+                    "import cinderx.jit as jit\n"
+                    "\n"
+                    "cinderjit._clear_autojit_gate_stats()\n"
+                    "\n"
+                    "def numeric_loop(value):\n"
+                    "    total = 0\n"
+                    "    for _ in range(8):\n"
+                    "        total += value\n"
+                    "    return total\n"
+                    "\n"
+                    "for _ in range(120):\n"
+                    "    numeric_loop(1)\n"
+                    "\n"
+                    "assert jit.is_jit_compiled(numeric_loop), (\n"
+                    "    jit.count_interpreted_calls(numeric_loop)\n"
+                    ")\n"
+                    "\n"
+                    "for _ in range(64):\n"
+                    "    numeric_loop(1.5)\n"
+                    "\n"
+                    "stats = cinderjit._autojit_gate_stats()\n"
+                    "assert stats['roi_frozen'] >= 1, stats\n"
+                    "assert stats['roi_uncompile'] == 0, stats\n"
+                    "assert stats['roi_recompile'] == 0, stats\n"
                     "assert not jit.is_jit_compiled(numeric_loop), stats\n",
                 ],
                 cwd=temp,
@@ -394,6 +445,52 @@ class AutoJitGateStatsDumpTests(unittest.TestCase):
                     "assert dispatch_stats['forced_compile'] == 0, dispatch_stats\n"
                     "assert jit.count_interpreted_calls(dispatch) <= 2\n"
                     "assert not jit.is_jit_compiled(dispatch)\n",
+                ],
+                cwd=temp,
+                env=env,
+                capture_output=True,
+                text=True,
+                timeout=60,
+            )
+
+            self.assertEqual(
+                completed.returncode,
+                0,
+                f"stdout:\n{completed.stdout}\nstderr:\n{completed.stderr}",
+            )
+
+    def test_plugin_freezes_low_loop_object_manipulators(self) -> None:
+        with tempfile.TemporaryDirectory() as temp:
+            env = _plugin_env()
+
+            completed = subprocess.run(
+                [
+                    sys.executable,
+                    "-c",
+                    "import cinderjit\n"
+                    "import cinderx.jit as jit\n"
+                    "\n"
+                    "class Payload:\n"
+                    "    def __init__(self):\n"
+                    "        self.value = 42\n"
+                    "\n"
+                    "def write_value(obj, value):\n"
+                    "    obj.value = value\n"
+                    "    return obj.value\n"
+                    "\n"
+                    "payload = Payload()\n"
+                    "cinderjit._clear_autojit_gate_stats()\n"
+                    "\n"
+                    "for value in range(20):\n"
+                    "    write_value(payload, value)\n"
+                    "\n"
+                    "stats = cinderjit._autojit_gate_stats()\n"
+                    "assert stats['global_threshold_return'] >= 1, stats\n"
+                    "assert stats['classified_defer_freeze'] >= 1, stats\n"
+                    "assert stats['classified_warmup_return'] == 0, stats\n"
+                    "assert stats['forced_compile'] == 0, stats\n"
+                    "assert jit.count_interpreted_calls(write_value) <= 2\n"
+                    "assert not jit.is_jit_compiled(write_value)\n",
                 ],
                 cwd=temp,
                 env=env,

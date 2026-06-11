@@ -230,8 +230,8 @@ struct Config {
   // repeatedly deopts. Disabled by default; enabled independently from
   // auto_classify so A/B can isolate its effect.
   bool roi_backoff_enabled{false};
-  size_t roi_deopt_budget_base{256};
-  size_t roi_backoff_max_rounds{2};
+  size_t roi_deopt_budget_base{32};
+  size_t roi_backoff_max_rounds{1};
   size_t roi_rewarm_factor{64};
   GdbOptions gdb;
   JitListOptions jit_list;

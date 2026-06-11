@@ -1472,9 +1472,6 @@ ThresholdDecision computeThreshold(
           saturatingMul(global, kStartupDeferThresholdFactor),
           key.highRisk() ? BranchReason::RiskDefer : BranchReason::LowRoi};
     }
-    if (key.family == Family::ObjectManipulator) {
-      return {global, BranchReason::None};
-    }
     return {std::max(global, kSteadyNonnumericWarmupThreshold),
             BranchReason::LowRoi};
   }
