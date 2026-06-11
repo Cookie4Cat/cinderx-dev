@@ -357,6 +357,49 @@ class AutoJitGateStatsDumpTests(unittest.TestCase):
                 f"stdout:\n{completed.stdout}\nstderr:\n{completed.stderr}",
             )
 
+    def test_plugin_compiles_logging_disabled_fast_path(self) -> None:
+        with tempfile.TemporaryDirectory() as temp:
+            env = _plugin_env()
+
+            completed = subprocess.run(
+                [
+                    sys.executable,
+                    "-c",
+                    "import logging\n"
+                    "import cinderjit\n"
+                    "import cinderx.jit as jit\n"
+                    "\n"
+                    "logger = logging.getLogger('cinderx.autojit.logging')\n"
+                    "logger.handlers[:] = []\n"
+                    "logger.setLevel(logging.WARNING)\n"
+                    "logger.propagate = False\n"
+                    "\n"
+                    "cinderjit._clear_autojit_gate_stats()\n"
+                    "for _ in range(16):\n"
+                    "    assert not logger.isEnabledFor(logging.DEBUG)\n"
+                    "\n"
+                    "stats = cinderjit._autojit_gate_stats()\n"
+                    "assert stats['global_threshold_return'] >= 1, stats\n"
+                    "assert stats['classified_defer_freeze'] == 0, stats\n"
+                    "assert stats['forced_compile'] >= 1, stats\n"
+                    "assert jit.is_jit_compiled(logging.Logger.isEnabledFor), (\n"
+                    "    stats,\n"
+                    "    jit.count_interpreted_calls(logging.Logger.isEnabledFor),\n"
+                    ")\n",
+                ],
+                cwd=temp,
+                env=env,
+                capture_output=True,
+                text=True,
+                timeout=60,
+            )
+
+            self.assertEqual(
+                completed.returncode,
+                0,
+                f"stdout:\n{completed.stdout}\nstderr:\n{completed.stderr}",
+            )
+
 
 if __name__ == "__main__":
     unittest.main()
