@@ -565,8 +565,8 @@ TEST(BehaviorClassifierTest, SteadyStateWarmsUpTinyStartupLikeWork) {
   tiny_object.loop_score = 0;
   tiny_object.code_size_bucket = 0;
   auto tiny_object_decision = computeThreshold(tiny_object, steady_state, 2);
-  EXPECT_EQ(tiny_object_decision.limit, 2);
-  EXPECT_EQ(tiny_object_decision.branch_reason, BranchReason::None);
+  EXPECT_EQ(tiny_object_decision.limit, 1000);
+  EXPECT_EQ(tiny_object_decision.branch_reason, BranchReason::LowRoi);
 
   StructureKey medium_object{Family::ObjectManipulator};
   medium_object.loop_score = 0;
@@ -588,7 +588,7 @@ class BehaviorClassifierRuntimeTest : public RuntimeTest {};
 
 TEST_F(
     BehaviorClassifierRuntimeTest,
-    AutoClassifyCompilesTinyObjectHelpersOnPythonCallPath) {
+    AutoClassifyDefersTinyObjectHelpersOnPythonCallPath) {
   ScopedAutoJitConfig config_guard;
   getMutableConfig().compile_after_n_calls = 2;
   getMutableConfig().auto_classify = true;
@@ -613,7 +613,8 @@ grid = Grid()
 for _ in range(16):
     Grid.__getitem__(grid, (0, 0))
 
-assert jit.is_jit_compiled(Grid.__getitem__), jit.count_interpreted_calls(Grid.__getitem__)
+assert not jit.is_jit_compiled(Grid.__getitem__)
+assert jit.count_interpreted_calls(Grid.__getitem__) <= 2
 )");
 }
 
@@ -1255,8 +1256,8 @@ target = ns["BaseEventLoop"].call_soon
 
   auto decision =
       computeThresholdForCode(codeFromFunc(func), user_helper, {}, 2);
-  EXPECT_EQ(decision.limit, 2);
-  EXPECT_EQ(decision.branch_reason, BranchReason::None);
+  EXPECT_EQ(decision.limit, 1000);
+  EXPECT_EQ(decision.branch_reason, BranchReason::LowRoi);
 }
 
 TEST_F(

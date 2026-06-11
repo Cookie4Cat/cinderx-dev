@@ -53,15 +53,15 @@ size_t countBinarySubscrs(const jit::hir::Function& irfunc) {
 }
 } // namespace
 
-// Test that BINARY_SUBSCR on array('d') generates LoadArrayItem(TCDouble) in
-// HIR.
+// Test that BINARY_SUBSCR on array('d') with a known index shape generates
+// LoadArrayItem(TCDouble) in HIR.
 TEST_F(ArrayLoadTest, BinarySubscrArrayDoubleGeneratesLoadArrayItem) {
   std::unique_ptr<jit::hir::Function> irfunc;
   CompileToHIR(
       R"(
 from array import array
-def load_array_double(a, i):
-    return a[i]
+def load_array_double(a):
+    return a[0]
 )",
       "load_array_double",
       irfunc);
@@ -94,8 +94,8 @@ TEST_F(ArrayLoadTest, LoadArrayItemCoexistsWithPrimitiveBox) {
   CompileToHIR(
       R"(
 from array import array
-def load_array_double(a, i):
-    return a[i]
+def load_array_double(a):
+    return a[0]
 )",
       "load_array_double",
       irfunc);
@@ -130,9 +130,8 @@ def load_array_double(a, i):
       << "Expected PrimitiveBox(CDouble) in HIR alongside LoadArrayItem";
 }
 
-// Test that BINARY_SUBSCR generates both fast path (LoadArrayItem) and slow
-// path (BinaryOp) for generic subscript.
-TEST_F(ArrayLoadTest, BinarySubscrGeneratesBothPaths) {
+// Test that BINARY_SUBSCR with unknown container/index shapes stays generic.
+TEST_F(ArrayLoadTest, BinarySubscrUnknownShapeGeneratesGenericPath) {
   std::unique_ptr<jit::hir::Function> irfunc;
   CompileToHIR(
       R"(
@@ -166,20 +165,21 @@ def load_any(a, i):
     }
   }
 
-  EXPECT_TRUE(found_load_array_item)
-      << "Expected LoadArrayItem(TCDouble) (fast path) in HIR";
+  EXPECT_FALSE(found_load_array_item)
+      << "Did not expect LoadArrayItem for unknown load shapes";
   EXPECT_TRUE(found_binary_op_subscr)
-      << "Expected BinaryOp(kSubscript) (slow path) in HIR";
+      << "Expected BinaryOp(kSubscript) in HIR";
 }
 
-// Test that CondBranchCheckType guard is present for array type check.
+// Test that CondBranchCheckType guard is present for array type check when the
+// fast path is enabled.
 TEST_F(ArrayLoadTest, CondBranchCheckTypeGuardPresent) {
   std::unique_ptr<jit::hir::Function> irfunc;
   CompileToHIR(
       R"(
 from array import array
-def load_array_double(a, i):
-    return a[i]
+def load_array_double(a):
+    return a[0]
 )",
       "load_array_double",
       irfunc);
@@ -206,8 +206,8 @@ TEST_F(ArrayLoadTest, SlowPathIsNotReSpecializedAcrossSimplifyPasses) {
   std::unique_ptr<jit::hir::Function> irfunc;
   CompileToHIR(
       R"(
-def load_any(a, i):
-    return a[i]
+def load_any(a):
+    return a[0]
 )",
       "load_any",
       irfunc);

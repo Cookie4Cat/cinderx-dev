@@ -1429,6 +1429,10 @@ ThresholdDecision computeThresholdForCode(
     const GateContext& context,
     uint32_t global) {
   auto decision = computeThreshold(key, context, global);
+  if (isStdlibAsyncioEventLoopFrameworkHelper(code, key, context)) {
+    return {saturatingMul(global, kStartupDeferThresholdFactor),
+            BranchReason::LowRoi};
+  }
   if (decision.branch_reason != BranchReason::None &&
       shouldAllowSteadyStatePlainGenerator(code, key, context)) {
     return {global, BranchReason::None};
@@ -1441,12 +1445,6 @@ ThresholdDecision computeThresholdForCode(
       (shouldAllowSteadyStateCompositeStatePredicate(code, key, context) ||
        shouldAllowSteadyStateProtocolDispatchCore(code, key, context))) {
     return {global, BranchReason::None};
-  }
-  if (decision.branch_reason == BranchReason::None &&
-      decision.limit == global &&
-      isStdlibAsyncioEventLoopFrameworkHelper(code, key, context)) {
-    return {saturatingMul(global, kStartupDeferThresholdFactor),
-            BranchReason::LowRoi};
   }
   return decision;
 }

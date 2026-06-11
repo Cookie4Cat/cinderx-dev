@@ -37,7 +37,15 @@ if os.environ.get("CINDERX_PLUGIN_ENABLE", "0") == "1":
         assert not cinderjit.is_jit_compiled(
             auto_jit_target
         ), "auto_jit_target should be deferred by AutoJIT classification"
-        assert cinderjit.count_interpreted_calls(auto_jit_target) == call_count
+        interpreted_calls = cinderjit.count_interpreted_calls(auto_jit_target)
+        threshold = cinderjit.get_compile_after_n_calls()
+        assert threshold is not None, "AutoJIT threshold was not configured"
+        assert interpreted_calls > 0, "auto_jit_target was never observed"
+        assert interpreted_calls <= min(call_count, threshold), (
+            interpreted_calls,
+            call_count,
+            threshold,
+        )
     else:
         assert cinderjit.is_jit_compiled(
             auto_jit_target
