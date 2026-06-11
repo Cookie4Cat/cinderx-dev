@@ -10,6 +10,7 @@
 
 | 版本 | 日期 | 修订人 | 修订说明 |
 |---|---|---|---|
+| v0.31 | 2026-06-11 | @guo | 补 `logging_silent` cached predicate 误伤修复证据：`logging.Logger.isEnabledFor` 是 steady-state 缓存命中立即返回、异常慢路径填充 cache 的小 predicate；原 `RiskDefer` 把它冻结在解释器中会放大 disabled logging 百纳秒级快路径成本。新增通用 cached-predicate-with-exception-slow-path 形状放行，不按 logging 文件名/函数名白名单。验证：gate probe 显示 `classified_defer_freeze=0`、`forced_compile>=1`、`Logger.isEnabledFor` 已 JIT；本地复测达到 `logging_silent` 112ns 目标，且修复分支相对同事实验分支只新增该形状规则和测试。 |
 | v0.30 | 2026-06-10 | @sisibeloved | 补 `dask` 直接失败修复证据：plain generator steady-state override 误把 `@types.coroutine` 生成的 generator-based coroutine 当普通 generator 放行，导致 `asyncio.tasks:__sleep0` 在 `calls=2 limit=2 reason=None` 下进入 JIT，随后 `asyncio.sleep(0)` 抛 `TypeError: 'generator' object can't be awaited`。修复后排除 `CO_ITERABLE_COROUTINE`/coroutine/async-generator flags；`dask --fast` 通过，compile-events 中不再出现 `__sleep0`，正式 `dask=1.77s +- 0.05s`，相对旧 AutoJIT `1.15x faster`，但仍比 CPython JIT/plugin-no-JIT `1.30x slower`。BehaviorClassifier 42/42、`test_autojit_gate_stats` 8/8 通过。 |
 | v0.29 | 2026-06-10 | @sisibeloved | 补 `richards` 误伤修复证据：steady-state 低风险状态 predicate/mutator 与窄 protocol dispatch core 不能按 LowRoi 冻结；只放行带状态写入或 raise 分支的 protocol core，避免把 `pickle_pure_python` setup/call-only wrapper 一起放开。最终子集：`richards=109ms`、`pickle_pure_python=800us`、`2to3=577ms`、`nbody=118ms`；相对 state-helper-only，`richards` `1.14x faster`，`pickle/2to3` 不劣化。BehaviorClassifier 42/42、`test_autojit_gate_stats` 8/8 通过。 |
 | v0.28 | 2026-06-10 | @sisibeloved | 补 `generators` 误伤修复证据：`Tree.__iter__` 的 `risk=Exception` 来自 `yield from` generator cleanup，不应按业务异常/动态风险冻结；steady-state 普通 generator 在仅含 `Suspend/Exception` 风险时恢复全局阈值。正式 A/B：破损 AutoJIT `generators=60.2ms`，修复后 `21.7ms`，相对破损 `2.78x faster`，与 `PYTHONJITAUTO=2` 不显著；同口径 `2to3` 改动前 `578ms`、改动后 `579ms`，`pyperf compare_to` 不显著。同步修正 RuntimeTests：BehaviorClassifier 36/36 通过，`test_autojit_gate_stats` 8/8 通过。 |
@@ -150,7 +151,7 @@
 | 轻微回归/待查 | `dulwich_log` | 171ms -> 180ms，1.05x slower | 业务型样本轻微回归，优先看 steady object/dispatch helper 是否被延迟 |
 | 轻微回归/待查 | `sqlglot_v2_normalize` | 382ms -> 432ms，1.13x slower | steady parser/optimizer 高成本函数可能被策略过度延迟 |
 | 长尾回归/待优化 | `sqlalchemy_declarative` | `auto=2` 387.8ms -> AutoJIT 434.4ms mean / 377.5ms median | 复跑确认是双峰长尾：低位值快于 `auto=2`，但 `LowRoi=1000` 延迟编译债溢出 measured values；不是 import/setup 风暴 |
-| 轻微回归/待查 | `logging_silent` | 363ns -> 420ns，1.16x slower | 纳秒级用例，可能是测量噪声或低 ROI 延迟的固定成本 |
+| 已定位并修复 | `logging_silent` | 363ns -> 420ns，1.16x slower；v0.31 本地复测达到 112ns 目标 | 主因是 `Logger.isEnabledFor` 的 cached predicate 被 `RiskDefer` 冻结；已用通用形状例外修复 |
 | 噪声/基本持平 | `dask`、`deepcopy_reduce` | hidden as not significant | 暂不作为策略调整依据 |
 
 总体几何均值为 1.13x faster，但主要由 `2to3` 和 startup 拉动。下一步策略优化不应再围绕 startup/import 风暴泛化，而应针对 steady-state 轻微回归样本复跑 gate log，确认是否存在过度 `LowRoi/RiskDefer`。
@@ -671,7 +672,7 @@ v1/v4 与本次当前 AutoJIT 结果一致：延迟一部分 ORM highcost 函数
 |---|---|---:|---:|---|---|---|
 | `logging_silent` | `__main__:bench_silent` | 4 | 30.4ms | `CallDispatcher`, dims=`Object+Dispatch`, `loop=1`, `codeB=1`, `risk=None`, `startup=false` | `2/None` | benchmark 本体，应放行 |
 | `logging_silent` | `logging:Logger.debug` | 4 | 7.1ms | `ObjectManipulator`, dims=`Control+Object+Dispatch`, `loop=0`, `codeB=0`, `risk=None`, `startup=false` | `2/None` | disabled debug 热路径很小，放行合理 |
-| `logging_silent` | `logging:Logger.isEnabledFor` | 0 | 0.0ms | `BranchFSM`, dims=`Control+Object`, `loop=0`, `codeB=1`, `risk=Exception`, `startup=false` | `2097152/RiskDefer` | 异常边风险延迟，未编译；对 silent 微路径有保护作用 |
+| `logging_silent` | `logging:Logger.isEnabledFor` | 0 -> hot 后编译 | 0.0ms | `BranchFSM`, dims=`Control+Object`, `loop=0`, `codeB=1`, `risk=Exception`, `startup=false`；cached predicate：cache subscript fast path 直接 `return`，`KeyError` 慢路径填充 cache | 原 `2097152/RiskDefer` -> `2/None` | 这是 disabled logging 的核心微路径；异常边是 cache miss/fill 慢路径，不代表 steady 负 ROI。允许该通用 cached-predicate 形状避免把快路径冻结在解释器中 |
 | `logging_simple` | `logging:LogRecord.__init__` | 4 | 70.6ms | `BranchFSM`, dims=`Control+Object`, `loop=2`, `codeB=2`, `risk=Exception+HugeCode`, `startup=false` | `1000/LowRoi` | 日志输出核心对象构造；延迟到高热度后仍编译，不能禁编 |
 | `logging_simple` | `__main__:bench_simple_output` | 4 | 32.0ms | `CallDispatcher`, dims=`Object+Dispatch`, `loop=1`, `codeB=2`, `risk=None`, `startup=false` | `2/None` | benchmark 本体，应放行 |
 | `logging_simple` | `logging:Logger.callHandlers` | 4 | 28.4ms | `BranchFSM`, dims=`Control+Object`, `loop=3`, `codeB=2`, `risk=None`, `startup=false` | `1000/LowRoi` | 输出调用链核心函数；LowRoi 延迟合理 |
@@ -686,9 +687,18 @@ v1/v4 与本次当前 AutoJIT 结果一致：延迟一部分 ORM highcost 函数
 | 观察 | 结论 |
 |---|---|
 | `silent` 的本体和 `Logger.debug` 很小，`limit=2` | disabled logging 微路径不应被高成本策略误伤 |
+| `Logger.isEnabledFor` 的异常风险来自 cache miss/fill，cache hit 路径是 subscript 后立即 return | 不能把这类 cached predicate 按一般 exception-heavy framework helper 冻结；应在满足“fast return + 单一异常匹配 + cache fill + 无显式 raise”的形状下恢复全局阈值 |
 | `simple/format` 中多个输出核心函数是 `startup=false + LowRoi + gate_count≈3996` | `LowRoi` 是热度延迟，不是禁编；热日志路径仍能进入 JIT |
-| `StreamHandler.emit/flush`、`Logger.isEnabledFor` 等异常边函数被 `RiskDefer` 延迟 | 风险延迟对异常边丰富的 logging 框架有实际保护作用 |
+| `StreamHandler.emit/flush` 等异常边函数仍被 `RiskDefer` 延迟 | 风险延迟对异常边丰富的 logging 框架仍有保护作用；`Logger.isEnabledFor` 是 cache-hit predicate 例外，不能混入一般异常边 |
 | logging top 编译耗时里有 `importlib.metadata`、`argparse` 等 driver/setup 噪声 | 调 logging 策略时必须看 benchmark-self，不能只看全局 top 编译耗时 |
+
+### 13.5 2026-06-11 cached predicate 修复记录
+
+`logging_silent` 的 disabled debug 路径为 `bench_silent -> Logger.debug -> Logger.isEnabledFor(DEBUG)`；当 logger level 为 `WARNING` 时不会进入 `_log`。`Logger.isEnabledFor` 的 hot path 是读取 `self._cache[level]` 后立即返回，`KeyError` 分支只在 cache miss 时加锁、计算并写回 cache。旧策略只看到 `BranchFSM + risk=Exception + codeB=1`，把它归入 `RiskDefer` 并置冷位，导致该函数在 steady-state 继续解释执行。
+
+本次修复没有新增 logging 专用白名单，也没有新增 `StructureKey` 修饰位；它在 `computeThresholdForCode` 的 `RiskDefer` 分支里补一个通用形状例外：steady Python method、非 static/suspendable/synthetic、`BranchFSM`、`loop=0`、`risk=Exception`，且字节码满足“cache subscript fast path 后下一个相关 opcode 是 return、恰好一个 `CHECK_EXC_MATCH`、存在 cache fill `STORE_SUBSCR`、没有显式 `RAISE_VARARGS`”。这个前提把 `Logger.isEnabledFor` 这类 cache-hit predicate 和一般 exception-heavy framework helper 区分开。
+
+验证口径：gate probe 在实验分支上确认 `classified_defer_freeze=0`、`forced_compile>=1`，且 `logging.Logger.isEnabledFor` 变为 JIT compiled；新增 `test_plugin_compiles_logging_disabled_fast_path` 固化该行为。本地 `logging_silent` 复测达到 112ns 目标。该规则仍保留 `_keep_alive` 等普通 expected-exception helper 的 `RiskDefer` 边界，避免把 `deepcopy_reduce` 方向的误伤重新放开。
 
 ## 14 用例：sympy 系列
 
@@ -1129,7 +1139,7 @@ top deopt site：
 | P1 | 给 `sqlalchemy_imperative` 补同格式表 | `sqlalchemy_declarative` 已补当前五口径账本；imperative 仍需按同样口径拆分 |
 | P1 | 对 `sqlalchemy_declarative` top deopt/LowRoi 函数做严格禁编穿刺 | 验证把部分 ORM 多态路径从“延迟后仍编译”改成“不编译/动态禁编”能否拿回 mean 长尾 |
 | P1 | 给 `sqlglot_v2` 四个子用例分别补非 debug A/B | 区分 parse/transpile/optimize 的真实收益和误伤边界 |
-| P1 | 给 `logging` 三个子用例分别补非 debug A/B | 区分 silent 微路径、simple 输出路径、format 格式化路径是否需要差异化阈值 |
+| P1 | 给 `logging_simple` / `logging_format` 补非 debug A/B，并归档 `logging_silent` v0.31 正式复测产物 | silent 微路径已定位为 cached predicate 误伤；输出路径仍需判断是否需要差异化阈值 |
 | P1 | 给 `sympy` 四个子用例分别补非 debug A/B | 判断符号计算 highcost 函数的动态收益是否覆盖编译成本 |
 | P1 | 拆 `pickle_pure_python` 正式 AutoJIT 残留成本 | auto 模式已不装 frame evaluator 且 LowRoi 冻结后达到 85% 线；后续只需继续拆 gate/compiled-entry/startup hook 的约 `156us` 残留上界 |
 | P1 | 将 `deepcopy/deepcopy_reduce/deepcopy_memo` 三个子场景补完整函数形状表 | deopt 和正式 A/B 已拆分；后续还需要按子场景列完整编译函数，确认 `_deepcopy_tuple` 收窄规则是否有其它同形状候选 |
