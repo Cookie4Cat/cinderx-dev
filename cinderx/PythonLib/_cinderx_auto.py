@@ -1,16 +1,36 @@
 import os
 import sys
 
-if os.environ.get("CINDERX_PLUGIN_ENABLE", "0") == "1":
+
+def _env_flag_enabled(name):
+    return os.environ.get(name, "0").lower() in ("1", "true", "yes", "on")
+
+
+def _cinderx_plugin_enabled():
+    return os.environ.get("CINDERX_PLUGIN_ENABLE", "0") == "1"
+
+
+def _cinderx_force_disabled():
+    return _env_flag_enabled("CINDERX_DISABLE")
+
+
+def _cinderx_jit_disabled():
+    return _env_flag_enabled("CINDERX_JIT_DISABLE") or _env_flag_enabled(
+        "PYTHONJITDISABLE"
+    )
+
+
+if _cinderx_plugin_enabled() and not _cinderx_force_disabled():
     import _cinderx  # noqa: F401
-    import cinderjit  # noqa: F401
+
+    if not _cinderx_jit_disabled():
+        import cinderjit  # noqa: F401
+    else:
+        cinderjit = None
 
     _AUTOJIT_IMPORT_PROVIDER_MARKER = "_cinderx_autojit_import_provider"
     _AUTOJIT_SETUP_PROVIDER_MARKER = "_cinderx_autojit_setup_provider"
     _AUTOJIT_GATE_STATS_PREFIX = "CINDERX_AUTOJIT_GATE_STATS: "
-
-    def _env_flag_enabled(name):
-        return os.environ.get(name, "0").lower() in ("1", "true", "yes", "on")
 
     def _is_autojit_classification_value(value):
         return isinstance(value, str) and (
@@ -38,6 +58,8 @@ if os.environ.get("CINDERX_PLUGIN_ENABLE", "0") == "1":
         return "off"
 
     def _maybe_enable_autojit_gate_stats():
+        if cinderjit is None:
+            return
         if not _env_flag_enabled("CINDERX_AUTOJIT_GATE_STATS"):
             return
         clear_stats = getattr(cinderjit, "_clear_autojit_gate_stats", None)
@@ -176,7 +198,8 @@ if os.environ.get("CINDERX_PLUGIN_ENABLE", "0") == "1":
             num_threads=parallel_gc_num_threads,
         )
 
-    _maybe_enable_autojit_gate_stats()
     _maybe_enable_parallel_gc()
-    _install_autojit_import_provider()
-    _maybe_install_autojit_setup_provider_for_module("lib2to3.main")
+    if cinderjit is not None:
+        _maybe_enable_autojit_gate_stats()
+        _install_autojit_import_provider()
+        _maybe_install_autojit_setup_provider_for_module("lib2to3.main")

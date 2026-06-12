@@ -2,6 +2,7 @@ import os
 from pathlib import Path
 import subprocess
 import sys
+import tempfile
 import textwrap
 import unittest
 
@@ -12,8 +13,6 @@ PYTHONLIB = Path(__file__).parents[2]
 class CinderXAutoBootstrapTest(unittest.TestCase):
     def test_plugin_startup_uses_lightweight_bootstrap(self) -> None:
         with self.subTest("does not import the full cinderx package"):
-            import tempfile
-
             with tempfile.TemporaryDirectory() as tempdir:
                 temp = Path(tempdir)
                 (temp / "cinderx.py").write_text(
@@ -89,6 +88,51 @@ class CinderXAutoBootstrapTest(unittest.TestCase):
                     0,
                     f"stdout:\n{completed.stdout}\nstderr:\n{completed.stderr}",
                 )
+
+    def test_jit_disabled_startup_does_not_import_cinderjit(self) -> None:
+        with tempfile.TemporaryDirectory() as tempdir:
+            temp = Path(tempdir)
+            (temp / "_cinderx.py").write_text(
+                textwrap.dedent(
+                    """
+                    def has_parallel_gc():
+                        return False
+                    """
+                )
+            )
+
+            env = os.environ.copy()
+            env["CINDERX_PLUGIN_ENABLE"] = "1"
+            env["PYTHONJITDISABLE"] = "1"
+            env["PYTHONPATH"] = f"{temp}{os.pathsep}{PYTHONLIB}"
+
+            completed = subprocess.run(
+                [
+                    sys.executable,
+                    "-S",
+                    "-c",
+                    textwrap.dedent(
+                        """
+                        import sys
+                        import _cinderx_auto
+
+                        assert "_cinderx" in sys.modules
+                        assert "cinderjit" not in sys.modules
+                        """
+                    ),
+                ],
+                env=env,
+                capture_output=True,
+                text=True,
+                timeout=30,
+            )
+
+            self.assertEqual(
+                completed.returncode,
+                0,
+                f"stdout:\n{completed.stdout}\nstderr:\n{completed.stderr}",
+            )
+            self.assertNotIn("Traceback", completed.stderr)
 
 
 if __name__ == "__main__":
