@@ -93,7 +93,7 @@ PY
 再验证自动导入路径：
 
 ```bash
-CINDERX_PLUGIN_ENABLE=1 PYTHONJITAUTO=2 python3.14 - <<'PY'
+CINDERX_PLUGIN_ENABLE=1 PYTHONJITAUTO=auto:2 python3.14 - <<'PY'
 import sys
 
 print("_cinderx_auto loaded:", "_cinderx_auto" in sys.modules)
@@ -195,9 +195,34 @@ python3.14 your_app.py
 | 环境变量 | 作用 |
 |---|---|
 | `PYTHONJITAUTO=N` | 启用自动 JIT 模式，函数调用 N 次后编译 |
+| `PYTHONJITAUTO=auto` | 启用 AutoJIT 行为分类，默认按 2 次调用阈值开始准入判断 |
+| `PYTHONJITAUTO=auto:N` | 启用 AutoJIT 行为分类，并以 N 次调用作为初始准入阈值 |
 | `PYTHONJITALL=1` | 编译所有函数（调用 0 次即编译） |
 | `PYTHONJITDISABLE=1` | 禁用 JIT |
 | `PYTHONJITLISTFILE=/path/to/list` | 通过 JIT 列表文件选择性编译指定函数 |
+
+#### AutoJIT 行为分类
+
+普通 `PYTHONJITAUTO=N` 只看调用次数：函数被调用到阈值后就尝试进入 JIT。低阈值能更早编译热点函数，但在启动、导入、脚本初始化等阶段也容易把大量只执行一两次的函数送进 JIT，造成编译风暴。
+
+`PYTHONJITAUTO=auto:N` 在调用次数之外增加一层行为分类。CinderX 会先根据字节码形状、启动/导入/setup 阶段信号和运行后的 deopt 反馈判断函数是否值得立即编译，再决定是放行、延后还是保持解释执行。它的目标是保留数值循环、稳定热点等高收益函数，同时抑制启动链路、导入链路、异常慢路径和低 ROI helper 的 JIT 成本。
+
+推荐在需要低阈值自动 JIT 的场景优先使用分类模式：
+
+```bash
+CINDERX_PLUGIN_ENABLE=1 PYTHONJITAUTO=auto:2 python3.14 your_app.py
+```
+
+分类模式下，import provider、`lib2to3` setup wrapper 和动态 ROI backoff 默认生效。当前 `StartupInit` 策略由 import provider 打开，setup wrapper 作为同一启动/初始化窗口的附加信号；关闭 import provider 后，不能把 setup wrapper 单独当作 setup-only 策略来评估。需要做 A/B 验证或临时回退时，可以使用以下开关：
+
+| 环境变量 | 作用 |
+|---|---|
+| `CINDERX_AUTOJIT_IMPORT_PROVIDER=off` | 关闭 import 阶段信号 |
+| `CINDERX_AUTOJIT_SETUP_PROVIDER=off` | 关闭 `lib2to3` setup wrapper；需在 import provider 开启时评估其增量 |
+| `CINDERX_AUTOJIT_ROI_BACKOFF=0` | 关闭运行时负 ROI 回退 |
+| `CINDERX_AUTOJIT_GATE_STATS=1` | 进程退出时输出 AutoJIT 准入统计，便于分析分类效果 |
+
+更完整的使用、测试和诊断方法见 [AutoJIT 行为分类使用指南](cinderx/Docs/README_CN.md#autojit-行为分类使用指南)。
 
 也可以通过修改业务代码使能 JIT 功能：
 
