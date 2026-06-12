@@ -35,8 +35,7 @@ class ScopedAutoJitConfig {
   ~ScopedAutoJitConfig() {
     getMutableConfig().compile_after_n_calls = compile_after_n_calls_;
     getMutableConfig().auto_classify = auto_classify_;
-    getMutableConfig().enable_startup_init_policy =
-        enable_startup_init_policy_;
+    getMutableConfig().enable_startup_init_policy = enable_startup_init_policy_;
     getMutableConfig().roi_backoff_enabled = roi_backoff_enabled_;
     getMutableConfig().roi_deopt_budget_base = roi_deopt_budget_base_;
     getMutableConfig().roi_backoff_max_rounds = roi_backoff_max_rounds_;
@@ -106,7 +105,9 @@ TEST(BehaviorClassifierTest, OpcodeClassGoldenExamples) {
   EXPECT_EQ(opcodeClassOf(-1), OpcodeClass::Invalid);
 }
 
-TEST(BehaviorClassifierTest, ComputeThresholdWarmsUpSteadyStateStartupLikeWork) {
+TEST(
+    BehaviorClassifierTest,
+    ComputeThresholdWarmsUpSteadyStateStartupLikeWork) {
   GateContext ctx{false};
 
   StructureKey trivial{Family::Trivial};
@@ -125,8 +126,7 @@ TEST(BehaviorClassifierTest, ComputeThresholdWarmsUpSteadyStateStartupLikeWork) 
   auto suspendable_trivial_decision =
       computeThreshold(suspendable_trivial, ctx, 2);
   EXPECT_EQ(suspendable_trivial_decision.limit, 1000);
-  EXPECT_EQ(
-      suspendable_trivial_decision.branch_reason, BranchReason::LowRoi);
+  EXPECT_EQ(suspendable_trivial_decision.branch_reason, BranchReason::LowRoi);
 
   StructureKey risky_trivial{Family::Trivial};
   risky_trivial.risk_reason = kRiskHugeCode;
@@ -170,8 +170,7 @@ TEST(BehaviorClassifierTest, StartupContextDefersImportLikeWork) {
   StructureKey trivial{Family::Trivial};
   auto trivial_startup_decision = computeThreshold(trivial, startup, 2);
   EXPECT_GE(trivial_startup_decision.limit, 65536);
-  EXPECT_EQ(
-      trivial_startup_decision.branch_reason, BranchReason::StartupInit);
+  EXPECT_EQ(trivial_startup_decision.branch_reason, BranchReason::StartupInit);
 
   StructureKey dispatcher{Family::CallDispatcher};
   auto startup_decision = computeThreshold(dispatcher, startup, 2);
@@ -235,10 +234,9 @@ TEST(BehaviorClassifierTest, ImportWindowDefersHighCostNonnumericWork) {
   StructureKey large_branch{Family::BranchFSM};
   large_branch.loop_score = 2;
   large_branch.code_size_bucket = 2;
-  large_branch.active_dim_mask = activeDimMaskFor(WorkDim::Control) |
-      activeDimMaskFor(WorkDim::Dispatch);
-  auto large_branch_decision =
-      computeThreshold(large_branch, import_window, 2);
+  large_branch.active_dim_mask =
+      activeDimMaskFor(WorkDim::Control) | activeDimMaskFor(WorkDim::Dispatch);
+  auto large_branch_decision = computeThreshold(large_branch, import_window, 2);
   EXPECT_GE(large_branch_decision.limit, 65536);
   EXPECT_EQ(large_branch_decision.branch_reason, BranchReason::StartupInit);
 
@@ -249,8 +247,8 @@ TEST(BehaviorClassifierTest, ImportWindowDefersHighCostNonnumericWork) {
   StructureKey medium_branch{Family::BranchFSM};
   medium_branch.loop_score = 1;
   medium_branch.code_size_bucket = 1;
-  medium_branch.active_dim_mask = activeDimMaskFor(WorkDim::Control) |
-      activeDimMaskFor(WorkDim::Dispatch);
+  medium_branch.active_dim_mask =
+      activeDimMaskFor(WorkDim::Control) | activeDimMaskFor(WorkDim::Dispatch);
   auto medium_branch_decision =
       computeThreshold(medium_branch, import_window, 2);
   EXPECT_GE(medium_branch_decision.limit, 65536);
@@ -266,8 +264,7 @@ TEST(BehaviorClassifierTest, ImportWindowDefersHighCostNonnumericWork) {
   risky_object.risk_reason = kRiskHugeCode;
   risky_object.code_size_bucket = 3;
   risky_object.active_dim_mask = activeDimMaskFor(WorkDim::Object);
-  auto risky_object_decision =
-      computeThreshold(risky_object, import_window, 2);
+  auto risky_object_decision = computeThreshold(risky_object, import_window, 2);
   EXPECT_GE(risky_object_decision.limit, 65536);
   EXPECT_EQ(risky_object_decision.branch_reason, BranchReason::RiskDefer);
 
@@ -289,10 +286,9 @@ TEST(BehaviorClassifierTest, ImportWindowDefersHighCostNonnumericWork) {
   numeric_loop.loop_score = 2;
   numeric_loop.risk_reason = kRiskHugeCode;
   numeric_loop.code_size_bucket = 3;
-  numeric_loop.active_dim_mask = activeDimMaskFor(WorkDim::Compute) |
-      activeDimMaskFor(WorkDim::Control);
-  auto numeric_loop_decision =
-      computeThreshold(numeric_loop, import_window, 2);
+  numeric_loop.active_dim_mask =
+      activeDimMaskFor(WorkDim::Compute) | activeDimMaskFor(WorkDim::Control);
+  auto numeric_loop_decision = computeThreshold(numeric_loop, import_window, 2);
   EXPECT_EQ(numeric_loop_decision.limit, 2);
   EXPECT_EQ(numeric_loop_decision.branch_reason, BranchReason::None);
 
@@ -324,16 +320,15 @@ TEST(BehaviorClassifierTest, ImportWindowDefersHighCostNonnumericWork) {
   small_object.loop_score = 1;
   small_object.code_size_bucket = 0;
   small_object.active_dim_mask = activeDimMaskFor(WorkDim::Object);
-  auto small_object_decision =
-      computeThreshold(small_object, import_window, 2);
+  auto small_object_decision = computeThreshold(small_object, import_window, 2);
   EXPECT_GE(small_object_decision.limit, 65536);
   EXPECT_EQ(small_object_decision.branch_reason, BranchReason::StartupInit);
 
   StructureKey compute_hint_object{Family::ObjectManipulator};
   compute_hint_object.loop_score = 1;
   compute_hint_object.code_size_bucket = 0;
-  compute_hint_object.active_dim_mask = activeDimMaskFor(WorkDim::Object) |
-      activeDimMaskFor(WorkDim::Compute);
+  compute_hint_object.active_dim_mask =
+      activeDimMaskFor(WorkDim::Object) | activeDimMaskFor(WorkDim::Compute);
   auto compute_hint_object_decision =
       computeThreshold(compute_hint_object, import_window, 2);
   EXPECT_EQ(compute_hint_object_decision.limit, 2);
@@ -398,8 +393,7 @@ TEST(BehaviorClassifierTest, SteadyStateWarmsUpLargeBranchStateMachines) {
   auto large_low_risk_branch_decision =
       computeThreshold(large_low_risk_branch_loop, steady_state, 2);
   EXPECT_EQ(large_low_risk_branch_decision.limit, 1000);
-  EXPECT_EQ(
-      large_low_risk_branch_decision.branch_reason, BranchReason::LowRoi);
+  EXPECT_EQ(large_low_risk_branch_decision.branch_reason, BranchReason::LowRoi);
 
   StructureKey numeric_loop{Family::NumericLoop};
   numeric_loop.loop_score = 3;
@@ -445,9 +439,8 @@ TEST(
   reflection_shape.loop_score = 3;
   reflection_shape.code_size_bucket = 3;
   reflection_shape.risk_reason = kRiskException | kRiskHugeCode;
-  reflection_shape.active_dim_mask =
-      activeDimMaskFor(WorkDim::Control) | activeDimMaskFor(WorkDim::Object) |
-      activeDimMaskFor(WorkDim::Dynamic);
+  reflection_shape.active_dim_mask = activeDimMaskFor(WorkDim::Control) |
+      activeDimMaskFor(WorkDim::Object) | activeDimMaskFor(WorkDim::Dynamic);
   auto reflection_decision =
       computeThreshold(reflection_shape, steady_state, 2);
   EXPECT_GE(reflection_decision.limit, 65536);
@@ -458,8 +451,7 @@ TEST(
   huge_only_object.code_size_bucket = 3;
   huge_only_object.risk_reason = kRiskHugeCode;
   huge_only_object.active_dim_mask = activeDimMaskFor(WorkDim::Object);
-  auto huge_only_decision =
-      computeThreshold(huge_only_object, steady_state, 2);
+  auto huge_only_decision = computeThreshold(huge_only_object, steady_state, 2);
   EXPECT_EQ(huge_only_decision.limit, 2);
   EXPECT_EQ(huge_only_decision.branch_reason, BranchReason::None);
 
@@ -474,9 +466,7 @@ TEST(
   EXPECT_EQ(numeric_decision.branch_reason, BranchReason::None);
 }
 
-TEST(
-    BehaviorClassifierTest,
-    SteadyStateRiskDefersExpectedExceptionLoopShape) {
+TEST(BehaviorClassifierTest, SteadyStateRiskDefersExpectedExceptionLoopShape) {
   GateContext steady_state{false};
 
   StructureKey tuple_memo_miss{Family::BranchFSM};
@@ -494,8 +484,7 @@ TEST(
   dispatching_exception_loop.code_size_bucket = 1;
   dispatching_exception_loop.risk_reason = kRiskException;
   dispatching_exception_loop.active_dim_mask =
-      activeDimMaskFor(WorkDim::Control) |
-      activeDimMaskFor(WorkDim::Dispatch);
+      activeDimMaskFor(WorkDim::Control) | activeDimMaskFor(WorkDim::Dispatch);
   auto dispatching_exception_loop_decision =
       computeThreshold(dispatching_exception_loop, steady_state, 2);
   EXPECT_EQ(dispatching_exception_loop_decision.limit, 1000);
@@ -509,9 +498,8 @@ TEST(BehaviorClassifierTest, SteadyStateDefersMultidimNonnumericObjectGraphs) {
   StructureKey reflection_object_graph{Family::ReflectionMeta};
   reflection_object_graph.loop_score = 1;
   reflection_object_graph.code_size_bucket = 1;
-  reflection_object_graph.active_dim_mask =
-      activeDimMaskFor(WorkDim::Object) | activeDimMaskFor(WorkDim::Dispatch) |
-      activeDimMaskFor(WorkDim::Dynamic);
+  reflection_object_graph.active_dim_mask = activeDimMaskFor(WorkDim::Object) |
+      activeDimMaskFor(WorkDim::Dispatch) | activeDimMaskFor(WorkDim::Dynamic);
   auto reflection_decision =
       computeThreshold(reflection_object_graph, steady_state, 2);
   EXPECT_GE(reflection_decision.limit, 65536);
@@ -519,10 +507,8 @@ TEST(BehaviorClassifierTest, SteadyStateDefersMultidimNonnumericObjectGraphs) {
 
   StructureKey call_dispatch_graph{Family::CallDispatcher};
   call_dispatch_graph.loop_score = 1;
-  call_dispatch_graph.active_dim_mask =
-      activeDimMaskFor(WorkDim::Control) |
-      activeDimMaskFor(WorkDim::Object) |
-      activeDimMaskFor(WorkDim::Dispatch);
+  call_dispatch_graph.active_dim_mask = activeDimMaskFor(WorkDim::Control) |
+      activeDimMaskFor(WorkDim::Object) | activeDimMaskFor(WorkDim::Dispatch);
   auto call_dispatch_decision =
       computeThreshold(call_dispatch_graph, steady_state, 2);
   EXPECT_GE(call_dispatch_decision.limit, 65536);
@@ -530,10 +516,8 @@ TEST(BehaviorClassifierTest, SteadyStateDefersMultidimNonnumericObjectGraphs) {
 
   StructureKey branch_scheduler{Family::BranchFSM};
   branch_scheduler.loop_score = 2;
-  branch_scheduler.active_dim_mask =
-      activeDimMaskFor(WorkDim::Control) |
-      activeDimMaskFor(WorkDim::Object) |
-      activeDimMaskFor(WorkDim::Dispatch) |
+  branch_scheduler.active_dim_mask = activeDimMaskFor(WorkDim::Control) |
+      activeDimMaskFor(WorkDim::Object) | activeDimMaskFor(WorkDim::Dispatch) |
       activeDimMaskFor(WorkDim::Dynamic);
   auto branch_decision = computeThreshold(branch_scheduler, steady_state, 2);
   EXPECT_EQ(branch_decision.limit, 2);
@@ -541,9 +525,8 @@ TEST(BehaviorClassifierTest, SteadyStateDefersMultidimNonnumericObjectGraphs) {
 
   StructureKey compute_object_graph{Family::ObjectManipulator};
   compute_object_graph.loop_score = 1;
-  compute_object_graph.active_dim_mask =
-      activeDimMaskFor(WorkDim::Compute) | activeDimMaskFor(WorkDim::Object) |
-      activeDimMaskFor(WorkDim::Dispatch) |
+  compute_object_graph.active_dim_mask = activeDimMaskFor(WorkDim::Compute) |
+      activeDimMaskFor(WorkDim::Object) | activeDimMaskFor(WorkDim::Dispatch) |
       activeDimMaskFor(WorkDim::Dynamic);
   auto compute_decision =
       computeThreshold(compute_object_graph, steady_state, 2);
@@ -796,9 +779,7 @@ target = TaskState.isWaitingWithPacket
   }
 }
 
-TEST_F(
-    BehaviorClassifierRuntimeTest,
-    AllowsSteadyStateProtocolDispatchCores) {
+TEST_F(BehaviorClassifierRuntimeTest, AllowsSteadyStateProtocolDispatchCores) {
   Ref<> add_packet = compileStockAndGet(
       R"(
 class Task:
@@ -854,9 +835,7 @@ target = Task.fn
   }
 }
 
-TEST_F(
-    BehaviorClassifierRuntimeTest,
-    DefersGlobalHeavyProtocolLikeWork) {
+TEST_F(BehaviorClassifierRuntimeTest, DefersGlobalHeavyProtocolLikeWork) {
   Ref<> global_heavy = compileStockAndGet(
       R"(
 G1 = True
@@ -893,9 +872,7 @@ target = Helper.globalHeavy
   EXPECT_NE(decision.branch_reason, BranchReason::None);
 }
 
-TEST_F(
-    BehaviorClassifierRuntimeTest,
-    DefersCallOnlyProtocolLikeWrappers) {
+TEST_F(BehaviorClassifierRuntimeTest, DefersCallOnlyProtocolLikeWrappers) {
   Ref<> call_only = compileStockAndGet(
       R"(
 class Wrapper:
@@ -967,12 +944,10 @@ def thin(x):
       "thin");
   GateContext steady_state{false};
   GateContext startup{true};
-  EXPECT_FALSE(
-      shouldDeferSuspendableAutoJitWithoutStructureKey(
-          codeFromFunc(thin), steady_state));
-  EXPECT_FALSE(
-      shouldDeferSuspendableAutoJitWithoutStructureKey(
-          codeFromFunc(thin), startup));
+  EXPECT_FALSE(shouldDeferSuspendableAutoJitWithoutStructureKey(
+      codeFromFunc(thin), steady_state));
+  EXPECT_FALSE(shouldDeferSuspendableAutoJitWithoutStructureKey(
+      codeFromFunc(thin), startup));
 
   Ref<> gen = compileStockAndGet(
       R"(
@@ -980,12 +955,10 @@ def gen():
     yield 1
 )",
       "gen");
-  EXPECT_TRUE(
-      shouldDeferSuspendableAutoJitWithoutStructureKey(
-          codeFromFunc(gen), startup));
-  EXPECT_FALSE(
-      shouldDeferSuspendableAutoJitWithoutStructureKey(
-          codeFromFunc(gen), steady_state));
+  EXPECT_TRUE(shouldDeferSuspendableAutoJitWithoutStructureKey(
+      codeFromFunc(gen), startup));
+  EXPECT_FALSE(shouldDeferSuspendableAutoJitWithoutStructureKey(
+      codeFromFunc(gen), steady_state));
 }
 
 TEST_F(
@@ -1162,9 +1135,8 @@ target = ns["BaseEventLoop"].call_soon
   StructureKey event_loop_helper{Family::ObjectManipulator};
   event_loop_helper.loop_score = 0;
   event_loop_helper.code_size_bucket = 0;
-  event_loop_helper.active_dim_mask =
-      activeDimMaskFor(WorkDim::Control) | activeDimMaskFor(WorkDim::Object) |
-      activeDimMaskFor(WorkDim::Dispatch);
+  event_loop_helper.active_dim_mask = activeDimMaskFor(WorkDim::Control) |
+      activeDimMaskFor(WorkDim::Object) | activeDimMaskFor(WorkDim::Dispatch);
 
   auto decision =
       computeThresholdForCode(codeFromFunc(func), event_loop_helper, {}, 2);
@@ -1220,9 +1192,8 @@ target = ns["gather"]
   StructureKey task_helper{Family::ReflectionMeta};
   task_helper.loop_score = 2;
   task_helper.code_size_bucket = 2;
-  task_helper.active_dim_mask =
-      activeDimMaskFor(WorkDim::Control) | activeDimMaskFor(WorkDim::Object) |
-      activeDimMaskFor(WorkDim::Dispatch) |
+  task_helper.active_dim_mask = activeDimMaskFor(WorkDim::Control) |
+      activeDimMaskFor(WorkDim::Object) | activeDimMaskFor(WorkDim::Dispatch) |
       activeDimMaskFor(WorkDim::Dynamic);
 
   auto decision =
@@ -1250,9 +1221,8 @@ target = ns["BaseEventLoop"].call_soon
   StructureKey user_helper{Family::ObjectManipulator};
   user_helper.loop_score = 0;
   user_helper.code_size_bucket = 0;
-  user_helper.active_dim_mask =
-      activeDimMaskFor(WorkDim::Control) | activeDimMaskFor(WorkDim::Object) |
-      activeDimMaskFor(WorkDim::Dispatch);
+  user_helper.active_dim_mask = activeDimMaskFor(WorkDim::Control) |
+      activeDimMaskFor(WorkDim::Object) | activeDimMaskFor(WorkDim::Dispatch);
 
   auto decision =
       computeThresholdForCode(codeFromFunc(func), user_helper, {}, 2);
@@ -1312,7 +1282,9 @@ def iterable_coro():
   EXPECT_EQ(startup_decision.branch_reason, BranchReason::RiskDefer);
 }
 
-TEST_F(BehaviorClassifierRuntimeTest, AutoClassifyAllowsGeneratorsInSteadyState) {
+TEST_F(
+    BehaviorClassifierRuntimeTest,
+    AutoClassifyAllowsGeneratorsInSteadyState) {
   ScopedAutoJitConfig config_guard;
   getMutableConfig().compile_after_n_calls = 2;
   getMutableConfig().auto_classify = true;
@@ -1498,7 +1470,9 @@ assert _cinderx._autojit_setup_depth() == 0
 )");
 }
 
-TEST_F(BehaviorClassifierRuntimeTest, DefaultImportProviderTracksFindAndLoadDepth) {
+TEST_F(
+    BehaviorClassifierRuntimeTest,
+    DefaultImportProviderTracksFindAndLoadDepth) {
   runStockCode(R"(
 import os
 import sys

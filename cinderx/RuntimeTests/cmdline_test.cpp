@@ -93,8 +93,7 @@ class ScopedAutoJitConfigState {
   ~ScopedAutoJitConfigState() {
     getMutableConfig().compile_after_n_calls = compile_after_n_calls_;
     getMutableConfig().auto_classify = auto_classify_;
-    getMutableConfig().enable_startup_init_policy =
-        enable_startup_init_policy_;
+    getMutableConfig().enable_startup_init_policy = enable_startup_init_policy_;
   }
 
  private:

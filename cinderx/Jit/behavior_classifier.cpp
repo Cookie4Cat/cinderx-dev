@@ -138,10 +138,9 @@ bool isSyntheticFilename(BorrowedRef<PyCodeObject> code) {
     return true;
   }
   std::string lowered = lowerAscii(filename_view);
-  return contains(lowered, "generated") ||
-      contains(lowered, "/_generated") || contains(lowered, "/genshi/") ||
-      contains(lowered, "/mako/") || contains(lowered, "/jinja") ||
-      contains(lowered, "/django/template/");
+  return contains(lowered, "generated") || contains(lowered, "/_generated") ||
+      contains(lowered, "/genshi/") || contains(lowered, "/mako/") ||
+      contains(lowered, "/jinja") || contains(lowered, "/django/template/");
 }
 
 uint8_t bucketDim(uint32_t count, uint32_t n_eff) {
@@ -217,24 +216,28 @@ std::array<RankedDim, static_cast<size_t>(WorkDim::kCount)> rankDims(
     const Signature& sig,
     const std::array<uint8_t, static_cast<size_t>(WorkDim::kCount)>& buckets) {
   std::array<RankedDim, static_cast<size_t>(WorkDim::kCount)> ranked{{
-      {WorkDim::Compute, buckets[dimIndex(WorkDim::Compute)],
+      {WorkDim::Compute,
+       buckets[dimIndex(WorkDim::Compute)],
        sig.counts[dimIndex(WorkDim::Compute)]},
-      {WorkDim::Control, buckets[dimIndex(WorkDim::Control)],
+      {WorkDim::Control,
+       buckets[dimIndex(WorkDim::Control)],
        sig.counts[dimIndex(WorkDim::Control)]},
-      {WorkDim::Object, buckets[dimIndex(WorkDim::Object)],
+      {WorkDim::Object,
+       buckets[dimIndex(WorkDim::Object)],
        sig.counts[dimIndex(WorkDim::Object)]},
-      {WorkDim::Dispatch, buckets[dimIndex(WorkDim::Dispatch)],
+      {WorkDim::Dispatch,
+       buckets[dimIndex(WorkDim::Dispatch)],
        sig.counts[dimIndex(WorkDim::Dispatch)]},
-      {WorkDim::Suspend, buckets[dimIndex(WorkDim::Suspend)],
+      {WorkDim::Suspend,
+       buckets[dimIndex(WorkDim::Suspend)],
        sig.counts[dimIndex(WorkDim::Suspend)]},
-      {WorkDim::Dynamic, buckets[dimIndex(WorkDim::Dynamic)],
+      {WorkDim::Dynamic,
+       buckets[dimIndex(WorkDim::Dynamic)],
        sig.counts[dimIndex(WorkDim::Dynamic)]},
   }};
 
   std::sort(
-      ranked.begin(),
-      ranked.end(),
-      [](const RankedDim& a, const RankedDim& b) {
+      ranked.begin(), ranked.end(), [](const RankedDim& a, const RankedDim& b) {
         if (a.bucket != b.bucket) {
           return a.bucket > b.bucket;
         }
@@ -326,9 +329,8 @@ uint8_t loopScore(
   }
 
   uint8_t nesting_score = static_cast<uint8_t>(std::min(depth, 3));
-  uint8_t count_score = seen_edge_count >= 4
-      ? 3
-      : (seen_edge_count >= 2 ? 2 : 1);
+  uint8_t count_score =
+      seen_edge_count >= 4 ? 3 : (seen_edge_count >= 2 ? 2 : 1);
   return std::min<uint8_t>(3, std::max(nesting_score, count_score));
 }
 
@@ -441,8 +443,7 @@ bool isStdlibAsyncioEventLoopFrameworkHelper(
     BorrowedRef<PyCodeObject> code,
     const StructureKey& key,
     const GateContext& context) {
-  if (context.startup_phase ||
-      !isLowRoiAsyncioEventLoopFrameworkShape(key)) {
+  if (context.startup_phase || !isLowRoiAsyncioEventLoopFrameworkShape(key)) {
     return false;
   }
   const char* filename = unicodeUtf8OrNull(code->co_filename);
@@ -1241,12 +1242,11 @@ bool shouldDeferSuspendableAutoJitWithoutStructureKey(
   if (code->co_flags & CI_CO_STATICALLY_COMPILED) {
     return false;
   }
-  return (code->co_flags & (CO_GENERATOR | CO_COROUTINE | CO_ASYNC_GENERATOR)) !=
-      0;
+  return (code->co_flags &
+          (CO_GENERATOR | CO_COROUTINE | CO_ASYNC_GENERATOR)) != 0;
 }
 
-std::optional<StructureKey> deriveStructureKey(
-    BorrowedRef<PyCodeObject> code) {
+std::optional<StructureKey> deriveStructureKey(BorrowedRef<PyCodeObject> code) {
   if (!isAutoJitClassifiable(code)) {
     return std::nullopt;
   }
@@ -1278,8 +1278,7 @@ std::optional<StructureKey> deriveStructureKey(
   auto ranked = rankDims(*sig, buckets);
   const RankedDim& first = ranked[0];
   const RankedDim& second = ranked[1];
-  if (first.bucket >= kMixedMinBucket &&
-      second.bucket >= kMixedMinBucket &&
+  if (first.bucket >= kMixedMinBucket && second.bucket >= kMixedMinBucket &&
       first.bucket - second.bucket <= kMixedBucketDelta) {
     key.family = Family::Mixed;
     key.mixed_shape = encodeMixedShape(first.dim, second.dim);
@@ -1319,20 +1318,19 @@ ThresholdDecision computeThreshold(
       key.family == Family::ObjectManipulator ||
       key.family == Family::BranchFSM;
   bool startup_like_mixed = key.family == Family::Mixed &&
-      mixedShapeAllIn(
-          key.mixed_shape,
-          {WorkDim::Dynamic,
-           WorkDim::Dispatch,
-           WorkDim::Object,
-           WorkDim::Control});
+      mixedShapeAllIn(key.mixed_shape,
+                      {WorkDim::Dynamic,
+                       WorkDim::Dispatch,
+                       WorkDim::Object,
+                       WorkDim::Control});
   bool high_cost_nonnumeric_import_candidate =
       getConfig().enable_startup_init_policy && context.startup_phase &&
       !key.is_static && key.family != Family::NumericLoop &&
       !key.computeDominantHint() &&
       (key.highRisk() || key.code_size_bucket > 0 ||
        key.family == Family::CallDispatcher ||
-       key.family == Family::ReflectionMeta || key.family == Family::BranchFSM ||
-       startup_like_mixed);
+       key.family == Family::ReflectionMeta ||
+       key.family == Family::BranchFSM || startup_like_mixed);
   bool startup_low_roi_nonnumeric_candidate =
       getConfig().enable_startup_init_policy && context.startup_phase &&
       !key.is_static &&
@@ -1398,16 +1396,18 @@ ThresholdDecision computeThreshold(
           saturatingMul(global, kStartupDeferThresholdFactor),
           key.highRisk() ? BranchReason::RiskDefer : BranchReason::LowRoi};
     }
-    return {std::max(global, kSteadyNonnumericWarmupThreshold),
-            BranchReason::LowRoi};
+    return {
+        std::max(global, kSteadyNonnumericWarmupThreshold),
+        BranchReason::LowRoi};
   }
 
-  bool large_branch_warmup_candidate = !key.is_static &&
-      key.loop_score > 0 && key.family == Family::BranchFSM &&
+  bool large_branch_warmup_candidate = !key.is_static && key.loop_score > 0 &&
+      key.family == Family::BranchFSM &&
       (key.highRisk() || key.code_size_bucket >= 2);
   if (large_branch_warmup_candidate) {
-    return {std::max(global, kSteadyNonnumericWarmupThreshold),
-            BranchReason::LowRoi};
+    return {
+        std::max(global, kSteadyNonnumericWarmupThreshold),
+        BranchReason::LowRoi};
   }
 
   bool low_roi_base = key.loop_score == 0 && !key.is_static &&
@@ -1430,8 +1430,9 @@ ThresholdDecision computeThresholdForCode(
     uint32_t global) {
   auto decision = computeThreshold(key, context, global);
   if (isStdlibAsyncioEventLoopFrameworkHelper(code, key, context)) {
-    return {saturatingMul(global, kStartupDeferThresholdFactor),
-            BranchReason::LowRoi};
+    return {
+        saturatingMul(global, kStartupDeferThresholdFactor),
+        BranchReason::LowRoi};
   }
   if (decision.branch_reason != BranchReason::None &&
       shouldAllowSteadyStatePlainGenerator(code, key, context)) {

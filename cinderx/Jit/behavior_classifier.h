@@ -47,8 +47,7 @@ enum class OpcodeClass : uint8_t {
 };
 
 constexpr bool isWorkDim(OpcodeClass cls) {
-  return static_cast<uint8_t>(cls) <
-      static_cast<uint8_t>(OpcodeClass::Neutral);
+  return static_cast<uint8_t>(cls) < static_cast<uint8_t>(OpcodeClass::Neutral);
 }
 
 WorkDim toWorkDim(OpcodeClass cls);
@@ -91,8 +90,7 @@ struct StructureKey {
 };
 
 constexpr uint32_t kSkeyValidBit = CI_CODE_EXTRA_SKEY_VALID_BIT;
-constexpr uint32_t kSkeyDecidedColdBit =
-    CI_CODE_EXTRA_SKEY_DECIDED_COLD_BIT;
+constexpr uint32_t kSkeyDecidedColdBit = CI_CODE_EXTRA_SKEY_DECIDED_COLD_BIT;
 constexpr uint32_t kSkeyPayloadMask = CI_CODE_EXTRA_SKEY_PAYLOAD_MASK;
 
 struct GateContext {
@@ -123,8 +121,7 @@ bool isAutoJitClassifiable(BorrowedRef<PyCodeObject> code);
 bool shouldDeferSuspendableAutoJitWithoutStructureKey(
     BorrowedRef<PyCodeObject> code,
     const GateContext& context);
-std::optional<StructureKey> deriveStructureKey(
-    BorrowedRef<PyCodeObject> code);
+std::optional<StructureKey> deriveStructureKey(BorrowedRef<PyCodeObject> code);
 std::optional<StructureKey> getOrComputeStructureKey(
     BorrowedRef<PyCodeObject> code,
     CodeExtra* extra);

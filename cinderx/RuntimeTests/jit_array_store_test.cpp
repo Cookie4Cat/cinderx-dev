@@ -126,8 +126,7 @@ def store_list(a, i, v):
 
   EXPECT_FALSE(found_store_array_item)
       << "Did not expect StoreArrayItem for unknown store shapes";
-  EXPECT_TRUE(found_store_subscr)
-      << "Expected StoreSubscr in HIR";
+  EXPECT_TRUE(found_store_subscr) << "Expected StoreSubscr in HIR";
 }
 
 TEST_F(ArrayStoreTest, CompiledStoreArrayDoubleFastPathUpdatesArray) {

@@ -167,8 +167,7 @@ def load_any(a, i):
 
   EXPECT_FALSE(found_load_array_item)
       << "Did not expect LoadArrayItem for unknown load shapes";
-  EXPECT_TRUE(found_binary_op_subscr)
-      << "Expected BinaryOp(kSubscript) in HIR";
+  EXPECT_TRUE(found_binary_op_subscr) << "Expected BinaryOp(kSubscript) in HIR";
 }
 
 // Test that CondBranchCheckType guard is present for array type check when the

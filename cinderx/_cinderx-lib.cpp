@@ -945,9 +945,8 @@ PyMethodDef _cinderx_methods[] = {
     {"_is_compile_perf_trampoline_pre_fork_enabled",
      is_compile_perf_trampoline_pre_fork_enabled,
      METH_NOARGS,
-     PyDoc_STR(
-         "Return whether compile perf-trampoline entries before fork is "
-         "enabled or not.")},
+     PyDoc_STR("Return whether compile perf-trampoline entries before fork is "
+               "enabled or not.")},
     {"immortalize_heap",
      cinder_immortalize_heap,
      METH_NOARGS,

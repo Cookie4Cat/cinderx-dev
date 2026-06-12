@@ -63,8 +63,7 @@ static inline uint64_t Ci_code_extra_get_calls(const CodeExtra* extra) {
   return _Py_atomic_load_uint64_relaxed(&extra->calls);
 }
 
-static inline uint32_t Ci_code_extra_load_skey_acquire(
-    const CodeExtra* extra) {
+static inline uint32_t Ci_code_extra_load_skey_acquire(const CodeExtra* extra) {
   return __atomic_load_n(&extra->skey_word, __ATOMIC_ACQUIRE);
 }
 
@@ -104,8 +103,7 @@ static inline int Ci_code_extra_cas_roi_ctl_release(
       __ATOMIC_RELAXED);
 }
 
-static inline uint32_t Ci_code_extra_incr_roi_deopt_count(
-    CodeExtra* extra) {
+static inline uint32_t Ci_code_extra_incr_roi_deopt_count(CodeExtra* extra) {
   uint32_t old =
       __atomic_fetch_add(&extra->roi_deopt_count, 1, __ATOMIC_RELAXED);
   return old == UINT32_MAX ? UINT32_MAX : old + 1;
@@ -138,8 +136,7 @@ static inline uint64_t Ci_code_extra_get_calls(const CodeExtra* extra) {
   return extra->calls;
 }
 
-static inline uint32_t Ci_code_extra_load_skey_acquire(
-    const CodeExtra* extra) {
+static inline uint32_t Ci_code_extra_load_skey_acquire(const CodeExtra* extra) {
   return extra->skey_word;
 }
 
@@ -178,8 +175,7 @@ static inline int Ci_code_extra_cas_roi_ctl_release(
   return 1;
 }
 
-static inline uint32_t Ci_code_extra_incr_roi_deopt_count(
-    CodeExtra* extra) {
+static inline uint32_t Ci_code_extra_incr_roi_deopt_count(CodeExtra* extra) {
   if (extra->roi_deopt_count != UINT32_MAX) {
     extra->roi_deopt_count += 1;
   }
