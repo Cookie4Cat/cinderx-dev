@@ -73,8 +73,6 @@ TypeWatcher<LoadTypeAttrCache> ltac_watcher;
 TypeWatcher<LoadMethodCache> lm_watcher;
 TypeWatcher<LoadTypeMethodCache> ltm_watcher;
 
-constexpr uintptr_t kKindMask = 0x07;
-
 // Sentinel PyTypeObject that must never escape into user code.
 #pragma clang diagnostic push
 #pragma clang diagnostic ignored "-Wmissing-field-initializers"
@@ -554,17 +552,8 @@ AttributeMutator::AttributeMutator() {
   reset();
 }
 
-PyTypeObject* AttributeMutator::type() const {
-  // clear tagged bits and return
-  return reinterpret_cast<PyTypeObject*>(type_ & ~kKindMask);
-}
-
 void AttributeMutator::reset() {
   type_ = 0;
-}
-
-bool AttributeMutator::isEmpty() const {
-  return type_ == 0;
 }
 
 void AttributeMutator::set_combined(PyTypeObject* type) {
@@ -676,13 +665,9 @@ inline PyObject* AttributeMutator::getAttr(PyObject* obj, PyObject* name) {
 
 void AttributeMutator::set_type(PyTypeObject* type, Kind kind) {
   auto raw = reinterpret_cast<uintptr_t>(type);
-  JIT_CHECK((raw & kKindMask) == 0, "PyTypeObject* expected to be aligned");
+  JIT_CHECK((raw & kindMask()) == 0, "PyTypeObject* expected to be aligned");
   auto mask = static_cast<uintptr_t>(kind);
   type_ = raw | mask;
-}
-
-AttributeMutator::Kind AttributeMutator::get_kind() const {
-  return static_cast<Kind>(type_ & kKindMask);
 }
 
 AttributeCache::AttributeCache() {
@@ -737,10 +722,6 @@ void AttributeCache::descrTypeChanged(PyTypeObject* tp) {
       }
     }
   }
-}
-
-std::span<AttributeMutator> AttributeCache::entries() {
-  return {entries_, getConfig().attr_cache_size};
 }
 
 AttributeMutator* AttributeCache::findEmptyEntry() {

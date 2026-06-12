@@ -63,6 +63,38 @@ void expectUnicodeEquals(PyObject* obj, const char* expected) {
   ASSERT_EQ(PyUnicode_CompareWithASCIIString(obj, expected), 0);
 }
 
+TEST_F(InlineCacheTest, AttributeMutatorTaggedKindMaskKeepsTypePointer) {
+  jit::AttributeMutator mutator;
+  ASSERT_TRUE(mutator.isEmpty());
+  EXPECT_EQ(mutator.type(), nullptr);
+
+  auto* type = &PyBaseObject_Type;
+  mutator.set_combined(type);
+  EXPECT_FALSE(mutator.isEmpty());
+  EXPECT_EQ(mutator.type(), type);
+  EXPECT_EQ(mutator.watchedDescrType(), nullptr);
+
+  mutator.set_split(type, 0, nullptr, false);
+  EXPECT_EQ(mutator.type(), type);
+  EXPECT_EQ(mutator.watchedDescrType(), nullptr);
+
+  mutator.set_split(type, 0, nullptr, true);
+  EXPECT_EQ(mutator.type(), type);
+  EXPECT_EQ(mutator.watchedDescrType(), nullptr);
+
+  mutator.set_descr_or_classvar(type, Py_None, 0);
+  EXPECT_EQ(mutator.type(), type);
+  EXPECT_EQ(mutator.watchedDescrType(), nullptr);
+
+  mutator.set_data_descr(type, Py_None);
+  EXPECT_EQ(mutator.type(), type);
+  EXPECT_EQ(mutator.watchedDescrType(), Py_TYPE(Py_None));
+
+  mutator.reset();
+  EXPECT_TRUE(mutator.isEmpty());
+  EXPECT_EQ(mutator.type(), nullptr);
+}
+
 TEST_F(InlineCacheTest, LoadTypeMethodCacheLookUp) {
   const char* src = R"(
 from abc import ABCMeta, abstractmethod

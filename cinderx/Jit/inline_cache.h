@@ -98,9 +98,14 @@ class AttributeMutator {
       "Kind enum should fit in 3 bits");
 
   AttributeMutator();
-  PyTypeObject* type() const;
+  PyTypeObject* type() const {
+    // clear tagged bits and return
+    return reinterpret_cast<PyTypeObject*>(type_ & ~kindMask());
+  }
   void reset();
-  bool isEmpty() const;
+  bool isEmpty() const {
+    return type_ == 0;
+  }
   void set_combined(PyTypeObject* type);
   void set_data_descr(PyTypeObject* type, PyObject* descr);
   void set_member_descr(PyTypeObject* type, PyObject* descr);
@@ -135,7 +140,9 @@ class AttributeMutator {
 
  private:
   void set_type(PyTypeObject* type, Kind kind);
-  Kind get_kind() const;
+  Kind get_kind() const {
+    return static_cast<Kind>(type_ & kindMask());
+  }
 
   uintptr_t type_; // This value stores both a PyTypeObject* for the type object
                    // and the Kind enum value which are bitpacked together to
@@ -161,7 +168,9 @@ class AttributeCache {
   }
 
  protected:
-  std::span<AttributeMutator> entries();
+  std::span<AttributeMutator> entries() {
+    return {entries_, getConfig().attr_cache_size};
+  }
 
   AttributeMutator* findEmptyEntry();
 
