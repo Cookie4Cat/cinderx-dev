@@ -11,8 +11,57 @@
 #endif
 
 #include <cstring>
+#include <memory>
+#include <new>
 
 class InlineCacheTest : public RuntimeTest {};
+
+class TestLoadAttrCache : public jit::LoadAttrCache {
+ public:
+  std::span<jit::AttributeMutator> entriesForTest() {
+    return entries();
+  }
+};
+
+struct TestLoadAttrCacheDeleter {
+  void operator()(TestLoadAttrCache* cache) const {
+    cache->~TestLoadAttrCache();
+    PyMem_Free(cache);
+  }
+};
+
+std::unique_ptr<TestLoadAttrCache, TestLoadAttrCacheDeleter>
+makeTestLoadAttrCache() {
+  void* mem = PyMem_Calloc(1, jit::AttributeCacheSizeTrait::size());
+  JIT_CHECK(mem != nullptr, "Failed to allocate test load attr cache");
+  return std::unique_ptr<TestLoadAttrCache, TestLoadAttrCacheDeleter>{
+      new (mem) TestLoadAttrCache()};
+}
+
+int countEntriesForType(TestLoadAttrCache* cache, PyTypeObject* type) {
+  int count = 0;
+  for (auto& entry : cache->entriesForTest()) {
+    if (entry.type() == type) {
+      count++;
+    }
+  }
+  return count;
+}
+
+int countEntriesForDescrType(TestLoadAttrCache* cache, PyTypeObject* type) {
+  int count = 0;
+  for (auto& entry : cache->entriesForTest()) {
+    if (entry.watchedDescrType() == type) {
+      count++;
+    }
+  }
+  return count;
+}
+
+void expectUnicodeEquals(PyObject* obj, const char* expected) {
+  ASSERT_TRUE(PyUnicode_Check(obj)) << "Expected a unicode result";
+  ASSERT_EQ(PyUnicode_CompareWithASCIIString(obj, expected), 0);
+}
 
 TEST_F(InlineCacheTest, LoadTypeMethodCacheLookUp) {
   const char* src = R"(
@@ -132,4 +181,88 @@ module_meth = functools._unwrap_partial
   ASSERT_EQ(
       PyObject_RichCompareBool(cache.moduleObj(), functools_mod, Py_EQ), 1)
       << "Expected functools to be cached as an obj";
+}
+
+TEST_F(InlineCacheTest, LoadAttrCacheKeepsSharedDescrTypeWatcher) {
+  runStockCode(R"(
+class Descr:
+    def __get__(self, obj, typ):
+        return "descr"
+
+    def __set__(self, obj, val):
+        raise RuntimeError("unimplemented")
+
+class T1:
+    foo = Descr()
+
+class T2:
+    foo = Descr()
+
+t1 = T1()
+t2 = T2()
+)");
+
+  auto cache = makeTestLoadAttrCache();
+  auto name = Ref<>::steal(PyUnicode_FromString("foo"));
+  ASSERT_NE(name, nullptr);
+
+  auto t1 = getGlobal("t1");
+  auto t2 = getGlobal("t2");
+  auto descr_type_obj = getGlobal("Descr");
+  ASSERT_TRUE(PyType_Check(descr_type_obj.get()));
+  auto* descr_type = reinterpret_cast<PyTypeObject*>(descr_type_obj.get());
+
+  auto t1_result = Ref<>::steal(
+      jit::LoadAttrCache::invoke(cache.get(), t1.get(), name.get()));
+  ASSERT_NE(t1_result, nullptr);
+  expectUnicodeEquals(t1_result.get(), "descr");
+
+  auto t2_result = Ref<>::steal(
+      jit::LoadAttrCache::invoke(cache.get(), t2.get(), name.get()));
+  ASSERT_NE(t2_result, nullptr);
+  expectUnicodeEquals(t2_result.get(), "descr");
+
+  ASSERT_EQ(countEntriesForType(cache.get(), Py_TYPE(t1.get())), 1);
+  ASSERT_EQ(countEntriesForType(cache.get(), Py_TYPE(t2.get())), 1);
+  ASSERT_EQ(countEntriesForDescrType(cache.get(), descr_type), 2);
+
+  jit::notifyICsTypeChanged(Py_TYPE(t1.get()));
+  EXPECT_EQ(countEntriesForType(cache.get(), Py_TYPE(t1.get())), 0);
+  EXPECT_EQ(countEntriesForType(cache.get(), Py_TYPE(t2.get())), 1);
+  EXPECT_EQ(countEntriesForDescrType(cache.get(), descr_type), 1);
+
+  jit::notifyICsTypeChanged(descr_type);
+  EXPECT_EQ(countEntriesForType(cache.get(), Py_TYPE(t2.get())), 0);
+  EXPECT_EQ(countEntriesForDescrType(cache.get(), descr_type), 0);
+}
+
+TEST_F(InlineCacheTest, LoadAttrCacheWatchesHeapImmutableTypes) {
+  runStockCode(R"(
+from cinderx import freeze_type
+
+class Frozen:
+    pass
+
+freeze_type(Frozen)
+obj = Frozen()
+obj.foo = "cached"
+)");
+
+  auto obj = getGlobal("obj");
+  auto* type = Py_TYPE(obj.get());
+  ASSERT_TRUE(PyType_HasFeature(type, Py_TPFLAGS_HEAPTYPE));
+  ASSERT_TRUE(PyType_HasFeature(type, Py_TPFLAGS_IMMUTABLETYPE));
+
+  auto cache = makeTestLoadAttrCache();
+  auto name = Ref<>::steal(PyUnicode_FromString("foo"));
+  ASSERT_NE(name, nullptr);
+
+  auto result = Ref<>::steal(
+      jit::LoadAttrCache::invoke(cache.get(), obj.get(), name.get()));
+  ASSERT_NE(result, nullptr);
+  expectUnicodeEquals(result.get(), "cached");
+  ASSERT_EQ(countEntriesForType(cache.get(), type), 1);
+
+  jit::notifyICsTypeChanged(type);
+  EXPECT_EQ(countEntriesForType(cache.get(), type), 0);
 }
