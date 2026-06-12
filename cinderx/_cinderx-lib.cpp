@@ -12,6 +12,7 @@
 #include "cinderx/Immortalize/immortalize.h"
 #include "cinderx/Interpreter/interpreter.h"
 #include "cinderx/Jit/anextawaitable.h"
+#include "cinderx/Jit/autojit_import.h"
 #include "cinderx/Jit/compiled_function.h"
 #include "cinderx/Jit/config.h"
 #include "cinderx/Jit/frame.h"
@@ -811,6 +812,38 @@ static PyObject* clear_strict_modules(PyObject*, PyObject*) {
   Py_RETURN_NONE;
 }
 
+static PyObject* autojit_import_enter(PyObject*, PyObject*) {
+  jit::autoJitImportEnter();
+  Py_RETURN_NONE;
+}
+
+static PyObject* autojit_import_leave(PyObject*, PyObject*) {
+  jit::autoJitImportLeave();
+  Py_RETURN_NONE;
+}
+
+static PyObject* autojit_import_depth(PyObject*, PyObject*) {
+  return PyLong_FromUnsignedLong(jit::autoJitStartupDepth());
+}
+
+static PyObject* autojit_import_scope_depth(PyObject*, PyObject*) {
+  return PyLong_FromUnsignedLong(jit::autoJitImportDepth());
+}
+
+static PyObject* autojit_setup_enter(PyObject*, PyObject*) {
+  jit::autoJitSetupEnter();
+  Py_RETURN_NONE;
+}
+
+static PyObject* autojit_setup_leave(PyObject*, PyObject*) {
+  jit::autoJitSetupLeave();
+  Py_RETURN_NONE;
+}
+
+static PyObject* autojit_setup_depth(PyObject*, PyObject*) {
+  return PyLong_FromUnsignedLong(jit::autoJitSetupDepth());
+}
+
 PyMethodDef _cinderx_methods[] = {
     {"install_frame_evaluator",
      install_frame_evaluator,
@@ -877,6 +910,34 @@ PyMethodDef _cinderx_methods[] = {
      clear_strict_modules,
      METH_NOARGS,
      "Clears all strict modules for shutdown"},
+    {"_autojit_import_enter",
+     autojit_import_enter,
+     METH_NOARGS,
+     PyDoc_STR("Enter AutoJIT import-depth provider scope.")},
+    {"_autojit_import_leave",
+     autojit_import_leave,
+     METH_NOARGS,
+     PyDoc_STR("Leave AutoJIT import-depth provider scope.")},
+    {"_autojit_import_depth",
+     autojit_import_depth,
+     METH_NOARGS,
+     PyDoc_STR("Return current AutoJIT startup provider depth.")},
+    {"_autojit_import_scope_depth",
+     autojit_import_scope_depth,
+     METH_NOARGS,
+     PyDoc_STR("Return current AutoJIT import provider depth.")},
+    {"_autojit_setup_enter",
+     autojit_setup_enter,
+     METH_NOARGS,
+     PyDoc_STR("Enter AutoJIT setup-depth provider scope.")},
+    {"_autojit_setup_leave",
+     autojit_setup_leave,
+     METH_NOARGS,
+     PyDoc_STR("Leave AutoJIT setup-depth provider scope.")},
+    {"_autojit_setup_depth",
+     autojit_setup_depth,
+     METH_NOARGS,
+     PyDoc_STR("Return current AutoJIT setup provider depth.")},
     {"_compile_perf_trampoline_pre_fork",
      compile_perf_trampoline_pre_fork,
      METH_NOARGS,
@@ -884,9 +945,8 @@ PyMethodDef _cinderx_methods[] = {
     {"_is_compile_perf_trampoline_pre_fork_enabled",
      is_compile_perf_trampoline_pre_fork_enabled,
      METH_NOARGS,
-     PyDoc_STR(
-         "Return whether compile perf-trampoline entries before fork is "
-         "enabled or not.")},
+     PyDoc_STR("Return whether compile perf-trampoline entries before fork is "
+               "enabled or not.")},
     {"immortalize_heap",
      cinder_immortalize_heap,
      METH_NOARGS,

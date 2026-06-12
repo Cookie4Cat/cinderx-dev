@@ -4,8 +4,6 @@
 
 from __future__ import annotations
 
-import gc
-import platform
 import sys
 from os import environ
 
@@ -67,6 +65,13 @@ try:
         )
 
     from _cinderx import (
+        _autojit_import_depth,
+        _autojit_import_enter,
+        _autojit_import_leave,
+        _autojit_import_scope_depth,
+        _autojit_setup_depth,
+        _autojit_setup_enter,
+        _autojit_setup_leave,
         _compile_perf_trampoline_pre_fork,
         _is_compile_perf_trampoline_pre_fork_enabled,
         async_cached_classproperty,
@@ -131,6 +136,27 @@ except ImportError as e:
 
     def _is_compile_perf_trampoline_pre_fork_enabled() -> bool:
         return False
+
+    def _autojit_import_enter() -> None:
+        pass
+
+    def _autojit_import_leave() -> None:
+        pass
+
+    def _autojit_import_depth() -> int:
+        return 0
+
+    def _autojit_import_scope_depth() -> int:
+        return 0
+
+    def _autojit_setup_enter() -> None:
+        pass
+
+    def _autojit_setup_leave() -> None:
+        pass
+
+    def _autojit_setup_depth() -> int:
+        return 0
 
     def is_lightweight_frames_enabled() -> bool:
         return False
@@ -546,6 +572,8 @@ def maybe_enable_parallel_gc() -> None:
     is_parallel_gc_enabled = environ.get("PARALLEL_GC_ENABLED", "0") == "1"
     if not has_parallel_gc() or not is_parallel_gc_enabled:
         return
+    import gc
+
     thresholds = gc.get_threshold()
     parallel_gc_threshold_gen0 = int(
         environ.get("PARALLEL_GC_THRESHOLD_GEN0", thresholds[0])
@@ -574,6 +602,117 @@ def maybe_enable_parallel_gc() -> None:
 _is_init: bool = False
 
 
+_AUTOJIT_IMPORT_PROVIDER_MARKER = "_cinderx_autojit_import_provider"
+_AUTOJIT_SETUP_PROVIDER_MARKER = "_cinderx_autojit_setup_provider"
+
+
+def _is_autojit_classification_value(value: object) -> bool:
+    return isinstance(value, str) and (value == "auto" or value.startswith("auto:"))
+
+
+def _autojit_import_provider() -> str:
+    provider = environ.get("CINDERX_AUTOJIT_IMPORT_PROVIDER")
+    if provider is not None:
+        return provider
+    if _is_autojit_classification_value(
+        environ.get("PYTHONJITAUTO")
+    ) or _is_autojit_classification_value(sys._xoptions.get("jit-auto")):
+        return "find_and_load"
+    return "off"
+
+
+def _autojit_setup_provider() -> str:
+    provider = environ.get("CINDERX_AUTOJIT_SETUP_PROVIDER")
+    if provider is not None:
+        return provider
+    if _is_autojit_classification_value(
+        environ.get("PYTHONJITAUTO")
+    ) or _is_autojit_classification_value(sys._xoptions.get("jit-auto")):
+        return "lib2to3_main"
+    return "off"
+
+
+def _make_autojit_setup_wrapper(original: object, provider: str) -> object:
+    def wrapper(*args: object, **kwargs: object) -> object:
+        _autojit_setup_enter()
+        try:
+            # pyre-ignore[29]: The wrapped setup callable is dynamically chosen.
+            return original(*args, **kwargs)
+        finally:
+            _autojit_setup_leave()
+
+    setattr(wrapper, _AUTOJIT_SETUP_PROVIDER_MARKER, provider)
+    setattr(wrapper, "__wrapped__", original)
+    return wrapper
+
+
+def _maybe_install_autojit_setup_provider_for_module(
+    fullname: str, provider: str | None = None
+) -> None:
+    if provider is None:
+        provider = _autojit_setup_provider()
+    if provider in ("", "0", "off"):
+        return
+    if provider != "lib2to3_main" or fullname != "lib2to3.main":
+        return
+
+    module = sys.modules.get("lib2to3.main")
+    if module is None:
+        return
+
+    current = getattr(module, "main", None)
+    if current is None:
+        return
+    if getattr(current, _AUTOJIT_SETUP_PROVIDER_MARKER, None) == provider:
+        return
+
+    setattr(module, "main", _make_autojit_setup_wrapper(current, provider))
+
+
+def _make_autojit_import_wrapper(original: object, provider: str) -> object:
+    setup_provider = _autojit_setup_provider()
+
+    def wrapper(*args: object, **kwargs: object) -> object:
+        _autojit_import_enter()
+        try:
+            # pyre-ignore[29]: The wrapped import callable is dynamically chosen.
+            module = original(*args, **kwargs)
+        finally:
+            _autojit_import_leave()
+        if setup_provider and args and isinstance(args[0], str):
+            _maybe_install_autojit_setup_provider_for_module(
+                args[0], setup_provider
+            )
+        return module
+
+    setattr(wrapper, _AUTOJIT_IMPORT_PROVIDER_MARKER, provider)
+    return wrapper
+
+
+def _install_autojit_import_provider() -> None:
+    provider = _autojit_import_provider()
+    if provider in ("", "0", "off"):
+        return
+
+    if provider == "builtins":
+        target = sys.modules.get("builtins")
+        attr = "__import__"
+    elif provider == "find_and_load":
+        target = sys.modules.get("importlib._bootstrap")
+        attr = "_find_and_load"
+    else:
+        return
+
+    if target is None:
+        return
+
+    current = getattr(target, attr)
+    if getattr(current, _AUTOJIT_IMPORT_PROVIDER_MARKER, None) == provider:
+        return
+
+    setattr(target, attr, _make_autojit_import_wrapper(current, provider))
+
+
 def init() -> None:
     """Initialize CinderX."""
     global _is_init
@@ -587,6 +726,8 @@ def init() -> None:
         return
 
     maybe_enable_parallel_gc()
+    _install_autojit_import_provider()
+    _maybe_install_autojit_setup_provider_for_module("lib2to3.main")
 
     _is_init = True
 

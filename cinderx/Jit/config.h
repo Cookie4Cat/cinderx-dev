@@ -220,6 +220,19 @@ struct Config {
   // inline caches used by the JIT.
   uint32_t attr_cache_size{4};
   std::optional<uint32_t> compile_after_n_calls;
+  // Enable AutoJIT behavior classification for PYTHONJITAUTO=auto[:N]. Plain
+  // numeric PYTHONJITAUTO and Python APIs keep this disabled.
+  bool auto_classify{false};
+  // Provider-before v1 keeps startup/import deferral disabled. This is only
+  // for a later import-depth provider-backed slice.
+  bool enable_startup_init_policy{false};
+  // Minimal dynamic feedback for code that compiles successfully but then
+  // repeatedly deopts. Enabled by default; disable with
+  // CINDERX_AUTOJIT_ROI_BACKOFF=0 when isolating A/B or rolling back.
+  bool roi_backoff_enabled{true};
+  size_t roi_deopt_budget_base{32};
+  size_t roi_backoff_max_rounds{1};
+  size_t roi_rewarm_factor{64};
   GdbOptions gdb;
   JitListOptions jit_list;
   LogOptions log;

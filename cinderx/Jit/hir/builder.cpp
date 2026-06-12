@@ -367,6 +367,29 @@ bool codeHasBackedge(BorrowedRef<PyCodeObject> code) {
   return false;
 }
 
+bool registerHasTypeEvidence(Register* reg, Type type) {
+  if (reg->isA(type)) {
+    return true;
+  }
+
+  auto* instr = reg->instr();
+  if (instr == nullptr || !instr->IsLoadConst()) {
+    return false;
+  }
+
+  return static_cast<const LoadConst*>(instr)->type() <= type;
+}
+
+bool hasArraySubscrStoreFastPathEvidence(
+    Register* container,
+    Register* sub,
+    Register* value,
+    Type array_type) {
+  return container->isA(array_type) ||
+      (registerHasTypeEvidence(sub, TLongExact) &&
+       registerHasTypeEvidence(value, TFloatExact));
+}
+
 } // namespace
 
 // Get the array.array type object for fast path type guards.
@@ -4528,11 +4551,17 @@ void HIRBuilder::emitStoreSubscr(
       bc_instr.specializedOpcode() != STORE_SUBSCR_DICT) {
     auto* array_type = getStdlibArrayType();
     if (array_type != nullptr) {
+      Type array_type_guard = Type::fromTypeExact(array_type);
+      if (!hasArraySubscrStoreFastPathEvidence(
+              container, sub, value, array_type_guard)) {
+        tc.emit<StoreSubscr>(container, sub, value, tc.frame);
+        return;
+      }
+
       BasicBlock* slow_path = cfg.AllocateBlock();
       BasicBlock* done_path = cfg.AllocateBlock();
 
       // Guard: container is array.array
-      Type array_type_guard = Type::fromTypeExact(array_type);
       BasicBlock* fast_path = cfg.AllocateBlock();
       tc.frame.cur_instr_offs = bc_instr.baseOffset();
       tc.emitSnapshot();

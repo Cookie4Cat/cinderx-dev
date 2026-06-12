@@ -48,6 +48,14 @@ class SlotAttrFieldAccessTests(unittest.TestCase):
         self.assertEqual(deopts[0]["normal"]["reason"], reason)
         self.assertEqual(deopts[0]["normal"]["description"], description)
         self.assertEqual(deopts[0]["int"]["lineno"], lineno)
+        for key in (
+            "bc_offset",
+            "deopt_idx",
+            "nonce",
+            "opcode",
+            "specialized_opcode",
+        ):
+            self.assertIsInstance(deopts[0]["int"][key], int)
 
     def test_member_descriptor_store_simplifies_to_store_field(self) -> None:
         cinderx.jit.force_uncompile(store_member_descriptor_value)

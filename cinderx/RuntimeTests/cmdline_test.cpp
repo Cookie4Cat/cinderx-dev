@@ -82,6 +82,41 @@ class ScopedJitConfigState {
   int cinderx_osr_state_;
 };
 
+class ScopedAutoJitConfigState {
+ public:
+  ScopedAutoJitConfigState()
+      : compile_after_n_calls_{getMutableConfig().compile_after_n_calls},
+        auto_classify_{getMutableConfig().auto_classify},
+        enable_startup_init_policy_{
+            getMutableConfig().enable_startup_init_policy} {}
+
+  ~ScopedAutoJitConfigState() {
+    getMutableConfig().compile_after_n_calls = compile_after_n_calls_;
+    getMutableConfig().auto_classify = auto_classify_;
+    getMutableConfig().enable_startup_init_policy = enable_startup_init_policy_;
+  }
+
+ private:
+  std::optional<uint32_t> compile_after_n_calls_;
+  bool auto_classify_;
+  bool enable_startup_init_policy_;
+};
+
+class ScopedXOption {
+ public:
+  explicit ScopedXOption(const wchar_t* flag) : key_{addToXargsDict(flag)} {}
+
+  ~ScopedXOption() {
+    if (key_ != nullptr) {
+      PyDict_DelItem(PySys_GetXOptions(), key_);
+      Py_DECREF(key_);
+    }
+  }
+
+ private:
+  PyObject* key_;
+};
+
 void resetFrameModeAndOSRConfig() {
   getMutableConfig().frame_mode = FrameMode::kNormal;
   getMutableConfig().osr_enabled = false;
@@ -89,6 +124,64 @@ void resetFrameModeAndOSRConfig() {
   cinderx_osr_enabled = 0;
   cinderx_osr_capable = 0;
   cinderx_osr_state = 0;
+}
+
+void resetJitForAutoJitEntryTest() {
+  jit::finalize();
+  jit::shutdown_jit_genobject_type();
+  Ci_FiniFrameEvalFunc();
+  getMutableConfig().compile_after_n_calls.reset();
+  getMutableConfig().auto_classify = false;
+  getMutableConfig().enable_startup_init_policy = false;
+}
+
+// Keep these snippets inside RuntimeTest's embedded interpreter: they validate
+// JIT config mutations made in this process, which an external Python script
+// would not observe.
+void assertNewFunctionCountsAndCompiles(RuntimeTest& test) {
+  test.runStockCode(R"(
+import cinderx
+import cinderx.jit as jit
+
+def target(n):
+    total = 0
+    for value in range(n):
+        total += value
+    return total
+
+assert jit.get_compile_after_n_calls() == 2
+assert cinderx.is_frame_evaluator_installed()
+assert jit.count_interpreted_calls(target) == 0
+target(5)
+target(5)
+assert not jit.is_jit_compiled(target)
+assert jit.count_interpreted_calls(target) == 2
+target(5)
+assert jit.is_jit_compiled(target)
+)");
+}
+
+void assertNewFunctionCountsAndDefersTrivialWork(RuntimeTest& test) {
+  test.runStockCode(R"(
+import cinderx
+import cinderx.jit as jit
+
+def target(value):
+    return value
+
+assert jit.get_compile_after_n_calls() == 2
+assert not cinderx.is_frame_evaluator_installed()
+assert jit.count_interpreted_calls(target) == 0
+target(1)
+target(2)
+assert not jit.is_jit_compiled(target)
+assert jit.count_interpreted_calls(target) == 2
+target(3)
+target(4)
+target(5)
+assert not jit.is_jit_compiled(target)
+assert jit.count_interpreted_calls(target) == 2
+)");
 }
 
 } // namespace
@@ -349,13 +442,234 @@ TEST_F(CmdLineTest, JITEnable) {
       try_flag_and_envvar_effect(
           L"jit-all",
           "PYTHONJITALL",
-          []() {},
+          []() {
+            getMutableConfig().compile_after_n_calls.reset();
+            getMutableConfig().auto_classify = true;
+          },
           []() {
             ASSERT_TRUE(isJitUsable());
             ASSERT_EQ(getConfig().compile_after_n_calls, 0);
+            ASSERT_FALSE(getConfig().auto_classify);
             ASSERT_EQ(
                 getConfig().asm_syntax,
                 AsmSyntax::ATT); // default to AT&T syntax
+          }),
+      0);
+}
+
+TEST_F(CmdLineTest, JITAutoNumericKeepsClassificationOff) {
+  ASSERT_EQ(
+      try_flag_and_envvar_effect(
+          L"jit-auto=2",
+          "PYTHONJITAUTO=2",
+          []() {
+            getMutableConfig().compile_after_n_calls.reset();
+            getMutableConfig().auto_classify = true;
+          },
+          []() {
+            ASSERT_EQ(getConfig().compile_after_n_calls, 2);
+            ASSERT_FALSE(getConfig().auto_classify);
+          }),
+      0);
+}
+
+TEST_F(CmdLineTest, JITAutoEmptyXOptionKeepsLegacyThresholdOne) {
+  ASSERT_EQ(
+      try_flag_and_envvar_effect(
+          L"jit-auto",
+          nullptr,
+          []() {
+            getMutableConfig().compile_after_n_calls.reset();
+            getMutableConfig().auto_classify = true;
+          },
+          []() {
+            ASSERT_EQ(getConfig().compile_after_n_calls, 1);
+            ASSERT_FALSE(getConfig().auto_classify);
+          }),
+      0);
+}
+
+TEST_F(CmdLineTest, JITAutoKeywordEnablesClassification) {
+  ASSERT_EQ(
+      try_flag_and_envvar_effect(
+          L"jit-auto=auto:7",
+          "PYTHONJITAUTO=auto:7",
+          []() {
+            getMutableConfig().compile_after_n_calls.reset();
+            getMutableConfig().auto_classify = false;
+          },
+          []() {
+            ASSERT_EQ(getConfig().compile_after_n_calls, 7);
+            ASSERT_TRUE(getConfig().auto_classify);
+          }),
+      0);
+}
+
+TEST_F(CmdLineTest, JITAutoKeywordUsesDefaultThreshold) {
+  ASSERT_EQ(
+      try_flag_and_envvar_effect(
+          L"jit-auto=auto",
+          "PYTHONJITAUTO=auto",
+          []() {
+            getMutableConfig().compile_after_n_calls.reset();
+            getMutableConfig().auto_classify = false;
+          },
+          []() {
+            ASSERT_EQ(getConfig().compile_after_n_calls, 2);
+            ASSERT_TRUE(getConfig().auto_classify);
+          }),
+      0);
+}
+
+TEST_F(CmdLineTest, JITAutoNumericEnvInstallsFrameEvaluator) {
+  ScopedAutoJitConfigState config_guard;
+  ScopedEnvVar env{"PYTHONJITAUTO"};
+  resetJitForAutoJitEntryTest();
+  env.set("2");
+  ASSERT_EQ(jit::initialize(), 0);
+  EXPECT_EQ(getConfig().compile_after_n_calls, 2);
+  EXPECT_FALSE(getConfig().auto_classify);
+
+  assertNewFunctionCountsAndCompiles(*this);
+
+  jit::finalize();
+  jit::shutdown_jit_genobject_type();
+}
+
+TEST_F(CmdLineTest, JITAutoNumericEnvKeepsStartupInitPolicyDisabled) {
+  ScopedAutoJitConfigState config_guard;
+  ScopedEnvVar env{"PYTHONJITAUTO"};
+  resetJitForAutoJitEntryTest();
+  env.set("2");
+  ASSERT_EQ(jit::initialize(), 0);
+  EXPECT_EQ(getConfig().compile_after_n_calls, 2);
+  EXPECT_FALSE(getConfig().auto_classify);
+  EXPECT_FALSE(getConfig().enable_startup_init_policy);
+
+  jit::finalize();
+  jit::shutdown_jit_genobject_type();
+}
+
+TEST_F(CmdLineTest, JITAutoEnvAutoModeCountsWithoutFrameEvaluator) {
+  ScopedAutoJitConfigState config_guard;
+  ScopedEnvVar env{"PYTHONJITAUTO"};
+  resetJitForAutoJitEntryTest();
+  env.set("auto:2");
+  ASSERT_EQ(jit::initialize(), 0);
+  EXPECT_EQ(getConfig().compile_after_n_calls, 2);
+  EXPECT_TRUE(getConfig().auto_classify);
+  EXPECT_TRUE(getConfig().enable_startup_init_policy);
+
+  assertNewFunctionCountsAndDefersTrivialWork(*this);
+
+  jit::finalize();
+  jit::shutdown_jit_genobject_type();
+}
+
+TEST_F(CmdLineTest, JITAutoEnvAutoModeDoesNotScheduleExistingFunctions) {
+  ScopedAutoJitConfigState config_guard;
+  ScopedEnvVar env{"PYTHONJITAUTO"};
+  resetJitForAutoJitEntryTest();
+  runStockCode(R"(
+def existing_function(value):
+    return value
+)");
+  Ref<> existing_function = getGlobal("existing_function");
+  ASSERT_TRUE(PyFunction_Check(existing_function));
+  BorrowedRef<PyFunctionObject> func{existing_function};
+  vectorcallfunc original_vectorcall = func->vectorcall;
+
+  env.set("auto:2");
+  ASSERT_EQ(jit::initialize(), 0);
+  EXPECT_EQ(getConfig().compile_after_n_calls, 2);
+  EXPECT_TRUE(getConfig().auto_classify);
+  EXPECT_TRUE(getConfig().enable_startup_init_policy);
+  EXPECT_EQ(func->vectorcall, original_vectorcall);
+
+  jit::finalize();
+  jit::shutdown_jit_genobject_type();
+}
+
+TEST_F(CmdLineTest, JITAutoXOptionAutoModeCountsWithoutFrameEvaluator) {
+  ScopedAutoJitConfigState config_guard;
+  ScopedXOption xoption{L"jit-auto=auto:2"};
+  resetJitForAutoJitEntryTest();
+  ASSERT_EQ(jit::initialize(), 0);
+  EXPECT_EQ(getConfig().compile_after_n_calls, 2);
+  EXPECT_TRUE(getConfig().auto_classify);
+  EXPECT_TRUE(getConfig().enable_startup_init_policy);
+
+  assertNewFunctionCountsAndDefersTrivialWork(*this);
+
+  jit::finalize();
+  jit::shutdown_jit_genobject_type();
+}
+
+TEST_F(CmdLineTest, JITAutoImportProviderEnablesStartupInitPolicy) {
+  ScopedAutoJitConfigState config_guard;
+  ScopedEnvVar auto_env{"PYTHONJITAUTO"};
+  ScopedEnvVar provider_env{"CINDERX_AUTOJIT_IMPORT_PROVIDER"};
+  resetJitForAutoJitEntryTest();
+  auto_env.set("auto:2");
+  ASSERT_EQ(jit::initialize(), 0);
+  EXPECT_EQ(getConfig().compile_after_n_calls, 2);
+  EXPECT_TRUE(getConfig().auto_classify);
+  EXPECT_TRUE(getConfig().enable_startup_init_policy);
+
+  jit::finalize();
+  jit::shutdown_jit_genobject_type();
+
+  resetJitForAutoJitEntryTest();
+  auto_env.set("auto:2");
+  provider_env.set("builtins");
+  ASSERT_EQ(jit::initialize(), 0);
+  EXPECT_EQ(getConfig().compile_after_n_calls, 2);
+  EXPECT_TRUE(getConfig().auto_classify);
+  EXPECT_TRUE(getConfig().enable_startup_init_policy);
+
+  jit::finalize();
+  jit::shutdown_jit_genobject_type();
+
+  resetJitForAutoJitEntryTest();
+  auto_env.set("auto:2");
+  provider_env.set("find_and_load");
+  ASSERT_EQ(jit::initialize(), 0);
+  EXPECT_EQ(getConfig().compile_after_n_calls, 2);
+  EXPECT_TRUE(getConfig().auto_classify);
+  EXPECT_TRUE(getConfig().enable_startup_init_policy);
+
+  jit::finalize();
+  jit::shutdown_jit_genobject_type();
+}
+
+TEST_F(CmdLineTest, JITAutoImportProviderOffKeepsStartupInitPolicyDisabled) {
+  ScopedAutoJitConfigState config_guard;
+  ScopedEnvVar auto_env{"PYTHONJITAUTO"};
+  ScopedEnvVar provider_env{"CINDERX_AUTOJIT_IMPORT_PROVIDER"};
+  resetJitForAutoJitEntryTest();
+  auto_env.set("auto:2");
+  provider_env.set("off");
+  ASSERT_EQ(jit::initialize(), 0);
+  EXPECT_EQ(getConfig().compile_after_n_calls, 2);
+  EXPECT_TRUE(getConfig().auto_classify);
+  EXPECT_FALSE(getConfig().enable_startup_init_policy);
+
+  jit::finalize();
+  jit::shutdown_jit_genobject_type();
+}
+
+TEST_F(CmdLineTest, JITAutoMalformedInputPreservesExistingConfig) {
+  ASSERT_EQ(
+      try_flag_and_envvar_effect(
+          L"jit-auto=auto:not-a-number",
+          "PYTHONJITAUTO=auto:not-a-number",
+          []() {
+            getMutableConfig().compile_after_n_calls.reset();
+            getMutableConfig().auto_classify = false;
+          },
+          []() {
+            ASSERT_FALSE(getConfig().compile_after_n_calls.has_value());
+            ASSERT_FALSE(getConfig().auto_classify);
           }),
       0);
 }

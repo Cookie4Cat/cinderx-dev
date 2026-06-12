@@ -35,6 +35,7 @@
 #include "cinderx/Jit/lir/regalloc.h"
 #include "cinderx/Jit/lir/verify.h"
 #include "cinderx/Jit/perf_jitdump.h"
+#include "cinderx/Jit/pyjit.h"
 #include "cinderx/UpstreamBorrow/borrowed.h"
 
 #include <fmt/format.h>
@@ -263,6 +264,8 @@ DeoptResult prepareForDeopt(
         JIT_ABORT("Lost exception when raising static exception");
     }
   }
+  jit::recordDeoptForRoiBackoff(
+      code_runtime, deopt_meta.reason, is_instrumentation_deopt);
   return {frame, is_instrumentation_deopt};
 }
 

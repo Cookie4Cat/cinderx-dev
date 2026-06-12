@@ -453,7 +453,10 @@ do { \
                 if (extra == NULL) { \
                     adaptive_enabled = false; \
                 } else { \
-                    Ci_code_extra_incr_calls(extra); \
+                    uint32_t skey_word = Ci_code_extra_load_skey_acquire(extra); \
+                    if (!(skey_word & CI_CODE_EXTRA_SKEY_DECIDED_COLD_BIT)) { \
+                        Ci_code_extra_incr_calls(extra); \
+                    } \
                     adaptive_enabled = is_adaptive_enabled(extra); \
                 } \
             } \

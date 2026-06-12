@@ -6,6 +6,7 @@
 
 - [开发者构建说明](#开发者构建说明)
 - [性能测试](#性能测试)
+  - [AutoJIT 行为分类使用指南](#autojit-行为分类使用指南)
 - [调试与性能分析](#调试与性能分析)
 
 
@@ -112,14 +113,115 @@ python3.14 -m pyperformance venv create --inherit-environ http_proxy,https_proxy
 sed -i 's/^include-system-site-packages = false/include-system-site-packages = true/' venv/<venv_name>/pyvenv.cfg
 ```
 
+### AutoJIT 行为分类使用指南
+
+AutoJIT 行为分类用于低阈值自动 JIT 场景。它不是“编译所有函数”，而是在函数达到初始调用阈值后，先判断这个函数现在是否值得进入 JIT。
+
+最常用的启动方式：
+
+```bash
+CINDERX_PLUGIN_ENABLE=1 PYTHONJITAUTO=auto:2 python3.14 your_app.py
+```
+
+也可以使用 `-X` 选项：
+
+```bash
+CINDERX_PLUGIN_ENABLE=1 python3.14 -X jit-auto=auto:2 your_app.py
+```
+
+`PYTHONJITAUTO=auto` 等价于使用默认分类阈值 2；`PYTHONJITAUTO=auto:N` 表示函数调用达到 N 次后进入分类准入。对比之下，`PYTHONJITAUTO=N` 是传统自动 JIT，只按调用次数触发，不启用行为分类。
+
+分类模式默认启用三类辅助能力：
+
+| 能力 | 默认值 | 作用 |
+|---|---|---|
+| import provider | `find_and_load` | 标记 import 链路中的函数，抑制导入期编译风暴 |
+| setup provider | `lib2to3_main` | 标记已知的一次性 setup 链路；当前作为 import provider 打开的 `StartupInit` 策略附加信号 |
+| ROI backoff | 开启 | 已经编译的函数如果反复 deopt，会反编译或冻结为解释执行 |
+
+常用环境变量如下：
+
+| 环境变量 | 默认值 | 作用 |
+|---|---|---|
+| `CINDERX_PLUGIN_ENABLE=1` | 关闭 | 通过 `cinderx.pth` 自动加载 CinderX 插件 |
+| `PYTHONJITAUTO=auto` | - | 启用 AutoJIT 行为分类，默认阈值为 2 |
+| `PYTHONJITAUTO=auto:N` | - | 启用 AutoJIT 行为分类，并使用 N 作为初始调用阈值 |
+| `PYTHONJITAUTO=N` | - | 启用传统自动 JIT，不启用行为分类 |
+| `CINDERX_AUTOJIT_IMPORT_PROVIDER=find_and_load` | auto 模式默认开启 | 使用 `importlib._bootstrap._find_and_load` 标记 import 阶段 |
+| `CINDERX_AUTOJIT_IMPORT_PROVIDER=off` | - | 关闭 import 阶段信号，常用于 A/B 定位 |
+| `CINDERX_AUTOJIT_SETUP_PROVIDER=lib2to3_main` | auto 模式默认开启 | 使用 `lib2to3.main.main` 标记 setup 阶段；当前需配合 import provider 开启才影响 `StartupInit` 策略 |
+| `CINDERX_AUTOJIT_SETUP_PROVIDER=off` | - | 关闭 setup 阶段信号，常用于评估 setup wrapper 增量 |
+| `CINDERX_AUTOJIT_ROI_BACKOFF=1` | 开启 | 启用运行时负 ROI 回退 |
+| `CINDERX_AUTOJIT_ROI_BACKOFF=0` | - | 关闭运行时负 ROI 回退，常用于回滚或隔离验证 |
+| `CINDERX_AUTOJIT_ROI_BACKOFF_BUDGET=N` | `32` | 单轮 deopt 预算基数 |
+| `CINDERX_AUTOJIT_ROI_BACKOFF_MAX_ROUNDS=N` | `1` | 允许反编译后重新预热的最大轮数 |
+| `CINDERX_AUTOJIT_ROI_REWARM_FACTOR=N` | `64` | 重新预热阈值倍率 |
+| `CINDERX_AUTOJIT_GATE_STATS=1` | 关闭 | 进程退出时输出 AutoJIT 准入统计 |
+| `CINDERX_AUTOJIT_GATE_STATS_FILE=/path/to/file.jsonl` | stderr | 将准入统计写入 JSONL 文件 |
+| `CINDERX_AUTOJIT_COMPILE_EVENTS_FILE=/path/to/file.jsonl` | 关闭 | 记录 forced compile 事件、阶段和函数形状，供性能分析使用 |
+
+pyperformance 推荐先跑传统自动 JIT 与分类模式两组，再用结果文件比较：
+
+```bash
+CINDERX_PLUGIN_ENABLE=1 PYTHONJITAUTO=2 \
+python3.14 -m pyperformance run \
+    --affinity=300 \
+    --warmup 3 \
+    --inherit-environ http_proxy,https_proxy,LD_LIBRARY_PATH,CINDERX_PLUGIN_ENABLE,PYTHONJITAUTO \
+    -b 2to3,python_startup,python_startup_no_site \
+    -o jit_auto_2.json
+
+CINDERX_PLUGIN_ENABLE=1 PYTHONJITAUTO=auto:2 \
+python3.14 -m pyperformance run \
+    --affinity=300 \
+    --warmup 3 \
+    --inherit-environ http_proxy,https_proxy,LD_LIBRARY_PATH,CINDERX_PLUGIN_ENABLE,PYTHONJITAUTO \
+    -b 2to3,python_startup,python_startup_no_site \
+    -o autojit_classify_2.json
+
+python3.14 -m pyperf compare_to jit_auto_2.json autojit_classify_2.json
+```
+
+如果要定位 import provider、setup provider 或 ROI backoff 的贡献，把对应环境变量加入 `--inherit-environ`，并分别设置为 `off` 或 `0` 做 A/B。当前不支持用 `CINDERX_AUTOJIT_IMPORT_PROVIDER=off` + `CINDERX_AUTOJIT_SETUP_PROVIDER=lib2to3_main` 代表 setup-only 策略；评估 setup wrapper 增量时，应保持 import provider 开启，只切换 `CINDERX_AUTOJIT_SETUP_PROVIDER`。
+
+```bash
+CINDERX_PLUGIN_ENABLE=1 \
+PYTHONJITAUTO=auto:2 \
+CINDERX_AUTOJIT_IMPORT_PROVIDER=off \
+CINDERX_AUTOJIT_SETUP_PROVIDER=off \
+CINDERX_AUTOJIT_ROI_BACKOFF=0 \
+python3.14 -m pyperformance run \
+    --affinity=300 \
+    --warmup 3 \
+    --inherit-environ http_proxy,https_proxy,LD_LIBRARY_PATH,CINDERX_PLUGIN_ENABLE,PYTHONJITAUTO,CINDERX_AUTOJIT_IMPORT_PROVIDER,CINDERX_AUTOJIT_SETUP_PROVIDER,CINDERX_AUTOJIT_ROI_BACKOFF \
+    -b 2to3 \
+    -o autojit_no_provider_no_backoff.json
+```
+
+需要看分类结果时，打开 gate stats：
+
+```bash
+CINDERX_PLUGIN_ENABLE=1 \
+PYTHONJITAUTO=auto:2 \
+CINDERX_AUTOJIT_GATE_STATS=1 \
+CINDERX_AUTOJIT_GATE_STATS_FILE=/tmp/autojit-gate-stats.jsonl \
+python3.14 your_app.py
+```
+
+需要注意：
+
+- Python API `cinderx.jit.auto()` 和 `cinderx.jit.compile_after_n_calls(N)` 只启用传统自动 JIT，不启用行为分类。
+- `PYTHONJITALL=1` 会尽早编译所有函数，不适合用来验证 AutoJIT 分类收益。
+- `PYTHONJITDISABLE=1` 或 `CINDERX_JIT_DISABLE=1` 会禁用 JIT；`CINDERX_DISABLE=1` 会禁用整个 CinderX 插件。
+
 ### 性能测试
 
 ``` bash
-// 命令示例
-CINDERX_PLUGIN_ENABLE=1 PYTHONJITAUTO=2 PYTHONJITLIGHTWEIGHTFRAME=1 python3.14 -m pyperformance run \
+# 命令示例
+CINDERX_PLUGIN_ENABLE=1 PYTHONJITAUTO=auto:2 python3.14 -m pyperformance run \
     --affinity=300 \
     --warmup 3 \
-    --inherit-environ http_proxy,https_proxy,LD_LIBRARY_PATH,CINDERX_PLUGIN_ENABLE,PYTHONJITAUTO,PYTHONJITLIGHTWEIGHTFRAME \
+    --inherit-environ http_proxy,https_proxy,LD_LIBRARY_PATH,CINDERX_PLUGIN_ENABLE,PYTHONJITAUTO \
     -o test.json
 ```
 pyperformance可通过`-b`参数指定用例范围，也可通过`--fast`方式快速验证，更多使用方式参考[pyperformance Docs](https://pyperformance.readthedocs.io)
@@ -146,6 +248,9 @@ CinderX 提供了丰富的环境变量用于调试和性能分析：
 | `PYTHONJITLISTFILE=/path/to/list` | 通过 JIT 列表文件选择性编译指定函数 |
 | `PYTHONJITPRELOADDEPENDENTLIMIT=N` | 编译时预加载依赖函数的最大数量（默认 99） |
 | `PYTHONJITALLSTATICFUNCTIONS=1` | 预加载并编译所有 Static Python 函数 |
+| `CINDERX_AUTOJIT_GATE_STATS=1` | 输出 AutoJIT 准入统计 |
+| `CINDERX_AUTOJIT_GATE_STATS_FILE=/path/to/file.jsonl` | 将 AutoJIT 准入统计写入 JSONL 文件 |
+| `CINDERX_AUTOJIT_COMPILE_EVENTS_FILE=/path/to/file.jsonl` | 记录 AutoJIT forced compile 事件、阶段和函数形状 |
 | `CINDERX_DISABLE=1` | 强制禁用整个 CinderX 扩展 |
 
 ---

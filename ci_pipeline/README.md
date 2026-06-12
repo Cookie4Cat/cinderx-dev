@@ -169,6 +169,12 @@ job.
 | `CINDERX_TESTGATE_PRELUDE` | Shell snippet run before each job; can also be overridden with `--prelude` |
 | `CINDERX_TESTGATE_ALLOW_TARGET_MISMATCH=1` | Allows current machine and suite target mismatches; equivalent to `--allow-target-mismatch` |
 
+For native `RuntimeTests`, the default `CC` and `CXX` come from the target
+`CINDERX_TEST_PYTHON`'s `sysconfig` values. This keeps the linker compatible
+with the target Python's static `libpython`, including Python builds that embed
+GCC LTO bytecode. If you override `CC` or `CXX`, make sure that compiler can
+link the target Python library.
+
 ## Dependency Cache And Pip Offline Mode
 
 `run_gate` does not hard-code a dependency cache path. Set `CINDERX_LOCAL_DEPS`

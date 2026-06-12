@@ -49,6 +49,13 @@ void finalize();
  */
 bool scheduleJitCompile(BorrowedRef<PyFunctionObject> func);
 
+void recordDeoptForRoiBackoff(
+    CodeRuntime* code_runtime,
+    DeoptReason reason,
+    bool is_instrumentation_deopt);
+
+bool roiBackoffAllowsCompile(BorrowedRef<PyCodeObject> code);
+
 /*
  * JIT compile func and patch its entry point.
  *
