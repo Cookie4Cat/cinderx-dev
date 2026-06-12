@@ -2,6 +2,7 @@
 
 #include <gtest/gtest.h>
 
+#include "cinderx/Jit/config.h"
 #include "cinderx/RuntimeTests/fixtures.h"
 #include "cinderx/StaticPython/checked_dict.h"
 #include "cinderx/StaticPython/checked_list.h"
@@ -28,6 +29,21 @@ class StaticSanityTest : public RuntimeTest {
 };
 
 namespace {
+
+class ScopedRoiBackoff {
+ public:
+  explicit ScopedRoiBackoff(bool enabled)
+      : previous_enabled_{jit::getMutableConfig().roi_backoff_enabled} {
+    jit::getMutableConfig().roi_backoff_enabled = enabled;
+  }
+
+  ~ScopedRoiBackoff() {
+    jit::getMutableConfig().roi_backoff_enabled = previous_enabled_;
+  }
+
+ private:
+  bool previous_enabled_;
+};
 
 Ref<> importModule(const char* name) {
   auto mod = Ref<>::steal(PyImport_ImportModule(name));
@@ -107,6 +123,7 @@ TEST_F(SanityTest, CanReinitRuntime) {
 }
 
 TEST_F(SanityTest, JitPythonShapeCoverage) {
+  ScopedRoiBackoff roi_backoff{false};
   runStockCode(R"(
 import cinderx.jit as jit
 

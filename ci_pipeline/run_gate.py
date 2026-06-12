@@ -237,6 +237,18 @@ def first_executable(candidates: list[str], extra_globs: list[str]) -> str | Non
     return None
 
 
+def compiler_executable(command: object) -> str | None:
+    if not command:
+        return None
+    try:
+        parts = shlex.split(str(command))
+    except ValueError:
+        parts = str(command).split()
+    if not parts:
+        return None
+    return parts[0]
+
+
 def env_truthy(value: str | None) -> bool:
     if value is None:
         return False
@@ -267,12 +279,44 @@ def configure_pip_dependencies(env: dict[str, str]) -> None:
         env.setdefault("PIP_NO_INDEX", "1")
 
 
+def target_python_build_toolchain(env: dict[str, str]) -> dict[str, str]:
+    code = (
+        "import json, sysconfig; "
+        "print(json.dumps({"
+        "'CC': sysconfig.get_config_var('CC'), "
+        "'CXX': sysconfig.get_config_var('CXX')"
+        "}))"
+    )
+    completed = subprocess.run(
+        [env["CINDERX_TEST_PYTHON"], "-c", code],
+        cwd=REPO_ROOT,
+        env=env,
+        check=True,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        text=True,
+    )
+    data = json.loads(completed.stdout)
+    toolchain = {}
+    for key in ("CC", "CXX"):
+        executable = compiler_executable(data.get(key))
+        if executable:
+            toolchain[key] = executable
+    return toolchain
+
+
 def configure_toolchain(env: dict[str, str]) -> None:
     env.setdefault("CINDERX_TEST_PYTHON", sys.executable)
     configure_pip_dependencies(env)
 
+    need_cc = "CC" not in env
+    need_cxx = "CXX" not in env
+    target_toolchain = {}
+    if need_cc or need_cxx:
+        target_toolchain = target_python_build_toolchain(env)
+
     if "CC" not in env:
-        cc = first_executable(
+        cc = target_toolchain.get("CC") or first_executable(
             ["gcc-14", "gcc", "clang-19", "clang"],
             [
                 "opt/gcc-*/bin/gcc",
@@ -283,7 +327,7 @@ def configure_toolchain(env: dict[str, str]) -> None:
             env["CC"] = cc
 
     if "CXX" not in env:
-        cxx = first_executable(
+        cxx = target_toolchain.get("CXX") or first_executable(
             ["g++-14", "g++", "clang++-19", "clang++"],
             [
                 "opt/gcc-*/bin/g++",
@@ -373,9 +417,14 @@ def cmake_value(value: object) -> str:
 def cinderx_test_python_info(env: dict[str, str]) -> dict[str, Any]:
     code = (
         "import json, os, sys, sysconfig; "
+        "library = sysconfig.get_config_var('LDLIBRARY') or "
+        "sysconfig.get_config_var('LIBRARY'); "
+        "libdir = sysconfig.get_config_var('LIBDIR'); "
         "print(json.dumps({"
+        "'executable': sys.executable, "
         "'py_version': f'{sys.version_info.major}.{sys.version_info.minor}', "
         "'python_root': os.path.join(sysconfig.get_path('include'), '..', '..'), "
+        "'python_library': os.path.join(libdir, library) if libdir and library else None, "
         "'meta_python': '+meta' in sys.version, "
         "'linux': sys.platform == 'linux', "
         "'mac': sys.platform == 'darwin'"
@@ -405,7 +454,10 @@ def runtime_tests_cmake_options(env: dict[str, str]) -> list[str]:
     options: dict[str, str] = {
         "PY_VERSION": py_version,
         "Python_ROOT_DIR": str(info["python_root"]),
+        "Python_EXECUTABLE": str(info["executable"]),
     }
+    if info.get("python_library"):
+        options["Python_LIBRARY"] = str(info["python_library"])
 
     def set_option(var: str, default: object) -> None:
         options[var] = env.get(var, cmake_value(default))

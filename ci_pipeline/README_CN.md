@@ -155,6 +155,11 @@ package data 只进入本地测试 wheel，不影响普通发布 wheel。
 | `CINDERX_TESTGATE_PRELUDE` | 每个 job 前执行的 shell 片段；也可用 `--prelude` 覆盖 |
 | `CINDERX_TESTGATE_ALLOW_TARGET_MISMATCH=1` | 允许当前机器与 suite target 不匹配；等价于 `--allow-target-mismatch` |
 
+native `RuntimeTests` 默认从目标 `CINDERX_TEST_PYTHON` 的 `sysconfig` 读取
+`CC/CXX`。这样链接器会和目标 Python 的静态 `libpython` 保持兼容，包括带 GCC LTO
+bytecode 的 Python 构建。如果手动覆盖 `CC` 或 `CXX`，调用方必须保证该编译器能链接目标
+Python 库。
+
 ## 依赖缓存与 pip 离线模式
 
 `run_gate` 不硬编码依赖缓存路径。需要离线构建或复用预置依赖时，显式设置
