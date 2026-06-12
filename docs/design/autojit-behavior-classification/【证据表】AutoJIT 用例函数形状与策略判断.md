@@ -10,6 +10,7 @@
 
 | 版本 | 日期 | 修订人 | 修订说明 |
 |---|---|---|---|
+| v0.35 | 2026-06-12 | @sisibeloved | 合并 upstream 后重打 dask 证据：同步本地 tracked 源码到 `blue-98:cinderx-test` 并重装 editable CinderX 后，L1/L3 子集通过；正式同核 `--affinity=30` 复跑 default/noattr，结果 default `1.58s +- 0.06s`、noattr `1.58s +- 0.05s`，`pyperf compare_to` 不显著，说明 !103 descriptor inline cache 后 `PYTHONJITATTRCACHES=0` 小收益消失。per-site deopt 以新 `{pid}` 日志模板重跑：RoiBackoff off `61912`、on `218`，确认 RoiBackoff 止血仍成立但 noattr 方向不再作为当前证据。 |
 | v0.34 | 2026-06-11 | @sisibeloved | 补 RoiBackoff 默认开启守门批次：`/results/autojit-roi-backoff-guard-20260611_221949` 对 `2to3`、`deepcopy` 子集、`generators`、`pickle_pure_python`、`sqlalchemy_declarative`、`nbody`、`richards` 做 on/off A/B；`2to3/deepcopy/generators/pickle/sqlalchemy` 无误伤，`nbody/richards` 初始并行差异经同核串行复跑转为 on 更快或持平。结论：支持 RoiBackoff 默认开启，保留 `CINDERX_AUTOJIT_ROI_BACKOFF=0` 回退；gdb smoke 在 blue-98 容器受 seccomp/ptrace 限制，作为环境补验项。 |
 | v0.33 | 2026-06-11 | @sisibeloved | 复核 `dask` 后续优化方向：按串行同核 `--affinity=30` 正式复跑默认 AutoJIT 与 `PYTHONJITATTRCACHES=0`，结果 `1.68s -> 1.61s`，`1.04x faster`，确认 noattr 是小正信号但属于全局 JIT 行为变化，不能直接默认化。补 per-site deopt 字段复核：RoiBackoff on 后当前 dask deopt 从 `64164` 降到 `129`，历史 LOAD_ATTR_SLOT 风暴已不是当前主项；关闭 LOAD_ATTR fallback、关闭 array double fastpath 均无收益。策略结论更新为：不继续扩大 startup/provider，也不做全局 slot fallback；下一步只考虑局部 attr-cache/PIC/expected-exception 等 JIT 动态成本专项。 |
 | v0.32 | 2026-06-11 | @sisibeloved | 重写 `logging_silent` 复核证据：正式五口径和 HIR/LIR 证明 `Logger.isEnabledFor` 与外层 `bench_silent` call-only loop 进入 CinderX JIT 均为负收益。删除 cached-predicate 静态放行，新增 `CallDispatcher + dims=Object|Dispatch + loop=1 + codeB=1 + risk=None` 的 LowRoi 延迟。正式 `logging_silent` 从原 AutoJIT `328ns` 降到 `212ns`，相对 CPython JIT `219ns` 为 `1.03x faster`；新增 `test_plugin_defers_logging_disabled_fast_path` 与 `test_plugin_defers_call_only_dispatch_loop`。同步补 dask RoiBackoff 复核：`1.67s -> 1.62s`，小收益但非根治。 |
@@ -105,6 +106,7 @@
 | `dask` | debug shape/gate/deopt：`--fast -n 3 -w 1`，`PYTHONJITLOGFILE` + `CINDERX_AUTOJIT_GATE_STATS_FILE` + `CINDERX_AUTOJIT_COMPILE_EVENTS_FILE` | `blue-98:cinderx-test:/results/autojit-dask-ledger-20260609/{dask-gate-stats.jsonl,dask-compile-events.jsonl,worker-gate-shapes/*.jit.log,dask-debug-fast.json}` | 4 个 worker 合计约 `962700` 次 gate、`3408` 次 forced compile、`161135` 次 defer freeze；编译事件 `3485` 条中 `3440` 条在 steady 阶段；deopt 合计 `1020754` 次，主要是 `GuardFailure` 和 expected exception |
 | `dask` | plain generator override 误伤复现与修复：`PYTHONJITAUTO=auto:2`，默认 provider，`PYTHONJITHUGEPAGES=0`；失败/修复均附 compile-events | `blue-98:cinderx-test:/results/autojit-dask-failure-20260610/{dask-fast-autojit.log,dask-fail-compile-events.jsonl,dask-fast-autojit-fixed.json,dask-fixed-compile-events.jsonl,dask-formal-autojit-fixed.json,logs/*}` | 失败口径中 `asyncio.tasks:__sleep0` 以 `calls=2 limit=2 reason=None` forced compile，触发 `TypeError: 'generator' object can't be awaited`；修复后 `dask --fast` 通过且 fixed compile-events 不再含 `__sleep0`；正式 `dask=1.77s +- 0.05s`，相对旧 AutoJIT `1.15x faster`，仍比 CPython JIT/plugin-no-JIT `1.30x slower` |
 | `dask` | RoiBackoff 后 per-site deopt 与 noattr 正式复核：默认 AutoJIT vs `PYTHONJITATTRCACHES=0`，串行同核 `--affinity=30 --warmup 3`，无 dump/HIR/debug 变量 | `blue-98:cinderx-test:/results/autojit-dask-site-fields-{roion,roioff}-20260611_203926`；`blue-98:cinderx-test:/results/autojit-dask-noattr-serial-aff30-20260611_212203/{default.json,noattr.json,compare-noattr-vs-default.txt,*.stats.txt,logs/*}` | 当前 RoiBackoff on 后 deopt 只剩 `129`，off 为 `64164`；历史 LOAD_ATTR_SLOT 风暴已不是当前主项。正式同核复跑默认 `1.68s +- 0.05s`，noattr `1.61s +- 0.04s`，`1.04x faster`；noattr 是小正信号但为全局 JIT 开关，不能直接作为生产默认 |
+| `dask` | 合并 upstream 后正式复核：default AutoJIT vs `PYTHONJITATTRCACHES=0`，串行同核 `--affinity=30 --warmup 3`；per-site deopt 使用 `{pid}` 日志模板、`--fast --warmup 1` | `blue-98:cinderx-test:/results/autojit-dask-after-upstream-20260612_003254/{default.json,noattr.json,compare-noattr-vs-default.txt}`；`blue-98:cinderx-test:/results/autojit-dask-site-fields-after-upstream-20260612_004151-pid/{roioff,roion}` | default `1.58s +- 0.06s`，noattr `1.58s +- 0.05s`，不显著；RoiBackoff off/on deopt `61912 -> 218`。结论：!103 后 noattr 证据失效，RoiBackoff 止血仍成立，剩余差距需重新拆账 |
 | RoiBackoff 默认开启守门 | off=`CINDERX_AUTOJIT_ROI_BACKOFF=0`，on=`CINDERX_AUTOJIT_ROI_BACKOFF=1`，其余 `CINDERX_PLUGIN_ENABLE=1 PYTHONJITAUTO=auto:2`，`--warmup 3`；`nbody/richards` 追加同核串行复跑 | `blue-98:cinderx-test:/results/autojit-roi-backoff-guard-20260611_221949/{off,on}` | `2to3/deepcopy/generators/pickle_pure_python/sqlalchemy_declarative` 无误伤；`nbody/richards` 初始并行差异由 CPU/NUMA 噪声解释，同核串行 on 分别为 `0.94x/0.99x` off；支持默认开启，保留 `=0` 回退 |
 | `coverage` | direct worker，`PYTHONJITAUTO=auto:2`，`CINDERX_AUTOJIT_IMPORT_PROVIDER=find_and_load` | `blue-98:/results/autojit-import-highcost-bucket1-20260605/worker-gate-shapes/coverage.*.jit.log` | 有真实 C++ gate 形状；debug 口径，不作为性能数值 |
 | `generators` | direct worker，同上 | `blue-98:/results/autojit-import-highcost-bucket1-20260605/worker-gate-shapes/generators.*.jit.log` | 有真实 C++ gate 形状；debug 口径 |
@@ -950,7 +952,7 @@ debug 口径：临时 autohook 只 `import _cinderx_auto`，`bm_pickle --pure-py
 
 ### 17.2 总表：差距账本
 
-注意：本小节保留 v0.23 初始账本，用来说明 dask 的原始差距来源；它不是 v0.32 的最新主线性能。RoiBackoff、per-site deopt 和 noattr 复核见 §17.2.1 与 §17.4.1。
+注意：本小节保留 v0.23 初始账本，用来说明 dask 的原始差距来源；它不是 v0.33 的最新主线性能。RoiBackoff、per-site deopt 和 noattr 复核见 §17.2.1 与 §17.4.1。
 
 口径：`blue-98`，`--warmup 3 --affinity=30`，正式 pyperformance 60 values。CPython JIT 使用 `/opt/python314-jit/bin/python3.14`；CinderX 口径使用同一 `/opt/python314` 和同一 dask venv，只改变 `CINDERX_PLUGIN_ENABLE` / `PYTHONJITAUTO` / provider 环境变量。
 
@@ -1042,6 +1044,40 @@ debug 口径：临时 autohook 只 `import _cinderx_auto`，`bm_pickle --pure-py
 | 是否误伤守门样本 | 本批次未发现。`deepcopy_reduce`、`generators`、`richards`、`nbody` 经复核不回归 |
 | 是否可以默认开启 | 可以，前提是保留 `CINDERX_AUTOJIT_ROI_BACKOFF=0` 为止血退路，并把 budget/rounds/rewarm/mask 写入 `autojit_config_id` |
 | 还缺什么 | 允许 ptrace 的环境补跑 gdb smoke；后续修改 reason mask / budget / rounds 需重新跑同类守门 |
+
+### 17.2.3 合并 upstream 后复核
+
+合并 upstream 后带入 descriptor inline cache、协程运行时路径和 `_cinderx.so` 内部 PLT 优化。由于这些改动正好覆盖 dask 剩余差距中的 attr-cache、async/coroutine 和固定调用开销，v0.33 的 noattr/per-site 证据不能继续跨配置引用。本轮先同步本地 tracked 源码到 `blue-98:cinderx-test`，重装 editable CinderX，再跑 L1/L3 和 dask 复核。
+
+功能测试：
+
+| 范围 | 结果 |
+|---|---|
+| `test_autojit_gate_stats.py` | `14 passed` |
+| RuntimeTests：`BehaviorClassifierTest.*:BehaviorClassifierRuntimeTest.*:InlineCacheTest.*:JITGeneratorTest.*` | `57 passed` |
+
+正式性能口径：`CINDERX_PLUGIN_ENABLE=1 PYTHONJITAUTO=auto:2 PYTHONJITHUGEPAGES=0`，`--warmup 3 --affinity=30`，worker venv `/cinderx/venv/cpython3.14-43f131f998a6-compat-31b33d68c68a`，`include-system-site-packages=true`，`pip freeze` 含 `-e /cinderx`。正式数据不带 dump/HIR/JIT log 变量。
+
+| 口径 | 产物 | 结果 | 结论 |
+|---|---|---:|---|
+| default AutoJIT | `/results/autojit-dask-after-upstream-20260612_003254/default.json` | `1.58s +- 0.06s` | 合并 upstream 后默认 dask 比 v0.33 的 `1.68s` 改善约 `100ms` |
+| `PYTHONJITATTRCACHES=0` | `/results/autojit-dask-after-upstream-20260612_003254/noattr.json` | `1.58s +- 0.05s` | `pyperf compare_to` 不显著；v0.33 的 `1.04x` noattr 小收益在 !103 后不复现 |
+
+per-site deopt 诊断口径：`--fast --warmup 1`，`PYTHONJITDUMPSTATS=1`，`PYTHONJITLOGFILE=$RESULTS/jit-{pid}.log`。合并后 `PYTHONJITLOGFILE` 只识别 `{pid}`，不能再用旧 `%p` 模板；使用 `%p` 会把多个 worker 写进同一个 `jit-%p.log` 并导致并发日志交错，该口径作废。
+
+| 口径 | 总 deopt | reason 分布 | top site | 结论 |
+|---|---:|---|---|---|
+| RoiBackoff off | `61912` | `UnhandledException=61694`、`GuardFailure=131`、`Raise=87` | `set_thread_state VectorCall=30792`、`LRU.__delitem__ DeleteSubscr=30792` | expected-exception/调用类风暴仍在 |
+| RoiBackoff on | `218` | `GuardFailure=131`、`UnhandledException=55`、`Raise=32` | `SpansSchedulerExtension.heartbeat GuardType=48`、`StateMachineEvent.to_loggable STORE_ATTR_SLOT=28`、`Scheduler.heartbeat_worker GuardType=24` | RoiBackoff 止血仍成立，大风暴被压平 |
+
+更新后的判断：
+
+| 问题 | 合并后答案 |
+|---|---|
+| noattr 还值得作为当前优化方向吗 | 暂不作为主线。descriptor inline cache 合入后，`PYTHONJITATTRCACHES=0` 与 default 持平，旧的 `1.04x` 小收益失效 |
+| RoiBackoff 还有效吗 | 有效。off/on deopt 从 `61912` 降到 `218`，仍解释了为什么默认开启有价值 |
+| dask 剩余差距变了吗 | 变小了。相对旧 CPython JIT 基线 `1.360s`，当前 default 约 `1.16x slower`，剩余差距约 `+220ms`；若要冻结最新对标，应再跑一轮 CPython JIT baseline |
+| 下一步 | 重新铺平合并后的 dask 阶段账本；不要继续引用 v0.33 的 noattr 结论作为优化依据 |
 
 ### 17.3 分表一：gate 与编译规模
 
