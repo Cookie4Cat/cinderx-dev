@@ -135,6 +135,9 @@ void resetJitForAutoJitEntryTest() {
   getMutableConfig().enable_startup_init_policy = false;
 }
 
+// Keep these snippets inside RuntimeTest's embedded interpreter: they validate
+// JIT config mutations made in this process, which an external Python script
+// would not observe.
 void assertNewFunctionCountsAndCompiles(RuntimeTest& test) {
   test.runStockCode(R"(
 import cinderx

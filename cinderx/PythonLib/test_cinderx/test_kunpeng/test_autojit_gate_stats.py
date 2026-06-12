@@ -7,6 +7,156 @@ import tempfile
 import unittest
 
 
+HELPER = Path(__file__).resolve()
+
+
+def install_fake_lib2to3_importer() -> None:
+    import importlib.abc
+    import importlib.machinery
+    import sys
+
+    class FakeLib2to3Loader(importlib.abc.Loader):
+        def create_module(self, spec):
+            return None
+
+        def exec_module(self, module):
+            if module.__name__ == "lib2to3":
+                module.__path__ = []
+                return
+            if module.__name__ == "lib2to3.main":
+
+                def main():
+                    return 42
+
+                module.main = main
+
+    class FakeLib2to3Finder(importlib.abc.MetaPathFinder):
+        def find_spec(self, fullname, path=None, target=None):
+            if fullname == "lib2to3":
+                return importlib.machinery.ModuleSpec(
+                    fullname,
+                    FakeLib2to3Loader(),
+                    is_package=True,
+                )
+            if fullname == "lib2to3.main":
+                return importlib.machinery.ModuleSpec(
+                    fullname,
+                    FakeLib2to3Loader(),
+                )
+            return None
+
+    sys.meta_path.insert(0, FakeLib2to3Finder())
+
+
+def case_setup_provider_default() -> None:
+    install_fake_lib2to3_importer()
+    import lib2to3.main
+
+    assert (
+        getattr(
+            lib2to3.main.main,
+            "_cinderx_autojit_setup_provider",
+            None,
+        )
+        == "lib2to3_main"
+    )
+
+
+def case_setup_provider_off() -> None:
+    install_fake_lib2to3_importer()
+    import lib2to3.main
+
+    assert (
+        getattr(
+            lib2to3.main.main,
+            "_cinderx_autojit_setup_provider",
+            None,
+        )
+        is None
+    )
+
+
+def numeric_loop(value):
+    total = 0
+    for _ in range(8):
+        total += value
+    return total
+
+
+def warm_numeric_loop_until_compiled():
+    import cinderx.jit as jit
+
+    for _ in range(120):
+        numeric_loop(1)
+
+    assert jit.is_jit_compiled(numeric_loop), (
+        jit.count_interpreted_calls(numeric_loop)
+    )
+    return jit
+
+
+def case_roi_backoff_uncompile() -> None:
+    import cinderjit
+
+    cinderjit._clear_autojit_gate_stats()
+    jit = warm_numeric_loop_until_compiled()
+
+    for _ in range(32):
+        numeric_loop(1.5)
+
+    stats = cinderjit._autojit_gate_stats()
+    assert stats["roi_uncompile"] >= 1, stats
+    assert stats["roi_recompile"] == 0, stats
+    assert stats["roi_frozen"] == 0, stats
+    assert not jit.is_jit_compiled(numeric_loop), stats
+
+
+def case_roi_backoff_default_freeze() -> None:
+    import cinderjit
+
+    cinderjit._clear_autojit_gate_stats()
+    jit = warm_numeric_loop_until_compiled()
+
+    for _ in range(64):
+        numeric_loop(1.5)
+
+    stats = cinderjit._autojit_gate_stats()
+    assert stats["roi_frozen"] >= 1, stats
+    assert stats["roi_uncompile"] == 0, stats
+    assert stats["roi_recompile"] == 0, stats
+    assert not jit.is_jit_compiled(numeric_loop), stats
+
+
+def case_roi_backoff_disabled() -> None:
+    import cinderjit
+
+    cinderjit._clear_autojit_gate_stats()
+    jit = warm_numeric_loop_until_compiled()
+
+    for _ in range(64):
+        numeric_loop(1.5)
+
+    stats = cinderjit._autojit_gate_stats()
+    assert stats["roi_frozen"] == 0, stats
+    assert stats["roi_uncompile"] == 0, stats
+    assert stats["roi_recompile"] == 0, stats
+    assert jit.is_jit_compiled(numeric_loop), stats
+
+
+CASES = {
+    "setup_provider_default": case_setup_provider_default,
+    "setup_provider_off": case_setup_provider_off,
+    "roi_backoff_uncompile": case_roi_backoff_uncompile,
+    "roi_backoff_default_freeze": case_roi_backoff_default_freeze,
+    "roi_backoff_disabled": case_roi_backoff_disabled,
+}
+
+
+if "--gate-stats-case" in sys.argv:
+    CASES[sys.argv[sys.argv.index("--gate-stats-case") + 1]]()
+    sys.exit(0)
+
+
 def _plugin_env() -> dict[str, str]:
     env = os.environ.copy()
     env.pop("PYTHONPATH", None)
@@ -48,41 +198,22 @@ def _plugin_env_without_auto_classify() -> dict[str, str]:
 
 
 class AutoJitGateStatsDumpTests(unittest.TestCase):
-    _FAKE_LIB2TO3_IMPORTER = (
-        "import importlib.abc\n"
-        "import importlib.machinery\n"
-        "import sys\n"
-        "\n"
-        "class FakeLib2to3Loader(importlib.abc.Loader):\n"
-        "    def create_module(self, spec):\n"
-        "        return None\n"
-        "\n"
-        "    def exec_module(self, module):\n"
-        "        if module.__name__ == 'lib2to3':\n"
-        "            module.__path__ = []\n"
-        "            return\n"
-        "        if module.__name__ == 'lib2to3.main':\n"
-        "            def main():\n"
-        "                return 42\n"
-        "            module.main = main\n"
-        "\n"
-        "class FakeLib2to3Finder(importlib.abc.MetaPathFinder):\n"
-        "    def find_spec(self, fullname, path=None, target=None):\n"
-        "        if fullname == 'lib2to3':\n"
-        "            return importlib.machinery.ModuleSpec(\n"
-        "                fullname,\n"
-        "                FakeLib2to3Loader(),\n"
-        "                is_package=True,\n"
-        "            )\n"
-        "        if fullname == 'lib2to3.main':\n"
-        "            return importlib.machinery.ModuleSpec(\n"
-        "                fullname,\n"
-        "                FakeLib2to3Loader(),\n"
-        "            )\n"
-        "        return None\n"
-        "\n"
-        "sys.meta_path.insert(0, FakeLib2to3Finder())\n"
-    )
+    def run_case(
+        self,
+        case_name: str,
+        *,
+        cwd: str,
+        env: dict[str, str],
+        timeout: int = 60,
+    ) -> subprocess.CompletedProcess[str]:
+        return subprocess.run(
+            [sys.executable, str(HELPER), "--gate-stats-case", case_name],
+            cwd=cwd,
+            env=env,
+            capture_output=True,
+            text=True,
+            timeout=timeout,
+        )
 
     def test_auto_classify_defaults_import_provider_to_find_and_load(self) -> None:
         with tempfile.TemporaryDirectory() as temp:
@@ -116,26 +247,10 @@ class AutoJitGateStatsDumpTests(unittest.TestCase):
     def test_auto_classify_defaults_setup_provider_to_lib2to3_main(self) -> None:
         with tempfile.TemporaryDirectory() as temp:
             env = _plugin_env()
-
-            completed = subprocess.run(
-                [
-                    sys.executable,
-                    "-c",
-                    (
-                        self._FAKE_LIB2TO3_IMPORTER
-                        + "import lib2to3.main\n"
-                        "assert getattr(\n"
-                        "    lib2to3.main.main,\n"
-                        "    '_cinderx_autojit_setup_provider',\n"
-                        "    None,\n"
-                        ") == 'lib2to3_main'\n"
-                    ),
-                ],
+            completed = self.run_case(
+                "setup_provider_default",
                 cwd=temp,
                 env=env,
-                capture_output=True,
-                text=True,
-                timeout=60,
             )
 
             self.assertEqual(
@@ -185,26 +300,10 @@ class AutoJitGateStatsDumpTests(unittest.TestCase):
     def test_plugin_without_auto_classify_keeps_setup_provider_off(self) -> None:
         with tempfile.TemporaryDirectory() as temp:
             env = _plugin_env_without_auto_classify()
-
-            completed = subprocess.run(
-                [
-                    sys.executable,
-                    "-c",
-                    (
-                        self._FAKE_LIB2TO3_IMPORTER
-                        + "import lib2to3.main\n"
-                        "assert getattr(\n"
-                        "    lib2to3.main.main,\n"
-                        "    '_cinderx_autojit_setup_provider',\n"
-                        "    None,\n"
-                        ") is None\n"
-                    ),
-                ],
+            completed = self.run_case(
+                "setup_provider_off",
                 cwd=temp,
                 env=env,
-                capture_output=True,
-                text=True,
-                timeout=60,
             )
 
             self.assertEqual(
@@ -313,43 +412,10 @@ class AutoJitGateStatsDumpTests(unittest.TestCase):
             env["CINDERX_AUTOJIT_ROI_BACKOFF"] = "1"
             env["CINDERX_AUTOJIT_ROI_BACKOFF_BUDGET"] = "8"
             env["CINDERX_AUTOJIT_ROI_BACKOFF_MAX_ROUNDS"] = "2"
-
-            completed = subprocess.run(
-                [
-                    sys.executable,
-                    "-c",
-                    "import cinderjit\n"
-                    "import cinderx.jit as jit\n"
-                    "\n"
-                    "cinderjit._clear_autojit_gate_stats()\n"
-                    "\n"
-                    "def numeric_loop(value):\n"
-                    "    total = 0\n"
-                    "    for _ in range(8):\n"
-                    "        total += value\n"
-                    "    return total\n"
-                    "\n"
-                    "for _ in range(120):\n"
-                    "    numeric_loop(1)\n"
-                    "\n"
-                    "assert jit.is_jit_compiled(numeric_loop), (\n"
-                    "    jit.count_interpreted_calls(numeric_loop)\n"
-                    ")\n"
-                    "\n"
-                    "for _ in range(32):\n"
-                    "    numeric_loop(1.5)\n"
-                    "\n"
-                    "stats = cinderjit._autojit_gate_stats()\n"
-                    "assert stats['roi_uncompile'] >= 1, stats\n"
-                    "assert stats['roi_recompile'] == 0, stats\n"
-                    "assert stats['roi_frozen'] == 0, stats\n"
-                    "assert not jit.is_jit_compiled(numeric_loop), stats\n",
-                ],
+            completed = self.run_case(
+                "roi_backoff_uncompile",
                 cwd=temp,
                 env=env,
-                capture_output=True,
-                text=True,
-                timeout=60,
             )
 
             self.assertEqual(
@@ -362,43 +428,10 @@ class AutoJitGateStatsDumpTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as temp:
             env = _plugin_env()
             env["PYTHONJITAUTO"] = "auto:100"
-
-            completed = subprocess.run(
-                [
-                    sys.executable,
-                    "-c",
-                    "import cinderjit\n"
-                    "import cinderx.jit as jit\n"
-                    "\n"
-                    "cinderjit._clear_autojit_gate_stats()\n"
-                    "\n"
-                    "def numeric_loop(value):\n"
-                    "    total = 0\n"
-                    "    for _ in range(8):\n"
-                    "        total += value\n"
-                    "    return total\n"
-                    "\n"
-                    "for _ in range(120):\n"
-                    "    numeric_loop(1)\n"
-                    "\n"
-                    "assert jit.is_jit_compiled(numeric_loop), (\n"
-                    "    jit.count_interpreted_calls(numeric_loop)\n"
-                    ")\n"
-                    "\n"
-                    "for _ in range(64):\n"
-                    "    numeric_loop(1.5)\n"
-                    "\n"
-                    "stats = cinderjit._autojit_gate_stats()\n"
-                    "assert stats['roi_frozen'] >= 1, stats\n"
-                    "assert stats['roi_uncompile'] == 0, stats\n"
-                    "assert stats['roi_recompile'] == 0, stats\n"
-                    "assert not jit.is_jit_compiled(numeric_loop), stats\n",
-                ],
+            completed = self.run_case(
+                "roi_backoff_default_freeze",
                 cwd=temp,
                 env=env,
-                capture_output=True,
-                text=True,
-                timeout=60,
             )
 
             self.assertEqual(
@@ -412,43 +445,10 @@ class AutoJitGateStatsDumpTests(unittest.TestCase):
             env = _plugin_env()
             env["PYTHONJITAUTO"] = "auto:100"
             env["CINDERX_AUTOJIT_ROI_BACKOFF"] = "0"
-
-            completed = subprocess.run(
-                [
-                    sys.executable,
-                    "-c",
-                    "import cinderjit\n"
-                    "import cinderx.jit as jit\n"
-                    "\n"
-                    "cinderjit._clear_autojit_gate_stats()\n"
-                    "\n"
-                    "def numeric_loop(value):\n"
-                    "    total = 0\n"
-                    "    for _ in range(8):\n"
-                    "        total += value\n"
-                    "    return total\n"
-                    "\n"
-                    "for _ in range(120):\n"
-                    "    numeric_loop(1)\n"
-                    "\n"
-                    "assert jit.is_jit_compiled(numeric_loop), (\n"
-                    "    jit.count_interpreted_calls(numeric_loop)\n"
-                    ")\n"
-                    "\n"
-                    "for _ in range(64):\n"
-                    "    numeric_loop(1.5)\n"
-                    "\n"
-                    "stats = cinderjit._autojit_gate_stats()\n"
-                    "assert stats['roi_frozen'] == 0, stats\n"
-                    "assert stats['roi_uncompile'] == 0, stats\n"
-                    "assert stats['roi_recompile'] == 0, stats\n"
-                    "assert jit.is_jit_compiled(numeric_loop), stats\n",
-                ],
+            completed = self.run_case(
+                "roi_backoff_disabled",
                 cwd=temp,
                 env=env,
-                capture_output=True,
-                text=True,
-                timeout=60,
             )
 
             self.assertEqual(

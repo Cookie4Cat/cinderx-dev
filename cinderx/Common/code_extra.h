@@ -4,10 +4,20 @@
 
 #include <stdint.h>
 
+// skey_word bit layout for cached AutoJIT structure keys:
+//   bit 31: classification payload is valid.
+//   bit 30: steady-state policy decided the code object is cold enough to stop
+//           per-frame call counting.
+//   bits 0-23: packed StructureKey payload. The gap between bit 30 and bit 23
+//              is reserved for future flags so payload width can stay stable.
 #define CI_CODE_EXTRA_SKEY_VALID_BIT 0x80000000u
 #define CI_CODE_EXTRA_SKEY_DECIDED_COLD_BIT 0x40000000u
 #define CI_CODE_EXTRA_SKEY_PAYLOAD_MASK 0x00FFFFFFu
 
+// roi_ctl bit layout for dynamic negative-ROI backoff:
+//   bit 31: code object is frozen for this process.
+//   bit 30: a deopt thread is already performing uncompile/backoff work.
+//   bits 24-27: completed backoff round count.
 #define CI_CODE_EXTRA_ROI_FROZEN_BIT 0x80000000u
 #define CI_CODE_EXTRA_ROI_PENDING_BIT 0x40000000u
 #define CI_CODE_EXTRA_ROI_ROUND_SHIFT 24
