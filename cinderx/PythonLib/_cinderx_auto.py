@@ -54,8 +54,19 @@ if _cinderx_plugin_enabled() and not _cinderx_force_disabled():
         if _is_autojit_classification_value(
             os.environ.get("PYTHONJITAUTO")
         ) or _is_autojit_classification_value(sys._xoptions.get("jit-auto")):
-            return "lib2to3_main"
+            return "lib2to3_main,multiprocessing_pool"
         return "off"
+
+    def _autojit_setup_provider_tokens(provider=None):
+        if provider is None:
+            provider = _autojit_setup_provider()
+        if provider in ("", "0", "off"):
+            return ()
+        return tuple(
+            token.strip()
+            for token in provider.replace("+", ",").split(",")
+            if token.strip() and token.strip() not in ("0", "off")
+        )
 
     def _maybe_enable_autojit_gate_stats():
         if cinderjit is None:
@@ -91,8 +102,17 @@ if _cinderx_plugin_enabled() and not _cinderx_force_disabled():
 
         atexit.register(dump_autojit_gate_stats)
 
-    def _make_autojit_setup_wrapper(original, provider):
+    def _autojit_setup_predicate_matches(predicate, args):
+        if predicate is None:
+            return True
+        if not args:
+            return False
+        return predicate(args[0])
+
+    def _make_autojit_setup_wrapper(original, provider, predicate=None):
         def wrapper(*args, **kwargs):
+            if not _autojit_setup_predicate_matches(predicate, args):
+                return original(*args, **kwargs)
             _cinderx._autojit_setup_enter()
             try:
                 return original(*args, **kwargs)
@@ -103,25 +123,115 @@ if _cinderx_plugin_enabled() and not _cinderx_force_disabled():
         setattr(wrapper, "__wrapped__", original)
         return wrapper
 
-    def _maybe_install_autojit_setup_provider_for_module(fullname, provider=None):
-        if provider is None:
-            provider = _autojit_setup_provider()
-        if provider in ("", "0", "off"):
-            return
-        if provider != "lib2to3_main" or fullname != "lib2to3.main":
-            return
+    def _make_autojit_setup_enter_wrapper(original, provider, predicate=None):
+        def wrapper(*args, **kwargs):
+            if not _autojit_setup_predicate_matches(predicate, args):
+                return original(*args, **kwargs)
+            _cinderx._autojit_setup_enter()
+            try:
+                return original(*args, **kwargs)
+            except BaseException:
+                _cinderx._autojit_setup_leave()
+                raise
 
-        module = sys.modules.get("lib2to3.main")
-        if module is None:
-            return
+        setattr(wrapper, _AUTOJIT_SETUP_PROVIDER_MARKER, provider)
+        setattr(wrapper, "__wrapped__", original)
+        return wrapper
 
-        current = getattr(module, "main", None)
+    def _make_autojit_setup_leave_wrapper(original, provider, predicate=None):
+        def wrapper(*args, **kwargs):
+            if not _autojit_setup_predicate_matches(predicate, args):
+                return original(*args, **kwargs)
+            try:
+                return original(*args, **kwargs)
+            finally:
+                _cinderx._autojit_setup_leave()
+
+        setattr(wrapper, _AUTOJIT_SETUP_PROVIDER_MARKER, provider)
+        setattr(wrapper, "__wrapped__", original)
+        return wrapper
+
+    def _is_process_pool_instance(obj):
+        cls = type(obj)
+        return (
+            getattr(cls, "__module__", None) == "multiprocessing.pool"
+            and getattr(cls, "__name__", None) == "Pool"
+        )
+
+    def _wrap_autojit_setup_attr(target, attr, provider, make_wrapper, predicate=None):
+        current = getattr(target, attr, None)
         if current is None:
             return
         if getattr(current, _AUTOJIT_SETUP_PROVIDER_MARKER, None) == provider:
             return
+        setattr(target, attr, make_wrapper(current, provider, predicate))
 
-        setattr(module, "main", _make_autojit_setup_wrapper(current, provider))
+    def _install_autojit_multiprocessing_pool_provider(module):
+        pool = getattr(module, "Pool", None)
+        if pool is not None:
+            _wrap_autojit_setup_attr(
+                pool,
+                "__init__",
+                "multiprocessing_pool",
+                _make_autojit_setup_wrapper,
+                _is_process_pool_instance,
+            )
+            _wrap_autojit_setup_attr(
+                pool,
+                "__enter__",
+                "multiprocessing_pool",
+                _make_autojit_setup_enter_wrapper,
+                _is_process_pool_instance,
+            )
+            _wrap_autojit_setup_attr(
+                pool,
+                "__exit__",
+                "multiprocessing_pool",
+                _make_autojit_setup_leave_wrapper,
+                _is_process_pool_instance,
+            )
+            for attr in (
+                "map",
+                "imap",
+                "imap_unordered",
+                "starmap",
+                "map_async",
+                "starmap_async",
+            ):
+                _wrap_autojit_setup_attr(
+                    pool,
+                    attr,
+                    "multiprocessing_pool",
+                    _make_autojit_setup_wrapper,
+                    _is_process_pool_instance,
+                )
+
+    def _maybe_install_autojit_setup_provider_for_module(fullname, provider=None):
+        providers = _autojit_setup_provider_tokens(provider)
+        if not providers:
+            return
+        if "lib2to3_main" in providers and fullname == "lib2to3.main":
+            module = sys.modules.get("lib2to3.main")
+            if module is None:
+                return
+
+            current = getattr(module, "main", None)
+            if current is None:
+                return
+            if (
+                getattr(current, _AUTOJIT_SETUP_PROVIDER_MARKER, None)
+                != "lib2to3_main"
+            ):
+                setattr(
+                    module,
+                    "main",
+                    _make_autojit_setup_wrapper(current, "lib2to3_main"),
+                )
+
+        if "multiprocessing_pool" in providers and fullname == "multiprocessing.pool":
+            module = sys.modules.get("multiprocessing.pool")
+            if module is not None:
+                _install_autojit_multiprocessing_pool_provider(module)
 
     def _make_autojit_import_wrapper(original, provider):
         setup_provider = _autojit_setup_provider()
@@ -203,3 +313,4 @@ if _cinderx_plugin_enabled() and not _cinderx_force_disabled():
         _maybe_enable_autojit_gate_stats()
         _install_autojit_import_provider()
         _maybe_install_autojit_setup_provider_for_module("lib2to3.main")
+        _maybe_install_autojit_setup_provider_for_module("multiprocessing.pool")
