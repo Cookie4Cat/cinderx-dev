@@ -155,7 +155,7 @@ flowchart LR
 |---|---|---|---|
 | import 执行点 | 已存在 | 可作为新增 provider 的挂点 | 解释器本来就知道什么时候在执行 import，只是没有把这个状态暴露给 AutoJIT |
 | CinderX import wrapper | 已有实验实现 | 可作为 CinderX-only opt-in 验证路径 | 包装 importlib `_find_and_load` 或 `builtins.__import__`，用现有 depth 暂时标记 import 执行域 |
-| CinderX setup wrapper | 已有 `lib2to3_main` 实验实现 | 只覆盖明确模块入口，不是通用生产 provider | 包装 `lib2to3.main.main()`，把 main/refactor setup 窗口放进同一 depth，验证不改 CPython 是否够用 |
+| CinderX setup wrapper | 已有 `lib2to3_main` / `multiprocessing_pool` 实现 | 只覆盖明确模块入口，不是通用生产 provider | 包装 `lib2to3.main.main()` 和 `multiprocessing.pool.Pool` 关键入口，把 main/refactor setup 与进程池构造、context 和任务提交窗口放进同一 depth，验证不改 CPython 是否够用；不包装 result iterator/get |
 | 生产安全 provider | 需新增或冻结 | 通过 Phase 0.5/gdb 后才能默认启用 import/setup 后移 | 在 CPython/CinderX import 路径维护轻量 depth/counter，JIT 只读 bool |
 | `module_initializing` | 已有诊断信号 | 不能单独上线 | 覆盖太窄，只表示某个模块 spec 正在初始化 |
 | `early_window` | 已有实验窗口 | 不能单独上线 | 只能估算启动期规模，会误伤启动后立刻进入的热代码 |
@@ -1178,7 +1178,7 @@ v1 只识别三类需要后移编译的候选：
 
 其它函数走现状全局阈值或稳态 warmup 阈值，尤其是数值循环、compute-dominant Mixed、Static Python 类型化函数、synthetic 高 loop/static/generated 函数，不因分类开启而默认后移。
 
-`startup_phase` 不是结构分类器的输出。它来自 provider 在当前线程上维护的轻量 depth/bool：CinderX-only 实验路径可由 import wrapper 或 `lib2to3_main` setup wrapper 维护；生产路径仍需冻结安全 provider。当前 `GateContext` 同时保留三个位：`startup_phase = import_phase || setup_phase`，用于现有阈值策略；`import_phase` 和 `setup_phase` 用于 compile event 诊断、phase A/B 和后续更细粒度决策。实现上，`StartupInit` 策略总开关由 import provider 打开，setup wrapper 只是附加窗口；`import=off/setup=on` 不代表已发布的 setup-only 策略。已有穿刺显示，提前在 import 期强制分类冻结会把第一次调用的字节码扫描成本前移，未形成稳定收益；扩大 setup/main window 又会误放行更多编译。因此当前策略暂不按 import/setup 分叉。import/setup 分支的关键保护条件仍是 `computeDominantHint`：`NumericLoop` 或 `Mixed` top-2 含 `Compute` 才算 compute-dominant；`ObjectManipulator` / `BranchFSM` 等主族即使 `active_dim_mask` 里带一点 `Compute`，仍按非数值高成本函数处理。`computeThreshold` 出现第二种策略时再提升为接口（T2.1）。
+`startup_phase` 不是结构分类器的输出。它来自 provider 在当前线程上维护的轻量 depth/bool：CinderX-only 实验路径可由 import wrapper、`lib2to3_main` setup wrapper 或 `multiprocessing_pool` setup wrapper 维护；生产路径仍需冻结安全 provider。当前 `GateContext` 同时保留三个位：`startup_phase = import_phase || setup_phase`，用于现有阈值策略；`import_phase` 和 `setup_phase` 用于 compile event 诊断、phase A/B 和后续更细粒度决策。实现上，`StartupInit` 策略总开关由 import provider 打开，setup wrapper 只是附加窗口；`import=off/setup=on` 不代表已发布的 setup-only 策略。已有穿刺显示，提前在 import 期强制分类冻结会把第一次调用的字节码扫描成本前移，未形成稳定收益；扩大 setup/main window 又会误放行更多编译。因此当前策略暂不按 import/setup 分叉。import/setup 分支的关键保护条件仍是 `computeDominantHint`：`NumericLoop` 或 `Mixed` top-2 含 `Compute` 才算 compute-dominant；`ObjectManipulator` / `BranchFSM` 等主族即使 `active_dim_mask` 里带一点 `Compute`，仍按非数值高成本函数处理。`computeThreshold` 出现第二种策略时再提升为接口（T2.1）。
 
 ### 8.7.3 实现设计
 
@@ -1330,7 +1330,7 @@ interface classifyAndThreshold(code, gate_state) -> uint
 | `cinderx/Jit/pyjit.cpp` (`jitVectorcall`) | 注入分类与策略查询（唯一准入改造点） |
 | `cinderx/Jit/pyjit.cpp` (`jit::initialize`) | `compile_after_n_calls` 已设置时先安装 frame evaluator，再调度已有函数；保证初始化后新定义函数进入 AutoJIT 计数/阈值门 |
 | 新增 `computeThreshold` 自由函数 | v1 最小策略返回 `{limit, branch_reason}`；启用 low_roi / risk-defer / import-setup high-cost nonnumeric candidate；下游升级时提升为接口 |
-| 配置/开关 | 扩展 `PYTHONJITAUTO` 解析为 `auto[:N]`（复用既有 AutoJIT 入口；FlagProcessor string 重载，T2.3），并按 R27 绑定入口激活验收；`CINDERX_AUTOJIT_SETUP_PROVIDER=lib2to3_main` 仅为 CinderX-only provider 实验开关 |
+| 配置/开关 | 扩展 `PYTHONJITAUTO` 解析为 `auto[:N]`（复用既有 AutoJIT 入口；FlagProcessor string 重载，T2.3），并按 R27 绑定入口激活验收；`CINDERX_AUTOJIT_SETUP_PROVIDER=lib2to3_main,multiprocessing_pool` 仅为 CinderX-only provider 实验开关 |
 
 ### 8.7.9 分配需求
 
@@ -1618,7 +1618,7 @@ pyperformance 的 warmup 会执行 benchmark 代码，但 warmup values 不进�
 ## 8.10 待决项 / Release Gates（与需求 Outstanding 对齐）
 
 - RoiBackoff（功能项 5）实现前提与守门：P1 机器码生命周期（`jit::uncompile` 不释放活跃机器码，否则降级 pending + 安全点）和 P2 共享 code 的全量 function 入口解除已进入实现/测试守门；mis-backoff on/off A/B 已覆盖负样本与守门样本（`dask`、`deepcopy` 子集、`generators`、`2to3`、`pickle_pure_python`、`nbody`、`richards`、`sqlalchemy_declarative`），结论支持默认开启。默认开启后保留 `CINDERX_AUTOJIT_ROI_BACKOFF=0` 为止血退路；当前 blue-98 容器 gdb smoke 被 seccomp/ptrace 权限阻断，需在允许 ptrace 的环境补验。
-- `startup_phase` 的安全 provider：不得在 `jitVectorcall` 中遍历 Python frame/code metadata；候选方案包括 import machinery 侧轻量 depth/counter、thread-local import state、CinderX-only import wrapper 或明确 setup wrapper。`lib2to3_main` setup wrapper 已验证可覆盖 `2to3` main/refactor 窗口，但当前实现仍依赖 import provider 打开 `StartupInit` 策略，setup wrapper 不是独立生产 provider。provider gate 需满足 gdb smoke、startup/import/setup 覆盖、post-import 误伤和热路径 O(1) 四条通过线。`import_phase/setup_phase` 当前只作为诊断和 A/B 维度；生产默认分叉策略必须另有证据证明比合并 `startup_phase` 更好。
+- `startup_phase` 的安全 provider：不得在 `jitVectorcall` 中遍历 Python frame/code metadata；候选方案包括 import machinery 侧轻量 depth/counter、thread-local import state、CinderX-only import wrapper 或明确 setup wrapper。`lib2to3_main` setup wrapper 已验证可覆盖 `2to3` main/refactor 窗口；`multiprocessing_pool` setup wrapper 覆盖 `Pool` 构造、context manager 和 `map/imap/imap_unordered/starmap/*_async` 任务提交，用于 `bench_mp_pool/concurrent_imap` 这类进程池固定成本窗口。`IMapIterator.next` 与 `ApplyResult.get` 是 result 消费/等待路径，不属于 setup window，当前明确不包装。当前实现仍依赖 import provider 打开 `StartupInit` 策略，setup wrapper 不是独立生产 provider。provider gate 需满足 gdb smoke、startup/import/setup 覆盖、post-import 误伤和热路径 O(1) 四条通过线。`import_phase/setup_phase` 当前只作为诊断和 A/B 维度；生产默认分叉策略必须另有证据证明比合并 `startup_phase` 更好。
 - policy/default freeze（已决为 release gate）：schema 红线已过，bootstrap defaults 可作为 coding/experiment defaults；生产默认策略不在设计期冻结，仍需 `auto[:N]` vs 数值 `N` A/B、相邻 cutoff/floor/δ/loop/risk 配置比较、synthetic/risk-defer ROI 证明、mis-defer 和 provider A/B。所有报告必须携带 `autojit_config_id`。
 - Phase-3：`specialization_band` 边界与滞回宽度、`specialization_presence` 重读频率（每 gate vs 惰性刷新）。
 

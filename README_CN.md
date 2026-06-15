@@ -213,12 +213,13 @@ python3.14 your_app.py
 CINDERX_PLUGIN_ENABLE=1 PYTHONJITAUTO=auto:2 python3.14 your_app.py
 ```
 
-分类模式下，import provider、`lib2to3` setup wrapper 和动态 ROI backoff 默认生效。当前 `StartupInit` 策略由 import provider 打开，setup wrapper 作为同一启动/初始化窗口的附加信号；关闭 import provider 后，不能把 setup wrapper 单独当作 setup-only 策略来评估。需要做 A/B 验证或临时回退时，可以使用以下开关：
+分类模式下，import provider、setup wrapper 和动态 ROI backoff 默认生效。setup wrapper 当前覆盖 `lib2to3.main` 和 `multiprocessing.pool.Pool` 两类一次性初始化/进程池通信窗口。当前 `StartupInit` 策略由 import provider 打开，setup wrapper 作为同一启动/初始化窗口的附加信号；关闭 import provider 后，不能把 setup wrapper 单独当作 setup-only 策略来评估。需要做 A/B 验证或临时回退时，可以使用以下开关：
 
 | 环境变量 | 作用 |
 |---|---|
 | `CINDERX_AUTOJIT_IMPORT_PROVIDER=off` | 关闭 import 阶段信号 |
-| `CINDERX_AUTOJIT_SETUP_PROVIDER=off` | 关闭 `lib2to3` setup wrapper；需在 import provider 开启时评估其增量 |
+| `CINDERX_AUTOJIT_SETUP_PROVIDER=off` | 关闭 `lib2to3` 和 multiprocessing setup wrapper；需在 import provider 开启时评估其增量 |
+| `CINDERX_AUTOJIT_SETUP_PROVIDER=lib2to3_main,multiprocessing_pool` | 显式指定 setup provider 组合 |
 | `CINDERX_AUTOJIT_ROI_BACKOFF=0` | 关闭运行时负 ROI 回退 |
 | `CINDERX_AUTOJIT_GATE_STATS=1` | 进程退出时输出 AutoJIT 准入统计，便于分析分类效果 |
 

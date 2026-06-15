@@ -1700,6 +1700,100 @@ assert _cinderx._autojit_setup_depth() == 0
 
 TEST_F(
     BehaviorClassifierRuntimeTest,
+    MultiprocessingPoolSetupProviderWrapsContextAndTracksDepth) {
+  runStockCode(R"(
+import os
+import sys
+import types
+os.environ["CINDERX_AUTOJIT_SETUP_PROVIDER"] = "multiprocessing_pool"
+
+import cinderx
+import _cinderx
+
+observed_depths = []
+
+module = types.ModuleType("multiprocessing.pool")
+
+class Pool:
+    __module__ = "multiprocessing.pool"
+
+    def __enter__(self):
+        observed_depths.append(_cinderx._autojit_setup_depth())
+        return self
+
+    def __exit__(self, *exc):
+        observed_depths.append(_cinderx._autojit_setup_depth())
+
+    def imap(self, *args):
+        observed_depths.append(_cinderx._autojit_setup_depth())
+        return iter(())
+
+class ThreadPool(Pool):
+    __module__ = "multiprocessing.pool"
+
+class IMapIterator:
+    def next(self):
+        return None
+
+    __next__ = next
+
+module.Pool = Pool
+module.IMapIterator = IMapIterator
+sys.modules["multiprocessing.pool"] = module
+
+cinderx._maybe_install_autojit_setup_provider_for_module("multiprocessing.pool")
+
+assert getattr(
+    module.Pool.__enter__,
+    "_cinderx_autojit_setup_provider",
+    None,
+) == "multiprocessing_pool"
+assert getattr(
+    module.Pool.imap,
+    "_cinderx_autojit_setup_provider",
+    None,
+) == "multiprocessing_pool"
+assert getattr(
+    module.IMapIterator.next,
+    "_cinderx_autojit_setup_provider",
+    None,
+) is None
+
+with module.Pool():
+    observed_depths.append(_cinderx._autojit_setup_depth())
+
+assert observed_depths == [1, 1, 1], observed_depths
+assert _cinderx._autojit_import_depth() == 0
+assert _cinderx._autojit_import_scope_depth() == 0
+assert _cinderx._autojit_setup_depth() == 0
+
+observed_depths.clear()
+list(module.Pool().imap(None, ()))
+assert observed_depths == [1], observed_depths
+assert _cinderx._autojit_import_depth() == 0
+assert _cinderx._autojit_import_scope_depth() == 0
+assert _cinderx._autojit_setup_depth() == 0
+
+observed_depths.clear()
+with ThreadPool():
+    observed_depths.append(_cinderx._autojit_setup_depth())
+
+assert observed_depths == [0, 0, 0], observed_depths
+assert _cinderx._autojit_import_depth() == 0
+assert _cinderx._autojit_import_scope_depth() == 0
+assert _cinderx._autojit_setup_depth() == 0
+
+observed_depths.clear()
+list(ThreadPool().imap(None, ()))
+assert observed_depths == [0], observed_depths
+assert _cinderx._autojit_import_depth() == 0
+assert _cinderx._autojit_import_scope_depth() == 0
+assert _cinderx._autojit_setup_depth() == 0
+)");
+}
+
+TEST_F(
+    BehaviorClassifierRuntimeTest,
     CompileAfterNCallsApiDisablesClassificationAndSchedulesExistingFunctions) {
   ScopedAutoJitConfig config_guard;
   getMutableConfig().compile_after_n_calls.reset();

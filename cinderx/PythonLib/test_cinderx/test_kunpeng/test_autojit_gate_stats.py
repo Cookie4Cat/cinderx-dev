@@ -76,6 +76,139 @@ def case_setup_provider_off() -> None:
     )
 
 
+def case_multiprocessing_pool_setup_provider_default() -> None:
+    import _cinderx
+    import cinderx
+    import sys
+    import types
+
+    observed_depths = []
+
+    module = types.ModuleType("multiprocessing.pool")
+
+    class Pool:
+        __module__ = "multiprocessing.pool"
+
+        def __enter__(self):
+            observed_depths.append(_cinderx._autojit_setup_depth())
+            return self
+
+        def __exit__(self, *exc):
+            observed_depths.append(_cinderx._autojit_setup_depth())
+
+        def imap(self, *args):
+            observed_depths.append(_cinderx._autojit_setup_depth())
+            return iter(())
+
+    class ThreadPool(Pool):
+        __module__ = "multiprocessing.pool"
+
+    class IMapIterator:
+        def next(self):
+            return None
+
+        __next__ = next
+
+    module.Pool = Pool
+    module.IMapIterator = IMapIterator
+    sys.modules["multiprocessing.pool"] = module
+
+    cinderx._maybe_install_autojit_setup_provider_for_module(
+        "multiprocessing.pool"
+    )
+
+    assert (
+        getattr(
+            module.Pool.__enter__,
+            "_cinderx_autojit_setup_provider",
+            None,
+        )
+        == "multiprocessing_pool"
+    )
+    assert (
+        getattr(
+            module.Pool.imap,
+            "_cinderx_autojit_setup_provider",
+            None,
+        )
+        == "multiprocessing_pool"
+    )
+    assert (
+        getattr(
+            module.IMapIterator.next,
+            "_cinderx_autojit_setup_provider",
+            None,
+        )
+        is None
+    )
+    with module.Pool():
+        observed_depths.append(_cinderx._autojit_setup_depth())
+
+    assert observed_depths == [1, 1, 1], observed_depths
+    assert _cinderx._autojit_setup_depth() == 0
+
+    observed_depths.clear()
+    list(module.Pool().imap(None, ()))
+    assert observed_depths == [1], observed_depths
+    assert _cinderx._autojit_setup_depth() == 0
+
+    observed_depths.clear()
+    with ThreadPool():
+        observed_depths.append(_cinderx._autojit_setup_depth())
+
+    assert observed_depths == [0, 0, 0], observed_depths
+    assert _cinderx._autojit_setup_depth() == 0
+
+    observed_depths.clear()
+    list(ThreadPool().imap(None, ()))
+    assert observed_depths == [0], observed_depths
+    assert _cinderx._autojit_setup_depth() == 0
+
+
+def case_multiprocessing_pool_setup_provider_off() -> None:
+    import cinderx
+    import sys
+    import types
+
+    module = types.ModuleType("multiprocessing.pool")
+
+    class Pool:
+        __module__ = "multiprocessing.pool"
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *exc):
+            pass
+
+        def imap(self, *args):
+            return iter(())
+
+    module.Pool = Pool
+    sys.modules["multiprocessing.pool"] = module
+
+    cinderx._maybe_install_autojit_setup_provider_for_module(
+        "multiprocessing.pool"
+    )
+
+    assert (
+        getattr(
+            module.Pool.__enter__,
+            "_cinderx_autojit_setup_provider",
+            None,
+        )
+        is None
+    )
+    assert (
+        getattr(
+            module.Pool.imap,
+            "_cinderx_autojit_setup_provider",
+            None,
+        )
+        is None
+    )
+
+
 def numeric_loop(value):
     total = 0
     for _ in range(8):
@@ -146,6 +279,12 @@ def case_roi_backoff_disabled() -> None:
 CASES = {
     "setup_provider_default": case_setup_provider_default,
     "setup_provider_off": case_setup_provider_off,
+    "multiprocessing_pool_setup_provider_default": (
+        case_multiprocessing_pool_setup_provider_default
+    ),
+    "multiprocessing_pool_setup_provider_off": (
+        case_multiprocessing_pool_setup_provider_off
+    ),
     "roi_backoff_uncompile": case_roi_backoff_uncompile,
     "roi_backoff_default_freeze": case_roi_backoff_default_freeze,
     "roi_backoff_disabled": case_roi_backoff_disabled,
@@ -259,6 +398,23 @@ class AutoJitGateStatsDumpTests(unittest.TestCase):
                 f"stdout:\n{completed.stdout}\nstderr:\n{completed.stderr}",
             )
 
+    def test_auto_classify_defaults_setup_provider_to_multiprocessing_pool(
+        self,
+    ) -> None:
+        with tempfile.TemporaryDirectory() as temp:
+            env = _plugin_env()
+            completed = self.run_case(
+                "multiprocessing_pool_setup_provider_default",
+                cwd=temp,
+                env=env,
+            )
+
+            self.assertEqual(
+                completed.returncode,
+                0,
+                f"stdout:\n{completed.stdout}\nstderr:\n{completed.stderr}",
+            )
+
     def test_auto_classify_defaults_setup_provider_for_cinderx_init(self) -> None:
         with tempfile.TemporaryDirectory() as temp:
             env = _plugin_env()
@@ -289,6 +445,23 @@ class AutoJitGateStatsDumpTests(unittest.TestCase):
                 capture_output=True,
                 text=True,
                 timeout=60,
+            )
+
+            self.assertEqual(
+                completed.returncode,
+                0,
+                f"stdout:\n{completed.stdout}\nstderr:\n{completed.stderr}",
+            )
+
+    def test_plugin_without_auto_classify_keeps_multiprocessing_pool_provider_off(
+        self,
+    ) -> None:
+        with tempfile.TemporaryDirectory() as temp:
+            env = _plugin_env_without_auto_classify()
+            completed = self.run_case(
+                "multiprocessing_pool_setup_provider_off",
+                cwd=temp,
+                env=env,
             )
 
             self.assertEqual(

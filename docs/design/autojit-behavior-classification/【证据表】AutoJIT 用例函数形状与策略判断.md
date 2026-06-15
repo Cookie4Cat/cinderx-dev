@@ -10,6 +10,7 @@
 
 | 版本 | 日期 | 修订人 | 修订说明 |
 |---|---|---|---|
+| v0.36 | 2026-06-15 | @sisibeloved | 新增 `bench_mp_pool` 初始分析和 4C 远端验证：该用例对应 pyperformance `concurrent_imap`，主体是 `multiprocessing.pool.Pool(2).imap(f, range(1000), chunk=10)` 且 `f(x)=x`，收益不来自 JIT 计算本体，而来自避免 Pool bootstrap / job submission 窗口制造低阈值 AutoJIT 固定成本。实现默认 setup provider 扩展为 `lib2to3_main,multiprocessing_pool`，覆盖 `Pool` 构造、context manager 与 `map/imap/imap_unordered/starmap/*_async` 提交方法；明确不包装 `IMapIterator.next` / `ApplyResult.get`，避免把 timed result 消费路径变成逐次 wrapper 成本。blue-98 4C16G cpuset 0-3 复测：旧 `PYTHONJITAUTO=2` `bench_mp_pool=950.8ms`，AutoJIT provider off `133.7ms`，错误 iterator wrap `141.8ms`，最终 Pool.imap-only provider `126.9ms`；`plugin-no-JIT=117.8ms`，no-plugin baseline `120.0ms`。新增 provider 测试并保留 `CINDERX_AUTOJIT_SETUP_PROVIDER=off` 回退。 |
 | v0.35 | 2026-06-12 | @sisibeloved | 合并 upstream 后重打 dask 证据：同步本地 tracked 源码到 `blue-98:cinderx-test` 并重装 editable CinderX 后，L1/L3 子集通过；正式同核 `--affinity=30` 复跑 default/noattr，结果 default `1.58s +- 0.06s`、noattr `1.58s +- 0.05s`，`pyperf compare_to` 不显著，说明 !103 descriptor inline cache 后 `PYTHONJITATTRCACHES=0` 小收益消失。per-site deopt 以新 `{pid}` 日志模板重跑：RoiBackoff off `61912`、on `218`，确认 RoiBackoff 止血仍成立但 noattr 方向不再作为当前证据。 |
 | v0.34 | 2026-06-11 | @sisibeloved | 补 RoiBackoff 默认开启守门批次：`/results/autojit-roi-backoff-guard-20260611_221949` 对 `2to3`、`deepcopy` 子集、`generators`、`pickle_pure_python`、`sqlalchemy_declarative`、`nbody`、`richards` 做 on/off A/B；`2to3/deepcopy/generators/pickle/sqlalchemy` 无误伤，`nbody/richards` 初始并行差异经同核串行复跑转为 on 更快或持平。结论：支持 RoiBackoff 默认开启，保留 `CINDERX_AUTOJIT_ROI_BACKOFF=0` 回退；gdb smoke 在 blue-98 容器受 seccomp/ptrace 限制，作为环境补验项。 |
 | v0.33 | 2026-06-11 | @sisibeloved | 复核 `dask` 后续优化方向：按串行同核 `--affinity=30` 正式复跑默认 AutoJIT 与 `PYTHONJITATTRCACHES=0`，结果 `1.68s -> 1.61s`，`1.04x faster`，确认 noattr 是小正信号但属于全局 JIT 行为变化，不能直接默认化。补 per-site deopt 字段复核：RoiBackoff on 后当前 dask deopt 从 `64164` 降到 `129`，历史 LOAD_ATTR_SLOT 风暴已不是当前主项；关闭 LOAD_ATTR fallback、关闭 array double fastpath 均无收益。策略结论更新为：不继续扩大 startup/provider，也不做全局 slot fallback；下一步只考虑局部 attr-cache/PIC/expected-exception 等 JIT 动态成本专项。 |
@@ -1295,8 +1296,54 @@ per-site 字段让每个 deopt 事件能落到 `bc_offset/deopt_idx/opcode/speci
 | deopt 数不能单独驱动准入策略 | `deepcopy` | 成立。必须同时看函数形状、子场景和正式 A/B；否则会误伤 `deepcopy_memo` |
 | `RiskDefer` 对低热大函数有效，但不能替代收益判断 | `pickle_pure_python`、`deepcopy` | 成立。部分入口/通用函数未编译是保护，但如果主差距在逐帧税或特定 deopt 上，继续调 `RiskDefer` 不会解决问题 |
 | steady async/framework 动态负 ROI 不能靠 startup/import 泛化解决 | `dask`、`sqlalchemy_declarative` | 成立。`dask` 的主因是 `distributed`/`asyncio`/`cloudpickle`/`zict` deopt；`sqlalchemy_declarative` 的主因是 ORM steady guard failure 加 delayed compile 长尾 |
+| 进程池固定成本窗口需要 setup provider 覆盖 | `bench_mp_pool` / `concurrent_imap` | 成立。用例主体是 `Pool(2).imap(f, range(1000), chunk=10)`，`f(x)=x` 几乎没有 JIT 计算收益；策略目标是让 Pool bootstrap 和 job submission 不制造低阈值 AutoJIT 固定成本。result iterator 消费是 timed 动态路径，不能放进 setup wrapper |
 
-## 20 待补清单
+## 20 `bench_mp_pool` / `concurrent_imap` 初始账本
+
+### 20.1 用例模型
+
+| 项 | 内容 | 策略含义 |
+|---|---|---|
+| pyperformance 名称 | `concurrent_imap`，结果行 `bench_mp_pool` | 证据表和命令中需要同时标注两个名称，避免把 selector 与结果行混淆 |
+| benchmark 主体 | `with Pool(2) as pool: for _ in pool.imap(f, range(1000), 10): pass` | 主要成本是 Pool/forkserver、IPC、pickle、queue、result 消费和调度唤醒 |
+| worker 函数 | `f(x): return x` | 典型 `Trivial`/低 ROI 函数，正常不应进入 JIT |
+| JIT 收益来源 | 很少 | 不能按数值循环用例期待 JIT 正收益 |
+| AutoJIT 目标 | 减少额外成本 | 让进程池初始化/通信窗口走 startup/setup 保守策略，并确认 trivial/infra 函数不被误编译 |
+
+### 20.2 五口径总表
+
+目标容器口径：blue-98 临时 4C16G 容器，`--cpuset-cpus=0-3 --memory=16g`，同 NUMA，不额外 `--affinity`；pyperformance `--warmups 3`；candidate worker venv `include-system-site-packages=true`。本轮 `/opt/python314` 的 `sys._jit.is_available() == False`，因此表内 baseline 是 no-plugin 解释器地板，不是 CPython JIT 发布基线；正式 CPython JIT 85% 线仍需在目标发布环境回灌。
+
+| 口径 | 命令差异 | `bench_mp_pool` mean / median | 相对 no-plugin | `bench_thread_pool` mean | 主要解释 |
+|---|---|---:|---:|---:|---|
+| no-plugin baseline | 不加载 CinderX plugin | `120.0ms / 101.0ms` | `1.00x` | `1.613ms` | 4C 进程池本身抖动大，std `67.9ms`；作为本轮环境地板 |
+| CinderX plugin-no-JIT | `CINDERX_PLUGIN_ENABLE=1 PYTHONJITDISABLE=1` | `117.8ms / 96.1ms` | `0.98x` | `1.630ms` | plugin 固定成本不是主因；未启用 JIT 时基本贴近 no-plugin |
+| CinderX `PYTHONJITAUTO=2` | 传统低阈值 JIT | `950.8ms / 972.8ms` | `7.92x` | `1.884ms` | 低阈值 JIT 在 Pool/bootstrap/infra 路径触发编译风暴和动态成本，是原始劣化主因 |
+| AutoJIT，setup provider off | `PYTHONJITAUTO=auto:2 CINDERX_AUTOJIT_SETUP_PROVIDER=off` | `133.7ms / 125.6ms` | `1.11x` | `1.734ms` | AutoJIT 分类、LowRoi/RoiBackoff 已压掉大头，但仍有约 `+13.7ms` 残差 |
+| AutoJIT，错误 iterator wrap | `Pool.imap` + `IMapIterator.next` 都包 setup | `141.8ms / 128.6ms` | `1.18x` | `1.820ms` | 逐 result `next` 进入 Python wrapper，timed 消费路径被拖慢，证明 result iterator 不能包 |
+| AutoJIT，最终 Pool.imap-only provider | 默认 provider：包 `Pool.imap`，不包 iterator/get | `126.9ms / 112.6ms` | `1.06x` | `1.752ms` | 相对 provider off 再拿回约 `6.8ms` mean / `13.0ms` median；接近 plugin/no-plugin 地板 |
+
+### 20.3 阶段拆分表
+
+| 阶段 | 触发频率 | 证据字段 | 当前策略 |
+|---|---|---|---|
+| Pool 构造 / worker 启动 | 每次 `Pool(2)` | compile-events `phase=setup`、gate stats、worker pid 分布 | `multiprocessing_pool` provider 包 `Pool.__init__` |
+| Pool context 生命周期 | 每次 `with Pool(...)` | setup depth smoke、compile-events `phase=setup` | `Pool.__enter__` 进入 setup depth，`Pool.__exit__` 退出 |
+| 同步/异步提交 | 每次提交 | compile-events `phase=setup` | `Pool.map/imap/imap_unordered/starmap/map_async/starmap_async` 用 setup wrapper |
+| imap 结果消费 | 每次 result iterator `next` | `bench_mp_pool` 主体耗时、thread_pool 对照 | **不包装**。这是 timed 动态路径；错误包装会把最终 mean 从 `126.9ms` 拖到 `141.8ms`，并把 `bench_thread_pool` 从 `1.75ms` 拖到 `1.82ms` |
+| async result get | 每次 `ApplyResult.get` | async result 消费路径 | **不包装**。`get()` 是等待/消费结果，不是提交窗口；后续若有 async 专项需要单独取证 |
+| worker 函数 `f` | 每个任务 | compile-events/gate stats 中 `fullname`、`family=Trivial` | 走 LowRoi/trivial 冻结，不应 forced compile |
+
+### 20.4 需要回灌的函数形状表
+
+| 函数/模块 | 预期形状 | 预期策略 | 验收 |
+|---|---|---|---|
+| benchmark `f` | `Trivial`、`loop=0`、`risk=0` | `LowRoi` 冻结或保持解释执行 | `forced_compile=0` |
+| `multiprocessing.pool.Pool.*` wrapper 命中的 helper | 多为 `CallDispatcher` / `ObjectManipulator` / `BranchFSM`，非 compute-dominant | setup 窗口内延迟 | `Pool.imap` 有 provider marker，`IMapIterator.next` 无 marker；高成本非数值不编译或显著减少 |
+| import/forkserver bootstrap helper | import/setup 阶段函数 | import/setup 延迟 | 不扩大到 steady worker 主体 |
+| `ThreadPool` 路径 | 不属于本 provider | 不进入 `multiprocessing_pool` setup depth | `ThreadPool` 继承 wrapped `Pool.imap` 时仍经过 wrapper 函数，但 exact `type(self).__name__ == "Pool"` 谓词返回 false，setup depth 保持 0 |
+
+## 21 待补清单
 
 | 优先级 | 项 | 目的 |
 |---|---|---|
@@ -1310,5 +1357,6 @@ per-site 字段让每个 deopt 事件能落到 `bc_offset/deopt_idx/opcode/speci
 | P1 | 给 `sympy` 四个子用例分别补非 debug A/B | 判断符号计算 highcost 函数的动态收益是否覆盖编译成本 |
 | P1 | 拆 `pickle_pure_python` 正式 AutoJIT 残留成本 | auto 模式已不装 frame evaluator 且 LowRoi 冻结后达到 85% 线；后续只需继续拆 gate/compiled-entry/startup hook 的约 `156us` 残留上界 |
 | P1 | 将 `deepcopy/deepcopy_reduce/deepcopy_memo` 三个子场景补完整函数形状表 | deopt 和正式 A/B 已拆分；后续还需要按子场景列完整编译函数，确认 `_deepcopy_tuple` 收窄规则是否有其它同形状候选 |
-| P1 | 给 `dulwich_log`、`bench_mp_pool` 补同格式表 | 扩大非 JIT 用例样本，避免只围绕 `2to3`/`dask` 调参 |
+| P1 | 给 `dulwich_log` 补同格式表 | 扩大非 JIT 用例样本，避免只围绕 `2to3`/`dask` 调参 |
+| P1 | 将 `bench_mp_pool` 五口径正式数值和函数形状回灌到 §20 | 验证 `multiprocessing_pool` provider 是否把 4C16G no-affinity 口径恢复到 CPython JIT 85% 线 |
 | P2 | 给 `scimark_fft/scimark_lu/scimark_sor/scimark_monte_carlo` 补同格式表 | 验证 JIT 用例误伤边界 |

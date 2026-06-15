@@ -136,7 +136,7 @@ CINDERX_PLUGIN_ENABLE=1 python3.14 -X jit-auto=auto:2 your_app.py
 | 能力 | 默认值 | 作用 |
 |---|---|---|
 | import provider | `find_and_load` | 标记 import 链路中的函数，抑制导入期编译风暴 |
-| setup provider | `lib2to3_main` | 标记已知的一次性 setup 链路；当前作为 import provider 打开的 `StartupInit` 策略附加信号 |
+| setup provider | `lib2to3_main,multiprocessing_pool` | 标记已知的一次性 setup 链路和进程池构造/任务提交窗口；当前作为 import provider 打开的 `StartupInit` 策略附加信号 |
 | ROI backoff | 开启 | 已经编译的函数如果反复 deopt，会反编译或冻结为解释执行 |
 
 常用环境变量如下：
@@ -149,7 +149,7 @@ CINDERX_PLUGIN_ENABLE=1 python3.14 -X jit-auto=auto:2 your_app.py
 | `PYTHONJITAUTO=N` | - | 启用传统自动 JIT，不启用行为分类 |
 | `CINDERX_AUTOJIT_IMPORT_PROVIDER=find_and_load` | auto 模式默认开启 | 使用 `importlib._bootstrap._find_and_load` 标记 import 阶段 |
 | `CINDERX_AUTOJIT_IMPORT_PROVIDER=off` | - | 关闭 import 阶段信号，常用于 A/B 定位 |
-| `CINDERX_AUTOJIT_SETUP_PROVIDER=lib2to3_main` | auto 模式默认开启 | 使用 `lib2to3.main.main` 标记 setup 阶段；当前需配合 import provider 开启才影响 `StartupInit` 策略 |
+| `CINDERX_AUTOJIT_SETUP_PROVIDER=lib2to3_main,multiprocessing_pool` | auto 模式默认开启 | 使用 `lib2to3.main.main` 和 `multiprocessing.pool.Pool` 标记 setup/进程池构造与任务提交阶段；当前需配合 import provider 开启才影响 `StartupInit` 策略 |
 | `CINDERX_AUTOJIT_SETUP_PROVIDER=off` | - | 关闭 setup 阶段信号，常用于评估 setup wrapper 增量 |
 | `CINDERX_AUTOJIT_ROI_BACKOFF=1` | 开启 | 启用运行时负 ROI 回退 |
 | `CINDERX_AUTOJIT_ROI_BACKOFF=0` | - | 关闭运行时负 ROI 回退，常用于回滚或隔离验证 |
@@ -182,7 +182,7 @@ python3.14 -m pyperformance run \
 python3.14 -m pyperf compare_to jit_auto_2.json autojit_classify_2.json
 ```
 
-如果要定位 import provider、setup provider 或 ROI backoff 的贡献，把对应环境变量加入 `--inherit-environ`，并分别设置为 `off` 或 `0` 做 A/B。当前不支持用 `CINDERX_AUTOJIT_IMPORT_PROVIDER=off` + `CINDERX_AUTOJIT_SETUP_PROVIDER=lib2to3_main` 代表 setup-only 策略；评估 setup wrapper 增量时，应保持 import provider 开启，只切换 `CINDERX_AUTOJIT_SETUP_PROVIDER`。
+如果要定位 import provider、setup provider 或 ROI backoff 的贡献，把对应环境变量加入 `--inherit-environ`，并分别设置为 `off` 或 `0` 做 A/B。当前不支持用 `CINDERX_AUTOJIT_IMPORT_PROVIDER=off` + `CINDERX_AUTOJIT_SETUP_PROVIDER=lib2to3_main,multiprocessing_pool` 代表 setup-only 策略；评估 setup wrapper 增量时，应保持 import provider 开启，只切换 `CINDERX_AUTOJIT_SETUP_PROVIDER`。setup provider 支持逗号或加号分隔的组合值，例如只测进程池窗口时可设为 `multiprocessing_pool`。
 
 ```bash
 CINDERX_PLUGIN_ENABLE=1 \
