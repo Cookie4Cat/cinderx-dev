@@ -1,5 +1,6 @@
 #!/home/pybin/bin/python3.14
 import argparse
+import hashlib
 import json
 import os
 import re
@@ -279,7 +280,83 @@ def format_section(title, entries):
     return "\n".join(lines)
 
 
-def build_release_body(tag, sha, log):
+def sha256_file(path):
+    digest = hashlib.sha256()
+    with path.open("rb") as handle:
+        for chunk in iter(lambda: handle.read(1024 * 1024), b""):
+            digest.update(chunk)
+    return digest.hexdigest()
+
+
+def write_sha256_sidecar(wheel_path, digest):
+    sha_path = wheel_path.with_name(f"{wheel_path.name}.sha256")
+    sha_path.write_text(f"{digest}  {wheel_path.name}\n", encoding="utf-8")
+    return sha_path
+
+
+def collect_wheel_assets(wheels):
+    assets = []
+    for wheel in wheels:
+        digest = sha256_file(wheel)
+        sidecar = write_sha256_sidecar(wheel, digest)
+        assets.append(
+            {
+                "path": wheel,
+                "name": wheel.name,
+                "sha256": digest,
+                "sha256_path": sidecar,
+                "sha256_name": sidecar.name,
+            }
+        )
+    return assets
+
+
+def format_integrity_section(wheel_assets):
+    lines = [
+        "## 完整性校验",
+        "请从本 Release 附件下载 `.whl` 和对应 `.sha256` 文件，安装前先校验：",
+        "",
+        "```bash",
+        "sha256sum -c <wheel-file>.sha256",
+        "```",
+        "",
+        "安装时可使用 pip hash-checking mode，让 pip 在安装过程中再次校验 wheel：",
+        "",
+        "```bash",
+        "python3.14 -m pip install --no-deps --require-hashes -r cinderx-release-requirements.txt",
+        "```",
+        "",
+        "`cinderx-release-requirements.txt` 内容示例：",
+        "",
+        "```text",
+    ]
+    if wheel_assets:
+        lines.extend(
+            f"./{asset['name']} --hash=sha256:{asset['sha256']}"
+            for asset in wheel_assets
+        )
+    else:
+        lines.append("./<wheel-file>.whl --hash=sha256:<sha256>")
+    lines.extend(
+        [
+            "```",
+            "",
+            "Release 附件 SHA256：",
+        ]
+    )
+    if wheel_assets:
+        for asset in wheel_assets:
+            lines.append(
+                f"- `{asset['name']}`: `{asset['sha256']}` "
+                f"(sidecar: `{asset['sha256_name']}`)"
+            )
+    else:
+        lines.append("- 暂无")
+    return "\n".join(lines)
+
+
+def build_release_body(tag, sha, log, wheel_assets=None):
+    wheel_assets = wheel_assets or []
     match = validate_release_tag(tag)
     previous_tag = previous_release_tag(tag, log)
     entries = git_log_entries(previous_tag, log)
@@ -310,6 +387,8 @@ def build_release_body(tag, sha, log):
         "- Wheel: 请在本 Release 附件中下载对应 `.whl`",
         f"- 构建命令: `{BUILD_COMMAND}`",
         "",
+        format_integrity_section(wheel_assets),
+        "",
         "## 完整变更日志",
         f"Changes since `{compare_from}`:",
     ]
@@ -338,12 +417,12 @@ def build_release_body(tag, sha, log):
     return "\n".join(body) + "\n"
 
 
-def create_release(tag, sha, log):
+def create_release(tag, sha, log, wheel_assets=None):
     validate_release_tag(tag)
     body = {
         "tag_name": tag,
         "name": f"CinderX {tag}",
-        "body": build_release_body(tag, sha, log),
+        "body": build_release_body(tag, sha, log, wheel_assets),
         "target_commitish": sha,
         "release_status": RELEASE_STATUS,
     }
@@ -409,9 +488,13 @@ def build_and_publish(tag, sha):
             if not wheels:
                 raise RuntimeError(f"no wheels found in {wheelhouse}")
             log_line(log, "built wheels: " + ", ".join(w.name for w in wheels))
-            create_release(tag, checked_sha, log)
-            for wheel in wheels:
-                upload_asset(tag, wheel, log)
+            wheel_assets = collect_wheel_assets(wheels)
+            for asset in wheel_assets:
+                log_line(log, f"sha256 {asset['name']} {asset['sha256']}")
+            create_release(tag, checked_sha, log, wheel_assets)
+            for asset in wheel_assets:
+                upload_asset(tag, asset["path"], log)
+                upload_asset(tag, asset["sha256_path"], log)
             success_marker.write_text(time.strftime("%Y-%m-%d %H:%M:%S %z"), encoding="utf-8")
             log_line(log, f"job success tag={tag}")
             return str(log_path)

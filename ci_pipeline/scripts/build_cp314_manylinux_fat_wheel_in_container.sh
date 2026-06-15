@@ -245,13 +245,17 @@ if [ "${CINDERX_SKIP_SMOKE:-0}" != "1" ]; then
   stage "START smoke"
   fat=$(find /fat-wheel -maxdepth 1 -type f -name 'cinderx-*.whl' | sort | tail -n 1)
   test -n "$fat"
+  fat_sha=$(awk '{print $1}' /logs/fat-wheel.sha256)
+  test -n "$fat_sha"
   : > /logs/fat-wheel-smoke.log
   for ver in 3.14.0 3.14.1 3.14.2 3.14.3; do
     py="/opt/cpython/${ver}/bin/python3.14"
     venv="/tmp/cinderx-fat-smoke-${ver}"
+    req="/tmp/cinderx-fat-smoke-${ver}.requirements.txt"
     rm -rf "$venv"
     "$py" -m venv "$venv"
-    "$venv/bin/python" -m pip install --no-index --no-deps "$fat"
+    printf '%s --hash=sha256:%s\n' "$fat" "$fat_sha" > "$req"
+    "$venv/bin/python" -m pip install --no-index --no-deps --require-hashes -r "$req"
     "$venv/bin/python" - <<'PY' | tee -a /logs/fat-wheel-smoke.log
 import sys
 import cinderx
