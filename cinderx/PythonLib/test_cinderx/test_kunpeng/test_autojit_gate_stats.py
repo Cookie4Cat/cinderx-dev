@@ -8,6 +8,10 @@ import unittest
 
 
 HELPER = Path(__file__).resolve()
+CP3140_AUTOJIT_DIRECT_CALL_GATE_UNSUPPORTED = sys.version_info[:3] == (3, 14, 0)
+CP3140_AUTOJIT_SKIP_REASON = (
+    "CPython 3.14.0 direct calls bypass the AutoJIT classification gate"
+)
 
 
 def install_fake_lib2to3_importer() -> None:
@@ -405,6 +409,10 @@ class AutoJitGateStatsDumpTests(unittest.TestCase):
             )
             self.assertFalse(stats_path.exists())
 
+    @unittest.skipIf(
+        CP3140_AUTOJIT_DIRECT_CALL_GATE_UNSUPPORTED,
+        CP3140_AUTOJIT_SKIP_REASON,
+    )
     def test_plugin_roi_backoff_uncompiles_deopt_storm(self) -> None:
         with tempfile.TemporaryDirectory() as temp:
             env = _plugin_env()
@@ -424,6 +432,10 @@ class AutoJitGateStatsDumpTests(unittest.TestCase):
                 f"stdout:\n{completed.stdout}\nstderr:\n{completed.stderr}",
             )
 
+    @unittest.skipIf(
+        CP3140_AUTOJIT_DIRECT_CALL_GATE_UNSUPPORTED,
+        CP3140_AUTOJIT_SKIP_REASON,
+    )
     def test_plugin_roi_backoff_defaults_freeze_first_deopt_storm(self) -> None:
         with tempfile.TemporaryDirectory() as temp:
             env = _plugin_env()
@@ -440,6 +452,10 @@ class AutoJitGateStatsDumpTests(unittest.TestCase):
                 f"stdout:\n{completed.stdout}\nstderr:\n{completed.stderr}",
             )
 
+    @unittest.skipIf(
+        CP3140_AUTOJIT_DIRECT_CALL_GATE_UNSUPPORTED,
+        CP3140_AUTOJIT_SKIP_REASON,
+    )
     def test_plugin_roi_backoff_env_zero_disables_backoff(self) -> None:
         with tempfile.TemporaryDirectory() as temp:
             env = _plugin_env()
@@ -457,6 +473,10 @@ class AutoJitGateStatsDumpTests(unittest.TestCase):
                 f"stdout:\n{completed.stdout}\nstderr:\n{completed.stderr}",
             )
 
+    @unittest.skipIf(
+        CP3140_AUTOJIT_DIRECT_CALL_GATE_UNSUPPORTED,
+        CP3140_AUTOJIT_SKIP_REASON,
+    )
     def test_plugin_freezes_low_roi_functions(self) -> None:
         with tempfile.TemporaryDirectory() as temp:
             env = _plugin_env()
@@ -516,6 +536,10 @@ class AutoJitGateStatsDumpTests(unittest.TestCase):
                 f"stdout:\n{completed.stdout}\nstderr:\n{completed.stderr}",
             )
 
+    @unittest.skipIf(
+        CP3140_AUTOJIT_DIRECT_CALL_GATE_UNSUPPORTED,
+        CP3140_AUTOJIT_SKIP_REASON,
+    )
     def test_plugin_freezes_low_loop_object_manipulators(self) -> None:
         with tempfile.TemporaryDirectory() as temp:
             env = _plugin_env()
@@ -562,6 +586,10 @@ class AutoJitGateStatsDumpTests(unittest.TestCase):
                 f"stdout:\n{completed.stdout}\nstderr:\n{completed.stderr}",
             )
 
+    @unittest.skipIf(
+        CP3140_AUTOJIT_DIRECT_CALL_GATE_UNSUPPORTED,
+        CP3140_AUTOJIT_SKIP_REASON,
+    )
     def test_plugin_defers_logging_disabled_fast_path(self) -> None:
         with tempfile.TemporaryDirectory() as temp:
             env = _plugin_env()

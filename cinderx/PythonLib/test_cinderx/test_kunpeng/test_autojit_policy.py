@@ -7,6 +7,10 @@ import unittest
 
 
 HELPER = Path(__file__).resolve()
+CP3140_AUTOJIT_DIRECT_CALL_GATE_UNSUPPORTED = sys.version_info[:3] == (3, 14, 0)
+CP3140_AUTOJIT_SKIP_REASON = (
+    "CPython 3.14.0 direct calls bypass the AutoJIT classification gate"
+)
 
 
 def _run_compile_smoke():
@@ -120,9 +124,17 @@ class AutoJitPolicyTests(unittest.TestCase):
             f"stdout:\n{completed.stdout}\nstderr:\n{completed.stderr}",
         )
 
+    @unittest.skipIf(
+        CP3140_AUTOJIT_DIRECT_CALL_GATE_UNSUPPORTED,
+        CP3140_AUTOJIT_SKIP_REASON,
+    )
     def test_autojit_defers_asyncio_event_loop_helpers(self) -> None:
         self.assert_case_passes("asyncio_event_loop_helpers")
 
+    @unittest.skipIf(
+        CP3140_AUTOJIT_DIRECT_CALL_GATE_UNSUPPORTED,
+        CP3140_AUTOJIT_SKIP_REASON,
+    )
     def test_autojit_defers_deepcopy_tuple_and_keep_alive(self) -> None:
         self.assert_case_passes(
             "deepcopy_exception_helpers",
