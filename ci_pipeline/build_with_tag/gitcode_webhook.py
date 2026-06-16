@@ -1,6 +1,7 @@
 #!/home/pybin/bin/python3.14
 import argparse
 import hashlib
+import ipaddress
 import json
 import os
 import re
@@ -36,6 +37,15 @@ API_BASE = env("GITCODE_API_BASE", "https://api.gitcode.com/api/v5").rstrip("/")
 ACCESS_TOKEN = env("GITCODE_ACCESS_TOKEN", "")
 GIT_USERNAME = env("GITCODE_GIT_USERNAME", "oauth2")
 USE_TOKEN_FOR_GIT = env_bool("GITCODE_USE_TOKEN_FOR_GIT", True)
+API_HOST = (urllib.parse.urlparse(API_BASE).hostname or "").lower()
+DEFAULT_UPLOAD_ALLOWED_HOSTS = ",".join(
+    host for host in ("gitcode.com", ".gitcode.com", API_HOST) if host
+)
+UPLOAD_ALLOWED_HOSTS = {
+    host.strip().lower()
+    for host in env("GITCODE_UPLOAD_ALLOWED_HOSTS", DEFAULT_UPLOAD_ALLOWED_HOSTS).split(",")
+    if host.strip()
+}
 
 WORK_BASE = Path(env("CINDERX_WEBHOOK_WORK_BASE", "/var/lib/cinderx-webhook"))
 REPO_DIR = Path(env("CINDERX_REPO_DIR", str(WORK_BASE / "repo")))
@@ -182,16 +192,60 @@ def checkout_tag(tag, sha, log):
     return checked_sha
 
 
-def api_url(path, params):
-    query = dict(params or {})
+def api_url(path, params=None):
+    query = urllib.parse.urlencode(params or {})
+    suffix = f"?{query}" if query else ""
+    return f"{API_BASE}{path}{suffix}"
+
+
+def api_headers(extra=None):
+    headers = {"Accept": "application/json"}
     if ACCESS_TOKEN:
-        query["access_token"] = ACCESS_TOKEN
-    return f"{API_BASE}{path}?{urllib.parse.urlencode(query)}"
+        headers["PRIVATE-TOKEN"] = ACCESS_TOKEN
+    if extra:
+        headers.update(extra)
+    return headers
+
+
+def host_allowed(host):
+    host = host.lower()
+    for allowed in UPLOAD_ALLOWED_HOSTS:
+        if allowed.startswith("."):
+            if host.endswith(allowed):
+                return True
+        elif host == allowed:
+            return True
+    return False
+
+
+def validate_upload_url(upload_url):
+    parsed = urllib.parse.urlparse(upload_url)
+    if parsed.scheme != "https":
+        raise RuntimeError("upload_url must use https")
+    if parsed.username or parsed.password:
+        raise RuntimeError("upload_url must not contain credentials")
+    if parsed.port not in (None, 443):
+        raise RuntimeError("upload_url must use the default https port")
+
+    host = (parsed.hostname or "").lower()
+    if not host:
+        raise RuntimeError("upload_url must include a host")
+    if not host_allowed(host):
+        raise RuntimeError(f"upload_url host is not allowed: {host}")
+
+    try:
+        addresses = socket.getaddrinfo(host, None, type=socket.SOCK_STREAM)
+    except socket.gaierror as exc:
+        raise RuntimeError(f"upload_url host cannot be resolved: {host}") from exc
+    for addr in addresses:
+        ip = ipaddress.ip_address(addr[4][0])
+        if not ip.is_global or getattr(ip, "is_site_local", False):
+            raise RuntimeError(f"upload_url resolves to disallowed address: {ip}")
 
 
 def request_json(method, path, params=None, body=None, expected=(200, 201)):
     data = None
-    headers = {"Accept": "application/json"}
+    headers = api_headers()
     if body is not None:
         data = json.dumps(body).encode("utf-8")
         headers["Content-Type"] = "application/json"
@@ -447,6 +501,7 @@ def upload_asset(tag, file_path, log):
     )
     log_line(log, f"got upload_url for {name}, status={status}")
     upload_url = upload_info["url"]
+    validate_upload_url(upload_url)
     headers = upload_info.get("headers") or {}
     data = file_path.read_bytes()
     req = urllib.request.Request(upload_url, data=data, headers=headers, method="PUT")
