@@ -41,8 +41,10 @@ set(CMAKE_CXX_STANDARD_REQUIRED ON)
 
 if (WINDOWS)
     set(SHARED_FLAGS "-DPy_BUILD_CORE -DPy_BUILD_CORE_MODULE")
+    set(CXX_FLAGS "")
 else()
-    set(SHARED_FLAGS "-DPy_BUILD_CORE -DPy_BUILD_CORE_MODULE -fPIC -Wall -Wextra -Wno-attributes -Wno-c99-designator -Wno-c++11-narrowing -Wno-cast-function-type -Wno-cast-function-type-mismatch -Wno-deprecated-declarations -Wno-missing-field-initializers -Wno-null-pointer-subtraction -Wno-parentheses -Wno-sign-compare -Wno-unknown-pragmas -Wno-unused-function -Wno-unused-parameter")
+    set(SHARED_FLAGS "-DPy_BUILD_CORE -DPy_BUILD_CORE_MODULE -fPIC -fvisibility=hidden -Wall -Wextra -Wno-attributes -Wno-c99-designator -Wno-c++11-narrowing -Wno-cast-function-type -Wno-cast-function-type-mismatch -Wno-deprecated-declarations -Wno-missing-field-initializers -Wno-null-pointer-subtraction -Wno-parentheses -Wno-sign-compare -Wno-unknown-pragmas -Wno-unused-function -Wno-unused-parameter")
+    set(CXX_FLAGS "-fvisibility-inlines-hidden")
 endif()
 
 macro(set_flag VAR)
@@ -69,7 +71,7 @@ set_flag(ENABLE_ZLIB)
 set_flag(ENABLE_XXCLASSLOADER)
 
 set(CMAKE_C_FLAGS "${CMAKE_C_FLAGS} ${SHARED_FLAGS}")
-set(CMAKE_CXX_FLAGS "${CMAKE_CXX_FLAGS} ${SHARED_FLAGS}")
+set(CMAKE_CXX_FLAGS "${CMAKE_CXX_FLAGS} ${CXX_FLAGS} ${SHARED_FLAGS}")
 
 ##############################################################################
 # Apply LTO (Link-Time Optimization) if enabled
@@ -383,11 +385,45 @@ if (${ENABLE_DISASSEMBLER})
     https://github.com/capstone-engine/capstone
     5.0.7
   )
-  set(CAPSTONE_BUILD_TESTS OFF CACHE BOOL "" FORCE)
+
+  # Skip unsupported architectures while preserving x86's Capstone default,
+  # except on ARM64 targets where CinderX only uses ARM64 disassembly.
+  set(CAPSTONE_AARCH64_SUPPORT OFF CACHE BOOL "" FORCE)
+  set(CAPSTONE_ARM64_SUPPORT OFF CACHE BOOL "" FORCE)
+  set(CAPSTONE_ARM_SUPPORT OFF CACHE BOOL "" FORCE)
+  set(CAPSTONE_BPF_SUPPORT OFF CACHE BOOL "" FORCE)
   set(CAPSTONE_BUILD_CSTOOL OFF CACHE BOOL "" FORCE)
+  set(CAPSTONE_BUILD_TESTS OFF CACHE BOOL "" FORCE)
+  set(CAPSTONE_EVM_SUPPORT OFF CACHE BOOL "" FORCE)
+  set(CAPSTONE_M680X_SUPPORT OFF CACHE BOOL "" FORCE)
+  set(CAPSTONE_M68K_SUPPORT OFF CACHE BOOL "" FORCE)
+  set(CAPSTONE_MIPS_SUPPORT OFF CACHE BOOL "" FORCE)
+  set(CAPSTONE_MOS65XX_SUPPORT OFF CACHE BOOL "" FORCE)
+  set(CAPSTONE_PPC_SUPPORT OFF CACHE BOOL "" FORCE)
+  set(CAPSTONE_RISCV_SUPPORT OFF CACHE BOOL "" FORCE)
+  set(CAPSTONE_SH_SUPPORT OFF CACHE BOOL "" FORCE)
+  set(CAPSTONE_SPARC_SUPPORT OFF CACHE BOOL "" FORCE)
+  set(CAPSTONE_SYSZ_SUPPORT OFF CACHE BOOL "" FORCE)
+  set(CAPSTONE_TMS320C64X_SUPPORT OFF CACHE BOOL "" FORCE)
+  set(CAPSTONE_TRICORE_SUPPORT OFF CACHE BOOL "" FORCE)
+  set(CAPSTONE_WASM_SUPPORT OFF CACHE BOOL "" FORCE)
+  set(CAPSTONE_XCORE_SUPPORT OFF CACHE BOOL "" FORCE)
+
+  if (CMAKE_SYSTEM_PROCESSOR MATCHES "x86_64|AMD64")
+    set(CAPSTONE_X86_SUPPORT ON CACHE BOOL "" FORCE)
+  elseif(CMAKE_SYSTEM_PROCESSOR MATCHES "aarch64|arm64")
+    set(CAPSTONE_X86_SUPPORT OFF CACHE BOOL "" FORCE)
+    set(CAPSTONE_AARCH64_SUPPORT ON CACHE BOOL "" FORCE)
+    set(CAPSTONE_ARM64_SUPPORT ON CACHE BOOL "" FORCE)
+  endif()
+
   FetchContent_MakeAvailable(capstone)
   target_compile_options(capstone PRIVATE -w)
   target_compile_options(capstone_static PRIVATE -w)
+  # CAPSTONE_STATIC suppresses CAPSTONE_EXPORT's visibility("default") annotation,
+  # keeping capstone symbols hidden with the rest of the extension internals.
+  target_compile_definitions(capstone PRIVATE CAPSTONE_STATIC)
+  target_compile_definitions(capstone_static PRIVATE CAPSTONE_STATIC)
 endif()
 
 ##############################################################################

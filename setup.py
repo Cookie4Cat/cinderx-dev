@@ -469,7 +469,22 @@ class BuildExt(build_ext):
 
         build_type = os.environ.get("CMAKE_BUILD_TYPE", "RelWithDebInfo")
         verbose_makefile = os.environ.get("CMAKE_VERBOSE_MAKEFILE", "OFF")
-        cmake_args = [
+
+        cmake_generator = os.environ.get("CMAKE_GENERATOR")
+        cmake_cache = os.path.join(build_dir, "CMakeCache.txt")
+        if not cmake_generator and not os.path.exists(cmake_cache):
+            # CMake records the generator in CMakeCache.txt. Only auto-select
+            # Ninja for fresh build directories so incremental builds keep using
+            # their original generator.
+            if platform.system() == "Windows":
+                cmake_generator = "Ninja"
+            elif shutil.which("ninja"):
+                cmake_generator = "Ninja"
+
+        cmake_args = []
+        if cmake_generator:
+            cmake_args += ["-G", cmake_generator]
+        cmake_args += [
             f"-DCMAKE_BUILD_TYPE={build_type}",
             f"-DCMAKE_LIBRARY_OUTPUT_DIRECTORY={os.path.dirname(extension_dir)}",
             f"-DCMAKE_C_COMPILER={cc}",
@@ -512,9 +527,6 @@ class BuildExt(build_ext):
             "-j",
             str(os.cpu_count() or 1),
         ]
-
-        if platform.system() == "Windows":
-            cmake_args.extend(["-G", "Ninja"])
 
         # pyre-ignore[16]: No pyre types for build_ext.
         self.spawn(["cmake"] + cmake_args + ["-B", build_dir, CHECKOUT_ROOT_DIR])
