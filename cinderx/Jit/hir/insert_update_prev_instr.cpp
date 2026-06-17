@@ -145,9 +145,9 @@ void InsertUpdatePrevInstr::Run([[maybe_unused]] Function& func) {
         parent = begin;
         last_emitted = nullptr;
         prev_emitted_lno_or_bc = INT_MAX;
-        if (getConfig().frame_mode == FrameMode::kLightweight) {
-          inited_once = false;
-        }
+#ifdef ENABLE_LIGHTWEIGHT_FRAMES
+        inited_once = false;
+#endif
       } else if (instr.IsEndInlinedFunction()) {
         parent =
             parents[static_cast<EndInlinedFunction&>(instr).matchingBegin()];
@@ -155,37 +155,39 @@ void InsertUpdatePrevInstr::Run([[maybe_unused]] Function& func) {
         prev_emitted_lno_or_bc = INT_MAX;
       }
 
-      if (getConfig().frame_mode == FrameMode::kLightweight) {
-        // The first LoadEvalBreaker is emitted for the RESUME instruction which
-        // indicates when we should update the line number from the instruction
-        // - 1 to the first instruction to indicate that the frame is now
-        // complete.
-        if (!inited_once && instr.IsLoadEvalBreaker()) {
-          auto target_code = parent == nullptr ? func.code : parent->code();
-          auto& cur_bc_idx_to_line = code_bc_idx_map.at(target_code);
-          int line_no = cur_bc_idx_to_line.lineNoFor(
-              BCIndex(target_code->_co_firsttraceable));
-          Instr* update_instr = UpdatePrevInstr::create(line_no, parent);
-          update_instr->setBytecodeOffset(
-              BCIndex(target_code->_co_firsttraceable));
-          update_instr->InsertBefore(instr);
-          last_emitted = update_instr;
+#ifdef ENABLE_LIGHTWEIGHT_FRAMES
+      // The first LoadEvalBreaker is emitted for the RESUME instruction which
+      // indicates when we should update the line number from the instruction
+      // - 1 to the first instruction to indicate that the frame is now
+      // complete.
+      if (!inited_once && instr.IsLoadEvalBreaker()) {
+        auto target_code = parent == nullptr ? func.code : parent->code();
+        auto& cur_bc_idx_to_line = code_bc_idx_map.at(target_code);
+        int line_no = cur_bc_idx_to_line.lineNoFor(
+            BCIndex(target_code->_co_firsttraceable));
+        Instr* update_instr = UpdatePrevInstr::create(line_no, parent);
+        update_instr->setBytecodeOffset(
+            BCIndex(target_code->_co_firsttraceable));
+        update_instr->InsertBefore(instr);
+        last_emitted = update_instr;
 
-          inited_once = true;
-        }
+        inited_once = true;
+      }
 #if PY_VERSION_HEX < 0x030F0000
-        // Stock CPython 3.14 has no JIT executable reifier callback. Keep
-        // instr_ptr current before arbitrary execution so frame APIs observe a
-        // complete frame at the right source line.
-        else if (hasArbitraryExecution(instr)) {
-          update_one();
-          last_emitted = nullptr;
-        }
-#endif
-      } else if (hasArbitraryExecution(instr)) {
+      // Stock CPython 3.14 has no JIT executable reifier callback. Keep
+      // instr_ptr current before arbitrary execution so frame APIs observe a
+      // complete frame at the right source line.
+      else if (hasArbitraryExecution(instr)) {
         update_one();
         last_emitted = nullptr;
       }
+#endif
+#else
+      if (hasArbitraryExecution(instr)) {
+        update_one();
+        last_emitted = nullptr;
+      }
+#endif
     }
 
     // Add the successors to be processed

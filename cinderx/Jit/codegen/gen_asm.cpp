@@ -235,8 +235,9 @@ DeoptResult prepareForDeopt(
   if (_PyFrame_GetCode(frame)->co_flags & kCoFlagsAnyGenerator) {
     BorrowedRef<PyGenObject> base_gen = _PyGen_GetGeneratorFromFrame(frame);
     JitGenObject* gen = JitGenObject::cast(base_gen.get());
-    JIT_CHECK(gen != nullptr, "Not a JIT generator");
-    deopt_jit_gen_object_only(gen);
+    if (gen != nullptr) {
+      deopt_jit_gen_object_only(gen);
+    }
   }
   if (!PyErr_Occurred() && !is_instrumentation_deopt) {
     auto reason = deopt_meta.reason;
@@ -1836,21 +1837,13 @@ void NativeGenerator::generateCode(
   }
 
   const hir::Function* func = GetFunction();
-  std::string_view prefix = [&] {
-    switch (func->frameMode) {
-      case FrameMode::kNormal:
-        [[fallthrough]];
-      case FrameMode::kLightweight:
-        return perf::kFuncSymbolPrefix;
-    }
-    JIT_ABORT("Invalid frame mode");
-  }();
   // For perf, we want only the size of the code, so we get that directly from
   // the text sections.
   std::vector<std::pair<void*, std::size_t>> code_sections;
   populateCodeSections(code_sections, codeholder, code_start_);
 #ifndef WIN32
-  perf::registerFunction(code_sections, func->fullname, prefix);
+  perf::registerFunction(
+      code_sections, func->fullname, perf::kFuncSymbolPrefix);
 #endif
 }
 

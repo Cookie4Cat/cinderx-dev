@@ -992,7 +992,7 @@ void LIRGenerator::GenerateExitBlocks() {
     uint64_t helper;
     if (!env_->can_deopt && uses_lw_frames && !has_freevars) {
       helper = reinterpret_cast<uint64_t>(JITRT_UnlinkLeafFrame);
-    } else if (!has_freevars && uses_lw_frames) {
+    } else if (uses_lw_frames && !has_freevars) {
       helper = reinterpret_cast<uint64_t>(JITRT_UnlinkLightweightFrameFast);
     } else {
       helper = reinterpret_cast<uint64_t>(JITRT_UnlinkFrame);
@@ -1096,7 +1096,7 @@ std::unique_ptr<jit::lir::Function> LIRGenerator::TranslateFunction() {
   // generate entry block and exit block
   entry_block_ = GenerateEntryBlock();
 
-#if defined(CINDER_AARCH64)
+#if defined(CINDER_AARCH64) && defined(ENABLE_LIGHTWEIGHT_FRAMES)
   // Compute the caller FrameState and active code object at each block's entry
   // by walking the CFG. Needed because blocks inside an inlined function may
   // not contain BeginInlinedFunction themselves (they're reached via branches).
@@ -1148,7 +1148,7 @@ std::unique_ptr<jit::lir::Function> LIRGenerator::TranslateFunction() {
   UnorderedMap<const hir::BasicBlock*, TranslatedBlock> bb_map;
   std::vector<const hir::BasicBlock*> translated;
   auto translate_block = [&](const hir::BasicBlock* hir_bb) {
-#if defined(CINDER_AARCH64)
+#if defined(CINDER_AARCH64) && defined(ENABLE_LIGHTWEIGHT_FRAMES)
     auto it = block_inline_ctx.find(hir_bb);
     const hir::FrameState* entry_fs =
         it != block_inline_ctx.end() ? it->second.caller_fs : nullptr;
@@ -4092,6 +4092,9 @@ LIRGenerator::TranslatedBlock LIRGenerator::TranslateOneBasicBlock(
             getConfig().stable_frame,
             "Inlined code stores references to code objects");
 #if defined(ENABLE_LIGHTWEIGHT_FRAMES)
+        if (getConfig().frame_mode != FrameMode::kLightweight) {
+          break;
+        }
         auto instr = static_cast<const BeginInlinedFunction*>(&i);
         // Set code object data
         BorrowedRef<PyCodeObject> code = instr->code();
@@ -4113,7 +4116,7 @@ LIRGenerator::TranslatedBlock LIRGenerator::TranslateOneBasicBlock(
             Instruction::kLea,
             Stk{PhyLocation(
                 static_cast<int32_t>(
-                    frameOffsetBefore(instr) + sizeof(FrameHeader)))});
+                    frameOffsetBefore(instr) + kFrameHeaderOverhead))});
 
         // There is already an interpreter frame for the caller function.
         Instruction* callee_frame = getInlinedFrame(bbb, instr);
@@ -4162,7 +4165,7 @@ LIRGenerator::TranslatedBlock LIRGenerator::TranslateOneBasicBlock(
             OutInd{
                 callee_frame,
                 (Py_ssize_t)offsetof(FrameHeader, func) -
-                    (Py_ssize_t)sizeof(FrameHeader)},
+                    (Py_ssize_t)kFrameHeaderOverhead},
             Instruction::kMove,
             rtfs_reg);
 
@@ -4291,17 +4294,14 @@ LIRGenerator::TranslatedBlock LIRGenerator::TranslateOneBasicBlock(
             Instruction::kMove,
             callee_frame);
 #endif
-
 #endif
         break;
       }
       case Opcode::kEndInlinedFunction: {
 #if defined(ENABLE_LIGHTWEIGHT_FRAMES)
-        JIT_CHECK(
-            getConfig().frame_mode == FrameMode::kLightweight,
-            "Can only generate LIR for inlined functions in 3.12+ when "
-            "lightweight frames are enabled");
-
+        if (getConfig().frame_mode != FrameMode::kLightweight) {
+          break;
+        }
         auto instr = static_cast<const EndInlinedFunction&>(i);
 
         // Test to see if RTFS is still in place
@@ -4311,7 +4311,7 @@ LIRGenerator::TranslatedBlock LIRGenerator::TranslateOneBasicBlock(
             Instruction::kMove,
             Ind{callee_frame,
                 (Py_ssize_t)offsetof(FrameHeader, func) -
-                    (Py_ssize_t)sizeof(FrameHeader)});
+                    (Py_ssize_t)kFrameHeaderOverhead});
 
         JIT_DCHECK(
             JIT_FRAME_INITIALIZED == 2,
@@ -4348,7 +4348,7 @@ LIRGenerator::TranslatedBlock LIRGenerator::TranslateOneBasicBlock(
             Stk{PhyLocation(
                 static_cast<int32_t>(
                     frameOffsetBefore(instr.matchingBegin()) +
-                    sizeof(FrameHeader)))});
+                    kFrameHeaderOverhead))});
 #if PY_VERSION_HEX >= 0x030D0000
         bbb.appendInstr(
             OutInd{env_->asm_tstate, offsetof(PyThreadState, current_frame)},
@@ -5127,7 +5127,7 @@ void LIRGenerator::emitLoadFrame(BasicBlockBuilder& bbb) {
         OutVReg{},
         Instruction::kLea,
         Stk{PhyLocation(
-            static_cast<int32_t>(-fh_size + sizeof(jit::FrameHeader)))});
+            static_cast<int32_t>(-fh_size + jit::kFrameHeaderOverhead))});
 
     // Load previous frame from tstate before we overwrite current_frame.
 #if PY_VERSION_HEX >= 0x030D0000
@@ -5205,7 +5205,7 @@ void LIRGenerator::emitLoadFrame(BasicBlockBuilder& bbb) {
               Instruction::kLea,
               Stk{PhyLocation(
                   static_cast<int32_t>(
-                      -fh_size + sizeof(jit::FrameHeader) +
+                      -fh_size + jit::kFrameHeaderOverhead +
                       offsetof(_PyInterpreterFrame, localsplus) +
                       func_->code->co_nlocalsplus *
                           sizeof(Ci_STACK_TYPE)))});
@@ -5215,6 +5215,16 @@ void LIRGenerator::emitLoadFrame(BasicBlockBuilder& bbb) {
               Instruction::kMove,
               Imm{static_cast<uint64_t>(func_->code->co_nlocalsplus), dt});
 #endif
+        case FrameFieldKind::kBuiltins:
+          return bbb.appendInstr(
+              OutVReg{},
+              Instruction::kMove,
+              Ind{env_->asm_func, offsetof(PyFunctionObject, func_builtins)});
+        case FrameFieldKind::kGlobals:
+          return bbb.appendInstr(
+              OutVReg{},
+              Instruction::kMove,
+              Ind{env_->asm_func, offsetof(PyFunctionObject, func_globals)});
         case FrameFieldKind::kZero:
         case FrameFieldKind::kOwnerThread:
           static_assert(
@@ -5269,7 +5279,7 @@ void LIRGenerator::emitLoadFrame(BasicBlockBuilder& bbb) {
       }
     }
 
-#if PY_VERSION_HEX >= 0x030E0000
+#if PY_VERSION_HEX >= 0x030E0000 && defined(ENABLE_LIGHTWEIGHT_FRAMES)
     bbb.annotateNext("Set _PyInterpreterFrame::f_globals");
     Instruction* globals = bbb.appendInstr(
         OutVReg{},
@@ -5328,8 +5338,37 @@ void LIRGenerator::emitLoadFrame(BasicBlockBuilder& bbb) {
         Imm{0, OperandBase::k8bit});
 #endif
 
+#ifndef ENABLE_LIGHTWEIGHT_FRAMES
+    // Without lazy reification, zero all localsplus slots so the GC
+    // doesn't see garbage pointers.
+    {
+      int nlocals = func_->code->co_nlocalsplus;
+      Instruction* zero = fieldVReg(FrameFieldKind::kZero, DataType::kObject);
+      int32_t base_off =
+          static_cast<int32_t>(offsetof(_PyInterpreterFrame, localsplus));
+      bbb.annotateNext("Zero localsplus");
+      int i = 0;
+      while (i + 1 < nlocals) {
+        bbb.appendInstr(
+            Instruction::kStorePair,
+            Imm{static_cast<uint64_t>(
+                base_off + static_cast<int32_t>(i * kPointerSize))},
+            frame,
+            zero,
+            zero);
+        i += 2;
+      }
+      if (i < nlocals) {
+        bbb.appendInstr(
+            OutInd{frame, base_off + static_cast<int32_t>(i * kPointerSize)},
+            Instruction::kMove,
+            zero);
+      }
+    }
+#endif
+
     // Incref fields that need it.
-    bbb.annotateNext("Incref execuctable / reifier");
+    bbb.annotateNext("Incref executable / reifier");
     JIT_DCHECK(executable_or_reifier_obj != nullptr, "should have reifier");
     if (!_Py_IsImmortal(executable_or_reifier_obj)) {
       makeIncref(bbb, executable_or_reifier, false);
@@ -5351,7 +5390,7 @@ void LIRGenerator::emitLoadFrame(BasicBlockBuilder& bbb) {
         frame);
 #endif
   }
-#endif // ENABLE_LIGHTWEIGHT_FRAMES
+#endif
 #if PY_VERSION_HEX >= 0x030D0000
   bbb.annotateNext("Load current interpreter frame");
   env_->asm_interpreter_frame = bbb.appendInstr(

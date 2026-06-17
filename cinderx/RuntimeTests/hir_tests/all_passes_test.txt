@@ -19,6 +19,7 @@ fun jittestmodule:test {
 fun jittestmodule:test {
   bb 0 {
     LoadFrame
+    UpdatePrevInstr<idx:0 line_no:1: no parent>
     v5:CInt64 = LoadEvalBreaker
     CondBranch<2, 1> v5
   }
@@ -150,6 +151,7 @@ fun jittestmodule:test {
   bb 0 {
     v14:Object = LoadArg<0; "x">
     LoadFrame
+    UpdatePrevInstr<idx:0 line_no:1: no parent>
     v16:CInt64 = LoadEvalBreaker
     CondBranch<4, 3> v16
   }
@@ -358,6 +360,7 @@ fun jittestmodule:test {
 fun jittestmodule:test {
   bb 0 {
     LoadFrame
+    UpdatePrevInstr<idx:0 line_no:2: no parent>
     v8:CInt64 = LoadEvalBreaker
     CondBranch<2, 1> v8
   }
@@ -500,6 +503,7 @@ fun jittestmodule:test {
   bb 0 {
     v8:Object = LoadArg<0; "obj">
     LoadFrame
+    UpdatePrevInstr<idx:0 line_no:1: no parent>
     v10:CInt64 = LoadEvalBreaker
     CondBranch<2, 1> v10
   }
@@ -625,6 +629,7 @@ fun jittestmodule:test {
     v6:Object = LoadArg<0; "x">
     v7:Object = LoadArg<1; "y">
     LoadFrame
+    UpdatePrevInstr<idx:0 line_no:1: no parent>
     v9:CInt64 = LoadEvalBreaker
     CondBranch<2, 1> v9
   }
@@ -745,6 +750,7 @@ fun jittestmodule:test {
     v8:Object = LoadArg<0; "x">
     v9:Object = LoadArg<1; "y">
     LoadFrame
+    UpdatePrevInstr<idx:0 line_no:1: no parent>
     v11:CInt64 = LoadEvalBreaker
     CondBranch<4, 3> v11
   }
@@ -875,6 +881,7 @@ fun jittestmodule:test {
     v6:Object = LoadArg<0; "x">
     v7:Object = LoadArg<1; "y">
     LoadFrame
+    UpdatePrevInstr<idx:0 line_no:1: no parent>
     v9:CInt64 = LoadEvalBreaker
     CondBranch<2, 1> v9
   }
@@ -1001,6 +1008,7 @@ fun jittestmodule:test {
   bb 0 {
     LoadFrame
     v11:Nullptr = LoadConst<Nullptr>
+    UpdatePrevInstr<idx:0 line_no:1: no parent>
     v12:CInt64 = LoadEvalBreaker
     CondBranch<2, 1> v12
   }
@@ -1230,6 +1238,7 @@ fun jittestmodule:test {
         Locals<1> v16
       }
     }
+    UpdatePrevInstr<idx:2 line_no:1: no parent>
     v18:CInt64 = LoadEvalBreaker
     CondBranch<7, 6> v18
   }
@@ -1489,6 +1498,7 @@ fun jittestmodule:test {
   bb 0 {
     LoadFrame
     v10:Nullptr = LoadConst<Nullptr>
+    UpdatePrevInstr<idx:0 line_no:1: no parent>
     v11:CInt64 = LoadEvalBreaker
     CondBranch<2, 1> v11
   }
@@ -1601,6 +1611,7 @@ fun jittestmodule:test {
   bb 0 {
     LoadFrame
     v9:Nullptr = LoadConst<Nullptr>
+    UpdatePrevInstr<idx:0 line_no:1: no parent>
     v10:CInt64 = LoadEvalBreaker
     CondBranch<2, 1> v10
   }
@@ -1711,6 +1722,7 @@ fun jittestmodule:test {
   bb 0 {
     LoadFrame
     v9:Nullptr = LoadConst<Nullptr>
+    UpdatePrevInstr<idx:0 line_no:1: no parent>
     v10:CInt64 = LoadEvalBreaker
     CondBranch<2, 1> v10
   }
@@ -1822,6 +1834,7 @@ fun jittestmodule:test {
   bb 0 {
     LoadFrame
     v10:Nullptr = LoadConst<Nullptr>
+    UpdatePrevInstr<idx:0 line_no:1: no parent>
     v11:CInt64 = LoadEvalBreaker
     CondBranch<2, 1> v11
   }
@@ -1946,6 +1959,7 @@ fun jittestmodule:test {
     v9:Object = LoadArg<1; "y">
     LoadFrame
     v11:Nullptr = LoadConst<Nullptr>
+    UpdatePrevInstr<idx:0 line_no:1: no parent>
     v12:CInt64 = LoadEvalBreaker
     CondBranch<2, 1> v12
   }

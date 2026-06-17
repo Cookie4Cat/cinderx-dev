@@ -166,9 +166,6 @@ void setIP(
     [[maybe_unused]] int frame_size,
     [[maybe_unused]] uintptr_t new_ip) {
 #if defined(__x86_64__) && defined(ENABLE_LIGHTWEIGHT_FRAMES)
-  JIT_CHECK(
-      getConfig().frame_mode == FrameMode::kLightweight,
-      "setIP requires lightweight frame mode");
   JIT_CHECK(isJitFrame(frame), "frame not executed by the JIT");
   uintptr_t frame_base;
   if (isGeneratorFrame(frame)) {
@@ -211,6 +208,7 @@ std::vector<_PyInterpreterFrame*> getUnitFrames(_PyInterpreterFrame* frame) {
 }
 
 UnitState getUnitState(_PyInterpreterFrame* frame) {
+#ifdef ENABLE_LIGHTWEIGHT_FRAMES
   std::vector<_PyInterpreterFrame*> unit_frames = getUnitFrames(frame);
   auto logUnitFrames = [&unit_frames] {
     JIT_LOG("Unit frames (increasing order of inline depth):");
@@ -305,6 +303,10 @@ UnitState getUnitState(_PyInterpreterFrame* frame) {
 #endif
 
   return unit_state;
+#else
+  throw std::runtime_error{
+      "updatePrevInstr: Lightweight frames are not supported"};
+#endif
 }
 
 void updatePrevInstr(_PyInterpreterFrame* frame) {
@@ -374,20 +376,18 @@ PyType_Slot framereifier_type_slots[] = {
 
 Ref<> makeFrameReifier([[maybe_unused]] BorrowedRef<PyCodeObject> code) {
 #if PY_VERSION_HEX >= 0x030E0000 && defined(ENABLE_LIGHTWEIGHT_FRAMES)
-  if (getConfig().frame_mode == FrameMode::kLightweight) {
 #if PY_VERSION_HEX >= 0x030F0000
-    PyObject* reifier =
-        PyUnstable_MakeJITExecutable(reifyRunningFrame, code, nullptr);
-    if (reifier == nullptr) {
-      PyErr_Print();
-      throw std::runtime_error(
-          fmt::format("failed to make reifier {}", codeQualname(code)));
-    }
-    return Ref<>::steal(reifier);
-#else
-    return Ref<>::create((PyObject*)code);
-#endif
+  PyObject* reifier =
+      PyUnstable_MakeJITExecutable(reifyRunningFrame, code, nullptr);
+  if (reifier == nullptr) {
+    PyErr_Print();
+    throw std::runtime_error(
+        fmt::format("failed to make reifier {}", codeQualname(code)));
   }
+  return Ref<>::steal(reifier);
+#else
+  return Ref<>::create((PyObject*)code);
+#endif
 #endif
   return nullptr;
 }
@@ -467,9 +467,6 @@ void jitFramePopulateFrame([[maybe_unused]] _PyInterpreterFrame* frame) {
   // reifier hook, and deopt needs to keep it attached so slab migration updates
   // PyFrameObject::f_frame.
   frame->return_offset = 0;
-  if (!(code->co_flags & kCoFlagsAnyGenerator)) {
-    frame->owner = FRAME_OWNED_BY_THREAD;
-  }
   int free_offset = code->co_nlocalsplus - numFreevars(code);
   Ci_STACK_TYPE* localsplus = &frame->localsplus[0];
   for (std::size_t i = 0; i < free_offset; i++) {
@@ -478,9 +475,6 @@ void jitFramePopulateFrame([[maybe_unused]] _PyInterpreterFrame* frame) {
   }
 
   jitFrameGetHeader(frame)->rtfs |= JIT_FRAME_INITIALIZED;
-#else
-  throw std::runtime_error{
-      "jitFramePopulateFrame: Lightweight frames are not supported"};
 #endif
 }
 
@@ -517,9 +511,6 @@ void jitFrameRemoveReifier(_PyInterpreterFrame* frame) {
     setFrameFunction(frame, Py_NewRef(func));
   }
 #endif
-#else
-  throw std::runtime_error{
-      "jitFrameRemoveReifier: Lightweight frames are not supported"};
 #endif
 }
 
@@ -561,29 +552,44 @@ FrameHeader* jitFrameGetHeader(_PyInterpreterFrame* frame) {
 #endif
 }
 
+#ifdef ENABLE_LIGHTWEIGHT_FRAMES
 void jitFrameSetFunction(_PyInterpreterFrame* frame, PyFunctionObject* func) {
   jitFrameGetHeader(frame)->func = func;
 }
+#endif
 
 BorrowedRef<PyFunctionObject> jitFrameGetFunction(_PyInterpreterFrame* frame) {
+#ifdef ENABLE_LIGHTWEIGHT_FRAMES
   if constexpr (PY_VERSION_HEX >= 0x030E0000) {
     return frameFunction(frame);
   }
   return reinterpret_cast<PyFunctionObject*>(
       jitFrameGetHeader(frame)->rtfs & ~JIT_FRAME_MASK);
+#else
+  return frameFunction(frame);
+#endif
 }
 
 RuntimeFrameState* jitFrameGetRtfs(_PyInterpreterFrame* frame) {
+#ifdef ENABLE_LIGHTWEIGHT_FRAMES
   assert(hasRtfsFunction(frame));
   assert(!(frameCode(frame)->co_flags & kCoFlagsAnyGenerator));
   return reinterpret_cast<RuntimeFrameState*>(
       jitFrameGetHeader(frame)->rtfs & ~JIT_FRAME_MASK);
+#else
+  throw std::runtime_error{"isJitFrame: Lightweight frames are not supported"};
+#endif
 }
 
 bool hasRtfsFunction(_PyInterpreterFrame* frame) {
+#ifdef ENABLE_LIGHTWEIGHT_FRAMES
   return jitFrameGetHeader(frame)->rtfs & JIT_FRAME_RTFS;
+#else
+  return false;
+#endif
 }
 
+#ifdef ENABLE_LIGHTWEIGHT_FRAMES
 void jitFrameInitLightweight(
     [[maybe_unused]] PyThreadState* tstate,
     _PyInterpreterFrame* frame,
@@ -635,6 +641,7 @@ void jitFrameInitLightweight(
 #endif
   frame->previous = previous;
 }
+#endif
 
 void jitFrameInitNormal(
     [[maybe_unused]] PyThreadState* tstate,
@@ -677,11 +684,13 @@ void jitFrameInit(
     _frameowner owner,
     _PyInterpreterFrame* previous,
     PyObject* reifier) {
+#ifdef ENABLE_LIGHTWEIGHT_FRAMES
   if (getConfig().frame_mode == FrameMode::kLightweight) {
     jitFrameInitLightweight(
         tstate, frame, func, code, owner, previous, reifier);
     return;
   }
+#endif
 
   jitFrameInitNormal(
       tstate, frame, func, code, null_locals_from, owner, previous);
@@ -703,6 +712,7 @@ void jitFrameClearExceptCode(_PyInterpreterFrame* frame) {
     return;
   }
 
+#ifdef ENABLE_LIGHTWEIGHT_FRAMES
   // If we've already initialized this _PyInterpreterFrame, or stock CPython
   // materialized a PyFrameObject from it directly, fall back to CPython's
   // clearing path so escaped frame objects take ownership of the frame data.
@@ -730,6 +740,9 @@ void jitFrameClearExceptCode(_PyInterpreterFrame* frame) {
     jitFrameGetHeader(frame)->rtfs = JIT_FRAME_INITIALIZED;
   }
 #endif
+#else
+  _PyFrame_ClearExceptCode(frame);
+#endif
 }
 
 RuntimeFrameState runtimeFrameStateFromThreadState(PyThreadState* tstate) {
@@ -743,6 +756,7 @@ void deoptAllJitFramesOnStack() {
   if (getConfig().frame_mode != FrameMode::kLightweight) {
     return;
   }
+
   PyInterpreterState* interp = PyInterpreterState_Get();
 
   // In free-threaded builds, other threads are actively running and may be

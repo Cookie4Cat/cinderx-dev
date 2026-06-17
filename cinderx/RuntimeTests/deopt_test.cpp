@@ -56,10 +56,10 @@ static inline Ref<> runInInterpreterViaReify(
       FRAME_OWNED_BY_THREAD,
       nullptr,
       makeFrameReifier(code));
-  if (getConfig().frame_mode == FrameMode::kLightweight) {
-    jit::jitFramePopulateFrame(interp_frame);
-    jit::jitFrameRemoveReifier(interp_frame);
-  }
+#ifdef ENABLE_LIGHTWEIGHT_FRAMES
+  jit::jitFramePopulateFrame(interp_frame);
+  jit::jitFrameRemoveReifier(interp_frame);
+#endif
   reifyFrame(interp_frame, dm, dfm, regs);
   // If we're at the start of the function, push IP past RESUME instruction
 #if PY_VERSION_HEX >= 0x030E0000

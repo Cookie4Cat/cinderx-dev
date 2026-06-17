@@ -26,6 +26,8 @@ enum class FrameFieldKind : uint8_t {
   kFrameReifier,
   kInstrPtr,
   kStackPointer,
+  kBuiltins,
+  kGlobals,
   kZero,
   kOwnerThread,
 };
@@ -44,6 +46,10 @@ constexpr const std::string_view frameFieldKindName(FrameFieldKind kind) {
       return "instr_ptr";
     case FrameFieldKind::kStackPointer:
       return "stackpointer";
+    case FrameFieldKind::kBuiltins:
+      return "builtins";
+    case FrameFieldKind::kGlobals:
+      return "globals";
     case FrameFieldKind::kZero:
       return "zero";
     case FrameFieldKind::kOwnerThread:
@@ -77,8 +83,13 @@ struct FrameInitTable {
   size_t num_groups{0};
 };
 
-// Version-specific field kinds, resolved at compile time.
-#if PY_VERSION_HEX >= 0x030F0000
+// Version/config-specific field kinds, resolved at compile time.
+#ifndef ENABLE_LIGHTWEIGHT_FRAMES
+// No lightweight frames, everything goes where you'd expect
+inline constexpr auto kFuncObjKind = FrameFieldKind::kFuncObj;
+inline constexpr auto kExecutableKind = FrameFieldKind::kExecutable;
+#elif PY_VERSION_HEX >= 0x030F0000
+// 3.15+: store the JIT executable reifier in f_executable.
 constexpr auto kFrameHeaderFuncKind = FrameFieldKind::kZero;
 constexpr auto kFuncObjKind = FrameFieldKind::kFuncObj;
 constexpr auto kExecutableKind = FrameFieldKind::kFrameReifier;
@@ -89,6 +100,8 @@ constexpr auto kFrameHeaderFuncKind = FrameFieldKind::kZero;
 constexpr auto kFuncObjKind = FrameFieldKind::kFuncObj;
 constexpr auto kExecutableKind = FrameFieldKind::kExecutable;
 #else
+// 3.12: store the function in the FrameHeader, reifier in function, executable
+// is normal
 constexpr auto kFrameHeaderFuncKind = FrameFieldKind::kFuncObj;
 constexpr auto kFuncObjKind = FrameFieldKind::kFrameReifier;
 constexpr auto kExecutableKind = FrameFieldKind::kExecutable;
@@ -103,11 +116,14 @@ consteval FrameInitTable buildFrameInitTable() {
 
   // All offsets are relative to the _PyInterpreterFrame pointer.
   // FrameHeader fields have negative offsets.
+
+#ifdef ENABLE_LIGHTWEIGHT_FRAMES
   constexpr int32_t fh = -static_cast<int32_t>(sizeof(jit::FrameHeader));
 
   add(fh + static_cast<int32_t>(offsetof(jit::FrameHeader, func)),
       kFrameHeaderFuncKind,
       DataType::kObject);
+#endif
   add(FRAME_EXECUTABLE_OFFSET, kExecutableKind, DataType::kObject);
   add(static_cast<int32_t>(offsetof(_PyInterpreterFrame, previous)),
       FrameFieldKind::kPrevFrame,
@@ -116,11 +132,11 @@ consteval FrameInitTable buildFrameInitTable() {
       kFuncObjKind,
       DataType::kObject);
   add(FRAME_INSTR_OFFSET, FrameFieldKind::kInstrPtr, DataType::kObject);
-
-#if PY_VERSION_HEX >= 0x030E0000
   add(static_cast<int32_t>(offsetof(_PyInterpreterFrame, f_locals)),
       FrameFieldKind::kZero,
       DataType::kObject);
+
+#if PY_VERSION_HEX >= 0x030E0000
   add(static_cast<int32_t>(offsetof(_PyInterpreterFrame, stackpointer)),
       FrameFieldKind::kStackPointer,
       DataType::kObject);
@@ -135,6 +151,36 @@ consteval FrameInitTable buildFrameInitTable() {
   add(static_cast<int32_t>(offsetof(_PyInterpreterFrame, owner)),
       FrameFieldKind::kOwnerThread,
       DataType::k8bit);
+
+#ifndef ENABLE_LIGHTWEIGHT_FRAMES
+  // Without ENABLE_LIGHTWEIGHT_FRAMES there is no lazy reification so
+  // we must initialize every field the interpreter expects.
+  add(static_cast<int32_t>(offsetof(_PyInterpreterFrame, f_globals)),
+      FrameFieldKind::kGlobals,
+      DataType::kObject);
+  add(static_cast<int32_t>(offsetof(_PyInterpreterFrame, f_builtins)),
+      FrameFieldKind::kBuiltins,
+      DataType::kObject);
+  add(static_cast<int32_t>(offsetof(_PyInterpreterFrame, frame_obj)),
+      FrameFieldKind::kZero,
+      DataType::kObject);
+
+  add(static_cast<int32_t>(offsetof(_PyInterpreterFrame, return_offset)),
+      FrameFieldKind::kZero,
+      DataType::k16bit);
+#if PY_VERSION_HEX >= 0x030E0000
+  // ugly, visited is a bitfield on debug builds and we can't use offset of on
+  // it.
+  add(static_cast<int32_t>(offsetof(_PyInterpreterFrame, owner) + 1),
+      FrameFieldKind::kZero,
+      DataType::k8bit);
+#else
+  add(static_cast<int32_t>(offsetof(_PyInterpreterFrame, stacktop)),
+      FrameFieldKind::kStackPointer,
+      DataType::k32bit);
+#endif
+
+#endif
 
   // Sort by offset (insertion sort for consteval compatibility).
   for (size_t i = 1; i < t.num_fields; i++) {
