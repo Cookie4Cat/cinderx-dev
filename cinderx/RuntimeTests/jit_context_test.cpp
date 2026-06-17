@@ -524,11 +524,9 @@ def func(x):
   jit::CodeRuntime* rt = compiled->runtime();
   ASSERT_NE(rt, nullptr);
 
-  const auto* fs = rt->frameState();
-  ASSERT_NE(fs, nullptr);
-  EXPECT_EQ(fs->code(), func->func_code);
-  EXPECT_NE(fs->builtins(), nullptr);
-  EXPECT_NE(fs->globals(), nullptr);
+  EXPECT_EQ(rt->code(), func->func_code);
+  EXPECT_NE(rt->builtins(), nullptr);
+  EXPECT_NE(rt->globals(), nullptr);
 }
 
 TEST_F(JITFrameTest, CompileAndRunSimpleFunc) {
@@ -1171,7 +1169,7 @@ def gen():
 
   jit::CodeRuntime* rt = jit_ctx_->lookupCodeRuntime(func);
   ASSERT_NE(rt, nullptr);
-  EXPECT_TRUE(rt->frameState()->isGen());
+  EXPECT_TRUE(rt->isGen());
 }
 
 class JITCodeRuntimeExtendedTest : public RuntimeTest {
@@ -1201,10 +1199,9 @@ def func():
 
   jit::CodeRuntime rt{func};
 
-  auto* inlined_fs = rt.allocateRuntimeFrameState(
-      func->func_code, func->func_builtins, func->func_globals);
-  ASSERT_NE(inlined_fs, nullptr);
-  EXPECT_EQ(inlined_fs->code(), func->func_code);
+  EXPECT_EQ(rt.code(), func->func_code);
+  EXPECT_NE(rt.builtins(), nullptr);
+  EXPECT_NE(rt.globals(), nullptr);
 }
 
 TEST_F(JITCodeRuntimeExtendedTest, MultipleDeoptMetadatas) {
@@ -1260,11 +1257,9 @@ def func():
 
   jit::CodeRuntime rt{func};
 
-  const auto* fs = rt.frameState();
-  ASSERT_NE(fs, nullptr);
-  EXPECT_EQ(fs->code(), func->func_code);
-  EXPECT_NE(fs->builtins(), nullptr);
-  EXPECT_NE(fs->globals(), nullptr);
+  EXPECT_EQ(rt.code(), func->func_code);
+  EXPECT_NE(rt.builtins(), nullptr);
+  EXPECT_NE(rt.globals(), nullptr);
 }
 
 TEST_F(JITCodeRuntimeExtendedTest, CompiledFunctionStackSizes) {
@@ -1403,12 +1398,12 @@ def gen():
 
   {
     jit::CodeRuntime rt{normal_func};
-    EXPECT_FALSE(rt.frameState()->isGen());
+    EXPECT_FALSE(rt.isGen());
   }
 
   {
     jit::CodeRuntime rt{gen_func};
-    EXPECT_TRUE(rt.frameState()->isGen());
+    EXPECT_TRUE(rt.isGen());
   }
 }
 
@@ -1563,11 +1558,9 @@ def func():
   EXPECT_GE(rt->frameSize(), 0);
   EXPECT_FALSE(rt->isCleared());
 
-  const auto* frame_state = rt->frameState();
-  ASSERT_NE(frame_state, nullptr);
-  ASSERT_NE(frame_state->code(), nullptr);
-  ASSERT_NE(frame_state->builtins(), nullptr);
-  ASSERT_NE(frame_state->globals(), nullptr);
+  ASSERT_NE(rt->code(), nullptr);
+  ASSERT_NE(rt->builtins(), nullptr);
+  ASSERT_NE(rt->globals(), nullptr);
 }
 
 class JITGeneratorTest : public RuntimeTest {
@@ -1829,7 +1822,7 @@ def gen():
 
   jit::CodeRuntime* rt = compiled->runtime();
   ASSERT_NE(rt, nullptr);
-  EXPECT_TRUE(rt->frameState()->isGen());
+  EXPECT_TRUE(rt->isGen());
 }
 
 TEST_F(JITGeneratorTest, NormalFuncRuntimeIsNotGen) {
@@ -1854,7 +1847,7 @@ def func():
 
   jit::CodeRuntime* rt = compiled->runtime();
   ASSERT_NE(rt, nullptr);
-  EXPECT_FALSE(rt->frameState()->isGen());
+  EXPECT_FALSE(rt->isGen());
 }
 
 namespace {

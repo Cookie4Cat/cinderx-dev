@@ -30,6 +30,7 @@ enum class FrameFieldKind : uint8_t {
   kGlobals,
   kZero,
   kOwnerThread,
+  kFrameHeaderFunc,
 };
 
 constexpr const std::string_view frameFieldKindName(FrameFieldKind kind) {
@@ -54,6 +55,8 @@ constexpr const std::string_view frameFieldKindName(FrameFieldKind kind) {
       return "zero";
     case FrameFieldKind::kOwnerThread:
       return "owner";
+    case FrameFieldKind::kFrameHeaderFunc:
+      return "frame_header_func";
   }
   return "unknown";
 }
@@ -84,25 +87,24 @@ struct FrameInitTable {
 };
 
 // Version/config-specific field kinds, resolved at compile time.
+// These aliases map semantic fields (f_executable, f_funcobj) to the
+// FrameFieldKind that describes what value goes there on each version.
 #ifndef ENABLE_LIGHTWEIGHT_FRAMES
 // No lightweight frames, everything goes where you'd expect
 inline constexpr auto kFuncObjKind = FrameFieldKind::kFuncObj;
 inline constexpr auto kExecutableKind = FrameFieldKind::kExecutable;
 #elif PY_VERSION_HEX >= 0x030F0000
 // 3.15+: store the JIT executable reifier in f_executable.
-constexpr auto kFrameHeaderFuncKind = FrameFieldKind::kZero;
 constexpr auto kFuncObjKind = FrameFieldKind::kFuncObj;
 constexpr auto kExecutableKind = FrameFieldKind::kFrameReifier;
 #elif PY_VERSION_HEX >= 0x030E0000
 // Stock 3.14 has no JIT executable reifier hook, so f_executable remains the
 // code object and f_funcobj remains the function.
-constexpr auto kFrameHeaderFuncKind = FrameFieldKind::kZero;
 constexpr auto kFuncObjKind = FrameFieldKind::kFuncObj;
 constexpr auto kExecutableKind = FrameFieldKind::kExecutable;
 #else
 // 3.12: store the function in the FrameHeader, reifier in function, executable
 // is normal
-constexpr auto kFrameHeaderFuncKind = FrameFieldKind::kFuncObj;
 constexpr auto kFuncObjKind = FrameFieldKind::kFrameReifier;
 constexpr auto kExecutableKind = FrameFieldKind::kExecutable;
 #endif
@@ -121,7 +123,7 @@ consteval FrameInitTable buildFrameInitTable() {
   constexpr int32_t fh = -static_cast<int32_t>(sizeof(jit::FrameHeader));
 
   add(fh + static_cast<int32_t>(offsetof(jit::FrameHeader, func)),
-      kFrameHeaderFuncKind,
+      FrameFieldKind::kFrameHeaderFunc,
       DataType::kObject);
 #endif
   add(FRAME_EXECUTABLE_OFFSET, kExecutableKind, DataType::kObject);

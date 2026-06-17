@@ -4105,10 +4105,7 @@ LIRGenerator::TranslatedBlock LIRGenerator::TranslateOneBasicBlock(
         env_->code_rt->addReference(builtins);
         PyObject* func = instr->func();
         env_->code_rt->addReference(func);
-        RuntimeFrameState* rtfs = env_->code_rt->allocateRuntimeFrameState(
-            code, builtins, globals, func);
-#endif
-#if defined(ENABLE_LIGHTWEIGHT_FRAMES)
+
         // Load the address of our _PyInterpreterFrame and the previous
         // _PyInterpreterFrame we skip past the FrameHeader for this.
         Instruction* caller_frame = bbb.appendInstr(
@@ -4156,18 +4153,19 @@ LIRGenerator::TranslatedBlock LIRGenerator::TranslateOneBasicBlock(
             Instruction::kMove,
             func_reg);
 
-        // Store RTFS in FrameHeader as a tag
-        Instruction* rtfs_reg = bbb.appendInstr(
-            OutVReg{DataType::k64bit},
+        // Store function pointer tagged with JIT_FRAME_INLINED in FrameHeader
+        // to mark this as an inlined frame.
+        Instruction* frame_status_reg = bbb.appendInstr(
+            OutVReg{},
             Instruction::kMove,
-            reinterpret_cast<uintptr_t>(rtfs) | JIT_FRAME_RTFS);
+            reinterpret_cast<uintptr_t>(func) | JIT_FRAME_INLINED);
         bbb.appendInstr(
             OutInd{
                 callee_frame,
                 (Py_ssize_t)offsetof(FrameHeader, func) -
                     (Py_ssize_t)kFrameHeaderOverhead},
             Instruction::kMove,
-            rtfs_reg);
+            frame_status_reg);
 
         bbb.appendInstr(
             OutInd{callee_frame, offsetof(_PyInterpreterFrame, previous)},
@@ -4304,10 +4302,10 @@ LIRGenerator::TranslatedBlock LIRGenerator::TranslateOneBasicBlock(
         }
         auto instr = static_cast<const EndInlinedFunction&>(i);
 
-        // Test to see if RTFS is still in place
+        // Test to see if the frame was materialized (JIT_FRAME_INITIALIZED bit)
         Instruction* callee_frame = getInlinedFrame(bbb, instr.matchingBegin());
-        auto rtfs_reg = bbb.appendInstr(
-            OutVReg{DataType::k64bit},
+        auto frame_status_reg = bbb.appendInstr(
+            OutVReg{},
             Instruction::kMove,
             Ind{callee_frame,
                 (Py_ssize_t)offsetof(FrameHeader, func) -
@@ -4321,7 +4319,10 @@ LIRGenerator::TranslatedBlock LIRGenerator::TranslateOneBasicBlock(
         auto materialized_block = bbb.allocateBlock();
         auto not_materialized_block = bbb.allocateBlock();
         bbb.appendBranch(
-            Instruction::kBranchBitSet, materialized_block, rtfs_reg, Imm{1});
+            Instruction::kBranchBitSet,
+            materialized_block,
+            frame_status_reg,
+            Imm{1});
         bbb.appendBlock(bbb.allocateBlock());
 
         Instruction* frame_obj = bbb.appendInstr(
@@ -5190,6 +5191,16 @@ void LIRGenerator::emitLoadFrame(BasicBlockBuilder& bbb) {
                 Instruction::kMove,
                 cinderx::getModuleState()->frame_reifier.get());
           }
+        case FrameFieldKind::kFrameHeaderFunc:
+#if PY_VERSION_HEX >= 0x030E0000
+          if (zero_reg == nullptr) {
+            zero_reg =
+                bbb.appendInstr(OutVReg{dt}, Instruction::kMove, Imm{0, dt});
+          }
+          return zero_reg;
+#else
+          return env_->asm_func;
+#endif
         case FrameFieldKind::kInstrPtr:
           _Py_CODEUNIT* code_start;
           if constexpr (PY_VERSION_HEX >= 0x030E0000) {

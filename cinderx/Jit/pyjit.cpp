@@ -4155,7 +4155,7 @@ void recordDeoptForRoiBackoff(
     return;
   }
 
-  BorrowedRef<PyCodeObject> code = code_runtime->frameState()->code();
+  BorrowedRef<PyCodeObject> code = code_runtime->code();
   CodeExtra* extra = codeExtra(code);
   if (extra == nullptr) {
     return;
