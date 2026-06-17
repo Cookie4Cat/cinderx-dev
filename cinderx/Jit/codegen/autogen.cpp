@@ -209,7 +209,7 @@ void TranslateOSREntry(Environ* env, const Instruction* instr) {
 }
 
 #if defined(CINDER_AARCH64)
-void emitA64BranchCC(
+void translateBranchCC(
     a64::Builder* as,
     Instruction::Opcode opcode,
     const asmjit::Label& label) {
@@ -221,6 +221,24 @@ void emitA64BranchCC(
     case Instruction::kBranchNZ:
     case Instruction::kBranchNE:
       as->b_ne(label);
+      break;
+    case Instruction::kBranchC:
+      as->b_cs(label);
+      break;
+    case Instruction::kBranchNC:
+      as->b_cc(label);
+      break;
+    case Instruction::kBranchO:
+      as->b_vs(label);
+      break;
+    case Instruction::kBranchNO:
+      as->b_vc(label);
+      break;
+    case Instruction::kBranchS:
+      as->b_mi(label);
+      break;
+    case Instruction::kBranchNS:
+      as->b_pl(label);
       break;
     case Instruction::kBranchA:
       as->b_hi(label);
@@ -261,7 +279,7 @@ void translateA64GuardCC(Environ* env, const Instruction* instr) {
       static_cast<Instruction::Opcode>(instr->getInput(0)->getConstant());
 
   env->aarch64_near_deopt_branches.emplace_back(near_label, deopt_label);
-  emitA64BranchCC(env->as, opcode, near_label);
+  translateBranchCC(env->as, opcode, near_label);
   fillLiveValueLocations(env->code_rt, index, instr, 2, instr->getNumInputs());
   env->deopt_exits.emplace_back(index, deopt_label, instr);
 
@@ -3461,7 +3479,7 @@ void AutoTranslator::translateInstr(Environ* env, const Instruction* instr)
             getLabel(env, instr->getInput(1)));
         return;
       }
-      env->as->b_eq(getLabel(env, instr->getInput(0)));
+      translateBranchCC(env->as, opcode, getLabel(env, instr->getInput(0)));
       return;
     case Instruction::kBranchNZ:
       if (instr->getNumInputs() == 2) {
@@ -3470,55 +3488,25 @@ void AutoTranslator::translateInstr(Environ* env, const Instruction* instr)
             getLabel(env, instr->getInput(1)));
         return;
       }
-      env->as->b_ne(getLabel(env, instr->getInput(0)));
-      return;
-    case Instruction::kBranchA:
-      env->as->b_hi(getLabel(env, instr->getInput(0)));
-      return;
-    case Instruction::kBranchB:
-      env->as->b_lo(getLabel(env, instr->getInput(0)));
-      return;
-    case Instruction::kBranchAE:
-      env->as->b_hs(getLabel(env, instr->getInput(0)));
-      return;
-    case Instruction::kBranchBE:
-      env->as->b_ls(getLabel(env, instr->getInput(0)));
-      return;
-    case Instruction::kBranchG:
-      env->as->b_gt(getLabel(env, instr->getInput(0)));
-      return;
-    case Instruction::kBranchL:
-      env->as->b_lt(getLabel(env, instr->getInput(0)));
-      return;
-    case Instruction::kBranchGE:
-      env->as->b_ge(getLabel(env, instr->getInput(0)));
-      return;
-    case Instruction::kBranchLE:
-      env->as->b_le(getLabel(env, instr->getInput(0)));
+      translateBranchCC(env->as, opcode, getLabel(env, instr->getInput(0)));
       return;
     case Instruction::kBranchC:
-      env->as->b_cs(getLabel(env, instr->getInput(0)));
-      return;
     case Instruction::kBranchNC:
-      env->as->b_cc(getLabel(env, instr->getInput(0)));
-      return;
     case Instruction::kBranchO:
-      env->as->b_vs(getLabel(env, instr->getInput(0)));
-      return;
     case Instruction::kBranchNO:
-      env->as->b_vc(getLabel(env, instr->getInput(0)));
-      return;
     case Instruction::kBranchS:
-      env->as->b_mi(getLabel(env, instr->getInput(0)));
-      return;
     case Instruction::kBranchNS:
-      env->as->b_pl(getLabel(env, instr->getInput(0)));
-      return;
+    case Instruction::kBranchA:
+    case Instruction::kBranchB:
+    case Instruction::kBranchAE:
+    case Instruction::kBranchBE:
+    case Instruction::kBranchG:
+    case Instruction::kBranchL:
+    case Instruction::kBranchGE:
+    case Instruction::kBranchLE:
     case Instruction::kBranchE:
-      env->as->b_eq(getLabel(env, instr->getInput(0)));
-      return;
     case Instruction::kBranchNE:
-      env->as->b_ne(getLabel(env, instr->getInput(0)));
+      translateBranchCC(env->as, opcode, getLabel(env, instr->getInput(0)));
       return;
     case Instruction::kCmpBranchZero:
       env->as->cbz(
