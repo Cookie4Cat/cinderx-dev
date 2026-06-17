@@ -776,6 +776,9 @@ static void cleanupFrameExecutable(_PyInterpreterFrame* frame) {
 // keeps the function alive. Incref now to balance the decref that
 // jitFrameClearExceptCode will perform.
 static void increfFuncObjForNonGenerator(_PyInterpreterFrame* frame) {
+  if (jit::getConfig().frame_mode != jit::FrameMode::kLightweight) {
+    return;
+  }
 #if PY_VERSION_HEX >= 0x030E0000 && PY_VERSION_HEX < 0x030F0000
   // The 3.14 port eagerly materializes CPython-visible frame fields and keeps
   // the setup-time function reference, so clear paths do not need a top-up ref.

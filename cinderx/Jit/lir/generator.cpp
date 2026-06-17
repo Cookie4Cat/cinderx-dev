@@ -5219,11 +5219,11 @@ void LIRGenerator::emitLoadFrame(BasicBlockBuilder& bbb) {
         Instruction::kMove,
         PhyReg{codegen::arch::reg_general_auxilary_return_loc});
 #if defined(CINDER_AARCH64) && defined(ENABLE_LIGHTWEIGHT_FRAMES)
-    // Now that FP points at the heap-allocated GenDataFooter, compute the
-    // deopt_idx address.  This must happen after the FP swap above —
-    // the kLea uses FP as its base register.
-    // TranslateOneBasicBlock reuses this for all deopt index stores.
     if (getConfig().frame_mode == FrameMode::kLightweight) {
+      // Now that FP points at the heap-allocated GenDataFooter, compute the
+      // deopt_idx address.  This must happen after the FP swap above —
+      // the kLea uses FP as its base register.
+      // TranslateOneBasicBlock reuses this for all deopt index stores.
       int32_t deopt_idx_offset = static_cast<int32_t>(
           offsetof(GenDataFooter, frame_header) +
           offsetof(FrameHeader, deopt_idx));

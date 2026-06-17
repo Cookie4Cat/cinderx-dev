@@ -446,6 +446,9 @@ void jitFramePopulateFrame([[maybe_unused]] _PyInterpreterFrame* frame) {
   // reifier hook, and deopt needs to keep it attached so slab migration updates
   // PyFrameObject::f_frame.
   frame->return_offset = 0;
+  if (!(code->co_flags & kCoFlagsAnyGenerator)) {
+    frame->owner = FRAME_OWNED_BY_THREAD;
+  }
   int free_offset = code->co_nlocalsplus - numFreevars(code);
   Ci_STACK_TYPE* localsplus = &frame->localsplus[0];
   for (std::size_t i = 0; i < free_offset; i++) {
@@ -602,7 +605,11 @@ void jitFrameInitLightweight(
 #ifdef Py_GIL_DISABLED
   frame->tlbc_index = 0;
 #endif
+#if PY_VERSION_HEX >= 0x030F0000
   setFrameCode(frame, reifier);
+#else
+  setFrameCode(frame, (PyObject*)code);
+#endif
   setFrameFunction(frame, (PyObject*)Py_NewRef(func));
   jitFrameGetHeader(frame)->frame_status = 0;
 #if defined(CINDER_AARCH64)
