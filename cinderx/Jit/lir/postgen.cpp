@@ -323,7 +323,12 @@ RewriteResult rewriteLoadArg(instr_iter_t instr_iter, Environ* env) {
   JIT_CHECK(instr->getNumInputs() == 1, "expected one input");
   OperandBase* input = instr->getInput(0);
   JIT_CHECK(input->isImm(), "expected constant arg index as input");
-  auto arg_idx = input->getConstant();
+  size_t arg_idx = input->getConstant();
+  JIT_CHECK(
+      arg_idx < env->arg_locations.size(),
+      "arg index {} out of range for {} arg locations",
+      arg_idx,
+      env->arg_locations.size());
   auto loc = env->arg_locations[arg_idx];
   static_cast<Operand*>(input)->setPhyRegOrStackSlot(loc);
   static_cast<Operand*>(input)->setDataType(instr->output()->dataType());

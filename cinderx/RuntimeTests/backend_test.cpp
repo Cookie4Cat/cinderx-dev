@@ -20,6 +20,7 @@
 #include "cinderx/module_state.h"
 
 #include <functional>
+// NOLINTNEXTLINE(facebook-hte-BadInclude-regex)
 #include <regex>
 #include <sstream>
 
@@ -197,7 +198,8 @@ class BackendTest : public RuntimeTest {
     EXPECT_EQ(result.error, asmjit::kErrorOk);
     EXPECT_TRUE(code_allocator->contains(result.addr))
         << "Compiled function should exist within the CodeAllocator";
-    gen.lir_func_.release();
+    Function* caller_owned_lir_func = gen.lir_func_.release();
+    EXPECT_EQ(caller_owned_lir_func, lir_func);
     return result.addr;
   }
 
@@ -904,19 +906,34 @@ TEST_F(BackendTest, MoveSequenceOptTest) {
   [RBP - 16]:Object = Move RAX:Object
   [RBP - 24]:Object = Move RSI:Object
         RDI:Object = Move RAX:Object
+        RSI:Object = Move [RBP - 24]:Object
         RDX:Object = Move RCX:Object
                      Call Object
+
+  [RBP - 32] is deleted: lastUse with no later stack reads.
+  RSI = Move [RBP - 24] is a self-reload (RSI spilled and loaded back to RSI).
+  It is left intact because reg == out_reg skips the rewrite.
   */
-  ASSERT_EQ(bb->getNumInstrs(), 5);
+  ASSERT_EQ(bb->getNumInstrs(), 6);
   auto& instrs = bb->instructions();
 
   auto iter = instrs.begin();
 
-  ASSERT_EQ((*(iter++))->opcode(), Instruction::kMove);
-  ASSERT_EQ((*(iter++))->opcode(), Instruction::kMove);
-  ASSERT_EQ((*(iter++))->opcode(), Instruction::kMove);
-  ASSERT_EQ((*(iter++))->opcode(), Instruction::kMove);
-  ASSERT_EQ((*(iter++))->opcode(), Instruction::kCall);
+  auto* spill0 = (*(iter++)).get();
+  auto* spill1 = (*(iter++)).get();
+  auto* arg0 = (*(iter++)).get();
+  auto* arg1 = (*(iter++)).get();
+  auto* arg2 = (*(iter++)).get();
+  auto* call_instr = (*(iter++)).get();
+
+  ASSERT_EQ(spill0->opcode(), Instruction::kMove);
+  ASSERT_EQ(spill1->opcode(), Instruction::kMove);
+  ASSERT_EQ(arg0->opcode(), Instruction::kMove);
+  ASSERT_EQ(arg0->getInput(0)->type(), OperandBase::kReg);
+  ASSERT_EQ(arg1->opcode(), Instruction::kMove);
+  ASSERT_EQ(arg1->getInput(0)->type(), OperandBase::kStack);
+  ASSERT_EQ(arg2->opcode(), Instruction::kMove);
+  ASSERT_EQ(call_instr->opcode(), Instruction::kCall);
 }
 
 TEST_F(BackendTest, MoveSequenceOpt2Test) {
@@ -975,6 +992,80 @@ TEST_F(BackendTest, MoveSequenceOpt2Test) {
   ASSERT_EQ((*iter)->opcode(), Instruction::kAdd);
   ASSERT_EQ((*iter)->getInput(1)->type(), OperandBase::kStack);
 #endif
+}
+
+TEST_F(BackendTest, MoveSequenceOptLeavesSelfReloadsIntact) {
+  auto lirfunc = std::make_unique<Function>();
+  auto bb = lirfunc->allocateBasicBlock();
+  auto epilogue = lirfunc->allocateBasicBlock();
+
+  const PhyLocation kSharedSlot{-16, 64};
+  const PhyLocation kReloadReg = ARGUMENT_REGS[0];
+  constexpr uint64_t kExpected = 4;
+
+  // Set up the previously failing case:
+  //
+  //   [RBP - 16] = Move RSI
+  //          RSI = Move [RBP - 16]   ; writes RSI, does not consume cached RSI
+  //          RAX = Move [RBP - 16]   ; later stack read still needs the spill
+  //
+  // A bad rewrite would turn the middle instruction into `RSI = Move RSI` and
+  // then conclude the spill is dead. This test checks that we keep both the
+  // spill store and the explicit self-reload in the block.
+  // Make a deleted spill observable instead of reading arbitrary stack data.
+  bb->allocateInstr(
+      Instruction::kMove,
+      nullptr,
+      OutStk{kSharedSlot, OperandBase::k64bit},
+      Imm{kExpected - kExpected, OperandBase::k64bit});
+  bb->allocateInstr(
+      Instruction::kMove,
+      nullptr,
+      OutPhyReg{kReloadReg, OperandBase::k64bit},
+      Imm{kExpected, OperandBase::k64bit});
+  bb->allocateInstr(
+      Instruction::kMove,
+      nullptr,
+      OutStk{kSharedSlot, OperandBase::k64bit},
+      PhyReg{kReloadReg, OperandBase::k64bit});
+
+  auto self_reload = bb->allocateInstr(
+      Instruction::kMove,
+      nullptr,
+      OutPhyReg{kReloadReg, OperandBase::k64bit},
+      Stk{kSharedSlot, OperandBase::k64bit});
+  self_reload->getInput(0)->setLastUse();
+  bb->allocateInstr(
+      Instruction::kMove,
+      nullptr,
+      OutPhyReg{arch::reg_general_return_loc, OperandBase::k64bit},
+      Stk{kSharedSlot, OperandBase::k64bit});
+  bb->allocateInstr(Instruction::kReturn, nullptr);
+  bb->addSuccessor(epilogue);
+
+  auto func = reinterpret_cast<uint64_t (*)()>(SimpleCompile(lirfunc.get()));
+
+  bool saw_spill = false;
+  bool saw_self_reload = false;
+  for (auto& instr : bb->instructions()) {
+    if (!instr->isMove()) {
+      continue;
+    }
+    auto* out = instr->output();
+    auto* in = instr->getInput(0);
+    if (out->isStack() && out->getStackSlot().loc == kSharedSlot.loc &&
+        in->isReg() && in->getPhyRegister() == kReloadReg) {
+      saw_spill = true;
+    }
+    if (out->isReg() && out->getPhyRegister() == kReloadReg && in->isStack() &&
+        in->getStackSlot().loc == kSharedSlot.loc) {
+      saw_self_reload = true;
+    }
+  }
+
+  EXPECT_TRUE(saw_spill);
+  EXPECT_TRUE(saw_self_reload);
+  EXPECT_EQ(func(), kExpected);
 }
 
 TEST_F(BackendTest, CastTest) {
