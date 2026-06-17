@@ -512,6 +512,23 @@ _PyInterpreterFrame* convertInterpreterFrameFromStackToSlab(
   if (new_frame->frame_obj != nullptr) {
     new_frame->frame_obj->f_frame = new_frame;
   }
+
+  // Non-generator frames don't incref f_funcobj during setup in the 3.15+
+  // lightweight-frame path. Now that we're handing the frame to the
+  // interpreter, incref to balance the clear path. The 3.14 port eagerly
+  // materializes frame metadata, so it keeps the setup-time func reference.
+#if PY_VERSION_HEX >= 0x030F0000
+  Py_INCREF(PyStackRef_AsPyObjectBorrow(new_frame->f_funcobj));
+#elif PY_VERSION_HEX >= 0x030E0000
+  // 3.14 keeps the setup-time func reference.
+#elif !defined(ENABLE_LIGHTWEIGHT_FRAMES)
+  Py_INCREF(new_frame->f_funcobj);
+#else
+  if (!isInlinedFrame(frame)) {
+    Py_INCREF(new_frame->f_funcobj);
+  }
+#endif
+
   return new_frame;
 }
 

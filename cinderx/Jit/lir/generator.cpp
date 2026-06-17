@@ -1165,7 +1165,8 @@ void LIRGenerator::GenerateExitBlocks() {
       executable = reinterpret_cast<PyObject*>(func_->code.get());
       exec_dtor = PyCode_Type.tp_dealloc;
 #endif
-      emitUnlinkFrame(bbb, has_freevars, env_->asm_func, executable, exec_dtor);
+      emitUnlinkFrame(
+          bbb, has_freevars, is_gen_, env_->asm_func, executable, exec_dtor);
     }
 
     // EpilogueEnd goes on the builder's current block which may differ
@@ -4453,13 +4454,7 @@ LIRGenerator::TranslatedBlock LIRGenerator::TranslateOneBasicBlock(
           bbb.annotateNext("Incref executable/reifier");
           makeIncref(bbb, executable_reg, false);
         }
-        // Incref funcobj.
-        // Without LW frames, _PyFrame_ClearExceptCode will DECREF f_funcobj
-        // during frame teardown, so we must INCREF it here to maintain the
-        // reference balance.  With LW frames on 3.12 the reifier stored in
-        // f_funcobj is managed separately and the inline cleanup path skips
-        // its decref, so the incref is only needed on 3.13+ or non-LW builds.
-#if PY_VERSION_HEX >= 0x030D0000 || !defined(ENABLE_LIGHTWEIGHT_FRAMES)
+#if PY_VERSION_HEX >= 0x030E0000 && PY_VERSION_HEX < 0x030F0000
         if (!_Py_IsImmortal(funcobj_val)) {
           bbb.annotateNext("Incref funcobj");
           makeIncref(bbb, funcobj_reg, false);
@@ -4480,28 +4475,34 @@ LIRGenerator::TranslatedBlock LIRGenerator::TranslateOneBasicBlock(
         BorrowedRef<PyCodeObject> code = instr.matchingBegin()->code();
         bool has_freevars = code->co_nfreevars > 0;
 
-        Instruction* func_reg = nullptr;
         PyObject* executable;
         std::optional<destructor> exec_dtor;
 #if PY_VERSION_HEX >= 0x030F0000 && defined(ENABLE_LIGHTWEIGHT_FRAMES)
         BorrowedRef<> reifier = inline_code_to_reifier_.at(code.get());
         executable = reifier.get();
         exec_dtor = PyUnstable_JITExecutable_Type.tp_dealloc;
-#elif PY_VERSION_HEX >= 0x030E0000
-        executable = code.getObj();
-        exec_dtor = PyCode_Type.tp_dealloc;
-        {
-          PyObject* func = instr.matchingBegin()->func();
-          if (!_Py_IsImmortal(func)) {
-            func_reg = bbb.appendInstr(OutVReg{}, Instruction::kMove, func);
-          }
-        }
 #else
-        executable = code.getObj();
         exec_dtor = PyCode_Type.tp_dealloc;
+        executable = code.getObj();
 #endif
+
+        Instruction* func_reg = nullptr;
+        PyFunctionObject* func = instr.matchingBegin()->func();
+        if (!_Py_IsImmortal(func)) {
+          func_reg = bbb.appendInstr(OutVReg{}, Instruction::kMove, func);
+        }
+
+        bool is_generator =
+            reinterpret_cast<PyCodeObject*>(func->func_code)->co_flags &
+            jit::kCoFlagsAnyGenerator;
         emitUnlinkFrame(
-            bbb, has_freevars, func_reg, executable, exec_dtor, callee_frame);
+            bbb,
+            has_freevars,
+            is_generator,
+            func_reg,
+            executable,
+            exec_dtor,
+            callee_frame);
         break;
       }
       case Opcode::kCompactLongUnbox: {
@@ -5458,8 +5459,15 @@ void LIRGenerator::emitLoadFrame(BasicBlockBuilder& bbb) {
     if (!_Py_IsImmortal(executable_or_reifier_obj)) {
       makeIncref(bbb, executable_or_reifier, false);
     }
+#if PY_VERSION_HEX >= 0x030E0000 && PY_VERSION_HEX < 0x030F0000
     bbb.annotateNext("Incref func");
     makeIncref(bbb, env_->asm_func, false);
+#else
+    if (is_gen_) {
+      bbb.annotateNext("Incref func");
+      makeIncref(bbb, env_->asm_func, false);
+    }
+#endif
 
     // Link frame into tstate.
     bbb.annotateNext("Set _PyInterpreterFrame as topmost frame");
@@ -5473,6 +5481,7 @@ void LIRGenerator::emitLoadFrame(BasicBlockBuilder& bbb) {
 void LIRGenerator::emitUnlinkFrame(
     BasicBlockBuilder& bbb,
     bool has_freevars,
+    bool is_generator,
     Instruction* func_reg,
     PyObject* executable,
     std::optional<destructor> exec_dtor,
@@ -5481,11 +5490,11 @@ void LIRGenerator::emitUnlinkFrame(
     bbb.appendInvokeInstruction(JITRT_UnlinkFrame, env_->asm_tstate);
   } else if (!env_->can_deopt) {
     emitInlineUnlinkLeafFrame(
-        bbb, func_reg, executable, exec_dtor, callee_frame);
+        bbb, is_generator, func_reg, executable, exec_dtor, callee_frame);
 #ifdef ENABLE_LIGHTWEIGHT_FRAMES
   } else {
     emitInlineUnlinkFastFrame(
-        bbb, func_reg, executable, exec_dtor, callee_frame);
+        bbb, is_generator, func_reg, executable, exec_dtor, callee_frame);
 #else
   } else {
     bbb.appendInvokeInstruction(
@@ -5496,6 +5505,7 @@ void LIRGenerator::emitUnlinkFrame(
 
 void LIRGenerator::emitInlineUnlinkLeafFrame(
     BasicBlockBuilder& bbb,
+    bool is_generator,
     Instruction* func_reg,
     PyObject* executable,
     std::optional<destructor> exec_dtor,
@@ -5511,7 +5521,13 @@ void LIRGenerator::emitInlineUnlinkLeafFrame(
 
   cfa.store(prev);
 
-  if (func_reg != nullptr) {
+  if (func_reg != nullptr &&
+#if PY_VERSION_HEX >= 0x030E0000 && PY_VERSION_HEX < 0x030F0000
+      true
+#else
+      is_generator
+#endif
+  ) {
     makeDecref(
         bbb,
         func_reg,
@@ -5528,6 +5544,7 @@ void LIRGenerator::emitInlineUnlinkLeafFrame(
 
 void LIRGenerator::emitInlineUnlinkFastFrame(
     BasicBlockBuilder& bbb,
+    bool is_generator,
     Instruction* func_reg,
     PyObject* executable,
     std::optional<destructor> exec_dtor,
@@ -5537,9 +5554,10 @@ void LIRGenerator::emitInlineUnlinkFastFrame(
 
   auto done_block = bbb.allocateBlock();
   auto not_materialized = bbb.allocateBlock();
-  auto check_frame_obj = bbb.allocateBlock();
   auto materialized_block = bbb.allocateBlock();
 
+#if PY_VERSION_HEX >= 0x030F0000
+  auto check_frame_obj = bbb.allocateBlock();
   Instruction* frame_status = bbb.appendInstr(
       OutVReg{},
       Instruction::kMove,
@@ -5550,6 +5568,15 @@ void LIRGenerator::emitInlineUnlinkFastFrame(
   static_assert(JIT_FRAME_INITIALIZED == 2);
   bbb.appendBranch(
       Instruction::kBranchBitNotSet, check_frame_obj, frame_status, Imm{1});
+#else
+  Instruction* frame_obj_reg = bbb.appendInstr(
+      OutVReg{},
+      Instruction::kMove,
+      Ind{frame,
+          static_cast<int32_t>(offsetof(_PyInterpreterFrame, frame_obj))});
+  bbb.appendInstr(Instruction::kTest, frame_obj_reg, frame_obj_reg);
+  bbb.appendBranch(Instruction::kBranchZ, not_materialized);
+#endif
 
   {
     bbb.appendBlock(materialized_block);
@@ -5560,6 +5587,7 @@ void LIRGenerator::emitInlineUnlinkFastFrame(
     bbb.appendBranch(Instruction::kBranch, done_block);
   }
 
+#if PY_VERSION_HEX >= 0x030F0000
   bbb.switchBlock(check_frame_obj);
   Instruction* frame_obj_reg = bbb.appendInstr(
       OutVReg{},
@@ -5569,6 +5597,7 @@ void LIRGenerator::emitInlineUnlinkFastFrame(
   bbb.appendInstr(Instruction::kTest, frame_obj_reg, frame_obj_reg);
   bbb.appendBranch(Instruction::kBranchNZ, materialized_block);
   bbb.appendBranch(Instruction::kBranch, not_materialized);
+#endif
 
   bbb.switchBlock(not_materialized);
 
@@ -5580,7 +5609,13 @@ void LIRGenerator::emitInlineUnlinkFastFrame(
 
   cfa.store(prev);
 
-  if (func_reg != nullptr) {
+  if (func_reg != nullptr &&
+#if PY_VERSION_HEX >= 0x030E0000 && PY_VERSION_HEX < 0x030F0000
+      true
+#else
+      is_generator
+#endif
+  ) {
     makeDecref(
         bbb,
         func_reg,

@@ -772,19 +772,25 @@ static void cleanupFrameExecutable(_PyInterpreterFrame* frame) {
 #endif
 }
 
-// Non-generator lightweight frames do not own an extra f_funcobj reference in
-// the common fast path. If clearing transfers the frame to CPython, balance the
-// clear path's decref before handing ownership over.
+// Non-generator frames don't incref f_funcobj during setup — the caller
+// keeps the function alive. Incref now to balance the decref that
+// jitFrameClearExceptCode will perform.
 static void increfFuncObjForNonGenerator(_PyInterpreterFrame* frame) {
-  if (jit::getConfig().frame_mode != jit::FrameMode::kLightweight) {
-    return;
-  }
+#if PY_VERSION_HEX >= 0x030E0000 && PY_VERSION_HEX < 0x030F0000
+  // The 3.14 port eagerly materializes CPython-visible frame fields and keeps
+  // the setup-time function reference, so clear paths do not need a top-up ref.
+  return;
+#endif
   if (frameCode(frame)->co_flags & jit::kCoFlagsAnyGenerator) {
     return;
   }
 #if PY_VERSION_HEX >= 0x030E0000
   Py_INCREF(PyStackRef_AsPyObjectBorrow(frame->f_funcobj));
 #elif defined(ENABLE_LIGHTWEIGHT_FRAMES)
+  // On 3.12+LW, f_funcobj holds the reifier, not the function. The
+  // function lives in FrameHeader.func. For inlined frames,
+  // jitFrameRemoveReifier already handles the incref via Py_NewRef,
+  // so only incref for non-inlined (top-level) frames here.
   if (!jit::isInlinedFrame(frame)) {
     Py_XINCREF(jit::jitFrameGetFunction(frame));
   }
@@ -803,6 +809,11 @@ void JITRT_UnlinkFrame(PyThreadState* tstate) {
 
   // This is needed particularly because it handles the work of copying
   // data to a PyFrameObject if one has escaped the function.
+#if !(PY_VERSION_HEX >= 0x030E0000 && PY_VERSION_HEX < 0x030F0000)
+  if (jit::getConfig().frame_mode == jit::FrameMode::kLightweight) {
+    increfFuncObjForNonGenerator(frame);
+  }
+#endif
   jit::jitFrameClearExceptCode(frame);
   cleanupFrameExecutable(frame);
 
@@ -845,29 +856,13 @@ void JITRT_UnlinkLightweightFrameFast(PyThreadState* tstate) {
 
   // Fast path for non-generator frames with no freevars.
   // The frame header is directly before the frame for non-generators.
-#ifdef ENABLE_LIGHTWEIGHT_FRAMES
-  auto* header = reinterpret_cast<jit::FrameHeader*>(frame) - 1;
-  if ((header->frame_status & JIT_FRAME_INITIALIZED) ||
-      frame->frame_obj != nullptr) {
-    // Frame was materialized by the runtime, use the slow path.
-    increfFuncObjForNonGenerator(frame);
-    jit::jitFrameClearExceptCode(frame);
-  } else {
-    // Common case: just close the function object.
-    Ci_STACK_CLOSE(frame->f_funcobj);
-  }
-
-  cleanupLightweightFrameExecutable(frame, header);
-#else
   if (frame->frame_obj != nullptr) {
     // Frame was materialized by the runtime, use the slow path.
+    increfFuncObjForNonGenerator(frame);
+
     jit::jitFrameClearExceptCode(frame);
-  } else {
-    // Common case: just close the function object.
-    Ci_STACK_CLOSE(frame->f_funcobj);
   }
   cleanupFrameExecutable(frame);
-#endif
 }
 
 void JITRT_UnlinkLeafFrame(PyThreadState* tstate) {
@@ -876,8 +871,16 @@ void JITRT_UnlinkLeafFrame(PyThreadState* tstate) {
 
 #ifdef ENABLE_LIGHTWEIGHT_FRAMES
   auto* header = reinterpret_cast<jit::FrameHeader*>(frame) - 1;
-  if ((header->frame_status & JIT_FRAME_INITIALIZED) ||
-      frame->frame_obj != nullptr) {
+#if PY_VERSION_HEX >= 0x030E0000 && PY_VERSION_HEX < 0x030F0000
+  // On 3.14, frame setup marks lightweight frames initialized even when the
+  // frame has not escaped. Only an attached PyFrameObject needs the clear path.
+  const bool frame_was_materialized = frame->frame_obj != nullptr;
+#else
+  const bool frame_was_materialized =
+      (header->frame_status & JIT_FRAME_INITIALIZED) ||
+      frame->frame_obj != nullptr;
+#endif
+  if (frame_was_materialized) {
     increfFuncObjForNonGenerator(frame);
     jit::jitFrameClearExceptCode(frame);
     cleanupLightweightFrameExecutable(frame, header);
