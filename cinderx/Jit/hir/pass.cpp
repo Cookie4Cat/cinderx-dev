@@ -539,6 +539,8 @@ Type outputType(
     case Opcode::kHintType:
     case Opcode::kIncref:
     case Opcode::kInitFrameCellVars:
+    case Opcode::kInitListElements:
+    case Opcode::kInitTupleElements:
     case Opcode::kLoadFrame:
     case Opcode::kOSREntry:
     case Opcode::kRaise:
