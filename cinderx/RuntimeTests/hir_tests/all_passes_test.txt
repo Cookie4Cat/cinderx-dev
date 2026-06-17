@@ -543,7 +543,7 @@ fun jittestmodule:test {
     }
     v16:MortalUnicodeExact["foo"] = LoadConst<MortalUnicodeExact["foo"]>
     UpdatePrevInstr<idx:8 line_no:2: no parent>
-    v18:Bool = VectorCall<2> v14 v8 v16 {
+    v18:ImmortalBool = VectorCall<2> v14 v8 v16 {
       LiveValues<3> b:v8 b:v14 b:v16
       FrameState {
         CurInstrOffset 16
@@ -658,7 +658,7 @@ fun jittestmodule:test {
 
   bb 1 (preds 0, 2) {
     UpdatePrevInstr<idx:2 line_no:2: no parent>
-    v13:Bool = Compare<In> v6 v7 {
+    v13:ImmortalBool = Compare<In> v6 v7 {
       LiveValues<2> b:v6 b:v7
       FrameState {
         CurInstrOffset 4
@@ -764,7 +764,7 @@ fun jittestmodule:test {
 
   bb 1 (preds 0, 2) {
     UpdatePrevInstr<idx:2 line_no:2: no parent>
-    v13:Bool = Compare<NotIn> v6 v7 {
+    v13:ImmortalBool = Compare<NotIn> v6 v7 {
       LiveValues<2> b:v6 b:v7
       FrameState {
         CurInstrOffset 4
