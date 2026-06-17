@@ -208,8 +208,73 @@ void TranslateOSREntry(Environ* env, const Instruction* instr) {
   }
 }
 
+#if defined(CINDER_AARCH64)
+void emitA64BranchCC(
+    a64::Builder* as,
+    Instruction::Opcode opcode,
+    const asmjit::Label& label) {
+  switch (opcode) {
+    case Instruction::kBranchZ:
+    case Instruction::kBranchE:
+      as->b_eq(label);
+      break;
+    case Instruction::kBranchNZ:
+    case Instruction::kBranchNE:
+      as->b_ne(label);
+      break;
+    case Instruction::kBranchA:
+      as->b_hi(label);
+      break;
+    case Instruction::kBranchB:
+      as->b_lo(label);
+      break;
+    case Instruction::kBranchAE:
+      as->b_hs(label);
+      break;
+    case Instruction::kBranchBE:
+      as->b_ls(label);
+      break;
+    case Instruction::kBranchG:
+      as->b_gt(label);
+      break;
+    case Instruction::kBranchL:
+      as->b_lt(label);
+      break;
+    case Instruction::kBranchGE:
+      as->b_ge(label);
+      break;
+    case Instruction::kBranchLE:
+      as->b_le(label);
+      break;
+    default:
+      JIT_ABORT(
+          "Unsupported AArch64 condition branch opcode {}",
+          static_cast<int>(opcode));
+  }
+}
+
+void translateA64GuardCC(Environ* env, const Instruction* instr) {
+  auto index = static_cast<size_t>(instr->getInput(1)->getConstant());
+  auto deopt_label = env->as->newLabel();
+  auto near_label = env->as->newLabel();
+  auto opcode =
+      static_cast<Instruction::Opcode>(instr->getInput(0)->getConstant());
+
+  env->aarch64_near_deopt_branches.emplace_back(near_label, deopt_label);
+  emitA64BranchCC(env->as, opcode, near_label);
+  fillLiveValueLocations(env->code_rt, index, instr, 2, instr->getNumInputs());
+  env->deopt_exits.emplace_back(index, deopt_label, instr);
+
+  if (!env->pending_debug_locs.empty() && instr->origin() != nullptr &&
+      env->pending_debug_locs.back().instr == instr->origin()) {
+    env->callsite_deopt_pending.emplace_back(
+        env->pending_debug_locs.back().label, deopt_label);
+  }
+}
+#endif
+
 // Translate GUARD instruction
-void TranslateGuard(Environ* env, const Instruction* instr) {
+void translateGuard(Environ* env, const Instruction* instr) {
 #if defined(CINDER_X86_64)
   auto as = env->as;
 
@@ -2950,7 +3015,7 @@ void AutoTranslator::translateInstr(Environ* env, const Instruction* instr)
       env->as->jne(getLabel(env, instr->getInput(0)));
       return;
     case Instruction::kGuard:
-      TranslateGuard(env, instr);
+      translateGuard(env, instr);
       return;
     case Instruction::kDeoptPatchpoint:
       TranslateDeoptPatchpoint(env, instr);
@@ -3447,8 +3512,11 @@ void AutoTranslator::translateInstr(Environ* env, const Instruction* instr)
       env->as->cbnz(
           getGpWiden(instr->getInput(0)), getLabel(env, instr->getInput(1)));
       return;
+    case Instruction::kA64GuardCC:
+      translateA64GuardCC(env, instr);
+      return;
     case Instruction::kGuard:
-      TranslateGuard(env, instr);
+      translateGuard(env, instr);
       return;
     case Instruction::kDeoptPatchpoint:
       TranslateDeoptPatchpoint(env, instr);

@@ -211,8 +211,8 @@ enum OperandSizeType {
   X(TreeIterLeaveCurrentNode, false, FlagEffects::kInvalidate, kDefault, 0, {}, 1) \
   X(ClearTreeIterState, false, FlagEffects::kInvalidate, kDefault, 0, {}, 1) \
   X(CmpBranchZero, false, FlagEffects::kNone, kDefault, 0, {1}, 1)            \
-  X(CmpBranchNonZero, false, FlagEffects::kNone, kDefault, 0, {1}, 1)
-
+  X(CmpBranchNonZero, false, FlagEffects::kNone, kDefault, 0, {1}, 1)        \
+  X(A64GuardCC, false, FlagEffects::kInvalidate, kDefault, 0, {0, 0}, 1)
 // Instruction class defines instructions in LIR.
 // Every instruction can have no more than one output, but arbitrary
 // number of inputs. The instruction logically has no output also

@@ -878,6 +878,7 @@ RewriteResult rewriteMemoryInputsToReg(instr_iter_t instr_iter) {
     case Instruction::kCall:
     case Instruction::kVectorCall:
     case Instruction::kVarArgCall:
+    case Instruction::kA64GuardCC:
     case Instruction::kGuard:
     case Instruction::kDeoptPatchpoint:
     case Instruction::kSelect:
