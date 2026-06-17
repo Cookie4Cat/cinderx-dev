@@ -1874,6 +1874,16 @@ Register* simplifyLoadAttr(Env& env, const LoadAttr* load_attr) {
     BorrowedRef<PyTypeObject> type{ty.runtimePyType()};
 
     if (type == &PyModule_Type || type == &Ci_StrictModule_Type) {
+      BorrowedRef<PyUnicodeObject> attr_name{load_attr->name()};
+      // TODO: This is a temporary mitigation for package search path state.
+      // LoadModuleAttrCached should eventually be fixed by making global
+      // cache / dict watcher invalidation correctly cover importlib-managed
+      // module __path__ updates, then this per-attribute exclusion can be
+      // removed.
+      if (type == &PyModule_Type &&
+          PyUnicode_CompareWithASCIIString(attr_name, "__path__") == 0) {
+        return nullptr;
+      }
       return env.emit<LoadModuleAttrCached>(
           load_attr->GetOperand(0),
           load_attr->name_idx(),
