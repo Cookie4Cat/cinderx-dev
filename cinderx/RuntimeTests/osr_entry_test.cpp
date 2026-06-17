@@ -212,7 +212,7 @@ class InterpreterFrameHolder {
         previous_{currentFrame(tstate_)},
         func_{func},
         code_{codeFromFunc(func)} {
-    frame_ = Cix_PyThreadState_PushFrame(tstate_, jit::jitFrameGetSize(code_));
+    frame_ = Cix_PyThreadState_PushFrame(tstate_, code_->co_framesize);
     JIT_CHECK(frame_ != nullptr, "failed to push test interpreter frame");
     jit::jitFrameInit(
         tstate_,
@@ -379,7 +379,7 @@ def test():
 
   BorrowedRef<PyCodeObject> code = PyFunction_GetCode(func);
   _PyInterpreterFrame* frame =
-      Cix_PyThreadState_PushFrame(tstate, jit::jitFrameGetSize(code));
+      Cix_PyThreadState_PushFrame(tstate, code->co_framesize);
   ASSERT_NE(frame, nullptr);
   jit::jitFrameInit(
       tstate,

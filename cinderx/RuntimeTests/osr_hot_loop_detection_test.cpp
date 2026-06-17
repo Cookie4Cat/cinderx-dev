@@ -204,7 +204,7 @@ class InterpreterFrameHolder {
     JIT_CHECK(
         jit::getConfig().frame_mode == jit::FrameMode::kNormal,
         "OSR eligibility tests construct normal interpreter frames");
-    frame_ = Cix_PyThreadState_PushFrame(tstate_, jit::jitFrameGetSize(code_));
+    frame_ = Cix_PyThreadState_PushFrame(tstate_, code_->co_framesize);
     JIT_CHECK(frame_ != nullptr, "failed to push test interpreter frame");
     jit::jitFrameInit(
         tstate_,
