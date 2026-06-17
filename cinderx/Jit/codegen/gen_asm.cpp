@@ -775,6 +775,7 @@ void* NativeGenerator::getVectorcallEntry() {
   if (GetFunction()->code->co_flags & kCoFlagsAnyGenerator) {
     env_.initial_yield_spill_size_ = lsalloc.initialYieldSpillSize();
   }
+  env_.can_deopt = GetFunction()->canDeopt();
 
   JIT_LOGIF(
       getConfig().log.dump_lir,

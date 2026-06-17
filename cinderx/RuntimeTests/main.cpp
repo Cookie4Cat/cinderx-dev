@@ -257,6 +257,7 @@ int main(int argc, char* argv[]) {
   register_test("builtin_load_method_elimination_test.txt");
   register_test("primitive_box_remat_test.txt");
   register_test("primitive_unbox_cse_test.txt");
+  register_test("leaf_function_test.txt");
   register_test("all_passes_test.txt");
   register_test("all_passes_static_test.txt", RuntimeTest::kStaticCompiler);
   register_test("native_calls_test.txt", RuntimeTest::kStaticCompiler);
