@@ -58,6 +58,13 @@ constexpr bool kPyRefDebug =
     false;
 #endif
 
+constexpr bool kFreeThreadedBuild =
+#ifdef Py_GIL_DISABLED
+    true;
+#else
+    false;
+#endif
+
 struct jit_string_deleter {
   void operator()(jit_string_t* ss) const {
     ss_free(ss);
