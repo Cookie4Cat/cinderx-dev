@@ -119,9 +119,9 @@ enum OperandSizeType {
   X(Fmul, false, FlagEffects::kNone, kAlways64, 1, {1, 1})                    \
   X(Fdiv, true, FlagEffects::kNone, kAlways64, 1, {1, 1})                     \
   X(Int64ToDouble, false, FlagEffects::kNone, kAlways64, 1, {1})              \
-  X(LShift, false, FlagEffects::kSet)                                         \
-  X(RShift, false, FlagEffects::kSet)                                         \
-  X(RShiftUn, false, FlagEffects::kSet)                                       \
+  X(LShift, false, FlagEffects::kSet, kOut, 1, {1})                           \
+  X(RShift, false, FlagEffects::kSet, kOut, 1, {1})                           \
+  X(RShiftUn, false, FlagEffects::kSet, kOut, 1, {1})                         \
   X(Test, false, FlagEffects::kSet, kDefault, 0, {1, 1})                      \
   X(Test32, false, FlagEffects::kSet, kDefault, 0, {1, 1})                    \
   X(Equal, false, FlagEffects::kSet, kDefault, 1, {1, 1})                     \
