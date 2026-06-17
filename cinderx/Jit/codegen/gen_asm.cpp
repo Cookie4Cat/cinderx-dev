@@ -601,23 +601,12 @@ class ThrowableErrorHandler : public ErrorHandler {
 
 } // namespace
 
-NativeGenerator::NativeGenerator(const hir::Function* func)
-    : NativeGenerator{
-          func,
-          generateDeoptTrampoline(false),
-          generateDeoptTrampoline(true),
-          generateFailedDeferredCompileTrampoline()} {}
-
 NativeGenerator::NativeGenerator(
     const hir::Function* func,
-    void* deopt_trampoline,
-    void* deopt_trampoline_generators,
-    void* failed_deferred_compile_trampoline)
+    NativeGeneratorFactory& factory)
     : func_{func},
-      deopt_trampoline_{deopt_trampoline},
-      deopt_trampoline_generators_{deopt_trampoline_generators},
-      failed_deferred_compile_trampoline_{failed_deferred_compile_trampoline},
-      inline_stack_size_{calcInlineStackSize(func)} {
+      inline_stack_size_{calcInlineStackSize(func)},
+      factory_(factory) {
   env_.has_inlined_functions = inline_stack_size_ > 0;
 }
 
@@ -1193,8 +1182,8 @@ void NativeGenerator::generateDeoptExits(const asmjit::CodeHolder& code) {
   as_->mov(x86::ptr(x86::rsp, kPointerSize), deopt_scratch_reg);
 
   auto trampoline = GetFunction()->code->co_flags & kCoFlagsAnyGenerator
-      ? deopt_trampoline_generators_
-      : deopt_trampoline_;
+      ? factory_.deoptTrampolineGenerators()
+      : factory_.deoptTrampoline();
   as_->mov(deopt_scratch_reg, reinterpret_cast<uint64_t>(trampoline));
   as_->jmp(deopt_scratch_reg);
 
@@ -1282,8 +1271,8 @@ void NativeGenerator::generateDeoptExits(const asmjit::CodeHolder& code) {
       arch::ptr_resolve(as_, a64::sp, kPointerSize * 2, arch::reg_scratch_0));
 
   auto trampoline = GetFunction()->code->co_flags & kCoFlagsAnyGenerator
-      ? deopt_trampoline_generators_
-      : deopt_trampoline_;
+      ? factory_.deoptTrampolineGenerators()
+      : factory_.deoptTrampoline();
   as_->mov(deopt_scratch_reg, trampoline);
   as_->br(deopt_scratch_reg);
 
@@ -1838,8 +1827,10 @@ void NativeGenerator::generateCode(
       env_.annotations.disassemble(code_start_, codeholder));
   {
     ThreadedCompileSerialize guard;
+    void* failed_deferred_compile_trampoline =
+        factory_.failedDeferredCompileTrampoline();
     for (auto& x : env_.function_indirections) {
-      *x.second.indirect = failed_deferred_compile_trampoline_;
+      *x.second.indirect = failed_deferred_compile_trampoline;
     }
   }
 
@@ -1897,19 +1888,33 @@ int NativeGenerator::calcInlineStackSize(const hir::Function* func) {
   return result;
 }
 
-NativeGeneratorFactory::NativeGeneratorFactory()
-    : deopt_trampoline_{generateDeoptTrampoline(false)},
-      deopt_trampoline_generators_{generateDeoptTrampoline(true)},
-      failed_deferred_compile_trampoline_{
-          generateFailedDeferredCompileTrampoline()} {}
+NativeGeneratorFactory::NativeGeneratorFactory() {}
+
+void* NativeGeneratorFactory::deoptTrampoline() {
+  if (deopt_trampoline_ == nullptr) {
+    deopt_trampoline_ = generateDeoptTrampoline(false);
+  }
+  return deopt_trampoline_;
+}
+
+void* NativeGeneratorFactory::deoptTrampolineGenerators() {
+  if (deopt_trampoline_generators_ == nullptr) {
+    deopt_trampoline_generators_ = generateDeoptTrampoline(true);
+  }
+  return deopt_trampoline_generators_;
+}
+
+void* NativeGeneratorFactory::failedDeferredCompileTrampoline() {
+  if (failed_deferred_compile_trampoline_ == nullptr) {
+    failed_deferred_compile_trampoline_ =
+        generateFailedDeferredCompileTrampoline();
+  }
+  return failed_deferred_compile_trampoline_;
+}
 
 std::unique_ptr<NativeGenerator> NativeGeneratorFactory::operator()(
-    const hir::Function* func) const {
-  return std::make_unique<NativeGenerator>(
-      func,
-      deopt_trampoline_,
-      deopt_trampoline_generators_,
-      failed_deferred_compile_trampoline_);
+    const hir::Function* func) {
+  return std::make_unique<NativeGenerator>(func, *this);
 }
 
 } // namespace jit::codegen

@@ -111,7 +111,8 @@ class BackendTest : public RuntimeTest {
       as.sub(asmjit::x86::rsp, arg_buffer_size);
     }
 
-    NativeGenerator gen(nullptr);
+    NativeGeneratorFactory factory;
+    NativeGenerator gen(nullptr, factory);
     gen.env_ = std::move(environ);
     gen.lir_func_.reset(lir_func);
     gen.generateAssemblyBody(code);
@@ -161,7 +162,8 @@ class BackendTest : public RuntimeTest {
       as.sub(asmjit::a64::sp, asmjit::a64::sp, arg_buffer_size);
     }
 
-    NativeGenerator gen(nullptr);
+    NativeGeneratorFactory factory;
+    NativeGenerator gen(nullptr, factory);
     gen.env_ = std::move(environ);
     gen.lir_func_.reset(lir_func);
     gen.generateAssemblyBody(code);
@@ -188,7 +190,8 @@ class BackendTest : public RuntimeTest {
     as.ldp(arch::fp, arch::lr, asmjit::a64::ptr_post(asmjit::a64::sp, 16));
     as.ret(arch::lr);
 #else
-    NativeGenerator gen(nullptr);
+    NativeGeneratorFactory factory;
+    NativeGenerator gen(nullptr, factory);
     CINDER_UNSUPPORTED
 #endif
 
