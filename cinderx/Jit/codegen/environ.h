@@ -23,7 +23,7 @@ struct Environ {
 
   // Modified registers. Set by VariableManager and read by generatePrologue()
   // and generateEpilogue().
-  PhyRegisterSet changed_regs{0};
+  PhyRegisterSet changed_regs{};
 
   // The size of all data stored on the C stack: shadow frames, spilled values,
   // saved callee-saved registers, and space for stack arguments to called
@@ -171,7 +171,7 @@ struct Environ {
   // autogen translator for both the normal entry and generator resume entry.
   int resume_frame_total_size{0};
   int resume_header_and_spill_size{0};
-  PhyRegisterSet resume_saved_regs{0};
+  PhyRegisterSet resume_saved_regs{};
 
   // Byte offset of gi_jit_data within a generator object, computed per
   // function. Read by the resume entry block builder.
