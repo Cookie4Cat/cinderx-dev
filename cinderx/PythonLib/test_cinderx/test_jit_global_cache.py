@@ -5,6 +5,7 @@
 # pyre-unsafe
 
 import builtins
+import types
 import unittest
 from textwrap import dedent
 
@@ -13,6 +14,60 @@ import cinderx.test_support as cinder_support
 from cinderx.test_support import run_in_subprocess, skip_unless_lazy_imports
 
 from .common import failUnlessHasOpcodes, with_globals
+
+
+class LoadModuleAttrCacheTests(unittest.TestCase):
+    def setUp(self):
+        if not cinderx.jit.is_enabled():
+            self.skipTest("JIT is disabled")
+
+    @staticmethod
+    def _warm(func, *args):
+        for _ in range(5_000):
+            func(*args)
+
+    @staticmethod
+    def _bind_module_global(func, module):
+        return with_globals({"module": module, "__builtins__": builtins})(func)
+
+    @staticmethod
+    def _compile_for_hir(func):
+        cinderx.jit.compile_after_n_calls(1_000_000)
+        return cinderx.jit.force_compile(func)
+
+    @run_in_subprocess
+    def test_module_dunder_path_does_not_use_module_attr_cache(self):
+        def get_path():
+            # pyre-ignore[10]: Dynamically injected into function globals.
+            return module.__path__
+
+        module_obj = types.ModuleType("pkg")
+        module_obj.__path__ = ["pkg-path"]
+        get_path = self._bind_module_global(get_path, module_obj)
+        self._warm(get_path)
+
+        self.assertTrue(self._compile_for_hir(get_path))
+        ops = cinderx.jit.get_function_hir_opcode_counts(get_path)
+        self.assertEqual(ops.get("LoadModuleAttrCached", 0), 0)
+        self.assertEqual(ops.get("LoadAttrCached", 0), 0)
+        self.assertGreaterEqual(ops.get("LoadAttr", 0), 1)
+        self.assertEqual(get_path(), ["pkg-path"])
+
+    @run_in_subprocess
+    def test_regular_module_attr_still_uses_module_attr_cache(self):
+        def get_value():
+            # pyre-ignore[10]: Dynamically injected into function globals.
+            return module.value
+
+        module_obj = types.ModuleType("plain")
+        module_obj.value = 42
+        get_value = self._bind_module_global(get_value, module_obj)
+        self._warm(get_value)
+
+        self.assertTrue(self._compile_for_hir(get_value))
+        ops = cinderx.jit.get_function_hir_opcode_counts(get_value)
+        self.assertGreaterEqual(ops.get("LoadModuleAttrCached", 0), 1)
+        self.assertEqual(get_value(), 42)
 
 
 class LoadGlobalCacheTests(unittest.TestCase):
