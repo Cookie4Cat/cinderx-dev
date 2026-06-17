@@ -3,6 +3,7 @@
 #include "cinderx/Jit/hir/function.h"
 
 #include <algorithm>
+#include <limits>
 
 namespace jit::hir {
 
@@ -86,16 +87,37 @@ bool Function::canDeopt() const {
 
 namespace {
 
-const unsigned char* parseExceptionTableVarint(
-    const unsigned char* cursor,
+bool parseExceptionTableVarint(
+    const unsigned char*& cursor,
+    const unsigned char* end,
+    bool is_entry_start,
     int* result) {
-  int value = cursor[0] & 63;
+  if (cursor >= end) {
+    return false;
+  }
+  if (((cursor[0] & 128) != 0) != is_entry_start) {
+    return false;
+  }
+
+  unsigned int value = cursor[0] & 63;
   while ((cursor[0] & 64) != 0) {
     cursor++;
-    value = (value << 6) | (cursor[0] & 63);
+    if (cursor >= end) {
+      return false;
+    }
+    if ((cursor[0] & 128) != 0) {
+      return false;
+    }
+
+    unsigned int chunk = cursor[0] & 63;
+    if (value > (std::numeric_limits<int>::max() - chunk) >> 6) {
+      return false;
+    }
+    value = (value << 6) | chunk;
   }
-  *result = value;
-  return cursor + 1;
+  *result = static_cast<int>(value);
+  cursor++;
+  return true;
 }
 
 bool isInExceptionProtectedRange(
@@ -110,11 +132,13 @@ bool isInExceptionProtectedRange(
     int start = 0;
     int size = 0;
     int unused = 0;
-    cursor = parseExceptionTableVarint(cursor, &start);
-    cursor = parseExceptionTableVarint(cursor, &size);
-    cursor = parseExceptionTableVarint(cursor, &unused);
-    cursor = parseExceptionTableVarint(cursor, &unused);
-    if (target_index >= start && target_index < start + size) {
+    if (!parseExceptionTableVarint(cursor, end, true, &start) ||
+        !parseExceptionTableVarint(cursor, end, false, &size) ||
+        !parseExceptionTableVarint(cursor, end, false, &unused) ||
+        !parseExceptionTableVarint(cursor, end, false, &unused)) {
+      return true;
+    }
+    if (target_index >= start && target_index - start < size) {
       return true;
     }
   }
