@@ -355,7 +355,7 @@ void PopulateResumeEntryBlock(BasicBlock* bb, Py_ssize_t gi_jit_data_offset) {
       Instruction::kMove, nullptr, OutInd(fp_reg, yp_off, DT::kObject), Imm(0));
 
   // Jump to yieldPoint->resumeTarget
-  bb->allocateInstr(Instruction::kIndirectJump, nullptr, Ind(scratch, rt_off));
+  bb->allocateInstr(Instruction::kBranch, nullptr, Ind(scratch, rt_off));
 }
 
 void PopulateEntryBlock(
@@ -519,8 +519,7 @@ UnresolvedJumpTable GenerateStaticTypeCheckBlocks(
       nullptr,
       OutPhyReg(tc_scratch),
       Ind(tc_scratch, defaulted_count_reg, 8, 0));
-  dispatch_block->allocateInstr(
-      Instruction::kIndirectJump, nullptr, Ind(tc_scratch));
+  dispatch_block->allocateInstr(Instruction::kBranch, nullptr, Ind(tc_scratch));
 
   // --- Emit check blocks ---
   // check_blocks[k] checks typed_args[typed_args.size()-1-k]
@@ -5607,8 +5606,7 @@ void GenerateDeoptTrampolineBlocks(
       Instruction::kLea, nullptr, OutPhyReg{sp_reg}, Ind(sp_reg, kPointerSize));
 #endif
   // Jump to the real epilogue.
-  block->allocateInstr(
-      Instruction::kIndirectJump, nullptr, PhyReg{jump_target_reg});
+  block->allocateInstr(Instruction::kBranch, nullptr, PhyReg{jump_target_reg});
 }
 
 void GenerateFailedDeferredCompileBlocks(

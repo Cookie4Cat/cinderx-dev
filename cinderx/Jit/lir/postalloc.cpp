@@ -912,7 +912,6 @@ RewriteResult rewriteMemoryInputsToReg(instr_iter_t instr_iter) {
     case Instruction::kEpilogueEnd:
     case Instruction::kPrologue:
     case Instruction::kSetupFrame:
-    case Instruction::kIndirectJump:
     case Instruction::kReserveStack:
     case Instruction::kVariadicPush:
     case Instruction::kLeave:

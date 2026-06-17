@@ -1236,9 +1236,9 @@ void translateSetupFrame(Environ* env, const Instruction*) {
 #endif
 }
 
-// Emit an indirect jump through a memory location. The instruction's single
-// input is a MemoryIndirect operand specifying [base + offset].
-void translateIndirectJump(Environ* env, const Instruction* instr) {
+// Emit a branch through a memory-indirect operand [base + offset].
+// Used by kBranch when its input is a MemoryIndirect operand.
+void translateBranchIndirect(Environ* env, const Instruction* instr) {
   arch::Builder* as = env->as;
   const OperandBase* input = instr->getInput(0);
 
@@ -1254,7 +1254,8 @@ void translateIndirectJump(Environ* env, const Instruction* instr) {
   }
 
   JIT_CHECK(
-      input->isInd(), "IndirectJump input must be memory indirect or register");
+      input->isInd(),
+      "Branch indirect input must be memory indirect or register");
 
   const auto* mem = input->getMemoryIndirect();
   PhyLocation base = mem->getBaseRegOperand()->getPhyRegister();
@@ -2883,9 +2884,17 @@ void AutoTranslator::translateInstr(Environ* env, const Instruction* instr)
       env->as->test(getReg(instr, in0), getReg(instr, in1));
       return;
     }
-    case Instruction::kBranch:
-      env->as->jmp(getLabel(env, instr->getInput(0)));
+    case Instruction::kBranch: {
+      auto* input = instr->getInput(0);
+      if (input->isInd() || input->isReg()) {
+        translateBranchIndirect(env, instr);
+      } else if (input->isImm()) {
+        env->as->jmp(getImm(input));
+      } else {
+        env->as->jmp(getLabel(env, input));
+      }
       return;
+    }
     case Instruction::kBranchZ:
       env->as->jz(getLabel(env, instr->getInput(0)));
       return;
@@ -2978,9 +2987,6 @@ void AutoTranslator::translateInstr(Environ* env, const Instruction* instr)
       return;
     case Instruction::kSetupFrame:
       translateSetupFrame(env, instr);
-      return;
-    case Instruction::kIndirectJump:
-      translateIndirectJump(env, instr);
       return;
     case Instruction::kInc: {
       auto* input = instr->getInput(0);
@@ -3354,9 +3360,17 @@ void AutoTranslator::translateInstr(Environ* env, const Instruction* instr)
     case Instruction::kTest:
       translateTst(env, instr);
       return;
-    case Instruction::kBranch:
-      env->as->b(getLabel(env, instr->getInput(0)));
+    case Instruction::kBranch: {
+      auto* input = instr->getInput(0);
+      if (input->isInd() || input->isReg()) {
+        translateBranchIndirect(env, instr);
+      } else if (input->isImm()) {
+        env->as->b(static_cast<uint64_t>(input->getConstant()));
+      } else {
+        env->as->b(getLabel(env, input));
+      }
       return;
+    }
     case Instruction::kBranchZ:
       if (instr->getNumInputs() == 2) {
         env->as->cbz(
@@ -3461,9 +3475,6 @@ void AutoTranslator::translateInstr(Environ* env, const Instruction* instr)
       return;
     case Instruction::kSetupFrame:
       translateSetupFrame(env, instr);
-      return;
-    case Instruction::kIndirectJump:
-      translateIndirectJump(env, instr);
       return;
     case Instruction::kInc:
       translateInc(env, instr);
