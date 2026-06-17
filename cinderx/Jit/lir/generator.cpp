@@ -5491,15 +5491,9 @@ void LIRGenerator::emitUnlinkFrame(
   } else if (!env_->can_deopt) {
     emitInlineUnlinkLeafFrame(
         bbb, is_generator, func_reg, executable, exec_dtor, callee_frame);
-#ifdef ENABLE_LIGHTWEIGHT_FRAMES
   } else {
     emitInlineUnlinkFastFrame(
         bbb, is_generator, func_reg, executable, exec_dtor, callee_frame);
-#else
-  } else {
-    bbb.appendInvokeInstruction(
-        JITRT_UnlinkLightweightFrameFast, env_->asm_tstate);
-#endif
   }
 }
 
