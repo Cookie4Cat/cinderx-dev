@@ -209,7 +209,9 @@ enum OperandSizeType {
   X(CheckTreeIterChildEntry, false, FlagEffects::kInvalidate, kDefault, 1, {1}, 1) \
   X(TreeIterEnterChild, false, FlagEffects::kInvalidate, kDefault, 0, {1}, 1)\
   X(TreeIterLeaveCurrentNode, false, FlagEffects::kInvalidate, kDefault, 0, {}, 1) \
-  X(ClearTreeIterState, false, FlagEffects::kInvalidate, kDefault, 0, {}, 1)
+  X(ClearTreeIterState, false, FlagEffects::kInvalidate, kDefault, 0, {}, 1) \
+  X(CmpBranchZero, false, FlagEffects::kNone, kDefault, 0, {1}, 1)            \
+  X(CmpBranchNonZero, false, FlagEffects::kNone, kDefault, 0, {1}, 1)
 
 // Instruction class defines instructions in LIR.
 // Every instruction can have no more than one output, but arbitrary
@@ -429,6 +431,7 @@ class Instruction {
 
   bool isCompare() const;
   bool isBranchCC() const;
+  bool isCmpBranch() const;
   bool isAnyBranch() const;
   bool isTerminator() const;
   bool isAnyYield() const;

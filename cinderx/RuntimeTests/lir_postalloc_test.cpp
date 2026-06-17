@@ -55,14 +55,14 @@ BB %4 - preds: %1 %2
   auto expected_lir_str = fmt::format(
       R"(Function:
 BB %0 - succs: %1 %2
-                   BranchNZ {}:Object, BB%1
+                   CmpBranchNonZero {}:Object, BB%1
 
 BB %2 - preds: %0 - succs: %3 %4
-                   BranchNZ {}:Object, BB%3
+                   CmpBranchNonZero {}:Object, BB%3
                    Branch BB%4
 
 BB %1 - preds: %0 - succs: %3 %4
-                   BranchZ {}:Object, BB%4
+                   CmpBranchZero {}:Object, BB%4
 
 BB %3 - preds: %1 %2
 {:>9}:Object = Move {}:Object
@@ -148,7 +148,7 @@ BB %2 - preds: %0
   auto expected_lir_str = fmt::format(
       R"(Function:
 BB %0 - succs: %1 %2
-                   BranchZ {}:Object, BB%2
+                   CmpBranchZero {}:Object, BB%2
                    Branch BB%1
 
 BB %1 - preds: %0 - section: .coldtext
@@ -724,6 +724,15 @@ static void checkSubWordCondBranchUsesTest(DataType data_type) {
   rewrite.run();
 
   auto instrs = collectInstrs(*entry);
+  if (codegen::arch::kBuildArch == codegen::arch::Arch::kAarch64) {
+    ASSERT_EQ(instrs.size(), 1);
+    EXPECT_TRUE(instrs[0]->isCmpBranch());
+    ASSERT_EQ(instrs[0]->getNumInputs(), 2);
+    EXPECT_EQ(instrs[0]->getInput(0)->dataType(), DataType::k32bit);
+    EXPECT_TRUE(instrs[0]->getInput(1)->isLabel());
+    return;
+  }
+
   ASSERT_GE(instrs.size(), 2);
   EXPECT_TRUE(instrs[0]->isTest());
   EXPECT_EQ(instrs[0]->getInput(0)->dataType(), data_type);
