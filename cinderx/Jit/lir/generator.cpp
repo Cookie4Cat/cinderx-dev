@@ -1407,11 +1407,11 @@ void LIRGenerator::makeIncrefFreeThreaded(
   BasicBlock* check_owner = bbb.allocateBlock();
   bbb.appendBlock(check_owner);
   Instruction* ob_tid = bbb.appendInstr(
-      OutVReg{},
+      OutVReg{DataType::k64bit},
       Instruction::kMove,
       Ind{instr, static_cast<int>(offsetof(PyObject, ob_tid))});
   Instruction* thread_id = bbb.appendInstr(
-      OutVReg{},
+      OutVReg{DataType::k64bit},
       Instruction::kMove,
       Ind{env_->asm_tstate,
           static_cast<int>(offsetof(PyThreadState, thread_id))});
@@ -1470,7 +1470,9 @@ void LIRGenerator::makeIncrefGILEnabled(
         r1);
   } else {
     Instruction* r1 = bbb.appendInstr(
-        OutVReg{}, Instruction::kMove, Ind{instr, kRefcountOffset});
+        OutVReg{DataType::k64bit},
+        Instruction::kMove,
+        Ind{instr, kRefcountOffset});
     bbb.appendInstr(Instruction::kInc, r1);
     bbb.appendInstr(OutInd{instr, kRefcountOffset}, Instruction::kMove, r1);
   }
@@ -1545,11 +1547,11 @@ void LIRGenerator::makeDecrefFreeThreaded(
   BasicBlock* check_owner = bbb.allocateBlock();
   bbb.appendBlock(check_owner);
   Instruction* ob_tid = bbb.appendInstr(
-      OutVReg{},
+      OutVReg{DataType::k64bit},
       Instruction::kMove,
       Ind{instr, static_cast<int>(offsetof(PyObject, ob_tid))});
   Instruction* thread_id = bbb.appendInstr(
-      OutVReg{},
+      OutVReg{DataType::k64bit},
       Instruction::kMove,
       Ind{env_->asm_tstate,
           static_cast<int>(offsetof(PyThreadState, thread_id))});
@@ -1601,7 +1603,9 @@ void LIRGenerator::makeDecrefGILEnabled(
     std::optional<destructor> destructor,
     bool possible_immortal) {
   Instruction* r1 = bbb.appendInstr(
-      OutVReg{}, Instruction::kMove, Ind{instr, kRefcountOffset});
+      OutVReg{DataType::k64bit},
+      Instruction::kMove,
+      Ind{instr, kRefcountOffset});
 
   if (possible_immortal) {
     auto mortal = bbb.allocateBlock();
@@ -3606,7 +3610,9 @@ LIRGenerator::TranslatedBlock LIRGenerator::TranslateOneBasicBlock(
         if (type <= (TCInt8 | TCInt16 | TCInt32) ||
             type <= (TCUInt8 | TCUInt16 | TCUInt32)) {
           Instruction* lir = bbb.appendInstr(
-              Instruction::kSext, OutVReg{}, instr->GetOperand(1));
+              Instruction::kSext,
+              OutVReg{DataType::k64bit},
+              instr->GetOperand(1));
           bbb.appendCallInstruction(
               instr->output(),
               JITRT_CheckSequenceBounds,
@@ -3662,7 +3668,7 @@ LIRGenerator::TranslatedBlock LIRGenerator::TranslateOneBasicBlock(
         // split table, so it's safe to load and access ma_values with no
         // additional checks here.
         Instruction* ma_values = bbb.appendInstr(
-            OutVReg{},
+            OutVReg{DataType::k64bit},
             Instruction::kMove,
             Ind{bbb.getDefInstr(dict),
                 static_cast<int32_t>(offsetof(PyDictObject, ma_values))});
@@ -4046,7 +4052,7 @@ LIRGenerator::TranslatedBlock LIRGenerator::TranslateOneBasicBlock(
         // Load the address of our _PyInterpreterFrame and the previous
         // _PyInterpreterFrame we skip past the FrameHeader for this.
         Instruction* caller_frame = bbb.appendInstr(
-            OutVReg{},
+            OutVReg{DataType::k64bit},
             Instruction::kLea,
             Stk{PhyLocation(
                 static_cast<int32_t>(
@@ -4093,7 +4099,7 @@ LIRGenerator::TranslatedBlock LIRGenerator::TranslateOneBasicBlock(
 
         // Store RTFS in FrameHeader as a tag
         Instruction* rtfs_reg = bbb.appendInstr(
-            OutVReg{},
+            OutVReg{DataType::k64bit},
             Instruction::kMove,
             reinterpret_cast<uintptr_t>(rtfs) | JIT_FRAME_RTFS);
         bbb.appendInstr(
@@ -4131,7 +4137,7 @@ LIRGenerator::TranslatedBlock LIRGenerator::TranslateOneBasicBlock(
             Imm{0, OperandBase::k16bit});
 
         Instruction* localsplus = bbb.appendInstr(
-            OutVReg{},
+            OutVReg{DataType::k64bit},
             Instruction::kLea,
             Stk{PhyLocation(
                 static_cast<int32_t>(
@@ -4168,7 +4174,8 @@ LIRGenerator::TranslatedBlock LIRGenerator::TranslateOneBasicBlock(
 #endif
 
         Instruction* codeunit_reg =
-            bbb.appendInstr(OutVReg{}, Instruction::kMove, frame_code);
+            bbb.appendInstr(
+                OutVReg{DataType::k64bit}, Instruction::kMove, frame_code);
 
         bbb.appendInstr(
             OutInd{callee_frame, FRAME_INSTR_OFFSET},
@@ -4244,7 +4251,7 @@ LIRGenerator::TranslatedBlock LIRGenerator::TranslateOneBasicBlock(
         // Test to see if RTFS is still in place
         Instruction* callee_frame = getInlinedFrame(bbb, instr.matchingBegin());
         auto rtfs_reg = bbb.appendInstr(
-            OutVReg{},
+            OutVReg{DataType::k64bit},
             Instruction::kMove,
             Ind{callee_frame,
                 (Py_ssize_t)offsetof(FrameHeader, func) -
@@ -4279,7 +4286,7 @@ LIRGenerator::TranslatedBlock LIRGenerator::TranslateOneBasicBlock(
         // The frame was never materialized, we just need to unlink the frame
         // and potentiall decref the code object.
         Instruction* caller_frame = bbb.appendInstr(
-            OutVReg{},
+            OutVReg{DataType::k64bit},
             Instruction::kLea,
             Stk{PhyLocation(
                 static_cast<int32_t>(
@@ -4969,7 +4976,7 @@ Instruction* LIRGenerator::getInlinedFrame(
              .emplace(
                  instr,
                  bbb.appendInstr(
-                     OutVReg{},
+                     OutVReg{DataType::k64bit},
                      Instruction::kLea,
                      Stk{PhyLocation(
                          static_cast<int32_t>(frameOffsetOf(instr)))}))
@@ -4990,7 +4997,9 @@ void LIRGenerator::emitLoadFrame(BasicBlockBuilder& bbb) {
     // Load the resume entry label address.
     bbb.annotateNext("Allocate generator + interpreter frame");
     Instruction* resume_label = bbb.appendInstr(
-        OutVReg{}, Instruction::kLea, AsmLbl{env_->gen_resume_entry_label});
+        OutVReg{DataType::k64bit},
+        Instruction::kLea,
+        AsmLbl{env_->gen_resume_entry_label});
     // spill_words is read from CodeRuntime by the runtime function,
     // so we don't need to pass it explicitly.
     env_->asm_tstate = bbb.appendInstr(
@@ -5019,7 +5028,9 @@ void LIRGenerator::emitLoadFrame(BasicBlockBuilder& bbb) {
           offsetof(GenDataFooter, frame_header) +
           offsetof(FrameHeader, deopt_idx));
       deopt_idx_addr_ = bbb.appendInstr(
-          OutVReg{}, Instruction::kLea, Stk{PhyLocation(deopt_idx_offset)});
+          OutVReg{DataType::k64bit},
+          Instruction::kLea,
+          Stk{PhyLocation(deopt_idx_offset)});
     }
 #endif
   } else if (func_->frameMode == FrameMode::kNormal) {
@@ -5048,6 +5059,7 @@ void LIRGenerator::emitLoadFrame(BasicBlockBuilder& bbb) {
           offsetof(FrameHeader, deopt_idx));
       auto* instr = bbb.appendInstr(Instruction::kLea);
       instr->output()->setVirtualRegister();
+      instr->output()->setDataType(DataType::k64bit);
       instr->allocateStackInput(PhyLocation(deopt_idx_offset));
       deopt_idx_addr_ = instr;
     }
@@ -5163,7 +5175,8 @@ void LIRGenerator::emitLoadFrame(BasicBlockBuilder& bbb) {
     _Py_CODEUNIT* code_start = _PyCode_CODE(func_->code.get()) - 1;
 #endif
     Instruction* code_start_reg =
-        bbb.appendInstr(OutVReg{}, Instruction::kMove, code_start);
+        bbb.appendInstr(
+            OutVReg{DataType::k64bit}, Instruction::kMove, code_start);
     bbb.appendInstr(
         OutInd{frame, FRAME_INSTR_OFFSET}, Instruction::kMove, code_start_reg);
 
@@ -5225,7 +5238,7 @@ void LIRGenerator::emitLoadFrame(BasicBlockBuilder& bbb) {
     bbb.annotateNext("Set _PyInterpreterFrame::localsplus");
     // Store stackpointer = &localsplus[co_nlocalsplus]
     Instruction* localsplus = bbb.appendInstr(
-        OutVReg{},
+        OutVReg{DataType::k64bit},
         Instruction::kLea,
         Stk{PhyLocation(
             static_cast<int32_t>(
