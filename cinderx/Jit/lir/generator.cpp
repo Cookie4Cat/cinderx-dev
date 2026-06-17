@@ -1153,18 +1153,19 @@ void LIRGenerator::GenerateExitBlocks() {
 
     // Unlink frame before epilogue. Non-generators always unlink.
     bool has_freevars = func_->code != nullptr && func_->code->co_nfreevars > 0;
-    if (func_->frameMode == FrameMode::kNormal || has_freevars) {
+    if (func_->frameMode == FrameMode::kNormal) {
       bbb.appendInvokeInstruction(JITRT_UnlinkFrame, env_->asm_tstate);
-    } else if (!env_->can_deopt) {
-      emitInlineUnlinkLeafFrame(bbb);
-#ifdef ENABLE_LIGHTWEIGHT_FRAMES
     } else {
-      emitInlineUnlinkFastFrame(bbb);
+      PyObject* executable;
+      std::optional<destructor> exec_dtor;
+#if PY_VERSION_HEX >= 0x030F0000 && defined(ENABLE_LIGHTWEIGHT_FRAMES)
+      executable = env_->code_rt->reifier().get();
+      exec_dtor = PyUnstable_JITExecutable_Type.tp_dealloc;
 #else
-    } else {
-      bbb.appendInvokeInstruction(
-          JITRT_UnlinkLightweightFrameFast, env_->asm_tstate);
+      executable = reinterpret_cast<PyObject*>(func_->code.get());
+      exec_dtor = PyCode_Type.tp_dealloc;
 #endif
+      emitUnlinkFrame(bbb, has_freevars, env_->asm_func, executable, exec_dtor);
     }
 
     // EpilogueEnd goes on the builder's current block which may differ
@@ -4473,95 +4474,34 @@ LIRGenerator::TranslatedBlock LIRGenerator::TranslateOneBasicBlock(
         if (func_->frameMode == FrameMode::kNormal) {
           break;
         }
-        auto instr = static_cast<const EndInlinedFunction&>(i);
+        const auto& instr = static_cast<const EndInlinedFunction&>(i);
 
-        // Test to see if the frame was materialized (JIT_FRAME_INITIALIZED bit)
         Instruction* callee_frame = getInlinedFrame(bbb, instr.matchingBegin());
-        auto done_block = bbb.allocateBlock();
-        auto not_materialized_block = bbb.allocateBlock();
-#ifdef ENABLE_LIGHTWEIGHT_FRAMES
-        auto frame_status_reg = bbb.appendInstr(
-            OutVReg{},
-            Instruction::kMove,
-            Ind{callee_frame,
-                (Py_ssize_t)offsetof(FrameHeader, frame_status) -
-                    (Py_ssize_t)kFrameHeaderOverhead});
-        JIT_DCHECK(
-            JIT_FRAME_INITIALIZED == 2,
-            "JIT_FRAME_INITIALIZED changed"); // this is the bit we're testing
-                                              // below
-        bbb.appendBranch(
-            Instruction::kBranchBitNotSet,
-            not_materialized_block,
-            frame_status_reg,
-            Imm{1});
-#else
-        auto frame_status_reg = bbb.appendInstr(
-            OutVReg{},
-            Instruction::kMove,
-            Ind{callee_frame,
-                (Py_ssize_t)offsetof(_PyInterpreterFrame, frame_obj)});
+        BorrowedRef<PyCodeObject> code = instr.matchingBegin()->code();
+        bool has_freevars = code->co_nfreevars > 0;
 
-        bbb.appendInstr(
-            Instruction::kCmp, frame_status_reg, Imm{0, DataType::k64bit});
-        bbb.appendBranch(Instruction::kBranchE, not_materialized_block);
-#endif
-
-        bbb.appendBlock(bbb.allocateBlock());
-
-        // The frame was materialized, let's use the unlink helper to clean
-        // things up.
-        bbb.appendInvokeInstruction(JITRT_UnlinkFrame, env_->asm_tstate);
-        bbb.appendBranch(Instruction::kBranch, done_block);
-
-        // The frame was not materialized, we just need to update thread state
-        // to point at the caller and maybe decref the code object.
-        bbb.switchBlock(not_materialized_block);
-        Instruction* caller_frame = bbb.appendInstr(
-            OutVReg{DataType::k64bit},
-            Instruction::kLea,
-            Stk{PhyLocation(
-                static_cast<int32_t>(
-                    frameOffsetBefore(instr.matchingBegin()) +
-                    kFrameHeaderOverhead))});
-        makeCurrentFrameAccessor(bbb).store(caller_frame);
-        {
-          auto code = instr.matchingBegin()->code();
+        Instruction* func_reg = nullptr;
+        PyObject* executable;
+        std::optional<destructor> exec_dtor;
 #if PY_VERSION_HEX >= 0x030F0000 && defined(ENABLE_LIGHTWEIGHT_FRAMES)
-          // With 3.15+ LW frames the executable slot holds the reifier.
-          auto reifier = inline_code_to_reifier_.at(code.get());
-          Instruction* reifier_reg =
-              bbb.appendInstr(OutVReg{}, Instruction::kMove, reifier.get());
-          makeDecref(
-              bbb,
-              reifier_reg,
-              std::optional<destructor>(
-                  PyUnstable_JITExecutable_Type.tp_dealloc));
+        BorrowedRef<> reifier = inline_code_to_reifier_.at(code.get());
+        executable = reifier.get();
+        exec_dtor = PyUnstable_JITExecutable_Type.tp_dealloc;
 #elif PY_VERSION_HEX >= 0x030E0000
-          // On stock 3.14, f_executable is the borrowed code object and
-          // f_funcobj is the function object we incref'd in BeginInlinedFunction.
+        executable = code.getObj();
+        exec_dtor = PyCode_Type.tp_dealloc;
+        {
           PyObject* func = instr.matchingBegin()->func();
           if (!_Py_IsImmortal(func)) {
-            Instruction* func_reg =
-                bbb.appendInstr(OutVReg{}, Instruction::kMove, func);
-            makeDecref(
-                bbb,
-                func_reg,
-                std::optional<destructor>(PyFunction_Type.tp_dealloc));
+            func_reg = bbb.appendInstr(OutVReg{}, Instruction::kMove, func);
           }
-#else
-          if (!_Py_IsImmortal(code.get())) {
-            Instruction* code_reg =
-                bbb.appendInstr(OutVReg{}, Instruction::kMove, code.get());
-            makeDecref(
-                bbb,
-                code_reg,
-                std::optional<destructor>(PyCode_Type.tp_dealloc));
-          }
-#endif
         }
-
-        bbb.appendBlock(done_block);
+#else
+        executable = code.getObj();
+        exec_dtor = PyCode_Type.tp_dealloc;
+#endif
+        emitUnlinkFrame(
+            bbb, has_freevars, func_reg, executable, exec_dtor, callee_frame);
         break;
       }
       case Opcode::kCompactLongUnbox: {
@@ -5530,34 +5470,38 @@ void LIRGenerator::emitLoadFrame(BasicBlockBuilder& bbb) {
   env_->asm_interpreter_frame = makeCurrentFrameAccessor(bbb).load();
 }
 
-void LIRGenerator::emitDecrefExecutable(BasicBlockBuilder& bbb) {
-  PyObject* executable;
-  std::optional<destructor> dtor;
-#if PY_VERSION_HEX >= 0x030E0000 && defined(ENABLE_LIGHTWEIGHT_FRAMES)
-  executable = env_->code_rt->reifier().get();
-#if PY_VERSION_HEX >= 0x030F0000
-  dtor = PyUnstable_JITExecutable_Type.tp_dealloc;
+void LIRGenerator::emitUnlinkFrame(
+    BasicBlockBuilder& bbb,
+    bool has_freevars,
+    Instruction* func_reg,
+    PyObject* executable,
+    std::optional<destructor> exec_dtor,
+    Instruction* callee_frame) {
+  if (has_freevars) {
+    bbb.appendInvokeInstruction(JITRT_UnlinkFrame, env_->asm_tstate);
+  } else if (!env_->can_deopt) {
+    emitInlineUnlinkLeafFrame(
+        bbb, func_reg, executable, exec_dtor, callee_frame);
+#ifdef ENABLE_LIGHTWEIGHT_FRAMES
+  } else {
+    emitInlineUnlinkFastFrame(
+        bbb, func_reg, executable, exec_dtor, callee_frame);
 #else
-  dtor = PyCode_Type.tp_dealloc;
+  } else {
+    bbb.appendInvokeInstruction(
+        JITRT_UnlinkLightweightFrameFast, env_->asm_tstate);
 #endif
-#else
-  executable = reinterpret_cast<PyObject*>(func_->code.get());
-  dtor = PyCode_Type.tp_dealloc;
-#endif
-  if (!_Py_IsImmortal(executable)) {
-    Instruction* exec_reg =
-        bbb.appendInstr(OutVReg{}, Instruction::kMove, executable);
-    makeDecref(bbb, exec_reg, dtor, false, false);
   }
 }
 
-void LIRGenerator::emitInlineUnlinkLeafFrame(BasicBlockBuilder& bbb) {
-  // Leaf frame: no deopts means the frame was never materialized.
-  // Inline the operations from JITRT_UnlinkLeafFrame: unlink the frame
-  // from the thread state, then decref func and executable.
-
+void LIRGenerator::emitInlineUnlinkLeafFrame(
+    BasicBlockBuilder& bbb,
+    Instruction* func_reg,
+    PyObject* executable,
+    std::optional<destructor> exec_dtor,
+    Instruction* callee_frame) {
   CurrentFrameAccessor cfa = makeCurrentFrameAccessor(bbb);
-  Instruction* frame = cfa.load();
+  Instruction* frame = callee_frame != nullptr ? callee_frame : cfa.load();
 
   Instruction* prev = bbb.appendInstr(
       OutVReg{},
@@ -5567,22 +5511,29 @@ void LIRGenerator::emitInlineUnlinkLeafFrame(BasicBlockBuilder& bbb) {
 
   cfa.store(prev);
 
-  makeDecref(
-      bbb,
-      env_->asm_func,
-      std::optional<destructor>(PyFunction_Type.tp_dealloc),
-      false,
-      false);
-  emitDecrefExecutable(bbb);
+  if (func_reg != nullptr) {
+    makeDecref(
+        bbb,
+        func_reg,
+        std::optional<destructor>(PyFunction_Type.tp_dealloc),
+        false,
+        false);
+  }
+  if (!_Py_IsImmortal(executable)) {
+    Instruction* exec_reg =
+        bbb.appendInstr(OutVReg{}, Instruction::kMove, executable);
+    makeDecref(bbb, exec_reg, exec_dtor, false, false);
+  }
 }
 
-void LIRGenerator::emitInlineUnlinkFastFrame(BasicBlockBuilder& bbb) {
-  // Fast frame: can deopt (may be materialized), no freevars.
-  // Check materialization: if materialized, call JITRT_UnlinkFrame;
-  // otherwise inline the unlink + decrefs.
-
+void LIRGenerator::emitInlineUnlinkFastFrame(
+    BasicBlockBuilder& bbb,
+    Instruction* func_reg,
+    PyObject* executable,
+    std::optional<destructor> exec_dtor,
+    Instruction* callee_frame) {
   CurrentFrameAccessor cfa = makeCurrentFrameAccessor(bbb);
-  Instruction* frame = cfa.load();
+  Instruction* frame = callee_frame != nullptr ? callee_frame : cfa.load();
 
   auto done_block = bbb.allocateBlock();
   auto not_materialized = bbb.allocateBlock();
@@ -5629,13 +5580,19 @@ void LIRGenerator::emitInlineUnlinkFastFrame(BasicBlockBuilder& bbb) {
 
   cfa.store(prev);
 
-  makeDecref(
-      bbb,
-      env_->asm_func,
-      std::optional<destructor>(PyFunction_Type.tp_dealloc),
-      false,
-      false);
-  emitDecrefExecutable(bbb);
+  if (func_reg != nullptr) {
+    makeDecref(
+        bbb,
+        func_reg,
+        std::optional<destructor>(PyFunction_Type.tp_dealloc),
+        false,
+        false);
+  }
+  if (!_Py_IsImmortal(executable)) {
+    Instruction* exec_reg =
+        bbb.appendInstr(OutVReg{}, Instruction::kMove, executable);
+    makeDecref(bbb, exec_reg, exec_dtor, false, false);
+  }
 
   bbb.appendBlock(done_block);
 }
