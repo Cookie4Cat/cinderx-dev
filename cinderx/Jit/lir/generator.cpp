@@ -4293,20 +4293,11 @@ LIRGenerator::TranslatedBlock LIRGenerator::TranslateOneBasicBlock(
             JIT_FRAME_INITIALIZED == 2,
             "JIT_FRAME_INITIALIZED changed"); // this is the bit we're testing
                                               // below
-        bbb.appendInstr(Instruction::kBitTest, rtfs_reg, Imm{1});
         auto done_block = bbb.allocateBlock();
         auto materialized_block = bbb.allocateBlock();
         auto not_materialized_block = bbb.allocateBlock();
-        // kBitTest lowers differently per architecture:
-        // - x86: BT sets the Carry flag to the tested bit value, so
-        //   kBranchC (jc) branches when the bit is set.
-        // - ARM64: BT is lowered to TST which sets the Zero flag, so
-        //   kBranchNE (b.ne) branches when the bit is set.
         bbb.appendBranch(
-            codegen::arch::kBuildArch == codegen::arch::Arch::kAarch64
-                ? Instruction::kBranchNE
-                : Instruction::kBranchC,
-            materialized_block);
+            Instruction::kBranchBitSet, materialized_block, rtfs_reg, Imm{1});
         bbb.appendBlock(bbb.allocateBlock());
 
         Instruction* frame_obj = bbb.appendInstr(
@@ -5383,8 +5374,8 @@ void GenerateDeoptTrampolineBlocks(
 
 #if defined(CINDER_X86_64)
   auto* vpush = block->allocateInstr(Instruction::kVariadicPush, nullptr);
-  // Push in descending order so the memory layout is ascending by PhyLocation.
-  // r15 was already saved by stage 2.
+  // Push in descending order so the memory layout is ascending by
+  // PhyLocation. r15 was already saved by stage 2.
   for (int i = 0; i < kStage3SavedRegs; i++) {
     vpush->addOperands(PhyReg{PhyLocation{i}});
   }
