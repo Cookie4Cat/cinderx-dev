@@ -382,6 +382,73 @@ for i in range(30):
   ASSERT_EQ(ncalls, 30);
 }
 
+TEST_F(BackendTest, ExplicitLIRSubKeepsRhsRegisterLiveAcrossOutputDefine) {
+#if !defined(CINDER_X86_64)
+  GTEST_SKIP() << "x86_64-specific allocator/codegen repro";
+#else
+  auto lirfunc = std::make_unique<Function>();
+  auto bb = lirfunc->allocateBasicBlock();
+  auto epilogue = lirfunc->allocateBasicBlock();
+
+  constexpr PhyLocation kLhsReg = R10;
+  constexpr std::array<PhyLocation, 13> kPressureRegs = {
+      RCX, RDX, RBX, RSI, RDI, R8, R9, R10, R11, R12, R13, R14, R15};
+
+  std::vector<Instruction*> pressure;
+  pressure.reserve(kPressureRegs.size());
+  // Bind vregs to almost every GP register without emitting code so the
+  // allocator has to make a real choice at the Sub instruction.
+  for (PhyLocation reg : kPressureRegs) {
+    pressure.push_back(bb->allocateInstr(
+        Instruction::kBind,
+        nullptr,
+        OutVReg{OperandBase::k64bit},
+        PhyReg{reg, OperandBase::k64bit}));
+  }
+
+  bb->allocateInstr(
+      Instruction::kMove,
+      nullptr,
+      OutPhyReg{kLhsReg, OperandBase::k64bit},
+      Imm{7});
+  auto rhs = bb->allocateInstr(
+      Instruction::kMove, nullptr, OutVReg{OperandBase::k64bit}, Imm{3});
+  auto sub = bb->allocateInstr(
+      Instruction::kSub,
+      nullptr,
+      OutVReg{OperandBase::k64bit},
+      PhyReg{kLhsReg, OperandBase::k64bit},
+      VReg{rhs});
+  bb->allocateInstr(
+      Instruction::kMove,
+      nullptr,
+      OutPhyReg{arch::reg_general_return_loc, OperandBase::k64bit},
+      VReg{sub});
+  bb->allocateInstr(Instruction::kReturn, nullptr);
+  bb->addSuccessor(epilogue);
+  // Keep the bound registers live across the Sub by threading them into the
+  // successor block. Without this, the pressure would end before the bug site.
+  for (Instruction* live_out : pressure) {
+    epilogue->allocateInstr(
+        Instruction::kPhi,
+        nullptr,
+        OutVReg{OperandBase::k64bit},
+        Lbl{bb},
+        VReg{live_out});
+  }
+
+  auto func = reinterpret_cast<uint64_t (*)()>(SimpleCompile(lirfunc.get()));
+
+  ASSERT_TRUE(sub->output()->isReg());
+  ASSERT_TRUE(sub->getInput(1)->isReg());
+  // Before the fix, both operands could land in RAX here, producing
+  // `mov rax, r10; sub rax, rax` and returning 0 instead of 4.
+  EXPECT_NE(
+      sub->output()->getPhyRegister(), sub->getInput(1)->getPhyRegister());
+  EXPECT_EQ(func(), 4);
+#endif
+}
+
 // floating-point arithmetic test
 TEST_F(BackendTest, FPArithmetic) {
   double a = 3.12;
