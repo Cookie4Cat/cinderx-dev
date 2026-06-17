@@ -99,10 +99,8 @@ struct ModuleState {
   // without calling PyType_Lookup (which isn't safe off the main thread).
   std::unordered_map<PyTypeObject*, Ref<>> builtin_members;
 
-#if PY_VERSION_HEX < 0x030E0000
   // Sentinel function object placed in JIT frames to identify them.
   Ref<> frame_reifier;
-#endif
 
   // Original sys._clear_type_cache, forwarded to by our replacement.
   Ref<> sys_clear_caches;
