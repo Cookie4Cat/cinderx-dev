@@ -1780,11 +1780,12 @@ void loadToReg(
 void storeFromReg(
     arch::Builder* as,
     const OperandBase* input,
+    const OperandBase* output_operand,
     const arch::Mem& output) {
   if (input->isVecD()) {
     as->str(AT::getVecD(input), output);
   } else {
-    switch (input->dataType()) {
+    switch (output_operand->dataType()) {
       case OperandBase::k8bit:
         as->strb(
             AT::getGp(DataType::k32bit, input->getPhyRegister().loc), output);
@@ -1794,7 +1795,9 @@ void storeFromReg(
             AT::getGp(DataType::k32bit, input->getPhyRegister().loc), output);
         break;
       default:
-        as->str(AT::getGp(input), output);
+        as->str(
+            AT::getGp(output_operand->dataType(), input->getPhyRegister().loc),
+            output);
         break;
     }
   }
@@ -2015,8 +2018,8 @@ void translateMove(Environ* env, const Instruction* instr) {
           as, arch::fp, output->getStackSlot().loc, arch::reg_scratch_0);
 
       if (input->isReg()) {
-        // Storing the value of a register to the stack.
-        storeFromReg(as, input, ptr);
+        // Storing the value of a register to the stack
+        storeFromReg(as, input, output, ptr);
       } else {
         JIT_ABORT("Unsupported operand type for Move: Stk + {}", input->type());
       }
@@ -2047,7 +2050,7 @@ void translateMove(Environ* env, const Instruction* instr) {
         auto ptr =
             ptrIndirect(as, scratch0, scratch1, output->getMemoryIndirect());
 
-        storeFromReg(as, input, ptr);
+        storeFromReg(as, input, output, ptr);
       } else if (input->isImm()) {
         // Storing a constant immediate to an address relative to another
         // register.
