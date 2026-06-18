@@ -10,8 +10,10 @@
 #include "cinderx/Jit/lir/generator.h"
 #include "cinderx/Jit/lir/parser.h"
 #include "cinderx/Jit/lir/target_select.h"
+#include "cinderx/Jit/pyjit.h"
 #include "cinderx/RuntimeTests/fixtures.h"
 
+#include <limits>
 #include <memory>
 #include <sstream>
 #include <string>
@@ -194,6 +196,59 @@ BB %0
   EXPECT_NE(lir_str.find("A64GuardCC"), std::string::npos) << lir_str;
   EXPECT_EQ(lir_str.find("LessThanUnsigned"), std::string::npos) << lir_str;
   EXPECT_EQ(lir_str.find("Guard "), std::string::npos) << lir_str;
+}
+
+TEST_F(LIRTargetSelectTest, A64GuardCCDeoptsThroughNearExit) {
+  runStockCode(R"(
+import cinderx.jit as jit
+
+jit.compile_after_n_calls(1000000)
+
+def test(a):
+    return a ** 2
+
+for _ in range(20000):
+    assert test(3.0) == 9.0
+)");
+
+  Ref<PyFunctionObject> pyfunc(getGlobal("test"));
+  ASSERT_NE(pyfunc, nullptr);
+
+  std::string lir_str =
+      getSelectedLIRString(reinterpret_cast<PyObject*>(pyfunc.get()));
+  ASSERT_NE(lir_str.find("A64GuardCC"), std::string::npos) << lir_str;
+
+  ASSERT_EQ(jit::compileFunction(pyfunc), jit::Result::OK);
+
+  size_t deopts = 0;
+  auto* ctx = jit::getContext();
+  ctx->setGuardFailureCallback([&deopts](const DeoptMetadata& meta) {
+    EXPECT_EQ(meta.reason, DeoptReason::kGuardFailure);
+    deopts++;
+  });
+
+  auto value = Ref<>::steal(PyFloat_FromDouble(3.0));
+  auto float_result = Ref<>::steal(PyObject_CallFunctionObjArgs(
+      reinterpret_cast<PyObject*>(pyfunc.get()), value.get(), nullptr));
+  ASSERT_NE(float_result, nullptr);
+  ASSERT_TRUE(PyFloat_Check(float_result));
+  EXPECT_EQ(PyFloat_AsDouble(float_result), 9.0);
+  EXPECT_EQ(deopts, 0);
+
+  auto infinity = Ref<>::steal(
+      PyFloat_FromDouble(std::numeric_limits<double>::infinity()));
+  auto overflow_result = Ref<>::steal(PyObject_CallFunctionObjArgs(
+      reinterpret_cast<PyObject*>(pyfunc.get()),
+      infinity.get(),
+      nullptr));
+  ctx->clearGuardFailureCallback();
+
+  ASSERT_NE(overflow_result, nullptr);
+  ASSERT_TRUE(PyFloat_Check(overflow_result));
+  EXPECT_EQ(
+      PyFloat_AsDouble(overflow_result),
+      std::numeric_limits<double>::infinity());
+  EXPECT_GE(deopts, 1);
 }
 
 TEST_F(LIRTargetSelectTest, KeepsPythonCompareBranchWhenResultHasExtraUses) {
