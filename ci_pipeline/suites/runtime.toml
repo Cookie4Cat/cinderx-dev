@@ -1,0 +1,16 @@
+fail_fast = true
+
+[target]
+python = "3.14"
+arch = "arm64"
+system = "Linux"
+
+[[jobs]]
+name = "runtime_tests"
+kind = "runtime_tests"
+coverage = true
+[jobs.env]
+CINDERX_RUNTIME_TEST_LIGHTWEIGHT_REGEX = "CmdLineTest.LightweightFrame|ReifyFrameTest|Deopt"
+CINDERX_RUNTIME_TEST_SPLIT_LWF_OSR = "1"
+ENABLE_LIGHTWEIGHT_FRAMES = "1"
+ENABLE_XXCLASSLOADER = "1"

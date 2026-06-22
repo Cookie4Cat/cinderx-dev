@@ -1,0 +1,402 @@
+# Copyright (c) Meta Platforms, Inc. and affiliates.
+#
+# @pyre-unsafe
+
+# pyre-unsafe
+
+import builtins
+import types
+import unittest
+from textwrap import dedent
+
+import cinderx.jit
+import cinderx.test_support as cinder_support
+from cinderx.test_support import run_in_subprocess, skip_unless_lazy_imports
+
+from .common import failUnlessHasOpcodes, with_globals
+
+
+class LoadModuleAttrCacheTests(unittest.TestCase):
+    def setUp(self):
+        if not cinderx.jit.is_enabled():
+            self.skipTest("JIT is disabled")
+
+    @staticmethod
+    def _warm(func, *args):
+        for _ in range(5_000):
+            func(*args)
+
+    @staticmethod
+    def _bind_module_global(func, module):
+        return with_globals({"module": module, "__builtins__": builtins})(func)
+
+    @staticmethod
+    def _compile_for_hir(func):
+        cinderx.jit.compile_after_n_calls(1_000_000)
+        return cinderx.jit.force_compile(func)
+
+    @run_in_subprocess
+    def test_module_dunder_path_does_not_use_module_attr_cache(self):
+        def get_path():
+            # pyre-ignore[10]: Dynamically injected into function globals.
+            return module.__path__
+
+        module_obj = types.ModuleType("pkg")
+        module_obj.__path__ = ["pkg-path"]
+        get_path = self._bind_module_global(get_path, module_obj)
+        self._warm(get_path)
+
+        self.assertTrue(self._compile_for_hir(get_path))
+        ops = cinderx.jit.get_function_hir_opcode_counts(get_path)
+        self.assertEqual(ops.get("LoadModuleAttrCached", 0), 0)
+        self.assertEqual(ops.get("LoadAttrCached", 0), 0)
+        self.assertGreaterEqual(ops.get("LoadAttr", 0), 1)
+        self.assertEqual(get_path(), ["pkg-path"])
+
+    @run_in_subprocess
+    def test_regular_module_attr_still_uses_module_attr_cache(self):
+        def get_value():
+            # pyre-ignore[10]: Dynamically injected into function globals.
+            return module.value
+
+        module_obj = types.ModuleType("plain")
+        module_obj.value = 42
+        get_value = self._bind_module_global(get_value, module_obj)
+        self._warm(get_value)
+
+        self.assertTrue(self._compile_for_hir(get_value))
+        ops = cinderx.jit.get_function_hir_opcode_counts(get_value)
+        self.assertGreaterEqual(ops.get("LoadModuleAttrCached", 0), 1)
+        self.assertEqual(get_value(), 42)
+
+
+class LoadGlobalCacheTests(unittest.TestCase):
+    def setUp(self):
+        # pyrefly: ignore [unknown-name]
+        global license, a_global
+        try:
+            del license
+        except NameError:
+            pass
+        try:
+            del a_global
+        except NameError:
+            pass
+
+    @staticmethod
+    def set_global(value):
+        # pyrefly: ignore [unknown-name]
+        global a_global
+        a_global = value
+
+    @staticmethod
+    @cinder_support.failUnlessJITCompiled
+    @failUnlessHasOpcodes("LOAD_GLOBAL")
+    def get_global():
+        # pyrefly: ignore [unknown-name]
+        return a_global
+
+    @staticmethod
+    def del_global():
+        # pyrefly: ignore [unknown-name]
+        global a_global
+        del a_global
+
+    @staticmethod
+    def set_license(value):
+        global license
+        license = value
+
+    @staticmethod
+    def del_license():
+        global license
+        del license
+
+    @cinder_support.failUnlessJITCompiled
+    @failUnlessHasOpcodes("LOAD_GLOBAL")
+    def test_simple(self):
+        # pyrefly: ignore [unknown-name]
+        global a_global
+        self.set_global(123)
+        self.assertEqual(a_global, 123)
+        self.set_global(456)
+        self.assertEqual(a_global, 456)
+
+    @cinder_support.failUnlessJITCompiled
+    @failUnlessHasOpcodes("LOAD_GLOBAL")
+    def test_shadow_builtin(self):
+        self.assertIs(license, builtins.license)
+        self.set_license(0xDEADBEEF)
+        self.assertIs(license, 0xDEADBEEF)
+        self.del_license()
+        self.assertIs(license, builtins.license)
+
+    @cinder_support.failUnlessJITCompiled
+    @failUnlessHasOpcodes("LOAD_GLOBAL")
+    def test_shadow_fake_builtin(self):
+        self.assertRaises(NameError, self.get_global)
+        # pyrefly: ignore [missing-attribute]
+        builtins.a_global = "poke"
+        # pyrefly: ignore [unknown-name]
+        self.assertEqual(a_global, "poke")
+        self.set_global("override poke")
+        # pyrefly: ignore [unknown-name]
+        self.assertEqual(a_global, "override poke")
+        self.del_global()
+        # pyrefly: ignore [unknown-name]
+        self.assertEqual(a_global, "poke")
+        # We don't support DELETE_ATTR yet.
+        delattr(builtins, "a_global")
+        self.assertRaises(NameError, self.get_global)
+
+    class prefix_str(str):
+        def __new__(cls, prefix, value):
+            s = super().__new__(cls, value)
+            # pyrefly: ignore [missing-attribute]
+            s.prefix = prefix
+            return s
+
+        def __hash__(self):
+            # pyrefly: ignore [missing-attribute]
+            return hash(self.prefix + self)
+
+        def __eq__(self, other):
+            # pyrefly: ignore [missing-attribute]
+            return (self.prefix + self) == other
+
+    @cinder_support.failUnlessJITCompiled
+    @failUnlessHasOpcodes("LOAD_GLOBAL")
+    def test_weird_key_in_globals(self):
+        # pyrefly: ignore [unknown-name]
+        global a_global
+        self.assertRaises(NameError, self.get_global)
+        globals()[self.prefix_str("a_glo", "bal")] = "a value"
+        self.assertEqual(a_global, "a value")
+        self.assertEqual(self.get_global(), "a value")
+
+    class MyGlobals(dict):
+        def __getitem__(self, key):
+            if key == "knock_knock":
+                return "who's there?"
+            return super().__getitem__(key)
+
+    @with_globals(MyGlobals())
+    def return_knock_knock(self):
+        # pyrefly: ignore [unknown-name]
+        return knock_knock  # noqa: F821
+
+    def test_dict_subclass_globals(self):
+        self.assertEqual(self.return_knock_knock(), "who's there?")
+
+    @cinder_support.failUnlessJITCompiled
+    @failUnlessHasOpcodes("LOAD_GLOBAL")
+    def _test_unwatch_builtins(self):
+        self.set_global("hey")
+        self.assertEqual(self.get_global(), "hey")
+        # pyrefly: ignore [unsupported-operation]
+        builtins.__dict__[42] = 42
+
+    @run_in_subprocess
+    def test_unwatch_builtins(self):
+        try:
+            self._test_unwatch_builtins()
+        finally:
+            # pyrefly: ignore [unsupported-operation]
+            del builtins.__dict__[42]
+
+    @skip_unless_lazy_imports()
+    @failUnlessHasOpcodes("LOAD_GLOBAL")
+    @run_in_subprocess
+    def test_preload_side_effect_modifies_globals(self):
+        with cinder_support.temp_sys_path() as tmp:
+            (tmp / "tmp_a.py").write_text(
+                dedent(
+                    """
+                    import importlib
+                    importlib.set_lazy_imports(True)
+                    from tmp_b import B
+
+                    A = 1
+
+                    def get_a():
+                        return A + B
+
+                    """
+                ),
+                encoding="utf8",
+            )
+            (tmp / "tmp_b.py").write_text(
+                dedent(
+                    """
+                    import tmp_a
+
+                    tmp_a.A = 2
+
+                    B = 3
+                    """
+                ),
+                encoding="utf8",
+            )
+            cinderx.jit.clear_runtime_stats()
+
+            # pyre-ignore[21]: This file dynamically generated as part of this test.
+            import tmp_a
+
+            # Force the compilation if this is running with AutoJIT.
+            cinderx.jit.force_compile(tmp_a.get_a)
+
+            # What happens on the first call is kinda undefined in principle
+            # given lazy imports; somebody could previously have imported B
+            # (not in this specific test, but in principle), or not, so the
+            # first call might return 4 or 5. With JIT compilation it will
+            # always return 5 because compilation will trigger the lazy import
+            # and its side effect. Without the JIT it will return 4 in this
+            # test, but we consider this an acceptable side effect of JIT
+            # compilation because this code can't in general rely on B never
+            # having previously been imported.
+            tmp_a.get_a()
+
+            # On the second call the result should undoubtedly be 5 in all
+            # circumstances. Even if we compile with the wrong value for A, the
+            # guard on the LoadGlobalCached will ensure we deopt and return the
+            # right result.
+            self.assertEqual(tmp_a.get_a(), 5)
+            if cinderx.jit.is_enabled():
+                self.assertTrue(cinderx.jit.is_jit_compiled(tmp_a.get_a))
+                # The real test here is what when the value of a global changes
+                # during compilation preload (as it does in this test because
+                # the preload bytescan of get_a() first hits A, loads the old
+                # value, then hits B, triggers the lazy import and imports
+                # tmp_b, causing the value of A to change), we still have time
+                # to compile with the correct (new) value and avoid compiling
+                # code that will inevitably deopt, and so we should.
+                stats = cinderx.jit.get_and_clear_runtime_stats()
+                relevant_deopts = [
+                    d
+                    for d in stats["deopt"]  # pyrefly: ignore [not-iterable]
+                    if d["normal"]["func_qualname"] == "get_a"
+                ]
+                self.assertEqual(relevant_deopts, [])
+
+    @skip_unless_lazy_imports()
+    @failUnlessHasOpcodes("LOAD_GLOBAL")
+    @run_in_subprocess
+    def test_preload_side_effect_makes_globals_unwatchable(self):
+        with cinder_support.temp_sys_path() as tmp:
+            (tmp / "tmp_a.py").write_text(
+                dedent(
+                    """
+                    import importlib
+                    importlib.set_lazy_imports(True)
+                    from tmp_b import B
+
+                    A = 1
+
+                    def get_a():
+                        return A + B
+
+                    """
+                ),
+                encoding="utf8",
+            )
+            (tmp / "tmp_b.py").write_text(
+                dedent(
+                    """
+                    import tmp_a
+
+                    tmp_a.__dict__[42] = 1
+                    tmp_a.A = 2
+
+                    B = 3
+                    """
+                ),
+                encoding="utf8",
+            )
+
+            cinderx.jit.clear_runtime_stats()
+            # pyrefly: ignore [missing-import]
+            import tmp_a
+
+            # Force the compilation if this is running with AutoJIT.
+            cinderx.jit.force_compile(tmp_a.get_a)
+
+            tmp_a.get_a()
+            self.assertEqual(tmp_a.get_a(), 5)
+            self.assertTrue(
+                not cinderx.jit.is_enabled() or cinderx.jit.is_jit_compiled(tmp_a.get_a)
+            )
+
+    @skip_unless_lazy_imports()
+    @failUnlessHasOpcodes("LOAD_GLOBAL")
+    @run_in_subprocess
+    def test_preload_side_effect_makes_builtins_unwatchable(self):
+        with cinder_support.temp_sys_path() as tmp:
+            (tmp / "tmp_a.py").write_text(
+                dedent(
+                    """
+                    import importlib
+                    importlib.set_lazy_imports(True)
+                    from tmp_b import B
+
+                    def get_a():
+                        return max(1, 2) + B
+
+                    """
+                ),
+                encoding="utf8",
+            )
+            (tmp / "tmp_b.py").write_text(
+                dedent(
+                    """
+                    __builtins__[42] = 2
+
+                    B = 3
+                    """
+                ),
+                encoding="utf8",
+            )
+            cinderx.jit.clear_runtime_stats()
+            # pyrefly: ignore [missing-import]
+            import tmp_a
+
+            # Force the compilation if this is running with AutoJIT.
+            cinderx.jit.force_compile(tmp_a.get_a)
+
+            tmp_a.get_a()
+            self.assertEqual(tmp_a.get_a(), 5)
+            self.assertTrue(
+                not cinderx.jit.is_enabled() or cinderx.jit.is_jit_compiled(tmp_a.get_a)
+            )
+
+    @skip_unless_lazy_imports()
+    @run_in_subprocess
+    def test_lazy_import_after_global_cached(self):
+        with cinder_support.temp_sys_path() as tmp:
+            (tmp / "tmp_a.py").write_text(
+                dedent(
+                    """
+                    import importlib
+                    importlib.set_lazy_imports(True)
+                    from tmp_b import B
+
+                    def f():
+                        return B
+
+                    for _ in range(51):
+                        f()
+
+                    from tmp_b import B
+                    """
+                )
+            )
+            (tmp / "tmp_b.py").write_text(
+                dedent(
+                    """
+                    B = 3
+                    """
+                )
+            )
+            # pyrefly: ignore [missing-import]
+            import tmp_a
+
+            self.assertEqual(tmp_a.f(), 3)

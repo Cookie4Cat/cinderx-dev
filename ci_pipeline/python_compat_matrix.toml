@@ -1,0 +1,24 @@
+[[supported]]
+name = "cp3140"
+python = "/usr/local/cpython-3.14.0/bin/python3.14"
+version = "3.14.0"
+
+[[supported]]
+name = "cp3141"
+python = "/usr/local/cpython-3.14.1/bin/python3.14"
+version = "3.14.1"
+
+[[supported]]
+name = "cp3142"
+python = "/usr/local/cpython-3.14.2/bin/python3.14"
+version = "3.14.2"
+
+[[supported]]
+name = "cp3143"
+python = "/usr/local/cpython-3.14.3/bin/python3.14"
+version = "3.14.3"
+
+[[unsupported]]
+name = "cp3116"
+python = "/usr/local/cpython-3.11.6/bin/python3.11"
+version = "3.11.6"

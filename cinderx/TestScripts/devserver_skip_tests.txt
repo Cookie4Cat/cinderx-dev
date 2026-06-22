@@ -1,0 +1,94 @@
+#
+# CinderX devserver test skips.
+#
+
+# Behavior of import events is different after CinderX initialization.
+test.test_bdb.StateTestCase.test_skip
+
+# buck2 always encodes module names into UTF8 strings, which this test
+# claims is against the expected behavior of the runtime.  Fixing the static
+# extension bits in buck2/prelude is harder than skipping this one test.
+test.test_import.ImportTracebackTests.test_unencodable_filename
+
+# Encoding warnings aren't showing up as expected, not sure why.
+test.test_io.CMiscIOTest.test_check_encoding_warning
+test.test_io.PyMiscIOTest.test_check_encoding_warning
+
+# Expects shutil.disk_usage() to report number of bytes used, but this isn't
+# supported with Eden.  It always reports 0 bytes used.
+test.test_shutil.TestMisc.test_disk_usage
+
+# Tests that the re module isn't impported as a part of site startup, but
+# it is getting pulled in now because of CinderX.
+test.test_site.StartupImportTests.test_startup_imports
+
+# CinderX initialization leads to two instances of StaticExtensionFinder in the
+# meta path.
+test.test_sys.SysModuleTest.test_no_duplicates_in_meta_path
+
+# sysconfig tests assert that the config ends in "x86_64-linux-gnu", but
+# currently it just ends with "x86_64" in the buck build.
+test.test_sysconfig.MakefileTests.test_get_makefile_filename
+test.test_sysconfig.TestSysConfig.test_srcdir
+test.test_sysconfig.TestSysConfig.test_triplet_in_ext_suffix
+
+# This expects the threading module to not have already been imported, but it
+# appears that cinderx will import it for us before the Python main function
+# starts running.
+test.test_threading.ThreadTests.test_import_from_another_thread
+
+# The venv tests copy the buck2-built binary to a temp directory and then try
+# to run it.  This messes up its rpaths and it cannot load libpython properly.
+test.test_venv.BasicTest.test_executable
+test.test_venv.BasicTest.test_multiprocessing
+test.test_venv.BasicTest.test_prefixes
+test.test_venv.EnsurePipTest.test_explicit_no_pip
+test.test_venv.EnsurePipTest.test_no_pip_by_default
+test.test_venv.EnsurePipTest.test_with_pip
+
+# Can't run GDB because it can't load the encodings module.
+test_cinderx.test_cpython_overrides.test_gdb
+
+# Entire test files to skip for various reasons.
+test_distutils
+test_gdb
+test_socket
+test_unicodedata
+test_urllib2net
+
+
+#
+# Skips added for 3.12+.
+#
+
+# Can't access general Internet hosts from Meta servers.
+test.test_audit.AuditTest.test_http
+
+# These fail os.fork() because the process has multiple threads? This may be
+# related to T184566736 where Buck gives zombie processes to children.
+test.test_threading.ThreadTests.test_main_thread_after_fork
+test.test_perf_profiler.TestPerfTrampoline.test_trampoline_works_with_forks
+test.test_multiprocessing_main_handling.ForkCmdLineTest.*
+test.test_multiprocessing_main_handling.ForkServerCmdLineTest.*
+test.test_concurrent_futures.test_shutdown.ProcessPoolForkProcessPoolShutdownTest.*
+test.test_multiprocessing.*.test_shared_memory_SharedMemoryManager_reuses_resource_tracker
+test_multiprocessing_fork
+test_multiprocessing_forkserver
+test_multiprocessing_spawn
+test.test_compileall.CommandLineTestsNoSourceEpoch.test_workers
+test.test_compileall.CommandLineTestsWithSourceEpoch.test_workers
+test.test_concurrent_futures.test_shutdown.ProcessPoolForkserverProcessPoolShutdownTest.test_interpreter_shutdown
+
+# This fails with a negative reference count even without CinderX being loaded.
+test.test_set.TestSet.test_c_api
+
+# This is skipped in CI because we don't have a TTY. Make sure it's also skipped
+# on devservers so the list of expected pass/fail tests is consistent on both
+# platforms.
+test_ioctl
+
+# Test is very sensitive and fails on seemingly irrelevant changes.
+test.test_subprocess.POSIXProcessTestCase.test_pass_fds_redirected
+
+# Failing on dev servers for some reason
+test.test_perf_profiler.TestPerfProfilerWithDwarf.test_python_calls_appear_in_the_stack_if_perf_activated

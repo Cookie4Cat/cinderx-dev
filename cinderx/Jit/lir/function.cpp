@@ -1,0 +1,282 @@
+// Copyright (c) Meta Platforms, Inc. and affiliates.
+
+#include "cinderx/Jit/lir/function.h"
+
+#include "cinderx/Jit/containers.h"
+#include "cinderx/Jit/lir/blocksorter.h"
+
+#include <algorithm>
+
+namespace jit::lir {
+
+namespace {
+
+// Helper for copyOperand.
+void copyIndirect(
+    UnorderedMap<LinkedOperand*, int>& instr_refs,
+    Operand* dest_op,
+    MemoryIndirect* source_op) {
+  auto base = source_op->getBaseRegOperand();
+  auto index = source_op->getIndexRegOperand();
+  std::variant<Instruction*, PhyLocation> dest_base;
+  std::variant<Instruction*, PhyLocation> dest_index;
+  if (base->isLinked()) {
+    dest_base = dest_op->instr();
+  } else {
+    // Otherwise, it must be physical register.
+    dest_base = base->getPhyRegister();
+  }
+  if (index != nullptr) {
+    if (index->isLinked()) {
+      dest_index = dest_op->instr();
+    } else {
+      // Otherwise, it must be physical register.
+      dest_index = index->getPhyRegister();
+    }
+  }
+
+  dest_op->setMemoryIndirect(
+      dest_base,
+      dest_index,
+      source_op->getMultipiler(),
+      source_op->getOffset());
+
+  // add linked operands to instr_refs
+  auto memInd = dest_op->getMemoryIndirect();
+  if (base->isLinked()) {
+    auto base_linked = static_cast<const LinkedOperand*>(base);
+    auto base_linked_id = base_linked->getLinkedOperand()->instr()->id();
+    instr_refs.emplace(
+        static_cast<LinkedOperand*>(memInd->getBaseRegOperand()),
+        base_linked_id);
+  }
+
+  if (index != nullptr && index->isLinked()) {
+    auto index_linked = static_cast<const LinkedOperand*>(index);
+    auto index_linked_id = index_linked->getLinkedOperand()->instr()->id();
+    instr_refs.emplace(
+        static_cast<LinkedOperand*>(memInd->getIndexRegOperand()),
+        index_linked_id);
+  }
+}
+
+// Helper for copyOperandBase.
+// Assume that type and data type are already be set.
+void copyOperand(
+    UnorderedMap<int, BasicBlock*>& block_index_map,
+    UnorderedMap<LinkedOperand*, int>& instr_refs,
+    Operand* operand,
+    Operand* operand_copy) {
+  switch (operand->type()) {
+    case OperandBase::kReg: {
+      operand_copy->setPhyRegister(operand->getPhyRegister());
+      operand_copy->setDataType(operand->dataType());
+      break;
+    }
+    case OperandBase::kStack: {
+      operand_copy->setStackSlot(operand->getStackSlot());
+      operand_copy->setDataType(operand->dataType());
+      break;
+    }
+    case OperandBase::kMem: {
+      operand_copy->setMemoryAddress(operand->getMemoryAddress());
+      break;
+    }
+    case OperandBase::kImm: {
+      operand_copy->setConstant(operand->getConstant(), operand->dataType());
+      break;
+    }
+    case OperandBase::kLabel: {
+      operand_copy->setBasicBlock(
+          map_get_strict(block_index_map, operand->getBasicBlock()->id()));
+      break;
+    }
+    case OperandBase::kInd: {
+      copyIndirect(instr_refs, operand_copy, operand->getMemoryIndirect());
+      break;
+    }
+    case OperandBase::kNone:
+    case OperandBase::kVreg:
+      // operand_copy should already be type kVreg.
+      break;
+  }
+}
+
+// Helper for deepCopyBasicBlocks.
+void copyInput(
+    UnorderedMap<int, BasicBlock*>& block_index_map,
+    UnorderedMap<LinkedOperand*, int>& instr_refs,
+    OperandBase* input,
+    Instruction* instr_copy) {
+  if (input->isLinked()) {
+    LinkedOperand* linked_opnd = instr_copy->allocateLinkedInput(nullptr);
+    instr_refs.emplace(
+        linked_opnd,
+        static_cast<LinkedOperand*>(input)->getDefine()->instr()->id());
+  } else {
+    // Allocate temporary input and set value_ using copyOperand.
+    Operand* input_copy = instr_copy->allocateImmediateInput(0);
+    copyOperand(
+        block_index_map, instr_refs, static_cast<Operand*>(input), input_copy);
+    input_copy->setDataType(input->dataType());
+  }
+}
+
+// Helper for deepCopyBasicBlocks.
+void connectLinkedOperands(
+    UnorderedMap<int, Instruction*>& output_index_map_,
+    UnorderedMap<LinkedOperand*, int>& instr_refs_) {
+  for (auto& [operand, instr_index] : instr_refs_) {
+    auto instr = map_get_strict(output_index_map_, instr_index);
+    operand->setLinkedInstr(instr);
+  }
+}
+
+// Helper used in copyFrom.
+// Expects blocks to be initialized into block_index_map_.
+// Copies the instructions and successors from src_blocks.
+void deepCopyBasicBlocks(
+    const std::vector<BasicBlock*>& src_blocks,
+    UnorderedMap<int, BasicBlock*>& block_index_map_,
+    const hir::Instr* origin) {
+  UnorderedMap<int, Instruction*> output_index_map;
+  UnorderedMap<LinkedOperand*, int> instr_refs;
+
+  for (auto bb : src_blocks) {
+    BasicBlock* bb_copy = map_get_strict(block_index_map_, bb->id());
+    for (auto succ : bb->successors()) {
+      bb_copy->addSuccessor(map_get_strict(block_index_map_, succ->id()));
+    }
+    for (auto& instr : bb->instructions()) {
+      // Copying the instruction will also copy the output
+      // (including the output type and data type).
+      bb_copy->instructions().emplace_back(
+          std::make_unique<Instruction>(bb_copy, instr.get(), origin));
+      Instruction* instr_copy = bb_copy->instructions().back().get();
+      output_index_map.emplace(instr->id(), instr_copy);
+      // Copy output.
+      Operand* output = instr->output();
+      Operand* output_copy = instr_copy->output();
+      copyOperand(block_index_map_, instr_refs, output, output_copy);
+      // Copy inputs.
+      for (size_t i = 0, n = instr->getNumInputs(); i < n; ++i) {
+        OperandBase* input = instr->getInput(i);
+        copyInput(block_index_map_, instr_refs, input, instr_copy);
+      }
+    }
+  }
+
+  connectLinkedOperands(output_index_map, instr_refs);
+}
+
+} // namespace
+
+Function::Function(const hir::Function* hir_func) : hir_func_{hir_func} {}
+
+int Function::allocateId() {
+  return next_id_++;
+}
+
+void Function::setNextId(int id) {
+  next_id_ = id;
+}
+
+Function::CopyResult Function::copyFrom(
+    const Function* src_func,
+    BasicBlock* prev_bb,
+    BasicBlock* next_bb,
+    const hir::Instr* origin) {
+  JIT_CHECK(
+      prev_bb->successors().size() == 1 && prev_bb->successors()[0] == next_bb,
+      "prev_bb should only have 1 successor which should be next_bb.");
+
+  UnorderedMap<int, BasicBlock*> block_index_map;
+
+  // Initialize the basic blocks.
+  for (auto bb : src_func->basicblocks()) {
+    BasicBlock* bb_copy = &basic_block_store_.emplace_back(this);
+    block_index_map.emplace(bb->id(), bb_copy);
+    // Insert basic block before the last block.
+    basic_blocks_.emplace(std::prev(basic_blocks_.end()), bb_copy);
+  }
+
+  deepCopyBasicBlocks(src_func->basicblocks(), block_index_map, origin);
+
+  int end = basic_blocks_.size() - 1;
+  int start = end - src_func->basic_blocks_.size();
+  BasicBlock* dest_start = basic_blocks_.at(start);
+  BasicBlock* dest_end = basic_blocks_.at(end - 1);
+  prev_bb->setSuccessor(0, dest_start);
+  JIT_CHECK(
+      dest_end->successors().empty(),
+      "Last block of function should have no successors.");
+  dest_end->addSuccessor(next_bb);
+
+  return CopyResult{start, end};
+}
+
+BasicBlock* Function::allocateBasicBlock() {
+  basic_block_store_.emplace_back(this);
+  BasicBlock* new_block = &basic_block_store_.back();
+  basic_blocks_.emplace_back(new_block);
+  return new_block;
+}
+
+BasicBlock* Function::allocateBasicBlockAfter(BasicBlock* block) {
+  auto iter = std::find_if(
+      basic_blocks_.begin(),
+      basic_blocks_.end(),
+      [block](const BasicBlock* a) -> bool { return block == a; });
+  ++iter;
+  basic_block_store_.emplace_back(this);
+  BasicBlock* new_block = &basic_block_store_.back();
+  basic_blocks_.emplace(iter, new_block);
+  return new_block;
+}
+
+const std::vector<BasicBlock*>& Function::basicblocks() const {
+  return basic_blocks_;
+}
+
+std::vector<BasicBlock*>& Function::basicblocks() {
+  return basic_blocks_;
+}
+
+BasicBlock* Function::entryBlock() const {
+  if (basic_blocks_.empty()) {
+    return nullptr;
+  }
+  return basic_blocks_.front();
+}
+
+size_t Function::getNumBasicBlocks() const {
+  return basic_blocks_.size();
+}
+
+void Function::sortBasicBlocks() {
+  // Remove resume_entry_block from the block list before sorting.
+  // It is a placeholder with no instructions during regalloc — populated
+  // post-regalloc by PopulateResumeEntryBlock. If left in the list, the
+  // sorter treats it as the exit block (since it was allocated last),
+  // which breaks liveness propagation in calculateLiveIntervals.
+  //
+  // Resume blocks are reachable from yield blocks via the CFG successor
+  // edges added during LIR generation, so the sorter includes them
+  // naturally. The resume_entry_block is re-inserted into the block list
+  // in generateCode() before code emission.
+  if (resume_entry_block_ != nullptr) {
+    std::erase(basic_blocks_, resume_entry_block_);
+  }
+
+  // Use the explicitly tracked exit block. Fall back to back() for
+  // compatibility with tests that don't call setExitBlock().
+  BasicBlock* exit = exit_block_ ? exit_block_ : basic_blocks_.back();
+  BasicBlockSorter sorter(basic_blocks_, exit);
+  basic_blocks_ = sorter.getSortedBlocks();
+}
+
+const hir::Function* Function::hirFunc() const {
+  return hir_func_;
+}
+
+} // namespace jit::lir

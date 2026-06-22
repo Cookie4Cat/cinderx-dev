@@ -1,0 +1,72 @@
+# Copyright (c) Meta Platforms, Inc. and affiliates.
+import os
+import sys
+import unittest
+from trace import Trace
+
+from cinderx.test_support import skip_if_jit
+
+# ------------------------------- Utilities -----------------------------------#
+
+
+def fix_ext_py(filename):
+    """Given a .pyc filename converts it to the appropriate .py"""
+    if filename.endswith(".pyc"):
+        filename = filename[:-1]
+    return filename
+
+
+def get_firstlineno(func):
+    return func.__code__.co_firstlineno
+
+
+# -------------------- Target functions for tracing ---------------------------#
+#
+# The relative line numbers of lines in these functions matter for verifying
+# tracing. Please modify the appropriate tests if you change one of the
+# functions. Absolute line numbers don't matter.
+#
+
+
+def traced_doubler(num):
+    return num * 2
+
+
+def traced_caller_list_comprehension():
+    k = 10
+    mylist = [traced_doubler(i) for i in range(k)]
+    return mylist
+
+
+# ------------------------------ Test cases -----------------------------------#
+
+
+class CinderX_TestLineCounts(unittest.TestCase):
+    """White-box testing of line-counting, via runfunc"""
+
+    def setUp(self):
+        self.addCleanup(sys.settrace, sys.gettrace())
+        self.tracer = Trace(count=1, trace=0, countfuncs=0, countcallers=0)
+        self.my_py_filename = fix_ext_py(__file__)
+
+    @skip_if_jit("tracing not supported with JIT")
+    def test_trace_list_comprehension(self) -> None:
+        # cinder modified for comprehension inlining
+        self.tracer.runfunc(traced_caller_list_comprehension)
+
+        firstlineno_calling = get_firstlineno(traced_caller_list_comprehension)
+        firstlineno_called = get_firstlineno(traced_doubler)
+        expected = {
+            (self.my_py_filename, firstlineno_calling + 1): 1,
+            # List comprehensions work differently in 3.x, so the count
+            # below changed compared to 2.x.
+            (self.my_py_filename, firstlineno_calling + 2): 11,
+            (self.my_py_filename, firstlineno_called + 1): 10,
+            (self.my_py_filename, firstlineno_calling + 3): 1,
+        }
+
+        self.assertEqual(self.tracer.results().counts, expected)
+
+
+if __name__ == "__main__":
+    unittest.main()

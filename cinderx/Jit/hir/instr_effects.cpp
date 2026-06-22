@@ -1,0 +1,583 @@
+// Copyright (c) Meta Platforms, Inc. and affiliates.
+
+#include "cinderx/Jit/hir/instr_effects.h"
+
+#include "cinderx/Jit/hir/hir.h"
+
+namespace jit::hir {
+
+namespace {
+// Instructions that don't produce a borrowed reference or steal any of their
+// inputs.
+MemoryEffects commonEffects(const Instr& inst, AliasClass may_store) {
+  return {false, AEmpty, {inst.NumOperands()}, may_store};
+}
+
+// Instructions that borrow their output from a specific location.
+MemoryEffects borrowFrom(const Instr& inst, AliasClass borrow_support) {
+  return {true, borrow_support, {inst.NumOperands()}, AEmpty};
+}
+
+util::BitVector stealAllInputs(const Instr& inst) {
+  return {inst.NumOperands(), (uint64_t{1} << inst.NumOperands()) - 1};
+}
+
+} // namespace
+
+MemoryEffects memoryEffects(const Instr& inst) {
+  switch (inst.opcode()) {
+    // Instructions that don't produce a borrowed reference, don't steal any
+    // inputs, and don't write to heap locations that we track.
+    case Opcode::kAssign:
+    case Opcode::kBitCast:
+    case Opcode::kBuildSlice:
+    case Opcode::kBuildString:
+    case Opcode::kBuildInterpolation:
+    case Opcode::kBuildTemplate:
+    case Opcode::kCast:
+    case Opcode::kCIntToCBool:
+    case Opcode::kCompactLongUnbox:
+    case Opcode::kDeopt:
+    case Opcode::kDeoptPatchpoint:
+    case Opcode::kDoubleBinaryOp:
+    case Opcode::kFloatCompare:
+    case Opcode::kGetSecondOutput:
+    case Opcode::kHintType:
+    case Opcode::kIndexUnbox:
+    case Opcode::kIntBinaryOp:
+    case Opcode::kPrimitiveConvert:
+    case Opcode::kIsCompactLong:
+    case Opcode::kIsNegativeAndErrOccurred:
+    case Opcode::kLoadEvalBreaker:
+    case Opcode::kLoadVarObjectSize:
+    case Opcode::kLongCompare:
+    case Opcode::kMakeCell:
+    case Opcode::kMakeCheckedDict:
+    case Opcode::kMakeDict:
+    case Opcode::kMakeSet:
+    case Opcode::kMakeTupleFromList:
+    case Opcode::kOSREntry:
+    case Opcode::kPrimitiveCompare:
+    case Opcode::kPrimitiveUnaryOp:
+    case Opcode::kPrimitiveUnbox:
+    case Opcode::kRefineType:
+    case Opcode::kSnapshot:
+    case Opcode::kTpAlloc:
+    case Opcode::kUnicodeCompare:
+    case Opcode::kUnicodeConcat:
+    case Opcode::kUnicodeRepeat:
+    case Opcode::kUnicodeSubscr:
+    case Opcode::kUnreachable:
+    case Opcode::kUseType:
+    case Opcode::kWaitHandleLoadCoroOrResult:
+    case Opcode::kWaitHandleLoadWaiter:
+      return commonEffects(inst, AEmpty);
+
+    // If boxing a bool, we return a borrowed reference to Py_True or Py_False.
+    case Opcode::kPrimitiveBoxBool:
+      return borrowFrom(inst, AEmpty);
+
+    case Opcode::kPrimitiveBox:
+      return commonEffects(inst, AEmpty);
+
+    // These push/pop frames and should not get DCE'd.
+    case Opcode::kBeginInlinedFunction:
+    case Opcode::kEndInlinedFunction:
+    // Updates the _PyInterpreterFrame
+    case Opcode::kUpdatePrevInstr:
+    // Can write to fields of its operands.
+    case Opcode::kSetCurrentAwaiter:
+    case Opcode::kWaitHandleRelease:
+    case Opcode::kLoadFrame:
+      return commonEffects(inst, AOther);
+
+    // These can deopt but don't write to any memory locations when they fall
+    // through.
+    case Opcode::kCheckErrOccurred:
+    case Opcode::kCheckExc:
+    case Opcode::kCheckField:
+    case Opcode::kCheckFreevar:
+    case Opcode::kCheckNeg:
+    case Opcode::kCheckSequenceBounds:
+    case Opcode::kCheckVar:
+    case Opcode::kGuard:
+    case Opcode::kGuardType:
+      return commonEffects(inst, AEmpty);
+
+    // Instructions that don't produce a borrowed reference, don't steal any
+    // inputs, and may write all memory locations (usually from invoking
+    // arbitrary user code).
+    case Opcode::kBinaryOp:
+    case Opcode::kCallEx:
+    case Opcode::kCallInd:
+    case Opcode::kCallIntrinsic:
+    case Opcode::kCallMethod:
+    case Opcode::kCallStatic:
+    case Opcode::kCallStaticRetVoid:
+    case Opcode::kCompare:
+    case Opcode::kCompareBool:
+    case Opcode::kConvertValue:
+    case Opcode::kCopyDictWithoutKeys:
+    case Opcode::kDeleteAttr:
+    case Opcode::kDeleteSubscr:
+    case Opcode::kDictMerge:
+    case Opcode::kDictUpdate:
+    case Opcode::kDictSubscr:
+    case Opcode::kEagerImportName:
+    case Opcode::kFillTypeAttrCache:
+    case Opcode::kFillTypeMethodCache:
+    case Opcode::kFloatBinaryOp:
+    case Opcode::kFormatValue:
+    case Opcode::kFormatWithSpec:
+    case Opcode::kGetAIter:
+    case Opcode::kGetANext:
+    case Opcode::kGetIter:
+    case Opcode::kGetLength:
+    case Opcode::kImportFrom:
+    case Opcode::kImportName:
+    case Opcode::kInPlaceOp:
+    case Opcode::kInitFrameCellVars:
+    case Opcode::kInvokeIterNext:
+    case Opcode::kInvokeStaticFunction:
+    case Opcode::kIsInstance:
+    case Opcode::kIsTruthy:
+    case Opcode::kLoadAttr:
+    case Opcode::kLoadAttrCached:
+    case Opcode::kLoadAttrSpecial:
+    case Opcode::kLoadAttrSuper:
+    case Opcode::kLoadGlobal:
+    case Opcode::kLoadMethod:
+    case Opcode::kLoadMethodCached:
+    case Opcode::kLoadMethodSuper:
+    case Opcode::kLoadModuleAttrCached:
+    case Opcode::kLoadModuleMethodCached:
+    case Opcode::kLoadSpecial:
+    case Opcode::kLongBinaryOp:
+    case Opcode::kLongInPlaceOp:
+    case Opcode::kMatchClass:
+    case Opcode::kMatchKeys:
+    case Opcode::kSend:
+    case Opcode::kUnaryOp:
+    case Opcode::kUnpackExToTuple:
+    case Opcode::kReserveStack:
+    case Opcode::kUnpackSequence:
+    case Opcode::kVectorCall:
+      return commonEffects(inst, AManagedHeapAny);
+
+    // Steals the reference to its second input and gives it to the cell
+    case Opcode::kSetCellItem:
+      return {true, AEmpty, {inst.NumOperands(), 2}, ACellItem};
+
+    // Atomically swaps cell value. Steals operand 1 (new value) and returns
+    // owned reference to old value. Used for thread-safe STORE_DEREF.
+    case Opcode::kSwapCellItem:
+      return {false, AEmpty, {inst.NumOperands(), 2}, ACellItem};
+
+    // Returns a stolen (from the cell), not borrowed, reference.
+    case Opcode::kStealCellItem:
+      return commonEffects(inst, AEmpty);
+
+    // Instructions that return nullptr or a borrowed reference to a singleton
+    // (usually None or True), and can invoke user code.
+    case Opcode::kMergeSetUnpack:
+    case Opcode::kRunPeriodicTasks:
+    case Opcode::kSetDictItem:
+    case Opcode::kSetSetItem:
+    case Opcode::kSetUpdate:
+    case Opcode::kStoreAttr:
+    case Opcode::kStoreAttrCached:
+    case Opcode::kStoreSubscr:
+      return {true, AEmpty, {}, AManagedHeapAny};
+
+    // AtQuiescentState reports to QSBR that the thread holds no unprotected
+    // pointers. This requires that all borrowed references from transient
+    // locations (globals, dict items, etc.) be promoted to owned before the
+    // quiescent state is reported. The AManagedHeapAny may_store ensures this.
+    case Opcode::kAtQuiescentState:
+      return {false, AEmpty, {}, AManagedHeapAny};
+
+    case Opcode::kListAppend:
+    case Opcode::kListExtend:
+      return {true, AEmpty, {inst.NumOperands()}, AListItem};
+
+    case Opcode::kIncref:
+    case Opcode::kXIncref:
+      return {false, AEmpty, {inst.NumOperands()}, AOther};
+
+    case Opcode::kBatchDecref:
+      return {false, AEmpty, {1, 1}, AManagedHeapAny};
+
+    case Opcode::kDecref:
+    case Opcode::kXDecref: {
+      if (inst.GetOperand(0)->type().runtimePyTypeDestructor().has_value()) {
+        return {false, AEmpty, {inst.NumOperands()}, AOther};
+      } else {
+        return {false, AEmpty, {1, 1}, AManagedHeapAny};
+      }
+    }
+
+    case Opcode::kMakeFunction:
+      // MakeFunction can invoke the JIT which may at some point have effects
+      // worth tracking.
+      return commonEffects(inst, AOther);
+
+    case Opcode::kMakeCheckedList:
+    case Opcode::kMakeList: {
+      // Steal all inputs.
+      util::BitVector inputs{inst.NumOperands()};
+      inputs.fill(true);
+      return {false, AEmpty, std::move(inputs), AListItem};
+    }
+    case Opcode::kMakeTuple:
+      return commonEffects(inst, ATupleItem);
+
+    case Opcode::kStoreField:
+      JIT_DCHECK(inst.NumOperands() == 3, "Unexpected number of operands");
+      return {false, AEmpty, {3, 2}, AInObjectAttr};
+
+    case Opcode::kLoadArg:
+    case Opcode::kLoadCurrentFunc:
+      return borrowFrom(inst, AFuncArgs);
+
+    case Opcode::kGuardIs:
+    case Opcode::kLoadConst:
+      return borrowFrom(inst, AEmpty);
+
+    case Opcode::kLoadCellItem:
+#ifdef Py_GIL_DISABLED
+      // In FT-Python, LoadCellItem calls PyCell_GetRef which returns an
+      // owned (new) reference.
+      return commonEffects(inst, AEmpty);
+#else
+      return borrowFrom(inst, ACellItem);
+#endif
+
+    case Opcode::kLoadField: {
+      auto& ldfld = static_cast<const LoadField&>(inst);
+      if (ldfld.borrowed()) {
+        return borrowFrom(inst, AInObjectAttr);
+      }
+      return commonEffects(inst, AEmpty);
+    }
+
+    case Opcode::kLoadFieldAddress:
+      return commonEffects(inst, AEmpty);
+
+    case Opcode::kLoadFunctionIndirect:
+
+    case Opcode::kLoadGlobalCached:
+      return borrowFrom(inst, AGlobal);
+
+    case Opcode::kLoadTupleItem:
+      return borrowFrom(inst, ATupleItem);
+
+    case Opcode::kLoadArrayItem: {
+      auto& load = static_cast<const LoadArrayItem&>(inst);
+      if (load.borrowed()) {
+        return borrowFrom(inst, AArrayItem | AListItem);
+      }
+      // When borrowed=false, the instruction is consuming (stealing) a
+      // reference from the array. Model as a write to AArrayItem to prevent
+      // DCE from removing it, which would leak the stolen reference.
+      return commonEffects(inst, AArrayItem);
+    }
+    case Opcode::kStoreArrayItem:
+      // we steal a ref to our third operand, the value being stored
+      return {
+          false, AEmpty, {inst.NumOperands(), 1 << 2}, AArrayItem | AListItem};
+    case Opcode::kLoadSplitDictItem:
+      return borrowFrom(inst, ADictItem);
+    case Opcode::kLoadTypeAttrCacheEntryType:
+    case Opcode::kLoadTypeAttrCacheEntryValue:
+      return borrowFrom(inst, ATypeAttrCache);
+    case Opcode::kLoadTypeMethodCacheEntryValue:
+      // This instruction will return a struct containing 2 pointers where the
+      // second pointer is emitted as an output by GetLoadMethodInstance who
+      // does not produce a borrowed reference. We are choosing to also not
+      // produce borrowed reference here to be consistent with
+      // GetLoadMethodInstance's memory effects for simplicity
+      return commonEffects(inst, AEmpty);
+    case Opcode::kLoadTypeMethodCacheEntryType:
+      return borrowFrom(inst, ATypeMethodCache);
+
+    case Opcode::kReturn:
+      return {false, AEmpty, {1, 1}, AManagedHeapAny};
+
+    case Opcode::kSetFunctionAttr: {
+      JIT_DCHECK(inst.NumOperands() == 2, "Unexpected number of operands");
+      return {false, AEmpty, {2, 1}, AFuncAttr};
+    }
+
+    case Opcode::kRaise:
+      return {false, AEmpty, stealAllInputs(inst), AEmpty};
+
+    case Opcode::kRaiseAwaitableError:
+    case Opcode::kRaiseStatic:
+      return commonEffects(inst, AManagedHeapAny);
+
+    // The outputs of InitialYield and YieldValue are the `arg` argument to
+    // _PyJIT_GenSend(), which is borrowed from its caller like all arguments
+    // to C functions.
+    case Opcode::kInitialYield:
+      return {true, AFuncArgs, {inst.NumOperands()}, AAny};
+    case Opcode::kYieldValue:
+      return {true, AFuncArgs, {1, 1}, AAny};
+
+    case Opcode::kCallCFunc:
+      return commonEffects(inst, AManagedHeapAny);
+
+    // TreeIter state machine instructions.
+    case Opcode::kEnsureTreeIterState:
+    case Opcode::kSaveCurrentNode:
+    case Opcode::kStateStackPush:
+    case Opcode::kCheckTreeIterChildEntry:
+    case Opcode::kTreeIterEnterChild:
+    case Opcode::kTreeIterLeaveCurrentNode:
+    case Opcode::kClearTreeIterState:
+      return commonEffects(inst, AManagedHeapAny);
+    case Opcode::kLoadCurrentNode:
+    case Opcode::kStateStackPop:
+      return commonEffects(inst, AOther);
+    case Opcode::kSavePhase:
+      return commonEffects(inst, AOther);
+    case Opcode::kLoadPhase:
+    case Opcode::kLoadPoppedPhase:
+    case Opcode::kLoadStackTop:
+      return commonEffects(inst, AEmpty);
+
+    case Opcode::kBranch:
+    case Opcode::kCondBranch:
+    case Opcode::kCondBranchCheckType:
+    case Opcode::kCondBranchIterNotDone:
+    case Opcode::kPhi:
+      JIT_ABORT(
+          "Opcode {} doesn't have well-defined memory effects", inst.opname());
+    case Opcode::kGetTuple:
+      return commonEffects(inst, AAny);
+  }
+
+  JIT_ABORT("Bad opcode {}", static_cast<int>(inst.opcode()));
+}
+
+bool hasArbitraryExecution(const Instr& inst) {
+  switch (inst.opcode()) {
+    /*
+     * No arbitrary execution.
+     */
+
+    // Deopting opcodes which don't have side-effects otherwise. Assume getting
+    // us into and resuming execution in the interpreter is sufficient to not
+    // need special handling for effective side-effects.
+    case Opcode::kCheckErrOccurred:
+    case Opcode::kCheckExc:
+    case Opcode::kCheckField:
+    case Opcode::kCheckFreevar:
+    case Opcode::kCheckNeg:
+    case Opcode::kCheckSequenceBounds:
+    case Opcode::kCheckVar:
+    case Opcode::kCIntToCBool:
+    case Opcode::kDeopt:
+    case Opcode::kGuard:
+    case Opcode::kGuardType:
+    case Opcode::kRaise:
+    case Opcode::kRaiseAwaitableError:
+    case Opcode::kRaiseStatic:
+
+    // Counting return as NOT arbitrary for now. Assume returning from the
+    // function is sufficient to not need special handling for further effects.
+    case Opcode::kReturn:
+
+    case Opcode::kAssign:
+    case Opcode::kAtQuiescentState:
+    case Opcode::kBeginInlinedFunction:
+    case Opcode::kBitCast:
+    case Opcode::kBranch:
+    case Opcode::kBuildSlice:
+    case Opcode::kBuildString:
+    case Opcode::kBuildInterpolation:
+    case Opcode::kBuildTemplate:
+    case Opcode::kCast:
+    case Opcode::kCompactLongUnbox:
+    case Opcode::kCondBranch:
+    case Opcode::kCondBranchCheckType:
+    case Opcode::kCondBranchIterNotDone:
+    case Opcode::kDeoptPatchpoint:
+    case Opcode::kDoubleBinaryOp:
+    case Opcode::kEndInlinedFunction:
+    case Opcode::kFloatCompare:
+    case Opcode::kGetSecondOutput:
+    case Opcode::kGuardIs:
+    case Opcode::kHintType:
+    case Opcode::kIncref:
+    case Opcode::kIndexUnbox:
+    case Opcode::kInitFrameCellVars:
+    case Opcode::kIntBinaryOp:
+    case Opcode::kPrimitiveConvert:
+    case Opcode::kIsCompactLong:
+    case Opcode::kIsNegativeAndErrOccurred:
+    case Opcode::kListAppend:
+    case Opcode::kListExtend:
+    case Opcode::kLoadArg:
+    case Opcode::kLoadArrayItem:
+    case Opcode::kLoadCellItem:
+    case Opcode::kLoadConst:
+    case Opcode::kLoadCurrentFunc:
+    case Opcode::kLoadFrame:
+    case Opcode::kLoadEvalBreaker:
+    case Opcode::kLoadField:
+    case Opcode::kLoadFieldAddress:
+    case Opcode::kLoadFunctionIndirect:
+    case Opcode::kLoadGlobalCached:
+    case Opcode::kLoadSplitDictItem:
+    case Opcode::kLoadTupleItem:
+    case Opcode::kLoadTypeAttrCacheEntryType:
+    case Opcode::kLoadTypeAttrCacheEntryValue:
+    case Opcode::kLoadTypeMethodCacheEntryType:
+    case Opcode::kLoadTypeMethodCacheEntryValue:
+    case Opcode::kLoadVarObjectSize:
+    case Opcode::kLongCompare:
+    case Opcode::kMakeCell:
+    case Opcode::kMakeCheckedDict:
+    case Opcode::kMakeCheckedList:
+    case Opcode::kMakeDict:
+    case Opcode::kMakeList:
+    case Opcode::kMakeSet:
+    case Opcode::kMakeTuple:
+    case Opcode::kMakeTupleFromList:
+    case Opcode::kOSREntry:
+    case Opcode::kPhi:
+    case Opcode::kPrimitiveBox:
+    case Opcode::kPrimitiveBoxBool:
+    case Opcode::kPrimitiveCompare:
+    case Opcode::kPrimitiveUnaryOp:
+    case Opcode::kPrimitiveUnbox:
+    case Opcode::kRefineType:
+    case Opcode::kReserveStack:
+    case Opcode::kSetCellItem:
+    case Opcode::kSetFunctionAttr:
+    case Opcode::kSnapshot:
+    case Opcode::kStealCellItem:
+    case Opcode::kSwapCellItem:
+    case Opcode::kStoreArrayItem:
+    case Opcode::kStoreField:
+    case Opcode::kTpAlloc:
+    case Opcode::kUnicodeCompare:
+    case Opcode::kUnicodeConcat:
+    case Opcode::kUnicodeRepeat:
+    case Opcode::kUnicodeSubscr:
+    case Opcode::kUnreachable:
+    case Opcode::kUpdatePrevInstr:
+    case Opcode::kUseType:
+    case Opcode::kWaitHandleLoadCoroOrResult:
+    case Opcode::kWaitHandleLoadWaiter:
+    case Opcode::kWaitHandleRelease:
+    case Opcode::kXIncref:
+    // TreeIter read-only phase/stack-top loads; no side effects.
+    case Opcode::kLoadPhase:
+    case Opcode::kLoadPoppedPhase:
+    case Opcode::kLoadStackTop:
+      return false;
+
+    /*
+     * Opcodes which do have potential arbitrary execution.
+     */
+    case Opcode::kBatchDecref:
+    case Opcode::kBinaryOp:
+    case Opcode::kCallEx:
+    case Opcode::kCallInd:
+    case Opcode::kCallIntrinsic:
+    case Opcode::kCallMethod:
+    case Opcode::kCallStatic:
+    case Opcode::kCallStaticRetVoid:
+    case Opcode::kCompare:
+    case Opcode::kCompareBool:
+    case Opcode::kConvertValue:
+    case Opcode::kCopyDictWithoutKeys:
+    case Opcode::kDecref:
+    case Opcode::kDeleteAttr:
+    case Opcode::kDeleteSubscr:
+    case Opcode::kDictMerge:
+    case Opcode::kDictSubscr:
+    case Opcode::kDictUpdate:
+    case Opcode::kEagerImportName:
+    case Opcode::kFillTypeAttrCache:
+    case Opcode::kFillTypeMethodCache:
+    case Opcode::kFloatBinaryOp:
+    case Opcode::kFormatValue:
+    case Opcode::kFormatWithSpec:
+    case Opcode::kGetAIter:
+    case Opcode::kGetANext:
+    case Opcode::kGetIter:
+    case Opcode::kGetLength:
+    case Opcode::kGetTuple:
+    case Opcode::kImportFrom:
+    case Opcode::kImportName:
+    case Opcode::kInitialYield:
+    case Opcode::kInPlaceOp:
+    case Opcode::kInvokeIterNext:
+    case Opcode::kInvokeStaticFunction:
+    case Opcode::kIsInstance:
+    case Opcode::kIsTruthy:
+    case Opcode::kLoadAttr:
+    case Opcode::kLoadAttrCached:
+    case Opcode::kLoadAttrSpecial:
+    case Opcode::kLoadAttrSuper:
+    case Opcode::kLoadGlobal:
+    case Opcode::kLoadMethod:
+    case Opcode::kLoadMethodCached:
+    case Opcode::kLoadMethodSuper:
+    case Opcode::kLoadModuleAttrCached:
+    case Opcode::kLoadModuleMethodCached:
+    case Opcode::kLoadSpecial:
+    case Opcode::kLongBinaryOp:
+    case Opcode::kLongInPlaceOp:
+    case Opcode::kMakeFunction:
+    case Opcode::kMergeSetUnpack:
+    case Opcode::kMatchClass:
+    case Opcode::kMatchKeys:
+    case Opcode::kRunPeriodicTasks:
+    case Opcode::kSend:
+    case Opcode::kSetCurrentAwaiter:
+    case Opcode::kSetDictItem:
+    case Opcode::kSetSetItem:
+    case Opcode::kSetUpdate:
+    case Opcode::kStoreAttr:
+    case Opcode::kStoreAttrCached:
+    case Opcode::kStoreSubscr:
+    case Opcode::kUnaryOp:
+    case Opcode::kUnpackExToTuple:
+    case Opcode::kUnpackSequence:
+    case Opcode::kVectorCall:
+    case Opcode::kXDecref:
+    case Opcode::kYieldValue:
+    // TreeIter state machine instructions with side effects or refcount ops.
+    case Opcode::kEnsureTreeIterState:
+    case Opcode::kSaveCurrentNode:
+    case Opcode::kLoadCurrentNode:
+    case Opcode::kSavePhase:
+    case Opcode::kStateStackPush:
+    case Opcode::kStateStackPop:
+    case Opcode::kCheckTreeIterChildEntry:
+    case Opcode::kTreeIterEnterChild:
+    case Opcode::kTreeIterLeaveCurrentNode:
+    case Opcode::kClearTreeIterState:
+      return true;
+
+    case Opcode::kCallCFunc:
+      switch (static_cast<const CallCFunc&>(inst).func()) {
+        case CallCFunc::Func::kJitCoro_GetAwaitableIter:
+          return true;
+        case CallCFunc::Func::kCix_PyAsyncGenValueWrapperNew:
+          return false;
+        case CallCFunc::Func::kJitGen_yf:
+          return false;
+      }
+      JIT_ABORT(
+          "Bad CallCFunc function {}",
+          static_cast<const CallCFunc&>(inst).func());
+  }
+
+  JIT_ABORT("Bad opcode {}", static_cast<int>(inst.opcode()));
+}
+
+} // namespace jit::hir

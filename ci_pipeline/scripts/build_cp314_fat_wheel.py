@@ -1,0 +1,352 @@
+#!/usr/bin/env python3
+# Copyright (c) Meta Platforms, Inc. and affiliates.
+#
+# This source code is licensed under the MIT license found in the
+# LICENSE file in the root directory of this source tree.
+"""Build a CPython 3.14 micro-version fat CinderX wheel.
+
+This repacks four ordinary cp314 wheels, each built with its matching CPython
+3.14 micro version, into one wheel with a Python `_cinderx` loader and four
+private native variants.
+"""
+
+from __future__ import annotations
+
+import argparse
+import base64
+import csv
+import hashlib
+import io
+import json
+import os
+from pathlib import Path
+import posixpath
+import re
+import sys
+import zipfile
+
+
+REQUIRES_PYTHON = ">=3.14,<3.14.4"
+VARIANTS = (
+    ("py3140", "py314_0", "_cinderx_3140"),
+    ("py3141", "py314_1", "_cinderx_3141"),
+    ("py3142", "py314_2", "_cinderx_3142"),
+    ("py3143", "py314_3", "_cinderx_3143"),
+)
+
+
+class WheelError(Exception):
+    pass
+
+
+def parse_wheel_filename(path: Path) -> dict[str, str | None]:
+    name = path.name
+    if not name.endswith(".whl"):
+        raise WheelError(f"{path} is not a wheel")
+    parts = name[:-4].split("-")
+    if len(parts) not in (5, 6):
+        raise WheelError(f"cannot parse wheel filename: {name}")
+
+    if len(parts) == 5:
+        distribution, version, python_tag, abi_tag, platform_tag = parts
+        build_tag = None
+    else:
+        distribution, version, build_tag, python_tag, abi_tag, platform_tag = parts
+    return {
+        "distribution": distribution,
+        "version": version,
+        "build_tag": build_tag,
+        "python_tag": python_tag,
+        "abi_tag": abi_tag,
+        "platform_tag": platform_tag,
+    }
+
+
+def read_wheel(path: Path) -> tuple[dict[str, bytes], dict[str, str | None]]:
+    parsed = parse_wheel_filename(path)
+    entries: dict[str, bytes] = {}
+    with zipfile.ZipFile(path) as wheel:
+        for info in wheel.infolist():
+            if info.is_dir():
+                continue
+            if info.filename in entries:
+                raise WheelError(f"{path} has duplicate entry {info.filename}")
+            entries[info.filename] = wheel.read(info.filename)
+    return entries, parsed
+
+
+def stable_wheel_content_sha256(entries: dict[str, bytes]) -> str:
+    """Return a sha256 over wheel paths and file contents, excluding zip metadata."""
+    digest = hashlib.sha256()
+    for name in sorted(entries):
+        encoded_name = name.encode("utf-8")
+        data = entries[name]
+        digest.update(len(encoded_name).to_bytes(8, "big"))
+        digest.update(encoded_name)
+        digest.update(len(data).to_bytes(8, "big"))
+        digest.update(data)
+    return digest.hexdigest()
+
+
+def find_dist_info(entries: dict[str, bytes]) -> str:
+    dist_infos = sorted(
+        {
+            name.split("/", 1)[0]
+            for name in entries
+            if "/" in name and name.split("/", 1)[0].endswith(".dist-info")
+        }
+    )
+    if len(dist_infos) != 1:
+        raise WheelError(f"expected one .dist-info directory, found {dist_infos}")
+    return dist_infos[0]
+
+
+def find_native_extension(entries: dict[str, bytes], wheel: Path) -> str:
+    candidates = [
+        name
+        for name in entries
+        if "/" not in name
+        and name.startswith("_cinderx")
+        and (name.endswith(".so") or ".so." in name or name.endswith(".pyd"))
+    ]
+    if len(candidates) != 1:
+        raise WheelError(
+            f"expected one top-level _cinderx native extension in {wheel}, "
+            f"found {candidates}"
+        )
+    return candidates[0]
+
+
+def variant_native_name(original_name: str, variant_prefix: str) -> str:
+    return re.sub(r"^_cinderx", variant_prefix, original_name, count=1)
+
+
+def update_requires_python(metadata: bytes, requires_python: str) -> bytes:
+    text = metadata.decode("utf-8")
+    lines = text.splitlines()
+    out: list[str] = []
+    replaced = False
+    inserted = False
+
+    for line in lines:
+        if line.lower().startswith("requires-python:"):
+            if not replaced:
+                out.append(f"Requires-Python: {requires_python}")
+                replaced = True
+            continue
+        out.append(line)
+        if not replaced and not inserted and line.lower().startswith("version:"):
+            out.append(f"Requires-Python: {requires_python}")
+            inserted = True
+            replaced = True
+
+    if not replaced:
+        out.append(f"Requires-Python: {requires_python}")
+    return ("\n".join(out) + "\n").encode("utf-8")
+
+
+def wheel_record_line(path: str, data: bytes) -> tuple[str, str, str]:
+    digest = hashlib.sha256(data).digest()
+    encoded = base64.urlsafe_b64encode(digest).rstrip(b"=").decode("ascii")
+    return (path, f"sha256={encoded}", str(len(data)))
+
+
+def render_record(entries: dict[str, bytes], record_path: str) -> bytes:
+    buf = io.StringIO(newline="")
+    writer = csv.writer(buf)
+    for path in sorted(entries):
+        if path == record_path:
+            continue
+        writer.writerow(wheel_record_line(path, entries[path]))
+    writer.writerow((record_path, "", ""))
+    return buf.getvalue().encode("utf-8")
+
+
+def build_loader(mapping: dict[int, str]) -> bytes:
+    mapping_literal = "{\n" + "".join(
+        f"    {micro}: {path!r},\n" for micro, path in sorted(mapping.items())
+    ) + "}"
+    loader = f'''# Generated by ci_pipeline/scripts/build_cp314_fat_wheel.py.
+from __future__ import annotations
+
+import importlib.machinery
+import importlib.util
+import platform
+from pathlib import Path
+import sys
+
+_SUPPORTED = {mapping_literal}
+
+
+def _select_native_path() -> Path:
+    version = sys.version_info
+    if platform.python_implementation() != "CPython" or version[:2] != (3, 14):
+        raise ImportError(
+            "this CinderX wheel supports CPython 3.14.0 through 3.14.3 only; "
+            f"runtime is {{platform.python_implementation()}} "
+            f"{{version.major}}.{{version.minor}}.{{version.micro}}"
+        )
+    relative = _SUPPORTED.get(version.micro)
+    if relative is None:
+        raise ImportError(
+            "this CinderX wheel supports CPython 3.14.0 through 3.14.3 only; "
+            f"runtime is CPython {{version.major}}.{{version.minor}}.{{version.micro}}"
+        )
+    path = Path(__file__).resolve().parent / relative
+    if not path.is_file():
+        raise ImportError(f"CinderX native extension variant is missing: {{path}}")
+    return path
+
+
+def _load_native():
+    path = _select_native_path()
+    old_module = sys.modules.get(__name__)
+    loader = importlib.machinery.ExtensionFileLoader(__name__, str(path))
+    spec = importlib.util.spec_from_file_location(__name__, str(path), loader=loader)
+    if spec is None or spec.loader is None:
+        raise ImportError(f"could not create import spec for {{path}}")
+    module = importlib.util.module_from_spec(spec)
+    sys.modules[__name__] = module
+    try:
+        spec.loader.exec_module(module)
+    except BaseException:
+        if old_module is None:
+            sys.modules.pop(__name__, None)
+        else:
+            sys.modules[__name__] = old_module
+        raise
+    module.__cinderx_fat_loader__ = __file__
+    module.__cinderx_fat_native__ = str(path)
+    module.__cinderx_fat_variant__ = path.parent.name
+    return module
+
+
+_native = _load_native()
+globals().update(_native.__dict__)
+'''
+    return loader.encode("utf-8")
+
+
+def validate_compatible_wheels(parsed_by_variant: dict[str, dict[str, str | None]]) -> None:
+    first_name, first = next(iter(parsed_by_variant.items()))
+    for variant, parsed in parsed_by_variant.items():
+        for key in ("distribution", "version", "python_tag", "abi_tag", "platform_tag"):
+            if parsed[key] != first[key]:
+                raise WheelError(
+                    f"{variant} wheel {key}={parsed[key]!r} does not match "
+                    f"{first_name} {key}={first[key]!r}"
+                )
+        if parsed["python_tag"] != "cp314" or parsed["abi_tag"] != "cp314":
+            raise WheelError(
+                f"{variant} wheel must be cp314-cp314, got "
+                f"{parsed['python_tag']}-{parsed['abi_tag']}"
+            )
+
+
+def build_fat_wheel(
+    wheels: dict[str, Path],
+    output_wheel: Path,
+    requires_python: str,
+    force: bool,
+) -> None:
+    loaded: dict[str, dict[str, bytes]] = {}
+    parsed: dict[str, dict[str, str | None]] = {}
+    native_names: dict[str, str] = {}
+
+    for variant, wheel_path in wheels.items():
+        entries, wheel_parsed = read_wheel(wheel_path)
+        loaded[variant] = entries
+        parsed[variant] = wheel_parsed
+        native_names[variant] = find_native_extension(entries, wheel_path)
+
+    validate_compatible_wheels(parsed)
+    base_variant = "py3143"
+    base_entries = loaded[base_variant]
+    dist_info = find_dist_info(base_entries)
+    metadata_path = f"{dist_info}/METADATA"
+    record_path = f"{dist_info}/RECORD"
+
+    if metadata_path not in base_entries:
+        raise WheelError(f"base wheel is missing {metadata_path}")
+    if output_wheel.exists() and not force:
+        raise WheelError(f"{output_wheel} already exists; pass --force to overwrite")
+
+    output_entries: dict[str, bytes] = {}
+    for name, data in base_entries.items():
+        if name == record_path:
+            continue
+        if name == native_names[base_variant]:
+            continue
+        if name.startswith("cinderx/_native/"):
+            continue
+        output_entries[name] = data
+
+    mapping: dict[int, str] = {}
+    provenance: dict[str, object] = {
+        "format": "cinderx-cp314-fat-wheel-v1",
+        "requires_python": requires_python,
+        "variants": {},
+    }
+    for variant_arg, dir_name, native_prefix in VARIANTS:
+        micro = int(variant_arg[-1])
+        original_name = native_names[variant_arg]
+        repacked_name = variant_native_name(original_name, native_prefix)
+        target = posixpath.join("cinderx", "_native", dir_name, repacked_name)
+        output_entries[target] = loaded[variant_arg][original_name]
+        mapping[micro] = target
+        wheel_path = wheels[variant_arg]
+        provenance["variants"][dir_name] = {
+            "source_wheel": str(wheel_path),
+            "source_sha256": stable_wheel_content_sha256(loaded[variant_arg]),
+            "native_source": original_name,
+            "native_target": target,
+        }
+
+    output_entries["_cinderx.py"] = build_loader(mapping)
+    output_entries["cinderx/_native/fat_wheel.json"] = (
+        json.dumps(provenance, indent=2, sort_keys=True) + "\n"
+    ).encode("utf-8")
+    output_entries[metadata_path] = update_requires_python(
+        output_entries[metadata_path], requires_python
+    )
+    output_entries[record_path] = render_record(output_entries, record_path)
+
+    output_wheel.parent.mkdir(parents=True, exist_ok=True)
+    tmp_wheel = output_wheel.with_suffix(output_wheel.suffix + ".tmp")
+    if tmp_wheel.exists():
+        tmp_wheel.unlink()
+    with zipfile.ZipFile(tmp_wheel, "w", compression=zipfile.ZIP_DEFLATED) as out:
+        for name in sorted(output_entries):
+            out.writestr(name, output_entries[name])
+    os.replace(tmp_wheel, output_wheel)
+
+
+def parse_args(argv: list[str]) -> argparse.Namespace:
+    parser = argparse.ArgumentParser(description=__doc__)
+    for variant, _, _ in VARIANTS:
+        parser.add_argument(
+            f"--{variant}-wheel",
+            required=True,
+            type=Path,
+            help=f"ordinary wheel built with CPython {variant.replace('py', '').replace('314', '3.14.')}",
+        )
+    parser.add_argument("--output-wheel", required=True, type=Path)
+    parser.add_argument("--requires-python", default=REQUIRES_PYTHON)
+    parser.add_argument("--force", action="store_true")
+    return parser.parse_args(argv)
+
+
+def main(argv: list[str]) -> int:
+    args = parse_args(argv)
+    wheels = {variant: getattr(args, f"{variant}_wheel") for variant, _, _ in VARIANTS}
+    try:
+        build_fat_wheel(wheels, args.output_wheel, args.requires_python, args.force)
+    except WheelError as exc:
+        print(f"error: {exc}", file=sys.stderr)
+        return 2
+    print(args.output_wheel)
+    return 0
+
+
+if __name__ == "__main__":
+    raise SystemExit(main(sys.argv[1:]))

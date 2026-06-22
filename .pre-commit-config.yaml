@@ -1,0 +1,14 @@
+repos:
+  - repo: local
+    hooks:
+      - id: clean-code-format
+        name: Clean code clang-format check
+        entry: python ci_pipeline/scripts/check_clean_code_incremental.py --format
+        language: system
+        pass_filenames: false
+
+      - id: clean-code-tidy
+        name: Clean code clang-tidy check
+        entry: python ci_pipeline/scripts/check_clean_code_incremental.py --tidy
+        language: system
+        pass_filenames: false
