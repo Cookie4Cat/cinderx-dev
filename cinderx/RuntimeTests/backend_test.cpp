@@ -20,6 +20,7 @@
 #include "cinderx/module_state.h"
 
 #include <functional>
+// NOLINTNEXTLINE(facebook-hte-BadInclude-regex)
 #include <regex>
 #include <sstream>
 
@@ -197,7 +198,8 @@ class BackendTest : public RuntimeTest {
     EXPECT_EQ(result.error, asmjit::kErrorOk);
     EXPECT_TRUE(code_allocator->contains(result.addr))
         << "Compiled function should exist within the CodeAllocator";
-    gen.lir_func_.release();
+    Function* caller_owned_lir_func = gen.lir_func_.release();
+    EXPECT_EQ(caller_owned_lir_func, lir_func);
     return result.addr;
   }
 
@@ -206,6 +208,62 @@ class BackendTest : public RuntimeTest {
       environ.arg_locations.push_back(loc);
     }
   }
+
+#if defined(CINDER_AARCH64)
+  // Compile pre-allocated LIR (physical registers + stack slots) directly to
+  // machine code, bypassing register allocation.  Used for tests that need
+  // precise control over which registers and stack slots are used.
+  void* CompilePreAllocated(Function* lir_func, int spill_size) {
+    Environ environ;
+    InitEnviron(environ);
+
+    // Skip PostGenerationRewrite and LinearScanAllocator — the instructions
+    // are already in post-alloc form with physical registers and stack slots.
+    environ.shadow_frames_and_spill_size = spill_size;
+    environ.changed_regs = {};
+
+    PostRegAllocRewrite post_rewrite(lir_func, &environ);
+    post_rewrite.run();
+
+    asmjit::CodeHolder code;
+    ICodeAllocator* code_allocator =
+        cinderx::getModuleState()->code_allocator.get();
+    code.init(code_allocator->asmJitEnvironment());
+
+    arch::Builder as(&code);
+    environ.as = &as;
+
+    // Prologue: save frame pointer and link register, set up frame.
+    as.stp(arch::fp, arch::lr, asmjit::a64::ptr_pre(asmjit::a64::sp, -16));
+    as.mov(arch::fp, asmjit::a64::sp);
+
+    // Allocate stack space for spill slots.
+    int allocate_stack = spill_size;
+    if (allocate_stack % kStackAlign != 0) {
+      allocate_stack += kStackAlign - (allocate_stack % kStackAlign);
+    }
+    as.sub(asmjit::a64::sp, asmjit::a64::sp, allocate_stack);
+
+    NativeGeneratorFactory factory;
+    auto gen = factory(nullptr);
+    gen->env_ = std::move(environ);
+    gen->lir_func_.reset(lir_func);
+    gen->generateAssemblyBody(code);
+
+    // Epilogue: restore stack and frame pointer, return.
+    as.mov(asmjit::a64::sp, arch::fp);
+    as.ldp(arch::fp, arch::lr, asmjit::a64::ptr_post(asmjit::a64::sp, 16));
+    as.ret(arch::lr);
+
+    as.finalize();
+
+    AllocateResult result = code_allocator->addCode(&code);
+    EXPECT_EQ(result.error, asmjit::kErrorOk);
+    Function* caller_owned_lir_func = gen->lir_func_.release();
+    EXPECT_EQ(caller_owned_lir_func, lir_func);
+    return result.addr;
+  }
+#endif
 
   void CheckCast(Function* lir_func) {
     auto func =
@@ -324,6 +382,73 @@ for i in range(30):
   // TASK(T190615535): This is waiting on the 3.12 custom interpreter loop.
   // Once we have that in place, we can start incrementing call counts in 3.12.
   ASSERT_EQ(ncalls, 30);
+}
+
+TEST_F(BackendTest, ExplicitLIRSubKeepsRhsRegisterLiveAcrossOutputDefine) {
+#if !defined(CINDER_X86_64)
+  GTEST_SKIP() << "x86_64-specific allocator/codegen repro";
+#else
+  auto lirfunc = std::make_unique<Function>();
+  auto bb = lirfunc->allocateBasicBlock();
+  auto epilogue = lirfunc->allocateBasicBlock();
+
+  constexpr PhyLocation kLhsReg = R10;
+  constexpr std::array<PhyLocation, 13> kPressureRegs = {
+      RCX, RDX, RBX, RSI, RDI, R8, R9, R10, R11, R12, R13, R14, R15};
+
+  std::vector<Instruction*> pressure;
+  pressure.reserve(kPressureRegs.size());
+  // Bind vregs to almost every GP register without emitting code so the
+  // allocator has to make a real choice at the Sub instruction.
+  for (PhyLocation reg : kPressureRegs) {
+    pressure.push_back(bb->allocateInstr(
+        Instruction::kBind,
+        nullptr,
+        OutVReg{OperandBase::k64bit},
+        PhyReg{reg, OperandBase::k64bit}));
+  }
+
+  bb->allocateInstr(
+      Instruction::kMove,
+      nullptr,
+      OutPhyReg{kLhsReg, OperandBase::k64bit},
+      Imm{7});
+  auto rhs = bb->allocateInstr(
+      Instruction::kMove, nullptr, OutVReg{OperandBase::k64bit}, Imm{3});
+  auto sub = bb->allocateInstr(
+      Instruction::kSub,
+      nullptr,
+      OutVReg{OperandBase::k64bit},
+      PhyReg{kLhsReg, OperandBase::k64bit},
+      VReg{rhs});
+  bb->allocateInstr(
+      Instruction::kMove,
+      nullptr,
+      OutPhyReg{arch::reg_general_return_loc, OperandBase::k64bit},
+      VReg{sub});
+  bb->allocateInstr(Instruction::kReturn, nullptr);
+  bb->addSuccessor(epilogue);
+  // Keep the bound registers live across the Sub by threading them into the
+  // successor block. Without this, the pressure would end before the bug site.
+  for (Instruction* live_out : pressure) {
+    epilogue->allocateInstr(
+        Instruction::kPhi,
+        nullptr,
+        OutVReg{OperandBase::k64bit},
+        Lbl{bb},
+        VReg{live_out});
+  }
+
+  auto func = reinterpret_cast<uint64_t (*)()>(SimpleCompile(lirfunc.get()));
+
+  ASSERT_TRUE(sub->output()->isReg());
+  ASSERT_TRUE(sub->getInput(1)->isReg());
+  // Before the fix, both operands could land in RAX here, producing
+  // `mov rax, r10; sub rax, rax` and returning 0 instead of 4.
+  EXPECT_NE(
+      sub->output()->getPhyRegister(), sub->getInput(1)->getPhyRegister());
+  EXPECT_EQ(func(), 4);
+#endif
 }
 
 // floating-point arithmetic test
@@ -781,19 +906,34 @@ TEST_F(BackendTest, MoveSequenceOptTest) {
   [RBP - 16]:Object = Move RAX:Object
   [RBP - 24]:Object = Move RSI:Object
         RDI:Object = Move RAX:Object
+        RSI:Object = Move [RBP - 24]:Object
         RDX:Object = Move RCX:Object
                      Call Object
+
+  [RBP - 32] is deleted: lastUse with no later stack reads.
+  RSI = Move [RBP - 24] is a self-reload (RSI spilled and loaded back to RSI).
+  It is left intact because reg == out_reg skips the rewrite.
   */
-  ASSERT_EQ(bb->getNumInstrs(), 5);
+  ASSERT_EQ(bb->getNumInstrs(), 6);
   auto& instrs = bb->instructions();
 
   auto iter = instrs.begin();
 
-  ASSERT_EQ((*(iter++))->opcode(), Instruction::kMove);
-  ASSERT_EQ((*(iter++))->opcode(), Instruction::kMove);
-  ASSERT_EQ((*(iter++))->opcode(), Instruction::kMove);
-  ASSERT_EQ((*(iter++))->opcode(), Instruction::kMove);
-  ASSERT_EQ((*(iter++))->opcode(), Instruction::kCall);
+  auto* spill0 = (*(iter++)).get();
+  auto* spill1 = (*(iter++)).get();
+  auto* arg0 = (*(iter++)).get();
+  auto* arg1 = (*(iter++)).get();
+  auto* arg2 = (*(iter++)).get();
+  auto* call_instr = (*(iter++)).get();
+
+  ASSERT_EQ(spill0->opcode(), Instruction::kMove);
+  ASSERT_EQ(spill1->opcode(), Instruction::kMove);
+  ASSERT_EQ(arg0->opcode(), Instruction::kMove);
+  ASSERT_EQ(arg0->getInput(0)->type(), OperandBase::kReg);
+  ASSERT_EQ(arg1->opcode(), Instruction::kMove);
+  ASSERT_EQ(arg1->getInput(0)->type(), OperandBase::kStack);
+  ASSERT_EQ(arg2->opcode(), Instruction::kMove);
+  ASSERT_EQ(call_instr->opcode(), Instruction::kCall);
 }
 
 TEST_F(BackendTest, MoveSequenceOpt2Test) {
@@ -852,6 +992,80 @@ TEST_F(BackendTest, MoveSequenceOpt2Test) {
   ASSERT_EQ((*iter)->opcode(), Instruction::kAdd);
   ASSERT_EQ((*iter)->getInput(1)->type(), OperandBase::kStack);
 #endif
+}
+
+TEST_F(BackendTest, MoveSequenceOptLeavesSelfReloadsIntact) {
+  auto lirfunc = std::make_unique<Function>();
+  auto bb = lirfunc->allocateBasicBlock();
+  auto epilogue = lirfunc->allocateBasicBlock();
+
+  const PhyLocation kSharedSlot{-16, 64};
+  const PhyLocation kReloadReg = ARGUMENT_REGS[0];
+  constexpr uint64_t kExpected = 4;
+
+  // Set up the previously failing case:
+  //
+  //   [RBP - 16] = Move RSI
+  //          RSI = Move [RBP - 16]   ; writes RSI, does not consume cached RSI
+  //          RAX = Move [RBP - 16]   ; later stack read still needs the spill
+  //
+  // A bad rewrite would turn the middle instruction into `RSI = Move RSI` and
+  // then conclude the spill is dead. This test checks that we keep both the
+  // spill store and the explicit self-reload in the block.
+  // Make a deleted spill observable instead of reading arbitrary stack data.
+  bb->allocateInstr(
+      Instruction::kMove,
+      nullptr,
+      OutStk{kSharedSlot, OperandBase::k64bit},
+      Imm{kExpected - kExpected, OperandBase::k64bit});
+  bb->allocateInstr(
+      Instruction::kMove,
+      nullptr,
+      OutPhyReg{kReloadReg, OperandBase::k64bit},
+      Imm{kExpected, OperandBase::k64bit});
+  bb->allocateInstr(
+      Instruction::kMove,
+      nullptr,
+      OutStk{kSharedSlot, OperandBase::k64bit},
+      PhyReg{kReloadReg, OperandBase::k64bit});
+
+  auto self_reload = bb->allocateInstr(
+      Instruction::kMove,
+      nullptr,
+      OutPhyReg{kReloadReg, OperandBase::k64bit},
+      Stk{kSharedSlot, OperandBase::k64bit});
+  self_reload->getInput(0)->setLastUse();
+  bb->allocateInstr(
+      Instruction::kMove,
+      nullptr,
+      OutPhyReg{arch::reg_general_return_loc, OperandBase::k64bit},
+      Stk{kSharedSlot, OperandBase::k64bit});
+  bb->allocateInstr(Instruction::kReturn, nullptr);
+  bb->addSuccessor(epilogue);
+
+  auto func = reinterpret_cast<uint64_t (*)()>(SimpleCompile(lirfunc.get()));
+
+  bool saw_spill = false;
+  bool saw_self_reload = false;
+  for (auto& instr : bb->instructions()) {
+    if (!instr->isMove()) {
+      continue;
+    }
+    auto* out = instr->output();
+    auto* in = instr->getInput(0);
+    if (out->isStack() && out->getStackSlot().loc == kSharedSlot.loc &&
+        in->isReg() && in->getPhyRegister() == kReloadReg) {
+      saw_spill = true;
+    }
+    if (out->isReg() && out->getPhyRegister() == kReloadReg && in->isStack() &&
+        in->getStackSlot().loc == kSharedSlot.loc) {
+      saw_self_reload = true;
+    }
+  }
+
+  EXPECT_TRUE(saw_spill);
+  EXPECT_TRUE(saw_self_reload);
+  EXPECT_EQ(func(), kExpected);
 }
 
 TEST_F(BackendTest, CastTest) {
@@ -1235,5 +1449,151 @@ BB %1
   } catch (ParserException&) {
   }
 }
+
+#if defined(CINDER_AARCH64)
+// This test uses CompilePreAllocated to construct the exact instruction
+// sequence the buggy register allocator would emit:
+//   1. Store a 64-bit pointer in X19 and a 32-bit flag in X21
+//   2. Swap X19↔X21 using X13 as temp with kObject-width moves
+//   3. Return X21 (which should hold the original 64-bit pointer)
+//
+// With the fix (k64bit moves): the pointer is preserved in full.
+// Without the fix (k32bit moves): upper 32 bits are zeroed.
+TEST_F(BackendTest, RegSwapPreserves64BitPointers) {
+  auto lirfunc = std::make_unique<Function>();
+  auto bb1 = lirfunc->allocateBasicBlock();
+  auto bb2 = lirfunc->allocateBasicBlock();
+
+  // Use caller-saved registers that don't clash with argument registers
+  // or the scratch register (X13). X9 and X10 are available.
+  constexpr auto kReg_A = X9;
+  constexpr auto kReg_B = X10;
+
+  // BB1: Move arg0 (64-bit pointer) to X19, arg1 (32-bit flag) to X21.
+  // Then perform a 3-register swap X19↔X21 using X13 (scratch) as temp,
+  // emitting with kObject width — this is what the FIXED regalloc emits.
+  // (The buggy version would use k32bit for the second edge, truncating.)
+  bb1->allocateInstr(
+      Instruction::kMove,
+      nullptr,
+      OutPhyReg{kReg_A, DataType::kObject},
+      PhyReg{ARGUMENT_REGS[0], DataType::kObject});
+  bb1->allocateInstr(
+      Instruction::kMove,
+      nullptr,
+      OutPhyReg{kReg_B, DataType::k32bit},
+      PhyReg{ARGUMENT_REGS[1], DataType::k32bit});
+
+  // Swap X19↔X21 via X13, using k64bit (the fix) — preserves all 64 bits.
+  bb1->allocateInstr(
+      Instruction::kMove,
+      nullptr,
+      OutPhyReg{arch::reg_scratch_0_loc, DataType::kObject},
+      PhyReg{kReg_A, DataType::kObject});
+  bb1->allocateInstr(
+      Instruction::kMove,
+      nullptr,
+      OutPhyReg{kReg_A, DataType::kObject},
+      PhyReg{kReg_B, DataType::kObject});
+  bb1->allocateInstr(
+      Instruction::kMove,
+      nullptr,
+      OutPhyReg{kReg_B, DataType::kObject},
+      PhyReg{arch::reg_scratch_0_loc, DataType::kObject});
+
+  bb1->allocateInstr(Instruction::kBranch, nullptr, Lbl{bb2});
+  bb1->addSuccessor(bb2);
+
+  // BB2: Return X21 (should hold the original 64-bit pointer from X19).
+  bb2->allocateInstr(
+      Instruction::kMove,
+      nullptr,
+      OutPhyReg{arch::reg_general_return_loc, DataType::kObject},
+      PhyReg{kReg_B, DataType::kObject});
+
+  auto func = (uint64_t (*)(uint64_t, uint64_t))CompilePreAllocated(
+      lirfunc.release(), 16);
+  ASSERT_NE(func, nullptr);
+
+  // The pointer has non-zero upper 32 bits.
+  // If the swap truncated it, upper bits would be zero.
+  constexpr uint64_t kPtr = 0xDEADBEEFCAFEBABEULL;
+  constexpr uint64_t kFlag = 42;
+  uint64_t result = func(kPtr, kFlag);
+  EXPECT_EQ(result, kPtr) << "Register swap truncated 64-bit pointer: got 0x"
+                          << std::hex << result << ", expected 0x" << kPtr;
+
+  // Also verify the upper 32 bits survived.
+  EXPECT_EQ(result & 0xFFFFFFFF00000000ULL, 0xDEADBEEF00000000ULL)
+      << "Upper 32 bits of pointer destroyed during swap: got 0x" << std::hex
+      << result;
+}
+
+// Negative test: verify that k32bit swap moves DO truncate 64-bit values.
+// This confirms the bug pattern — if this test ever passes, the k32bit
+// codegen changed and the fix in rewriteLIREmitCopies may need revisiting.
+TEST_F(BackendTest, RegSwapK32bitTruncates64BitValues) {
+  auto lirfunc = std::make_unique<Function>();
+  auto bb1 = lirfunc->allocateBasicBlock();
+  auto bb2 = lirfunc->allocateBasicBlock();
+
+  constexpr auto kReg_A = X9;
+  constexpr auto kReg_B = X10;
+
+  // Same setup as RegSwapPreserves64BitPointers, but swap uses k32bit
+  // (the buggy data type that the unfixed regalloc would emit).
+  bb1->allocateInstr(
+      Instruction::kMove,
+      nullptr,
+      OutPhyReg{kReg_A, DataType::kObject},
+      PhyReg{ARGUMENT_REGS[0], DataType::kObject});
+  bb1->allocateInstr(
+      Instruction::kMove,
+      nullptr,
+      OutPhyReg{kReg_B, DataType::k32bit},
+      PhyReg{ARGUMENT_REGS[1], DataType::k32bit});
+
+  // Swap using k32bit — this SHOULD truncate the 64-bit pointer.
+  bb1->allocateInstr(
+      Instruction::kMove,
+      nullptr,
+      OutPhyReg{arch::reg_scratch_0_loc, DataType::k32bit},
+      PhyReg{kReg_A, DataType::k32bit});
+  bb1->allocateInstr(
+      Instruction::kMove,
+      nullptr,
+      OutPhyReg{kReg_A, DataType::k32bit},
+      PhyReg{kReg_B, DataType::k32bit});
+  bb1->allocateInstr(
+      Instruction::kMove,
+      nullptr,
+      OutPhyReg{kReg_B, DataType::k32bit},
+      PhyReg{arch::reg_scratch_0_loc, DataType::k32bit});
+
+  bb1->allocateInstr(Instruction::kBranch, nullptr, Lbl{bb2});
+  bb1->addSuccessor(bb2);
+
+  bb2->allocateInstr(
+      Instruction::kMove,
+      nullptr,
+      OutPhyReg{arch::reg_general_return_loc, DataType::kObject},
+      PhyReg{kReg_B, DataType::kObject});
+
+  auto func = (uint64_t (*)(uint64_t, uint64_t))CompilePreAllocated(
+      lirfunc.release(), 16);
+  ASSERT_NE(func, nullptr);
+
+  constexpr uint64_t kPtr = 0xDEADBEEFCAFEBABEULL;
+  uint64_t result = func(kPtr, 42);
+
+  // The k32bit swap SHOULD truncate — upper 32 bits should be zero.
+  // This confirms the bug pattern exists in the codegen layer.
+  EXPECT_NE(result, kPtr)
+      << "k32bit swap should NOT preserve full 64-bit value";
+  EXPECT_EQ(result & 0xFFFFFFFF00000000ULL, 0ULL)
+      << "k32bit swap should zero upper 32 bits, got 0x" << std::hex << result;
+}
+
+#endif // CINDER_AARCH64
 
 } // namespace jit::codegen
