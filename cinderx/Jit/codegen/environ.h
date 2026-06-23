@@ -22,7 +22,7 @@ struct Environ {
   arch::Builder* as{nullptr};
 
   // Modified registers. Set by VariableManager and read by generatePrologue()
-  // and generateEpilogue().
+  // and deoptimization exit generation.
   PhyRegisterSet changed_regs{};
 
   // The size of all data stored on the C stack: shadow frames, spilled values,
@@ -42,6 +42,15 @@ struct Environ {
   asmjit::Label hard_exit_label;
   asmjit::Label exit_label;
   asmjit::Label gen_resume_entry_label;
+  asmjit::Label finish_frame_setup;
+  asmjit::Label correct_arg_count;
+  asmjit::Label prologue_exit;
+  asmjit::Label wrapper_exit;
+
+  // Static type check jump table, resolved after code generation.
+  void** static_typecheck_table{nullptr};
+  std::vector<std::pair<int, jit::lir::BasicBlock*>>
+      static_typecheck_jt_entries;
 
   // Resume label shared between StoreGenYieldPoint/YieldInitial and
   // ResumeGenYield. Created by translateStoreGenYieldPoint or

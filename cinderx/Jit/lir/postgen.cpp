@@ -98,13 +98,13 @@ RewriteResult rewriteBinaryOpConstantPosition(instr_iter_t instr_iter) {
     return changed ? kChanged : kUnchanged;
   }
 
-  if (!instr->isAdd() && !instr->isSub() && !instr->isXor() &&
-      !instr->isAnd() && !instr->isOr() && !instr->isMul() &&
-      !instr->isCompare()) {
+  bool is_commutative_or_compare = instr->isAdd() || instr->isAnd() ||
+      instr->isMul() || instr->isOr() || instr->isXor() || instr->isCompare();
+  bool is_shift = instr->isLShift() || instr->isRShift() || instr->isRShiftUn();
+  if (!is_commutative_or_compare && !is_shift && !instr->isSub()) {
     return kUnchanged;
   }
 
-  bool is_commutative_or_compare = !instr->isSub();
   auto input0 = instr->getInput(0);
   auto input1 = instr->getInput(1);
 
@@ -687,8 +687,8 @@ RewriteResult rewriteMoveAbsoluteAddress(instr_iter_t instr_iter) {
   auto addr_move = block->allocateInstrBefore(
       instr_iter,
       Instruction::kMove,
-      OutVReg{DataType::k64bit},
-      Imm{addr, DataType::k64bit});
+      OutVReg{DataType::kObject},
+      Imm{addr, DataType::kObject});
 
   // Replace the Mem input with Ind{addr_vreg, offset=0}. For a simple
   // Ind with no index and offset 0, ptrIndirect resolves to ptr(base)

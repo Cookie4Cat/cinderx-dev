@@ -97,6 +97,7 @@ class NativeGenerator {
 
   bool hasStaticEntry() const;
   int calcInlineStackSize(const hir::Function* func);
+  void generatePrologueBlocks(lir::BasicBlock* frameSetupBlock);
   void generateCode(asmjit::CodeHolder& code, lir::BasicBlock* frameSetupBlock);
   void generateFunctionEntry();
   void generateFunctionExit();
@@ -139,7 +140,6 @@ class NativeGenerator {
 #endif
 
   int maxInlineStackSize();
-  void generateEpilogue(asmjit::BaseNode* epilogue_cursor);
   void generateDeoptExits(const asmjit::CodeHolder& code);
   void emitAarch64LoadAttrInvokeStub(const asmjit::CodeHolder& code);
   void linkDeoptPatchers(const asmjit::CodeHolder& code);

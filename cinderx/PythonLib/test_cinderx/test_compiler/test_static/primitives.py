@@ -16,7 +16,10 @@ from cinderx.compiler.static.types import (
     FAST_LEN_LIST,
     PRIM_OP_ADD_INT,
     PRIM_OP_GT_INT,
+    PRIM_OP_LSHIFT_INT,
     PRIM_OP_LT_INT,
+    PRIM_OP_RSHIFT_INT,
+    PRIM_OP_RSHIFT_UN_INT,
     SEQ_LIST,
     SEQ_LIST_INEXACT,
     TypedSyntaxError,
@@ -1117,6 +1120,48 @@ class PrimitivesTests(StaticTestBase):
         self.assertInBytecode(f, "PRIMITIVE_BINARY_OP", PRIM_OP_ADD_INT)
         f = self.run_code(codestr)["f"]
         self.assertEqual(f(), 43)
+
+    def test_lshift(self) -> None:
+        codestr = """
+        from __static__ import int64, box
+        def f(x):
+            z: int64 = int64(x) << 3
+            return box(z)
+        """
+
+        code = self.compile(codestr)
+        f = self.find_code(code)
+        self.assertInBytecode(f, "PRIMITIVE_BINARY_OP", PRIM_OP_LSHIFT_INT)
+        f = self.run_code(codestr)["f"]
+        self.assertEqual(f(8), 64)
+
+    def test_rshift(self) -> None:
+        codestr = """
+        from __static__ import int64, box
+        def f(x):
+            z: int64 = int64(x) >> 3
+            return box(z)
+        """
+
+        code = self.compile(codestr)
+        f = self.find_code(code)
+        self.assertInBytecode(f, "PRIMITIVE_BINARY_OP", PRIM_OP_RSHIFT_INT)
+        f = self.run_code(codestr)["f"]
+        self.assertEqual(f(42), 5)
+
+    def test_rshift_unsigned(self) -> None:
+        codestr = """
+        from __static__ import uint64, box
+        def f(x):
+            z: uint64 = uint64(x) >> 3
+            return box(z)
+        """
+
+        code = self.compile(codestr)
+        f = self.find_code(code)
+        self.assertInBytecode(f, "PRIMITIVE_BINARY_OP", PRIM_OP_RSHIFT_UN_INT)
+        f = self.run_code(codestr)["f"]
+        self.assertEqual(f(42), 5)
 
     def test_unbox_long(self):
         codestr = """

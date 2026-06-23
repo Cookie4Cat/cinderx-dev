@@ -119,9 +119,9 @@ enum OperandSizeType {
   X(Fmul, false, FlagEffects::kNone, kAlways64, 1, {1, 1})                    \
   X(Fdiv, true, FlagEffects::kNone, kAlways64, 1, {1, 1})                     \
   X(Int64ToDouble, false, FlagEffects::kNone, kAlways64, 1, {1})              \
-  X(LShift, false, FlagEffects::kSet)                                         \
-  X(RShift, false, FlagEffects::kSet)                                         \
-  X(RShiftUn, false, FlagEffects::kSet)                                       \
+  X(LShift, false, FlagEffects::kSet, kOut, 1, {1})                           \
+  X(RShift, false, FlagEffects::kSet, kOut, 1, {1})                           \
+  X(RShiftUn, false, FlagEffects::kSet, kOut, 1, {1})                         \
   X(Test, false, FlagEffects::kSet, kDefault, 0, {1, 1})                      \
   X(Test32, false, FlagEffects::kSet, kDefault, 0, {1, 1})                    \
   X(Equal, false, FlagEffects::kSet, kDefault, 1, {1, 1})                     \
@@ -318,7 +318,7 @@ class Instruction {
       allocateFPImmediateInput(first_arg.value)
           ->setDataType(OperandBase::kDouble);
     } else if constexpr (std::is_same_v<FT, MemImm>) {
-      allocateAddressInput(first_arg.value);
+      allocateAddressInput(first_arg.value)->setDataType(first_arg.data_type);
     } else if constexpr (std::is_same_v<FT, Lbl>) {
       allocateLabelInput(first_arg.value);
     } else if constexpr (std::is_same_v<FT, AsmLbl>) {
@@ -345,6 +345,7 @@ class Instruction {
       output()->setDataType(OperandBase::kDouble);
     } else if constexpr (std::is_same_v<FT, OutMemImm>) {
       output()->setMemoryAddress(first_arg.value);
+      output()->setDataType(first_arg.data_type);
     } else if constexpr (std::is_same_v<FT, OutLbl>) {
       output()->setBasicBlock(first_arg.value);
     } else if constexpr (std::is_same_v<FT, OutVReg>) {

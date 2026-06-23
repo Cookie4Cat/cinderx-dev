@@ -13,6 +13,7 @@
 #include "cinderx/Jit/hir/hir.h"
 #include "cinderx/Jit/jit_rt.h"
 #include "cinderx/Jit/lir/instruction.h"
+#include "cinderx/Jit/lir/printer.h"
 #include "cinderx/module_state.h"
 
 using namespace asmjit;
@@ -99,7 +100,11 @@ int getOperandSize(const Instruction* instr, const OperandBase* operand) {
 // Returns the appropriately-sized Gp register for a given operand, respecting
 // the instruction's OperandSizeType property.
 arch::Gp getReg(const Instruction* instr, const OperandBase* operand) {
-  JIT_CHECK(operand->isReg(), "Expected a register for getReg");
+  JIT_CHECK(
+      operand->isReg(),
+      "Expected a register for getReg '{}' in '{}'",
+      *operand,
+      *instr);
   int size = getOperandSize(instr, operand);
   auto reg = operand->getPhyRegister().loc;
 #if defined(CINDER_X86_64)
@@ -179,8 +184,6 @@ void fillLiveValueLocations(
     const Instruction* instr,
     size_t begin_input,
     size_t end_input) {
-  ThreadedCompileSerialize guard;
-
   DeoptMetadata& deopt_meta = code_runtime->getDeoptMetadata(deopt_idx);
   for (size_t i = begin_input; i < end_input; i++) {
     auto loc = instr->getInput(i)->getPhyRegOrStackSlot();
@@ -1657,6 +1660,69 @@ void translateTreeIterOp(Environ* env, const Instruction* instr) {
   }
 }
 
+void translateShift(Environ* env, const Instruction* instr) {
+  auto opcode = instr->opcode();
+  auto in0_reg = getReg(instr, instr->getInput(0));
+  auto in1 = instr->getInput(1);
+  auto out_reg =
+      (instr->getNumOutputs() > 0) ? getReg(instr, instr->output()) : in0_reg;
+  // Currently just a limitation of x86-64 register allocation.
+  JIT_CHECK(
+      arch::kBuildArch != arch::Arch::kX86_64 || in1->isImm(),
+      "Cannot emit non-immediate RHS for instruction '{}'",
+      *instr);
+
+  if (instr->getNumOutputs() > 0 && arch::kBuildArch != arch::Arch::kAarch64) {
+    env->as->mov(out_reg, in0_reg);
+  }
+
+#if defined(CINDER_X86_64)
+  asmjit::Imm shift = getImm(in1);
+  switch (opcode) {
+    case Instruction::kLShift:
+      env->as->shl(out_reg, shift);
+      return;
+    case Instruction::kRShift:
+      env->as->sar(out_reg, shift);
+      return;
+    case Instruction::kRShiftUn:
+      env->as->shr(out_reg, shift);
+      return;
+    default:
+      break;
+  }
+#elif defined(CINDER_AARCH64)
+  switch (opcode) {
+    case Instruction::kLShift:
+      if (in1->isReg()) {
+        env->as->lsl(out_reg, in0_reg, getReg(instr, in1));
+      } else {
+        env->as->lsl(out_reg, in0_reg, getImm(in1));
+      }
+      return;
+    case Instruction::kRShift:
+      if (in1->isReg()) {
+        env->as->asr(out_reg, in0_reg, getReg(instr, in1));
+      } else {
+        env->as->asr(out_reg, in0_reg, getImm(in1));
+      }
+      return;
+    case Instruction::kRShiftUn:
+      if (in1->isReg()) {
+        env->as->lsr(out_reg, in0_reg, getReg(instr, in1));
+      } else {
+        env->as->lsr(out_reg, in0_reg, getImm(in1));
+      }
+      return;
+    default:
+      break;
+  }
+#else
+  JIT_ABORT("Unrecognized architecture for emitting shift instruction");
+#endif
+  JIT_ABORT("Unrecognized shift opcode '{}'", instr->opname());
+}
+
 #if defined(CINDER_AARCH64)
 namespace {
 
@@ -1780,11 +1846,12 @@ void loadToReg(
 void storeFromReg(
     arch::Builder* as,
     const OperandBase* input,
+    const OperandBase* output_operand,
     const arch::Mem& output) {
   if (input->isVecD()) {
     as->str(AT::getVecD(input), output);
   } else {
-    switch (input->dataType()) {
+    switch (output_operand->dataType()) {
       case OperandBase::k8bit:
         as->strb(
             AT::getGp(DataType::k32bit, input->getPhyRegister().loc), output);
@@ -1794,7 +1861,9 @@ void storeFromReg(
             AT::getGp(DataType::k32bit, input->getPhyRegister().loc), output);
         break;
       default:
-        as->str(AT::getGp(input), output);
+        as->str(
+            AT::getGp(output_operand->dataType(), input->getPhyRegister().loc),
+            output);
         break;
     }
   }
@@ -2015,8 +2084,8 @@ void translateMove(Environ* env, const Instruction* instr) {
           as, arch::fp, output->getStackSlot().loc, arch::reg_scratch_0);
 
       if (input->isReg()) {
-        // Storing the value of a register to the stack.
-        storeFromReg(as, input, ptr);
+        // Storing the value of a register to the stack
+        storeFromReg(as, input, output, ptr);
       } else {
         JIT_ABORT("Unsupported operand type for Move: Stk + {}", input->type());
       }
@@ -2047,7 +2116,7 @@ void translateMove(Environ* env, const Instruction* instr) {
         auto ptr =
             ptrIndirect(as, scratch0, scratch1, output->getMemoryIndirect());
 
-        storeFromReg(as, input, ptr);
+        storeFromReg(as, input, output, ptr);
       } else if (input->isImm()) {
         // Storing a constant immediate to an address relative to another
         // register.
@@ -3126,6 +3195,11 @@ void AutoTranslator::translateInstr(Environ* env, const Instruction* instr)
       }
       return;
     }
+    case Instruction::kLShift:
+    case Instruction::kRShift:
+    case Instruction::kRShiftUn:
+      translateShift(env, instr);
+      return;
     case Instruction::kTest32: {
       auto* in0 = instr->getInput(0);
       auto* in1 = instr->getInput(1);
@@ -3232,9 +3306,6 @@ void AutoTranslator::translateInstr(Environ* env, const Instruction* instr)
     case Instruction::kSext:
     case Instruction::kZext:
     case Instruction::kMulAdd:
-    case Instruction::kLShift:
-    case Instruction::kRShift:
-    case Instruction::kRShiftUn:
     case Instruction::kLoadArg:
     case Instruction::kLoadSecondCallResult:
     case Instruction::kMovConstPool:
@@ -3496,6 +3567,11 @@ void AutoTranslator::translateInstr(Environ* env, const Instruction* instr)
     case Instruction::kMul:
       translateMul(env, instr);
       return;
+    case Instruction::kLShift:
+    case Instruction::kRShift:
+    case Instruction::kRShiftUn:
+      translateShift(env, instr);
+      return;
     case Instruction::kTest32: {
       auto* in0 = instr->getInput(0);
       auto* in1 = instr->getInput(1);
@@ -3556,9 +3632,6 @@ void AutoTranslator::translateInstr(Environ* env, const Instruction* instr)
     case Instruction::kCdq:
     case Instruction::kCwd:
     case Instruction::kCqo:
-    case Instruction::kLShift:
-    case Instruction::kRShift:
-    case Instruction::kRShiftUn:
     case Instruction::kLoadArg:
     case Instruction::kLoadSecondCallResult:
     case Instruction::kCondBranch:
