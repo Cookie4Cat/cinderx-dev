@@ -58,6 +58,14 @@ class LIRABITest : public RuntimeTest {
     auto insn = bb.allocateInstr(opcode, origin, args...);
     switch (opcode) {
       case Instruction::kBranch:
+        // kBranch supports both Label and MemoryIndirect operands. Only add
+        // a label if no operands were already provided (i.e., the caller did
+        // not pass an Ind operand).
+        if (insn->getNumInputs() == 0) {
+          environ.block_label_map.emplace(&bb, as.newLabel());
+          insn->addOperands(Lbl{&bb});
+        }
+        break;
       case Instruction::kBranchZ:
       case Instruction::kBranchNZ:
       case Instruction::kBranchA:
@@ -908,6 +916,18 @@ TEST_F(LIRABITest, TestkBranch_Label) {
   translateInstr(Instruction::kBranchNS);
   translateInstr(Instruction::kBranchE);
   translateInstr(Instruction::kBranchNE);
+}
+
+// kBranch with MemoryIndirect (indirect jump)
+TEST_F(LIRABITest, TestkBranch_Indirect) {
+  translateInstr(Instruction::kBranch, Ind(ARGUMENT_REGS[0]));
+  translateInstr(Instruction::kBranch, Ind(ARGUMENT_REGS[0], 8));
+}
+
+// kBranch with Imm (direct address jump)
+TEST_F(LIRABITest, TestkBranch_Imm) {
+  translateInstr(
+      Instruction::kBranch, Imm{reinterpret_cast<uint64_t>(testImmPtrTarget)});
 }
 
 // kEqual R r r

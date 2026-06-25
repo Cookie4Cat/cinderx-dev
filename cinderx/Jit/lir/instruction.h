@@ -193,7 +193,6 @@ enum OperandSizeType {
   X(EpilogueEnd, false, FlagEffects::kInvalidate, kDefault, 0, {}, 1)         \
   X(Prologue, false, FlagEffects::kInvalidate, kDefault, 0, {}, 1)            \
   X(SetupFrame, false, FlagEffects::kInvalidate, kDefault, 0, {}, 1)          \
-  X(IndirectJump, false, FlagEffects::kInvalidate, kDefault, 0, {}, 1)        \
   X(VariadicPush, false, FlagEffects::kNone, kDefault, 0, {}, 1)              \
   X(Leave, false, FlagEffects::kInvalidate, kDefault, 0, {}, 1)               \
   X(Ret, false, FlagEffects::kInvalidate, kDefault, 0, {}, 1)                 \
@@ -210,8 +209,10 @@ enum OperandSizeType {
   X(CheckTreeIterChildEntry, false, FlagEffects::kInvalidate, kDefault, 1, {1}, 1) \
   X(TreeIterEnterChild, false, FlagEffects::kInvalidate, kDefault, 0, {1}, 1)\
   X(TreeIterLeaveCurrentNode, false, FlagEffects::kInvalidate, kDefault, 0, {}, 1) \
-  X(ClearTreeIterState, false, FlagEffects::kInvalidate, kDefault, 0, {}, 1)
-
+  X(ClearTreeIterState, false, FlagEffects::kInvalidate, kDefault, 0, {}, 1) \
+  X(CmpBranchZero, false, FlagEffects::kNone, kDefault, 0, {1}, 1)            \
+  X(CmpBranchNonZero, false, FlagEffects::kNone, kDefault, 0, {1}, 1)        \
+  X(A64GuardCC, false, FlagEffects::kInvalidate, kDefault, 0, {0, 0}, 1)
 // Instruction class defines instructions in LIR.
 // Every instruction can have no more than one output, but arbitrary
 // number of inputs. The instruction logically has no output also
@@ -430,6 +431,7 @@ class Instruction {
 
   bool isCompare() const;
   bool isBranchCC() const;
+  bool isCmpBranch() const;
   bool isAnyBranch() const;
   bool isTerminator() const;
   bool isAnyYield() const;

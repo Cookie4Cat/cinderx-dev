@@ -208,8 +208,91 @@ void TranslateOSREntry(Environ* env, const Instruction* instr) {
   }
 }
 
+#if defined(CINDER_AARCH64)
+void translateBranchCC(
+    a64::Builder* as,
+    Instruction::Opcode opcode,
+    const asmjit::Label& label) {
+  switch (opcode) {
+    case Instruction::kBranchZ:
+    case Instruction::kBranchE:
+      as->b_eq(label);
+      break;
+    case Instruction::kBranchNZ:
+    case Instruction::kBranchNE:
+      as->b_ne(label);
+      break;
+    case Instruction::kBranchC:
+      as->b_cs(label);
+      break;
+    case Instruction::kBranchNC:
+      as->b_cc(label);
+      break;
+    case Instruction::kBranchO:
+      as->b_vs(label);
+      break;
+    case Instruction::kBranchNO:
+      as->b_vc(label);
+      break;
+    case Instruction::kBranchS:
+      as->b_mi(label);
+      break;
+    case Instruction::kBranchNS:
+      as->b_pl(label);
+      break;
+    case Instruction::kBranchA:
+      as->b_hi(label);
+      break;
+    case Instruction::kBranchB:
+      as->b_lo(label);
+      break;
+    case Instruction::kBranchAE:
+      as->b_hs(label);
+      break;
+    case Instruction::kBranchBE:
+      as->b_ls(label);
+      break;
+    case Instruction::kBranchG:
+      as->b_gt(label);
+      break;
+    case Instruction::kBranchL:
+      as->b_lt(label);
+      break;
+    case Instruction::kBranchGE:
+      as->b_ge(label);
+      break;
+    case Instruction::kBranchLE:
+      as->b_le(label);
+      break;
+    default:
+      JIT_ABORT(
+          "Unsupported AArch64 condition branch opcode {}",
+          static_cast<int>(opcode));
+  }
+}
+
+void translateA64GuardCC(Environ* env, const Instruction* instr) {
+  auto index = static_cast<size_t>(instr->getInput(1)->getConstant());
+  auto deopt_label = env->as->newLabel();
+  auto near_label = env->as->newLabel();
+  auto opcode =
+      static_cast<Instruction::Opcode>(instr->getInput(0)->getConstant());
+
+  env->aarch64_near_deopt_branches.emplace_back(near_label, deopt_label);
+  translateBranchCC(env->as, opcode, near_label);
+  fillLiveValueLocations(env->code_rt, index, instr, 2, instr->getNumInputs());
+  env->deopt_exits.emplace_back(index, deopt_label, instr);
+
+  if (!env->pending_debug_locs.empty() && instr->origin() != nullptr &&
+      env->pending_debug_locs.back().instr == instr->origin()) {
+    env->callsite_deopt_pending.emplace_back(
+        env->pending_debug_locs.back().label, deopt_label);
+  }
+}
+#endif
+
 // Translate GUARD instruction
-void TranslateGuard(Environ* env, const Instruction* instr) {
+void translateGuard(Environ* env, const Instruction* instr) {
 #if defined(CINDER_X86_64)
   auto as = env->as;
 
@@ -1236,9 +1319,9 @@ void translateSetupFrame(Environ* env, const Instruction*) {
 #endif
 }
 
-// Emit an indirect jump through a memory location. The instruction's single
-// input is a MemoryIndirect operand specifying [base + offset].
-void translateIndirectJump(Environ* env, const Instruction* instr) {
+// Emit a branch through a memory-indirect operand [base + offset].
+// Used by kBranch when its input is a MemoryIndirect operand.
+void translateBranchIndirect(Environ* env, const Instruction* instr) {
   arch::Builder* as = env->as;
   const OperandBase* input = instr->getInput(0);
 
@@ -1254,7 +1337,8 @@ void translateIndirectJump(Environ* env, const Instruction* instr) {
   }
 
   JIT_CHECK(
-      input->isInd(), "IndirectJump input must be memory indirect or register");
+      input->isInd(),
+      "Branch indirect input must be memory indirect or register");
 
   const auto* mem = input->getMemoryIndirect();
   PhyLocation base = mem->getBaseRegOperand()->getPhyRegister();
@@ -1801,18 +1885,25 @@ arch::Mem ptrIndirect(
     arch::Builder* as,
     arch::Gp scratch0,
     arch::Gp scratch1,
-    const MemoryIndirect* indirect) {
+    const MemoryIndirect* indirect,
+    DataType data_type) {
   auto base = getGpOrSP(indirect->getBaseRegOperand());
   auto indexRegOperand = indirect->getIndexRegOperand();
   auto offset = indirect->getOffset();
 
   if (indexRegOperand != nullptr) {
-    leaIndex(
-        as,
-        scratch1,
-        base,
-        AT::getGp(indexRegOperand),
-        indirect->getMultipiler());
+    auto index = AT::getGp(indexRegOperand);
+    auto multiplier = indirect->getMultipiler();
+
+    if (offset == 0) {
+      if (multiplier == 0) {
+        return a64::ptr(base, index);
+      } else if (multiplier == byteShift(data_type)) {
+        return a64::ptr(base, index, a64::lsl(multiplier));
+      }
+    }
+
+    leaIndex(as, scratch1, base, index, multiplier);
 
     base = scratch1;
   }
@@ -2044,7 +2135,8 @@ void translateMove(Environ* env, const Instruction* instr) {
               as,
               arch::reg_scratch_0,
               arch::reg_scratch_1,
-              input->getMemoryIndirect());
+              input->getMemoryIndirect(),
+              output->dataType());
 
           loadToReg(as, output, ptr);
           break;
@@ -2113,15 +2205,23 @@ void translateMove(Environ* env, const Instruction* instr) {
       if (input->isReg()) {
         // Storing the value of a register to an address relative to another
         // register.
-        auto ptr =
-            ptrIndirect(as, scratch0, scratch1, output->getMemoryIndirect());
+        auto ptr = ptrIndirect(
+            as,
+            scratch0,
+            scratch1,
+            output->getMemoryIndirect(),
+            output->dataType());
 
         storeFromReg(as, input, output, ptr);
       } else if (input->isImm()) {
         // Storing a constant immediate to an address relative to another
         // register.
-        auto ptr =
-            ptrIndirect(as, scratch0, scratch1, output->getMemoryIndirect());
+        auto ptr = ptrIndirect(
+            as,
+            scratch0,
+            scratch1,
+            output->getMemoryIndirect(),
+            output->dataType());
 
         // Use the output's data type to determine the store width.
         switch (output->dataType()) {
@@ -2883,9 +2983,17 @@ void AutoTranslator::translateInstr(Environ* env, const Instruction* instr)
       env->as->test(getReg(instr, in0), getReg(instr, in1));
       return;
     }
-    case Instruction::kBranch:
-      env->as->jmp(getLabel(env, instr->getInput(0)));
+    case Instruction::kBranch: {
+      auto* input = instr->getInput(0);
+      if (input->isInd() || input->isReg()) {
+        translateBranchIndirect(env, instr);
+      } else if (input->isImm()) {
+        env->as->jmp(getImm(input));
+      } else {
+        env->as->jmp(getLabel(env, input));
+      }
       return;
+    }
     case Instruction::kBranchZ:
       env->as->jz(getLabel(env, instr->getInput(0)));
       return;
@@ -2941,7 +3049,7 @@ void AutoTranslator::translateInstr(Environ* env, const Instruction* instr)
       env->as->jne(getLabel(env, instr->getInput(0)));
       return;
     case Instruction::kGuard:
-      TranslateGuard(env, instr);
+      translateGuard(env, instr);
       return;
     case Instruction::kDeoptPatchpoint:
       TranslateDeoptPatchpoint(env, instr);
@@ -2978,9 +3086,6 @@ void AutoTranslator::translateInstr(Environ* env, const Instruction* instr)
       return;
     case Instruction::kSetupFrame:
       translateSetupFrame(env, instr);
-      return;
-    case Instruction::kIndirectJump:
-      translateIndirectJump(env, instr);
       return;
     case Instruction::kInc: {
       auto* input = instr->getInput(0);
@@ -3309,6 +3414,8 @@ void AutoTranslator::translateInstr(Environ* env, const Instruction* instr)
     case Instruction::kLoadArg:
     case Instruction::kLoadSecondCallResult:
     case Instruction::kMovConstPool:
+    case Instruction::kCmpBranchZero:
+    case Instruction::kCmpBranchNonZero:
     case Instruction::kCondBranch:
     case Instruction::kPhi:
     case Instruction::kReturn:
@@ -3354,9 +3461,17 @@ void AutoTranslator::translateInstr(Environ* env, const Instruction* instr)
     case Instruction::kTest:
       translateTst(env, instr);
       return;
-    case Instruction::kBranch:
-      env->as->b(getLabel(env, instr->getInput(0)));
+    case Instruction::kBranch: {
+      auto* input = instr->getInput(0);
+      if (input->isInd() || input->isReg()) {
+        translateBranchIndirect(env, instr);
+      } else if (input->isImm()) {
+        env->as->b(static_cast<uint64_t>(input->getConstant()));
+      } else {
+        env->as->b(getLabel(env, input));
+      }
       return;
+    }
     case Instruction::kBranchZ:
       if (instr->getNumInputs() == 2) {
         env->as->cbz(
@@ -3364,7 +3479,7 @@ void AutoTranslator::translateInstr(Environ* env, const Instruction* instr)
             getLabel(env, instr->getInput(1)));
         return;
       }
-      env->as->b_eq(getLabel(env, instr->getInput(0)));
+      translateBranchCC(env->as, opcode, getLabel(env, instr->getInput(0)));
       return;
     case Instruction::kBranchNZ:
       if (instr->getNumInputs() == 2) {
@@ -3373,58 +3488,39 @@ void AutoTranslator::translateInstr(Environ* env, const Instruction* instr)
             getLabel(env, instr->getInput(1)));
         return;
       }
-      env->as->b_ne(getLabel(env, instr->getInput(0)));
-      return;
-    case Instruction::kBranchA:
-      env->as->b_hi(getLabel(env, instr->getInput(0)));
-      return;
-    case Instruction::kBranchB:
-      env->as->b_lo(getLabel(env, instr->getInput(0)));
-      return;
-    case Instruction::kBranchAE:
-      env->as->b_hs(getLabel(env, instr->getInput(0)));
-      return;
-    case Instruction::kBranchBE:
-      env->as->b_ls(getLabel(env, instr->getInput(0)));
-      return;
-    case Instruction::kBranchG:
-      env->as->b_gt(getLabel(env, instr->getInput(0)));
-      return;
-    case Instruction::kBranchL:
-      env->as->b_lt(getLabel(env, instr->getInput(0)));
-      return;
-    case Instruction::kBranchGE:
-      env->as->b_ge(getLabel(env, instr->getInput(0)));
-      return;
-    case Instruction::kBranchLE:
-      env->as->b_le(getLabel(env, instr->getInput(0)));
+      translateBranchCC(env->as, opcode, getLabel(env, instr->getInput(0)));
       return;
     case Instruction::kBranchC:
-      env->as->b_cs(getLabel(env, instr->getInput(0)));
-      return;
     case Instruction::kBranchNC:
-      env->as->b_cc(getLabel(env, instr->getInput(0)));
-      return;
     case Instruction::kBranchO:
-      env->as->b_vs(getLabel(env, instr->getInput(0)));
-      return;
     case Instruction::kBranchNO:
-      env->as->b_vc(getLabel(env, instr->getInput(0)));
-      return;
     case Instruction::kBranchS:
-      env->as->b_mi(getLabel(env, instr->getInput(0)));
-      return;
     case Instruction::kBranchNS:
-      env->as->b_pl(getLabel(env, instr->getInput(0)));
-      return;
+    case Instruction::kBranchA:
+    case Instruction::kBranchB:
+    case Instruction::kBranchAE:
+    case Instruction::kBranchBE:
+    case Instruction::kBranchG:
+    case Instruction::kBranchL:
+    case Instruction::kBranchGE:
+    case Instruction::kBranchLE:
     case Instruction::kBranchE:
-      env->as->b_eq(getLabel(env, instr->getInput(0)));
-      return;
     case Instruction::kBranchNE:
-      env->as->b_ne(getLabel(env, instr->getInput(0)));
+      translateBranchCC(env->as, opcode, getLabel(env, instr->getInput(0)));
+      return;
+    case Instruction::kCmpBranchZero:
+      env->as->cbz(
+          getGpWiden(instr->getInput(0)), getLabel(env, instr->getInput(1)));
+      return;
+    case Instruction::kCmpBranchNonZero:
+      env->as->cbnz(
+          getGpWiden(instr->getInput(0)), getLabel(env, instr->getInput(1)));
+      return;
+    case Instruction::kA64GuardCC:
+      translateA64GuardCC(env, instr);
       return;
     case Instruction::kGuard:
-      TranslateGuard(env, instr);
+      translateGuard(env, instr);
       return;
     case Instruction::kDeoptPatchpoint:
       TranslateDeoptPatchpoint(env, instr);
@@ -3461,9 +3557,6 @@ void AutoTranslator::translateInstr(Environ* env, const Instruction* instr)
       return;
     case Instruction::kSetupFrame:
       translateSetupFrame(env, instr);
-      return;
-    case Instruction::kIndirectJump:
-      translateIndirectJump(env, instr);
       return;
     case Instruction::kInc:
       translateInc(env, instr);

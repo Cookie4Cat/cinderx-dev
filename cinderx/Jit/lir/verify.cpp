@@ -40,9 +40,23 @@ bool verifyPostRegAllocInvariants(Function* func, std::ostream& err) {
               num_inputs == 1, "Branch must have one or two inputs.");
         }
         auto operand = instr->getInput(num_inputs - 1);
+        if (num_inputs == 1 &&
+            (operand->isInd() || operand->isImm() || operand->isReg())) {
+          // Indirect or direct-address branch: no CFG successor to verify.
+          continue;
+        }
         JIT_DCHECK(
             operand->type() == OperandBase::kLabel,
             "Branch must jump to a label.");
+        branched_blocks.insert(operand->getBasicBlock());
+      } else if (instr->isCmpBranch()) {
+        JIT_DCHECK(
+            instr->getNumInputs() == 2,
+            "CmpBranch must have register and label inputs.");
+        auto operand = instr->getInput(1);
+        JIT_DCHECK(
+            operand->type() == OperandBase::kLabel,
+            "CmpBranch second input must be a label.");
         branched_blocks.insert(operand->getBasicBlock());
       }
     }

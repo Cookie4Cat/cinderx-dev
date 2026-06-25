@@ -1489,10 +1489,20 @@ void LinearScanAllocator::resolveEdges() {
       bool is_exit = last_instr_opcode == Instruction::kReturn ||
           last_instr_opcode == Instruction::kBranchToYieldExit;
 
+      // Label-targeted branches are inserted by postalloc, so they should
+      // not exist yet. Indirect branches (MemoryIndirect operand) and
+      // direct-address branches (Imm operand) are created in the generator
+      // and are expected here.
       JIT_CHECK(
-          last_instr_opcode != Instruction::kBranch,
-          "Unconditional branch should not have been generated yet: {}",
-          *last_instr);
+          last_instr_opcode != Instruction::kBranch ||
+              (last_instr->getNumInputs() > 0 &&
+               (last_instr->getInput(0)->isInd() ||
+                last_instr->getInput(0)->isImm() ||
+                last_instr->getInput(0)->isReg())),
+          "Unconditional branch to label should not have been generated yet: "
+          "{} {}",
+          *last_instr,
+          last_instr->getInput(0)->type());
 
       rewriteLIREmitCopies(
           basic_block, basic_block->instructions().end(), std::move(copies));
