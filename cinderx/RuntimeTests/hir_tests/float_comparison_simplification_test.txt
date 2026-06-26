@@ -235,7 +235,7 @@ fun test {
     v1:Object = LoadArg<1>
     v2:FloatExact = RefineType<FloatExact> v0
     v3:FloatExact = RefineType<FloatExact> v1
-    v4:Bool = FloatCompare<GreaterThan> v2 v3
+    v4:ImmortalBool = FloatCompare<GreaterThan> v2 v3
     v5:ImmortalBool[True] = LoadConst<ImmortalBool[True]>
     v6:CBool = PrimitiveCompare<NotEqual> v4 v5
     CondBranch<1, 2> v6
@@ -284,7 +284,7 @@ fun test {
     v1:Object = LoadArg<1>
     v2:FloatExact = RefineType<FloatExact> v0
     v3:FloatExact = RefineType<FloatExact> v1
-    v4:Bool = FloatCompare<GreaterThan> v2 v3
+    v4:ImmortalBool = FloatCompare<GreaterThan> v2 v3
     v5:ImmortalBool[False] = LoadConst<ImmortalBool[False]>
     v6:CBool = PrimitiveCompare<Equal> v4 v5
     CondBranch<1, 2> v6
@@ -334,7 +334,7 @@ fun test {
     v1:Object = LoadArg<1>
     v2:FloatExact = RefineType<FloatExact> v0
     v3:FloatExact = RefineType<FloatExact> v1
-    v4:Bool = FloatCompare<GreaterThan> v2 v3
+    v4:ImmortalBool = FloatCompare<GreaterThan> v2 v3
     v5:ImmortalBool[True] = LoadConst<ImmortalBool[True]>
     v6:CBool = PrimitiveCompare<Equal> v4 v5
     UseType<Bool> v4
@@ -384,7 +384,7 @@ fun test {
     v1:Object = LoadArg<1>
     v2:FloatExact = RefineType<FloatExact> v0
     v3:FloatExact = RefineType<FloatExact> v1
-    v4:Bool = FloatCompare<GreaterThan> v2 v3
+    v4:ImmortalBool = FloatCompare<GreaterThan> v2 v3
     v5:ImmortalLongExact[1] = LoadConst<ImmortalLongExact[1]>
     v6:CBool = PrimitiveCompare<Equal> v4 v5
     CondBranch<1, 2> v6
@@ -427,7 +427,7 @@ fun test {
 fun test {
   bb 0 {
     v0:Object = LoadArg<0>
-    v2:Bool = PrimitiveBoxBool v0
+    v2:ImmortalBool = PrimitiveBoxBool v0
     v3:ImmortalBool[True] = LoadConst<ImmortalBool[True]>
     v4:CBool = PrimitiveCompare<Equal> v2 v3
     CondBranch<1, 2> v4

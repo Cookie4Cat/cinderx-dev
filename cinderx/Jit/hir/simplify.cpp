@@ -323,22 +323,32 @@ Register* simplifyCast(const Cast* instr) {
 
 Register* emitGetLengthInt64(Env& env, Register* obj) {
   Type ty = obj->type();
-  if (
-// TODO(T255264007). Enable this again. See P2169677410.
-#ifndef Py_GIL_DISABLED
-      ty <= TListExact || ty <= TArray ||
-#endif
-      ty <= TTupleExact) {
+
+  // Constant folding.
+  if (ty.hasObjectSpec()) {
+    PyObject* spec = ty.objectSpec();
+    if (ty <= TTupleExact) {
+      env.emit<UseType>(obj, ty);
+      Py_ssize_t len = PyTuple_GET_SIZE(spec);
+      return env.emit<LoadConst>(Type::fromCInt(len, TCInt64));
+    }
+    if (ty <= TUnicodeExact) {
+      env.emit<UseType>(obj, ty);
+      Py_ssize_t len = PyUnicode_GET_LENGTH(spec);
+      return env.emit<LoadConst>(Type::fromCInt(len, TCInt64));
+    }
+  }
+
+  if (ty <= TTupleExact ||
+      // TODO(T255264007). Enable this again. See P2169677410.
+      (!kFreeThreadedBuild && (ty <= TListExact || ty <= TArray))) {
     env.emit<UseType>(obj, ty.unspecialized());
     return env.emit<LoadField>(
         obj, "ob_size", offsetof(PyVarObject, ob_size), TCInt64);
   }
-  if (
-// TODO(T255264007). Enable this again. See P2169677410.
-#ifndef Py_GIL_DISABLED
-      ty <= TDictExact || ty <= TSetExact ||
-#endif
-      ty <= TUnicodeExact) {
+  if (ty <= TUnicodeExact ||
+      // TODO(T255264007). Enable this again. See P2169677410.
+      (!kFreeThreadedBuild && (ty <= TDictExact || ty <= TSetExact))) {
     std::size_t offset = 0;
     const char* name = nullptr;
     if (ty <= TDictExact) {
@@ -460,10 +470,6 @@ Register* simplifyLongCompare(Env& env, const LongCompare* instr) {
 
   // TODO: Constant folding.
 
-  if (!getConfig().compact_long_guards) {
-    return nullptr;
-  }
-
   auto prim_op = toPrimitiveCompareOp(op);
   if (!prim_op.has_value()) {
     return nullptr;
@@ -500,6 +506,14 @@ Register* simplifyCondBranch(Env& env, const CondBranch* instr) {
     Register* src = convert->src();
     if (convert->type().sizeInBytes() >= src->type().sizeInBytes()) {
       return env.emit<CondBranch>(src, instr->true_bb(), instr->false_bb());
+    }
+  }
+  if (cond->instr()->IsPrimitiveUnaryOp()) {
+    auto unary = static_cast<PrimitiveUnaryOp*>(cond->instr());
+    auto unary_op = unary->op();
+    if (unary_op == PrimitiveUnaryOpKind::kNotInt) {
+      return env.emit<CondBranch>(
+          unary->GetOperand(0), instr->false_bb(), instr->true_bb());
     }
   }
   return nullptr;
@@ -1373,13 +1387,16 @@ Register* simplifyIntBinaryOp(Env& env, const IntBinaryOp* instr) {
 Register* simplifyPrimitiveCompare(Env& env, const PrimitiveCompare* instr) {
   Register* left = instr->GetOperand(0);
   Register* right = instr->GetOperand(1);
-  if (instr->op() == PrimitiveCompareOp::kEqual ||
-      instr->op() == PrimitiveCompareOp::kNotEqual) {
+  PrimitiveCompareOp op = instr->op();
+  bool commutative =
+      op == PrimitiveCompareOp::kEqual || op == PrimitiveCompareOp::kNotEqual;
+
+  if (commutative) {
     auto do_cbool = [&](bool value) {
       env.emit<UseType>(left, left->type());
       env.emit<UseType>(right, right->type());
       return env.emit<LoadConst>(Type::fromCBool(
-          instr->op() == PrimitiveCompareOp::kNotEqual ? !value : value));
+          op == PrimitiveCompareOp::kNotEqual ? !value : value));
     };
     if (!left->type().couldBe(right->type())) {
       return do_cbool(false);
@@ -1391,12 +1408,35 @@ Register* simplifyPrimitiveCompare(Env& env, const PrimitiveCompare* instr) {
       return do_cbool(left->type().objectSpec() == right->type().objectSpec());
     }
   }
+
+  // Canonicalize boolean constants to the right for == and !=.
+  if (commutative && left->isA(TBool) && right->isA(TBool) &&
+      left->type().hasObjectSpec() && !right->type().hasObjectSpec()) {
+    return env.emit<PrimitiveCompare>(op, right, left);
+  }
+  if (commutative && left->isA(TCBool) && right->isA(TCBool) &&
+      left->type().hasIntSpec() && !right->type().hasIntSpec()) {
+    return env.emit<PrimitiveCompare>(op, right, left);
+  }
+
   // box(b) == True --> b
-  if (instr->op() == PrimitiveCompareOp::kEqual &&
-      left->instr()->IsPrimitiveBoxBool() &&
+  if (op == PrimitiveCompareOp::kEqual && left->instr()->IsPrimitiveBoxBool() &&
       right->type().asObject() == Py_True) {
     return left->instr()->GetOperand(0);
   }
+  // box(b) == False --> !b
+  if (op == PrimitiveCompareOp::kEqual && left->instr()->IsPrimitiveBoxBool() &&
+      right->type().asObject() == Py_False) {
+    return env.emit<PrimitiveUnaryOp>(
+        PrimitiveUnaryOpKind::kNotInt, left->instr()->GetOperand(0));
+  }
+  // box(b1) CMP box(b2) --> b1 CMP b2
+  if (left->instr()->IsPrimitiveBoxBool() &&
+      right->instr()->IsPrimitiveBoxBool()) {
+    return env.emit<PrimitiveCompare>(
+        op, left->instr()->GetOperand(0), right->instr()->GetOperand(0));
+  }
+
   return nullptr;
 }
 
@@ -1494,10 +1534,10 @@ Register* simplifyLoadAttrSplitDict(
     const LoadAttr* load_attr,
     BorrowedRef<PyTypeObject> type,
     BorrowedRef<PyUnicodeObject> name) {
-#ifdef Py_GIL_DISABLED
-  // See T255055907.
-  return nullptr;
-#endif
+  if constexpr (kFreeThreadedBuild) {
+    // See T255055907.
+    return nullptr;
+  }
 
   if (!PyType_HasFeature(type, Py_TPFLAGS_MANAGED_DICT) ||
       !PyType_HasFeature(type, Py_TPFLAGS_INLINE_VALUES)) {
@@ -2445,17 +2485,20 @@ Register* simplifyInstr(Env& env, const Instr* instr) {
       return simplifyCompactLongUnbox(
           env, static_cast<const CompactLongUnbox*>(instr));
 
-// TODO(T255262756) - Enable this again. See P2169675076 and P2184559031 (same
-// pattern but applied to simplifyLoadAttrTypeReceiver).
-#ifndef Py_GIL_DISABLED
     case Opcode::kLoadAttr:
+      // TODO(T255262756) - Enable this again. See P2169675076 and
+      // P2184559031 (same pattern but applied to
+      // simplifyLoadAttrTypeReceiver).
+      if constexpr (kFreeThreadedBuild) {
+        return nullptr;
+      }
       return simplifyLoadAttr(env, static_cast<const LoadAttr*>(instr));
-#endif
-// TODO(T255263721) - Enable this again. See P2169673579 and P2184559031.
-#ifndef Py_GIL_DISABLED
     case Opcode::kLoadMethod:
+      // TODO(T255263721) - Enable this again. See P2169673579 and P2184559031.
+      if constexpr (kFreeThreadedBuild) {
+        return nullptr;
+      }
       return simplifyLoadMethod(env, static_cast<const LoadMethod*>(instr));
-#endif
     case Opcode::kLoadField:
       return simplifyLoadField(env, static_cast<const LoadField*>(instr));
     case Opcode::kLoadTupleItem:

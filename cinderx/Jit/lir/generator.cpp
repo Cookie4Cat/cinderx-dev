@@ -1381,11 +1381,11 @@ void LIRGenerator::makeIncref(
     bbb.appendBlock(cont);
   }
 
-#ifdef Py_GIL_DISABLED
-  makeIncrefFreeThreaded(bbb, instr, end_incref);
-#else
-  makeIncrefGILEnabled(bbb, instr, end_incref, possible_immortal);
-#endif
+  if constexpr (kFreeThreadedBuild) {
+    makeIncrefFreeThreaded(bbb, instr, end_incref);
+  } else {
+    makeIncrefGILEnabled(bbb, instr, end_incref, possible_immortal);
+  }
 
   bbb.appendBlock(end_incref);
 }
@@ -1396,14 +1396,15 @@ void LIRGenerator::makeIncrefFreeThreaded(
     lir::Instruction* instr,
     BasicBlock* end_incref) {
   // Inline the common-case incref for free-threading. Check thread ownership
-  // (ob_tid == tstate->thread_id) and use a non-atomic store for thread-owned
-  // objects. Fall back to Py_IncRef for objects owned by other threads.
+  // (ob_tid == tstate->thread_id) and use a relaxed atomic store for
+  // thread-owned objects. Fall back to Py_IncRef for objects owned by other
+  // threads.
   BasicBlock* slow_incref = bbb.allocateBlock();
 
-  // Load ob_ref_local (32-bit thread-local refcount).
+  // Load ob_ref_local (32-bit thread-local refcount) with relaxed semantics.
   Instruction* ref_local = bbb.appendInstr(
       OutVReg{OperandBase::k32bit},
-      Instruction::kMove,
+      Instruction::kMoveRelaxed,
       Ind{instr,
           static_cast<int>(offsetof(PyObject, ob_ref_local)),
           DataType::k32bit});
@@ -1428,7 +1429,8 @@ void LIRGenerator::makeIncrefFreeThreaded(
   bbb.appendInstr(Instruction::kCmp, ob_tid, thread_id);
   bbb.appendBranch(Instruction::kBranchNE, slow_incref);
 
-  // Fast path: thread-owned, store incremented ob_ref_local non-atomically.
+  // Fast path: thread-owned, store incremented ob_ref_local with relaxed
+  // semantics.
   BasicBlock* fast_store = bbb.allocateBlock();
   bbb.appendBlock(fast_store);
   bbb.appendInstr(
@@ -1436,7 +1438,7 @@ void LIRGenerator::makeIncrefFreeThreaded(
           instr,
           static_cast<int>(offsetof(PyObject, ob_ref_local)),
           DataType::k32bit},
-      Instruction::kMove,
+      Instruction::kMoveRelaxed,
       ref_local);
   updateRefTotal(bbb, Instruction::kInc);
   // Jump past the slow path to end_incref.
@@ -1519,11 +1521,11 @@ void LIRGenerator::makeDecref(
     bbb.appendBlock(cont);
   }
 
-#ifdef Py_GIL_DISABLED
-  makeDecrefFreeThreaded(bbb, instr, end_decref);
-#else
-  makeDecrefGILEnabled(bbb, instr, end_decref, destructor, possible_immortal);
-#endif
+  if constexpr (kFreeThreadedBuild) {
+    makeDecrefFreeThreaded(bbb, instr, end_decref);
+  } else {
+    makeDecrefGILEnabled(bbb, instr, end_decref, destructor, possible_immortal);
+  }
 
   bbb.appendBlock(end_decref);
 }
@@ -1534,16 +1536,16 @@ void LIRGenerator::makeDecrefFreeThreaded(
     lir::Instruction* instr,
     BasicBlock* end_decref) {
   // Inline the common-case decref for free-threading. Check thread ownership
-  // and use a non-atomic decrement for thread-owned objects. When the local
+  // and use a relaxed atomic store for thread-owned objects. When the local
   // refcount reaches zero, call _Py_MergeZeroLocalRefcount to merge with the
   // shared refcount. Fall back to Py_DecRef for objects owned by other threads.
   BasicBlock* slow_decref = bbb.allocateBlock();
   BasicBlock* merge_refcount = bbb.allocateBlock();
 
-  // Load ob_ref_local (32-bit).
+  // Load ob_ref_local (32-bit) with relaxed semantics.
   Instruction* ref_local = bbb.appendInstr(
       OutVReg{OperandBase::k32bit},
-      Instruction::kMove,
+      Instruction::kMoveRelaxed,
       Ind{instr,
           static_cast<int>(offsetof(PyObject, ob_ref_local)),
           DataType::k32bit});
@@ -1568,7 +1570,7 @@ void LIRGenerator::makeDecrefFreeThreaded(
   bbb.appendInstr(Instruction::kCmp, ob_tid, thread_id);
   bbb.appendBranch(Instruction::kBranchNE, slow_decref);
 
-  // Fast path: thread-owned, decrement non-atomically.
+  // Fast path: thread-owned, decrement and store with relaxed semantics.
   BasicBlock* fast_dec = bbb.allocateBlock();
   bbb.appendBlock(fast_dec);
   updateRefTotal(bbb, Instruction::kDec);
@@ -1578,7 +1580,7 @@ void LIRGenerator::makeDecrefFreeThreaded(
           instr,
           static_cast<int>(offsetof(PyObject, ob_ref_local)),
           DataType::k32bit},
-      Instruction::kMove,
+      Instruction::kMoveRelaxed,
       ref_local);
   // Re-test zero flag after the store (the store may clobber flags).
   bbb.appendInstr(Instruction::kTest32, ref_local, ref_local);
@@ -1765,10 +1767,17 @@ LIRGenerator::TranslatedBlock LIRGenerator::TranslateOneBasicBlock(
         // FT needs to call PyCell_GetRef for thread-safety. Switching the two
         // implementations changes whether the output is borrowed or new so
         // there is a corresponding switch in instr_effects.cpp.
-#ifdef Py_GIL_DISABLED
-        auto* instr = static_cast<const LoadCellItem*>(&i);
-        bbb.appendCallInstruction(
-            instr->output(), JITRT_LoadCellItem, instr->GetOperand(0));
+#if PY_VERSION_HEX >= 0x030D0000
+        if constexpr (kFreeThreadedBuild) {
+          auto* instr = static_cast<const LoadCellItem*>(&i);
+          bbb.appendCallInstruction(
+              instr->output(), JITRT_LoadCellItem, instr->GetOperand(0));
+        } else {
+          hir::Register* dest = i.output();
+          Instruction* src_base = bbb.getDefInstr(i.GetOperand(0));
+          constexpr int32_t kOffset = offsetof(PyCellObject, ob_ref);
+          bbb.appendInstr(dest, Instruction::kMove, Ind{src_base, kOffset});
+        }
 #else
         hir::Register* dest = i.output();
         Instruction* src_base = bbb.getDefInstr(i.GetOperand(0));
@@ -3779,17 +3788,22 @@ LIRGenerator::TranslatedBlock LIRGenerator::TranslateOneBasicBlock(
       }
       case Opcode::kSetDictItem: {
         auto instr = static_cast<const SetDictItem*>(&i);
-        bbb.appendCallInstruction(
-            instr->output(),
-#ifdef Py_GIL_DISABLED
-            // TODO(T250369690): Need thread-safe checked collections
-            PyDict_SetItem,
-#else
-            Ci_DictOrChecked_SetItem,
-#endif
-            instr->GetOperand(0),
-            instr->GetOperand(1),
-            instr->GetOperand(2));
+        if constexpr (kFreeThreadedBuild) {
+          // TODO(T250369690): Need thread-safe checked collections
+          bbb.appendCallInstruction(
+              instr->output(),
+              PyDict_SetItem,
+              instr->GetOperand(0),
+              instr->GetOperand(1),
+              instr->GetOperand(2));
+        } else {
+          bbb.appendCallInstruction(
+              instr->output(),
+              Ci_DictOrChecked_SetItem,
+              instr->GetOperand(0),
+              instr->GetOperand(1),
+              instr->GetOperand(2));
+        }
         break;
       }
       case Opcode::kSetSetItem: {
@@ -3953,16 +3967,20 @@ LIRGenerator::TranslatedBlock LIRGenerator::TranslateOneBasicBlock(
       case Opcode::kListAppend: {
         auto instr = static_cast<const ListAppend*>(&i);
 
-        bbb.appendCallInstruction(
-            instr->output(),
-#ifdef Py_GIL_DISABLED
-            // TODO(T250369690): Need thread-safe checked collections
-            PyList_Append,
-#else
-            Ci_ListOrCheckedList_Append,
-#endif
-            instr->GetOperand(0),
-            instr->GetOperand(1));
+        if constexpr (kFreeThreadedBuild) {
+          // TODO(T250369690): Need thread-safe checked collections
+          bbb.appendCallInstruction(
+              instr->output(),
+              PyList_Append,
+              instr->GetOperand(0),
+              instr->GetOperand(1));
+        } else {
+          bbb.appendCallInstruction(
+              instr->output(),
+              Ci_ListOrCheckedList_Append,
+              instr->GetOperand(0),
+              instr->GetOperand(1));
+        }
         break;
       }
       case Opcode::kListExtend: {
@@ -4022,9 +4040,9 @@ LIRGenerator::TranslatedBlock LIRGenerator::TranslateOneBasicBlock(
         break;
       }
       case Opcode::kAtQuiescentState: {
-#ifdef Py_GIL_DISABLED
-        bbb.appendInvokeInstruction(JITRT_AtQuiescentState, env_->asm_tstate);
-#endif
+        if constexpr (kFreeThreadedBuild) {
+          bbb.appendInvokeInstruction(JITRT_AtQuiescentState, env_->asm_tstate);
+        }
         break;
       }
       case Opcode::kRunPeriodicTasks: {

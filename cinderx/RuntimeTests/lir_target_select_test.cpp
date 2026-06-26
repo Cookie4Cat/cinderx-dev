@@ -264,9 +264,16 @@ def func(x, y):
 
   std::string lir_str = getSelectedLIRString(pyfunc.get());
 
-  EXPECT_NE(lir_str.find(" = Equal "), std::string::npos) << lir_str;
-  EXPECT_NE(lir_str.find("CondBranch"), std::string::npos) << lir_str;
-  EXPECT_EQ(lir_str.find("BranchE"), std::string::npos) << lir_str;
+  // Compare<In> now produces an immortal bool, so the truth-value branch can
+  // be selected as Cmp + BranchE while the Python compare result is still kept
+  // for the guard.
+  EXPECT_NE(lir_str.find("Compare<In>"), std::string::npos) << lir_str;
+  EXPECT_NE(lir_str.find("PrimitiveCompare<Equal>"), std::string::npos)
+      << lir_str;
+  EXPECT_NE(lir_str.find("Guard 4"), std::string::npos) << lir_str;
+  EXPECT_NE(lir_str.find("Cmp "), std::string::npos) << lir_str;
+  EXPECT_NE(lir_str.find("BranchE"), std::string::npos) << lir_str;
+  EXPECT_EQ(lir_str.find(" = Equal "), std::string::npos) << lir_str;
 }
 #endif
 

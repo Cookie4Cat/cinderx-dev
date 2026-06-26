@@ -168,7 +168,6 @@ struct Config {
   // Whether or not to JIT specialized opcodes or to fall back to their generic
   // counterparts.
   bool specialized_opcodes{true};
-
   // Enable OSR hot-loop detection. OSR is production-off by default and must
   // be explicitly enabled by -X osr-enabled or CINDERX_OSR_ENABLED.
   bool osr_enabled{false};
@@ -185,9 +184,6 @@ struct Config {
   // that contain a loop backedge. Disable to restore the old unconditional
   // guard behavior.
   bool backedge_gated_int_guards{true};
-  // Add guards for long objects being compact (not arbitrary-length) as part of
-  // arithmetic operations.
-  bool compact_long_guards{false};
 
   // Support instrumentation (monitoring/tracing/profiling) by falling back to
   // the interpreter
