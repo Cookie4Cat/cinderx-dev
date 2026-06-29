@@ -179,6 +179,7 @@ def build_docker_command(args: argparse.Namespace, dirs: dict[str, Path]) -> lis
         "CMAKE_BUILD_TYPE": args.cmake_build_type,
         "CMAKE_BUILD_PARALLEL_LEVEL": args.cmake_build_parallel_level,
         "MAKEFLAGS": args.makeflags,
+        "SOURCE_DATE_EPOCH": os.environ.get("SOURCE_DATE_EPOCH"),
         "HTTP_PROXY": proxy,
         "HTTPS_PROXY": proxy,
         "ALL_PROXY": proxy,
