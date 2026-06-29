@@ -12,11 +12,7 @@ int frameHeaderSize(BorrowedRef<PyCodeObject> code) {
     return 0;
   }
 
-  if (getConfig().frame_mode == FrameMode::kLightweight) {
-    return sizeof(FrameHeader) + sizeof(PyObject*) * code->co_framesize;
-  }
-
-  return 0;
+  return kFrameHeaderOverhead + sizeof(PyObject*) * code->co_framesize;
 }
 
 } // namespace jit

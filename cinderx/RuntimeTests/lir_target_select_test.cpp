@@ -6,6 +6,7 @@
 #include "cinderx/Jit/codegen/environ.h"
 #include "cinderx/Jit/compiler.h"
 #include "cinderx/Jit/context.h"
+#include "cinderx/Jit/frame.h"
 #include "cinderx/Jit/hir/hir.h"
 #include "cinderx/Jit/lir/generator.h"
 #include "cinderx/Jit/lir/parser.h"
@@ -41,7 +42,13 @@ class LIRTargetSelectTest : public RuntimeTest {
     env.ctx = getContext();
 
     CodeRuntime runtime{func};
-    runtime.setReifier(irfunc->reifier);
+    Ref<> reifier;
+    if (irfunc->reifier != nullptr) {
+      runtime.setReifier(irfunc->reifier);
+    } else {
+      reifier = makeFrameReifier(func->func_code);
+      runtime.setReifier(reifier);
+    }
     env.code_rt = &runtime;
 
     LIRGenerator lir_gen(irfunc.get(), &env);

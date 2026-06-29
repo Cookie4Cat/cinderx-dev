@@ -23,6 +23,26 @@ namespace jit::lir {
 
 class BasicBlockBuilder;
 
+// On 3.12, tstate->current_frame lives behind an extra indirection through
+// tstate->cframe. This helper caches that cframe pointer so it's loaded at
+// most once when both load() and store() are called in the same scope.
+// On 3.13+ the field is directly on tstate and no caching is needed.
+struct CurrentFrameAccessor {
+  CurrentFrameAccessor(BasicBlockBuilder& bbb, Instruction* tstate)
+      : bbb_(bbb), tstate_(tstate) {}
+
+  Instruction* load();
+  void store(Instruction* frame);
+
+ private:
+  BasicBlockBuilder& bbb_;
+  Instruction* tstate_;
+#if PY_VERSION_HEX < 0x030D0000
+  Instruction* cframe_{nullptr};
+  Instruction* loadCFrame();
+#endif
+};
+
 class LIRGenerator {
  public:
   explicit LIRGenerator(
@@ -72,7 +92,8 @@ class LIRGenerator {
 
   // For generators: the shared epilogue block (unlink frame, FP restore,
   // return). Receives values from both exit_block_ (returns) and yield blocks.
-  // nullptr for non-generators.
+  // For non-generators: set when inline frame-unlink code creates additional
+  // blocks, so the block sorter uses the correct exit block.
   BasicBlock* exit_epilogue_{nullptr};
 
   // Phi instruction in exit_block_ for merging return values.
@@ -214,7 +235,31 @@ class LIRGenerator {
   void resolvePhiOperands(
       UnorderedMap<const hir::BasicBlock*, TranslatedBlock>& bb_map);
 
+  CurrentFrameAccessor makeCurrentFrameAccessor(BasicBlockBuilder& bbb);
+
   void emitLoadFrame(BasicBlockBuilder& bbb);
+  void emitUnlinkFrame(
+      BasicBlockBuilder& bbb,
+      bool has_freevars,
+      bool is_generator,
+      Instruction* func_reg,
+      PyObject* executable,
+      std::optional<destructor> exec_dtor,
+      Instruction* callee_frame = nullptr);
+  void emitInlineUnlinkLeafFrame(
+      BasicBlockBuilder& bbb,
+      bool is_generator,
+      Instruction* func_reg,
+      PyObject* executable,
+      std::optional<destructor> exec_dtor,
+      Instruction* callee_frame = nullptr);
+  void emitInlineUnlinkFastFrame(
+      BasicBlockBuilder& bbb,
+      bool is_generator,
+      Instruction* func_reg,
+      PyObject* executable,
+      std::optional<destructor> exec_dtor,
+      Instruction* callee_frame = nullptr);
 
   void emitExceptionCheck(
       const jit::hir::DeoptBase& i,

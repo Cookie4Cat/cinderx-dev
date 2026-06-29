@@ -167,7 +167,8 @@ enum OperandSizeType {
   X(BranchNS)                                                                 \
   X(BranchE)                                                                  \
   X(BranchNE)                                                                 \
-  X(BitTest, false, FlagEffects::kSet, kDefault, 1, {1})                      \
+  X(BranchBitSet, false, FlagEffects::kSet, kDefault, 0, {1}, 1)              \
+  X(BranchBitNotSet, false, FlagEffects::kSet, kDefault, 0, {1}, 1)           \
   X(Inc, false, FlagEffects::kSet)                                            \
   X(Dec, false, FlagEffects::kSet)                                            \
   X(CondBranch, false, FlagEffects::kInvalidate, kDefault, 0, {1})            \
@@ -194,6 +195,7 @@ enum OperandSizeType {
   X(Prologue, false, FlagEffects::kInvalidate, kDefault, 0, {}, 1)            \
   X(SetupFrame, false, FlagEffects::kInvalidate, kDefault, 0, {}, 1)          \
   X(VariadicPush, false, FlagEffects::kNone, kDefault, 0, {}, 1)              \
+  X(StorePair, false, FlagEffects::kNone, kDefault, 0, {0, 1, 1, 1}, 1)       \
   X(Leave, false, FlagEffects::kInvalidate, kDefault, 0, {}, 1)               \
   X(Ret, false, FlagEffects::kInvalidate, kDefault, 0, {}, 1)                 \
   /* TreeIter state machine LIR opcodes. All are essential side-effect ops. */\

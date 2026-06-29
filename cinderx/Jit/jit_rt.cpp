@@ -573,23 +573,14 @@ static void init_and_link_interpreter_frame(
   setCurrentFrame(tstate, frame);
 }
 
-static inline PyThreadState* allocate_and_link_interpreter_frame(
+static PyThreadState* allocate_and_link_interpreter_frame(
     PyFunctionObject* func,
     PyCodeObject* co) {
   PyThreadState* tstate = PyThreadState_GET();
   JIT_DCHECK(tstate != nullptr, "thread state cannot be null");
-  JIT_DCHECK(
-      PyCode_Check(func->func_code),
-      "Non-code object for JIT function: {}",
-      jit::repr(reinterpret_cast<PyObject*>(func)));
 
-  // Frame allocation failure is very unlikely - it can only happen if we run
-  // out of memory. If this happens we behave less gracefully than the
-  // interpreter as we don't have references to args to allow for proper
-  // clean-up. Maybe we'll want to change this in future if it limits
-  // us from getting something like a stack-trace on this kind of failure.
   _PyInterpreterFrame* frame =
-      Cix_PyThreadState_PushFrame(tstate, jit::jitFrameGetSize(co));
+      Cix_PyThreadState_PushFrame(tstate, co->co_framesize);
   JIT_CHECK(frame != nullptr, "Failed to allocate _PyInterpreterFrame");
 
   init_and_link_interpreter_frame(
@@ -601,16 +592,14 @@ static inline PyThreadState* allocate_and_link_interpreter_frame(
 PyThreadState* JITRT_AllocateAndLinkInterpreterFrame_Debug(
     PyFunctionObject* func,
     PyCodeObject* jit_code_object) {
-  PyCodeObject* co = (PyCodeObject*)func->func_code;
-  // Given this assertion we actually don't need to incref the code object as
-  // happens in _PyFrame_Initialize.
+  PyCodeObject* co = reinterpret_cast<PyCodeObject*>(func->func_code);
   JIT_DCHECK(co == jit_code_object, "Code object mismatch");
   return allocate_and_link_interpreter_frame(func, co);
 }
 
 PyThreadState* JITRT_AllocateAndLinkInterpreterFrame_Release(
     PyFunctionObject* func) {
-  PyCodeObject* co = (PyCodeObject*)func->func_code;
+  PyCodeObject* co = reinterpret_cast<PyCodeObject*>(func->func_code);
   return allocate_and_link_interpreter_frame(func, co);
 }
 
@@ -647,7 +636,7 @@ JITRT_AllocateAndLinkGenAndInterpreterFrame(
       "Non-code object for JIT function: {}",
       jit::repr(reinterpret_cast<PyObject*>(func)));
   BorrowedRef<PyCodeObject> co{func->func_code};
-  JIT_DCHECK(co == code_rt->frameState()->code(), "Code object mismatch");
+  JIT_DCHECK(co == code_rt->code(), "Code object mismatch");
 
   uint64_t spill_words = code_rt->spillWords();
   PyThreadState* tstate = PyThreadState_GET();
@@ -772,6 +761,47 @@ void JITRT_DecrefFrame(PyFrameObject* frame) {
   }
 }
 
+static void cleanupFrameExecutable(_PyInterpreterFrame* frame) {
+#if PY_VERSION_HEX >= 0x030E0000
+  // Can't use a plain decref as this needs to be symmetric with
+  // _PyFrame_Initialize() which uses PyStackRef_FromPyObjectNew() for
+  // f_executable.
+  PyStackRef_CLOSE(frame->f_executable);
+#else
+  Py_DECREF(frameExecutable(frame));
+#endif
+}
+
+// Non-generator frames don't incref f_funcobj during setup — the caller
+// keeps the function alive. Incref now to balance the decref that
+// jitFrameClearExceptCode will perform.
+static void increfFuncObjForNonGenerator(_PyInterpreterFrame* frame) {
+  if (jit::getConfig().frame_mode != jit::FrameMode::kLightweight) {
+    return;
+  }
+#if PY_VERSION_HEX >= 0x030E0000 && PY_VERSION_HEX < 0x030F0000
+  // The 3.14 port eagerly materializes CPython-visible frame fields and keeps
+  // the setup-time function reference, so clear paths do not need a top-up ref.
+  return;
+#endif
+  if (frameCode(frame)->co_flags & jit::kCoFlagsAnyGenerator) {
+    return;
+  }
+#if PY_VERSION_HEX >= 0x030E0000
+  Py_INCREF(PyStackRef_AsPyObjectBorrow(frame->f_funcobj));
+#elif defined(ENABLE_LIGHTWEIGHT_FRAMES)
+  // On 3.12+LW, f_funcobj holds the reifier, not the function. The
+  // function lives in FrameHeader.func. For inlined frames,
+  // jitFrameRemoveReifier already handles the incref via Py_NewRef,
+  // so only incref for non-inlined (top-level) frames here.
+  if (!jit::isInlinedFrame(frame)) {
+    Py_XINCREF(jit::jitFrameGetFunction(frame));
+  }
+#else
+  Py_INCREF(frame->f_funcobj);
+#endif
+}
+
 void JITRT_UnlinkFrame(PyThreadState* tstate) {
   /*
    * The reference for this is _PyEvalFrameClearAndPop in ceval.c.
@@ -782,21 +812,17 @@ void JITRT_UnlinkFrame(PyThreadState* tstate) {
 
   // This is needed particularly because it handles the work of copying
   // data to a PyFrameObject if one has escaped the function.
-  jit::jitFrameClearExceptCode(frame);
-#if PY_VERSION_HEX >= 0x030E0000
-  // Can't use a plain decref as this needs to be symmetric with
-  // _PyFrame_Initialize() which uses PyStackRef_FromPyObjectNew() for
-  // f_executable.
-  PyStackRef_CLOSE(frame->f_executable);
-#else
-  Py_DECREF(frameExecutable(frame));
+#if !(PY_VERSION_HEX >= 0x030E0000 && PY_VERSION_HEX < 0x030F0000)
+  if (jit::getConfig().frame_mode == jit::FrameMode::kLightweight) {
+    increfFuncObjForNonGenerator(frame);
+  }
 #endif
+  jit::jitFrameClearExceptCode(frame);
+  cleanupFrameExecutable(frame);
 
   if (jit::getConfig().frame_mode != jit::FrameMode::kLightweight) {
     Cix_PyThreadState_PopFrame(tstate, frame);
   }
-
-  // JIT frames are stack allocated so there's nothing to pop.
 }
 
 PyObject*
@@ -821,13 +847,13 @@ JITRT_LoadGlobal(PyObject* globals, PyObject* builtins, PyObject* name) {
 PyObject* JITRT_LoadGlobalFromThreadState(
     PyThreadState* tstate,
     PyObject* name) {
-  jit::RuntimeFrameState rtfs = jit::runtimeFrameStateFromThreadState(tstate);
-  return JITRT_LoadGlobal(rtfs.globals(), rtfs.builtins(), name);
+  _PyInterpreterFrame* frame = currentFrame(tstate);
+  return JITRT_LoadGlobal(frame->f_globals, frame->f_builtins, name);
 }
 
 PyObject* JITRT_LoadGlobalsDict(PyThreadState* tstate) {
-  jit::RuntimeFrameState rtfs = jit::runtimeFrameStateFromThreadState(tstate);
-  return rtfs.globals();
+  _PyInterpreterFrame* frame = currentFrame(tstate);
+  return frame->f_globals;
 }
 
 static int listPrefixReverseAssignFallback(PyObject* list, PyObject* index) {
@@ -2205,8 +2231,8 @@ PyObject* JITRT_CopyDictWithoutKeys(PyObject* subject, PyObject* keys) {
 }
 
 PyObject* JITRT_LoadName(PyThreadState* tstate, int name_idx) {
-  jit::RuntimeFrameState rtfs = jit::runtimeFrameStateFromThreadState(tstate);
-  return PyTuple_GET_ITEM(rtfs.code()->co_names, name_idx);
+  _PyInterpreterFrame* frame = currentFrame(tstate);
+  return PyTuple_GET_ITEM(frameCode(frame)->co_names, name_idx);
 }
 
 void JITRT_FormatAwaitableError(

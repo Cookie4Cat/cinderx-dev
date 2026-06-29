@@ -576,8 +576,6 @@ class HIRBuilder {
   // Check that a code object can be compiled into HIR.
   void checkTranslate();
 
-  void advancePastYieldInstr(TranslationContext& tc);
-
   BorrowedRef<PyCodeObject> code_;
   BlockMap block_map_;
   const Preloader& preloader_;
@@ -593,6 +591,15 @@ class HIRBuilder {
   bool code_has_backedge_{false};
 
   OperandStack static_method_stack_;
+
+  // True if the function's bytecode contains only opcodes that cannot invoke
+  // user Python code and has no backward jumps (loops). Stricter than the
+  // common "leaf function" definition (no calls) — this also requires no
+  // complex opcodes. Used to skip RunPeriodicTasks at RESUME since the
+  // function returns quickly and the caller will check periodic tasks.
+  bool is_simple_leaf_function_{false};
+
+  static bool isSimpleLeafFunction(BorrowedRef<PyCodeObject> code);
 };
 
 } // namespace jit::hir

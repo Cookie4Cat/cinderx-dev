@@ -736,6 +736,42 @@ BasicBlock* HIRBuilder::getBlockAtOff(BCOffset off) {
   return it->second;
 }
 
+bool HIRBuilder::isSimpleLeafFunction(BorrowedRef<PyCodeObject> code) {
+  if (code->co_flags & kCoFlagsAnyGenerator) {
+    return false;
+  }
+  for (auto& instr : BytecodeInstructionBlock{code}) {
+    switch (instr.opcode()) {
+      case COPY:
+      case LOAD_CONST:
+      case LOAD_FAST:
+      case LOAD_FAST_AND_CLEAR:
+      case LOAD_FAST_BORROW:
+      case LOAD_FAST_BORROW_LOAD_FAST_BORROW:
+      case LOAD_FAST_CHECK:
+      case LOAD_FAST_LOAD_FAST:
+      case NOP:
+      case NOT_TAKEN:
+      case POP_TOP:
+      case PUSH_NULL:
+      case RESUME:
+      case RETURN_CONST:
+      case RETURN_VALUE:
+      case STORE_FAST:
+      case STORE_FAST_LOAD_FAST:
+      case STORE_FAST_STORE_FAST:
+      case SWAP:
+        break;
+      default:
+        return false;
+    }
+    if (instr.isBackwardBranch()) {
+      return false;
+    }
+  }
+  return true;
+}
+
 std::unique_ptr<Function> buildHIR(const Preloader& preloader) {
   return HIRBuilder{preloader}.buildHIR();
 }
@@ -755,6 +791,8 @@ std::unique_ptr<Function> buildHIR(const Preloader& preloader) {
 std::unique_ptr<Function> HIRBuilder::buildHIR() {
   checkTranslate();
   code_has_backedge_ = codeHasBackedge(code_);
+
+  is_simple_leaf_function_ = isSimpleLeafFunction(code_);
 
   std::unique_ptr<Function> irfunc = preloader_.makeFunction();
   buildHIRImpl(irfunc.get(), /*frame_state=*/nullptr);
@@ -960,19 +998,6 @@ InlineResult HIRBuilder::inlineHIR(
   }
 
   return {entry_block, exit_block};
-}
-
-void HIRBuilder::advancePastYieldInstr(TranslationContext& tc) {
-  // A YIELD_VALUE/RETURN_GENERATOR doesn't directly fail, however we may want
-  // to throw into the generator which means we'd deopt. In this case we need
-  // bytecode pointer to the following instruction which is where the
-  // interpreter should pick-up execution.
-  BCOffset next_bc_offs{
-      BytecodeInstruction{code_, tc.frame.cur_instr_offs}.nextInstrOffset()};
-  tc.frame.cur_instr_offs = next_bc_offs;
-  JIT_DCHECK(
-      next_bc_offs.asIndex().value() < countIndices(code_),
-      "Yield should not be end of instruction stream");
 }
 
 void HIRBuilder::translate(
@@ -1364,9 +1389,8 @@ void HIRBuilder::translate(
         }
         case POP_JUMP_IF_FALSE:
         case POP_JUMP_IF_TRUE: {
-          BCOffset target_off = bc_instr.getJumpTarget();
-          BasicBlock* target = getBlockAtOff(target_off);
-          if (target_off <= bc_instr.baseOffset()) {
+          BasicBlock* target = getBlockAtOff(bc_instr.getJumpTarget());
+          if (bc_instr.isBackwardBranch()) {
             loop_headers.emplace(target);
           }
           emitPopJumpIf(tc, bc_instr);
@@ -1374,9 +1398,8 @@ void HIRBuilder::translate(
         }
         case POP_JUMP_IF_NONE:
         case POP_JUMP_IF_NOT_NONE: {
-          BCOffset target_off = bc_instr.getJumpTarget();
-          BasicBlock* target = getBlockAtOff(target_off);
-          if (target_off <= bc_instr.baseOffset()) {
+          BasicBlock* target = getBlockAtOff(bc_instr.getJumpTarget());
+          if (bc_instr.isBackwardBranch()) {
             loop_headers.emplace(target);
           }
           emitPopJumpIfNone(tc, bc_instr);
@@ -1702,9 +1725,6 @@ void HIRBuilder::translate(
         }
         case RETURN_GENERATOR: {
           auto out = temps_.AllocateStack();
-          if constexpr (PY_VERSION_HEX >= 0x030E0000) {
-            advancePastYieldInstr(tc);
-          }
           tc.emit<InitialYield>(out, tc.frame);
           tc.frame.stack.push(out);
           break;
@@ -2216,6 +2236,9 @@ void HIRBuilder::emitResume(
     TranslationContext& tc,
     const jit::BytecodeInstruction& bc_instr) {
   if (bc_instr.oparg() >= 2) {
+    return;
+  }
+  if (is_simple_leaf_function_) {
     return;
   }
   TranslationContext succ(cfg.AllocateBlock(), tc.frame);
@@ -4030,15 +4053,23 @@ void HIRBuilder::emitMakeListTuple(
     const jit::BytecodeInstruction& bc_instr) {
   auto num_elems = static_cast<size_t>(bc_instr.oparg());
   auto dst = temps_.AllocateStack();
-  Instr* instr;
   if (bc_instr.opcode() == BUILD_TUPLE) {
-    instr = tc.emit<MakeTuple>(num_elems, dst, tc.frame);
+    tc.emit<MakeTuple>(dst, num_elems, tc.frame);
   } else {
-    instr = tc.emit<MakeList>(num_elems, dst, tc.frame);
+    tc.emit<MakeList>(dst, num_elems, tc.frame);
   }
-  for (size_t i = num_elems; i > 0; i--) {
-    auto opnd = tc.frame.stack.pop();
-    instr->SetOperand(i - 1, opnd);
+  if (num_elems > 0) {
+    Instr* fill;
+    if (bc_instr.opcode() == BUILD_TUPLE) {
+      fill = tc.emit<InitTupleElements>(num_elems + 1);
+    } else {
+      fill = tc.emit<InitListElements>(num_elems + 1);
+    }
+    fill->SetOperand(0, dst);
+    for (size_t i = num_elems; i > 0; i--) {
+      auto opnd = tc.frame.stack.pop();
+      fill->SetOperand(i, opnd);
+    }
   }
   tc.frame.stack.push(dst);
 }
@@ -4072,11 +4103,14 @@ void HIRBuilder::emitBuildCheckedList(
       "expected CheckedList type");
 
   Register* list = temps_.AllocateStack();
-  auto instr = tc.emit<MakeCheckedList>(list_size, list, type, tc.frame);
-  // Fill list
-  for (size_t i = list_size; i > 0; i--) {
-    auto operand = tc.frame.stack.pop();
-    instr->SetOperand(i - 1, operand);
+  tc.emit<MakeCheckedList>(list, list_size, type, tc.frame);
+  if (list_size > 0) {
+    auto fill = tc.emit<InitListElements>(list_size + 1);
+    fill->SetOperand(0, list);
+    for (size_t i = list_size; i > 0; i--) {
+      auto operand = tc.frame.stack.pop();
+      fill->SetOperand(i, operand);
+    }
   }
   tc.frame.stack.push(list);
 }
@@ -5245,10 +5279,15 @@ void HIRBuilder::emitYieldValue(
       tc.emit<YieldValue>(out, in, tc.frame);
     }
   } else {
-    advancePastYieldInstr(tc);
     if (bc_instr.oparg() == 1) {
       auto* yv = tc.emit<YieldValue>(out, in, tc.frame);
-      yv->setYieldFromIter(stack.top());
+      // In 3.15, PUSH_NULL adds a loop index between the sub-iterator and
+      // the yield value. The sub-iterator is one below the top.
+      if constexpr (PY_VERSION_HEX >= 0x030F0000) {
+        yv->setYieldFromIter(stack.top(1));
+      } else {
+        yv->setYieldFromIter(stack.top());
+      }
     } else {
       JIT_CHECK(bc_instr.oparg() == 0, "Invalid oparg {}", bc_instr.oparg());
       tc.emit<YieldValue>(out, in, tc.frame);

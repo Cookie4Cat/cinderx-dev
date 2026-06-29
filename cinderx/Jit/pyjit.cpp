@@ -1286,18 +1286,24 @@ FlagProcessor initFlagProcessor() {
 
   flag_processor.setFlags(PySys_GetXOptions());
 
-  // T198250666: Bit of a hack but this makes other things easier.  In 3.12 all
-  // functions need access to the runtime PyFunctionObject, which prevents
-  // inlining.  Our tests check `is_hir_inliner_enabled()` to see if the inliner
-  // is functional and make assumptions based on that.  This is only available
-  // when we have lightweight frames enabled as we need cooperation w/ the
-  // runtime to let us reify the frame.
-  //
-  // Inlining is only compatible w/ lightweight frames because we need our
-  // reifier to cooperate with restoring the frame object into something usable
-  // when CPython wants it.
-  if (getConfig().frame_mode != FrameMode::kLightweight) {
+  // Inlining relies on lightweight-frame reification support.  Keep the
+  // inliner disabled for normal-frame runs so tests and explicit normal-mode
+  // configurations do not build inline frames that cannot be safely unlinked.
+  bool force_disable_inliner_for_normal_frame =
+      getConfig().frame_mode != FrameMode::kLightweight;
+  if (force_disable_inliner_for_normal_frame) {
     getMutableConfig().hir_opts.inliner = false;
+  }
+
+  // If the inliner is off and the user hasn't explicitly set the preload
+  // dependent limit, set it to zero.  Nothing is going to be inlined so there's
+  // no need to aggressively preload.
+  //
+  // This will reduce the chance that Static Python functions can natively call
+  // each other though.
+  if (!force_disable_inliner_for_normal_frame && !getConfig().hir_opts.inliner &&
+      !flag_processor.hasHandled("jit-preload-dependent-limit")) {
+    getMutableConfig().preload_dependent_limit = 0;
   }
 
   return flag_processor;
@@ -4155,7 +4161,7 @@ void recordDeoptForRoiBackoff(
     return;
   }
 
-  BorrowedRef<PyCodeObject> code = code_runtime->frameState()->code();
+  BorrowedRef<PyCodeObject> code = code_runtime->code();
   CodeExtra* extra = codeExtra(code);
   if (extra == nullptr) {
     return;

@@ -17,8 +17,6 @@
 
 namespace jit {
 
-RuntimeFrameState runtimeFrameStateFromThreadState(PyThreadState* tstate);
-
 // A singleton reifier object that was set _PyInterpreterFrame's f_funcobj
 // to. The Python runtime will call this object when it needs a complete
 // frame.
@@ -55,12 +53,9 @@ BorrowedRef<PyFunctionObject> jitFrameGetFunction(_PyInterpreterFrame* frame);
 // Sets the PyFunctionObject to be stashed away in an interpreter frame.
 void jitFrameSetFunction(_PyInterpreterFrame* frame, PyFunctionObject* func);
 
-// Checks if the interpreter frame is an inline frame w/ runtime frame state
-bool hasRtfsFunction(_PyInterpreterFrame* frame);
-
-// Get the RuntimeFrameState from a _PyInterpreterFrame, hasRtfsFunction must be
-// true.
-RuntimeFrameState* jitFrameGetRtfs(_PyInterpreterFrame* frame);
+// Checks if the interpreter frame is an inlined JIT frame (tagged with
+// JIT_FRAME_INLINED in the FrameHeader).
+bool isInlinedFrame(_PyInterpreterFrame* frame);
 
 FrameHeader* jitFrameGetHeader(_PyInterpreterFrame* frame);
 
@@ -81,10 +76,6 @@ void jitFrameInit(
     _frameowner owner,
     _PyInterpreterFrame* previous,
     PyObject* reifier);
-
-// Gets the frame size (in number of words) that's required for the JIT
-// to initialize a frame object.
-size_t jitFrameGetSize(PyCodeObject* code);
 
 Ref<> makeFrameReifier(BorrowedRef<PyCodeObject> code);
 
