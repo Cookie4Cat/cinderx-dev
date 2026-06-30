@@ -63,10 +63,11 @@ python3.14 -m pip install --no-index cinderx-*_aarch64.whl
 
 | 文件/目录 | 说明 |
 |---|---|
-| `cinderx/` | CinderX Python 包，包含 `cinderx.jit`、缓存属性、Strict/Static 辅助接口等 | 
+| `cinderx/` | CinderX Python 包，包含 `cinderx.jit`、缓存属性、Strict/Static 辅助接口、compiler 子包、`cinderx/opcode.py` 等 |
+| `cinderx/_native/` | fat wheel 的 native 扩展目录，包含 `fat_wheel.json` 和 `py314_0` 至 `py314_3` 对应的 `_cinderx_314*.so` |
+| `_cinderx.py` | 顶层 native loader；按当前 CPython 3.14 micro 版本加载 `cinderx/_native/` 下对应的 native 扩展 |
 | `__static__/`、`__strict__/` | Static Python 和 Strict Modules 的兼容包入口 | 
-| `opcodes/` | CinderX opcode 辅助模块 |
-| `_cinderx.so` | CinderX native 扩展，包含 JIT/runtime 核心能力 |
+| `opcodes/` | CinderX opcode 生成/维护辅助包，包含 `3.12/`、`3.14/`、`3.15/` 版本化 `opcode.py` 和生成脚本 |
 | `_cinderx_auto.py` | 自动导入入口；由 `cinderx.pth` 在 Python 启动时触发 |
 | `cinderx.pth` | site 模块启动钩子；设置 `CINDERX_PLUGIN_ENABLE=1` 时自动导入 CinderX |
 | `cinderx-<version>.dist-info/` | wheel 元数据、`RECORD`、安装器信息等 |

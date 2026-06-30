@@ -15,6 +15,7 @@ from __future__ import annotations
 import argparse
 import base64
 import csv
+import datetime
 import hashlib
 import io
 import json
@@ -160,6 +161,40 @@ def render_record(entries: dict[str, bytes], record_path: str) -> bytes:
         writer.writerow(wheel_record_line(path, entries[path]))
     writer.writerow((record_path, "", ""))
     return buf.getvalue().encode("utf-8")
+
+
+def wheel_zip_date_time() -> tuple[int, int, int, int, int, int]:
+    source_date_epoch = os.environ.get("SOURCE_DATE_EPOCH")
+    if source_date_epoch is not None:
+        try:
+            timestamp = int(source_date_epoch)
+        except ValueError as exc:
+            raise WheelError("SOURCE_DATE_EPOCH must be an integer timestamp") from exc
+        try:
+            date = datetime.datetime.fromtimestamp(
+                timestamp, datetime.timezone.utc
+            ).date()
+        except (OverflowError, OSError) as exc:
+            raise WheelError(
+                "SOURCE_DATE_EPOCH is outside the supported timestamp range"
+            ) from exc
+    else:
+        date = datetime.datetime.now(datetime.timezone.utc).date()
+    return (date.year, date.month, date.day, 0, 0, 0)
+
+
+def wheel_zip_info(
+    name: str, date_time: tuple[int, int, int, int, int, int]
+) -> zipfile.ZipInfo:
+    try:
+        info = zipfile.ZipInfo(name, date_time)
+    except ValueError as exc:
+        raise WheelError(
+            f"ZIP does not support timestamp {date_time!r}; check SOURCE_DATE_EPOCH"
+        ) from exc
+    info.compress_type = zipfile.ZIP_DEFLATED
+    info.external_attr = 0o600 << 16
+    return info
 
 
 def build_loader(mapping: dict[int, str]) -> bytes:
@@ -315,9 +350,10 @@ def build_fat_wheel(
     tmp_wheel = output_wheel.with_suffix(output_wheel.suffix + ".tmp")
     if tmp_wheel.exists():
         tmp_wheel.unlink()
+    zip_date_time = wheel_zip_date_time()
     with zipfile.ZipFile(tmp_wheel, "w", compression=zipfile.ZIP_DEFLATED) as out:
         for name in sorted(output_entries):
-            out.writestr(name, output_entries[name])
+            out.writestr(wheel_zip_info(name, zip_date_time), output_entries[name])
     os.replace(tmp_wheel, output_wheel)
 
 
