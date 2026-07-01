@@ -1024,6 +1024,7 @@ JITRT_CallFunctionEx(PyObject* func, PyObject* pargs, PyObject* kwargs) {
 }
 
 PyObject* JITRT_Call(
+    PyThreadState* tstate,
     PyObject* callable,
     PyObject* const* args,
     size_t nargsf,
@@ -1052,7 +1053,6 @@ PyObject* JITRT_Call(
     }
   }
 
-  PyThreadState* tstate = _PyThreadState_GET();
   PyObject* res =
       _PyObject_VectorcallTstate(tstate, callable, args, nargsf, kwnames);
   // In 3.12 calls to non-Python functions will check for the eval breaker
@@ -1065,12 +1065,12 @@ PyObject* JITRT_Call(
   return res;
 }
 
-PyObject* JITRT_Vectorcall(
+PyObject* JITRT_VectorcallTstate(
+    PyThreadState* tstate,
     PyObject* callable,
     PyObject* const* args,
     size_t nargsf,
     PyObject* kwnames) {
-  PyThreadState* tstate = _PyThreadState_GET();
   PyObject* res =
       _PyObject_VectorcallTstate(tstate, callable, args, nargsf, kwnames);
   // In 3.12 calls to non-Python functions will check for the eval breaker
@@ -1666,6 +1666,7 @@ PyObject* JITRT_FormatValue(
 }
 
 PyObject* JITRT_BuildString(
+    PyThreadState* /*tstate*/,
     void* /*unused*/,
     PyObject** args,
     size_t nargsf,

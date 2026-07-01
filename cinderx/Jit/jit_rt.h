@@ -176,6 +176,7 @@ JITRT_CallFunctionEx(PyObject* func, PyObject* pargs, PyObject* kwargs);
  * deopt.
  */
 PyObject* JITRT_Call(
+    PyThreadState* tstate,
     PyObject* callable,
     PyObject* const* args,
     size_t nargsf,
@@ -185,7 +186,8 @@ PyObject* JITRT_Call(
  * Performs a function call with a vectorcall. Will check and handle any
  * eval breaker events after the call.
  */
-PyObject* JITRT_Vectorcall(
+PyObject* JITRT_VectorcallTstate(
+    PyThreadState* tstate,
     PyObject* callable,
     PyObject* const* args,
     size_t nargsf,
@@ -365,6 +367,7 @@ PyObject* JITRT_FormatValue(
  * Concatenate strings from args
  */
 PyObject* JITRT_BuildString(
+    PyThreadState* /*tstate*/,
     void* /*unused*/,
     PyObject** args,
     size_t nargsf,
