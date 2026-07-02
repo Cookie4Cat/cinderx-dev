@@ -58,6 +58,7 @@ void finiCodeExtraIndex();
 // this data if this is the first access. Returns nullptr on failure with no
 // Python error set.
 CodeExtra* codeExtra(PyCodeObject* code);
+size_t codeCallCount(PyCodeObject* code);
 
 // Get the extra data object associated with a code object if it already exists.
 // Unlike codeExtra(), this never allocates a CodeExtra.

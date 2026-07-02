@@ -203,6 +203,7 @@ struct Config {
   // the inliner, doesn't have any specific meaning, and can change as the
   // inliner's algorithm changes.
   size_t inliner_cost_limit{2000};
+  size_t inliner_cold_call_threshold{20};
   // Number of workers to use for batch compilation, like in precompile_all().
   // If this number isn't configured then batch compilation will happen inline
   // on the calling thread.

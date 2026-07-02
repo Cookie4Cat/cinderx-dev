@@ -335,11 +335,6 @@ bool hasRequiredFlags(BorrowedRef<PyCodeObject> code) {
   return (code->co_flags & required_code_flags) == required_code_flags;
 }
 
-uint64_t countCalls(PyCodeObject* code) {
-  auto extra = codeExtra(code);
-  return extra != nullptr ? Ci_code_extra_get_calls(extra) : 0;
-}
-
 GateContext readGateContext() {
   bool import_phase = autoJitImportDepth() > 0;
   bool setup_phase = autoJitSetupDepth() > 0;
@@ -1108,6 +1103,12 @@ FlagProcessor initFlagProcessor() {
       getMutableConfig().inliner_cost_limit,
       "Limit how much the inliner is able to inline. The number's definition "
       "is only relevant to the inliner itself.");
+  flag_processor.addOption(
+      "jit-hir-inliner-cold-call-threshold",
+      "PYTHONJITHIRINLINERCOLDCALLTHRESHOLD",
+      getMutableConfig().inliner_cold_call_threshold,
+      "Calls below this threshold are considered cold and will not be "
+      "inlined.  Setting to 0 disables the check.");
 
   flag_processor.addOption(
       "jit-lir-inliner",
@@ -2422,7 +2423,7 @@ PyObject* count_interpreted_calls(PyObject* /* self */, PyObject* arg) {
     return nullptr;
   }
   BorrowedRef<PyCodeObject> code{func->func_code};
-  return PyLong_FromLong(static_cast<long>(countCalls(code)));
+  return PyLong_FromLong(static_cast<long>(codeCallCount(code)));
 }
 
 PyObject* is_jit_compiled(PyObject* /* self */, PyObject* arg) {
