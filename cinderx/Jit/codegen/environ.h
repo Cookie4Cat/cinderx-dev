@@ -170,6 +170,10 @@ struct Environ {
 
   bool has_inlined_functions{false};
 
+#if defined(CINDER_X86_64) && defined(_WIN32)
+  int win_struct_ret_offset{0};
+#endif
+
   // True if the function has any DeoptBase instructions in its final HIR.
   // When false, the interpreter frame can never be materialized, enabling a
   // cheaper inline frame unlink at exit.
