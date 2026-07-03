@@ -7,13 +7,25 @@
 
 #include "internal/pycore_frame.h"
 
-void Ci_InitOpcodes() {}
+extern int Ci_SeedDictVersionShadow(void);
+
+void Ci_InitOpcodes() {
+  // See [P2] in cinderx_ceval.c: park the vendored loop's dict-version
+  // shadow counter far above the runtime's own allocator.
+  (void)Ci_SeedDictVersionShadow();
+}
+
+// The vendored upstream v3.11.6 eval loop (Interpreter/3.11/cinderx_ceval.c).
+extern PyObject* Ci_EvalFrameDefault_311(
+    PyThreadState* tstate,
+    _PyInterpreterFrame* frame,
+    int throwflag);
 
 PyObject* _Py_HOT_FUNCTION
 Ci_EvalFrame(PyThreadState* tstate, _PyInterpreterFrame* frame, int throwflag) {
-  // Plain PEP 523 pass-through on 3.11. Call counting and auto-JIT
+  // Route through the vendored 3.11.6 loop. Call counting and auto-JIT
   // scheduling land with the bytecode-frontend milestone.
-  return _PyEval_EvalFrameDefault(tstate, frame, throwflag);
+  return Ci_EvalFrameDefault_311(tstate, frame, throwflag);
 }
 
 PyObject* Ci_StaticFunction_Vectorcall(

@@ -261,14 +261,9 @@ PyObject* _PyTuple_FromArray(PyObject* const* src, Py_ssize_t n) {
   return tuple;
 }
 
-PyFrameObject* _PyFrame_MakeAndSetFrameObject(_PyInterpreterFrame* frame) {
-  (void)frame;
-  PyErr_SetString(
-      PyExc_NotImplementedError,
-      "frame object materialization is not supported by the stock Python "
-      "3.11 CinderX fallback");
-  return NULL;
-}
+// _PyFrame_MakeAndSetFrameObject now comes verbatim from the vendored
+// Interpreter/3.11/ceval/frame.c (M2); the earlier NotImplementedError stub
+// that lived here is gone.
 
 void _PyFrame_ClearExceptCode(_PyInterpreterFrame* frame) {
   int stacktop = frame->stacktop;
