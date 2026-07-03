@@ -18,6 +18,7 @@
 #include "cinderx/Jit/config.h"
 #include "cinderx/Jit/hir/builder.h"
 #include "cinderx/Jit/hir/hir.h"
+#include "cinderx/Jit/hir/inliner.h"
 #include "cinderx/Jit/hir/parser.h"
 #include "cinderx/Jit/hir/phi_elimination.h"
 #include "cinderx/Jit/hir/printer.h"
@@ -2784,6 +2785,49 @@ def f():
   auto call_result2 =
       Ref<>::steal(PyObject_Call(pyfunc, empty_tuple, /*kwargs=*/nullptr));
   EXPECT_TRUE(isIntEquals(call_result2, 2));
+}
+
+TEST_F(CppInlinerTest, ColdCallThresholdZeroDoesNotPruneAll) {
+  struct RestoreFlag {
+    size_t old_value;
+    ~RestoreFlag() {
+      getMutableConfig().inliner_cold_call_threshold = old_value;
+    }
+  } restore{getConfig().inliner_cold_call_threshold};
+
+  // Setting threshold to 0 should disable pruning, not prune everything.
+  getMutableConfig().inliner_cold_call_threshold = 0;
+
+  const char* pycode = R"(
+def foo():
+    return 4
+
+def test():
+    return foo()
+)";
+  std::unique_ptr<Function> irfunc;
+  ASSERT_NO_FATAL_FAILURE(CompileToHIR(pycode, "test", irfunc));
+  ASSERT_NE(irfunc, nullptr);
+
+  // Run the inliner; should not crash or throw.
+  InlineFunctionCalls inliner;
+  EXPECT_NO_THROW(inliner.Run(*irfunc));
+}
+
+TEST_F(CppInlinerTest, CallFuncWithKeywordArgs) {
+  const char* pycode = R"(
+def f(a, b, c=3):
+    return a + b + c
+
+def test():
+    return f(1, b=2)
+)";
+  Ref<PyObject> pyfunc(compileAndGet(pycode, "test"));
+  ASSERT_NE(pyfunc, nullptr);
+  auto empty_tuple = Ref<>::steal(PyTuple_New(0));
+  auto result = Ref<>::steal(PyObject_Call(pyfunc, empty_tuple, nullptr));
+  ASSERT_NE(result, nullptr);
+  EXPECT_TRUE(isIntEquals(result, 6));
 }
 
 class HIRCloneTest : public RuntimeTest {};
