@@ -2862,8 +2862,7 @@ LIRGenerator::TranslatedBlock LIRGenerator::TranslateOneBasicBlock(
         auto instr = static_cast<const LoadModuleAttrCached*>(&i);
         Instruction* name = getNameFromIdx(bbb, instr);
         auto cache = getContext()->allocateLoadModuleAttrCache();
-        appendCall2RetValues(
-            bbb,
+        bbb.appendCallInstruction(
             instr->output(),
             LoadModuleAttrCache::lookupHelper,
             cache,
