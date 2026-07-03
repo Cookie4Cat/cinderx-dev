@@ -177,6 +177,10 @@ class Preloader {
     return fullname_;
   }
 
+  BorrowedRef<PyTypeObject> methodOwnerType() const {
+    return method_owner_type_.type;
+  }
+
   Type returnType() const {
     return return_type_;
   }
@@ -218,6 +222,7 @@ class Preloader {
   BorrowedRef<> constArg(BytecodeInstruction& bc_instr) const;
   PyObject** getGlobalCache(BorrowedRef<> name) const;
   bool canCacheGlobals() const;
+  void preloadMethodOwnerType();
   bool preload();
 
   // Preload information only relevant to Static Python functions.
@@ -259,6 +264,7 @@ class Preloader {
   std::unordered_map<long, Type> check_arg_types_;
   std::map<long, OwnedType> check_arg_pytypes_;
   std::optional<OwnedType> inferred_self_type_;
+  OwnedType method_owner_type_;
   // keyed by name index, names borrowed from code object
   GlobalNamesMap global_names_;
   Type return_type_{TObject};

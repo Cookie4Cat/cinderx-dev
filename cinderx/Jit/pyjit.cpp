@@ -327,6 +327,7 @@ CompilerContext<Compiler>* jitCtx() {
 
 bool isLightweightFramesCompiledIn();
 int validateFrameModeConfig();
+uint32_t g_auto_jit_import_depth = 0;
 
 // Don't care flags: CO_NOFREE, CO_FUTURE_* (the only still-relevant future is
 // "annotations" which doesn't impact bytecode execution.)
@@ -479,7 +480,7 @@ void setInterpreterJitFlag(bool enabled) {
     tstate->interp->jit = enabled;
   }
 #else
-  (void)enabled;  // No interp->jit flag before 3.13.
+  (void)enabled;  // 3.11 解释器无 interp->jit 标志
 #endif
 }
 
@@ -498,6 +499,17 @@ bool isCinderModule(BorrowedRef<> module_name) {
   return name == "cinderx";
 }
 
+bool isImportlibBootstrapModule(BorrowedRef<> module_name) {
+  if (module_name == nullptr || !PyUnicode_Check(module_name)) {
+    return false;
+  }
+  std::string_view name = PyUnicode_AsUTF8(module_name);
+  return name == "_frozen_importlib" ||
+      name == "_frozen_importlib_external" ||
+      name == "importlib._bootstrap" ||
+      name == "importlib._bootstrap_external";
+}
+
 bool shouldAlwaysScheduleCompile(BorrowedRef<PyCodeObject> code) {
   // There's a config option for forcing all Static Python functions to be
   // compiled.
@@ -505,31 +517,80 @@ bool shouldAlwaysScheduleCompile(BorrowedRef<PyCodeObject> code) {
   return is_static && getConfig().compile_all_static_functions;
 }
 
+bool isFunctionDefinedInInitializingModule(BorrowedRef<PyFunctionObject> func) {
+  PyObject* globals = func->func_globals;
+  if (!PyDict_CheckExact(globals)) {
+    return false;
+  }
+
+  PyObject* spec = PyDict_GetItemString(globals, "__spec__");
+  if (spec == nullptr) {
+    PyErr_Clear();
+    return false;
+  }
+
+  auto initializing =
+      Ref<>::steal(PyObject_GetAttrString(spec, "_initializing"));
+  if (initializing == nullptr) {
+    PyErr_Clear();
+    return false;
+  }
+
+  int is_true = PyObject_IsTrue(initializing);
+  if (is_true < 0) {
+    PyErr_Clear();
+    return false;
+  }
+  return is_true != 0;
+}
+
 // Check if a function has been preloaded.
 bool isPreloaded(BorrowedRef<PyFunctionObject> func) {
   return hir::preloaderManager().find(func) != nullptr;
 }
 
-// Like jitVectorcall(), but ignores any call count requirements.
-PyObject* forcedJitVectorcall(
+PyObject* compileAndRunJitVectorcall(
     PyObject* func_obj,
     PyObject* const* stack,
     size_t nargsf,
-    PyObject* kwnames) {
+    PyObject* kwnames,
+    bool disable_auto_on_failure) {
   JIT_DCHECK(
       PyFunction_Check(func_obj),
       "Called JIT wrapper with {} object instead of a function",
       Py_TYPE(func_obj)->tp_name);
   BorrowedRef<PyFunctionObject> func{func_obj};
-  BorrowedRef<PyCodeObject> code{func->func_code};
 
   auto result = compileFunction(func);
+  if (result != Result::OK && disable_auto_on_failure) {
+    // 验证分支的 2 参 compileFunction 语义：失败即关闭该函数的 auto-JIT
+    if (CodeExtra* extra = codeExtraIfExists(
+            reinterpret_cast<PyCodeObject*>(func->func_code))) {
+      Ci_code_extra_disable_auto_jit(extra);
+    }
+  }
   if (result == Result::OK) {
     incAutoJitGateStat(g_auto_jit_gate_stats.forced_compile_ok);
     JIT_DCHECK(
         isJitCompiled(func),
         "JIT succeeded for function {} but it is not recognized as compiled",
         funcFullname(func));
+    if (disable_auto_on_failure) {
+      // Auto-JIT reaches this path from jitVectorcall after a function has
+      // crossed the call threshold. On 3.11, immediately re-entering the
+      // freshly installed vectorcall from that wrapper can leave caught
+      // exceptions on the wrong interpreter resume point. Keep the threshold
+      // invocation interpreted; subsequent calls enter through the installed
+      // compiled vectorcall normally.
+      auto jit_entry = func->vectorcall;
+      auto interp_entry = getInterpretedVectorcall(func);
+      setVectorcall(func, interp_entry);
+      PyObject* interp_result = interp_entry(func_obj, stack, nargsf, kwnames);
+      if (func->vectorcall == interp_entry) {
+        setVectorcall(func, jit_entry);
+      }
+      return interp_result;
+    }
     return func->vectorcall(func_obj, stack, nargsf, kwnames);
   }
 
@@ -553,6 +614,15 @@ PyObject* forcedJitVectorcall(
   // interpreted entrypoint instead.
   incAutoJitGateStat(g_auto_jit_gate_stats.forced_compile_fallback);
   return interp_entry(func_obj, stack, nargsf, kwnames);
+}
+
+// Like jitVectorcall(), but ignores any call count requirements.
+PyObject* forcedJitVectorcall(
+    PyObject* func_obj,
+    PyObject* const* stack,
+    size_t nargsf,
+    PyObject* kwnames) {
+  return compileAndRunJitVectorcall(func_obj, stack, nargsf, kwnames, false);
 }
 
 // Python function entry point when the JIT is enabled.
@@ -1668,12 +1738,9 @@ enum class JitEligibility { Ineligible, JitListEligible, Eligible };
  * possible.
  */
 JitEligibility getCompilationEligibility(BorrowedRef<PyFunctionObject> func) {
-#if PY_VERSION_HEX < 0x030C0000
-  // The 3.11 bytecode frontend is not implemented yet; nothing is eligible.
-  return JitEligibility::Ineligible;
-#endif
   // Can be called after the module has been finalized, due to function events.
-  if (jitCtx() == nullptr || isCinderModule(func->func_module)) {
+  if (jitCtx() == nullptr || isCinderModule(func->func_module) ||
+      isImportlibBootstrapModule(func->func_module)) {
     return JitEligibility::Ineligible;
   }
 
@@ -1681,6 +1748,11 @@ JitEligibility getCompilationEligibility(BorrowedRef<PyFunctionObject> func) {
   if (!hasRequiredFlags(code)) {
     return JitEligibility::Ineligible;
   }
+#if PY_VERSION_HEX < 0x030C0000
+  if (code->co_flags & kCoFlagsAnyGenerator) {
+    return JitEligibility::Ineligible;
+  }
+#endif
 
   // Note: This is not the same as fetching the function's code object and
   // checking its module and qualname, as functions can be renamed after they
@@ -1701,22 +1773,24 @@ JitEligibility getCompilationEligibility(BorrowedRef<PyFunctionObject> func) {
 JitEligibility getCompilationEligibility(
     BorrowedRef<> module_name,
     BorrowedRef<PyCodeObject> code) {
-#if PY_VERSION_HEX < 0x030C0000
-  // The 3.11 bytecode frontend is not implemented yet; nothing is eligible.
-  return JitEligibility::Ineligible;
-#endif
   // Can be called after the module has been finalized, due to function events.
   if (jitCtx() == nullptr) {
     return JitEligibility::Ineligible;
   }
 
-  if (isCinderModule(module_name)) {
+  if (isCinderModule(module_name) ||
+      isImportlibBootstrapModule(module_name)) {
     return JitEligibility::Ineligible;
   }
 
   if (!hasRequiredFlags(code)) {
     return JitEligibility::Ineligible;
   }
+#if PY_VERSION_HEX < 0x030C0000
+  if (code->co_flags & kCoFlagsAnyGenerator) {
+    return JitEligibility::Ineligible;
+  }
+#endif
 
   if (auto jit_list = cinderx::getModuleState()->jit_list.get()) {
     if (jit_list->lookupCode(code) == 1 ||
@@ -1973,7 +2047,6 @@ PyObject* enable_jit(PyObject* /* self */, PyObject* /* arg */) {
 // sys.monitoring.register_callback()
 bool hasRegisteredMonitoringCallbacks() {
 #if PY_VERSION_HEX < 0x030C0000
-  // sys.monitoring only exists on 3.12+.
   return false;
 #else
   auto is = PyInterpreterState_Get();
@@ -2143,8 +2216,26 @@ void schedule_existing_functions_for_jit(uint32_t calls) {
   // Schedule all pre-existing functions for compilation.
   walkFunctionObjects(
       [](BorrowedRef<PyFunctionObject> func) { scheduleJitCompile(func); });
+}
+
+int compile_after_n_calls_impl(uint32_t calls, bool schedule_existing) {
+  if (Ci_InitFrameEvalFunc() < 0) {
+    return -1;
+  }
+
+  getMutableConfig().compile_after_n_calls = calls;
+
+  if (schedule_existing) {
+    // Schedule all pre-existing functions for compilation.
+    walkFunctionObjects([](BorrowedRef<PyFunctionObject> func) {
+      if (!isFunctionDefinedInInitializingModule(func)) {
+        scheduleJitCompile(func);
+      }
+    });
+  }
 
   JIT_DLOG("Configuring JIT to compile functions after {} calls", calls);
+  return 0;
 }
 
 int compile_after_n_calls_impl(uint32_t calls) {
@@ -2174,6 +2265,44 @@ PyObject* compile_after_n_calls(PyObject* /* self */, PyObject* arg) {
   }
 
   Py_RETURN_NONE;
+}
+
+PyObject* compile_after_n_calls_no_preexisting(
+    PyObject* /* self */,
+    PyObject* arg) {
+  Py_ssize_t calls = -1;
+  if (!PyArg_Parse(arg, "n:_compile_after_n_calls_no_preexisting", &calls)) {
+    return nullptr;
+  }
+  if (calls < 0 || calls > std::numeric_limits<uint32_t>::max()) {
+    PyErr_Format(
+        PyExc_ValueError,
+        "Cannot configure JIT to compile functions after '%zd' calls",
+        calls);
+    return nullptr;
+  }
+
+  if (compile_after_n_calls_impl(calls, false) < 0) {
+    return nullptr;
+  }
+
+  Py_RETURN_NONE;
+}
+
+PyObject* autojit_import_enter(PyObject* /* self */, PyObject* /* arg */) {
+  ++g_auto_jit_import_depth;
+  Py_RETURN_NONE;
+}
+
+PyObject* autojit_import_leave(PyObject* /* self */, PyObject* /* arg */) {
+  if (g_auto_jit_import_depth > 0) {
+    --g_auto_jit_import_depth;
+  }
+  Py_RETURN_NONE;
+}
+
+PyObject* autojit_import_depth(PyObject* /* self */, PyObject* /* arg */) {
+  return PyLong_FromUnsignedLong(g_auto_jit_import_depth);
 }
 
 PyObject* auto_jit(PyObject* /* self */, PyObject* /* arg */) {
@@ -3529,8 +3658,27 @@ PyMethodDef jit_methods[] = {
     {"compile_after_n_calls",
      compile_after_n_calls,
      METH_O,
-     PyDoc_STR("Configure the JIT to automatically compile functions after "
-               "they are called a set number of times.")},
+     PyDoc_STR(
+         "Configure the JIT to automatically compile functions after "
+         "they are called a set number of times.")},
+    {"_compile_after_n_calls_no_preexisting",
+     compile_after_n_calls_no_preexisting,
+     METH_O,
+     PyDoc_STR(
+         "Configure auto-JIT without immediately scanning pre-existing "
+         "functions. Private bootstrap helper.")},
+    {"_autojit_import_enter",
+     autojit_import_enter,
+     METH_NOARGS,
+     PyDoc_STR("Enter an import scope that defers auto-JIT scheduling.")},
+    {"_autojit_import_leave",
+     autojit_import_leave,
+     METH_NOARGS,
+     PyDoc_STR("Leave an import scope that defers auto-JIT scheduling.")},
+    {"_autojit_import_depth",
+     autojit_import_depth,
+     METH_NOARGS,
+     PyDoc_STR("Return current auto-JIT import deferral depth.")},
     {"disassemble", disassemble, METH_O, "Disassemble JIT compiled functions."},
     {"_test_parse_thread_state_prologue",
      test_parse_thread_state_prologue,
@@ -4506,6 +4654,34 @@ bool tryAttachCachedCompiledEntry(BorrowedRef<PyFunctionObject> func) {
   return jitCtx()->finalizeFunc(func, compiled);
 }
 
+extern "C" void Ci_MaybeScheduleAutoJIT(
+    PyFunctionObject* func,
+    uint64_t calls) {
+  if (func == nullptr) {
+    return;
+  }
+  BorrowedRef<PyFunctionObject> func_ref{func};
+  BorrowedRef<PyCodeObject> code{func_ref->func_code};
+  if (codeAutoJitDisabled(code)) {
+    return;
+  }
+  auto limit = getConfig().compile_after_n_calls;
+  if (!limit.has_value() || calls < *limit) {
+    return;
+  }
+  if (g_auto_jit_import_depth > 0) {
+    return;
+  }
+  if (isFunctionDefinedInInitializingModule(func_ref)) {
+    return;
+  }
+  if (getCompilationEligibility(func_ref) == JitEligibility::Ineligible) {
+    disableCodeAutoJit(code);
+    return;
+  }
+  scheduleJitCompile(func_ref);
+}
+
 bool scheduleJitCompile(BorrowedRef<PyFunctionObject> func) {
   FreeThreadedJITEntrypointGuard guard;
 
@@ -4567,11 +4743,6 @@ bool scheduleJitCompile(BorrowedRef<PyFunctionObject> func) {
 
 Result compileFunction(BorrowedRef<PyFunctionObject> func) {
   FreeThreadedJITEntrypointGuard guard;
-#if PY_VERSION_HEX < 0x030C0000
-  // The 3.11 bytecode frontend is not implemented yet; cinderx loads and
-  // runs on 3.11 with the JIT inert.
-  return Result::CANNOT_SPECIALIZE;
-#endif
   if (!isJitInitialized()) {
     return Result::NOT_INITIALIZED;
   }
@@ -4594,11 +4765,6 @@ void uncompile(BorrowedRef<PyFunctionObject> func) {
 
 Result compileFunctionWithOSR(BorrowedRef<PyFunctionObject> func) {
   FreeThreadedJITEntrypointGuard guard;
-#if PY_VERSION_HEX < 0x030C0000
-  // The 3.11 bytecode frontend is not implemented yet; cinderx loads and
-  // runs on 3.11 with the JIT inert.
-  return Result::CANNOT_SPECIALIZE;
-#endif
   if (!isJitInitialized()) {
     return Result::NOT_INITIALIZED;
   }

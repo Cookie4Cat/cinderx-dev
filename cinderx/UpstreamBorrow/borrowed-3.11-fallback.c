@@ -265,16 +265,20 @@ PyObject* _PyTuple_FromArray(PyObject* const* src, Py_ssize_t n) {
 // Interpreter/3.11/ceval/frame.c (M2); the earlier NotImplementedError stub
 // that lived here is gone.
 
+// 3.11 has no _PyFrame_ClearExceptCode (that name is 3.13+); the verbatim
+// 3.11 clear is _PyFrame_Clear in the vendored Interpreter/3.11/ceval/frame.c,
+// which also handles the escaped-frame take_ownership transfer (data copy
+// into the PyFrameObject, f_back linking, GC tracking) that a naive
+// field-clearing mirror misses -- skipping it leaves escaped frame objects
+// pointing at a dead interpreter frame.
+//
+// Callers own the code reference separately (cleanupFrameExecutable), so
+// balance _PyFrame_Clear's Py_DECREF(f_code) with a pre-incref. On the
+// take_ownership early-return path the copied frame keeps the extra code
+// reference, which the caller's cleanup then consumes; both paths balance.
 void _PyFrame_ClearExceptCode(_PyInterpreterFrame* frame) {
-  int stacktop = frame->stacktop;
-  if (stacktop > 0) {
-    for (int i = 0; i < stacktop; i++) {
-      Py_CLEAR(frame->localsplus[i]);
-    }
-  }
-  Py_CLEAR(frame->f_locals);
-  Py_CLEAR(frame->f_func);
-  Py_CLEAR(frame->frame_obj);
+  Py_INCREF(frame->f_code);
+  _PyFrame_Clear(frame);
 }
 
 #define ASSERT_VALID_BOUNDS(bounds)

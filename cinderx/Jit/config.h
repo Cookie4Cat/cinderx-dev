@@ -134,7 +134,10 @@ struct Config {
   // to be initialized or uninitialized.  Intended for testing.
   std::optional<bool> force_init;
   FrameMode frame_mode{
-#ifdef ENABLE_LIGHTWEIGHT_FRAMES
+// Lightweight frames are only implemented for 3.12+ frame layouts; on 3.11
+// the materialized-frame model is the supported default (design decision
+// D4: the LWF skeleton stays compiled in, the runtime default stays off).
+#if defined(ENABLE_LIGHTWEIGHT_FRAMES) && PY_VERSION_HEX >= 0x030C0000
       FrameMode::kLightweight
 #else
       FrameMode::kNormal

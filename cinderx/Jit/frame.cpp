@@ -117,7 +117,7 @@ uintptr_t getFrameBaseFromOnStackFrame(_PyInterpreterFrame* frame) {
   // The frame is embedded in the frame header at the beginning of the
   // stack frame.
   return reinterpret_cast<uintptr_t>(frame) +
-      sizeof(PyObject*) * _PyFrame_GetCode(frame)->co_framesize;
+      sizeof(PyObject*) * frameSlotsForCodeObject(_PyFrame_GetCode(frame));
 }
 
 uintptr_t getIP(_PyInterpreterFrame* frame, int frame_size) {
@@ -327,6 +327,82 @@ void updatePrevInstr(_PyInterpreterFrame* frame) {
       "updatePrevInstr: Lightweight frames are not supported"};
 #endif
 }
+
+CodeRuntime* lookupCodeRuntimeForOwningFrame(_PyInterpreterFrame* frame) {
+  JIT_CHECK(
+      !isInlinedFrame(frame),
+      "owning frame unexpectedly refers to an inlined frame");
+  return getCodeRuntime(frame);
+}
+
+struct ActiveDeoptMetadata {
+  const DeoptMetadata* meta;
+  uintptr_t frame_base;
+};
+
+std::optional<ActiveDeoptMetadata> getActiveDeoptMetadata(
+    _PyInterpreterFrame* owning_frame,
+    CodeRuntime* code_rt = nullptr) {
+  if (code_rt == nullptr) {
+    code_rt = lookupCodeRuntimeForOwningFrame(owning_frame);
+  }
+  if (code_rt == nullptr || code_rt->frameSize() < 0) {
+    return std::nullopt;
+  }
+
+#if defined(Py_GIL_DISABLED)
+  std::size_t deopt_idx = jitFrameGetHeader(owning_frame)->deopt_idx;
+  if (deopt_idx >= code_rt->deoptMetadatas().size()) {
+    return std::nullopt;
+  }
+  uintptr_t frame_base;
+  if (isGeneratorFrame(owning_frame)) {
+    PyGenObject* gen = _PyGen_GetGeneratorFromFrame(owning_frame);
+    auto footer = jitGenDataFooter(gen);
+    frame_base = reinterpret_cast<uintptr_t>(footer);
+  } else {
+#if defined(CINDER_X86_64)
+    frame_base = getFrameBaseFromOnStackFrame(owning_frame);
+#else
+    frame_base = reinterpret_cast<uintptr_t>(owning_frame) +
+        sizeof(PyObject*) *
+            frameSlotsForCodeObject(_PyFrame_GetCode(owning_frame));
+#endif
+  }
+  return ActiveDeoptMetadata{
+      .meta = &code_rt->getDeoptMetadata(deopt_idx),
+      .frame_base = frame_base,
+  };
+#else
+  return std::nullopt;
+#endif
+}
+
+#if defined(META_PYTHON) && defined(Py_GIL_DISABLED)
+int visitJitDeferredRefs(PyInterpreterState* interp, gcvisitobjects_t visit) {
+  _Py_FOR_EACH_TSTATE_BEGIN(interp, p) {
+    for (_PyInterpreterFrame* frame = p->current_frame; frame != nullptr;
+         frame = frame->previous) {
+      if (frame->owner >= FRAME_OWNED_BY_INTERPRETER) {
+        continue;
+      }
+
+      if (!isJitFrame(frame) || isInlined(frame)) {
+        continue;
+      }
+
+      std::optional<ActiveDeoptMetadata> active = getActiveDeoptMetadata(frame);
+      if (!active.has_value()) {
+        JIT_ABORT("no active deopt metadata");
+      }
+
+      visitLiveDeferredRefs(*active->meta, active->frame_base, visit);
+    }
+  }
+  _Py_FOR_EACH_TSTATE_END(interp);
+  return 0;
+}
+#endif
 
 #if PY_VERSION_HEX < 0x030E0000
 
