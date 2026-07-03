@@ -429,6 +429,18 @@ _PyCode_CreateLineArray(PyCodeObject *co)
 
 // ==== verbatim from Objects/genobject.c (v3.11.6) ===================
 
+typedef struct _PyAsyncGenWrappedValue {
+    PyObject_HEAD
+    PyObject *agw_val;
+} _PyAsyncGenWrappedValue;
+
+static struct _Py_async_gen_state *
+get_async_gen_state(void)
+{
+    PyInterpreterState *interp = _PyInterpreterState_GET();
+    return &interp->async_gen;
+}
+
 static PyObject *
 make_gen(PyTypeObject *type, PyFunctionObject *func)
 {
@@ -525,6 +537,40 @@ _Py_MakeCoro(PyFunctionObject *func)
         }
     }
     return coro;
+}
+
+PyObject *
+_PyAsyncGenValueWrapperNew(PyObject *val)
+{
+    _PyAsyncGenWrappedValue *o;
+    assert(val);
+
+#if _PyAsyncGen_MAXFREELIST > 0
+    struct _Py_async_gen_state *state = get_async_gen_state();
+#ifdef Py_DEBUG
+    // _PyAsyncGenValueWrapperNew() must not be called after _PyAsyncGen_Fini()
+    assert(state->value_numfree != -1);
+#endif
+    if (state->value_numfree) {
+        state->value_numfree--;
+        o = state->value_freelist[state->value_numfree];
+        OBJECT_STAT_INC(from_freelist);
+        assert(_PyAsyncGenWrappedValue_CheckExact(o));
+        _Py_NewReference((PyObject*)o);
+    }
+    else
+#endif
+    {
+        o = PyObject_GC_New(_PyAsyncGenWrappedValue,
+                            &_PyAsyncGenWrappedValue_Type);
+        if (o == NULL) {
+            return NULL;
+        }
+    }
+    o->agw_val = val;
+    Py_INCREF(val);
+    _PyObject_GC_TRACK((PyObject*)o);
+    return (PyObject*)o;
 }
 
 // ==== verbatim from Objects/exceptions.c (v3.11.6) ===================

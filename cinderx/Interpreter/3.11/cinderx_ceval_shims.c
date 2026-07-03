@@ -229,12 +229,8 @@ void _PyThread_cond_after(long long us, struct timespec* abs) {
 
 // ---------------------------------------------------------------------------
 // Aliases for helpers already mirrored in UpstreamBorrow's 3.11 fallback.
-
-extern PyObject* Cix_PyAsyncGenValueWrapperNew(PyObject* value);
-
-PyObject* _PyAsyncGenValueWrapperNew(PyObject* value) {
-  return Cix_PyAsyncGenValueWrapperNew(value);
-}
+// (_PyAsyncGenValueWrapperNew comes verbatim via the extras generator; the
+// fallback's NotImplementedError stub is no longer referenced from here.)
 
 extern void Cix_PyThreadState_PopFrame(
     PyThreadState* tstate,

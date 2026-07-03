@@ -53,7 +53,14 @@ SYMBOLS: list[tuple[str, list[str]]] = [
     ),
     (
         "Objects/genobject.c",
-        ["make_gen", "compute_cr_origin", "_Py_MakeCoro"],
+        [
+            "typedef:_PyAsyncGenWrappedValue",
+            "get_async_gen_state",
+            "make_gen",
+            "compute_cr_origin",
+            "_Py_MakeCoro",
+            "_PyAsyncGenValueWrapperNew",
+        ],
     ),
     (
         "Objects/exceptions.c",
