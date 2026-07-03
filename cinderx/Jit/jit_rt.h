@@ -206,11 +206,16 @@ PyObject* JITRT_Vectorcall(
     PyObject* kwnames);
 
 /*
- * Performs a vectorcall to an exact Python function. This has the same calling
- * convention as JITRT_VectorcallTstate but skips the generic callable dispatch.
+ * Performs a vectorcall to an exact Python function, skipping the generic
+ * callable dispatch.
+ *
+ * IMPORTANT: this is a drop-in replacement for _PyObject_Vectorcall at LIR
+ * call sites (3.11, where that symbol does not exist), so it must keep
+ * _PyObject_Vectorcall's exact 4-argument signature. An extra leading
+ * PyThreadState* parameter shifts every argument register at the emitted
+ * call site and sends control through stack garbage (see M4-log).
  */
 PyObject* JITRT_VectorcallPythonFunction(
-    PyThreadState* tstate,
     PyObject* callable,
     PyObject* const* args,
     size_t nargsf,
