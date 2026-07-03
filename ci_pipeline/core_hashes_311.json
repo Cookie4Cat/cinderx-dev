@@ -1,0 +1,18 @@
+{
+  "comment": "Locked hashes for the CPython 3.11 vendored/generated core set. Regenerate with verify_core_hashes.py --generate; the diff of this file is what reviewers approve.",
+  "files": {
+    "cinderx/Interpreter/3.11/cinder_opcode.h": "0f3fb4523195076b3aebe0f68dc489d6438e25df93681f76786cf559400f11cc",
+    "cinderx/Interpreter/3.11/cinder_opcode_ids.h": "f7a9ab46a5c1f5e06f299e241c2e808bf6e2431c1b882270798152c12bbcbb77",
+    "cinderx/Interpreter/3.11/cinder_opcode_metadata.h": "1bc8f9266497855a96da5f217da1226698a69aa8783d4fdc763aa315afdaa8c5",
+    "cinderx/Interpreter/3.11/cinderx_opcode_targets.h": "ea30f843dffbd4cf79feb3407838a5fe8a24a8af0ed891b667603050656d5161",
+    "cinderx/Interpreter/3.11/interpreter.c": "047a70d6bdb33ae6eef5d7af4d88a9e8b32ac1ef8978594fa58062029799acea",
+    "cinderx/PythonLib/opcodes/3.11/opcode.py": "ee10cdee637396c2a5d15aef53232cfa5792bd96fd2ae6356661a2ba14ccfd72",
+    "cinderx/UpstreamBorrow/borrowed-3.11-fallback.c": "a3bcc4fd9ee4f0fb8a6956c21ec2cbfc85b2591415ee6ef15961ab3215ce999d"
+  },
+  "generated_utc": "2026-07-03T16:17:31+00:00",
+  "patterns": [
+    "cinderx/Interpreter/3.11/**/*",
+    "cinderx/PythonLib/opcodes/3.11/opcode.py",
+    "cinderx/UpstreamBorrow/borrowed-3.11-fallback.c"
+  ]
+}
