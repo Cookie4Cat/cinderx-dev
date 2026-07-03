@@ -50,6 +50,12 @@
 #include <vector>
 
 using namespace asmjit;
+#if PY_VERSION_HEX < 0x030C0000
+// The vendored v3.11.6 eval loop (Interpreter/3.11/cinderx_ceval.c).
+extern "C" PyObject* Ci_EvalFrameDefault_311(
+    PyThreadState*, _PyInterpreterFrame*, int);
+#endif
+
 using namespace jit;
 using namespace jit::hir;
 using namespace jit::lir;
@@ -368,12 +374,14 @@ PyObject* resumeInInterpreter(
 #if PY_VERSION_HEX >= 0x030C0000
     result = _PyEval_EvalFrame(tstate, frame, err_occurred);
 #else
-    // 3.11's CinderX frame evaluator is only a scheduling shim around the
-    // stock interpreter. When a JIT guard deopts with an active exception, the
-    // reified frame must resume directly in CPython's exception-table logic;
-    // re-entering the scheduling shim can leave a caught exception as a NULL
-    // return without an active Python error.
-    result = _PyEval_EvalFrameDefault(tstate, frame, err_occurred);
+    // Resume the deopted frame directly in the eval loop, bypassing
+    // Ci_EvalFrame's scheduling logic: a guard deopt with an active
+    // exception must land straight in the exception-table handling.
+    // M2 note: resume in the *vendored* v3.11.6 loop, not libpython's
+    // _PyEval_EvalFrameDefault, so all bytecode execution stays in one
+    // loop (single micro-version semantics, future instrumentation
+    // points see deopted frames too).
+    result = Ci_EvalFrameDefault_311(tstate, frame, err_occurred);
 #endif
 
     // If exception occurred before RETURN_GENERATOR, the generator was never
