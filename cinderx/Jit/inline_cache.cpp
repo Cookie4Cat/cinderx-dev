@@ -333,7 +333,7 @@ int SplitMutator::setAttrKnownOffset(
   return 0;
 }
 
-#else
+#elif PY_VERSION_HEX >= 0x030C0000
 
 int SplitMutator::setAttr(PyObject* obj, PyObject* name, PyObject* value) {
   PyDictOrValues dorv = *_PyObject_DictOrValuesPointer(obj);
@@ -440,6 +440,17 @@ PyObject* SplitMutator::getAttr(PyObject* obj, PyObject* name) {
   Py_INCREF(result);
   return result;
 }
+#else
+
+// 3.11：无 split-values 快路径，回退通用属性协议（慢但正确，门禁裁决行为）
+int SplitMutator::setAttr(PyObject* obj, PyObject* name, PyObject* value) {
+  return PyObject_SetAttr(obj, name, value);
+}
+
+PyObject* SplitMutator::getAttr(PyObject* obj, PyObject* name) {
+  return PyObject_GetAttr(obj, name);
+}
+
 #endif // PY_VERSION_HEX < 0x030E0000
 
 int CombinedMutator::setAttr(PyObject* obj, PyObject* name, PyObject* value) {
@@ -1094,7 +1105,7 @@ bool isValidKeysVersion(uint32_t keys_version, BorrowedRef<> obj) {
     }
     return dict->ma_keys->dk_version == keys_version;
   }
-#else
+#elif PY_VERSION_HEX >= 0x030C0000
   PyTypeObject* tp = Py_TYPE(obj);
   if (PyType_HasFeature(tp, Py_TPFLAGS_MANAGED_DICT)) {
     PyDictOrValues dorv = *_PyObject_DictOrValuesPointer(obj);

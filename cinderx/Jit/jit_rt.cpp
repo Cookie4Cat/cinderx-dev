@@ -580,7 +580,7 @@ static PyThreadState* allocate_and_link_interpreter_frame(
   JIT_DCHECK(tstate != nullptr, "thread state cannot be null");
 
   _PyInterpreterFrame* frame =
-      Cix_PyThreadState_PushFrame(tstate, co->co_framesize);
+      Cix_PyThreadState_PushFrame(tstate, frameSlotsForCodeObject(co));
   JIT_CHECK(frame != nullptr, "Failed to allocate _PyInterpreterFrame");
 
   init_and_link_interpreter_frame(
@@ -951,7 +951,12 @@ static bool handle_periodic_activities_on_call(
     PyObject* callable) {
   JITRT_AtQuiescentState(tstate);
   return res != nullptr && !PyFunction_Check(callable) &&
-      is_eval_breaker_set(tstate) && _Py_HandlePending(tstate) != 0;
+      is_eval_breaker_set(tstate) &&
+#if PY_VERSION_HEX < 0x030C0000
+      Py_MakePendingCalls() != 0;
+#else
+      _Py_HandlePending(tstate) != 0;
+#endif
 }
 
 PyObject*
@@ -1173,12 +1178,18 @@ static inline PyObject* super_lookup_method_or_attr(
     }
     return result;
   }
+#if PY_VERSION_HEX < 0x030C0000
+  // Unreachable while the 3.11 frontend is not implemented; the real
+  // super-lookup support lands with the call-path milestone.
+  JIT_ABORT("super lookup helper not available on 3.11");
+#else
   // Check Py_TYPE(self) because in a class method super call
   // self can be a type. https://github.com/python/cpython/pull/106977
   if (Py_TYPE(self)->tp_getattro != PyObject_GenericGetAttr) {
     meth_found = nullptr;
   }
   return _PySuper_Lookup(type, self, name, meth_found);
+#endif
 }
 
 LoadMethodResult JITRT_GetMethodFromSuper(
@@ -2336,6 +2347,8 @@ PyObject JITRT_IterDoneSentinel = {
 #endif
 // clang-format on
 
+#elif PY_VERSION_HEX < 0x030C0000
+    1,
 #else
     {.ob_refcnt = _Py_IMMORTAL_REFCNT},
 #endif

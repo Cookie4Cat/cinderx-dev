@@ -660,6 +660,9 @@ std::optional<TreeIterMatch> TreeIterStateMachinePass::matchTreeIter(
     proof.field_name = lf->name();
     proof.name_idx = tupleNameIndex(func.code->co_names, lf->name().c_str());
     proof.value_offset = static_cast<intptr_t>(lf->offset());
+#if PY_VERSION_HEX >= 0x030D0000
+    // 3.13+ 内联 values 布局；3.11 无 Py_TPFLAGS_INLINE_VALUES/valid 字段，
+    // 维持 kSlotOrMember 分类即可。
     if (node_pytype != nullptr &&
         PyType_HasFeature(
             node_pytype,
@@ -672,6 +675,7 @@ std::optional<TreeIterMatch> TreeIterStateMachinePass::matchTreeIter(
             node_pytype->tp_basicsize + offsetof(PyDictValues, valid);
       }
     }
+#endif
     // guard_source, layout_dependency, and fallback_shape are left at defaults
     // (production stubs).
     proof.runtime_failure_action = RuntimeFailureAction::kExperimentalFailClosed;

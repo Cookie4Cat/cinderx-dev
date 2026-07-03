@@ -3102,6 +3102,7 @@ void HIRBuilder::emitLoadAttr(
         break;
       }
 #ifndef Py_GIL_DISABLED
+#if PY_VERSION_HEX >= 0x030E0000
       case LOAD_ATTR_SLOT: {
         if (!slot_fast_path_enabled) {
           break;
@@ -3199,6 +3200,7 @@ void HIRBuilder::emitLoadAttr(
         }
         return;
       }
+#endif
 #endif
 #if PY_VERSION_HEX >= 0x030E0000
       case LOAD_ATTR_METHOD_WITH_VALUES: {
@@ -4278,6 +4280,7 @@ void HIRBuilder::emitStoreAttr(
   Register* receiver = tc.frame.stack.pop();
   Register* value = tc.frame.stack.pop();
 #ifndef Py_GIL_DISABLED
+#if PY_VERSION_HEX >= 0x030E0000
   if (getConfig().specialized_opcodes &&
       bc_instr.specializedOpcode() == STORE_ATTR_SLOT) {
     // STORE_ATTR oparg is always the co_names index; unlike LOAD_ATTR it does
@@ -4314,6 +4317,7 @@ void HIRBuilder::emitStoreAttr(
         previous);
     return;
   }
+#endif
 #endif
   tc.emit<StoreAttr>(receiver, value, bc_instr.oparg(), tc.frame);
 }

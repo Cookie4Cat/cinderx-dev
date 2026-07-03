@@ -5,9 +5,11 @@
 #include "cinderx/UpstreamBorrow/borrowed.h" // @donotremove
 
 #include "internal/pycore_frame.h"
-#include "internal/pycore_interpframe.h"
 #include "internal/pycore_pystate.h"
+#if PY_VERSION_HEX >= 0x030E0000
+#include "internal/pycore_interpframe.h"
 #include "internal/pycore_stackref.h"
+#endif
 
 #include "cinderx/Common/code.h"
 #include "cinderx/Jit/bytecode.h"
@@ -92,6 +94,12 @@ void clearBackedgeCounters(BackedgeCounters* counters) {
 void popCurrentFrameForTestHook(
     PyThreadState* tstate,
     _PyInterpreterFrame* frame) {
+#if PY_VERSION_HEX < 0x030E0000
+  // 3.11 无 OSR（设计范围外），测试钩子无需操作
+  (void)tstate;
+  (void)frame;
+  return;
+#else
   if (tstate == nullptr || frame == nullptr || tstate->current_frame != frame ||
       frame->owner == FRAME_OWNED_BY_INTERPRETER) {
     return;
@@ -101,6 +109,7 @@ void popCurrentFrameForTestHook(
   jit::jitFrameClearExceptCode(frame);
   PyStackRef_CLEAR(frame->f_executable);
   Cix_PyThreadState_PopFrame(tstate, frame);
+#endif
 }
 
 // ---------------------------------------------------------------------------
@@ -301,6 +310,9 @@ bool isOSREligible(
   if (frame->frame_obj != nullptr) {
     return false;
   }
+#if PY_VERSION_HEX < 0x030E0000
+  return false;  // 3.11 无 OSR
+#else
   if (!PyStackRef_FunctionCheck(frame->f_funcobj)) {
     return false;
   }
@@ -308,6 +320,7 @@ bool isOSREligible(
     return false;
   }
   return true;
+#endif
 }
 
 void resetOSRState(PyCodeObject* code) {
@@ -397,6 +410,10 @@ int performOSR(
     const OSRMetadata* osr_meta,
     const CompiledFunction* compiled,
     PyObject** out_result) {
+#if PY_VERSION_HEX < 0x030E0000
+  (void)tstate; (void)frame; (void)osr_meta; (void)compiled; (void)out_result;
+  return -1;  // 3.11 无 OSR
+#else
   JIT_DCHECK(out_result != nullptr, "performOSR: out_result is null");
   JIT_DCHECK(
       tstate->current_frame == frame,
@@ -504,6 +521,7 @@ extern "C" {
 
 Ci_BackedgeCounters* Ci_OSR_GetBackedgeCounters(PyCodeObject* code) {
   return asCiBackedgeCounters(jit::getBackedgeCounters(code));
+#endif
 }
 
 Ci_BackedgeCounters* Ci_OSR_GetOrCreateBackedgeCounters(PyCodeObject* code) {
@@ -565,6 +583,12 @@ int Ci_OSR_TryOSR(
     _Py_CODEUNIT* this_instr,
     uint32_t oparg,
     PyObject** out_result) {
+#if PY_VERSION_HEX < 0x030E0000
+  // 3.11 无 OSR（设计范围外）
+  (void)tstate; (void)frame; (void)this_instr; (void)oparg;
+  (void)out_result;
+  return 0;
+#else
   // Test hook: if installed, delegate and handle frame cleanup on non-zero rc
   if (g_try_osr_hook.hook != nullptr) {
     int rc = g_try_osr_hook.hook(
@@ -695,6 +719,7 @@ cache_lookup:;
   }
 
   return jit::performOSR(tstate, frame, osr, compiled.get(), out_result);
+#endif
 }
 
 void Ci_OSR_ResetState(PyCodeObject* code) {

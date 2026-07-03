@@ -1032,6 +1032,7 @@ int _cinderx_exec_impl(PyObject* m) {
   }
   state->builtin_next = Ref<>::create(next);
 
+#if PY_VERSION_HEX >= 0x030C0000
   auto async_lazy_value = new (std::nothrow) cinderx::AsyncLazyValueState();
   if (async_lazy_value == nullptr) {
     return -1;
@@ -1041,6 +1042,7 @@ int _cinderx_exec_impl(PyObject* m) {
   }
 
   state->async_lazy_value.reset(async_lazy_value);
+#endif
 
   PyTypeObject* gen_type = (PyTypeObject*)PyType_FromSpec(&jit::JitGen_Spec);
   if (gen_type == nullptr) {
@@ -1091,11 +1093,15 @@ int _cinderx_exec_impl(PyObject* m) {
   }
   state->anext_awaitable_type = Ref<PyTypeObject>::steal(anext_awaitable_type);
 
+#if PY_VERSION_HEX >= 0x030C0000
+  // The JIT-generator-aware anext replacement is only registered on 3.12+
+  // (matching the method-table guard); 3.11 keeps the stock builtin.
   auto anext_func = Ref<>::steal(PyObject_GetAttrString(m, "anext"));
   if (anext_func == nullptr ||
       PyObject_SetAttrString(builtins_mod, "anext", anext_func) < 0) {
     return -1;
   }
+#endif
 
 #if PY_VERSION_HEX >= 0x030E0000 && defined(ENABLE_PARALLEL_GC)
   Ref<> gc_mod = Ref<>::steal(PyImport_ImportModule("gc"));
@@ -1186,8 +1192,10 @@ int _cinderx_exec_impl(PyObject* m) {
   ADDITEM("cached_property_with_descr", &PyCachedPropertyWithDescr_Type);
   ADDITEM("async_cached_property", &PyAsyncCachedProperty_Type);
   ADDITEM("async_cached_classproperty", &PyAsyncCachedClassProperty_Type);
+#if PY_VERSION_HEX >= 0x030C0000
   ADDITEM("AsyncLazyValue", async_lazy_value->asyncLazyValueType());
   ADDITEM("AwaitableValue", async_lazy_value->awaitableValueType());
+#endif
 
 #undef ADDITEM
 
@@ -1292,7 +1300,9 @@ int _cinderx_exec(PyObject* m) {
 
 PyModuleDef_Slot _cinderx_slots[] = {
     {Py_mod_exec, reinterpret_cast<void*>(_cinderx_exec)},
+#if PY_VERSION_HEX >= 0x030C0000
     {Py_mod_multiple_interpreters, Py_MOD_MULTIPLE_INTERPRETERS_NOT_SUPPORTED},
+#endif
 #if PY_VERSION_HEX >= 0x030E0000
     {Py_mod_gil, Py_MOD_GIL_NOT_USED},
 #endif

@@ -154,7 +154,9 @@ struct Config {
   bool stable_frame{true};
   // Use inline caches for attribute accesses.
   bool attr_caches{
-#ifdef Py_GIL_DISABLED
+#if PY_VERSION_HEX < 0x030B0000
+      false
+#elif defined(Py_GIL_DISABLED)
       // TODO(T250369692): FT support for inline-caches.
       false
 #else

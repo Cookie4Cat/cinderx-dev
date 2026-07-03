@@ -441,6 +441,9 @@ void jitFramePopulateFrame([[maybe_unused]] _PyInterpreterFrame* frame) {
 #else
   frame->stacktop = code->co_nlocalsplus;
 #endif
+#if PY_VERSION_HEX < 0x030C0000
+  frame->frame_obj = nullptr;
+#else
   // Preserve an already-materialized frame object. Stock CPython 3.14 can
   // create it directly from f_executable without going through Cinder's
   // reifier hook, and deopt needs to keep it attached so slab migration updates
@@ -449,6 +452,7 @@ void jitFramePopulateFrame([[maybe_unused]] _PyInterpreterFrame* frame) {
   if (!(code->co_flags & kCoFlagsAnyGenerator)) {
     frame->owner = FRAME_OWNED_BY_THREAD;
   }
+#endif
   int free_offset = code->co_nlocalsplus - numFreevars(code);
   Ci_STACK_TYPE* localsplus = &frame->localsplus[0];
   for (std::size_t i = 0; i < free_offset; i++) {
@@ -502,7 +506,7 @@ _PyInterpreterFrame* convertInterpreterFrameFromStackToSlab(
     _PyInterpreterFrame* frame) {
   PyCodeObject* code = _PyFrame_GetCode(frame);
   _PyInterpreterFrame* new_frame =
-      _PyThreadState_PushFrame(tstate, code->co_framesize);
+      Cix_PyThreadState_PushFrame(tstate, frameSlotsForCodeObject(code));
   if (new_frame == nullptr) {
     return nullptr;
   }
@@ -510,7 +514,7 @@ _PyInterpreterFrame* convertInterpreterFrameFromStackToSlab(
   jitFramePopulateFrame(frame);
   jitFrameRemoveReifier(frame);
 
-  memcpy(new_frame, frame, code->co_framesize * sizeof(PyObject*));
+  memcpy(new_frame, frame, frameSlotsForCodeObject(code) * sizeof(PyObject*));
 
   if (new_frame->frame_obj != nullptr) {
     new_frame->frame_obj->f_frame = new_frame;
@@ -653,13 +657,20 @@ void jitFrameInitNormal(
       code,
       null_locals_from,
       previous);
-#else
+#elif PY_VERSION_HEX >= 0x030C0000
   _PyFrame_Initialize(
       frame,
       (PyFunctionObject*)Py_NewRef(func),
       nullptr,
       code,
       null_locals_from);
+  frame->previous = previous;
+#else
+  _PyFrame_InitializeSpecials(
+      frame, (PyFunctionObject*)Py_NewRef(func), nullptr, code->co_nlocalsplus);
+  for (int i = null_locals_from; i < code->co_nlocalsplus; i++) {
+    frame->localsplus[i] = nullptr;
+  }
   frame->previous = previous;
 #endif
   // We must set `frame->owner` after calling `_PyFrame_Initialize`;
