@@ -1165,8 +1165,37 @@ Register* simplifyInPlaceOp(Env& env, const InPlaceOp* instr) {
   Register* lhs = instr->left();
   Register* rhs = instr->right();
   if (lhs->isA(TLongExact) && rhs->isA(TLongExact)) {
-    // All binary ops on TLong's return mutable so can be freely simplified with
-    // no explicit check.
+    std::optional<BinaryOpKind> compact_op;
+    switch (instr->op()) {
+      case InPlaceOpKind::kAdd:
+        compact_op = BinaryOpKind::kAdd;
+        break;
+      case InPlaceOpKind::kSubtract:
+        compact_op = BinaryOpKind::kSubtract;
+        break;
+      default:
+        break;
+    }
+
+    auto frame_state_size =
+        instr->frameState()->localsplus.size() + instr->frameState()->stack.size();
+    if (compact_op.has_value() && frame_state_size <= 8) {
+      env.emit<UseType>(lhs, TLongExact);
+      env.emit<UseType>(rhs, TLongExact);
+      Register* is_lhs_compact = env.emit<IsCompactLong>(lhs);
+      Register* is_rhs_compact = env.emit<IsCompactLong>(rhs);
+      Register* both_compact = env.emit<IntBinaryOp>(
+          BinaryOpKind::kAnd, is_lhs_compact, is_rhs_compact);
+      auto guard = env.emitInstr<Guard>(both_compact);
+      guard->setFrameState(*instr->frameState());
+      Register* unboxed_lhs = env.emit<CompactLongUnbox>(lhs);
+      Register* unboxed_rhs = env.emit<CompactLongUnbox>(rhs);
+      Register* result =
+          env.emit<IntBinaryOp>(*compact_op, unboxed_lhs, unboxed_rhs);
+      return env.emit<PrimitiveBox>(result, TCInt64, *instr->frameState());
+    }
+
+    // Remaining exact-int inplace ops still use the generic long helper path.
     switch (instr->op()) {
       case InPlaceOpKind::kAdd:
       case InPlaceOpKind::kAnd:
@@ -1633,7 +1662,19 @@ Register* simplifyLoadAttrSplitDict(
   patchpoint->setDescr("split dict type modified");
   env.emit<UseType>(receiver, receiver->type());
 
-  // PyDictOrValues is stored at -3 per _PyObject_DictOrValuesPointer
+#if PY_VERSION_HEX < 0x030C0000
+  // CPython 3.11 stores the inline values pointer in a separate pre-header slot
+  // from the managed dict pointer.  If values is null the instance dict has been
+  // materialized, so deopt to the generic LOAD_ATTR path instead of treating the
+  // dict pointer as tagged values.
+  Register* values = env.emit<LoadField>(
+      receiver, "__dict_values__", -4 * sizeof(PyObject*), TCUInt64);
+  auto guard = env.emitInstr<Guard>(values);
+  guard->setGuiltyReg(receiver);
+  guard->setDescr("dict values check");
+  Register* values_obj = env.emit<BitCast>(values, TOptObject);
+#else
+  // PyDictOrValues is stored at -3 per _PyObject_DictOrValuesPointer.
   Register* obj_dict = env.emit<LoadField>(
       receiver, "__dict__", -3 * sizeof(PyObject*), TOptDict);
   // We pass the attribute's name to this CheckField (not "__dict__") because
@@ -1652,6 +1693,7 @@ Register* simplifyLoadAttrSplitDict(
   guard->setDescr("dict values check");
   Register* values = env.emit<IntBinaryOp>(BinaryOpKind::kAdd, dict_ptr, one);
   Register* values_obj = env.emit<BitCast>(values, TOptObject);
+#endif
   Register* attr = env.emit<LoadField>(
       values_obj, "attr", attr_idx * sizeof(PyObject*), TOptObject);
 
@@ -2068,8 +2110,12 @@ static bool isBuiltin(Register* callable, const char* name) {
 static Register* resolveArgs(
     Env& env,
     const VectorCall* instr,
-    BorrowedRef<PyFunctionObject> target) {
+    BorrowedRef<PyFunctionObject> target,
+    Register* resolved_func = nullptr) {
   BorrowedRef<PyCodeObject> code{target->func_code};
+  if (resolved_func == nullptr) {
+    resolved_func = instr->func();
+  }
   JIT_CHECK(!(code->co_flags & CO_VARARGS), "can't resolve varargs");
   // number of positional args (including args with default values)
   size_t co_argcount = static_cast<size_t>(code->co_argcount);
@@ -2113,11 +2159,12 @@ static Register* resolveArgs(
   }
 
   Register* defaults_obj = env.emit<LoadField>(
-      instr->GetOperand(0),
+      resolved_func,
       "func_defaults",
       offsetof(PyFunctionObject, func_defaults),
       TTuple);
   env.emit<GuardIs>(defaults, defaults_obj);
+
   // creates an instruction VectorCall(arg_size, dest_reg, frame_state)
   // and inserts it to the current block. Returns the output of vectorcall
   auto new_instr = env.emitRawInstr<VectorCall>(
@@ -2129,7 +2176,7 @@ static Register* resolveArgs(
 
   // populate the call arguments of the newly created VectorCall
   // the first arg is the function to call
-  new_instr->SetOperand(0, instr->func());
+  new_instr->SetOperand(0, resolved_func);
   for (size_t i = 0; i < resolved_args.size(); i++) {
     new_instr->SetOperand(i + 1, resolved_args.at(i));
   }
@@ -2137,9 +2184,101 @@ static Register* resolveArgs(
   return result;
 }
 
+static bool canResolveArgs(
+    const VectorCall* instr,
+    BorrowedRef<PyFunctionObject> target) {
+  BorrowedRef<PyCodeObject> code{target->func_code};
+  size_t co_argcount = static_cast<size_t>(code->co_argcount);
+  if (instr->numArgs() > co_argcount) {
+    return false;
+  }
+
+  size_t num_positional = std::min(co_argcount, instr->numArgs());
+  BorrowedRef<PyTupleObject> defaults{target->func_defaults};
+  size_t num_defaults =
+      defaults == nullptr ? 0 : static_cast<size_t>(PyTuple_GET_SIZE(defaults));
+  return num_positional + num_defaults >= co_argcount;
+}
+
+static BorrowedRef<PyFunctionObject> resolveLoadGlobalFuncTarget(
+    Env& env,
+    const LoadGlobal* instr) {
+  if (env.func.code == nullptr || env.func.globals == nullptr ||
+      env.func.builtins == nullptr) {
+    return nullptr;
+  }
+
+  BorrowedRef<PyCodeObject> code{env.func.code};
+  int name_idx = instr->name_idx();
+  if (name_idx < 0 || name_idx >= PyTuple_GET_SIZE(code->co_names)) {
+    return nullptr;
+  }
+
+  BorrowedRef<> name = PyTuple_GET_ITEM(code->co_names, name_idx);
+  JIT_CHECK(name != nullptr, "LOAD_GLOBAL name cannot be null");
+
+  ThreadedCompileSerialize guard;
+  PyObject* target = PyDict_GetItemWithError(
+      reinterpret_cast<PyObject*>(env.func.globals.get()), name);
+  if (target == nullptr && !PyErr_Occurred()) {
+    target = PyDict_GetItemWithError(
+        reinterpret_cast<PyObject*>(env.func.builtins.get()), name);
+  }
+  if (PyErr_Occurred()) {
+    PyErr_Clear();
+    return nullptr;
+  }
+  if (target == nullptr || !PyFunction_Check(target)) {
+    return nullptr;
+  }
+  return reinterpret_cast<PyFunctionObject*>(target);
+}
+
+static Register* resolveLoadGlobalFuncArgs(
+    Env& env,
+    const VectorCall* instr,
+    BorrowedRef<PyFunctionObject> target) {
+  Register* func = instr->func();
+  if (func->instr() == nullptr || !func->instr()->IsLoadGlobal()) {
+    return nullptr;
+  }
+
+  BorrowedRef<PyFunctionObject> current_target =
+      resolveLoadGlobalFuncTarget(env, static_cast<LoadGlobal*>(func->instr()));
+  if (current_target != target) {
+    return nullptr;
+  }
+  if (!canResolveArgs(instr, target)) {
+    return nullptr;
+  }
+
+  BorrowedRef<> kept_target = env.func.env.addReference(target);
+  auto guarded = env.emit<GuardIs>(kept_target, func);
+  return resolveArgs(env, instr, target, guarded);
+}
+
 Register* simplifyCallMethod(Env& env, const CallMethod* instr) {
-  // If this is statically known to be trying to call a function, update to
-  // using a VectorCall directly.
+  // If this is the guarded CPython 3.11 method-cache path, call the cached
+  // Python function directly with the pushed receiver. Do not apply this to
+  // ordinary LoadMethod results: polymorphic method sites may temporarily have
+  // a TFunc callable while still needing the generic CallMethod semantics.
+  Instr* func_instr = instr->func()->instr();
+  Type func_type = instr->func()->type();
+  if (func_instr != nullptr && func_instr->IsLoadConst() &&
+      func_type.hasObjectSpec() && PyFunction_Check(func_type.objectSpec()) &&
+      !(instr->self()->type() <= TNullptr)) {
+    auto call = env.emitRawInstr<VectorCall>(
+        instr->NumOperands(),
+        env.func.env.AllocateRegister(),
+        instr->flags(),
+        *instr->frameState());
+    for (size_t i = 0; i < instr->NumOperands(); ++i) {
+      call->SetOperand(i, instr->GetOperand(i));
+    }
+    call->output()->set_type(instr->output()->type());
+    return call->output();
+  }
+
   if constexpr (PY_VERSION_HEX >= 0x030E0000) {
     if (instr->self()->type() <= TNullptr) {
       auto call = env.emitRawInstr<VectorCall>(
@@ -2416,6 +2555,18 @@ Register* simplifyVectorCall(Env& env, const VectorCall* instr) {
         "argcount must be greater than or equal to zero");
     if (instr->numArgs() != static_cast<size_t>(code->co_argcount)) {
       return resolveArgs(env, instr, func);
+    }
+  } else if (target->instr() != nullptr && target->instr()->IsLoadGlobal()) {
+    if (auto func = resolveLoadGlobalFuncTarget(
+            env, static_cast<LoadGlobal*>(target->instr()))) {
+      BorrowedRef<PyCodeObject> code{func->func_code};
+      if (code->co_kwonlyargcount > 0 || (code->co_flags & CO_VARARGS) ||
+          (code->co_flags & CO_VARKEYWORDS)) {
+        return nullptr;
+      }
+      if (instr->numArgs() != static_cast<size_t>(code->co_argcount)) {
+        return resolveLoadGlobalFuncArgs(env, instr, func);
+      }
     }
   }
   return nullptr;

@@ -258,6 +258,18 @@ CodeExtra* codeExtraIfExists(PyCodeObject* code) {
   return reinterpret_cast<CodeExtra*>(data_ptr);
 }
 
+bool codeAutoJitDisabled(PyCodeObject* code) {
+  CodeExtra* extra = codeExtraIfExists(code);
+  return extra != nullptr && Ci_code_extra_auto_jit_disabled(extra);
+}
+
+void disableCodeAutoJit(PyCodeObject* code) {
+  CodeExtra* extra = codeExtra(code);
+  if (extra != nullptr) {
+    Ci_code_extra_disable_auto_jit(extra);
+  }
+}
+
 int numLocals(PyCodeObject* code) {
   return code->co_nlocals;
 }

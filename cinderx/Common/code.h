@@ -63,6 +63,13 @@ CodeExtra* codeExtra(PyCodeObject* code);
 // Unlike codeExtra(), this never allocates a CodeExtra.
 CodeExtra* codeExtraIfExists(PyCodeObject* code);
 
+// Return whether auto-JIT attempts have been suppressed for this code object.
+// This does not affect explicit force_compile() calls.
+bool codeAutoJitDisabled(PyCodeObject* code);
+
+// Suppress future auto-JIT scheduling for this code object.
+void disableCodeAutoJit(PyCodeObject* code);
+
 // Count the various frame variables that a code object will use.
 int numLocals(PyCodeObject* code);
 int numCellvars(PyCodeObject* code);

@@ -410,6 +410,79 @@ bool Preloader::canCacheGlobals() const {
   return hasOnlyUnicodeKeys(builtins_) && hasOnlyUnicodeKeys(globals_);
 }
 
+void Preloader::preloadMethodOwnerType() {
+  const std::string& name = fullname();
+  const std::size_t colon = name.find(':');
+  if (colon == std::string::npos || colon + 1 == name.size()) {
+    return;
+  }
+
+  std::string_view qualname{name};
+  qualname.remove_prefix(colon + 1);
+  if (qualname.find("<locals>") != std::string_view::npos) {
+    return;
+  }
+
+  const std::size_t dot = qualname.find('.');
+  if (dot == std::string_view::npos || dot == 0 ||
+      dot + 1 == qualname.size() ||
+      qualname.find('.', dot + 1) != std::string_view::npos) {
+    return;
+  }
+
+  std::string_view owner_name = qualname.substr(0, dot);
+  std::string_view method_name = qualname.substr(dot + 1);
+  auto owner_key = Ref<>::steal(
+      PyUnicode_FromStringAndSize(owner_name.data(), owner_name.size()));
+  if (owner_key == nullptr) {
+    PyErr_Clear();
+    return;
+  }
+
+  PyObject* owner = PyDict_GetItemWithError(globals_, owner_key);
+  if (owner == nullptr) {
+    if (PyErr_Occurred()) {
+      PyErr_Clear();
+    }
+    return;
+  }
+  if (!PyType_Check(owner)) {
+    return;
+  }
+
+  auto method_key = Ref<>::steal(
+      PyUnicode_FromStringAndSize(method_name.data(), method_name.size()));
+  if (method_key == nullptr) {
+    PyErr_Clear();
+    return;
+  }
+
+  auto owner_type = reinterpret_cast<PyTypeObject*>(owner);
+  if (owner_type->tp_dict == nullptr) {
+    return;
+  }
+
+  PyObject* descr = PyDict_GetItemWithError(owner_type->tp_dict, method_key);
+  if (descr == nullptr) {
+    if (PyErr_Occurred()) {
+      PyErr_Clear();
+    }
+    return;
+  }
+  if (!PyFunction_Check(descr)) {
+    return;
+  }
+  auto func = reinterpret_cast<PyFunctionObject*>(descr);
+  if (func->func_code != code_) {
+    return;
+  }
+
+  method_owner_type_ = {
+      Ref<PyTypeObject>::create(owner_type),
+      false,
+      true};
+}
+
 BorrowedRef<> Preloader::global(int name_idx) const {
   BorrowedRef<> name = map_get(global_names_, name_idx, nullptr);
   if (name != nullptr && canCacheGlobals()) {
@@ -454,6 +527,7 @@ bool Preloader::preload() {
   if (!is_static) {
     inferred_self_type_ = infer_method_self_type_candidate(code_, globals_);
   }
+  preloadMethodOwnerType();
 
   jit::BytecodeInstructionBlock bc_instrs{code_};
   for (auto bc_instr : bc_instrs) {

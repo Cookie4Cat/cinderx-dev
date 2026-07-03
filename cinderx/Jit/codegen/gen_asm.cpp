@@ -365,7 +365,16 @@ PyObject* resumeInInterpreter(
 
     setupTraceForDeoptedFrame(frame, tstate);
 
+#if PY_VERSION_HEX >= 0x030C0000
     result = _PyEval_EvalFrame(tstate, frame, err_occurred);
+#else
+    // 3.11's CinderX frame evaluator is only a scheduling shim around the
+    // stock interpreter. When a JIT guard deopts with an active exception, the
+    // reified frame must resume directly in CPython's exception-table logic;
+    // re-entering the scheduling shim can leave a caught exception as a NULL
+    // return without an active Python error.
+    result = _PyEval_EvalFrameDefault(tstate, frame, err_occurred);
+#endif
 
     // If exception occurred before RETURN_GENERATOR, the generator was never
     // returned to anyone. The JIT created the generator early, but the caller

@@ -55,7 +55,11 @@ typedef struct CodeExtra {
   uint32_t roi_deopt_count;
   uint32_t roi_ctl;
   uint64_t roi_recompile_floor;
+  // Miscellaneous flags for code-level JIT bookkeeping.
+  uint64_t flags;
 } CodeExtra;
+
+#define CI_CODE_EXTRA_AUTO_JIT_DISABLED 1
 
 // Thread-safe accessors for CodeExtra::calls.
 // Under FT-Python, these use atomics to avoid data races.
@@ -136,6 +140,18 @@ static inline void Ci_code_extra_store_roi_recompile_floor_release(
   __atomic_store_n(&extra->roi_recompile_floor, floor, __ATOMIC_RELEASE);
 }
 
+static inline int Ci_code_extra_auto_jit_disabled(const CodeExtra* extra) {
+  return (
+      _Py_atomic_load_uint64_relaxed(&extra->flags) &
+      CI_CODE_EXTRA_AUTO_JIT_DISABLED) != 0;
+}
+
+static inline void Ci_code_extra_disable_auto_jit(CodeExtra* extra) {
+  uint64_t flags = _Py_atomic_load_uint64_relaxed(&extra->flags);
+  _Py_atomic_store_uint64_relaxed(
+      &extra->flags, flags | CI_CODE_EXTRA_AUTO_JIT_DISABLED);
+}
+
 #else
 
 static inline void Ci_code_extra_incr_calls(CodeExtra* extra) {
@@ -207,6 +223,14 @@ static inline void Ci_code_extra_store_roi_recompile_floor_release(
     CodeExtra* extra,
     uint64_t floor) {
   extra->roi_recompile_floor = floor;
+}
+
+static inline int Ci_code_extra_auto_jit_disabled(const CodeExtra* extra) {
+  return (extra->flags & CI_CODE_EXTRA_AUTO_JIT_DISABLED) != 0;
+}
+
+static inline void Ci_code_extra_disable_auto_jit(CodeExtra* extra) {
+  extra->flags |= CI_CODE_EXTRA_AUTO_JIT_DISABLED;
 }
 
 #endif
