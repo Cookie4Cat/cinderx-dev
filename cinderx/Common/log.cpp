@@ -2,14 +2,46 @@
 
 #include "cinderx/Common/log.h"
 
+#include <stdexcept>
+
 #include "cinderx/Jit/threaded_compile.h"
 
 namespace jit {
 
+
+namespace {
+// Trim file paths to be rooted at "cinderx/" for cleaner log output.
+std::string_view trimSourcePath(std::string_view path) {
+  constexpr std::string_view pattern = "cinderx/";
+  size_t pos = path.rfind(pattern);
+  return pos == std::string_view::npos ? path : path.substr(pos);
+}
+} // namespace
+
+[[noreturn]] JIT_COLD void throwImplV(
+    std::string_view file,
+    int line,
+    fmt::string_view format,
+    fmt::format_args args) {
+  std::string msg = fmt::format("{}:{} ", trimSourcePath(file), line);
+  fmt::vformat_to(std::back_inserter(msg), format, args);
+  throw std::runtime_error{msg};
+}
+
 void printPythonException() {
   if (PyErr_Occurred()) {
+#if PY_VERSION_HEX < 0x030C0000
+    PyObject *type, *value, *traceback;
+    PyErr_Fetch(&type, &value, &traceback);
+    PyErr_NormalizeException(&type, &value, &traceback);
+    PyErr_Display(type, value, traceback);
+    Py_XDECREF(type);
+    Py_XDECREF(value);
+    Py_XDECREF(traceback);
+#else
     auto exc = Ref<>::steal(PyErr_GetRaisedException());
     PyErr_DisplayException(exc);
+#endif
   }
 }
 

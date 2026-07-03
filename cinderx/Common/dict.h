@@ -23,11 +23,19 @@ extern "C" {
 #include "internal/pycore_dict.h"
 
 static inline PyObject* getBorrowedTypeDict(PyTypeObject* self) {
+#if PY_VERSION_HEX < 0x030C0000
+  return self->tp_dict;
+#else
   return _PyType_GetDict(self);
+#endif
 }
 
+#if PY_VERSION_HEX < 0x030C0000
+#define _PyDict_NotifyEvent(EVENT, MP, KEY, VAL) DICT_NEXT_VERSION()
+#else
 #define _PyDict_NotifyEvent(EVENT, MP, KEY, VAL) \
   _PyDict_NotifyEvent(_PyInterpreterState_GET(), (EVENT), (MP), (KEY), (VAL))
+#endif
 
 // Check if a dictionary is guaranteed to only contain unicode/string keys.
 //
@@ -63,10 +71,19 @@ static inline uint32_t dictGetKeysVersion(
   if (dictkeys->dk_version != 0) {
     return dictkeys->dk_version;
   }
+  (void)interp;
+#if PY_VERSION_HEX < 0x030C0000
+  static uint32_t next_keys_version = 1;
+  uint32_t v = next_keys_version++;
+  if (v == 0) {
+    return 0;
+  }
+#else
   if (interp->dict_state.next_keys_version == 0) {
     return 0;
   }
   uint32_t v = interp->dict_state.next_keys_version++;
+#endif
   dictkeys->dk_version = v;
   return v;
 }
