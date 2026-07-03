@@ -1,0 +1,16 @@
+# diffgate divergence allowlist (P0 分级差分契约的"允许偏差类"载体)
+#
+# 每条 rule 是一个 normalizer：diff 前对两侧输出行做正则替换。
+# 纪律：
+#   - 新增条目必须带 rationale（为什么这类偏差被允许）；
+#   - 新增条目必须在 tests/test_allowlist_pinning.py 里有钉住测试
+#     （证明该规则确实命中目标偏差，且不会把真差异洗掉）；
+#   - 源自"中间类偏差裁决"的条目须带 issue 字段指向裁决记录/缺陷单
+#     （参照 V8 foozzie 豁免绑 bug 的实践）；永久偏差类（如地址）可不带；
+#   - 硬等价类（返回值/异常类型与消息/行号）严禁通过本文件豁免。
+
+[[rule]]
+id = "mem-addr"
+rationale = "对象地址属于允许偏差类：id()/repr 中的 0x... 地址在 JIT on/off 下必然不同"
+pattern = "0x[0-9a-fA-F]{6,16}"
+replacement = "0xADDR"
