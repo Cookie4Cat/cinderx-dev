@@ -80,17 +80,17 @@ const char* ss_get_string(const auto_jit_string_t& ss);
 // * A bound method.
 // * Error.
 //
-// Prior to 3.14 in CPython, the first element returned indicated if we had a
+// Prior to 3.11 in CPython, the first element returned indicated if we had a
 // bound method through being nullptr. However, we wanted to use nullptr to
 // trigger a deopt for the error case so instead the JIT used Py_None and
 // handled this in the runtime.
 //
-// After 3.14 things are simpler and we always have a callable as the first
-// element, so free to use nullptr on error to trigger a deopt.
+// In 3.11+ CALL expects the first element to be the callable and the second
+// element to be either the receiver or nullptr.
 struct LoadMethodResult {
   LoadMethodResult() = default;
   LoadMethodResult(PyObject* none_or_callable, PyObject* inst_or_callable) {
-    if constexpr (PY_VERSION_HEX >= 0x030E0000) {
+    if constexpr (PY_VERSION_HEX >= 0x030B0000) {
       if (none_or_callable == nullptr) {
         JIT_CHECK(
             inst_or_callable == nullptr, "Error, both args should be nullptr");
@@ -492,6 +492,15 @@ class FrozenList {
 inline void setVectorcall(
     BorrowedRef<PyFunctionObject> func,
     vectorcallfunc entry) {
+  // CPython's specializing interpreter caches Python-function call paths behind
+  // func_version.  Changing vectorcall changes the call target without going
+  // through PyFunction_Set* APIs, so invalidate those caches first.
+#ifdef __cpp_lib_atomic_ref
+  std::atomic_ref<uint32_t>(func->func_version)
+      .store(0, std::memory_order_relaxed);
+#else
+  __atomic_store_n(&func->func_version, 0, __ATOMIC_RELAXED);
+#endif
 #ifdef __cpp_lib_atomic_ref
   std::atomic_ref<vectorcallfunc>(func->vectorcall)
       .store(entry, std::memory_order_relaxed);
@@ -503,6 +512,9 @@ inline void setVectorcall(
 using FuncVisitor = void (*)(BorrowedRef<PyFunctionObject>);
 
 inline void walkFunctionObjects(FuncVisitor visitor) {
+#if PY_VERSION_HEX < 0x030E0000
+  (void)visitor;
+#else
   auto wrapper = [](PyObject* obj, void* arg) {
     if (PyFunction_Check(obj)) {
       BorrowedRef<PyFunctionObject> func{obj};
@@ -512,6 +524,7 @@ inline void walkFunctionObjects(FuncVisitor visitor) {
   };
 
   PyUnstable_GC_VisitObjects(wrapper, reinterpret_cast<void*>(visitor));
+#endif
 }
 
 } // namespace jit

@@ -124,14 +124,16 @@ int uninstrument(PyCodeObject* code, int index) {
     return base_opcode;
   }
 
-  // Instrumented lines and arbitrary instrumented instructions need to check
-  // different tables.
+// Instrumented lines and arbitrary instrumented instructions need to check
+// different tables. CPython 3.11 does not have PEP 669 monitoring opcodes.
+#if PY_VERSION_HEX >= 0x030C0000
   if (opcode == INSTRUMENTED_INSTRUCTION) {
     return code->_co_monitoring->per_instruction_opcodes[index];
   }
   if (opcode == INSTRUMENTED_LINE) {
     return Cix_GetOriginalOpcode(code->_co_monitoring->lines, index);
   }
+#endif
 
   return opcode;
 }
@@ -151,7 +153,11 @@ Py_ssize_t inlineCacheSize(PyCodeObject* code, int index) {
 }
 
 int loadAttrIndex(int oparg) {
+#if PY_VERSION_HEX < 0x030C0000
+  return oparg;
+#else
   return oparg >> 1;
+#endif
 }
 
 int loadGlobalIndex(int oparg) {

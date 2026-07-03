@@ -4,7 +4,9 @@
 
 extern "C" {
 #include "internal/pycore_ceval.h"
+#if PY_VERSION_HEX >= 0x030C0000
 #include "internal/pycore_intrinsics.h"
+#endif
 
 #if PY_VERSION_HEX >= 0x030D0000
 #include "internal/pycore_setobject.h"
@@ -2458,7 +2460,12 @@ LIRGenerator::TranslatedBlock LIRGenerator::TranslateOneBasicBlock(
             Instruction::kCondBranch, is_not_negative, done, check_err);
         bbb.switchBlock(check_err);
 
-        constexpr int32_t kOffset = offsetof(PyThreadState, current_exception);
+        constexpr int32_t kOffset =
+#if PY_VERSION_HEX < 0x030C0000
+            offsetof(PyThreadState, curexc_type);
+#else
+            offsetof(PyThreadState, current_exception);
+#endif
         Instruction* curexc = bbb.appendInstr(
             Instruction::kMove, OutVReg{}, Ind{env_->asm_tstate, kOffset});
 
@@ -3366,7 +3373,12 @@ LIRGenerator::TranslatedBlock LIRGenerator::TranslateOneBasicBlock(
       }
       case Opcode::kCheckErrOccurred: {
         const auto& instr = static_cast<const DeoptBase&>(i);
-        constexpr int32_t kOffset = offsetof(PyThreadState, current_exception);
+        constexpr int32_t kOffset =
+#if PY_VERSION_HEX < 0x030C0000
+            offsetof(PyThreadState, curexc_type);
+#else
+            offsetof(PyThreadState, current_exception);
+#endif
         Instruction* load = bbb.appendInstr(
             Instruction::kMove, OutVReg{}, Ind{env_->asm_tstate, kOffset});
         appendGuard(bbb, InstrGuardKind::kZero, instr, load);
@@ -3565,6 +3577,10 @@ LIRGenerator::TranslatedBlock LIRGenerator::TranslateOneBasicBlock(
         break;
       }
       case Opcode::kCallIntrinsic: {
+#if PY_VERSION_HEX < 0x030C0000
+        // CALL_INTRINSIC_* only exists on 3.12+.
+        JIT_ABORT("CallIntrinsic is not part of CPython 3.11 bytecode");
+#else
         auto& hir_instr = static_cast<const CallIntrinsic&>(i);
         uint64_t func_addr;
         switch (hir_instr.NumOperands()) {
@@ -3602,6 +3618,7 @@ LIRGenerator::TranslatedBlock LIRGenerator::TranslateOneBasicBlock(
           instr->addOperands(VReg{bbb.getDefInstr(arg)});
         }
         break;
+#endif
       }
       case Opcode::kCallMethod: {
         auto& hir_instr = static_cast<const CallMethod&>(i);
@@ -4246,8 +4263,13 @@ LIRGenerator::TranslatedBlock LIRGenerator::TranslateOneBasicBlock(
         break;
       }
       case Opcode::kRunPeriodicTasks: {
+#if PY_VERSION_HEX < 0x030C0000
+        auto helper = Py_MakePendingCalls;
+        bbb.appendCallInstruction(i.output(), helper);
+#else
         auto helper = _Py_HandlePending;
         bbb.appendCallInstruction(i.output(), helper, env_->asm_tstate);
+#endif
         break;
       }
       case Opcode::kSnapshot: {
@@ -4506,6 +4528,10 @@ LIRGenerator::TranslatedBlock LIRGenerator::TranslateOneBasicBlock(
         break;
       }
       case Opcode::kCompactLongUnbox: {
+#if PY_VERSION_HEX < 0x030C0000
+        // Compact longs are a 3.12+ PyLongObject layout.
+        JIT_ABORT("CompactLongUnbox is not supported on 3.11");
+#else
         // Inline _PyLong_CompactValue: sign * (Py_ssize_t)ob_digit[0]
         // where sign = 1 - (lv_tag & 3).
         Instruction* obj = bbb.getDefInstr(i.GetOperand(0));
@@ -4539,8 +4565,13 @@ LIRGenerator::TranslatedBlock LIRGenerator::TranslateOneBasicBlock(
         // result = sign * digit
         bbb.appendInstr(i.output(), Instruction::kMul, sign, digit64);
         break;
+#endif
       }
       case Opcode::kIsCompactLong: {
+#if PY_VERSION_HEX < 0x030C0000
+        // Compact longs are a 3.12+ PyLongObject layout.
+        JIT_ABORT("IsCompactLong is not supported on 3.11");
+#else
         Type operand_type = i.GetOperand(0)->type();
         if (operand_type <= TCInt64) {
           // For a raw CInt64, check if the value fits in a single 30-bit
@@ -4574,6 +4605,7 @@ LIRGenerator::TranslatedBlock LIRGenerator::TranslateOneBasicBlock(
               Imm{2 << _PyLong_NON_SIZE_BITS});
         }
         break;
+#endif
       }
       case Opcode::kIsTruthy: {
         auto is_truthy = static_cast<const IsTruthy*>(&i);

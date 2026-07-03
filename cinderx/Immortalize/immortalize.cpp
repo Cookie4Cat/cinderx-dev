@@ -17,6 +17,10 @@ struct _gc_runtime_state* get_gc_state() {
 }
 
 bool can_immortalize(PyObject* obj) {
+#if PY_VERSION_HEX < 0x030C0000
+  (void)obj;
+  return false;
+#else
   if (obj == nullptr || _Py_IsImmortal(obj)) {
     return false;
   }
@@ -29,6 +33,7 @@ bool can_immortalize(PyObject* obj) {
   }
 
   return true;
+#endif
 }
 
 bool immortalize(PyObject* obj) {

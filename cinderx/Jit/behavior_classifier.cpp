@@ -472,20 +472,48 @@ bool shouldAllowSteadyStatePlainGenerator(
 
 bool isLoadAttrOpcode(int opcode) {
   switch (opcode) {
+#ifdef LOAD_ATTR
     case LOAD_ATTR:
+#endif
+#ifdef LOAD_ATTR_CLASS
     case LOAD_ATTR_CLASS:
+#endif
+#ifdef LOAD_ATTR_CLASS_WITH_METACLASS_CHECK
     case LOAD_ATTR_CLASS_WITH_METACLASS_CHECK:
+#endif
+#ifdef LOAD_ATTR_GETATTRIBUTE_OVERRIDDEN
     case LOAD_ATTR_GETATTRIBUTE_OVERRIDDEN:
+#endif
+#ifdef LOAD_ATTR_INSTANCE_VALUE
     case LOAD_ATTR_INSTANCE_VALUE:
+#endif
+#ifdef LOAD_ATTR_METHOD_LAZY_DICT
     case LOAD_ATTR_METHOD_LAZY_DICT:
+#endif
+#ifdef LOAD_ATTR_METHOD_NO_DICT
     case LOAD_ATTR_METHOD_NO_DICT:
+#endif
+#ifdef LOAD_ATTR_METHOD_WITH_VALUES
     case LOAD_ATTR_METHOD_WITH_VALUES:
+#endif
+#ifdef LOAD_ATTR_MODULE
     case LOAD_ATTR_MODULE:
+#endif
+#ifdef LOAD_ATTR_NONDESCRIPTOR_NO_DICT
     case LOAD_ATTR_NONDESCRIPTOR_NO_DICT:
+#endif
+#ifdef LOAD_ATTR_NONDESCRIPTOR_WITH_VALUES
     case LOAD_ATTR_NONDESCRIPTOR_WITH_VALUES:
+#endif
+#ifdef LOAD_ATTR_PROPERTY
     case LOAD_ATTR_PROPERTY:
+#endif
+#ifdef LOAD_ATTR_SLOT
     case LOAD_ATTR_SLOT:
+#endif
+#ifdef LOAD_ATTR_WITH_HINT
     case LOAD_ATTR_WITH_HINT:
+#endif
       return true;
     default:
       return false;
@@ -494,10 +522,18 @@ bool isLoadAttrOpcode(int opcode) {
 
 bool isStoreAttrOpcode(int opcode) {
   switch (opcode) {
+#ifdef STORE_ATTR
     case STORE_ATTR:
+#endif
+#ifdef STORE_ATTR_INSTANCE_VALUE
     case STORE_ATTR_INSTANCE_VALUE:
+#endif
+#ifdef STORE_ATTR_SLOT
     case STORE_ATTR_SLOT:
+#endif
+#ifdef STORE_ATTR_WITH_HINT
     case STORE_ATTR_WITH_HINT:
+#endif
       return true;
     default:
       return false;
@@ -505,8 +541,20 @@ bool isStoreAttrOpcode(int opcode) {
 }
 
 bool isReturnOpcode(int opcode) {
-  return opcode == RETURN_VALUE || opcode == INSTRUMENTED_RETURN_VALUE ||
-      opcode == RETURN_CONST || opcode == RETURN_PRIMITIVE;
+  if (opcode == RETURN_VALUE || opcode == RETURN_PRIMITIVE) {
+    return true;
+  }
+#ifdef INSTRUMENTED_RETURN_VALUE
+  if (opcode == INSTRUMENTED_RETURN_VALUE) {
+    return true;
+  }
+#endif
+#ifdef RETURN_CONST
+  if (opcode == RETURN_CONST) {
+    return true;
+  }
+#endif
+  return false;
 }
 
 bool isBooleanPredicateControlOpcode(
@@ -516,14 +564,30 @@ bool isBooleanPredicateControlOpcode(
     return true;
   }
   switch (opcode) {
+#ifdef NOT_TAKEN
     case NOT_TAKEN:
+#endif
+#ifdef TO_BOOL
     case TO_BOOL:
+#endif
+#ifdef TO_BOOL_ALWAYS_TRUE
     case TO_BOOL_ALWAYS_TRUE:
+#endif
+#ifdef TO_BOOL_BOOL
     case TO_BOOL_BOOL:
+#endif
+#ifdef TO_BOOL_INT
     case TO_BOOL_INT:
+#endif
+#ifdef TO_BOOL_LIST
     case TO_BOOL_LIST:
+#endif
+#ifdef TO_BOOL_NONE
     case TO_BOOL_NONE:
+#endif
+#ifdef TO_BOOL_STR
     case TO_BOOL_STR:
+#endif
       return true;
     default:
       return false;
@@ -532,9 +596,15 @@ bool isBooleanPredicateControlOpcode(
 
 bool isAllowedProtocolDynamicOpcode(int opcode) {
   switch (opcode) {
+#ifdef LOAD_GLOBAL
     case LOAD_GLOBAL:
+#endif
+#ifdef LOAD_GLOBAL_BUILTIN
     case LOAD_GLOBAL_BUILTIN:
+#endif
+#ifdef LOAD_GLOBAL_MODULE
     case LOAD_GLOBAL_MODULE:
+#endif
       return true;
     default:
       return false;
@@ -548,18 +618,42 @@ bool isAllowedProtocolControlOpcode(
     return true;
   }
   switch (opcode) {
+#ifdef JUMP
     case JUMP:
+#endif
+#ifdef JUMP_FORWARD
     case JUMP_FORWARD:
+#endif
+#ifdef NOT_TAKEN
     case NOT_TAKEN:
+#endif
+#ifdef NOP
     case NOP:
+#endif
+#ifdef RAISE_VARARGS
     case RAISE_VARARGS:
+#endif
+#ifdef TO_BOOL
     case TO_BOOL:
+#endif
+#ifdef TO_BOOL_ALWAYS_TRUE
     case TO_BOOL_ALWAYS_TRUE:
+#endif
+#ifdef TO_BOOL_BOOL
     case TO_BOOL_BOOL:
+#endif
+#ifdef TO_BOOL_INT
     case TO_BOOL_INT:
+#endif
+#ifdef TO_BOOL_LIST
     case TO_BOOL_LIST:
+#endif
+#ifdef TO_BOOL_NONE
     case TO_BOOL_NONE:
+#endif
+#ifdef TO_BOOL_STR
     case TO_BOOL_STR:
+#endif
       return true;
     default:
       return false;
@@ -894,303 +988,869 @@ MixedShape encodeMixedShape(WorkDim a, WorkDim b) {
 
 OpcodeClass opcodeClassOf(int canonical_opcode) {
   switch (canonical_opcode) {
+#ifdef BINARY_OP
     case BINARY_OP:
+#endif
+#ifdef BINARY_OP_ADD_FLOAT
     case BINARY_OP_ADD_FLOAT:
+#endif
+#ifdef BINARY_OP_ADD_INT
     case BINARY_OP_ADD_INT:
+#endif
+#ifdef BINARY_OP_ADD_UNICODE
     case BINARY_OP_ADD_UNICODE:
+#endif
+#ifdef BINARY_OP_EXTEND
     case BINARY_OP_EXTEND:
+#endif
+#ifdef BINARY_OP_INPLACE_ADD_UNICODE
     case BINARY_OP_INPLACE_ADD_UNICODE:
+#endif
+#ifdef BINARY_OP_MULTIPLY_FLOAT
     case BINARY_OP_MULTIPLY_FLOAT:
+#endif
+#ifdef BINARY_OP_MULTIPLY_INT
     case BINARY_OP_MULTIPLY_INT:
+#endif
+#ifdef BINARY_OP_SUBTRACT_FLOAT
     case BINARY_OP_SUBTRACT_FLOAT:
+#endif
+#ifdef BINARY_OP_SUBTRACT_INT
     case BINARY_OP_SUBTRACT_INT:
+#endif
+#ifdef CAST
     case CAST:
+#endif
+#ifdef CAST_CACHED
     case CAST_CACHED:
+#endif
+#ifdef COMPARE_OP
     case COMPARE_OP:
+#endif
+#ifdef COMPARE_OP_FLOAT
     case COMPARE_OP_FLOAT:
+#endif
+#ifdef COMPARE_OP_INT
     case COMPARE_OP_INT:
+#endif
+#ifdef COMPARE_OP_STR
     case COMPARE_OP_STR:
+#endif
+#ifdef CONTAINS_OP
     case CONTAINS_OP:
+#endif
+#ifdef CONTAINS_OP_DICT
     case CONTAINS_OP_DICT:
+#endif
+#ifdef CONTAINS_OP_SET
     case CONTAINS_OP_SET:
+#endif
+#ifdef CONVERT_PRIMITIVE
     case CONVERT_PRIMITIVE:
+#endif
+#ifdef IS_OP
     case IS_OP:
+#endif
+#ifdef LOAD_TYPE
     case LOAD_TYPE:
+#endif
+#ifdef PRIMITIVE_BINARY_OP
     case PRIMITIVE_BINARY_OP:
+#endif
+#ifdef PRIMITIVE_BOX
     case PRIMITIVE_BOX:
+#endif
+#ifdef PRIMITIVE_COMPARE_OP
     case PRIMITIVE_COMPARE_OP:
+#endif
+#ifdef PRIMITIVE_UNARY_OP
     case PRIMITIVE_UNARY_OP:
+#endif
+#ifdef PRIMITIVE_UNBOX
     case PRIMITIVE_UNBOX:
+#endif
+#ifdef REFINE_TYPE
     case REFINE_TYPE:
+#endif
+#ifdef UNARY_INVERT
     case UNARY_INVERT:
+#endif
+#ifdef UNARY_NEGATIVE
     case UNARY_NEGATIVE:
+#endif
+#ifdef UNARY_NOT
     case UNARY_NOT:
+#endif
       return OpcodeClass::Compute;
 
+#ifdef CHECK_EG_MATCH
     case CHECK_EG_MATCH:
+#endif
+#ifdef CHECK_EXC_MATCH
     case CHECK_EXC_MATCH:
+#endif
+#ifdef CLEANUP_THROW
     case CLEANUP_THROW:
+#endif
+#ifdef END_FOR
     case END_FOR:
+#endif
+#ifdef EXIT_INIT_CHECK
     case EXIT_INIT_CHECK:
+#endif
+#ifdef FOR_ITER
     case FOR_ITER:
+#endif
+#ifdef FOR_ITER_GEN
     case FOR_ITER_GEN:
+#endif
+#ifdef FOR_ITER_LIST
     case FOR_ITER_LIST:
+#endif
+#ifdef FOR_ITER_RANGE
     case FOR_ITER_RANGE:
+#endif
+#ifdef FOR_ITER_TUPLE
     case FOR_ITER_TUPLE:
+#endif
+#ifdef INSTRUMENTED_END_FOR
     case INSTRUMENTED_END_FOR:
+#endif
+#ifdef INSTRUMENTED_FOR_ITER
     case INSTRUMENTED_FOR_ITER:
+#endif
+#ifdef INSTRUMENTED_JUMP_BACKWARD
     case INSTRUMENTED_JUMP_BACKWARD:
+#endif
+#ifdef INSTRUMENTED_JUMP_FORWARD
     case INSTRUMENTED_JUMP_FORWARD:
+#endif
+#ifdef INSTRUMENTED_NOT_TAKEN
     case INSTRUMENTED_NOT_TAKEN:
+#endif
+#ifdef INSTRUMENTED_POP_JUMP_IF_FALSE
     case INSTRUMENTED_POP_JUMP_IF_FALSE:
+#endif
+#ifdef INSTRUMENTED_POP_JUMP_IF_NONE
     case INSTRUMENTED_POP_JUMP_IF_NONE:
+#endif
+#ifdef INSTRUMENTED_POP_JUMP_IF_NOT_NONE
     case INSTRUMENTED_POP_JUMP_IF_NOT_NONE:
+#endif
+#ifdef INSTRUMENTED_POP_JUMP_IF_TRUE
     case INSTRUMENTED_POP_JUMP_IF_TRUE:
+#endif
+#ifdef INSTRUMENTED_RETURN_VALUE
     case INSTRUMENTED_RETURN_VALUE:
+#endif
+#ifdef JUMP
     case JUMP:
+#endif
+#ifdef JUMP_BACKWARD
     case JUMP_BACKWARD:
+#endif
+#ifdef JUMP_BACKWARD_JIT
     case JUMP_BACKWARD_JIT:
+#endif
+#ifdef JUMP_BACKWARD_NO_INTERRUPT
     case JUMP_BACKWARD_NO_INTERRUPT:
+#endif
+#ifdef JUMP_BACKWARD_NO_JIT
     case JUMP_BACKWARD_NO_JIT:
+#endif
+#ifdef JUMP_FORWARD
     case JUMP_FORWARD:
+#endif
+#ifdef JUMP_IF_FALSE
     case JUMP_IF_FALSE:
+#endif
+#ifdef JUMP_IF_TRUE
     case JUMP_IF_TRUE:
+#endif
+#ifdef JUMP_NO_INTERRUPT
     case JUMP_NO_INTERRUPT:
+#endif
+#ifdef NOT_TAKEN
     case NOT_TAKEN:
+#endif
+#ifdef POP_BLOCK
     case POP_BLOCK:
+#endif
+#ifdef POP_EXCEPT
     case POP_EXCEPT:
+#endif
+#ifdef POP_JUMP_IF_FALSE
     case POP_JUMP_IF_FALSE:
+#endif
+#ifdef POP_JUMP_IF_NONE
     case POP_JUMP_IF_NONE:
+#endif
+#ifdef POP_JUMP_IF_NONZERO
     case POP_JUMP_IF_NONZERO:
+#endif
+#ifdef POP_JUMP_IF_NOT_NONE
     case POP_JUMP_IF_NOT_NONE:
+#endif
+#ifdef POP_JUMP_IF_TRUE
     case POP_JUMP_IF_TRUE:
+#endif
+#ifdef POP_JUMP_IF_ZERO
     case POP_JUMP_IF_ZERO:
+#endif
+#ifdef PUSH_EXC_INFO
     case PUSH_EXC_INFO:
+#endif
+#ifdef RAISE_VARARGS
     case RAISE_VARARGS:
+#endif
+#ifdef RERAISE
     case RERAISE:
+#endif
+#ifdef RETURN_PRIMITIVE
     case RETURN_PRIMITIVE:
+#endif
+#ifdef RETURN_VALUE
     case RETURN_VALUE:
+#endif
+#ifdef SETUP_CLEANUP
     case SETUP_CLEANUP:
+#endif
+#ifdef SETUP_FINALLY
     case SETUP_FINALLY:
+#endif
+#ifdef SETUP_WITH
     case SETUP_WITH:
+#endif
+#ifdef TO_BOOL
     case TO_BOOL:
+#endif
+#ifdef TO_BOOL_ALWAYS_TRUE
     case TO_BOOL_ALWAYS_TRUE:
+#endif
+#ifdef TO_BOOL_BOOL
     case TO_BOOL_BOOL:
+#endif
+#ifdef TO_BOOL_INT
     case TO_BOOL_INT:
+#endif
+#ifdef TO_BOOL_LIST
     case TO_BOOL_LIST:
+#endif
+#ifdef TO_BOOL_NONE
     case TO_BOOL_NONE:
+#endif
+#ifdef TO_BOOL_STR
     case TO_BOOL_STR:
+#endif
+#ifdef WITH_EXCEPT_START
     case WITH_EXCEPT_START:
+#endif
       return OpcodeClass::Control;
 
+#ifdef BINARY_OP_SUBSCR_DICT
     case BINARY_OP_SUBSCR_DICT:
+#endif
+#ifdef BINARY_OP_SUBSCR_GETITEM
     case BINARY_OP_SUBSCR_GETITEM:
+#endif
+#ifdef BINARY_OP_SUBSCR_LIST_INT
     case BINARY_OP_SUBSCR_LIST_INT:
+#endif
+#ifdef BINARY_OP_SUBSCR_LIST_SLICE
     case BINARY_OP_SUBSCR_LIST_SLICE:
+#endif
+#ifdef BINARY_OP_SUBSCR_STR_INT
     case BINARY_OP_SUBSCR_STR_INT:
+#endif
+#ifdef BINARY_OP_SUBSCR_TUPLE_INT
     case BINARY_OP_SUBSCR_TUPLE_INT:
+#endif
+#ifdef BINARY_SLICE
     case BINARY_SLICE:
+#endif
+#ifdef BUILD_CHECKED_LIST
     case BUILD_CHECKED_LIST:
+#endif
+#ifdef BUILD_CHECKED_LIST_CACHED
     case BUILD_CHECKED_LIST_CACHED:
+#endif
+#ifdef BUILD_CHECKED_MAP
     case BUILD_CHECKED_MAP:
+#endif
+#ifdef BUILD_CHECKED_MAP_CACHED
     case BUILD_CHECKED_MAP_CACHED:
+#endif
+#ifdef BUILD_LIST
     case BUILD_LIST:
+#endif
+#ifdef BUILD_MAP
     case BUILD_MAP:
+#endif
+#ifdef BUILD_SET
     case BUILD_SET:
+#endif
+#ifdef BUILD_SLICE
     case BUILD_SLICE:
+#endif
+#ifdef BUILD_TUPLE
     case BUILD_TUPLE:
+#endif
+#ifdef DELETE_ATTR
     case DELETE_ATTR:
+#endif
+#ifdef DELETE_SUBSCR
     case DELETE_SUBSCR:
+#endif
+#ifdef DICT_MERGE
     case DICT_MERGE:
+#endif
+#ifdef DICT_UPDATE
     case DICT_UPDATE:
+#endif
+#ifdef FAST_LEN
     case FAST_LEN:
+#endif
+#ifdef GET_ITER
     case GET_ITER:
+#endif
+#ifdef GET_LEN
     case GET_LEN:
+#endif
+#ifdef LIST_APPEND
     case LIST_APPEND:
+#endif
+#ifdef LIST_DEL
     case LIST_DEL:
+#endif
+#ifdef LIST_EXTEND
     case LIST_EXTEND:
+#endif
+#ifdef LOAD_ATTR
     case LOAD_ATTR:
+#endif
+#ifdef LOAD_ATTR_CLASS
     case LOAD_ATTR_CLASS:
+#endif
+#ifdef LOAD_ATTR_CLASS_WITH_METACLASS_CHECK
     case LOAD_ATTR_CLASS_WITH_METACLASS_CHECK:
+#endif
+#ifdef LOAD_ATTR_GETATTRIBUTE_OVERRIDDEN
     case LOAD_ATTR_GETATTRIBUTE_OVERRIDDEN:
+#endif
+#ifdef LOAD_ATTR_INSTANCE_VALUE
     case LOAD_ATTR_INSTANCE_VALUE:
+#endif
+#ifdef LOAD_ATTR_METHOD_LAZY_DICT
     case LOAD_ATTR_METHOD_LAZY_DICT:
+#endif
+#ifdef LOAD_ATTR_METHOD_NO_DICT
     case LOAD_ATTR_METHOD_NO_DICT:
+#endif
+#ifdef LOAD_ATTR_METHOD_WITH_VALUES
     case LOAD_ATTR_METHOD_WITH_VALUES:
+#endif
+#ifdef LOAD_ATTR_MODULE
     case LOAD_ATTR_MODULE:
+#endif
+#ifdef LOAD_ATTR_NONDESCRIPTOR_NO_DICT
     case LOAD_ATTR_NONDESCRIPTOR_NO_DICT:
+#endif
+#ifdef LOAD_ATTR_NONDESCRIPTOR_WITH_VALUES
     case LOAD_ATTR_NONDESCRIPTOR_WITH_VALUES:
+#endif
+#ifdef LOAD_ATTR_PROPERTY
     case LOAD_ATTR_PROPERTY:
+#endif
+#ifdef LOAD_ATTR_SLOT
     case LOAD_ATTR_SLOT:
+#endif
+#ifdef LOAD_ATTR_WITH_HINT
     case LOAD_ATTR_WITH_HINT:
+#endif
+#ifdef LOAD_FIELD
     case LOAD_FIELD:
+#endif
+#ifdef LOAD_ITERABLE_ARG
     case LOAD_ITERABLE_ARG:
+#endif
+#ifdef LOAD_MAPPING_ARG
     case LOAD_MAPPING_ARG:
+#endif
+#ifdef LOAD_OBJ_FIELD
     case LOAD_OBJ_FIELD:
+#endif
+#ifdef LOAD_PRIMITIVE_FIELD
     case LOAD_PRIMITIVE_FIELD:
+#endif
+#ifdef MAP_ADD
     case MAP_ADD:
+#endif
+#ifdef MATCH_CLASS
     case MATCH_CLASS:
+#endif
+#ifdef MATCH_KEYS
     case MATCH_KEYS:
+#endif
+#ifdef MATCH_MAPPING
     case MATCH_MAPPING:
+#endif
+#ifdef MATCH_SEQUENCE
     case MATCH_SEQUENCE:
+#endif
+#ifdef SEQUENCE_GET
     case SEQUENCE_GET:
+#endif
+#ifdef SEQUENCE_SET
     case SEQUENCE_SET:
+#endif
+#ifdef SET_ADD
     case SET_ADD:
+#endif
+#ifdef SET_UPDATE
     case SET_UPDATE:
+#endif
+#ifdef STORE_ATTR
     case STORE_ATTR:
+#endif
+#ifdef STORE_ATTR_INSTANCE_VALUE
     case STORE_ATTR_INSTANCE_VALUE:
+#endif
+#ifdef STORE_ATTR_SLOT
     case STORE_ATTR_SLOT:
+#endif
+#ifdef STORE_ATTR_WITH_HINT
     case STORE_ATTR_WITH_HINT:
+#endif
+#ifdef STORE_FIELD
     case STORE_FIELD:
+#endif
+#ifdef STORE_OBJ_FIELD
     case STORE_OBJ_FIELD:
+#endif
+#ifdef STORE_PRIMITIVE_FIELD
     case STORE_PRIMITIVE_FIELD:
+#endif
+#ifdef STORE_SLICE
     case STORE_SLICE:
+#endif
+#ifdef STORE_SUBSCR
     case STORE_SUBSCR:
+#endif
+#ifdef STORE_SUBSCR_DICT
     case STORE_SUBSCR_DICT:
+#endif
+#ifdef STORE_SUBSCR_LIST_INT
     case STORE_SUBSCR_LIST_INT:
+#endif
+#ifdef TP_ALLOC
     case TP_ALLOC:
+#endif
+#ifdef TP_ALLOC_CACHED
     case TP_ALLOC_CACHED:
+#endif
+#ifdef UNPACK_EX
     case UNPACK_EX:
+#endif
+#ifdef UNPACK_SEQUENCE
     case UNPACK_SEQUENCE:
+#endif
+#ifdef UNPACK_SEQUENCE_LIST
     case UNPACK_SEQUENCE_LIST:
+#endif
+#ifdef UNPACK_SEQUENCE_TUPLE
     case UNPACK_SEQUENCE_TUPLE:
+#endif
+#ifdef UNPACK_SEQUENCE_TWO_TUPLE
     case UNPACK_SEQUENCE_TWO_TUPLE:
+#endif
       return OpcodeClass::Object;
 
+#ifdef CALL
     case CALL:
+#endif
+#ifdef CALL_ALLOC_AND_ENTER_INIT
     case CALL_ALLOC_AND_ENTER_INIT:
+#endif
+#ifdef CALL_BOUND_METHOD_EXACT_ARGS
     case CALL_BOUND_METHOD_EXACT_ARGS:
+#endif
+#ifdef CALL_BOUND_METHOD_GENERAL
     case CALL_BOUND_METHOD_GENERAL:
+#endif
+#ifdef CALL_BUILTIN_CLASS
     case CALL_BUILTIN_CLASS:
+#endif
+#ifdef CALL_BUILTIN_FAST
     case CALL_BUILTIN_FAST:
+#endif
+#ifdef CALL_BUILTIN_FAST_WITH_KEYWORDS
     case CALL_BUILTIN_FAST_WITH_KEYWORDS:
+#endif
+#ifdef CALL_BUILTIN_O
     case CALL_BUILTIN_O:
+#endif
+#ifdef CALL_FUNCTION_EX
     case CALL_FUNCTION_EX:
+#endif
+#ifdef CALL_INTRINSIC_1
     case CALL_INTRINSIC_1:
+#endif
+#ifdef CALL_INTRINSIC_2
     case CALL_INTRINSIC_2:
+#endif
+#ifdef CALL_ISINSTANCE
     case CALL_ISINSTANCE:
+#endif
+#ifdef CALL_KW
     case CALL_KW:
+#endif
+#ifdef CALL_KW_BOUND_METHOD
     case CALL_KW_BOUND_METHOD:
+#endif
+#ifdef CALL_KW_NON_PY
     case CALL_KW_NON_PY:
+#endif
+#ifdef CALL_KW_PY
     case CALL_KW_PY:
+#endif
+#ifdef CALL_LEN
     case CALL_LEN:
+#endif
+#ifdef CALL_LIST_APPEND
     case CALL_LIST_APPEND:
+#endif
+#ifdef CALL_METHOD_DESCRIPTOR_FAST
     case CALL_METHOD_DESCRIPTOR_FAST:
+#endif
+#ifdef CALL_METHOD_DESCRIPTOR_FAST_WITH_KEYWORDS
     case CALL_METHOD_DESCRIPTOR_FAST_WITH_KEYWORDS:
+#endif
+#ifdef CALL_METHOD_DESCRIPTOR_NOARGS
     case CALL_METHOD_DESCRIPTOR_NOARGS:
+#endif
+#ifdef CALL_METHOD_DESCRIPTOR_O
     case CALL_METHOD_DESCRIPTOR_O:
+#endif
+#ifdef CALL_NON_PY_GENERAL
     case CALL_NON_PY_GENERAL:
+#endif
+#ifdef CALL_PY_EXACT_ARGS
     case CALL_PY_EXACT_ARGS:
+#endif
+#ifdef CALL_PY_GENERAL
     case CALL_PY_GENERAL:
+#endif
+#ifdef CALL_STR_1
     case CALL_STR_1:
+#endif
+#ifdef CALL_TUPLE_1
     case CALL_TUPLE_1:
+#endif
+#ifdef CALL_TYPE_1
     case CALL_TYPE_1:
+#endif
+#ifdef INSTRUMENTED_CALL
     case INSTRUMENTED_CALL:
+#endif
+#ifdef INSTRUMENTED_CALL_FUNCTION_EX
     case INSTRUMENTED_CALL_FUNCTION_EX:
+#endif
+#ifdef INSTRUMENTED_CALL_KW
     case INSTRUMENTED_CALL_KW:
+#endif
+#ifdef INSTRUMENTED_LOAD_SUPER_ATTR
     case INSTRUMENTED_LOAD_SUPER_ATTR:
+#endif
+#ifdef INVOKE_FUNCTION
     case INVOKE_FUNCTION:
+#endif
+#ifdef INVOKE_FUNCTION_CACHED
     case INVOKE_FUNCTION_CACHED:
+#endif
+#ifdef INVOKE_INDIRECT_CACHED
     case INVOKE_INDIRECT_CACHED:
+#endif
+#ifdef INVOKE_METHOD
     case INVOKE_METHOD:
+#endif
+#ifdef INVOKE_NATIVE
     case INVOKE_NATIVE:
+#endif
+#ifdef LOAD_METHOD_STATIC
     case LOAD_METHOD_STATIC:
+#endif
+#ifdef LOAD_METHOD_STATIC_CACHED
     case LOAD_METHOD_STATIC_CACHED:
+#endif
+#ifdef LOAD_SPECIAL
     case LOAD_SPECIAL:
+#endif
+#ifdef LOAD_SUPER_ATTR
     case LOAD_SUPER_ATTR:
+#endif
+#ifdef LOAD_SUPER_ATTR_ATTR
     case LOAD_SUPER_ATTR_ATTR:
+#endif
+#ifdef LOAD_SUPER_ATTR_METHOD
     case LOAD_SUPER_ATTR_METHOD:
+#endif
+#ifdef PUSH_NULL
     case PUSH_NULL:
+#endif
       return OpcodeClass::Dispatch;
 
+#ifdef END_ASYNC_FOR
     case END_ASYNC_FOR:
+#endif
+#ifdef END_SEND
     case END_SEND:
+#endif
+#ifdef GET_AITER
     case GET_AITER:
+#endif
+#ifdef GET_ANEXT
     case GET_ANEXT:
+#endif
+#ifdef GET_AWAITABLE
     case GET_AWAITABLE:
+#endif
+#ifdef GET_YIELD_FROM_ITER
     case GET_YIELD_FROM_ITER:
+#endif
+#ifdef INSTRUMENTED_END_ASYNC_FOR
     case INSTRUMENTED_END_ASYNC_FOR:
+#endif
+#ifdef INSTRUMENTED_END_SEND
     case INSTRUMENTED_END_SEND:
+#endif
+#ifdef INSTRUMENTED_YIELD_VALUE
     case INSTRUMENTED_YIELD_VALUE:
+#endif
+#ifdef RETURN_GENERATOR
     case RETURN_GENERATOR:
+#endif
+#ifdef SEND
     case SEND:
+#endif
+#ifdef SEND_GEN
     case SEND_GEN:
+#endif
+#ifdef YIELD_VALUE
     case YIELD_VALUE:
+#endif
       return OpcodeClass::Suspend;
 
+#ifdef ANNOTATIONS_PLACEHOLDER
     case ANNOTATIONS_PLACEHOLDER:
+#endif
+#ifdef BUILD_INTERPOLATION
     case BUILD_INTERPOLATION:
+#endif
+#ifdef BUILD_STRING
     case BUILD_STRING:
+#endif
+#ifdef BUILD_TEMPLATE
     case BUILD_TEMPLATE:
+#endif
+#ifdef CONVERT_VALUE
     case CONVERT_VALUE:
+#endif
+#ifdef COPY_FREE_VARS
     case COPY_FREE_VARS:
+#endif
+#ifdef DELETE_DEREF
     case DELETE_DEREF:
+#endif
+#ifdef DELETE_GLOBAL
     case DELETE_GLOBAL:
+#endif
+#ifdef DELETE_NAME
     case DELETE_NAME:
+#endif
+#ifdef EAGER_IMPORT_NAME
     case EAGER_IMPORT_NAME:
+#endif
+#ifdef FORMAT_SIMPLE
     case FORMAT_SIMPLE:
+#endif
+#ifdef FORMAT_WITH_SPEC
     case FORMAT_WITH_SPEC:
+#endif
+#ifdef IMPORT_FROM
     case IMPORT_FROM:
+#endif
+#ifdef IMPORT_NAME
     case IMPORT_NAME:
+#endif
+#ifdef LOAD_BUILD_CLASS
     case LOAD_BUILD_CLASS:
+#endif
+#ifdef LOAD_CLASS
     case LOAD_CLASS:
+#endif
+#ifdef LOAD_CLOSURE
     case LOAD_CLOSURE:
+#endif
+#ifdef LOAD_DEREF
     case LOAD_DEREF:
+#endif
+#ifdef LOAD_FROM_DICT_OR_DEREF
     case LOAD_FROM_DICT_OR_DEREF:
+#endif
+#ifdef LOAD_FROM_DICT_OR_GLOBALS
     case LOAD_FROM_DICT_OR_GLOBALS:
+#endif
+#ifdef LOAD_GLOBAL
     case LOAD_GLOBAL:
+#endif
+#ifdef LOAD_GLOBAL_BUILTIN
     case LOAD_GLOBAL_BUILTIN:
+#endif
+#ifdef LOAD_GLOBAL_MODULE
     case LOAD_GLOBAL_MODULE:
+#endif
+#ifdef LOAD_LOCALS
     case LOAD_LOCALS:
+#endif
+#ifdef LOAD_NAME
     case LOAD_NAME:
+#endif
+#ifdef MAKE_CELL
     case MAKE_CELL:
+#endif
+#ifdef MAKE_FUNCTION
     case MAKE_FUNCTION:
+#endif
+#ifdef SETUP_ANNOTATIONS
     case SETUP_ANNOTATIONS:
+#endif
+#ifdef SET_FUNCTION_ATTRIBUTE
     case SET_FUNCTION_ATTRIBUTE:
+#endif
+#ifdef STORE_DEREF
     case STORE_DEREF:
+#endif
+#ifdef STORE_GLOBAL
     case STORE_GLOBAL:
+#endif
+#ifdef STORE_NAME
     case STORE_NAME:
+#endif
       return OpcodeClass::Dynamic;
 
+#ifdef COPY
     case COPY:
+#endif
+#ifdef DELETE_FAST
     case DELETE_FAST:
+#endif
+#ifdef INSTRUMENTED_POP_ITER
     case INSTRUMENTED_POP_ITER:
+#endif
+#ifdef INTERPRETER_EXIT
     case INTERPRETER_EXIT:
+#endif
+#ifdef LOAD_COMMON_CONSTANT
     case LOAD_COMMON_CONSTANT:
+#endif
+#ifdef LOAD_CONST
     case LOAD_CONST:
+#endif
+#ifdef LOAD_CONST_IMMORTAL
     case LOAD_CONST_IMMORTAL:
+#endif
+#ifdef LOAD_CONST_MORTAL
     case LOAD_CONST_MORTAL:
+#endif
+#ifdef LOAD_FAST
     case LOAD_FAST:
+#endif
+#ifdef LOAD_FAST_AND_CLEAR
     case LOAD_FAST_AND_CLEAR:
+#endif
+#ifdef LOAD_FAST_BORROW
     case LOAD_FAST_BORROW:
+#endif
+#ifdef LOAD_FAST_BORROW_LOAD_FAST_BORROW
     case LOAD_FAST_BORROW_LOAD_FAST_BORROW:
+#endif
+#ifdef LOAD_FAST_CHECK
     case LOAD_FAST_CHECK:
+#endif
+#ifdef LOAD_FAST_LOAD_FAST
     case LOAD_FAST_LOAD_FAST:
+#endif
+#ifdef LOAD_LOCAL
     case LOAD_LOCAL:
+#endif
+#ifdef LOAD_SMALL_INT
     case LOAD_SMALL_INT:
+#endif
+#ifdef POP_ITER
     case POP_ITER:
+#endif
+#ifdef POP_TOP
     case POP_TOP:
+#endif
+#ifdef PRIMITIVE_LOAD_CONST
     case PRIMITIVE_LOAD_CONST:
+#endif
+#ifdef STORE_FAST
     case STORE_FAST:
+#endif
+#ifdef STORE_FAST_LOAD_FAST
     case STORE_FAST_LOAD_FAST:
+#endif
+#ifdef STORE_FAST_MAYBE_NULL
     case STORE_FAST_MAYBE_NULL:
+#endif
+#ifdef STORE_FAST_STORE_FAST
     case STORE_FAST_STORE_FAST:
+#endif
+#ifdef STORE_LOCAL
     case STORE_LOCAL:
+#endif
+#ifdef STORE_LOCAL_CACHED
     case STORE_LOCAL_CACHED:
+#endif
+#ifdef SWAP
     case SWAP:
+#endif
       return OpcodeClass::Neutral;
 
+#ifdef CACHE
     case CACHE:
+#endif
+#ifdef ENTER_EXECUTOR
     case ENTER_EXECUTOR:
+#endif
+#ifdef EXTENDED_ARG
     case EXTENDED_ARG:
+#endif
+#ifdef EXTENDED_OPCODE
     case EXTENDED_OPCODE:
+#endif
+#ifdef INSTRUMENTED_INSTRUCTION
     case INSTRUMENTED_INSTRUCTION:
+#endif
+#ifdef INSTRUMENTED_LINE
     case INSTRUMENTED_LINE:
+#endif
+#ifdef INSTRUMENTED_RESUME
     case INSTRUMENTED_RESUME:
+#endif
+#ifdef NOP
     case NOP:
+#endif
+#ifdef RESERVED
     case RESERVED:
+#endif
+#ifdef RESUME
     case RESUME:
+#endif
+#ifdef RESUME_CHECK
     case RESUME_CHECK:
+#endif
       return OpcodeClass::Ignored;
   }
   return OpcodeClass::Invalid;
@@ -1198,13 +1858,27 @@ OpcodeClass opcodeClassOf(int canonical_opcode) {
 
 bool isExceptionControlOpcode(int canonical_opcode) {
   switch (canonical_opcode) {
+#ifdef CHECK_EG_MATCH
     case CHECK_EG_MATCH:
+#endif
+#ifdef CHECK_EXC_MATCH
     case CHECK_EXC_MATCH:
+#endif
+#ifdef CLEANUP_THROW
     case CLEANUP_THROW:
+#endif
+#ifdef POP_EXCEPT
     case POP_EXCEPT:
+#endif
+#ifdef PUSH_EXC_INFO
     case PUSH_EXC_INFO:
+#endif
+#ifdef RERAISE
     case RERAISE:
+#endif
+#ifdef WITH_EXCEPT_START
     case WITH_EXCEPT_START:
+#endif
       return true;
     default:
       return false;

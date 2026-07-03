@@ -192,8 +192,11 @@ Py_ssize_t _PyDictKeys_StringLookupSplit(PyDictKeysObject* dk, PyObject* key);
 #define Cix_PyCode_InitAddressRange _PyCode_InitAddressRange
 #define Cix_PyLineTable_NextAddressRange _PyLineTable_NextAddressRange
 #define Cix_PyDict_LoadGlobal _PyDict_LoadGlobal
+#if PY_VERSION_HEX >= 0x030C0000
+// 3.11: borrowed-3.11-fallback.c 提供同名真函数实现
 #define Cix_PyThreadState_PushFrame _PyThreadState_PushFrame
 #define Cix_PyThreadState_PopFrame _PyThreadState_PopFrame
+#endif
 #define Cix_PyFrame_ClearExceptCode _PyFrame_ClearExceptCode
 #define Cix_PyTypeAlias_Type _PyTypeAlias_Type
 
@@ -249,14 +252,29 @@ void _PyDict_InsertSplitValue(
 #define Cix_PyTuple_FromArray PyTuple_FromArray
 #endif
 
-// managed_static_type_state was known as static_builtin_state only in 3.12.
-#if PY_VERSION_HEX < 0x030D0000
+// managed_static_type_state does not exist on stock 3.11. The static-builtin
+// branches are unreachable there because _Py_TPFLAGS_STATIC_BUILTIN is 0.
+#if PY_VERSION_HEX < 0x030C0000
+typedef struct {
+  PyObject* tp_dict;
+  PyObject* tp_subclasses;
+} managed_static_type_state;
+static inline managed_static_type_state* Cix_PyStaticType_GetState(
+    PyInterpreterState*,
+    PyTypeObject*) {
+  return NULL;
+}
+#elif PY_VERSION_HEX < 0x030D0000
 typedef static_builtin_state managed_static_type_state;
-#endif
 
 managed_static_type_state* Cix_PyStaticType_GetState(
     PyInterpreterState*,
     PyTypeObject*);
+#else
+managed_static_type_state* Cix_PyStaticType_GetState(
+    PyInterpreterState*,
+    PyTypeObject*);
+#endif
 
 PyObject* Cix_Py_union_type_or(PyObject*, PyObject*);
 
@@ -270,7 +288,11 @@ void Cix_PyThreadState_PopFrame(
 
 void Cix_PyFrame_ClearExceptCode(_PyInterpreterFrame* frame);
 
-#if PY_VERSION_HEX < 0x030F0000
+#if PY_VERSION_HEX < 0x030C0000
+static inline uint8_t Cix_DEINSTRUMENT(uint8_t op) {
+  return 0;
+}
+#elif PY_VERSION_HEX < 0x030F0000
 uint8_t Cix_DEINSTRUMENT(uint8_t op);
 #endif
 

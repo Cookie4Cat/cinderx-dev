@@ -36,6 +36,27 @@ void printPythonException();
 // "<failed to get UTF8 from Python string>"
 std::string repr(BorrowedRef<> obj);
 
+#ifndef JIT_COLD
+#define JIT_COLD __attribute__((cold))
+#endif
+
+[[noreturn]] JIT_COLD void throwImplV(
+    std::string_view file,
+    int line,
+    fmt::string_view format,
+    fmt::format_args args);
+
+template <typename... Args>
+[[noreturn]] JIT_COLD void throwImpl(
+    std::string_view file,
+    int line,
+    fmt::format_string<Args...> format,
+    Args&&... args) {
+  throwImplV(file, line, format, fmt::make_format_args(args...));
+}
+
+#define JIT_THROW(...) jit::throwImpl(__FILE__, __LINE__, __VA_ARGS__)
+
 #define JIT_LOG(...)                                           \
   {                                                            \
     FILE* _output = jit::getConfig().log.output_file;          \

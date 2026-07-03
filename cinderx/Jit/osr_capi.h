@@ -4,7 +4,17 @@
 
 #include "cinderx/python.h"
 
+#if PY_VERSION_HEX >= 0x030D0000
 #include "pycore_pyatomic_ft_wrappers.h"
+#else
+// 3.11 无 free-threading 原子包装头；GIL 构建下等价为普通读写
+#ifndef FT_ATOMIC_LOAD_INT_RELAXED
+#define FT_ATOMIC_LOAD_INT_RELAXED(x) (x)
+#endif
+#ifndef FT_ATOMIC_STORE_INT_RELAXED
+#define FT_ATOMIC_STORE_INT_RELAXED(x, v) ((x) = (v))
+#endif
+#endif
 
 #include <stdbool.h>
 #include <stdint.h>

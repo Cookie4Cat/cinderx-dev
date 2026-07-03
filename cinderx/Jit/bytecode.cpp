@@ -173,6 +173,11 @@ int BytecodeInstruction::specializedOpcode() const {
 #ifdef BINARY_OP_SUBSCR_TUPLE_INT
     case BINARY_OP_SUBSCR_TUPLE_INT:
 #endif
+#if PY_VERSION_HEX < 0x030C0000
+    case COMPARE_OP_FLOAT_JUMP:
+    case COMPARE_OP_INT_JUMP:
+    case COMPARE_OP_STR_JUMP:
+#endif
     case COMPARE_OP_FLOAT:
     case COMPARE_OP_INT:
     case COMPARE_OP_STR:
@@ -184,6 +189,11 @@ int BytecodeInstruction::specializedOpcode() const {
     case LOAD_ATTR_METHOD_WITH_VALUES:
 #endif
     case LOAD_ATTR_SLOT:
+#if PY_VERSION_HEX < 0x030C0000
+    case LOAD_ATTR_INSTANCE_VALUE:
+    case LOAD_METHOD_WITH_VALUES:
+    case LOAD_GLOBAL_MODULE:
+#endif
     case LOAD_ATTR_MODULE:
     case STORE_ATTR_SLOT:
     case STORE_SUBSCR_DICT:
@@ -203,12 +213,24 @@ int BytecodeInstruction::oparg() const {
 
 uint16_t BytecodeInstruction::cacheU16(int instruction_offset) const {
   auto idx = opcodeIndex().value() + instruction_offset;
-  return read_u16(&codeUnit(code_)[idx].cache);
+#if PY_VERSION_HEX >= 0x030C0000
+  return codeUnit(code_)[idx].cache;
+#else
+  // 3.11: _Py_CODEUNIT 是裸 uint16，缓存槽即码元本身
+  return codeUnit(code_)[idx];
+#endif
 }
 
 uint32_t BytecodeInstruction::cacheU32(int instruction_offset) const {
   auto idx = opcodeIndex().value() + instruction_offset;
-  return read_u32(&codeUnit(code_)[idx].cache);
+#if PY_VERSION_HEX >= 0x030C0000
+  uint32_t lo = codeUnit(code_)[idx].cache;
+  uint32_t hi = codeUnit(code_)[idx + 1].cache;
+#else
+  uint32_t lo = codeUnit(code_)[idx];
+  uint32_t hi = codeUnit(code_)[idx + 1];
+#endif
+  return lo | (hi << 16);
 }
 
 uint32_t BytecodeInstruction::attrCacheTypeVersion() const {
@@ -235,6 +257,16 @@ bool BytecodeInstruction::isBranch() const {
     case JUMP_IF_NOT_EXC_MATCH:
     case JUMP_IF_TRUE_OR_POP:
     case JUMP_IF_ZERO_OR_POP:
+#if PY_VERSION_HEX < 0x030C0000
+    case POP_JUMP_BACKWARD_IF_FALSE:
+    case POP_JUMP_BACKWARD_IF_NONE:
+    case POP_JUMP_BACKWARD_IF_NOT_NONE:
+    case POP_JUMP_BACKWARD_IF_TRUE:
+    case POP_JUMP_FORWARD_IF_FALSE:
+    case POP_JUMP_FORWARD_IF_NONE:
+    case POP_JUMP_FORWARD_IF_NOT_NONE:
+    case POP_JUMP_FORWARD_IF_TRUE:
+#endif
     case POP_JUMP_IF_FALSE:
     case POP_JUMP_IF_NONE:
     case POP_JUMP_IF_NONZERO:
@@ -287,6 +319,12 @@ BCOffset BytecodeInstruction::getJumpTarget() const {
 #if PY_VERSION_HEX >= 0x030E0000
       || opcode() == JUMP_BACKWARD_JIT || opcode() == JUMP_BACKWARD_NO_JIT
 #endif
+#if PY_VERSION_HEX < 0x030C0000
+      || opcode() == POP_JUMP_BACKWARD_IF_FALSE ||
+      opcode() == POP_JUMP_BACKWARD_IF_NONE ||
+      opcode() == POP_JUMP_BACKWARD_IF_NOT_NONE ||
+      opcode() == POP_JUMP_BACKWARD_IF_TRUE
+#endif
   ) {
     delta = -delta;
   }
@@ -300,7 +338,7 @@ BCOffset BytecodeInstruction::getJumpTarget() const {
   // We make this tweak here so it applies both when generating the branching
   // HIR operation, and when creating block boundaries for bytecode. The END_FOR
   // will end up on its own in an unreachable block.
-  if (opcode() == FOR_ITER) {
+  if (PY_VERSION_HEX >= 0x030C0000 && opcode() == FOR_ITER) {
     BytecodeInstruction target_bc{code_, target};
     JIT_CHECK(target_bc.opcode() == END_FOR, "Expected END_FOR");
     return target_bc.nextInstrOffset();
@@ -320,6 +358,9 @@ _Py_CODEUNIT BytecodeInstruction::word() const {
 }
 
 bool BytecodeInstruction::isAbsoluteControlFlow() const {
+#if PY_VERSION_HEX < 0x030C0000
+  return false;
+#else
   switch (opcode()) {
     case JUMP_ABSOLUTE:
     case JUMP_IF_FALSE_OR_POP:
@@ -336,6 +377,7 @@ bool BytecodeInstruction::isAbsoluteControlFlow() const {
     default:
       return false;
   }
+#endif
 }
 
 BytecodeInstructionBlock::BytecodeInstructionBlock(

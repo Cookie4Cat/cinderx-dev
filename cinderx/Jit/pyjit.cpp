@@ -473,10 +473,14 @@ bool shouldSkipAutoJitScheduleForRoiBackoffFrozen(
 }
 
 void setInterpreterJitFlag(bool enabled) {
+#if PY_VERSION_HEX >= 0x030D0000
   PyThreadState* tstate = _PyThreadState_UncheckedGet();
   if (tstate != nullptr && tstate->interp != nullptr) {
     tstate->interp->jit = enabled;
   }
+#else
+  (void)enabled;  // No interp->jit flag before 3.13.
+#endif
 }
 
 // If functions in the cinderx module get compiled, they will somehow keep the
@@ -1664,6 +1668,10 @@ enum class JitEligibility { Ineligible, JitListEligible, Eligible };
  * possible.
  */
 JitEligibility getCompilationEligibility(BorrowedRef<PyFunctionObject> func) {
+#if PY_VERSION_HEX < 0x030C0000
+  // The 3.11 bytecode frontend is not implemented yet; nothing is eligible.
+  return JitEligibility::Ineligible;
+#endif
   // Can be called after the module has been finalized, due to function events.
   if (jitCtx() == nullptr || isCinderModule(func->func_module)) {
     return JitEligibility::Ineligible;
@@ -1693,6 +1701,10 @@ JitEligibility getCompilationEligibility(BorrowedRef<PyFunctionObject> func) {
 JitEligibility getCompilationEligibility(
     BorrowedRef<> module_name,
     BorrowedRef<PyCodeObject> code) {
+#if PY_VERSION_HEX < 0x030C0000
+  // The 3.11 bytecode frontend is not implemented yet; nothing is eligible.
+  return JitEligibility::Ineligible;
+#endif
   // Can be called after the module has been finalized, due to function events.
   if (jitCtx() == nullptr) {
     return JitEligibility::Ineligible;
@@ -1960,6 +1972,10 @@ PyObject* enable_jit(PyObject* /* self */, PyObject* /* arg */) {
 // Check if there are any active callback registered through
 // sys.monitoring.register_callback()
 bool hasRegisteredMonitoringCallbacks() {
+#if PY_VERSION_HEX < 0x030C0000
+  // sys.monitoring only exists on 3.12+.
+  return false;
+#else
   auto is = PyInterpreterState_Get();
   for (int tool_id = 0; tool_id < PY_MONITORING_TOOL_IDS; ++tool_id) {
     // Skip the internal Python tool IDs used by sys.setprofile and
@@ -1984,12 +2000,18 @@ bool hasRegisteredMonitoringCallbacks() {
     }
   }
   return false;
+#endif
 }
 
 // Check if sys.setprofile or sys.settrace have active callbacks registered.
 bool hasActiveLegacyTracing() {
+#if PY_VERSION_HEX < 0x030C0000
+  PyThreadState* tstate = PyThreadState_Get();
+  return tstate->c_profilefunc != nullptr || tstate->c_tracefunc != nullptr;
+#else
   auto is = PyInterpreterState_Get();
   return is->sys_profiling_threads > 0 || is->sys_tracing_threads > 0;
+#endif
 }
 
 bool isInstrumentationActive() {
@@ -4545,6 +4567,11 @@ bool scheduleJitCompile(BorrowedRef<PyFunctionObject> func) {
 
 Result compileFunction(BorrowedRef<PyFunctionObject> func) {
   FreeThreadedJITEntrypointGuard guard;
+#if PY_VERSION_HEX < 0x030C0000
+  // The 3.11 bytecode frontend is not implemented yet; cinderx loads and
+  // runs on 3.11 with the JIT inert.
+  return Result::CANNOT_SPECIALIZE;
+#endif
   if (!isJitInitialized()) {
     return Result::NOT_INITIALIZED;
   }
@@ -4567,6 +4594,11 @@ void uncompile(BorrowedRef<PyFunctionObject> func) {
 
 Result compileFunctionWithOSR(BorrowedRef<PyFunctionObject> func) {
   FreeThreadedJITEntrypointGuard guard;
+#if PY_VERSION_HEX < 0x030C0000
+  // The 3.11 bytecode frontend is not implemented yet; cinderx loads and
+  // runs on 3.11 with the JIT inert.
+  return Result::CANNOT_SPECIALIZE;
+#endif
   if (!isJitInitialized()) {
     return Result::NOT_INITIALIZED;
   }

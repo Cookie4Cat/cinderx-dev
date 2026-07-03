@@ -2,15 +2,10 @@
 #
 # pyre-strict
 
+from __future__ import annotations
+
 from contextlib import contextmanager
-from typing import Any, AsyncGenerator, Callable, Coroutine, Generator, TypeVar
 from warnings import catch_warnings, simplefilter, warn
-
-
-# The JIT compiles arbitrary Python functions.  Ideally this type would exclude native
-# functions, but that doesn't seem possible yet.
-#
-FuncAny = Callable[..., Any]
 
 
 try:
@@ -62,7 +57,17 @@ try:
         set_max_code_size,
     )
 
+    # Runtime-only placeholder. The real typing alias is only needed when the JIT
+    # extension is unavailable, so successful startup does not import typing.
+    FuncAny = object
+
 except ImportError:
+    from typing import Any, AsyncGenerator, Callable, Coroutine, Generator, TypeVar
+
+    # The JIT compiles arbitrary Python functions. Ideally this type would
+    # exclude native functions, but that doesn't seem possible yet.
+    FuncAny = Callable[..., Any]
+
     TDeoptGenYield = TypeVar("TDeoptGenYield")
     TDeoptGenSend = TypeVar("TDeoptGenSend")
     TDeoptGenReturn = TypeVar("TDeoptGenReturn")

@@ -109,13 +109,17 @@ def main(opcode_py, cinderx_opcode_py, outfile='Include/opcode.h',
 
     opmap = opcode['opmap']
     opname = opcode['opname']
-    hasarg = opcode['hasarg']
+    HAVE_ARGUMENT = opcode["HAVE_ARGUMENT"]
+    hasarg = opcode.get('hasarg')
+    if hasarg is None:
+        hasarg = [op for op in opmap.values() if op >= HAVE_ARGUMENT]
+        opcode['hasarg'] = hasarg
     hasconst = opcode['hasconst']
     hasname = opcode['hasname']
     hasjrel = opcode['hasjrel']
     hasjabs = opcode['hasjabs']
-    is_pseudo = opcode['is_pseudo']
-    _pseudo_ops = opcode['_pseudo_ops']
+    is_pseudo = opcode.get('is_pseudo', lambda op: False)
+    _pseudo_ops = opcode.get('_pseudo_ops', [])
 
     # Read in the additional cinderx opcodes.
     cinder_opcode = {}
@@ -124,11 +128,10 @@ def main(opcode_py, cinderx_opcode_py, outfile='Include/opcode.h',
     exec(code, cinder_opcode)
     cinder_opcode["init"](opname, opmap, hasname, hasjrel, hasjabs, hasconst, hasarg, opcode["_cache_format"], opcode["_specializations"], opcode["_inline_cache_entries"], False)
 
-    ENABLE_SPECIALIZATION = opcode["ENABLE_SPECIALIZATION"]
-    HAVE_ARGUMENT = opcode["HAVE_ARGUMENT"]
-    MIN_PSEUDO_OPCODE = opcode["MIN_PSEUDO_OPCODE"]
-    MAX_PSEUDO_OPCODE = opcode["MAX_PSEUDO_OPCODE"]
-    MIN_INSTRUMENTED_OPCODE = opcode["MIN_INSTRUMENTED_OPCODE"]
+    ENABLE_SPECIALIZATION = opcode.get("ENABLE_SPECIALIZATION", True)
+    MIN_PSEUDO_OPCODE = opcode.get("MIN_PSEUDO_OPCODE", 256)
+    MAX_PSEUDO_OPCODE = opcode.get("MAX_PSEUDO_OPCODE", 255)
+    MIN_INSTRUMENTED_OPCODE = opcode.get("MIN_INSTRUMENTED_OPCODE", 256)
 
     NUM_OPCODES = len(opname)
     used = [ False ] * len(opname)
@@ -232,17 +235,23 @@ def main(opcode_py, cinderx_opcode_py, outfile='Include/opcode.h',
 
         nobj.write("/* Unary Functions: */")
         nobj.write("\n")
-        for i, op in enumerate(opcode["_intrinsic_1_descs"]):
+        intrinsic_1_descs = opcode.get("_intrinsic_1_descs", [])
+        intrinsic_2_descs = opcode.get("_intrinsic_2_descs", [])
+        max_intrinsic_1 = -1
+        max_intrinsic_2 = -1
+        for i, op in enumerate(intrinsic_1_descs):
             nobj.write(DEFINE.format(op, i))
+            max_intrinsic_1 = i
         nobj.write("\n")
-        nobj.write(DEFINE.format("MAX_INTRINSIC_1", i))
+        nobj.write(DEFINE.format("MAX_INTRINSIC_1", max_intrinsic_1))
 
         nobj.write("\n\n")
         nobj.write("/* Binary Functions: */\n")
-        for i, op in enumerate(opcode["_intrinsic_2_descs"]):
+        for i, op in enumerate(intrinsic_2_descs):
             nobj.write(DEFINE.format(op, i))
+            max_intrinsic_2 = i
         nobj.write("\n")
-        nobj.write(DEFINE.format("MAX_INTRINSIC_2", i))
+        nobj.write(DEFINE.format("MAX_INTRINSIC_2", max_intrinsic_2))
 
         nobj.write(intrinsic_footer)
 

@@ -453,6 +453,8 @@ endif()
 
 if (${PY_VERSION} EQUAL 3.12 OR ${PY_VERSION} EQUAL 3.14 OR ${PY_VERSION} EQUAL 3.15)
   set(BORROWED_C ${PROJECT_SOURCE_DIR}/UpstreamBorrow/borrowed-${PY_VERSION}.gen_cached.c)
+elseif (${PY_VERSION} EQUAL 3.11)
+  set(BORROWED_C ${PROJECT_SOURCE_DIR}/UpstreamBorrow/borrowed-3.11-fallback.c)
 else()
   set(BORROWED_C "${GENERATED_HEADER_DIR}/dummy-borrowed.c")
   file(WRITE ${BORROWED_C} "")
@@ -476,7 +478,7 @@ set(INTERP_SOURCES
   ${PROJECT_SOURCE_DIR}/Interpreter/iter_helpers.c
 )
 
-if (${PY_VERSION} EQUAL 3.12 OR ${PY_VERSION} EQUAL 3.14 OR ${PY_VERSION} EQUAL 3.15)
+if (${PY_VERSION} EQUAL 3.11 OR ${PY_VERSION} EQUAL 3.12 OR ${PY_VERSION} EQUAL 3.14 OR ${PY_VERSION} EQUAL 3.15)
   set(SOURCE_CINDERX_OPCODE_TARGETS_H ${PROJECT_SOURCE_DIR}/Interpreter/${PY_VERSION}/cinderx_opcode_targets.h)
   set(SOURCE_CINDER_OPCODE_H ${PROJECT_SOURCE_DIR}/Interpreter/${PY_VERSION}/cinder_opcode.h)
   set(SOURCE_CINDER_OPCODE_IDS_H ${PROJECT_SOURCE_DIR}/Interpreter/${PY_VERSION}/cinder_opcode_ids.h)
@@ -523,7 +525,11 @@ target_link_libraries(immortalize PRIVATE asmjit::asmjit fmt::fmt)
 ########################################
 # StaticPython/
 
-file(GLOB_RECURSE STATIC_PYTHON_SOURCES ${PROJECT_SOURCE_DIR}/StaticPython/*.c)
+if (${PY_VERSION} EQUAL 3.11)
+  set(STATIC_PYTHON_SOURCES ${PROJECT_SOURCE_DIR}/StaticPython/static_python_stub.cpp)
+else()
+  file(GLOB_RECURSE STATIC_PYTHON_SOURCES ${PROJECT_SOURCE_DIR}/StaticPython/*.c)
+endif()
 add_library(static-python ${STATIC_PYTHON_SOURCES})
 target_link_libraries(static-python PRIVATE fmt::fmt asmjit::asmjit common borrowed)
 

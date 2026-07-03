@@ -456,6 +456,19 @@ class BuildExt(build_ext):
         print(f"Copying _cinderx_auto.py to {auto_dest}")
         self.copy_file(auto_source, auto_dest, preserve_mode=False)
 
+        # Copy startup hook files to build_lib root so wheel installation places
+        # them directly in site-packages.
+        for filename in ("cinderx.pth", "_cinderx_auto.py"):
+            source = os.path.join(PYTHON_LIB_DIR, filename)
+            dest = os.path.join(self.build_lib, filename)
+            if not os.path.isfile(source):
+                raise FileNotFoundError(
+                    f"Required file not found: {source}. "
+                    f"Ensure {filename} exists in the source directory."
+                )
+            print(f"Copying {filename} to {dest}")
+            self.copy_file(source, dest, preserve_mode=False)
+
     def _run_cmake(self, extension: CMakeExtension) -> None:
         # pyre-ignore[16]: No pyre types for build_ext.
         build_dir = self.build_temp

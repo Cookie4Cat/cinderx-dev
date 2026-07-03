@@ -7,7 +7,9 @@
 
 #include "cinderx/python.h"
 
-#if PY_VERSION_HEX >= 0x030D0000
+#if PY_VERSION_HEX < 0x030D0000
+#include "internal/pycore_frame.h"
+#else
 #include "internal/pycore_interpframe.h"
 #endif
 
@@ -15,7 +17,11 @@
 #include "internal/pycore_genobject.h"
 #endif
 
+#if PY_VERSION_HEX < 0x030C0000
+#define CI_INTERP_IMPORT_FIELD(interp, field) interp->field
+#else
 #define CI_INTERP_IMPORT_FIELD(interp, field) interp->imports.field
+#endif
 
 #include "internal/pycore_interp.h"
 
@@ -98,6 +104,8 @@ inline void setCurrentFrame(PyThreadState* tstate, _PyInterpreterFrame* frame) {
 static inline PyObject* frameFunction(_PyInterpreterFrame* frame) {
 #if PY_VERSION_HEX >= 0x030E0000
   return PyStackRef_AsPyObjectBorrow(frame->f_funcobj);
+#elif PY_VERSION_HEX < 0x030C0000
+  return (PyObject*)frame->f_func;
 #else
   return frame->f_funcobj;
 #endif
@@ -112,6 +120,8 @@ static inline void setFrameFunction(
   } else {
     frame->f_funcobj = PyStackRef_NULL;
   }
+#elif PY_VERSION_HEX < 0x030C0000
+  frame->f_func = (PyFunctionObject*)func;
 #else
   frame->f_funcobj = (PyObject*)func;
 #endif
@@ -175,6 +185,10 @@ static inline void setFrameCode(_PyInterpreterFrame* frame, PyObject* code) {
   frame->f_code = (PyCodeObject*)Py_NewRef(code);
 }
 #endif
+
+static inline int frameSlotsForCodeObject(PyCodeObject* code) {
+  return FRAME_SPECIALS_SIZE + _PyFrame_NumSlotsForCodeObject(code);
+}
 
 static inline PyObject* frameExecutable(_PyInterpreterFrame* frame) {
 #if PY_VERSION_HEX >= 0x030E0000
@@ -244,6 +258,9 @@ static inline PyObject* frameExecutable(_PyInterpreterFrame* frame) {
 #if PY_VERSION_HEX < 0x030E0000
 #define Ci_Type_HasValidVersionTag(type) \
   PyType_HasFeature(type, Py_TPFLAGS_VALID_VERSION_TAG)
+#if PY_VERSION_HEX < 0x030C0000
+#define PyUnstable_Type_AssignVersionTag(type) Ci_Type_HasValidVersionTag(type)
+#endif
 #else
 #define Ci_Type_HasValidVersionTag(type) ((type)->tp_version_tag != 0)
 #endif
