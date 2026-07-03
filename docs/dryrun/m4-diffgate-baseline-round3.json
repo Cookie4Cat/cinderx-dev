@@ -1,0 +1,627 @@
+{
+  "python": "3.11.15 (main, Jun  6 2026, 08:01:57) [GCC 14.2.1 20250110 (Red Hat 14.2.1-11)]",
+  "modules": [
+    "corpus_calls",
+    "corpus_controlflow",
+    "corpus_frames",
+    "corpus_hotloops",
+    "corpus_ic_mutation",
+    "corpus_operators",
+    "corpus_unbound"
+  ],
+  "total_cases": 918,
+  "modes": [
+    "jit",
+    "jit_deopt"
+  ],
+  "failures": [
+    "jit:case_annotation_only_then_read",
+    "jit:case_attr_class_del_raises",
+    "jit:case_attr_class_reassign",
+    "jit:case_attr_mro_bases_change",
+    "jit:case_attr_property_added_later",
+    "jit:case_augassign_before_bind",
+    "jit:case_conditional_false_path",
+    "jit:case_del_then_read",
+    "jit:case_fstring_unbound",
+    "jit:case_loop_var_zero_iterations",
+    "jit:case_match_class_positional",
+    "jit:case_match_mapping",
+    "jit:case_match_no_capture",
+    "jit:case_op_add__big128__float25",
+    "jit:case_op_eq__bigpos__bigpos",
+    "jit:case_op_eq__bigpos__int3",
+    "jit:case_op_eq__negint__bigpos",
+    "jit:case_op_ge__bigpos__bigpos",
+    "jit:case_op_ge__bigpos__int3",
+    "jit:case_op_ge__negint__bigpos",
+    "jit:case_op_gt__bigpos__bigpos",
+    "jit:case_op_gt__bigpos__int3",
+    "jit:case_op_gt__negint__bigpos",
+    "jit:case_op_iadd__bigpos__bigpos",
+    "jit:case_op_isub__bigpos__bigpos",
+    "jit:case_op_le__bigpos__bigpos",
+    "jit:case_op_le__bigpos__int3",
+    "jit:case_op_le__negint__bigpos",
+    "jit:case_op_lt__bigpos__bigpos",
+    "jit:case_op_lt__bigpos__int3",
+    "jit:case_op_lt__negint__bigpos",
+    "jit:case_op_mul__big128__float25",
+    "jit:case_op_ne__bigpos__bigpos",
+    "jit:case_op_ne__bigpos__int3",
+    "jit:case_op_ne__negint__bigpos",
+    "jit:case_op_pow__big128__float25",
+    "jit:case_op_sub__big128__float25",
+    "jit:case_read_before_assign",
+    "jit:case_return_expr_maybe_unbound",
+    "jit:case_walrus_dead_branch",
+    "jit:case_while_else_unbound",
+    "jit:case_while_is_none_backjump",
+    "jit_deopt:case_annotation_only_then_read",
+    "jit_deopt:case_attr_class_del_raises",
+    "jit_deopt:case_attr_class_reassign",
+    "jit_deopt:case_attr_mro_bases_change",
+    "jit_deopt:case_attr_property_added_later",
+    "jit_deopt:case_augassign_before_bind",
+    "jit_deopt:case_conditional_false_path",
+    "jit_deopt:case_del_then_read",
+    "jit_deopt:case_descriptor_nondata_vs_instance",
+    "jit_deopt:case_fstring_unbound",
+    "jit_deopt:case_hot_int_accumulate",
+    "jit_deopt:case_loop_var_zero_iterations",
+    "jit_deopt:case_match_class_positional",
+    "jit_deopt:case_match_mapping",
+    "jit_deopt:case_match_no_capture",
+    "jit_deopt:case_op_add__big128__float25",
+    "jit_deopt:case_op_eq__bigpos__bigpos",
+    "jit_deopt:case_op_eq__bigpos__int3",
+    "jit_deopt:case_op_eq__negint__bigpos",
+    "jit_deopt:case_op_ge__bigpos__bigpos",
+    "jit_deopt:case_op_ge__bigpos__int3",
+    "jit_deopt:case_op_ge__negint__bigpos",
+    "jit_deopt:case_op_gt__bigpos__bigpos",
+    "jit_deopt:case_op_gt__bigpos__int3",
+    "jit_deopt:case_op_gt__negint__bigpos",
+    "jit_deopt:case_op_iadd__bigpos__bigpos",
+    "jit_deopt:case_op_isub__bigpos__bigpos",
+    "jit_deopt:case_op_le__bigpos__bigpos",
+    "jit_deopt:case_op_le__bigpos__int3",
+    "jit_deopt:case_op_le__negint__bigpos",
+    "jit_deopt:case_op_lt__bigpos__bigpos",
+    "jit_deopt:case_op_lt__bigpos__int3",
+    "jit_deopt:case_op_lt__negint__bigpos",
+    "jit_deopt:case_op_mul__big128__float25",
+    "jit_deopt:case_op_ne__bigpos__bigpos",
+    "jit_deopt:case_op_ne__bigpos__int3",
+    "jit_deopt:case_op_ne__negint__bigpos",
+    "jit_deopt:case_op_pow__big128__float25",
+    "jit_deopt:case_op_sub__big128__float25",
+    "jit_deopt:case_read_before_assign",
+    "jit_deopt:case_return_expr_maybe_unbound",
+    "jit_deopt:case_walrus_dead_branch",
+    "jit_deopt:case_while_else_unbound",
+    "jit_deopt:case_while_is_none_backjump"
+  ],
+  "new_failures": [
+    "jit:case_annotation_only_then_read",
+    "jit:case_attr_class_del_raises",
+    "jit:case_attr_class_reassign",
+    "jit:case_attr_mro_bases_change",
+    "jit:case_attr_property_added_later",
+    "jit:case_augassign_before_bind",
+    "jit:case_conditional_false_path",
+    "jit:case_del_then_read",
+    "jit:case_fstring_unbound",
+    "jit:case_loop_var_zero_iterations",
+    "jit:case_match_class_positional",
+    "jit:case_match_mapping",
+    "jit:case_match_no_capture",
+    "jit:case_op_add__big128__float25",
+    "jit:case_op_eq__bigpos__bigpos",
+    "jit:case_op_eq__bigpos__int3",
+    "jit:case_op_eq__negint__bigpos",
+    "jit:case_op_ge__bigpos__bigpos",
+    "jit:case_op_ge__bigpos__int3",
+    "jit:case_op_ge__negint__bigpos",
+    "jit:case_op_gt__bigpos__bigpos",
+    "jit:case_op_gt__bigpos__int3",
+    "jit:case_op_gt__negint__bigpos",
+    "jit:case_op_iadd__bigpos__bigpos",
+    "jit:case_op_isub__bigpos__bigpos",
+    "jit:case_op_le__bigpos__bigpos",
+    "jit:case_op_le__bigpos__int3",
+    "jit:case_op_le__negint__bigpos",
+    "jit:case_op_lt__bigpos__bigpos",
+    "jit:case_op_lt__bigpos__int3",
+    "jit:case_op_lt__negint__bigpos",
+    "jit:case_op_mul__big128__float25",
+    "jit:case_op_ne__bigpos__bigpos",
+    "jit:case_op_ne__bigpos__int3",
+    "jit:case_op_ne__negint__bigpos",
+    "jit:case_op_pow__big128__float25",
+    "jit:case_op_sub__big128__float25",
+    "jit:case_read_before_assign",
+    "jit:case_return_expr_maybe_unbound",
+    "jit:case_walrus_dead_branch",
+    "jit:case_while_else_unbound",
+    "jit:case_while_is_none_backjump",
+    "jit_deopt:case_annotation_only_then_read",
+    "jit_deopt:case_attr_class_del_raises",
+    "jit_deopt:case_attr_class_reassign",
+    "jit_deopt:case_attr_mro_bases_change",
+    "jit_deopt:case_attr_property_added_later",
+    "jit_deopt:case_augassign_before_bind",
+    "jit_deopt:case_conditional_false_path",
+    "jit_deopt:case_del_then_read",
+    "jit_deopt:case_descriptor_nondata_vs_instance",
+    "jit_deopt:case_fstring_unbound",
+    "jit_deopt:case_hot_int_accumulate",
+    "jit_deopt:case_loop_var_zero_iterations",
+    "jit_deopt:case_match_class_positional",
+    "jit_deopt:case_match_mapping",
+    "jit_deopt:case_match_no_capture",
+    "jit_deopt:case_op_add__big128__float25",
+    "jit_deopt:case_op_eq__bigpos__bigpos",
+    "jit_deopt:case_op_eq__bigpos__int3",
+    "jit_deopt:case_op_eq__negint__bigpos",
+    "jit_deopt:case_op_ge__bigpos__bigpos",
+    "jit_deopt:case_op_ge__bigpos__int3",
+    "jit_deopt:case_op_ge__negint__bigpos",
+    "jit_deopt:case_op_gt__bigpos__bigpos",
+    "jit_deopt:case_op_gt__bigpos__int3",
+    "jit_deopt:case_op_gt__negint__bigpos",
+    "jit_deopt:case_op_iadd__bigpos__bigpos",
+    "jit_deopt:case_op_isub__bigpos__bigpos",
+    "jit_deopt:case_op_le__bigpos__bigpos",
+    "jit_deopt:case_op_le__bigpos__int3",
+    "jit_deopt:case_op_le__negint__bigpos",
+    "jit_deopt:case_op_lt__bigpos__bigpos",
+    "jit_deopt:case_op_lt__bigpos__int3",
+    "jit_deopt:case_op_lt__negint__bigpos",
+    "jit_deopt:case_op_mul__big128__float25",
+    "jit_deopt:case_op_ne__bigpos__bigpos",
+    "jit_deopt:case_op_ne__bigpos__int3",
+    "jit_deopt:case_op_ne__negint__bigpos",
+    "jit_deopt:case_op_pow__big128__float25",
+    "jit_deopt:case_op_sub__big128__float25",
+    "jit_deopt:case_read_before_assign",
+    "jit_deopt:case_return_expr_maybe_unbound",
+    "jit_deopt:case_walrus_dead_branch",
+    "jit_deopt:case_while_else_unbound",
+    "jit_deopt:case_while_is_none_backjump"
+  ],
+  "fixed_vs_baseline": [],
+  "infra_errors": [],
+  "detail": {
+    "jit:case_match_class_positional": {
+      "kind": "diff",
+      "interp": "CASE case_match_class_positional OK (1, 2)",
+      "jit": "CASE case_match_class_positional EXC RuntimeError: MATCH_CLASS is not supported by the stock Python 3.11 CinderX fallback @case_match_class_positional+8"
+    },
+    "jit:case_match_mapping": {
+      "kind": "diff",
+      "interp": "CASE case_match_mapping OK ('point', 1, [('y', 2)])",
+      "jit": "CASE case_match_mapping EXC RuntimeError: MATCH_KEYS is not supported by the stock Python 3.11 CinderX fallback @case_match_mapping+3"
+    },
+    "jit:case_while_is_none_backjump": {
+      "kind": "diff",
+      "interp": "CASE case_while_is_none_backjump OK (2, 'found')",
+      "jit": "CASE case_while_is_none_backjump CRASH exit=-6"
+    },
+    "jit_deopt:case_match_class_positional": {
+      "kind": "diff",
+      "interp": "CASE case_match_class_positional OK (1, 2)",
+      "jit_deopt": "CASE case_match_class_positional EXC RuntimeError: MATCH_CLASS is not supported by the stock Python 3.11 CinderX fallback @case_match_class_positional+8"
+    },
+    "jit_deopt:case_match_mapping": {
+      "kind": "diff",
+      "interp": "CASE case_match_mapping OK ('point', 1, [('y', 2)])",
+      "jit_deopt": "CASE case_match_mapping EXC RuntimeError: MATCH_KEYS is not supported by the stock Python 3.11 CinderX fallback @case_match_mapping+3"
+    },
+    "jit_deopt:case_while_is_none_backjump": {
+      "kind": "diff",
+      "interp": "CASE case_while_is_none_backjump OK (2, 'found')",
+      "jit_deopt": "CASE case_while_is_none_backjump CRASH exit=-6"
+    },
+    "jit_deopt:case_hot_int_accumulate": {
+      "kind": "diff",
+      "interp": "CASE case_hot_int_accumulate OK 11249997000000",
+      "jit_deopt": "CASE case_hot_int_accumulate CRASH exit=-6"
+    },
+    "jit:case_attr_class_del_raises": {
+      "kind": "diff",
+      "interp": "CASE case_attr_class_del_raises OK ('temp', \"AttributeError: 'Temp' object has no attribute 'attr'\")",
+      "jit": "CASE case_attr_class_del_raises OK ('temp', 'temp')"
+    },
+    "jit:case_attr_class_reassign": {
+      "kind": "diff",
+      "interp": "CASE case_attr_class_reassign OK ('class-attr', 'mutated')",
+      "jit": "CASE case_attr_class_reassign OK ('class-attr', 'class-attr')"
+    },
+    "jit:case_attr_mro_bases_change": {
+      "kind": "diff",
+      "interp": "CASE case_attr_mro_bases_change OK ('from-A', 'from-B')",
+      "jit": "CASE case_attr_mro_bases_change OK ('from-A', 'from-A')"
+    },
+    "jit:case_attr_property_added_later": {
+      "kind": "diff",
+      "interp": "CASE case_attr_property_added_later OK ('plain', 'via-property')",
+      "jit": "CASE case_attr_property_added_later OK ('plain', 'plain')"
+    },
+    "jit_deopt:case_attr_class_del_raises": {
+      "kind": "diff",
+      "interp": "CASE case_attr_class_del_raises OK ('temp', \"AttributeError: 'Temp' object has no attribute 'attr'\")",
+      "jit_deopt": "CASE case_attr_class_del_raises OK ('temp', 'temp')"
+    },
+    "jit_deopt:case_attr_class_reassign": {
+      "kind": "diff",
+      "interp": "CASE case_attr_class_reassign OK ('class-attr', 'mutated')",
+      "jit_deopt": "CASE case_attr_class_reassign OK ('class-attr', 'class-attr')"
+    },
+    "jit_deopt:case_attr_mro_bases_change": {
+      "kind": "diff",
+      "interp": "CASE case_attr_mro_bases_change OK ('from-A', 'from-B')",
+      "jit_deopt": "CASE case_attr_mro_bases_change OK ('from-A', 'from-A')"
+    },
+    "jit_deopt:case_attr_property_added_later": {
+      "kind": "diff",
+      "interp": "CASE case_attr_property_added_later OK ('plain', 'via-property')",
+      "jit_deopt": "CASE case_attr_property_added_later OK ('plain', 'plain')"
+    },
+    "jit_deopt:case_descriptor_nondata_vs_instance": {
+      "kind": "diff",
+      "interp": "CASE case_descriptor_nondata_vs_instance OK ('non-data', 'instance-wins')",
+      "jit_deopt": "CASE case_descriptor_nondata_vs_instance OK ('from-A', 'instance-wins')"
+    },
+    "jit:case_op_add__big128__float25": {
+      "kind": "diff",
+      "interp": "CASE case_op_add__big128__float25 OK 3.402823669209385e+38",
+      "jit": "CASE case_op_add__big128__float25 CRASH exit=-6"
+    },
+    "jit:case_op_eq__bigpos__bigpos": {
+      "kind": "diff",
+      "interp": "CASE case_op_eq__bigpos__bigpos OK True",
+      "jit": "CASE case_op_eq__bigpos__bigpos CRASH exit=-6"
+    },
+    "jit:case_op_eq__bigpos__int3": {
+      "kind": "diff",
+      "interp": "CASE case_op_eq__bigpos__int3 OK False",
+      "jit": "CASE case_op_eq__bigpos__int3 CRASH exit=-6"
+    },
+    "jit:case_op_eq__negint__bigpos": {
+      "kind": "diff",
+      "interp": "CASE case_op_eq__negint__bigpos OK False",
+      "jit": "CASE case_op_eq__negint__bigpos CRASH exit=-6"
+    },
+    "jit:case_op_ge__bigpos__bigpos": {
+      "kind": "diff",
+      "interp": "CASE case_op_ge__bigpos__bigpos OK True",
+      "jit": "CASE case_op_ge__bigpos__bigpos CRASH exit=-6"
+    },
+    "jit:case_op_ge__bigpos__int3": {
+      "kind": "diff",
+      "interp": "CASE case_op_ge__bigpos__int3 OK True",
+      "jit": "CASE case_op_ge__bigpos__int3 CRASH exit=-6"
+    },
+    "jit:case_op_ge__negint__bigpos": {
+      "kind": "diff",
+      "interp": "CASE case_op_ge__negint__bigpos OK False",
+      "jit": "CASE case_op_ge__negint__bigpos CRASH exit=-6"
+    },
+    "jit:case_op_gt__bigpos__bigpos": {
+      "kind": "diff",
+      "interp": "CASE case_op_gt__bigpos__bigpos OK False",
+      "jit": "CASE case_op_gt__bigpos__bigpos CRASH exit=-6"
+    },
+    "jit:case_op_gt__bigpos__int3": {
+      "kind": "diff",
+      "interp": "CASE case_op_gt__bigpos__int3 OK True",
+      "jit": "CASE case_op_gt__bigpos__int3 CRASH exit=-6"
+    },
+    "jit:case_op_gt__negint__bigpos": {
+      "kind": "diff",
+      "interp": "CASE case_op_gt__negint__bigpos OK False",
+      "jit": "CASE case_op_gt__negint__bigpos CRASH exit=-6"
+    },
+    "jit:case_op_iadd__bigpos__bigpos": {
+      "kind": "diff",
+      "interp": "CASE case_op_iadd__bigpos__bigpos OK 9223372036854775810",
+      "jit": "CASE case_op_iadd__bigpos__bigpos CRASH exit=-6"
+    },
+    "jit:case_op_isub__bigpos__bigpos": {
+      "kind": "diff",
+      "interp": "CASE case_op_isub__bigpos__bigpos OK 0",
+      "jit": "CASE case_op_isub__bigpos__bigpos CRASH exit=-6"
+    },
+    "jit:case_op_le__bigpos__bigpos": {
+      "kind": "diff",
+      "interp": "CASE case_op_le__bigpos__bigpos OK True",
+      "jit": "CASE case_op_le__bigpos__bigpos CRASH exit=-6"
+    },
+    "jit:case_op_le__bigpos__int3": {
+      "kind": "diff",
+      "interp": "CASE case_op_le__bigpos__int3 OK False",
+      "jit": "CASE case_op_le__bigpos__int3 CRASH exit=-6"
+    },
+    "jit:case_op_le__negint__bigpos": {
+      "kind": "diff",
+      "interp": "CASE case_op_le__negint__bigpos OK True",
+      "jit": "CASE case_op_le__negint__bigpos CRASH exit=-6"
+    },
+    "jit:case_op_lt__bigpos__bigpos": {
+      "kind": "diff",
+      "interp": "CASE case_op_lt__bigpos__bigpos OK False",
+      "jit": "CASE case_op_lt__bigpos__bigpos CRASH exit=-6"
+    },
+    "jit:case_op_lt__bigpos__int3": {
+      "kind": "diff",
+      "interp": "CASE case_op_lt__bigpos__int3 OK False",
+      "jit": "CASE case_op_lt__bigpos__int3 CRASH exit=-6"
+    },
+    "jit:case_op_lt__negint__bigpos": {
+      "kind": "diff",
+      "interp": "CASE case_op_lt__negint__bigpos OK True",
+      "jit": "CASE case_op_lt__negint__bigpos CRASH exit=-6"
+    },
+    "jit:case_op_mul__big128__float25": {
+      "kind": "diff",
+      "interp": "CASE case_op_mul__big128__float25 OK 8.507059173023462e+38",
+      "jit": "CASE case_op_mul__big128__float25 CRASH exit=-6"
+    },
+    "jit:case_op_ne__bigpos__bigpos": {
+      "kind": "diff",
+      "interp": "CASE case_op_ne__bigpos__bigpos OK False",
+      "jit": "CASE case_op_ne__bigpos__bigpos CRASH exit=-6"
+    },
+    "jit:case_op_ne__bigpos__int3": {
+      "kind": "diff",
+      "interp": "CASE case_op_ne__bigpos__int3 OK True",
+      "jit": "CASE case_op_ne__bigpos__int3 CRASH exit=-6"
+    },
+    "jit:case_op_ne__negint__bigpos": {
+      "kind": "diff",
+      "interp": "CASE case_op_ne__negint__bigpos OK True",
+      "jit": "CASE case_op_ne__negint__bigpos CRASH exit=-6"
+    },
+    "jit:case_op_pow__big128__float25": {
+      "kind": "diff",
+      "interp": "CASE case_op_pow__big128__float25 OK 2.13598703592091e+96",
+      "jit": "CASE case_op_pow__big128__float25 CRASH exit=-6"
+    },
+    "jit:case_op_sub__big128__float25": {
+      "kind": "diff",
+      "interp": "CASE case_op_sub__big128__float25 OK 3.402823669209385e+38",
+      "jit": "CASE case_op_sub__big128__float25 CRASH exit=-6"
+    },
+    "jit_deopt:case_op_add__big128__float25": {
+      "kind": "diff",
+      "interp": "CASE case_op_add__big128__float25 OK 3.402823669209385e+38",
+      "jit_deopt": "CASE case_op_add__big128__float25 CRASH exit=-6"
+    },
+    "jit_deopt:case_op_eq__bigpos__bigpos": {
+      "kind": "diff",
+      "interp": "CASE case_op_eq__bigpos__bigpos OK True",
+      "jit_deopt": "CASE case_op_eq__bigpos__bigpos CRASH exit=-6"
+    },
+    "jit_deopt:case_op_eq__bigpos__int3": {
+      "kind": "diff",
+      "interp": "CASE case_op_eq__bigpos__int3 OK False",
+      "jit_deopt": "CASE case_op_eq__bigpos__int3 CRASH exit=-6"
+    },
+    "jit_deopt:case_op_eq__negint__bigpos": {
+      "kind": "diff",
+      "interp": "CASE case_op_eq__negint__bigpos OK False",
+      "jit_deopt": "CASE case_op_eq__negint__bigpos CRASH exit=-6"
+    },
+    "jit_deopt:case_op_ge__bigpos__bigpos": {
+      "kind": "diff",
+      "interp": "CASE case_op_ge__bigpos__bigpos OK True",
+      "jit_deopt": "CASE case_op_ge__bigpos__bigpos CRASH exit=-6"
+    },
+    "jit_deopt:case_op_ge__bigpos__int3": {
+      "kind": "diff",
+      "interp": "CASE case_op_ge__bigpos__int3 OK True",
+      "jit_deopt": "CASE case_op_ge__bigpos__int3 CRASH exit=-6"
+    },
+    "jit_deopt:case_op_ge__negint__bigpos": {
+      "kind": "diff",
+      "interp": "CASE case_op_ge__negint__bigpos OK False",
+      "jit_deopt": "CASE case_op_ge__negint__bigpos CRASH exit=-6"
+    },
+    "jit_deopt:case_op_gt__bigpos__bigpos": {
+      "kind": "diff",
+      "interp": "CASE case_op_gt__bigpos__bigpos OK False",
+      "jit_deopt": "CASE case_op_gt__bigpos__bigpos CRASH exit=-6"
+    },
+    "jit_deopt:case_op_gt__bigpos__int3": {
+      "kind": "diff",
+      "interp": "CASE case_op_gt__bigpos__int3 OK True",
+      "jit_deopt": "CASE case_op_gt__bigpos__int3 CRASH exit=-6"
+    },
+    "jit_deopt:case_op_gt__negint__bigpos": {
+      "kind": "diff",
+      "interp": "CASE case_op_gt__negint__bigpos OK False",
+      "jit_deopt": "CASE case_op_gt__negint__bigpos CRASH exit=-6"
+    },
+    "jit_deopt:case_op_iadd__bigpos__bigpos": {
+      "kind": "diff",
+      "interp": "CASE case_op_iadd__bigpos__bigpos OK 9223372036854775810",
+      "jit_deopt": "CASE case_op_iadd__bigpos__bigpos CRASH exit=-6"
+    },
+    "jit_deopt:case_op_isub__bigpos__bigpos": {
+      "kind": "diff",
+      "interp": "CASE case_op_isub__bigpos__bigpos OK 0",
+      "jit_deopt": "CASE case_op_isub__bigpos__bigpos CRASH exit=-6"
+    },
+    "jit_deopt:case_op_le__bigpos__bigpos": {
+      "kind": "diff",
+      "interp": "CASE case_op_le__bigpos__bigpos OK True",
+      "jit_deopt": "CASE case_op_le__bigpos__bigpos CRASH exit=-6"
+    },
+    "jit_deopt:case_op_le__bigpos__int3": {
+      "kind": "diff",
+      "interp": "CASE case_op_le__bigpos__int3 OK False",
+      "jit_deopt": "CASE case_op_le__bigpos__int3 CRASH exit=-6"
+    },
+    "jit_deopt:case_op_le__negint__bigpos": {
+      "kind": "diff",
+      "interp": "CASE case_op_le__negint__bigpos OK True",
+      "jit_deopt": "CASE case_op_le__negint__bigpos CRASH exit=-6"
+    },
+    "jit_deopt:case_op_lt__bigpos__bigpos": {
+      "kind": "diff",
+      "interp": "CASE case_op_lt__bigpos__bigpos OK False",
+      "jit_deopt": "CASE case_op_lt__bigpos__bigpos CRASH exit=-6"
+    },
+    "jit_deopt:case_op_lt__bigpos__int3": {
+      "kind": "diff",
+      "interp": "CASE case_op_lt__bigpos__int3 OK False",
+      "jit_deopt": "CASE case_op_lt__bigpos__int3 CRASH exit=-6"
+    },
+    "jit_deopt:case_op_lt__negint__bigpos": {
+      "kind": "diff",
+      "interp": "CASE case_op_lt__negint__bigpos OK True",
+      "jit_deopt": "CASE case_op_lt__negint__bigpos CRASH exit=-6"
+    },
+    "jit_deopt:case_op_mul__big128__float25": {
+      "kind": "diff",
+      "interp": "CASE case_op_mul__big128__float25 OK 8.507059173023462e+38",
+      "jit_deopt": "CASE case_op_mul__big128__float25 CRASH exit=-6"
+    },
+    "jit_deopt:case_op_ne__bigpos__bigpos": {
+      "kind": "diff",
+      "interp": "CASE case_op_ne__bigpos__bigpos OK False",
+      "jit_deopt": "CASE case_op_ne__bigpos__bigpos CRASH exit=-6"
+    },
+    "jit_deopt:case_op_ne__bigpos__int3": {
+      "kind": "diff",
+      "interp": "CASE case_op_ne__bigpos__int3 OK True",
+      "jit_deopt": "CASE case_op_ne__bigpos__int3 CRASH exit=-6"
+    },
+    "jit_deopt:case_op_ne__negint__bigpos": {
+      "kind": "diff",
+      "interp": "CASE case_op_ne__negint__bigpos OK True",
+      "jit_deopt": "CASE case_op_ne__negint__bigpos CRASH exit=-6"
+    },
+    "jit_deopt:case_op_pow__big128__float25": {
+      "kind": "diff",
+      "interp": "CASE case_op_pow__big128__float25 OK 2.13598703592091e+96",
+      "jit_deopt": "CASE case_op_pow__big128__float25 CRASH exit=-6"
+    },
+    "jit_deopt:case_op_sub__big128__float25": {
+      "kind": "diff",
+      "interp": "CASE case_op_sub__big128__float25 OK 3.402823669209385e+38",
+      "jit_deopt": "CASE case_op_sub__big128__float25 CRASH exit=-6"
+    },
+    "jit:case_annotation_only_then_read": {
+      "kind": "diff",
+      "interp": "CASE case_annotation_only_then_read EXC UnboundLocalError: cannot access local variable 'x' where it is not associated with a value @case_annotation_only_then_read+2",
+      "jit": "CASE case_annotation_only_then_read EXC SystemError: <function case_annotation_only_then_read at 0xffff9392ad40> returned NULL without setting an exception @main+47"
+    },
+    "jit:case_augassign_before_bind": {
+      "kind": "diff",
+      "interp": "CASE case_augassign_before_bind EXC UnboundLocalError: cannot access local variable 'x' where it is not associated with a value @case_augassign_before_bind+1",
+      "jit": "CASE case_augassign_before_bind CRASH exit=-11"
+    },
+    "jit:case_conditional_false_path": {
+      "kind": "diff",
+      "interp": "CASE case_conditional_false_path EXC UnboundLocalError: cannot access local variable 'x' where it is not associated with a value @case_conditional_false_path+4",
+      "jit": "CASE case_conditional_false_path CRASH exit=-11"
+    },
+    "jit:case_del_then_read": {
+      "kind": "diff",
+      "interp": "CASE case_del_then_read EXC UnboundLocalError: cannot access local variable 'x' where it is not associated with a value @case_del_then_read+3",
+      "jit": "CASE case_del_then_read EXC SystemError: <function case_del_then_read at 0xffff8a549300> returned NULL without setting an exception @main+47"
+    },
+    "jit:case_fstring_unbound": {
+      "kind": "diff",
+      "interp": "CASE case_fstring_unbound EXC UnboundLocalError: cannot access local variable 'name' where it is not associated with a value @case_fstring_unbound+3",
+      "jit": "CASE case_fstring_unbound CRASH exit=-11"
+    },
+    "jit:case_loop_var_zero_iterations": {
+      "kind": "diff",
+      "interp": "CASE case_loop_var_zero_iterations EXC UnboundLocalError: cannot access local variable 'item' where it is not associated with a value @case_loop_var_zero_iterations+3",
+      "jit": "CASE case_loop_var_zero_iterations EXC SystemError: <function case_loop_var_zero_iterations at 0xffffaffea8e0> returned NULL without setting an exception @main+47"
+    },
+    "jit:case_match_no_capture": {
+      "kind": "diff",
+      "interp": "CASE case_match_no_capture EXC UnboundLocalError: cannot access local variable 'captured' where it is not associated with a value @case_match_no_capture+5",
+      "jit": "CASE case_match_no_capture EXC RuntimeError: MATCH_CLASS is not supported by the stock Python 3.11 CinderX fallback @case_match_no_capture+3"
+    },
+    "jit:case_read_before_assign": {
+      "kind": "diff",
+      "interp": "CASE case_read_before_assign EXC UnboundLocalError: cannot access local variable 'x' where it is not associated with a value @case_read_before_assign+3",
+      "jit": "CASE case_read_before_assign EXC SystemError: <function case_read_before_assign at 0xffffaffe9260> returned NULL without setting an exception @main+47"
+    },
+    "jit:case_return_expr_maybe_unbound": {
+      "kind": "diff",
+      "interp": "CASE case_return_expr_maybe_unbound EXC UnboundLocalError: cannot access local variable 'result' where it is not associated with a value @case_return_expr_maybe_unbound+4",
+      "jit": "CASE case_return_expr_maybe_unbound EXC SystemError: <function case_return_expr_maybe_unbound at 0xffffaffeaac0> returned NULL without setting an exception @main+47"
+    },
+    "jit:case_walrus_dead_branch": {
+      "kind": "diff",
+      "interp": "CASE case_walrus_dead_branch EXC UnboundLocalError: cannot access local variable 'w' where it is not associated with a value @case_walrus_dead_branch+3",
+      "jit": "CASE case_walrus_dead_branch EXC SystemError: <function case_walrus_dead_branch at 0xffffaffeaf20> returned NULL without setting an exception @main+47"
+    },
+    "jit:case_while_else_unbound": {
+      "kind": "diff",
+      "interp": "CASE case_while_else_unbound EXC UnboundLocalError: cannot access local variable 'y' where it is not associated with a value @case_while_else_unbound+7",
+      "jit": "CASE case_while_else_unbound CRASH exit=-6"
+    },
+    "jit_deopt:case_annotation_only_then_read": {
+      "kind": "diff",
+      "interp": "CASE case_annotation_only_then_read EXC UnboundLocalError: cannot access local variable 'x' where it is not associated with a value @case_annotation_only_then_read+2",
+      "jit_deopt": "CASE case_annotation_only_then_read EXC SystemError: <function case_annotation_only_then_read at 0xffffb174ed40> returned NULL without setting an exception @main+47"
+    },
+    "jit_deopt:case_augassign_before_bind": {
+      "kind": "diff",
+      "interp": "CASE case_augassign_before_bind EXC UnboundLocalError: cannot access local variable 'x' where it is not associated with a value @case_augassign_before_bind+1",
+      "jit_deopt": "CASE case_augassign_before_bind CRASH exit=-11"
+    },
+    "jit_deopt:case_conditional_false_path": {
+      "kind": "diff",
+      "interp": "CASE case_conditional_false_path EXC UnboundLocalError: cannot access local variable 'x' where it is not associated with a value @case_conditional_false_path+4",
+      "jit_deopt": "CASE case_conditional_false_path CRASH exit=-11"
+    },
+    "jit_deopt:case_del_then_read": {
+      "kind": "diff",
+      "interp": "CASE case_del_then_read EXC UnboundLocalError: cannot access local variable 'x' where it is not associated with a value @case_del_then_read+3",
+      "jit_deopt": "CASE case_del_then_read EXC SystemError: <function case_del_then_read at 0xffffadae1300> returned NULL without setting an exception @main+47"
+    },
+    "jit_deopt:case_fstring_unbound": {
+      "kind": "diff",
+      "interp": "CASE case_fstring_unbound EXC UnboundLocalError: cannot access local variable 'name' where it is not associated with a value @case_fstring_unbound+3",
+      "jit_deopt": "CASE case_fstring_unbound CRASH exit=-11"
+    },
+    "jit_deopt:case_loop_var_zero_iterations": {
+      "kind": "diff",
+      "interp": "CASE case_loop_var_zero_iterations EXC UnboundLocalError: cannot access local variable 'item' where it is not associated with a value @case_loop_var_zero_iterations+3",
+      "jit_deopt": "CASE case_loop_var_zero_iterations EXC SystemError: <function case_loop_var_zero_iterations at 0xffffb6ab28e0> returned NULL without setting an exception @main+47"
+    },
+    "jit_deopt:case_match_no_capture": {
+      "kind": "diff",
+      "interp": "CASE case_match_no_capture EXC UnboundLocalError: cannot access local variable 'captured' where it is not associated with a value @case_match_no_capture+5",
+      "jit_deopt": "CASE case_match_no_capture EXC RuntimeError: MATCH_CLASS is not supported by the stock Python 3.11 CinderX fallback @case_match_no_capture+3"
+    },
+    "jit_deopt:case_read_before_assign": {
+      "kind": "diff",
+      "interp": "CASE case_read_before_assign EXC UnboundLocalError: cannot access local variable 'x' where it is not associated with a value @case_read_before_assign+3",
+      "jit_deopt": "CASE case_read_before_assign EXC SystemError: <function case_read_before_assign at 0xffffb6ab1260> returned NULL without setting an exception @main+47"
+    },
+    "jit_deopt:case_return_expr_maybe_unbound": {
+      "kind": "diff",
+      "interp": "CASE case_return_expr_maybe_unbound EXC UnboundLocalError: cannot access local variable 'result' where it is not associated with a value @case_return_expr_maybe_unbound+4",
+      "jit_deopt": "CASE case_return_expr_maybe_unbound EXC SystemError: <function case_return_expr_maybe_unbound at 0xffffb6ab2ac0> returned NULL without setting an exception @main+47"
+    },
+    "jit_deopt:case_walrus_dead_branch": {
+      "kind": "diff",
+      "interp": "CASE case_walrus_dead_branch EXC UnboundLocalError: cannot access local variable 'w' where it is not associated with a value @case_walrus_dead_branch+3",
+      "jit_deopt": "CASE case_walrus_dead_branch EXC SystemError: <function case_walrus_dead_branch at 0xffffb6ab2f20> returned NULL without setting an exception @main+47"
+    },
+    "jit_deopt:case_while_else_unbound": {
+      "kind": "diff",
+      "interp": "CASE case_while_else_unbound EXC UnboundLocalError: cannot access local variable 'y' where it is not associated with a value @case_while_else_unbound+7",
+      "jit_deopt": "CASE case_while_else_unbound CRASH exit=-6"
+    }
+  }
+}

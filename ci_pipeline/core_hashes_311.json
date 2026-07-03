@@ -20,9 +20,9 @@
     "cinderx/Interpreter/3.11/extract_ceval_extras.py": "fc6ad6745fd2ee02907727251800d1af72853742483f951de46b1c553a3ea2f2",
     "cinderx/Interpreter/3.11/interpreter.c": "4d2b6df7f9b8ac7b01cb61d41aaf4c88fc8147e45d123375dfa9dbe99895fea3",
     "cinderx/PythonLib/opcodes/3.11/opcode.py": "ee10cdee637396c2a5d15aef53232cfa5792bd96fd2ae6356661a2ba14ccfd72",
-    "cinderx/UpstreamBorrow/borrowed-3.11-fallback.c": "6cb1d78659994f0e5d30f864e960c268348b5c2ff02cd3ff24a4b69a4530f684"
+    "cinderx/UpstreamBorrow/borrowed-3.11-fallback.c": "23d6480dd7c0cb44f02556abbf0a00e244e6f3d08d965ababc1b8e60fb9fd9d4"
   },
-  "generated_utc": "2026-07-03T17:33:52+00:00",
+  "generated_utc": "2026-07-03T18:01:01+00:00",
   "patterns": [
     "cinderx/Interpreter/3.11/**/*",
     "cinderx/PythonLib/opcodes/3.11/opcode.py",
