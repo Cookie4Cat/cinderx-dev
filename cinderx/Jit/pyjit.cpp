@@ -70,6 +70,11 @@
 
 using namespace jit;
 
+#if PY_VERSION_HEX < 0x030C0000
+// vendored 循环 [P4] 的解释器默认入口镜像；定义见本文件尾。
+extern "C" void* Ci_StockEntry311;
+#endif
+
 namespace {
 
 constexpr uint32_t kAutoJitInterpretOnlyThreshold = 65536;
@@ -4485,7 +4490,15 @@ int initialize() {
       if (Ci_InitFrameEvalFunc() < 0) {
         return -1;
       }
+#if PY_VERSION_HEX < 0x030C0000
+      // 3.11 计数式 auto 由 vendored 循环 [P3] 帧压栈钩子驱动（存量与
+      // 新建函数在执行时被统一计数），不做启动期存量函数入口安装，
+      // 避免双机制并存。
+      Ci_StockEntry311 =
+          reinterpret_cast<void*>(Ci_PyFunction_Vectorcall);
+#else
       schedule_existing_functions_for_jit(*compile_n);
+#endif
     }
   } else if (mod_state->jit_list.get() != nullptr) {
     if (rescheduleJitList() < 0) {
@@ -5099,31 +5112,48 @@ Result compilePreloaderImpl(
 } // namespace jit
 
 #if PY_VERSION_HEX < 0x030C0000
-// 3.11 无 function watcher，函数创建时无法回调安装 auto-JIT 入口。
-// 求值器（Interpreter/3.11/interpreter.c 的 Ci_EvalFrame）在函数首次以
-// 解释方式进入时调用本桥接完成惰性接线。预演版语义：首次解释执行时
-// 安装强制编译入口，函数第二次被调用即编译（等效 PYTHONJITAUTO=2）。
-// 不采用 jitVectorcall 计数入口的原因：其阈值计数依赖 CodeExtra，而
-// CodeExtra 在 3.14 经 code watcher 于代码对象创建时分配，3.11 无
-// watcher 则计数恒为零、永不达阈值——按需分配 CodeExtra 属正式 M9
-// 接线范围。仅当槽位仍为解释器默认入口时安装，不覆盖已编译入口、
-// 递归守卫包装或强制编译入口。
-extern "C" int Ci_MaybeInstallAutoJitEntry311(PyFunctionObject* func) {
+// 解释器默认 vectorcall 入口的 void* 镜像，供 vendored 循环 [P4] 特化
+// 调用的按被调方判定使用（见 cinderx_ceval.c 台账）。initialize() 赋值；
+// 为空时 [P4] 恒 DEOPT，退回一刀切语义（fail-safe）。
+extern "C" void* Ci_StockEntry311 = nullptr;
+
+// [P3] 帧压栈计数钩子（vendored 循环 start_frame 处调用）：计数式
+// auto-JIT 的 3.11 实现。CodeExtra 由 codeExtra() 按需分配（3.14 经
+// code watcher 于创建时分配，3.11 无 watcher）。阈值到达即编译，编译
+// 失败则停用该 code 的 auto，避免反复尝试。计数覆盖所有解释执行入口
+// （vectorcall 与特化 CALL 内联压栈）。
+extern "C" void Ci_AutoJitCountFramePush311(
+    PyThreadState* /* tstate */,
+    _PyInterpreterFrame* frame) {
+  auto limit = jit::getConfig().compile_after_n_calls;
+  if (!limit.has_value()) {
+    return;
+  }
+  PyFunctionObject* func = frame->f_func;
   if (func == nullptr || !jit::isJitUsable()) {
-    return 0;
+    return;
   }
-  if (!jit::getConfig().compile_after_n_calls.has_value()) {
-    return 0;
+  BorrowedRef<PyCodeObject> code{frame->f_code};
+  if (!jit::ci_autoJit311AllowsCode(code)) {
+    return;
   }
-  if (func->vectorcall != getInterpretedVectorcall(func)) {
-    return 0;
+  CodeExtra* extra = codeExtra(code);
+  if (extra == nullptr) {
+    PyErr_Clear();
+    return;
   }
-  // 预演范围阀：见 ci_autoJit311AllowsCode 处注释。
-  if (!jit::ci_autoJit311AllowsCode(
-          reinterpret_cast<PyCodeObject*>(func->func_code))) {
-    return 0;
+  if (Ci_code_extra_auto_jit_disabled(extra)) {
+    return;
   }
-  setVectorcall(func, forcedJitVectorcall);
-  return 1;
+  Ci_code_extra_incr_calls(extra);
+  if (Ci_code_extra_get_calls(extra) != *limit) {
+    return;
+  }
+  if (isJitCompiled(func)) {
+    return;
+  }
+  if (jit::compileFunction(func) != jit::Result::OK) {
+    Ci_code_extra_disable_auto_jit(extra);
+  }
 }
 #endif

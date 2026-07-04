@@ -1700,6 +1700,8 @@ _PyEval_EvalFrameDefault(PyThreadState *tstate, _PyInterpreterFrame *frame, int 
 
 
 start_frame:
+    /* [P3] auto-JIT frame-push counting; see cinderx_ceval.c ledger. */
+    Ci_AutoJitCountFramePush311(tstate, frame);
     if (_Py_EnterRecursiveCallTstate(tstate, "")) {
         tstate->recursion_remaining--;
         goto exit_unwind;
@@ -4826,13 +4828,14 @@ handle_eval_breaker:
 
         TARGET(CALL_PY_EXACT_ARGS) {
             assert(call_shape.kwnames == NULL);
-            DEOPT_IF(tstate->interp->eval_frame, CALL);
             _PyCallCache *cache = (_PyCallCache *)next_instr;
             int is_meth = is_method(stack_pointer, oparg);
             int argcount = oparg + is_meth;
             PyObject *callable = PEEK(argcount + 1);
             DEOPT_IF(!PyFunction_Check(callable), CALL);
             PyFunctionObject *func = (PyFunctionObject *)callable;
+            /* [P4] callee-aware deopt; see cinderx_ceval.c ledger. */
+            DEOPT_IF((void *)func->vectorcall != Ci_StockEntry311, CALL);
             DEOPT_IF(func->func_version != read_u32(cache->func_version), CALL);
             PyCodeObject *code = (PyCodeObject *)func->func_code;
             DEOPT_IF(code->co_argcount != argcount, CALL);
@@ -4860,13 +4863,14 @@ handle_eval_breaker:
 
         TARGET(CALL_PY_WITH_DEFAULTS) {
             assert(call_shape.kwnames == NULL);
-            DEOPT_IF(tstate->interp->eval_frame, CALL);
             _PyCallCache *cache = (_PyCallCache *)next_instr;
             int is_meth = is_method(stack_pointer, oparg);
             int argcount = oparg + is_meth;
             PyObject *callable = PEEK(argcount + 1);
             DEOPT_IF(!PyFunction_Check(callable), CALL);
             PyFunctionObject *func = (PyFunctionObject *)callable;
+            /* [P4] callee-aware deopt; see cinderx_ceval.c ledger. */
+            DEOPT_IF((void *)func->vectorcall != Ci_StockEntry311, CALL);
             DEOPT_IF(func->func_version != read_u32(cache->func_version), CALL);
             PyCodeObject *code = (PyCodeObject *)func->func_code;
             DEOPT_IF(argcount > code->co_argcount, CALL);
