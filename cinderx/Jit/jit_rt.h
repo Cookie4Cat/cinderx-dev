@@ -673,3 +673,23 @@ void JITRT_TreeIterLeaveCurrentNode(jit::GenDataFooter* footer);
 // Release all owned refs in tree_iter_state and set footer->tree_iter_state
 // to nullptr.  Idempotent.
 void JITRT_ClearTreeIterState(jit::GenDataFooter* footer);
+
+namespace jit {
+
+// M6 异常注入 fuzz（count-then-inject，JSC exception-fuzz 同款）。
+// 环境变量 CI_EXC_INJECT 控制：
+//   CI_EXC_INJECT=count  仅统计检查点总数，进程退出时向 stderr 输出
+//                        CI_EXC_INJECT_TOTAL=<n>；
+//   CI_EXC_INJECT=<n>    在第 n 个（1 起）检查点处合成 RuntimeError 并令
+//                        helper 走失败路径。
+// 检查点=可返回 NULL 的高频运行时入口（调用族 JITRT_Call/Vectorcall/
+// VectorcallPythonFunction）以及 LIR 发射期按开关替换的 C-API 垫片
+// （LoadAttr/BinaryOp，见 lir/generator.cpp）。未设置环境变量时仅有一次
+// 全局布尔判断的开销。
+bool excInjectEnabled();
+
+// 计数并判定当前检查点是否注入；注入时已设置异常，调用方应立即走
+// 失败返回路径。
+bool excInjectFire();
+
+} // namespace jit

@@ -67,6 +67,24 @@ namespace jit::lir {
 
 namespace {
 
+// M6 异常注入 fuzz：LoadAttr/BinaryOp 的检查点垫片。这两类操作把 C-API
+// 指针直接烘焙进生成码，无运行时 helper 可挂钩，故在 LIR 发射期按
+// CI_EXC_INJECT 开关替换为对应垫片（协议见 jit_rt.h）。
+template <binaryfunc F>
+PyObject* excInjectBinary(PyObject* left, PyObject* right) {
+  if (jit::excInjectFire()) {
+    return nullptr;
+  }
+  return F(left, right);
+}
+
+PyObject* excInjectGetAttr(PyObject* base, PyObject* name) {
+  if (jit::excInjectFire()) {
+    return nullptr;
+  }
+  return PyObject_GetAttr(base, name);
+}
+
 #ifndef Py_GIL_DISABLED
 constexpr size_t kRefcountOffset = offsetof(PyObject, ob_refcnt);
 #endif
@@ -2810,7 +2828,11 @@ LIRGenerator::TranslatedBlock LIRGenerator::TranslateOneBasicBlock(
         hir::Register* dst = instr->output();
         hir::Register* base = instr->GetOperand(0);
         Instruction* name = getNameFromIdx(bbb, instr);
-        bbb.appendCallInstruction(dst, PyObject_GetAttr, base, name);
+        bbb.appendCallInstruction(
+            dst,
+            excInjectEnabled() ? excInjectGetAttr : PyObject_GetAttr,
+            base,
+            name);
         break;
       }
       case Opcode::kLoadAttrCached: {
@@ -3038,6 +3060,26 @@ LIRGenerator::TranslatedBlock LIRGenerator::TranslateOneBasicBlock(
             PyNumber_TrueDivide,
             PyNumber_Xor,
         };
+        // 异常注入垫片表，与 helpers 顺序一致（Power 为三元操作，维持
+        // 原实现不注入）。
+        static const binaryfunc inject_helpers[] = {
+            excInjectBinary<PyNumber_Add>,
+            excInjectBinary<PyNumber_And>,
+            excInjectBinary<PyNumber_FloorDivide>,
+            excInjectBinary<PyNumber_Lshift>,
+            excInjectBinary<PyNumber_MatrixMultiply>,
+            excInjectBinary<PyNumber_Remainder>,
+            excInjectBinary<PyNumber_Multiply>,
+            excInjectBinary<PyNumber_Or>,
+            nullptr, // PyNumber_Power is a ternary op.
+            excInjectBinary<PyNumber_Rshift>,
+            excInjectBinary<PyObject_GetItem>,
+            excInjectBinary<PyNumber_Subtract>,
+            excInjectBinary<PyNumber_TrueDivide>,
+            excInjectBinary<PyNumber_Xor>,
+        };
+        static_assert(sizeof(inject_helpers) == sizeof(helpers));
+
         JIT_CHECK(
             static_cast<unsigned long>(bin_op->op()) < sizeof(helpers),
             "unsupported binop");
@@ -3046,7 +3088,8 @@ LIRGenerator::TranslatedBlock LIRGenerator::TranslateOneBasicBlock(
         if (bin_op->op() != BinaryOpKind::kPower) {
           bbb.appendCallInstruction(
               bin_op->output(),
-              helpers[op_kind],
+              excInjectEnabled() ? inject_helpers[op_kind]
+                                 : helpers[op_kind],
               bin_op->left(),
               bin_op->right());
         } else {
@@ -3986,7 +4029,7 @@ LIRGenerator::TranslatedBlock LIRGenerator::TranslateOneBasicBlock(
               instr->output(),
               Instruction::kCall,
               Imm{reinterpret_cast<uint64_t>(
-                  JITRT_GET_STATIC_ENTRY(func->vectorcall))});
+                  JITRT_GET_STATIC_ENTRY(jitVectorcallEntryBase(func)))});
         } else {
           void** indir = env_->ctx->findFunctionEntryCache(func);
           env_->function_indirections.emplace(func, indir);

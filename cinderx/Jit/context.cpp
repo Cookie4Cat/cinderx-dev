@@ -2,6 +2,7 @@
 
 #include "cinderx/Jit/context.h"
 
+#include "internal/pycore_ceval.h"
 #include "internal/pycore_interp.h"
 #include "internal/pycore_object.h"
 #include "internal/pycore_pystate.h"
@@ -14,6 +15,7 @@
 #include "cinderx/Jit/config.h"
 #include "cinderx/Jit/elf/reader.h"
 #include "cinderx/StaticPython/classloader.h"
+#include "cinderx/module_c_state.h"
 #include "cinderx/module_state.h"
 #include "cinderx/python_runtime.h"
 
@@ -448,6 +450,62 @@ void Context::finalizeMultiThreadedCompile() {
   deferred_finalizations_.clear();
 }
 
+#if PY_VERSION_HEX < 0x030C0000
+// 3.11：编译后代码不经过 _PyEval_EvalFrameDefault 入口，因此绕开了解释器
+// 在该入口执行的递归深度检查（tstate->recursion_remaining），深层 JIT 递归
+// 会直接耗尽 C 栈（SIGSEGV 而非 RecursionError）。编译函数的 vectorcall
+// 入口经此包装补齐与解释器一致的计数与检查。prologue 级检查需要帧链接前
+// 的错误出口，当前代码生成层没有该路径；生成器 resume 路径不经 vectorcall，
+// 仍不在保护范围内（见 M6 预演日志）。
+static PyObject* recursionGuardedVectorcall(
+    PyObject* func_obj,
+    PyObject* const* stack,
+    size_t nargsf,
+    PyObject* kwnames) {
+  PyThreadState* tstate = PyThreadState_GET();
+  BorrowedRef<PyFunctionObject> func{func_obj};
+  // D8 tracing pause（预演版）：tracing/profiling 激活期间新调用一律进入
+  // 解释器（生成码不产生 trace 事件）。已在栈上的 JIT 帧不受影响；解释器
+  // 入口自带递归计数，此路径不重复计数。
+  if (tstate->cframe->use_tracing) {
+    return getInterpretedVectorcall(func)(func_obj, stack, nargsf, kwnames);
+  }
+  if (_Py_EnterRecursiveCallTstate(tstate, "")) {
+    return nullptr;
+  }
+  PyObject* result;
+  if (CompiledFunction* compiled =
+          getContext() != nullptr ? getContext()->lookupFunc(func) : nullptr) {
+    result = compiled->vectorcallEntry()(func_obj, stack, nargsf, kwnames);
+  } else {
+    // 安装与调用之间函数被去优化：退回解释器入口。
+    result = getInterpretedVectorcall(func)(func_obj, stack, nargsf, kwnames);
+  }
+  _Py_LeaveRecursiveCallTstate(tstate);
+  return result;
+}
+#endif
+
+bool isRecursionGuardVectorcall(vectorcallfunc entry) {
+#if PY_VERSION_HEX < 0x030C0000
+  return entry == recursionGuardedVectorcall;
+#else
+  (void)entry;
+  return false;
+#endif
+}
+
+vectorcallfunc jitVectorcallEntryBase(BorrowedRef<PyFunctionObject> func) {
+#if PY_VERSION_HEX < 0x030C0000
+  if (Context* ctx = getContext()) {
+    if (CompiledFunction* compiled = ctx->lookupFunc(func)) {
+      return compiled->vectorcallEntry();
+    }
+  }
+#endif
+  return func->vectorcall;
+}
+
 bool Context::finalizeFunc(
     BorrowedRef<PyFunctionObject> func,
     BorrowedRef<CompiledFunction> compiled) {
@@ -462,7 +520,11 @@ bool Context::finalizeFunc(
   // In case the function had previously been deopted.
   removeDeoptedFunc(func);
 
+#if PY_VERSION_HEX < 0x030C0000
+  setVectorcall(func, recursionGuardedVectorcall);
+#else
   setVectorcall(func, compiled->vectorcallEntry());
+#endif
   if (hasFunctionEntryCache(func)) {
     void** indirect = findFunctionEntryCache(func);
     *indirect = compiled->staticEntry();
