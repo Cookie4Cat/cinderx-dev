@@ -1362,6 +1362,16 @@ void NativeGenerator::emitAarch64LoadMethodInvokeStub(
   as_->bind(env_.load_method_invoke_stub);
 
   // x0=cache, x1=obj, x2=name
+  if (getConfig().collect_attr_cache_stats) {
+    // 计数模式专用：stub 入口总数（GIL 下普通读改写即可；快路径命中数
+    // = 该值 − lm_helper）。非计数模式不发射，零开销。
+    as_->mov(
+        a64::x12,
+        reinterpret_cast<uint64_t>(&g_ic_runtime_stats.lm_stub_entries));
+    as_->ldr(a64::x11, arch::ptr_offset(a64::x12, 0));
+    as_->add(a64::x11, a64::x11, 1);
+    as_->str(a64::x11, arch::ptr_offset(a64::x12, 0));
+  }
   as_->ldr(a64::x11, arch::ptr_offset(a64::x1, kObTypeOffset));
 
   auto emit_entry = [&](uint32_t entry_index, Label next_entry) {
@@ -1487,6 +1497,16 @@ void NativeGenerator::emitAarch64LoadAttrInvokeStub(
   as_->bind(env_.load_attr_invoke_stub);
 
   // x0=cache, x1=obj, x2=name
+  if (getConfig().collect_attr_cache_stats) {
+    // 计数模式专用：stub 入口总数（GIL 下普通读改写即可；快路径命中数
+    // = 该值 − la_invoke）。非计数模式不发射，零开销。
+    as_->mov(
+        a64::x12,
+        reinterpret_cast<uint64_t>(&g_ic_runtime_stats.la_stub_entries));
+    as_->ldr(a64::x11, arch::ptr_offset(a64::x12, 0));
+    as_->add(a64::x11, a64::x11, 1);
+    as_->str(a64::x11, arch::ptr_offset(a64::x12, 0));
+  }
   as_->ldr(a64::x11, arch::ptr_offset(a64::x1, kObTypeOffset));
 
   auto emit_load_attr_entry = [&](uint32_t entry_index, Label next_entry) {

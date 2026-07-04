@@ -20,6 +20,7 @@
 #include "cinderx/Jit/context.h"
 #include "cinderx/Jit/frame.h"
 #include "cinderx/Jit/generators_rt.h"
+#include "cinderx/Jit/inline_cache.h"
 // NOLINTNEXTLINE(facebook-unused-include-check)
 #include "cinderx/Immortalize/immortalize.h"
 #include "cinderx/StaticPython/classloader.h"
@@ -1313,6 +1314,7 @@ PyObject* JITRT_LoadAttrInstanceValueOrGeneric(
     uint32_t type_version,
     Py_ssize_t index) {
 #if PY_VERSION_HEX < 0x030C0000
+  jit::incICStat(jit::g_ic_runtime_stats.lavog_calls);
   PyTypeObject* type = Py_TYPE(obj);
   if (type->tp_version_tag == type_version &&
       PyType_HasFeature(type, Py_TPFLAGS_MANAGED_DICT)) {
@@ -1320,11 +1322,13 @@ PyObject* JITRT_LoadAttrInstanceValueOrGeneric(
     if (values != nullptr) {
       PyObject* value = values->values[index];
       if (value != nullptr) {
+        jit::incICStat(jit::g_ic_runtime_stats.lavog_values_hit);
         Py_INCREF(value);
         return value;
       }
     }
   }
+  jit::incICStat(jit::g_ic_runtime_stats.lavog_generic);
 #else
   (void)type_version;
   (void)index;

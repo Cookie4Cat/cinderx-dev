@@ -214,6 +214,27 @@ class AttributeCache {
   void
   fill(BorrowedRef<PyTypeObject> type, BorrowedRef<> name, BorrowedRef<> descr);
 
+#if PY_VERSION_HEX < 0x030C0000
+  // 3.11 站点扩展：承接 fill 因 tp_getattro 非泛型而拒绝的两类高频
+  // 接收者（IC 计数轮站点归属：模块属性如 math.sqrt、无 __get__ 的
+  // 纯类变量如求解器方向/强度常量）。单槽，首个稳定形态占据。
+  //  - kModule：值借引用 + 模块 dict 版本（Ci_DictVersionTag，任何
+  //    字典变更即失效）拉式验证；
+  //  - kTypeAttr：值借引用 + tp_version_tag（VALID 标志）拉式验证，
+  //    MRO 任意层变更经 PyType_Modified 传播失效。
+  // 两个版本号发号器全局单调不复用：容器对象亡后即使地址复用，指针
+  // 相等而版本必不相等，借引用在版本校验通过前不被解引用（D9）。
+  enum class SiteExtKind : uint8_t { kNone, kModule, kTypeAttr };
+
+  PyObject* siteExtGetAttr(PyObject* obj);
+  void siteExtTryFill(PyObject* obj, PyObject* name, PyObject* result);
+
+  BorrowedRef<> site_container_;
+  BorrowedRef<> site_value_;
+  uint64_t site_version_{0};
+  SiteExtKind site_kind_{SiteExtKind::kNone};
+#endif
+
   AttributeMutator entries_[0];
 };
 
@@ -327,6 +348,47 @@ struct CacheStats {
   std::string method_name;
   std::unordered_map<std::string, CacheMiss> misses;
 };
+
+// IC 快慢路径全局计数器（PYTHONJITCOLLECTINLINECACHESTATS 门控，经
+// cinderjit.get_and_clear_inline_cache_stats() 的 "globals" 段导出）。
+// *_stub_entries 由 aarch64 内联 stub 在计数模式下直增（计数指令仅在
+// 计数模式下发射，GIL 持有期间普通读改写即可）；其余计数在 C++ helper
+// 内自增。语义：stub 命中数 = stub_entries − 对应 helper 进入数。
+struct ICRuntimeStats {
+  uint64_t la_stub_entries{0};
+  uint64_t lm_stub_entries{0};
+  std::atomic<uint64_t> la_invoke{0};
+  std::atomic<uint64_t> la_entry_hit{0};
+  std::atomic<uint64_t> la_split_values_hit{0};
+  std::atomic<uint64_t> la_split_materialized{0};
+  std::atomic<uint64_t> la_site_module_hit{0};
+  std::atomic<uint64_t> la_site_type_hit{0};
+  std::atomic<uint64_t> la_slow{0};
+  std::atomic<uint64_t> lavog_calls{0};
+  std::atomic<uint64_t> lavog_values_hit{0};
+  std::atomic<uint64_t> lavog_generic{0};
+  std::atomic<uint64_t> lm_helper{0};
+  std::atomic<uint64_t> lm_scan_hit{0};
+  std::atomic<uint64_t> lm_version_fail{0};
+  std::atomic<uint64_t> lm_keys_fail{0};
+  std::atomic<uint64_t> lm_slow{0};
+  std::atomic<uint64_t> lm_fill{0};
+  std::atomic<uint64_t> sa_invoke{0};
+  std::atomic<uint64_t> sa_entry_hit{0};
+  std::atomic<uint64_t> sa_slow{0};
+};
+
+extern ICRuntimeStats g_ic_runtime_stats;
+
+// la_slow 站点归属直方图（计数模式专用；键 = 接收者类型.属性名，
+// 随 get_and_clear_inline_cache_stats() 导出并清空）。
+std::unordered_map<std::string, uint64_t>& icSlowSiteHistogram();
+
+inline void incICStat(std::atomic<uint64_t>& counter) {
+  if (getConfig().collect_attr_cache_stats) {
+    counter.fetch_add(1, std::memory_order_relaxed);
+  }
+}
 
 class LoadMethodCache {
  public:

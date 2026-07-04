@@ -156,6 +156,23 @@ void maybeCollectCacheStats(
 
 } // namespace
 
+ICRuntimeStats g_ic_runtime_stats;
+
+// la_slow 站点归属直方图（计数模式专用；键 = 接收者类型.属性名）。
+std::unordered_map<std::string, uint64_t>& icSlowSiteHistogram() {
+  static std::unordered_map<std::string, uint64_t> histogram;
+  return histogram;
+}
+
+static void recordICSlowSite(BorrowedRef<> obj, BorrowedRef<> name) {
+  if (!getConfig().collect_attr_cache_stats) {
+    return;
+  }
+  std::string key = fmt::format(
+      "{}.{}", Py_TYPE(obj.get())->tp_name, PyUnicode_AsUTF8(name));
+  icSlowSiteHistogram()[key]++;
+}
+
 void AttributeMutator::changeKindFromSplitInline(
     SplitMutator* split,
     Kind new_kind) {
@@ -450,9 +467,42 @@ static inline PyDictValues* ci_inline_values_311(PyObject* obj) {
       reinterpret_cast<char*>(obj) - 4 * sizeof(PyObject*));
 }
 
-// 3.11：写侧维持通用协议（值槽插入需要 _PyDictValues_AddToInsertionOrder
-// 等内部配套；收益集中在读侧，写侧优化为后续项）。
+// 3.11 写侧覆写快路径（IC 计数轮：richards/raytrace 每窗口数百万次
+// STORE_ATTR 全部落在既有值槽覆写）。等价于 stock
+// STORE_ATTR_INSTANCE_VALUE 的 old != NULL 分支：values 形态实例无
+// 独立字典对象、无版本号可失效，直接槽位替换。新属性插入（槽位空，
+// 需 _PyDictValues_AddToInsertionOrder 插入序记录）与物化实例回退
+// 通用协议。有效性前提同读侧：调用方 matches() 已做 tp_version_tag
+// 拉式校验，共享键容量固定故 val_offset 恒在实例 values 容量内。
 int SplitMutator::setAttr(PyObject* obj, PyObject* name, PyObject* value) {
+  if (ensureValueOffset(name)) {
+    PyDictValues* values = ci_inline_values_311(obj);
+    if (values != nullptr) {
+      PyObject* old = values->values[val_offset];
+      if (old != nullptr) {
+        Py_INCREF(value);
+        values->values[val_offset] = value;
+        Py_DECREF(old);
+        return 0;
+      }
+      // 插入分支：镜像 stock STORE_ATTR_INSTANCE_VALUE 的 old == NULL
+      // 路径（值写入 + 插入序记录）。_PyDictValues_AddToInsertionOrder
+      // 为内部符号不可链接，此处按 vendored 3.11.6 的 values 预头布局
+      // 逐字复刻：[-1]=容量、[-2]=已插入数、[-2-size]=插入序字节。
+      // 容量保护与 stock 的 assert 同判据，越界回退通用协议（该形态
+      // 意味着实例应物化，交由 PyObject_SetAttr 处理）。
+      uint8_t* size_ptr = reinterpret_cast<uint8_t*>(values) - 2;
+      int size = *size_ptr;
+      if (size + 2 < reinterpret_cast<uint8_t*>(values)[-1]) {
+        size++;
+        size_ptr[-size] = static_cast<uint8_t>(val_offset);
+        *size_ptr = size;
+        Py_INCREF(value);
+        values->values[val_offset] = value;
+        return 0;
+      }
+    }
+  }
   return PyObject_SetAttr(obj, name, value);
 }
 
@@ -481,12 +531,14 @@ PyObject* SplitMutator::getAttrInlineKnownOffset(
   PyDictValues* values = ci_inline_values_311(obj);
   if (values == nullptr) {
     // 实例字典已物化，回退通用协议（正确优先；物化实例为少数形态）。
+    incICStat(g_ic_runtime_stats.la_split_materialized);
     return PyObject_GetAttr(obj, name);
   }
   PyObject* result = values->values[val_offset];
   if (result == nullptr) {
     return raise_attribute_error(obj, name);
   }
+  incICStat(g_ic_runtime_stats.la_split_values_hit);
   Py_INCREF(result);
   return result;
 }
@@ -917,12 +969,14 @@ int StoreAttrCache::invoke(
 }
 
 int StoreAttrCache::doInvoke(PyObject* obj, PyObject* name, PyObject* value) {
+  incICStat(g_ic_runtime_stats.sa_invoke);
   BorrowedRef<PyTypeObject> tp = Py_TYPE(obj);
   for (auto& entry : entries()) {
     if (entry.type() != tp) {
       continue;
     }
     if (entry.matches(tp)) {
+      incICStat(g_ic_runtime_stats.sa_entry_hit);
       return entry.setAttr(obj, name, value);
     }
     // 类型指针相同但版本失效：该条目不可能再次命中（版本号单调递增），
@@ -935,6 +989,7 @@ int StoreAttrCache::doInvoke(PyObject* obj, PyObject* name, PyObject* value) {
 
 int __attribute__((noinline))
 StoreAttrCache::invokeSlowPath(PyObject* obj, PyObject* name, PyObject* value) {
+  incICStat(g_ic_runtime_stats.sa_slow);
   int result = PyObject_SetAttr(obj, name, value);
   if (result < 0) {
     JIT_DCHECK(
@@ -957,12 +1012,14 @@ LoadAttrCache::invoke(LoadAttrCache* cache, PyObject* obj, PyObject* name) {
 }
 
 PyObject* LoadAttrCache::doInvoke(PyObject* obj, PyObject* name) {
+  incICStat(g_ic_runtime_stats.la_invoke);
   PyTypeObject* tp = Py_TYPE(obj);
   for (auto& entry : entries()) {
     if (entry.type() != tp) {
       continue;
     }
     if (entry.matches(tp)) {
+      incICStat(g_ic_runtime_stats.la_entry_hit);
       return entry.getAttr(obj, name);
     }
     // 类型指针相同但版本失效：该条目不可能再次命中（版本号单调递增），
@@ -970,12 +1027,19 @@ PyObject* LoadAttrCache::doInvoke(PyObject* obj, PyObject* name) {
     entry.reset();
     break;
   }
+#if PY_VERSION_HEX < 0x030C0000
+  if (PyObject* result = siteExtGetAttr(obj)) {
+    return result;
+  }
+#endif
   return invokeSlowPath(obj, name);
 }
 
 PyObject* __attribute__((noinline)) LoadAttrCache::invokeSlowPath(
     PyObject* obj,
     PyObject* name) {
+  incICStat(g_ic_runtime_stats.la_slow);
+  recordICSlowSite(obj, name);
   auto result = Ref<>::steal(PyObject_GetAttr(obj, name));
   if (result == nullptr) {
     JIT_DCHECK(
@@ -988,6 +1052,11 @@ PyObject* __attribute__((noinline)) LoadAttrCache::invokeSlowPath(
   if (type->tp_getattro == PyObject_GenericGetAttr) {
     fill(type, name);
   }
+#if PY_VERSION_HEX < 0x030C0000
+  else {
+    siteExtTryFill(obj, name, result);
+  }
+#endif
 
   return result.release();
 }
@@ -1250,6 +1319,7 @@ bool isValidKeysVersion(uint32_t keys_version, BorrowedRef<> obj) {
 LoadMethodResult LoadMethodCache::lookup(
     BorrowedRef<> obj,
     BorrowedRef<> name) {
+  incICStat(g_ic_runtime_stats.lm_helper);
   BorrowedRef<PyTypeObject> tp = Py_TYPE(obj);
 
   for (auto& entry : entries_) {
@@ -1259,15 +1329,18 @@ LoadMethodResult LoadMethodCache::lookup(
       // 失效条目立即清空（不触碰其中借引用，D9）。
       if (!Ci_Type_HasValidVersionTag(tp) ||
           tp->tp_version_tag != entry.type_version) {
+        incICStat(g_ic_runtime_stats.lm_version_fail);
         entry.type.reset();
         entry.value.reset();
         continue;
       }
 #endif
       if (!isValidKeysVersion(entry.keys_version, obj)) {
+        incICStat(g_ic_runtime_stats.lm_keys_fail);
         continue;
       }
 
+      incICStat(g_ic_runtime_stats.lm_scan_hit);
       PyObject* result = entry.value;
       Py_INCREF(result);
       Py_INCREF(obj);
@@ -1275,6 +1348,7 @@ LoadMethodResult LoadMethodCache::lookup(
     }
   }
 
+  incICStat(g_ic_runtime_stats.lm_slow);
   return lookupSlowPath(obj, name);
 }
 
@@ -1412,6 +1486,7 @@ void LoadMethodCache::fill(
       }
 
       lm_watcher.watch(type, this);
+      incICStat(g_ic_runtime_stats.lm_fill);
       entry.type = type;
       entry.value = value;
       entry.keys_version = keys_version;
@@ -1725,6 +1800,73 @@ PyObject* __attribute__((noinline)) LoadModuleAttrCache::lookupSlowPath(
   auto generic = Ref<>::steal(PyObject_GetAttr(object, name));
   return generic == nullptr ? nullptr : generic.release();
 }
+
+#if PY_VERSION_HEX < 0x030C0000
+
+PyObject* AttributeCache::siteExtGetAttr(PyObject* obj) {
+  switch (site_kind_) {
+    case SiteExtKind::kModule:
+      if (obj == site_container_ && site_value_ != nullptr &&
+          site_version_ == getModuleVersion(BorrowedRef<>{obj})) {
+        incICStat(g_ic_runtime_stats.la_site_module_hit);
+        return Py_NewRef(site_value_);
+      }
+      break;
+    case SiteExtKind::kTypeAttr:
+      if (obj == site_container_ && site_value_ != nullptr) {
+        auto tp = reinterpret_cast<PyTypeObject*>(obj);
+        if (Ci_Type_HasValidVersionTag(tp) &&
+            tp->tp_version_tag == site_version_) {
+          incICStat(g_ic_runtime_stats.la_site_type_hit);
+          return Py_NewRef(site_value_);
+        }
+      }
+      break;
+    case SiteExtKind::kNone:
+      break;
+  }
+  return nullptr;
+}
+
+void AttributeCache::siteExtTryFill(
+    PyObject* obj,
+    PyObject* name,
+    PyObject* result) {
+  if (site_kind_ != SiteExtKind::kNone) {
+    // 单槽：已被占据。版本失效的旧形态由 siteExtGetAttr 未命中自然
+    // 落到本函数，允许同容器重填；异容器（站点多态）不抢占。
+    if (obj != site_container_) {
+      return;
+    }
+  }
+  if (PyModule_CheckExact(obj) || Ci_StrictModule_Check(obj)) {
+    auto [version, value] = getModuleAttribute(obj, name);
+    // 仅当泛型协议的返回与模块 dict 中的对象同一时才可缓存（排除
+    // __getattr__ 钩子、shadow 于类型侧的属性等变换形态）。
+    if (value != nullptr && value == result) {
+      site_container_ = obj;
+      site_value_ = value;
+      site_version_ = version;
+      site_kind_ = SiteExtKind::kModule;
+    }
+    return;
+  }
+  if (PyType_Check(obj)) {
+    auto tp = reinterpret_cast<PyTypeObject*>(obj);
+    PyObject* value = _PyType_Lookup(tp, name);
+    // 仅纯类变量：解析值无 __get__ 且泛型协议返回原对象（排除元类
+    // 数据描述符、classmethod/staticmethod/函数等描述符形态）。
+    if (value != nullptr && value == result &&
+        Py_TYPE(value)->tp_descr_get == nullptr && ensureVersionTag(tp)) {
+      site_container_ = obj;
+      site_value_ = value;
+      site_version_ = tp->tp_version_tag;
+      site_kind_ = SiteExtKind::kTypeAttr;
+    }
+  }
+}
+
+#endif // PY_VERSION_HEX < 0x030C0000
 
 LoadMethodResult LoadModuleMethodCache::lookupHelper(
     LoadModuleMethodCache* cache,
