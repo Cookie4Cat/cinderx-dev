@@ -2844,8 +2844,11 @@ LIRGenerator::TranslatedBlock LIRGenerator::TranslateOneBasicBlock(
         hir::Register* base = instr->GetOperand(0);
         Instruction* name = getNameFromIdx(bbb, instr);
         auto cache = getContext()->allocateLoadAttrCache();
-#if defined(CINDER_AARCH64) && PY_VERSION_HEX >= 0x030E0000 && \
-    !defined(Py_GIL_DISABLED)
+// 3.11 一并启用内联快路径 stub：条目命中改为 tp_version_tag 拉式校验
+// （无 type watcher 的 D5 语义，与 AttributeMutator::matches 一致），
+// values 形态经预头 -4 槽直读（M9 性能归因轮）。
+#if defined(CINDER_AARCH64) && !defined(Py_GIL_DISABLED) && \
+    (PY_VERSION_HEX >= 0x030E0000 || PY_VERSION_HEX < 0x030C0000)
         bbb.appendInstr(
             dst,
             Instruction::kLoadAttrCachedFastPath,
@@ -2974,8 +2977,23 @@ LIRGenerator::TranslatedBlock LIRGenerator::TranslateOneBasicBlock(
               PyUnicode_AsUTF8(code->co_filename),
               PyUnicode_AsUTF8(code->co_name));
         }
+// 3.11 方法缓存内联快路径 stub（M9 IC 内联轮）：条目命中含
+// tp_version_tag 拉式校验与共享键版本校验，返回 (callable, self)
+// 双寄存器对（x0/x1，与 LoadMethodResult ABI 一致）；未命中尾跳
+// lookupHelper。3.14 暂不启用（该线无既有方法 stub，另行评估）。
+#if defined(CINDER_AARCH64) && !defined(Py_GIL_DISABLED) && \
+    PY_VERSION_HEX < 0x030C0000
+        bbb.appendInstr(
+            dst,
+            Instruction::kLoadMethodCachedFastPath,
+            LoadMethodCache::lookupHelper,
+            cache,
+            base,
+            name);
+#else
         bbb.appendCallInstruction(
             dst, LoadMethodCache::lookupHelper, cache, base, name);
+#endif
         break;
       }
       case Opcode::kLoadModuleAttrCached: {

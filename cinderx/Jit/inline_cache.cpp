@@ -442,13 +442,53 @@ PyObject* SplitMutator::getAttr(PyObject* obj, PyObject* name) {
 }
 #else
 
-// 3.11：无 split-values 快路径，回退通用属性协议（慢但正确，门禁裁决行为）
+// 3.11 managed dict 预头双槽：-4 = PyDictValues*（非空即 values 形态），
+// -3 = PyDictObject*（物化后使用）。见 CPython 3.11
+// _PyObject_ValuesPointer / _PyObject_ManagedDictPointer。
+static inline PyDictValues* ci_inline_values_311(PyObject* obj) {
+  return *reinterpret_cast<PyDictValues**>(
+      reinterpret_cast<char*>(obj) - 4 * sizeof(PyObject*));
+}
+
+// 3.11：写侧维持通用协议（值槽插入需要 _PyDictValues_AddToInsertionOrder
+// 等内部配套；收益集中在读侧，写侧优化为后续项）。
 int SplitMutator::setAttr(PyObject* obj, PyObject* name, PyObject* value) {
   return PyObject_SetAttr(obj, name, value);
 }
 
+// 读侧 values 形态快路径（M9 性能归因轮，替换原全泛型占位）。有效性
+// 前提：调用方（AttributeMutator::matches）已做 tp_version_tag 拉式
+// 校验；3.11 共享键容量固定（不够用即整实例物化），val_offset 恒在
+// 实例 values 容量内；值槽为 NULL 时按 stock 语义抛 AttributeError
+// （fill 仅在名字解析为实例属性时选择 split 形态，类侧变化由版本
+// 校验拦截）。
 PyObject* SplitMutator::getAttr(PyObject* obj, PyObject* name) {
-  return PyObject_GetAttr(obj, name);
+  return getAttrInline(obj, name);
+}
+
+PyObject* SplitMutator::getAttrInline(PyObject* obj, PyObject* name) {
+  if (!ensureValueOffset(name)) {
+    return PyObject_GetAttr(obj, name);
+  }
+  AttributeMutator::changeKindFromSplitInline(
+      this, AttributeMutator::Kind::kSplitInlineKnownOffset);
+  return getAttrInlineKnownOffset(obj, name);
+}
+
+PyObject* SplitMutator::getAttrInlineKnownOffset(
+    PyObject* obj,
+    PyObject* name) {
+  PyDictValues* values = ci_inline_values_311(obj);
+  if (values == nullptr) {
+    // 实例字典已物化，回退通用协议（正确优先；物化实例为少数形态）。
+    return PyObject_GetAttr(obj, name);
+  }
+  PyObject* result = values->values[val_offset];
+  if (result == nullptr) {
+    return raise_attribute_error(obj, name);
+  }
+  Py_INCREF(result);
+  return result;
 }
 
 #endif // PY_VERSION_HEX < 0x030E0000
@@ -627,6 +667,11 @@ AttributeMutator::setAttr(PyObject* obj, PyObject* name, PyObject* value) {
       return split_.setAttrInline(obj, name, value);
     case AttributeMutator::Kind::kSplitInlineKnownOffset:
       return split_.setAttrInlineKnownOffset(obj, name, value);
+#elif PY_VERSION_HEX < 0x030C0000
+    // 3.11：inline 两 kind 的写侧走通用协议（读侧快路径见 SplitMutator）。
+    case AttributeMutator::Kind::kSplitInline:
+    case AttributeMutator::Kind::kSplitInlineKnownOffset:
+      return split_.setAttr(obj, name, value);
 #endif
     case AttributeMutator::Kind::kCombined:
       return combined_.setAttr(obj, name, value);
@@ -655,6 +700,11 @@ inline PyObject* AttributeMutator::getAttr(PyObject* obj, PyObject* name) {
 #if PY_VERSION_HEX >= 0x030E0000
     case AttributeMutator::Kind::kSplitKnownOffset:
       return split_.getAttrKnownOffset(obj, name);
+    case AttributeMutator::Kind::kSplitInline:
+      return split_.getAttrInline(obj, name);
+    case AttributeMutator::Kind::kSplitInlineKnownOffset:
+      return split_.getAttrInlineKnownOffset(obj, name);
+#elif PY_VERSION_HEX < 0x030C0000
     case AttributeMutator::Kind::kSplitInline:
       return split_.getAttrInline(obj, name);
     case AttributeMutator::Kind::kSplitInlineKnownOffset:
@@ -845,6 +895,11 @@ void AttributeCache::fill(
     bool inline_values = false;
 #if PY_VERSION_HEX >= 0x030E0000
     inline_values = type->tp_flags & Py_TPFLAGS_INLINE_VALUES;
+#elif PY_VERSION_HEX < 0x030C0000
+    // 3.11：managed dict 类型的实例默认即 values 形态（预头 -4 槽），
+    // 选择 inline 族 kind 以启用读侧快路径；个别已物化实例在
+    // getAttrInlineKnownOffset 内按槽位空值回退通用协议。
+    inline_values = true;
 #endif
     mut->set_split(type, getDictKeysIndex(keys, name), keys, inline_values);
   } else {
@@ -1154,6 +1209,29 @@ bool isValidKeysVersion(uint32_t keys_version, BorrowedRef<> obj) {
       return true;
     }
     return dict->ma_keys->dk_version == keys_version;
+  }
+#else
+  // 3.11：values 形态实例必须校验共享键版本，否则"名字已在共享键、
+  // 槽位后填"的实例遮蔽形态会漏检（M9 IC 内联轮修复；此前 values
+  // 形态直接落到 GetDictPtr 得 NULL 判有效）。物化实例经 -3 槽字典
+  // 校验。
+  {
+    PyTypeObject* tp = Py_TYPE(obj.get());
+    if (PyType_HasFeature(tp, Py_TPFLAGS_MANAGED_DICT)) {
+      PyDictValues* values = *reinterpret_cast<PyDictValues**>(
+          reinterpret_cast<char*>(obj.get()) - 4 * sizeof(PyObject*));
+      if (values != nullptr) {
+        PyHeapTypeObject* ht = reinterpret_cast<PyHeapTypeObject*>(tp);
+        return ht->ht_cached_keys != nullptr &&
+            ht->ht_cached_keys->dk_version == keys_version;
+      }
+      PyDictObject* dict = *reinterpret_cast<PyDictObject**>(
+          reinterpret_cast<char*>(obj.get()) - 3 * sizeof(PyObject*));
+      if (dict == nullptr) {
+        return true;
+      }
+      return dict->ma_keys->dk_version == keys_version;
+    }
   }
 #endif
 

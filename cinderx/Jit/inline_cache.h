@@ -35,6 +35,14 @@ struct SplitMutator {
   int setAttrInline(PyObject* obj, PyObject* name, PyObject* value);
   PyObject* getAttrInlineKnownOffset(PyObject* obj, PyObject* name);
   int setAttrInlineKnownOffset(PyObject* obj, PyObject* name, PyObject* value);
+#elif PY_VERSION_HEX < 0x030C0000
+  // 3.11 values 形态快路径（M9 性能归因轮）：managed dict 的预头双槽
+  // 布局（-4=PyDictValues*，-3=PyDictObject*；values 槽非空即 values
+  // 形态）。命中有效性由条目级 tp_version_tag 拉式校验（matches()）
+  // 前置保证；3.11 共享键不增长（不够用即物化），val_offset 恒在
+  // 实例 values 容量内。写侧维持通用协议（后续项）。
+  PyObject* getAttrInline(PyObject* obj, PyObject* name);
+  PyObject* getAttrInlineKnownOffset(PyObject* obj, PyObject* name);
 #endif
   bool canInsertToSplitDict(BorrowedRef<PyDictObject> dict, BorrowedRef<> name);
   bool ensureValueOffset(BorrowedRef<> name);
@@ -155,6 +163,11 @@ class AttributeMutator {
     return offsetof(AttributeMutator, split_) +
         offsetof(SplitMutator, val_offset);
   }
+#if PY_VERSION_HEX < 0x030C0000
+  static constexpr size_t typeVersionOffset() {
+    return offsetof(AttributeMutator, type_version_);
+  }
+#endif
 
  private:
   void set_type(PyTypeObject* type, Kind kind);
@@ -329,6 +342,31 @@ class LoadMethodCache {
 
     bool isValidKeysVersion(BorrowedRef<> obj);
   };
+
+#if PY_VERSION_HEX < 0x030C0000
+  // 3.11 内联快路径 stub 的条目布局访问器（gen_asm 汇编发射用）。
+  static constexpr size_t entriesOffset() {
+    return offsetof(LoadMethodCache, entries_);
+  }
+  static constexpr size_t entryTypeOffset() {
+    return offsetof(Entry, type);
+  }
+  static constexpr size_t entryValueOffset() {
+    return offsetof(Entry, value);
+  }
+  static constexpr size_t entryKeysVersionOffset() {
+    return offsetof(Entry, keys_version);
+  }
+  static constexpr size_t entryTypeVersionOffset() {
+    return offsetof(Entry, type_version);
+  }
+  static constexpr size_t entrySize() {
+    return sizeof(Entry);
+  }
+  static constexpr size_t numEntries() {
+    return 4;
+  }
+#endif
 
   ~LoadMethodCache();
 

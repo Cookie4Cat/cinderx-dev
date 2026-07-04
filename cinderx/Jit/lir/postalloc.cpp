@@ -296,12 +296,14 @@ RewriteResult rewriteCallInstrs(instr_iter_t instr_iter, Environ* env) {
     return kChanged;
   } else if (
       !instr->isCall() && !instr->isVectorCall() &&
-      !instr->isLoadAttrCachedFastPath()) {
+      !instr->isLoadAttrCachedFastPath() &&
+      !instr->isLoadMethodCachedFastPath()) {
     return kUnchanged;
   }
 
   auto output = instr->output();
-  if ((instr->isCall() || instr->isLoadAttrCachedFastPath()) &&
+  if ((instr->isCall() || instr->isLoadAttrCachedFastPath() ||
+       instr->isLoadMethodCachedFastPath()) &&
       instr->getNumInputs() == 1 && output->isNone()) {
     return kUnchanged;
   }
