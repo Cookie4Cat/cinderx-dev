@@ -1,0 +1,16 @@
+test_coro_extensions.py	rc=0	1 skipped in 0.02s
+test_frame_evaluator.py	rc=0	6 passed in 0.01s
+test_immortalize.py	rc=0	1 failed, 2 passed in 0.04s
+test_jit_async_generators.py	rc=0	no tests ran in 0.01s
+test_jit_count_calls.py	rc=0	4 passed in 0.01s
+test_jit_disable.py	rc=0	4 failed, 11 passed in 0.11s
+test_jit_exception.py	rc=0	15 passed in 0.02s
+test_jit_frame.py	rc=0	5 failed, 9 passed, 2 warnings in 0.06s
+test_jit_generators.py	rc=0	Extension modules: cinderjit, _cinderx (total: 2)
+test_jit_global_cache.py	rc=0	1 failed, 11 passed in 0.03s
+test_jitlist.py	rc=0	4 failed, 8 passed in 0.05s
+test_jit_preload.py	rc=0	3 passed, 6 subtests passed in 0.17s
+test_jit_specialization.py	rc=0	18 failed in 0.06s
+test_jit_support_instrumentation.py	rc=0	1 skipped in 0.03s
+test_jit_type_annotations.py	rc=0	2 failed, 3 passed in 0.02s
+test_oss_quick.py	rc=0	1 passed in 0.01s

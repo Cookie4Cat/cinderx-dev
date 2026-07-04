@@ -1,0 +1,287 @@
+{
+  "status": "failed",
+  "suites_total": 10,
+  "suites_ran": 10,
+  "suites_passed": 2,
+  "suites_failed": 8,
+  "suites_skipped": 0,
+  "tests_passed": 42,
+  "tests_failed": 35,
+  "tests_error": 4,
+  "tests_skipped": 3,
+  "tests_deselected": 7,
+  "results": [
+    {
+      "name": "all_test_cinderx",
+      "status": "failed",
+      "returncode": -11,
+      "command": [
+        "/tmp/tcx-venv/bin/python",
+        "-m",
+        "pytest",
+        "cinderx/PythonLib/test_cinderx/test_coro_extensions.py",
+        "cinderx/PythonLib/test_cinderx/test_frame_evaluator.py",
+        "cinderx/PythonLib/test_cinderx/test_immortalize.py",
+        "cinderx/PythonLib/test_cinderx/test_jit_async_generators.py",
+        "cinderx/PythonLib/test_cinderx/test_jit_count_calls.py",
+        "cinderx/PythonLib/test_cinderx/test_jit_disable.py",
+        "cinderx/PythonLib/test_cinderx/test_jit_exception.py",
+        "cinderx/PythonLib/test_cinderx/test_jit_frame.py",
+        "cinderx/PythonLib/test_cinderx/test_jit_generators.py",
+        "cinderx/PythonLib/test_cinderx/test_jit_global_cache.py",
+        "cinderx/PythonLib/test_cinderx/test_jit_preload.py",
+        "cinderx/PythonLib/test_cinderx/test_jit_specialization.py",
+        "cinderx/PythonLib/test_cinderx/test_jit_support_instrumentation.py",
+        "cinderx/PythonLib/test_cinderx/test_jit_type_annotations.py",
+        "cinderx/PythonLib/test_cinderx/test_jitlist.py",
+        "cinderx/PythonLib/test_cinderx/test_oss_quick.py",
+        "cinderx/PythonLib/test_cinderx/test_kunpeng/test_arm64_call_result_move_chain.py",
+        "cinderx/PythonLib/test_cinderx/test_kunpeng/test_array_double_load_specialization.py",
+        "cinderx/PythonLib/test_cinderx/test_kunpeng/test_array_double_store_specialization.py",
+        "cinderx/PythonLib/test_cinderx/test_kunpeng/test_attr_cache_descriptor_watcher.py",
+        "cinderx/PythonLib/test_cinderx/test_kunpeng/test_autojit_gate_stats.py",
+        "cinderx/PythonLib/test_cinderx/test_kunpeng/test_autojit_policy.py",
+        "cinderx/PythonLib/test_cinderx/test_kunpeng/test_binary_op_subscr_specialization.py",
+        "cinderx/PythonLib/test_cinderx/test_kunpeng/test_bsymbolic_linkage.py",
+        "cinderx/PythonLib/test_cinderx/test_kunpeng/test_cinderx_auto_bootstrap.py",
+        "cinderx/PythonLib/test_cinderx/test_kunpeng/test_codegen_split_immediate.py",
+        "cinderx/PythonLib/test_cinderx/test_kunpeng/test_elf_machine.py",
+        "cinderx/PythonLib/test_cinderx/test_kunpeng/test_float_accumulator_promotion.py",
+        "cinderx/PythonLib/test_cinderx/test_kunpeng/test_float_comparison_simplification.py",
+        "cinderx/PythonLib/test_cinderx/test_kunpeng/test_jit_cached_compiled_entry.py",
+        "cinderx/PythonLib/test_cinderx/test_kunpeng/test_jit_coroutines_runtime.py",
+        "cinderx/PythonLib/test_cinderx/test_kunpeng/test_jit_global_int_cache.py",
+        "cinderx/PythonLib/test_cinderx/test_kunpeng/test_jit_inferred_self_type.py",
+        "cinderx/PythonLib/test_cinderx/test_kunpeng/test_jit_specialization.py",
+        "cinderx/PythonLib/test_cinderx/test_kunpeng/test_jit_tree_iter.py",
+        "cinderx/PythonLib/test_cinderx/test_kunpeng/test_lightweight_frames.py",
+        "cinderx/PythonLib/test_cinderx/test_kunpeng/test_list_prefix_reverse_assign.py",
+        "cinderx/PythonLib/test_cinderx/test_kunpeng/test_load_attr_lir_fastpath.py",
+        "cinderx/PythonLib/test_cinderx/test_kunpeng/test_load_attr_method_with_values.py",
+        "cinderx/PythonLib/test_cinderx/test_kunpeng/test_load_method_getattr_fallback.py",
+        "cinderx/PythonLib/test_cinderx/test_kunpeng/test_long_float_true_divide.py",
+        "cinderx/PythonLib/test_cinderx/test_kunpeng/test_loop_call_callee_saved_pref.py",
+        "cinderx/PythonLib/test_cinderx/test_kunpeng/test_pow2_optimization.py",
+        "cinderx/PythonLib/test_cinderx/test_kunpeng/test_primitive_box_remat.py",
+        "cinderx/PythonLib/test_cinderx/test_kunpeng/test_primitive_unbox_cse.py",
+        "cinderx/PythonLib/test_cinderx/test_kunpeng/test_setup_lightweight_frames.py",
+        "cinderx/PythonLib/test_cinderx/test_kunpeng/test_slot_attr_field_access.py",
+        "cinderx/PythonLib/test_cinderx/test_kunpeng/test_startup_auto_jit.py",
+        "cinderx/PythonLib/test_cinderx/test_kunpeng/test_to_bool_specialization.py",
+        "cinderx/PythonLib/test_cinderx/test_kunpeng/test_unpack_sequence.py"
+      ],
+      "log": "/tmp/tcx-logs2/all_test_cinderx.log",
+      "test_counts": {
+        "passed": 0,
+        "failed": 0,
+        "error": 0,
+        "skipped": 0,
+        "deselected": 0
+      }
+    },
+    {
+      "name": "test_cpython_overrides",
+      "status": "failed",
+      "returncode": 1,
+      "command": [
+        "/tmp/tcx-venv/bin/python",
+        "-m",
+        "pytest",
+        "-vv",
+        "-rs",
+        "--import-mode=importlib",
+        "-p",
+        "test_cinderx_known_skips",
+        "cinderx/PythonLib/test_cinderx/test_cpython_overrides"
+      ],
+      "log": "/tmp/tcx-logs2/test_cpython_overrides.log",
+      "test_counts": {
+        "passed": 12,
+        "failed": 16,
+        "error": 0,
+        "skipped": 3,
+        "deselected": 0
+      }
+    },
+    {
+      "name": "test_cinderjit",
+      "status": "failed",
+      "returncode": 2,
+      "command": [
+        "/tmp/tcx-venv/bin/python",
+        "-m",
+        "pytest",
+        "-vv",
+        "-rs",
+        "--import-mode=importlib",
+        "cinderx/PythonLib/test_cinderx/test_cinderjit.py"
+      ],
+      "log": "/tmp/tcx-logs2/test_cinderjit.log",
+      "test_counts": {
+        "passed": 0,
+        "failed": 0,
+        "error": 1,
+        "skipped": 0,
+        "deselected": 0
+      }
+    },
+    {
+      "name": "test_coro_extensions",
+      "status": "passed",
+      "returncode": 0,
+      "command": [
+        "/tmp/tcx-venv/bin/python",
+        "-m",
+        "pytest",
+        "-vv",
+        "-rs",
+        "--import-mode=importlib",
+        "cinderx/PythonLib/test_cinderx/test_coro_extensions.py"
+      ],
+      "log": "/tmp/tcx-logs2/test_coro_extensions.log",
+      "test_counts": {
+        "passed": 4,
+        "failed": 0,
+        "error": 0,
+        "skipped": 0,
+        "deselected": 0
+      }
+    },
+    {
+      "name": "test_jit_coroutines",
+      "status": "failed",
+      "returncode": 2,
+      "command": [
+        "/tmp/tcx-venv/bin/python",
+        "-m",
+        "pytest",
+        "-vv",
+        "-rs",
+        "--import-mode=importlib",
+        "cinderx/PythonLib/test_cinderx/test_jit_coroutines.py"
+      ],
+      "log": "/tmp/tcx-logs2/test_jit_coroutines.log",
+      "test_counts": {
+        "passed": 0,
+        "failed": 0,
+        "error": 1,
+        "skipped": 0,
+        "deselected": 0
+      }
+    },
+    {
+      "name": "test_jit_attr_cache",
+      "status": "failed",
+      "returncode": 2,
+      "command": [
+        "/tmp/tcx-venv/bin/python",
+        "-m",
+        "pytest",
+        "-vv",
+        "-rs",
+        "--import-mode=importlib",
+        "cinderx/PythonLib/test_cinderx/test_jit_attr_cache.py",
+        "-k",
+        "not test_load_method_from_strict_module"
+      ],
+      "log": "/tmp/tcx-logs2/test_jit_attr_cache.log",
+      "test_counts": {
+        "passed": 0,
+        "failed": 0,
+        "error": 1,
+        "skipped": 0,
+        "deselected": 0
+      }
+    },
+    {
+      "name": "test_type_cache",
+      "status": "failed",
+      "returncode": 2,
+      "command": [
+        "/tmp/tcx-venv/bin/python",
+        "-m",
+        "pytest",
+        "-vv",
+        "-rs",
+        "--import-mode=importlib",
+        "cinderx/PythonLib/test_cinderx/test_type_cache.py"
+      ],
+      "log": "/tmp/tcx-logs2/test_type_cache.log",
+      "test_counts": {
+        "passed": 0,
+        "failed": 0,
+        "error": 1,
+        "skipped": 0,
+        "deselected": 0
+      }
+    },
+    {
+      "name": "test_osr",
+      "status": "failed",
+      "returncode": 1,
+      "command": [
+        "/tmp/tcx-venv/bin/python",
+        "-m",
+        "pytest",
+        "-vv",
+        "-rs",
+        "--import-mode=importlib",
+        "cinderx/PythonLib/test_cinderx/test_kunpeng/test_osr.py"
+      ],
+      "log": "/tmp/tcx-logs2/test_osr.log",
+      "test_counts": {
+        "passed": 13,
+        "failed": 6,
+        "error": 0,
+        "skipped": 0,
+        "deselected": 0
+      }
+    },
+    {
+      "name": "test_jit_support_instrumentation",
+      "status": "failed",
+      "returncode": 1,
+      "command": [
+        "/tmp/tcx-venv/bin/python",
+        "-m",
+        "pytest",
+        "-vv",
+        "-rs",
+        "--import-mode=importlib",
+        "cinderx/PythonLib/test_cinderx/test_jit_support_instrumentation.py",
+        "-k",
+        "JitMonitoringIntegrationTest or JitSetProfileIntegrationTest or (JitSetTraceIntegrationTest and not test_looping_thread_deopted_on_instrumentation) or JitCombinedTracingIntegrationTest or test_suspended_generator_deopted_on_instrumentation_attach or test_multiple_suspended_generators_all_deopted"
+      ],
+      "log": "/tmp/tcx-logs2/test_jit_support_instrumentation.log",
+      "test_counts": {
+        "passed": 7,
+        "failed": 13,
+        "error": 0,
+        "skipped": 0,
+        "deselected": 7
+      }
+    },
+    {
+      "name": "test_frame_evaluator_clean_slate",
+      "status": "passed",
+      "returncode": 0,
+      "command": [
+        "/tmp/tcx-venv/bin/python",
+        "-m",
+        "pytest",
+        "-vv",
+        "-rs",
+        "--import-mode=importlib",
+        "cinderx/PythonLib/test_cinderx/test_frame_evaluator.py"
+      ],
+      "log": "/tmp/tcx-logs2/test_frame_evaluator_clean_slate.log",
+      "test_counts": {
+        "passed": 6,
+        "failed": 0,
+        "error": 0,
+        "skipped": 0,
+        "deselected": 0
+      }
+    }
+  ]
+}
