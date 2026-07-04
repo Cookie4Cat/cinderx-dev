@@ -501,7 +501,20 @@ static inline Py_ssize_t ci_hinted_keys_index_311(
 // 路径的物化副作用曾把整个工作负载的新生实例批量转入慢形态（IC
 // 计数轮 go 案）。values 形态经共享键定位直读；物化实例经 -3 槽
 // 字典查找（管理型实例字典恒为 unicode 键）。
-static PyObject* ci_peek_instance_attr_311(PyObject* obj, PyObject* name) {
+// split 包装字典的 ma_values 是实例创建时的原 values 数组，容量
+// （预头 [-1] 字节）定格；ma_keys 为其后仍可成长的共享键——hint
+// 虽 < dk_nentries 仍可能 ≥ 包装数组容量，越界即回落（go 三件套②
+// 排障实证：store stub 物化写越界 → 任意堆写）。
+static inline bool ci_split_values_in_capacity_311(
+    PyDictValues* values,
+    Py_ssize_t ix) {
+  return ix < reinterpret_cast<uint8_t*>(values)[-1];
+}
+
+static PyObject* ci_peek_instance_attr_hinted_311(
+    PyObject* obj,
+    PyObject* name,
+    Py_ssize_t* hint_io) {
   PyTypeObject* tp = Py_TYPE(obj);
   if (!PyType_HasFeature(tp, Py_TPFLAGS_MANAGED_DICT)) {
     return nullptr;
@@ -513,14 +526,34 @@ static PyObject* ci_peek_instance_attr_311(PyObject* obj, PyObject* name) {
     if (dk == nullptr || !DK_IS_UNICODE(dk)) {
       return nullptr;
     }
-    Py_ssize_t ix = getDictKeysIndex(dk, name);
+    Py_ssize_t ix = ci_hinted_keys_index_311(dk, name, hint_io);
     return ix >= 0 ? values->values[ix] : nullptr;
   }
   PyDictObject* dict = ci_managed_dict_311(obj);
   if (dict == nullptr) {
     return nullptr;
   }
+  // 物化实例：unicode 键经 hint 直读（split 包装读 ma_values、
+  // combined 读 me_value——me_key 自验证故 hint 在两种键对象间
+  // 迁移也安全）；general 键罕见形态走通用查找。
+  if (DK_IS_UNICODE(dict->ma_keys)) {
+    Py_ssize_t ix = ci_hinted_keys_index_311(dict->ma_keys, name, hint_io);
+    if (ix < 0) {
+      return nullptr;
+    }
+    if (dict->ma_values != nullptr) {
+      return ci_split_values_in_capacity_311(dict->ma_values, ix)
+          ? dict->ma_values->values[ix]
+          : nullptr;
+    }
+    return DK_UNICODE_ENTRIES(dict->ma_keys)[ix].me_value;
+  }
   return PyDict_GetItem(reinterpret_cast<PyObject*>(dict), name);
+}
+
+static PyObject* ci_peek_instance_attr_311(PyObject* obj, PyObject* name) {
+  Py_ssize_t hint = -1;
+  return ci_peek_instance_attr_hinted_311(obj, name, &hint);
 }
 
 // 3.11 写侧覆写快路径（IC 计数轮：richards/raytrace 每窗口数百万次
@@ -566,7 +599,9 @@ int SplitMutator::setAttr(PyObject* obj, PyObject* name, PyObject* value) {
     PyDictObject* dict = ci_managed_dict_311(obj);
     if (dict != nullptr && DK_IS_UNICODE(dict->ma_keys)) {
       Py_ssize_t ix = ci_hinted_keys_index_311(dict->ma_keys, name, &mat_hint);
-      if (ix >= 0) {
+      if (ix >= 0 &&
+          (dict->ma_values == nullptr ||
+           ci_split_values_in_capacity_311(dict->ma_values, ix))) {
         PyObject** slot = dict->ma_values != nullptr
             ? &dict->ma_values->values[ix]
             : &DK_UNICODE_ENTRIES(dict->ma_keys)[ix].me_value;
@@ -622,6 +657,12 @@ PyObject* SplitMutator::getAttrInlineKnownOffset(
     if (dict != nullptr && DK_IS_UNICODE(dict->ma_keys)) {
       Py_ssize_t ix = ci_hinted_keys_index_311(dict->ma_keys, name, &mat_hint);
       if (ix >= 0) {
+        if (dict->ma_values != nullptr &&
+            !ci_split_values_in_capacity_311(dict->ma_values, ix)) {
+          // 键在成长后的共享键中、但槽位超出包装数组容量：属性必然
+          // 未曾写入，缺失语义同 values 快路径论证。
+          return raise_attribute_error(obj, name);
+        }
         PyObject* result = dict->ma_values != nullptr
             ? dict->ma_values->values[ix]
             : DK_UNICODE_ENTRIES(dict->ma_keys)[ix].me_value;
@@ -728,9 +769,10 @@ PyObject* DescrOrClassVarMutator::getAttr(PyObject* obj, PyObject* name) {
 
 #if PY_VERSION_HEX < 0x030C0000
   // Check instance dict（无副作用直读：_PyObject_GetDictPtr 会物化
-  // values 形态实例）。
+  // values 形态实例；带 hint 免除每次访问的字符串哈希查找）。
   if (PyType_HasFeature(Py_TYPE(obj), Py_TPFLAGS_MANAGED_DICT)) {
-    if (PyObject* iattr = ci_peek_instance_attr_311(obj, name)) {
+    if (PyObject* iattr =
+            ci_peek_instance_attr_hinted_311(obj, name, &mat_hint)) {
       Py_INCREF(iattr);
       return iattr;
     }
@@ -812,6 +854,9 @@ void AttributeMutator::set_descr_or_classvar(
   set_type(type, Kind::kDescrOrClassVar);
   descr_or_cvar_.descr = descr;
   descr_or_cvar_.keys_version = keys_version;
+#if PY_VERSION_HEX < 0x030C0000
+  descr_or_cvar_.mat_hint = -1;
+#endif
 }
 
 void AttributeMutator::set_split(
@@ -1524,9 +1569,13 @@ LoadMethodResult LoadMethodCache::lookup(
         Py_ssize_t ix =
             ci_hinted_keys_index_311(dict->ma_keys, name, &ia_hint_);
         if (ix >= 0) {
-          v = dict->ma_values != nullptr
-              ? dict->ma_values->values[ix]
-              : DK_UNICODE_ENTRIES(dict->ma_keys)[ix].me_value;
+          if (dict->ma_values != nullptr) {
+            v = ci_split_values_in_capacity_311(dict->ma_values, ix)
+                ? dict->ma_values->values[ix]
+                : nullptr;
+          } else {
+            v = DK_UNICODE_ENTRIES(dict->ma_keys)[ix].me_value;
+          }
         }
       }
     }
@@ -1616,8 +1665,9 @@ LoadMethodResult __attribute__((noinline)) LoadMethodCache::lookupSlowPath(
 #if PY_VERSION_HEX < 0x030C0000
   if (PyType_HasFeature(tp, Py_TPFLAGS_MANAGED_DICT)) {
     // 无副作用直读（_PyObject_GetDictPtr 会物化 values 形态实例，
-    // 方法慢路径高频，物化副作用曾把新生实例批量转入慢形态）。
-    attr = ci_peek_instance_attr_311(obj, name);
+    // 方法慢路径高频，物化副作用曾把新生实例批量转入慢形态）；
+    // hint 与实例属性方法位共用（同名同槽）。
+    attr = ci_peek_instance_attr_hinted_311(obj, name, &ia_hint_);
     if (attr != nullptr) {
       maybeCollectCacheStats(
           cache_stats_, tp, name, CacheMissReason::kUncategorized);

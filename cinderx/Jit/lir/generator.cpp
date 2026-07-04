@@ -3831,6 +3831,20 @@ LIRGenerator::TranslatedBlock LIRGenerator::TranslateOneBasicBlock(
         Instruction* name = getNameFromIdx(bbb, instr);
         hir::Register* value = instr->GetOperand(1);
         auto cache = getContext()->allocateStoreAttrCache();
+// 3.11 写侧内联快路径 stub（go 三件套②）：values 覆写与物化 hint
+// 覆写行内完成，插入/删除/描述符与 refcnt==1 的旧值（dealloc 路径）
+// 回落 helper。调用形指令，结果 0/-1 与 helper 一致。
+#if defined(CINDER_AARCH64) && !defined(Py_GIL_DISABLED) && \
+    PY_VERSION_HEX < 0x030C0000
+        Instruction* result = bbb.appendInstr(
+            OutVReg{OperandBase::k32bit},
+            Instruction::kStoreAttrCachedFastPath,
+            jit::StoreAttrCache::invoke,
+            cache,
+            base,
+            name,
+            value);
+#else
         Instruction* result = bbb.appendCallInstruction(
             OutVReg{OperandBase::k32bit},
             jit::StoreAttrCache::invoke,
@@ -3838,6 +3852,7 @@ LIRGenerator::TranslatedBlock LIRGenerator::TranslateOneBasicBlock(
             base,
             name,
             value);
+#endif
         appendGuard(bbb, InstrGuardKind::kNotNegative, *instr, result);
         break;
       }

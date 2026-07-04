@@ -88,6 +88,11 @@ struct DescrOrClassVarMutator {
 
   BorrowedRef<> descr;
   uint32_t keys_version;
+#if PY_VERSION_HEX < 0x030C0000
+  // 实例字典遮蔽检查的 me_key 自验证 hint（go 三件套①：类默认值被
+  // 实例遮蔽的形态每次访问付字符串哈希字典查找）。任意值均安全。
+  Py_ssize_t mat_hint;
+#endif
 };
 
 // An instance of AttributeMutator is specialized to more efficiently perform a
@@ -366,6 +371,7 @@ struct CacheStats {
 struct ICRuntimeStats {
   uint64_t la_stub_entries{0};
   uint64_t lm_stub_entries{0};
+  uint64_t sa_stub_entries{0};
   std::atomic<uint64_t> la_invoke{0};
   std::atomic<uint64_t> la_entry_hit{0};
   std::atomic<uint64_t> la_split_values_hit{0};

@@ -106,6 +106,7 @@ struct Environ {
 
   asmjit::Label load_attr_invoke_stub;
   asmjit::Label load_method_invoke_stub;
+  asmjit::Label store_attr_invoke_stub;
 
   struct IndirectInfo {
     explicit IndirectInfo(void** indirect_ptr) : indirect(indirect_ptr) {}

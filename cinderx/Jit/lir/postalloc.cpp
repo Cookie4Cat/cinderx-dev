@@ -297,13 +297,15 @@ RewriteResult rewriteCallInstrs(instr_iter_t instr_iter, Environ* env) {
   } else if (
       !instr->isCall() && !instr->isVectorCall() &&
       !instr->isLoadAttrCachedFastPath() &&
-      !instr->isLoadMethodCachedFastPath() && !instr->isIsTruthyFastPath()) {
+      !instr->isLoadMethodCachedFastPath() && !instr->isIsTruthyFastPath() &&
+      !instr->isStoreAttrCachedFastPath()) {
     return kUnchanged;
   }
 
   auto output = instr->output();
   if ((instr->isCall() || instr->isLoadAttrCachedFastPath() ||
-       instr->isLoadMethodCachedFastPath() || instr->isIsTruthyFastPath()) &&
+       instr->isLoadMethodCachedFastPath() || instr->isIsTruthyFastPath() ||
+       instr->isStoreAttrCachedFastPath()) &&
       instr->getNumInputs() == 1 && output->isNone()) {
     return kUnchanged;
   }
@@ -322,7 +324,8 @@ RewriteResult rewriteCallInstrs(instr_iter_t instr_iter, Environ* env) {
   // 直呼函数操作数（helper），内联 stub 从不被进入（计数矩阵抓获：
   // lm_stub_entries 恒 0 而 lm_helper 数百万）。
   if (!instr->isLoadAttrCachedFastPath() &&
-      !instr->isLoadMethodCachedFastPath() && !instr->isIsTruthyFastPath()) {
+      !instr->isLoadMethodCachedFastPath() && !instr->isIsTruthyFastPath() &&
+      !instr->isStoreAttrCachedFastPath()) {
     instr->setOpcode(Instruction::kCall);
   }
 

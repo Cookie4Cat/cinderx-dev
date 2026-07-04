@@ -3305,6 +3305,7 @@ PyObject* get_and_clear_inline_cache_stats(PyObject* /* self */, PyObject*) {
     ICRuntimeStats& s = g_ic_runtime_stats;
     set_counter("la_stub_entries", std::exchange(s.la_stub_entries, 0));
     set_counter("lm_stub_entries", std::exchange(s.lm_stub_entries, 0));
+    set_counter("sa_stub_entries", std::exchange(s.sa_stub_entries, 0));
     auto take = [](std::atomic<uint64_t>& c) {
       return c.exchange(0, std::memory_order_relaxed);
     };
