@@ -2104,6 +2104,49 @@ void translateLoadMethodCachedFastPath(
 #endif
 }
 
+void translateIsTruthyFastPath(Environ* env, const Instruction* instr) {
+#if defined(CINDER_AARCH64) && !defined(Py_GIL_DISABLED) && \
+    PY_VERSION_HEX < 0x030C0000
+  auto output = instr->output();
+  auto as = env->as;
+
+  // postalloc 已按调用约定把唯一实参放入 x0；调用形语义保证 x9-x15
+  // 此刻无活值。True/False 单例指针行内比对（动态真值判定的主体
+  // 形态——布尔谓词结果与标志位属性），其余类型调用 PyObject_IsTrue
+  // （慢臂结果可为 -1，kNotNegative 守卫在 LIR 层已挂）。结果统一落
+  // w0 后再搬运到分配的输出寄存器（镜像 attr 快路径的输出处理）。
+  asmjit::Label done = as->newLabel();
+  asmjit::Label load_true = as->newLabel();
+  asmjit::Label load_false = as->newLabel();
+
+  as->mov(a64::x12, reinterpret_cast<uint64_t>(Py_True));
+  as->cmp(a64::x0, a64::x12);
+  as->b_eq(load_true);
+  as->mov(a64::x12, reinterpret_cast<uint64_t>(Py_False));
+  as->cmp(a64::x0, a64::x12);
+  as->b_eq(load_false);
+  emitCall(*env, reinterpret_cast<uint64_t>(PyObject_IsTrue), instr);
+  as->b(done);
+  as->bind(load_true);
+  as->mov(a64::w0, 1);
+  as->b(done);
+  as->bind(load_false);
+  as->mov(a64::w0, 0);
+  as->bind(done);
+
+  if (output->type() != OperandBase::kNone) {
+    auto out_reg = AT::getGpOutput(output);
+    if (out_reg.isGpW()) {
+      as->mov(out_reg, a64::w0);
+    } else {
+      as->mov(out_reg, a64::x0);
+    }
+  }
+#else
+  translateCall(env, instr);
+#endif
+}
+
 void translateLoadAttrCachedFastPath(Environ* env, const Instruction* instr) {
 #if defined(CINDER_AARCH64) && !defined(Py_GIL_DISABLED) && \
     (PY_VERSION_HEX >= 0x030E0000 || PY_VERSION_HEX < 0x030C0000)
@@ -3780,6 +3823,9 @@ void AutoTranslator::translateInstr(Environ* env, const Instruction* instr)
       break;
     case Instruction::kLoadMethodCachedFastPath:
       translateLoadMethodCachedFastPath(env, instr);
+      return;
+    case Instruction::kIsTruthyFastPath:
+      translateIsTruthyFastPath(env, instr);
       return;
     case Instruction::kMove:
       translateMove(env, instr);

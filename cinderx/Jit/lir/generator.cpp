@@ -5012,8 +5012,21 @@ LIRGenerator::TranslatedBlock LIRGenerator::TranslateOneBasicBlock(
       }
       case Opcode::kIsTruthy: {
         auto is_truthy = static_cast<const IsTruthy*>(&i);
+#if defined(CINDER_AARCH64) && !defined(Py_GIL_DISABLED) && \
+    PY_VERSION_HEX < 0x030C0000
+        // 动态真值判定行内快路径（IsTruthy 轮）：True/False 单例指针
+        // 比较行内完成（动态真值判定的主体形态——布尔谓词结果与
+        // 标志位属性），其余类型才调用 PyObject_IsTrue。调用形指令，
+        // 慢臂结果可为 -1，沿用 kNotNegative 守卫。
+        Instruction* call_instr = bbb.appendInstr(
+            i.output(),
+            Instruction::kIsTruthyFastPath,
+            PyObject_IsTrue,
+            i.GetOperand(0));
+#else
         Instruction* call_instr = bbb.appendCallInstruction(
             i.output(), PyObject_IsTrue, i.GetOperand(0));
+#endif
         appendGuard(bbb, InstrGuardKind::kNotNegative, *is_truthy, call_instr);
         break;
       }

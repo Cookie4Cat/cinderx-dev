@@ -311,6 +311,7 @@ bool Instruction::isCallLike() const {
     case kCall:
     case kLoadAttrCachedFastPath:
     case kLoadMethodCachedFastPath:
+    case kIsTruthyFastPath:
     case kVarArgCall:
     case kVectorCall:
       return true;
