@@ -277,7 +277,15 @@ def env_for_mode(startup_dir: Path, marker_file: Path) -> dict[str, str]:
 
     env.pop("CINDERX_JIT_DISABLE", None)
     env.pop("PYTHONJITDISABLE", None)
-    env["PYTHONJITLIGHTWEIGHTFRAME"] = "1"
+    # Lightweight frames are only implemented for 3.12+ frame layouts; on
+    # 3.11 forcing PYTHONJITLIGHTWEIGHTFRAME=1 crashes at cinderx.init()
+    # (materialized frames are the supported model there, design decision
+    # D4). Workers run under sys.executable, so the runner's own version
+    # is authoritative.
+    if sys.version_info >= (3, 12):
+        env["PYTHONJITLIGHTWEIGHTFRAME"] = "1"
+    else:
+        env["PYTHONJITLIGHTWEIGHTFRAME"] = "0"
     env["CINDERX_OSR_ENABLED"] = "0"
 
     return env

@@ -1,0 +1,50 @@
+# 3.11 libtest 配置③（JIT-on 差分）裁剪清单首版（设计书 §4.3；
+# M9 预演盘点）。选择标准是"测解释器而非测库"；双阈值
+# （--adaptive-compile-after 2 / 24）覆盖特化前后编译的字节码。
+# 命名注意：3.11 中为 test_unicode / test_yield_from（3.12 起更名
+# test_str / test_pep380）。随里程碑扩张（M3 加 pdb/bdb，M7 加
+# pickle/copy）。
+#
+# 语言核心
+test_grammar
+test_builtin
+test_types
+test_descr
+test_descrtut
+test_dict
+test_set
+test_list
+test_tuple
+test_int
+test_float
+test_unicode
+test_exceptions
+test_raise
+test_traceback
+test_call
+test_keywordonlyarg
+test_unpack
+test_unpack_ex
+test_scope
+test_super
+test_property
+test_metaclass
+test_augassign
+test_with
+test_contextlib
+#
+# generator / 协程（拒编回退正确性）
+test_generators
+test_genexps
+test_yield_from
+test_coroutines
+#
+# 已识别风险区
+test_sys
+test_sys_settrace
+test_sys_setprofile
+test_gc
+test_weakref
+test_signal
+test_inspect
+test_frame
