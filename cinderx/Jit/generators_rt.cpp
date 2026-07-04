@@ -99,8 +99,16 @@ void gen_dealloc_with_custom_free(PyObject* self) {
     _PyErr_ClearExcState(&gen->gi_exc_state);
   }
 
+#if PY_VERSION_HEX >= 0x030C0000
   Ci_STACK_CLEAR(frame->FRAME_EXECUTABLE);
-
+#else
+  // 3.11 引用会计与 3.12+ 不同：帧的 f_code 是借引用（强引用由 f_func
+  // 持有，_PyFrame_Clear 负责释放），此处不得递减；code 的强引用在
+  // gi_code 头部字段上，与 stock gen_dealloc 对齐在此释放（分配侧见
+  // jit_rt.cpp 的生成器初始化）。此前"漏配 gi_code(+1)"与"错减借引用
+  // f_code(-1)"恰好抵消，两处必须成对修正。
+  Py_CLEAR(gen->gi_code);
+#endif
   Py_CLEAR(gen->gi_name);
   Py_CLEAR(gen->gi_qualname);
 
@@ -854,6 +862,19 @@ void unpatchJitGenAmSendForDeopt() {
   coro_type->tp_as_async->am_send = reinterpret_cast<sendfunc>(jitgen_am_send);
 }
 
+#if PY_VERSION_HEX < 0x030C0000
+// 3.11 的 gi_code 经 stock member 表暴露（3.12 起字段移除、getset 接管），
+// JitGen 类型此处按 stock 布局补齐 tp_members。getset 拷贝协议要求与
+// stock gen_getsetlist 逐下标同名，不能经 getset 注入。
+static PyMemberDef jitgen_memberlist311[] = {
+    {"gi_code",
+     T_OBJECT,
+     offsetof(PyGenObject, gi_code),
+     READONLY | PY_AUDIT_READ},
+    {} /* Sentinel */
+};
+#endif
+
 PyType_Slot gen_slots[] = {
     {Py_tp_dealloc, reinterpret_cast<void*>(jitgen_dealloc)},
     {Py_tp_traverse, reinterpret_cast<void*>(jitgen_traverse)},
@@ -863,6 +884,9 @@ PyType_Slot gen_slots[] = {
     {Py_tp_iternext, reinterpret_cast<void*>(jitgen_iternext)},
     {Py_tp_methods, jitgen_methods},
     {Py_tp_getset, jitgen_getsetlist},
+#if PY_VERSION_HEX < 0x030C0000
+    {Py_tp_members, jitgen_memberlist311},
+#endif
     {Py_am_send, reinterpret_cast<void*>(jitgen_am_send)},
     // gi_weakreflist
     {0, nullptr},

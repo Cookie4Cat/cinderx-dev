@@ -4977,7 +4977,13 @@ Result compilePreloaderImpl(
         preloader.fullname());
     return Result::CANNOT_SPECIALIZE;
   }
+#if PY_VERSION_HEX < 0x030C0000
+  // D6：3.11 仅编译同步生成器；协程与异步生成器一律拒编回退解释器。
+  constexpr int forbidden_flags =
+      CO_ASYNC_GENERATOR | CO_COROUTINE | CO_ITERABLE_COROUTINE;
+#else
   constexpr int forbidden_flags = CO_ASYNC_GENERATOR;
+#endif
   if (code->co_flags & forbidden_flags) {
     JIT_DLOG(
         "Cannot JIT compile {} as it has prohibited code flags: 0x{:x}",

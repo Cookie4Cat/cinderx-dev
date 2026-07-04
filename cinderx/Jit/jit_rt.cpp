@@ -714,6 +714,12 @@ JITRT_AllocateAndLinkGenAndInterpreterFrame(
   gen->gi_weakreflist = nullptr;
   gen->gi_exc_state.exc_value = nullptr;
   gen->gi_exc_state.previous_item = nullptr;
+#if PY_VERSION_HEX < 0x030C0000
+  // 3.11 的 PyGenObject 头部仍有 gi_code 字段（3.12 起移除，code 移入
+  // 嵌入帧）；gen_traverse/gen_dealloc 都会访问它，不初始化则为分配器
+  // 残留垃圾，GC 遍历即崩。
+  gen->gi_code = reinterpret_cast<PyCodeObject*>(Py_NewRef(co));
+#endif
   JIT_DCHECK(func->func_name != nullptr, "func_name is null");
   gen->gi_name = Py_NewRef(func->func_name);
   JIT_DCHECK(func->func_qualname != nullptr, "func_qualname is null");
