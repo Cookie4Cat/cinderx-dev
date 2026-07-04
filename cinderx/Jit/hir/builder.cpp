@@ -3803,30 +3803,9 @@ void HIRBuilder::emitLoadAttr(
         return;
       }
 #endif
-#if PY_VERSION_HEX < 0x030C0000
-      case LOAD_ATTR_INSTANCE_VALUE: {
-        BorrowedRef<PyTypeObject> owner_type = preloader_.methodOwnerType();
-        if (owner_type != nullptr) {
-          auto guard = tc.emit<GuardType>(
-              receiver, Type::fromTypeExact(owner_type), receiver, tc.frame);
-          receiver = guard->output();
-          guarded_receiver_type = true;
-        }
-        break;
-      }
-#endif
       default:
         break;
     }
-#if PY_VERSION_HEX < 0x030C0000
-    BorrowedRef<PyTypeObject> owner_type = preloader_.methodOwnerType();
-    if (!guarded_receiver_type && owner_type != nullptr &&
-        !tc.frame.localsplus.empty() && receiver == tc.frame.localsplus[0]) {
-      auto guard = tc.emit<GuardType>(
-          receiver, Type::fromTypeExact(owner_type), receiver, tc.frame);
-      receiver = guard->output();
-    }
-#endif
   }
 
   Register* result = temps_.AllocateStack();
@@ -3851,6 +3830,20 @@ bool HIRBuilder::tryEmitLoadAttrInstanceValue311(
   uint32_t type_version = readCacheU32(cache->version);
   if (type_version == 0) {
     return false;
+  }
+
+  // 精确类型投机仅在有站点见证时发射：本站点解释器特化缓存观测到的
+  // 接收者类型版本必须等于方法定义类的版本。定义类本身不构成接收者
+  // 类型证据——继承方法的接收者是子类实例，无见证的精确守卫恒假，
+  // 会导致每次调用 deopt（ROI backoff 随后冻结回解释器）。
+  BorrowedRef<PyTypeObject> owner_type = preloader_.methodOwnerType();
+  if (owner_type != nullptr && owner_type->tp_version_tag == type_version) {
+    auto guard = tc.emit<GuardType>(
+        receiver, Type::fromTypeExact(owner_type), receiver, tc.frame);
+    Register* result = temps_.AllocateStack();
+    tc.emit<LoadAttr>(result, guard->output(), name_idx, tc.frame);
+    tc.frame.stack.push(result);
+    return true;
   }
 
   BorrowedRef<> name = PyTuple_GET_ITEM(code_->co_names, name_idx);
