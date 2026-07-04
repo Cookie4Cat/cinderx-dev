@@ -203,6 +203,7 @@ static void reifyStack(
     const auto& value = meta.getStackValue(i, frame_meta);
     Ref<> obj = mem.readOwned(value);
 
+#if PY_VERSION_HEX >= 0x030C0000
     // When we are deoptimizing a JIT-compiled function that contains an
     // optimizable LoadMethod, we need to be able to know whether or not the
     // LoadMethod returned a bound method object in order to properly
@@ -214,8 +215,34 @@ static void reifyStack(
     } else {
       *stack_top = Ci_STACK_STEAL(obj.release());
     }
+#else
+    // 3.11：LoadMethodResult 构造时已归一化为 (callable, self_or_null)，
+    // callable 槽持有 Py_None 是合法值（属性本身就是 None），不做 ≤3.10
+    // 时代的 None→NULL 替换；非方法形态由下方的槽序交换处理。
+    *stack_top = Ci_STACK_STEAL(obj.release());
+#endif
     stack_top--;
   }
+
+#if PY_VERSION_HEX < 0x030C0000
+  // 3.11 解释器的方法调用窗口栈序是 [meth_or_null, self_or_callable,
+  // args...]（LOAD_METHOD 未命中方法时 NULL 标志位在“下”槽），而 JIT
+  // 内部沿用 3.12+ 约定 (callable, self_or_null)（NULL 在“上”槽）。方法
+  // 形态（self != NULL）下两种约定字面同序；非方法形态（self == NULL：
+  // bound method、模块级函数、经 generic 路径的 classmethod 等）必须把
+  // 两槽交换为 [NULL, callable]，否则恢复后解释器 CALL 以 PEEK(oparg+2)
+  // 判定 is_meth 时把 callable 误当方法标志，再前置一次 self 导致元数
+  // 与实参错位（M9 有机 deopt-resume 案的根因）。
+  PyObject** stack_base =
+      &frame->localsplus[_PyFrame_GetCode(frame)->co_nlocalsplus];
+  for (std::size_t i = 0; i + 1 < frame_meta.stack.size(); i++) {
+    const auto& value = meta.getStackValue(i, frame_meta);
+    if (value.isLoadMethodResult() && stack_base[i + 1] == nullptr) {
+      stack_base[i + 1] = stack_base[i];
+      stack_base[i] = nullptr;
+    }
+  }
+#endif
 }
 
 Ref<> profileDeopt(const DeoptMetadata& meta, const MemoryView& mem) {

@@ -365,6 +365,21 @@ PySendResult jitgen_am_send(PyObject* obj, PyObject* arg, PyObject** presult) {
   // Execution happens here
   PyObject* result = send_core(gen, arg, tstate).release();
 
+#if PY_VERSION_HEX < 0x030C0000
+  // 3.11 语义镜像（stock gen_send_ex2）：生成器深度 deopt 后经解释器
+  // 完成（返回或异常外抛）的路径上，没有任何一方复位生成器运行态与
+  // exc_info——stock 3.11 中该职责在 gen_send_ex2 尾部，本函数即其
+  // JIT 替身，必须补齐（M8"完成路径运行态残留"案：残留
+  // FRAME_EXECUTING 使后续所有操作报 generator already executing）。
+  if (gen->gi_frame_state == FRAME_EXECUTING) {
+    gen->gi_frame_state = FRAME_COMPLETED;
+  }
+  if (tstate->exc_info == &gen->gi_exc_state) {
+    tstate->exc_info = gen->gi_exc_state.previous_item;
+    gen->gi_exc_state.previous_item = nullptr;
+  }
+#endif
+
   JIT_DCHECK(tstate->exc_info == prev_exc_info, "Invalid exc_info");
   JIT_DCHECK(gen->gi_exc_state.previous_item == nullptr, "Invalid exc_state");
   JIT_DCHECK(gen->gi_frame_state != FRAME_EXECUTING, "Invalid frame state");
@@ -389,6 +404,25 @@ PySendResult jitgen_am_send(PyObject* obj, PyObject* arg, PyObject** presult) {
     }
 
   } else {
+#if PY_VERSION_HEX < 0x030C0000
+    // 3.11 的 PEP 479 洗白由 stock gen_send_ex2 完成（3.12+ 移入求值
+    // 循环）；JIT 生成器不经过 gen_send_ex2，需在此逐字镜像，否则编译
+    // 生成器体内的 raise StopIteration 会原样泄漏给调用方。
+    if (PyErr_ExceptionMatches(PyExc_StopIteration)) {
+      const char* msg = "generator raised StopIteration";
+      if (PyCoro_CheckExact(gen)) {
+        msg = "coroutine raised StopIteration";
+      } else if (PyAsyncGen_CheckExact(gen)) {
+        msg = "async generator raised StopIteration";
+      }
+      _PyErr_FormatFromCause(PyExc_RuntimeError, "%s", msg);
+    } else if (
+        PyAsyncGen_CheckExact(gen) &&
+        PyErr_ExceptionMatches(PyExc_StopAsyncIteration)) {
+      const char* msg = "async generator raised StopAsyncIteration";
+      _PyErr_FormatFromCause(PyExc_RuntimeError, "%s", msg);
+    }
+#else
     JIT_DCHECK(
         !PyErr_ExceptionMatches(PyExc_StopIteration),
         "Generator should not raise StopIteration");
@@ -396,6 +430,7 @@ PySendResult jitgen_am_send(PyObject* obj, PyObject* arg, PyObject** presult) {
         !PyAsyncGen_CheckExact(gen) ||
             !PyErr_ExceptionMatches(PyExc_StopAsyncIteration),
         "Async gen should not raise StopAsyncIteration");
+#endif
   }
 
 #ifdef ENABLE_GENERATOR_AWAITER
@@ -408,6 +443,16 @@ PySendResult jitgen_am_send(PyObject* obj, PyObject* arg, PyObject** presult) {
   JIT_DCHECK(
       gen->gi_exc_state.exc_value == nullptr,
       "Should not have an exception by now");
+#endif
+#if PY_VERSION_HEX < 0x030C0000
+  // 完成而未清帧 = 经解释器完成的 deopt 路径（JIT 原生完成路径已置
+  // CLEARED 并释放帧资源）；镜像 stock gen_send_ex2 尾部：先置
+  // CLEARED（防清帧触发的析构再入）再清帧。
+  if (FRAME_STATE_FINISHED(gen->gi_frame_state) &&
+      gen->gi_frame_state != FRAME_CLEARED) {
+    gen->gi_frame_state = FRAME_CLEARED;
+    _PyFrame_Clear(frame);
+  }
 #endif
   JIT_DCHECK(gen->gi_frame_state == FRAME_CLEARED, "Frame not cleared");
 
@@ -947,7 +992,13 @@ void deopt_jit_gen_object_only(JitGenObject* gen) {
       : &PyCoro_Type;
   Py_DECREF(old_type);
   Py_SET_TYPE(reinterpret_cast<PyObject*>(gen), type);
-#ifdef ENABLE_LIGHTWEIGHT_FRAMES
+// 3.11 生成器帧为物化帧（kNormal），没有 LWF 帧头：jitFrameGetFunction/
+// jitFrameRemoveReifier 在 <0x030E 分支读写的是"帧前头槽"，3.11 布局下
+// 那是 JitGen 结构的邻居字节——完成态分支的 Py_XDECREF 会对垃圾指针
+// 减引用（M9R3 nqueens 现场：修复运行态残留后，经解释器完成的 deopt
+// 生成器首次走进该分支即 SEGV；此前该 bug 被运行态残留 bug 掩护）。
+// 3.11 的 f_func 由 _PyFrame_Clear/原生 teardown 释放，无需此块。
+#if defined(ENABLE_LIGHTWEIGHT_FRAMES) && PY_VERSION_HEX >= 0x030C0000
   auto frame = generatorFrame(gen);
   if (gen->gi_frame_state != FRAME_CLEARED) {
     jitFrameRemoveReifier(frame);
