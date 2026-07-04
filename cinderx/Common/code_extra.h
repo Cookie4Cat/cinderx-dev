@@ -57,6 +57,18 @@ typedef struct CodeExtra {
   uint64_t roi_recompile_floor;
   // Miscellaneous flags for code-level JIT bookkeeping.
   uint64_t flags;
+  // 试用期计时判定（AutoJIT probation）：编译完成后的前 2K 次调用在
+  // 入口包装器内按奇偶交替走解释/编译两条入口并计时，等样本均时对比
+  // （带余量）决定转正或卸载冻结——时间维度直接回答"编译态是否劣于
+  // 解释态"（计数阈值无法区分慢路径多但净更快的形态）。
+  // probation_ctl：0=未启或已裁决，1=试用中。
+  uint32_t probation_ctl;
+  uint32_t probation_seq;
+  uint64_t probation_interp_ns;
+  uint64_t probation_jit_ns;
+  // IC 压力密度（生产判据）：本 code 各内联 stub 慢路径进入计数，
+  // 由 stub 慢尾直增（发射期烘焙地址），入口包装器按调用窗对比。
+  uint64_t ic_slow_pressure;
 } CodeExtra;
 
 #define CI_CODE_EXTRA_AUTO_JIT_DISABLED 1

@@ -93,6 +93,7 @@ struct AutoJitGateStats {
   std::atomic<uint64_t> roi_uncompile{0};
   std::atomic<uint64_t> roi_recompile{0};
   std::atomic<uint64_t> roi_frozen{0};
+  std::atomic<uint64_t> probation_frozen{0};
 };
 
 struct AutoJitGateState {
@@ -127,6 +128,7 @@ void clearAutoJitGateStats() {
   g_auto_jit_gate_stats.roi_uncompile.store(0, std::memory_order_relaxed);
   g_auto_jit_gate_stats.roi_recompile.store(0, std::memory_order_relaxed);
   g_auto_jit_gate_stats.roi_frozen.store(0, std::memory_order_relaxed);
+  g_auto_jit_gate_stats.probation_frozen.store(0, std::memory_order_relaxed);
 }
 
 int setAutoJitGateStat(
@@ -862,6 +864,26 @@ FlagProcessor initFlagProcessor() {
       [](const std::string& val) { parseAutoJitOption(val); },
       "Enable auto-JIT mode, which compiles functions after the given "
       "threshold");
+
+  flag_processor.addOption(
+      "jit-auto-probation",
+      "CINDERX_AUTOJIT_PROBATION",
+      getMutableConfig().probation_calls,
+      "AutoJIT probation sample count per arm (0 disables timed probation)");
+
+  flag_processor.addOption(
+      "jit-auto-probation-margin",
+      "CINDERX_AUTOJIT_PROBATION_MARGIN",
+      getMutableConfig().probation_margin_pct,
+      "AutoJIT probation freeze margin percent (freeze when jit mean time "
+      "exceeds interp mean time times pct/100)");
+
+  flag_processor.addOption(
+      "jit-auto-ic-pressure-ratio",
+      "CINDERX_AUTOJIT_IC_PRESSURE_RATIO",
+      getMutableConfig().ic_pressure_ratio,
+      "Freeze code to the interpreter when inline-cache slow-path entries "
+      "per call exceed this ratio over a 4096-call window (0 disables)");
 
   flag_processor.addOption(
       "jit-auto-roi-backoff",
@@ -4375,6 +4397,33 @@ void triggerRoiBackoff(
 }
 
 } // namespace
+
+// 试用期裁决冻结（go 三件套③）：卸载共享该 code 的全部已编译函数，
+// 置 ROI FROZEN 位与 DecidedCold 位——jitVectorcall 的既有冻结检查
+// 使该 code 此后长期解释执行，帧压栈计数亦停。
+void probationFreeze(BorrowedRef<PyFunctionObject> func) {
+  BorrowedRef<PyCodeObject> code{func->func_code};
+  CodeExtra* extra = codeExtraIfExists(code);
+  std::vector<Ref<PyFunctionObject>> funcs;
+  if (jitCtx() != nullptr) {
+    for (auto& entry : jitCtx()->compiledFuncs()) {
+      BorrowedRef<PyFunctionObject> f = entry.first;
+      if (reinterpret_cast<PyCodeObject*>(f->func_code) == code.get()) {
+        funcs.emplace_back(Ref<PyFunctionObject>::create(f.get()));
+      }
+    }
+  }
+  for (auto& f : funcs) {
+    ::uncompileImpl(f);
+  }
+  if (extra != nullptr) {
+    Ci_code_extra_or_skey_release(extra, kSkeyDecidedColdBit);
+    uint32_t ctl = Ci_code_extra_load_roi_ctl_relaxed(extra);
+    Ci_code_extra_store_roi_ctl_release(
+        extra, ctl | CI_CODE_EXTRA_ROI_FROZEN_BIT);
+  }
+  incAutoJitGateStat(g_auto_jit_gate_stats.probation_frozen);
+}
 
 void recordDeoptForRoiBackoff(
     CodeRuntime* code_runtime,

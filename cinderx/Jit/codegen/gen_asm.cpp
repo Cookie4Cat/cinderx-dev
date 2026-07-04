@@ -8,6 +8,7 @@
 #include "cinderx/Common/extra-py-flags.h"
 #include "cinderx/Common/log.h"
 #include "cinderx/Common/py-portability.h"
+#include "cinderx/Common/code.h"
 #include "cinderx/Common/util.h"
 #include "cinderx/Interpreter/interpreter.h"
 #include "cinderx/Jit/bytecode.h"
@@ -1444,6 +1445,19 @@ void NativeGenerator::emitAarch64LoadMethodInvokeStub(
   as_->ret(arch::lr);
 
   as_->bind(slow_path);
+  if (getConfig().ic_pressure_ratio > 0) {
+    // IC 压力密度（go 三件套③）：慢路径进入计数直增本 code 的
+    // CodeExtra 槽（发射期烘焙地址），入口包装器按调用窗裁决。
+    if (CodeExtra* extra = codeExtra(GetFunction()->code)) {
+      // LSE stadd：单指令内存原子加，免 load-use 停顿（miss 密集而
+      // 密度未超阈的负载不为计数额外买单）。
+      as_->mov(
+          a64::x9,
+          reinterpret_cast<uint64_t>(&extra->ic_slow_pressure));
+      as_->mov(a64::x10, 1);
+      as_->stadd(a64::x10, a64::ptr(a64::x9));
+    }
+  }
   as_->mov(
       arch::reg_scratch_br,
       reinterpret_cast<uint64_t>(jit::LoadMethodCache::lookupHelper));
@@ -1691,6 +1705,19 @@ void NativeGenerator::emitAarch64LoadAttrInvokeStub(
   as_->ret(arch::lr);
 
   as_->bind(slow_path);
+  if (getConfig().ic_pressure_ratio > 0) {
+    // IC 压力密度（go 三件套③）：慢路径进入计数直增本 code 的
+    // CodeExtra 槽（发射期烘焙地址），入口包装器按调用窗裁决。
+    if (CodeExtra* extra = codeExtra(GetFunction()->code)) {
+      // LSE stadd：单指令内存原子加，免 load-use 停顿（miss 密集而
+      // 密度未超阈的负载不为计数额外买单）。
+      as_->mov(
+          a64::x9,
+          reinterpret_cast<uint64_t>(&extra->ic_slow_pressure));
+      as_->mov(a64::x10, 1);
+      as_->stadd(a64::x10, a64::ptr(a64::x9));
+    }
+  }
   as_->mov(
       arch::reg_scratch_br,
       reinterpret_cast<uint64_t>(jit::LoadAttrCache::invoke));
@@ -1923,6 +1950,19 @@ void NativeGenerator::emitAarch64StoreAttrInvokeStub(
   as_->ret(arch::lr);
 
   as_->bind(slow_path);
+  if (getConfig().ic_pressure_ratio > 0) {
+    // IC 压力密度（go 三件套③）：慢路径进入计数直增本 code 的
+    // CodeExtra 槽（发射期烘焙地址），入口包装器按调用窗裁决。
+    if (CodeExtra* extra = codeExtra(GetFunction()->code)) {
+      // LSE stadd：单指令内存原子加，免 load-use 停顿（miss 密集而
+      // 密度未超阈的负载不为计数额外买单）。
+      as_->mov(
+          a64::x9,
+          reinterpret_cast<uint64_t>(&extra->ic_slow_pressure));
+      as_->mov(a64::x10, 1);
+      as_->stadd(a64::x10, a64::ptr(a64::x9));
+    }
+  }
   as_->mov(
       arch::reg_scratch_br,
       reinterpret_cast<uint64_t>(jit::StoreAttrCache::invoke));
