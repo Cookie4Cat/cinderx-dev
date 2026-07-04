@@ -3294,6 +3294,54 @@ PyObject* get_and_clear_inline_cache_stats(PyObject* /* self */, PyObject*) {
     make_inline_cache_stats(load_type_method_stats, cache_stats);
   }
 
+  // 全局快慢路径计数器（读出即清零）。
+  {
+    auto globals = Ref<>::steal(check(PyDict_New()));
+    check(PyDict_SetItemString(stats, "globals", globals));
+    auto set_counter = [&](const char* key, uint64_t value) {
+      auto num = Ref<>::steal(check(PyLong_FromUnsignedLongLong(value)));
+      check(PyDict_SetItemString(globals, key, num));
+    };
+    ICRuntimeStats& s = g_ic_runtime_stats;
+    set_counter("la_stub_entries", std::exchange(s.la_stub_entries, 0));
+    set_counter("lm_stub_entries", std::exchange(s.lm_stub_entries, 0));
+    auto take = [](std::atomic<uint64_t>& c) {
+      return c.exchange(0, std::memory_order_relaxed);
+    };
+    set_counter("la_invoke", take(s.la_invoke));
+    set_counter("la_entry_hit", take(s.la_entry_hit));
+    set_counter("la_split_values_hit", take(s.la_split_values_hit));
+    set_counter("la_split_materialized", take(s.la_split_materialized));
+    set_counter("la_site_module_hit", take(s.la_site_module_hit));
+    set_counter("la_site_type_hit", take(s.la_site_type_hit));
+    set_counter("la_slow", take(s.la_slow));
+    set_counter("lavog_calls", take(s.lavog_calls));
+    set_counter("lavog_values_hit", take(s.lavog_values_hit));
+    set_counter("lavog_generic", take(s.lavog_generic));
+    set_counter("lm_helper", take(s.lm_helper));
+    set_counter("lm_scan_hit", take(s.lm_scan_hit));
+    set_counter("lm_version_fail", take(s.lm_version_fail));
+    set_counter("lm_keys_fail", take(s.lm_keys_fail));
+    set_counter("lm_slow", take(s.lm_slow));
+    set_counter("lm_fill", take(s.lm_fill));
+    set_counter("sa_invoke", take(s.sa_invoke));
+    set_counter("sa_entry_hit", take(s.sa_entry_hit));
+    set_counter("sa_slow", take(s.sa_slow));
+  }
+
+  // la_slow 站点归属直方图（读出即清零）。
+  {
+    auto sites = Ref<>::steal(check(PyDict_New()));
+    check(PyDict_SetItemString(stats, "la_slow_sites", sites));
+    auto& histogram = icSlowSiteHistogram();
+    for (auto& [key, count] : histogram) {
+      auto py_key = Ref<>::steal(check(PyUnicode_FromString(key.c_str())));
+      auto num = Ref<>::steal(check(PyLong_FromUnsignedLongLong(count)));
+      check(PyDict_SetItem(sites, py_key, num));
+    }
+    histogram.clear();
+  }
+
   return stats.release();
 }
 

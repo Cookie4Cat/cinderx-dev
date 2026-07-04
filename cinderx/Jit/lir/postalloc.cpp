@@ -318,7 +318,11 @@ RewriteResult rewriteCallInstrs(instr_iter_t instr_iter, Environ* env) {
   }
 
   instr->setNumInputs(1); // leave function self operand only
-  if (!instr->isLoadAttrCachedFastPath()) {
+  // 快路径调用形指令必须保留自身操作码：改写为 kCall 会让 translate
+  // 直呼函数操作数（helper），内联 stub 从不被进入（计数矩阵抓获：
+  // lm_stub_entries 恒 0 而 lm_helper 数百万）。
+  if (!instr->isLoadAttrCachedFastPath() &&
+      !instr->isLoadMethodCachedFastPath()) {
     instr->setOpcode(Instruction::kCall);
   }
 
