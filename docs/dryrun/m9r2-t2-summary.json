@@ -1,0 +1,117 @@
+{
+ "go": {
+  "a": "OK",
+  "a_mean": 0.06048189271241426,
+  "b": "OK",
+  "b_mean": 0.09174676034599542,
+  "ratio": 0.6592264673360119
+ },
+ "hexiom": {
+  "a": "OK",
+  "a_mean": 0.0028932195253825437,
+  "b": "OK",
+  "b_mean": 0.005020693591601836,
+  "ratio": 0.5762589316786949
+ },
+ "richards": {
+  "a": "OK",
+  "a_mean": 0.022184618182169893,
+  "b": "OK",
+  "b_mean": 0.03434037646899621,
+  "ratio": 0.6460214028870361
+ },
+ "richards_super": {
+  "a": "OK",
+  "a_mean": 0.027525859240752956,
+  "b": "OK",
+  "b_mean": 0.04031355208717287,
+  "ratio": 0.6827941924152907
+ },
+ "deltablue": {
+  "a": "OK",
+  "a_mean": 0.0017417708033462987,
+  "b": "FAIL rc=1     raise RuntimeError(\"%s failed with exit code %s\" | RuntimeError: /opt/_internal/cpython-3.11.15/bin/python failed with exit code -11"
+ },
+ "raytrace": {
+  "a": "OK",
+  "a_mean": 0.13781000534072518,
+  "b": "FAIL rc=1     raise RuntimeError(\"%s failed with exit code %s\" | RuntimeError: /opt/_internal/cpython-3.11.15/bin/python failed with exit code 1"
+ },
+ "generators": {
+  "a": "OK",
+  "a_mean": 0.021155109400084863,
+  "b": "OK",
+  "b_mean": 0.030531366208257773,
+  "ratio": 0.692897568218322
+ },
+ "unpickle_pure_python": {
+  "a": "FAIL rc=2                         {pickle,pickle_dict,pickle_list,unpickle,unpickle_list} | run_benchmark.py: error: argument benchmark: invalid choice: 'unpickle_pure_python' (choose from 'pickle', 'pickle_dict', 'pickle_list', 'unpickle', 'unpickle_list')",
+  "b": "FAIL rc=2                         {pickle,pickle_dict,pickle_list,unpickle,unpickle_list} | run_benchmark.py: error: argument benchmark: invalid choice: 'unpickle_pure_python' (choose from 'pickle', 'pickle_dict', 'pickle_list', 'unpickle', 'unpickle_list')"
+ },
+ "pickle_pure_python": {
+  "a": "FAIL rc=2                         {pickle,pickle_dict,pickle_list,unpickle,unpickle_list} | run_benchmark.py: error: argument benchmark: invalid choice: 'pickle_pure_python' (choose from 'pickle', 'pickle_dict', 'pickle_list', 'unpickle', 'unpickle_list')",
+  "b": "FAIL rc=2                         {pickle,pickle_dict,pickle_list,unpickle,unpickle_list} | run_benchmark.py: error: argument benchmark: invalid choice: 'pickle_pure_python' (choose from 'pickle', 'pickle_dict', 'pickle_list', 'unpickle', 'unpickle_list')"
+ },
+ "chaos": {
+  "a": "OK",
+  "a_mean": 0.03324637959400813,
+  "b": "OK",
+  "b_mean": 0.049865183598982794,
+  "ratio": 0.6667253019938009
+ },
+ "nbody": {
+  "a": "OK",
+  "a_mean": 0.0472776290650169,
+  "b": "OK",
+  "b_mean": 0.039548323947625856,
+  "ratio": 1.1954395116118455
+ },
+ "regex_compile": {
+  "a": "OK",
+  "a_mean": 0.05324493039709826,
+  "b": "OK",
+  "b_mean": 0.06606126851402223,
+  "ratio": 0.8059931574852583
+ },
+ "spectral_norm": {
+  "a": "OK",
+  "a_mean": 0.04972358160497,
+  "b": "FAIL rc=1     raise RuntimeError(\"%s failed with exit code %s\" | RuntimeError: /opt/_internal/cpython-3.11.15/bin/python failed with exit code -11"
+ },
+ "sqlglot_v2_parse": {
+  "a": "OK",
+  "a_mean": 0.0005313759741208438,
+  "b": "FAIL rc=1            ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^ | TypeError: 'dict_itemiterator' object is not callable"
+ },
+ "sqlglot_v2_transpile": {
+  "a": "OK",
+  "a_mean": 0.0008115442940227998,
+  "b": "FAIL rc=1            ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^ | TypeError: 'dict_itemiterator' object is not callable"
+ },
+ "fannkuch": {
+  "a": "OK",
+  "a_mean": 0.2081788652886947,
+  "b": "OK",
+  "b_mean": 0.20923748339215914,
+  "ratio": 0.9949405905371155
+ },
+ "scimark": {
+  "a": "OK",
+  "a_mean": 0.06164359749149298,
+  "b": "FAIL rc=1     raise RuntimeError(\"%s failed with exit code %s\" | RuntimeError: /opt/_internal/cpython-3.11.15/bin/python failed with exit code -11"
+ },
+ "nqueens": {
+  "a": "OK",
+  "a_mean": 0.04283241705658535,
+  "b": "OK",
+  "b_mean": 0.056078179134055973,
+  "ratio": 0.7637982851439172
+ },
+ "float": {
+  "a": "OK",
+  "a_mean": 0.03395174635419001,
+  "b": "OK",
+  "b_mean": 0.038508916203863916,
+  "ratio": 0.8816593584314728
+ }
+}

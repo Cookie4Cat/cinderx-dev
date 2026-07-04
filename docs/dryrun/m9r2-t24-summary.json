@@ -1,0 +1,121 @@
+{
+ "go": {
+  "a": "OK",
+  "a_mean": 0.06380340876057744,
+  "b": "OK",
+  "b_mean": 0.08868699410619835,
+  "ratio": 0.7194223843484421
+ },
+ "hexiom": {
+  "a": "OK",
+  "a_mean": 0.0030441565036502046,
+  "b": "FAIL rc=1     raise RuntimeError(\"%s failed with exit code %s\" | RuntimeError: /opt/_internal/cpython-3.11.15/bin/python failed with exit code -11"
+ },
+ "richards": {
+  "a": "OK",
+  "a_mean": 0.02304084550123662,
+  "b": "OK",
+  "b_mean": 0.032885213708505036,
+  "ratio": 0.7006445421176513
+ },
+ "richards_super": {
+  "a": "OK",
+  "a_mean": 0.028699279498929777,
+  "b": "OK",
+  "b_mean": 0.036540646998522185,
+  "ratio": 0.7854069880068205
+ },
+ "deltablue": {
+  "a": "OK",
+  "a_mean": 0.001724971044556393,
+  "b": "FAIL rc=1     raise RuntimeError(\"%s failed with exit code %s\" | RuntimeError: /opt/_internal/cpython-3.11.15/bin/python failed with exit code -11"
+ },
+ "raytrace": {
+  "a": "OK",
+  "a_mean": 0.14024152690544725,
+  "b": "FAIL rc=1     raise RuntimeError(\"%s failed with exit code %s\" | RuntimeError: /opt/_internal/cpython-3.11.15/bin/python failed with exit code 1"
+ },
+ "generators": {
+  "a": "OK",
+  "a_mean": 0.021994901549381513,
+  "b": "OK",
+  "b_mean": 0.02909082008215288,
+  "ratio": 0.7560770541108022
+ },
+ "unpickle_pure_python": {
+  "a": "FAIL rc=2                         {pickle,pickle_dict,pickle_list,unpickle,unpickle_list} | run_benchmark.py: error: argument benchmark: invalid choice: 'unpickle_pure_python' (choose from 'pickle', 'pickle_dict', 'pickle_list', 'unpickle', 'unpickle_list')",
+  "b": "FAIL rc=2                         {pickle,pickle_dict,pickle_list,unpickle,unpickle_list} | run_benchmark.py: error: argument benchmark: invalid choice: 'unpickle_pure_python' (choose from 'pickle', 'pickle_dict', 'pickle_list', 'unpickle', 'unpickle_list')"
+ },
+ "pickle_pure_python": {
+  "a": "FAIL rc=2                         {pickle,pickle_dict,pickle_list,unpickle,unpickle_list} | run_benchmark.py: error: argument benchmark: invalid choice: 'pickle_pure_python' (choose from 'pickle', 'pickle_dict', 'pickle_list', 'unpickle', 'unpickle_list')",
+  "b": "FAIL rc=2                         {pickle,pickle_dict,pickle_list,unpickle,unpickle_list} | run_benchmark.py: error: argument benchmark: invalid choice: 'pickle_pure_python' (choose from 'pickle', 'pickle_dict', 'pickle_list', 'unpickle', 'unpickle_list')"
+ },
+ "chaos": {
+  "a": "OK",
+  "a_mean": 0.033462126289183894,
+  "b": "OK",
+  "b_mean": 0.034163491583118835,
+  "ratio": 0.9794703274918918
+ },
+ "nbody": {
+  "a": "OK",
+  "a_mean": 0.04817347847856581,
+  "b": "OK",
+  "b_mean": 0.05080840759910643,
+  "ratio": 0.9481398995746727
+ },
+ "regex_compile": {
+  "a": "OK",
+  "a_mean": 0.05425418031712373,
+  "b": "OK",
+  "b_mean": 0.06648981805580358,
+  "ratio": 0.8159772714611624
+ },
+ "spectral_norm": {
+  "a": "OK",
+  "a_mean": 0.05179861225187778,
+  "b": "FAIL rc=1     raise RuntimeError(\"%s failed with exit code %s\" | RuntimeError: /opt/_internal/cpython-3.11.15/bin/python failed with exit code -11"
+ },
+ "sqlglot_v2_parse": {
+  "a": "OK",
+  "a_mean": 0.0005303995961488303,
+  "b": "OK",
+  "b_mean": 0.00064400211716323,
+  "ratio": 0.8235991497748355
+ },
+ "sqlglot_v2_transpile": {
+  "a": "OK",
+  "a_mean": 0.0008124876777098204,
+  "b": "OK",
+  "b_mean": 0.0010228641544623922,
+  "ratio": 0.7943260834444398
+ },
+ "fannkuch": {
+  "a": "OK",
+  "a_mean": 0.20589752125864227,
+  "b": "OK",
+  "b_mean": 0.21201889108245572,
+  "ratio": 0.9711281867735417
+ },
+ "scimark": {
+  "a": "OK",
+  "a_mean": 0.0614923496725775,
+  "b": "OK",
+  "b_mean": 0.08733073259994853,
+  "ratio": 0.7041318427301702
+ },
+ "nqueens": {
+  "a": "OK",
+  "a_mean": 0.043214934528805315,
+  "b": "OK",
+  "b_mean": 0.05510700646167,
+  "ratio": 0.7842003640474232
+ },
+ "float": {
+  "a": "OK",
+  "a_mean": 0.034487842589927216,
+  "b": "OK",
+  "b_mean": 0.03456489629267404,
+  "ratio": 0.9977707526707332
+ }
+}

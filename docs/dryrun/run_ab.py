@@ -97,7 +97,7 @@ def run_side(bench, side, out_json, timeout):
         # 仍被排除（有机 deopt-resume 已立案，见 M9-log）。
         prefixes = ":".join([SITE, *extra_prefixes])
         env["PYTHONPATH"] = f"{SC_DIR}:{CINDERX_PP}"
-        env["PYTHONJITAUTO"] = "2"
+        env["PYTHONJITAUTO"] = os.environ.get("M9_THRESHOLD", "2")
         env["CI_JIT_AUTO_ONLY_PREFIX"] = prefixes
         cmd += [
             "--inherit-environ",
