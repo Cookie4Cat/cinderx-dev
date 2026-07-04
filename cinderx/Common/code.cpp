@@ -161,6 +161,8 @@ int loadAttrIndex(int oparg) {
 }
 
 int loadGlobalIndex(int oparg) {
+  // The low "push NULL" bit dates back to 3.11 (unlike LOAD_ATTR's method
+  // bit, which is 3.12+), so the shift applies on every supported version.
   return oparg >> 1;
 }
 

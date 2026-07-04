@@ -6,6 +6,7 @@
 #include "cinderx/Interpreter/cinder_opcode.h"
 
 #include "internal/pycore_genobject.h"
+#include "internal/pycore_pyerrors.h"
 
 #include <assert.h>
 #include <limits.h>
@@ -451,13 +452,43 @@ void Cix_format_kwargs_error(
       kwargs);
 }
 
+// Mirrors upstream v3.11.6 ceval.c format_exc_check_arg verbatim. The
+// previous version fed the PyObject* straight into a %.200s (char*) format,
+// printing the object header bytes as the "name"; upstream converts via
+// PyUnicode_AsUTF8 and attaches the name to NameError for the
+// did-you-mean suggestion machinery.
 void Cix_format_exc_check_arg(
     PyThreadState* tstate,
     PyObject* exc,
     const char* format_str,
     PyObject* obj) {
-  (void)tstate;
-  PyErr_Format(exc, format_str, obj);
+  const char* obj_str;
+
+  if (!obj)
+    return;
+
+  obj_str = PyUnicode_AsUTF8(obj);
+  if (!obj_str)
+    return;
+
+  _PyErr_Format(tstate, exc, format_str, obj_str);
+
+  if (exc == PyExc_NameError) {
+    // Include the name in the NameError exceptions to offer suggestions
+    // later.
+    PyObject *type, *value, *traceback;
+    PyErr_Fetch(&type, &value, &traceback);
+    PyErr_NormalizeException(&type, &value, &traceback);
+    if (PyErr_GivenExceptionMatches(value, PyExc_NameError)) {
+      PyNameErrorObject* name_exc = (PyNameErrorObject*)value;
+      if (name_exc->name == NULL) {
+        // We do not care if this fails because we are going to restore the
+        // NameError anyway.
+        (void)PyObject_SetAttrString(value, "name", obj);
+      }
+    }
+    PyErr_Restore(type, value, traceback);
+  }
 }
 
 PyObject* Ci_Builtin_Next_Core(PyObject* it, PyObject* def) {

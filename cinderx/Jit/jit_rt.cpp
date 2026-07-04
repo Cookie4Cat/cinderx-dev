@@ -1030,13 +1030,20 @@ JITRT_CallFunctionEx(PyObject* func, PyObject* pargs, PyObject* kwargs) {
       if (PyDict_Update(d, kwargs) != 0) {
         Py_DECREF(d);
         if (PyErr_ExceptionMatches(PyExc_AttributeError)) {
-          PyErr_Format(
-              PyExc_TypeError,
-              "%.200s%.200s argument after ** "
-              "must be a mapping, not %.200s",
-              PyEval_GetFuncName(func),
-              PyEval_GetFuncDesc(func),
-              kwargs->ob_type->tp_name);
+          // Match stock ceval (do_call_core): qualified function string via
+          // _PyObject_FunctionStr, formatted with the exception cleared.
+          PyThreadState* tstate = _PyThreadState_GET();
+          _PyErr_Clear(tstate);
+          PyObject* funcstr = _PyObject_FunctionStr(func);
+          if (funcstr != nullptr) {
+            _PyErr_Format(
+                tstate,
+                PyExc_TypeError,
+                "%U argument after ** must be a mapping, not %.200s",
+                funcstr,
+                Py_TYPE(kwargs)->tp_name);
+            Py_DECREF(funcstr);
+          }
         }
         return nullptr;
       }
@@ -1047,13 +1054,20 @@ JITRT_CallFunctionEx(PyObject* func, PyObject* pargs, PyObject* kwargs) {
   }
   if (!PyTuple_CheckExact(pargs)) {
     if (pargs->ob_type->tp_iter == nullptr && !PySequence_Check(pargs)) {
-      PyErr_Format(
-          PyExc_TypeError,
-          "%.200s%.200s argument after * "
-          "must be an iterable, not %.200s",
-          PyEval_GetFuncName(func),
-          PyEval_GetFuncDesc(func),
-          pargs->ob_type->tp_name);
+      // Match stock ceval (check_args_iterable): qualified function string
+      // via _PyObject_FunctionStr, formatted with the exception cleared.
+      PyThreadState* tstate = _PyThreadState_GET();
+      _PyErr_Clear(tstate);
+      PyObject* funcstr = _PyObject_FunctionStr(func);
+      if (funcstr != nullptr) {
+        _PyErr_Format(
+            tstate,
+            PyExc_TypeError,
+            "%U argument after * must be an iterable, not %.200s",
+            funcstr,
+            Py_TYPE(pargs)->tp_name);
+        Py_DECREF(funcstr);
+      }
       return nullptr;
     }
     pargs = PySequence_Tuple(pargs);
@@ -1144,7 +1158,6 @@ PyObject* JITRT_Vectorcall(
 }
 
 PyObject* JITRT_VectorcallPythonFunction(
-    PyThreadState*,
     PyObject* callable,
     PyObject* const* args,
     size_t nargsf,
