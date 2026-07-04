@@ -1268,6 +1268,32 @@ void LIRGenerator::AnalyzeCopies() {
 }
 
 std::unique_ptr<jit::lir::Function> LIRGenerator::TranslateFunction() {
+#if PY_VERSION_HEX < 0x030C0000
+  // The 3.11 materialized-frame epilogue is reached through an exit phi fed
+  // by normal returns. A function whose every path is dominated by an
+  // always-raising guard (e.g. a statically-unbound local) has no Return
+  // terminator left in the final HIR, which would leave a zero-input exit
+  // phi that later lowering cannot materialize. Reject such functions like
+  // the frontend pattern valves; they fall back to the interpreter with
+  // identical behavior. Checked here (not in buildHIR) because the dead
+  // Return is only pruned by the SSA simplification passes.
+  if (!is_gen_) {
+    bool has_return = false;
+    for (auto& hir_bb : GetHIRFunction()->cfg.blocks) {
+      if (hir_bb.GetTerminator()->opcode() == hir::Opcode::kReturn) {
+        has_return = true;
+        break;
+      }
+    }
+    if (!has_return) {
+      JIT_THROW(
+          "functions with no reachable normal return are unsupported on "
+          "CPython 3.11 in {}",
+          func_->fullname);
+    }
+  }
+#endif
+
   AnalyzeCopies();
 
   auto function = std::make_unique<jit::lir::Function>(func_);
@@ -1389,10 +1415,21 @@ std::unique_ptr<jit::lir::Function> LIRGenerator::TranslateFunction() {
         break;
       }
       case Opcode::kReturn: {
-        last_bb->addSuccessor(exit_block_);
         auto* ret = static_cast<const Return*>(hir_term);
-        return_edges_.push_back(
-            {last_bb, phi_bbb.getDefInstr(ret->GetOperand(0))});
+        Instruction* retval = phi_bbb.getDefInstr(ret->GetOperand(0));
+        if (retval == nullptr) {
+          // The return value is Bottom-typed and was never materialized
+          // (e.g. the block is dominated by an always-raising CheckVar, as
+          // with a statically-unbound local). The block body already ends
+          // in Unreachable; wiring it into the exit phi would create an
+          // empty operand that codegen cannot translate.
+          JIT_CHECK(
+              ret->GetOperand(0)->type() <= hir::TBottom,
+              "missing LIR def for a non-Bottom return value");
+          break;
+        }
+        last_bb->addSuccessor(exit_block_);
+        return_edges_.push_back({last_bb, retval});
         break;
       }
       default:

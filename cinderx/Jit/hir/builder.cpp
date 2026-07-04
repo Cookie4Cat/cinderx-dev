@@ -282,10 +282,15 @@ bool isSupportedOpcode(int opcode) {
     case MAKE_CELL:
     case MAKE_FUNCTION:
     case MAP_ADD:
+#if PY_VERSION_HEX >= 0x030C0000
+    // On 3.11 the MATCH_* runtime helpers in the borrow fallback are
+    // placeholders; treat the opcodes as unsupported so match statements
+    // fall back to the interpreter until the helpers are ported.
     case MATCH_CLASS:
     case MATCH_KEYS:
     case MATCH_MAPPING:
     case MATCH_SEQUENCE:
+#endif
     case NOP:
     case NOT_TAKEN:
     case POP_BLOCK:
@@ -1290,6 +1295,7 @@ std::unique_ptr<Function> HIRBuilder::buildHIR() {
   // Run because the rest of CleanCFG requires SSA.
   removeTrampolineBlocks(&irfunc->cfg);
   removeUnreachableBlocks(*irfunc);
+
   return irfunc;
 }
 
