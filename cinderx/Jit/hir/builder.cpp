@@ -4298,7 +4298,15 @@ void HIRBuilder::emitLoadFast(
     const jit::BytecodeInstruction& bc_instr) {
   int var_idx = bc_instr.oparg();
   Register* var = tc.frame.localsplus[var_idx];
-  if (bc_instr.opcode() == LOAD_FAST_CHECK) {
+#if PY_VERSION_HEX < 0x030C0000
+  // 3.11 has no LOAD_FAST_CHECK/LOAD_FAST split (that came with 3.12's
+  // definite-assignment analysis): the interpreter checks every LOAD_FAST
+  // for an unbound local, so the JIT must too.
+  bool needs_unbound_check = bc_instr.opcode() == LOAD_FAST;
+#else
+  bool needs_unbound_check = bc_instr.opcode() == LOAD_FAST_CHECK;
+#endif
+  if (needs_unbound_check) {
     tc.emit<CheckVar>(var, var, getVarname(code_, var_idx), tc.frame);
   }
   tc.frame.stack.push(var);

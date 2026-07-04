@@ -2850,8 +2850,21 @@ void translateSelect(Environ* env, const Instruction* instr) {
       condition_reg = AT::getGp(condition_op);
       break;
   }
-  auto true_val_reg = AT::getGpWiden(instr->getInput(1));
-  auto false_val_reg = AT::getGpWiden(instr->getInput(2));
+  // csel takes registers only, but LIR copy propagation can fold constant
+  // moves into either value input; materialize immediates into the scratch
+  // registers (safe here: both are dead across this instruction and the
+  // condition has already been consumed by the cmp below being emitted
+  // after the movs).
+  auto materialize = [&](const lir::OperandBase* op,
+                         const arch::Gp& scratch) -> arch::Gp {
+    if (op->isImm()) {
+      as->mov(scratch, getImm(op));
+      return scratch;
+    }
+    return AT::getGpWiden(op);
+  };
+  auto true_val_reg = materialize(instr->getInput(1), arch::reg_scratch_0);
+  auto false_val_reg = materialize(instr->getInput(2), arch::reg_scratch_1);
 
   as->cmp(condition_reg, 0);
   as->csel(output, true_val_reg, false_val_reg, a64::CondCode::kNE);

@@ -1,0 +1,172 @@
+{
+  "python": "3.11.15 (main, Jun  6 2026, 08:01:57) [GCC 14.2.1 20250110 (Red Hat 14.2.1-11)]",
+  "modules": [
+    "corpus_calls",
+    "corpus_controlflow",
+    "corpus_frames",
+    "corpus_hotloops",
+    "corpus_ic_mutation",
+    "corpus_operators",
+    "corpus_unbound"
+  ],
+  "total_cases": 918,
+  "modes": [
+    "jit",
+    "jit_deopt"
+  ],
+  "failures": [
+    "jit:case_annotation_only_then_read",
+    "jit:case_attr_class_del_raises",
+    "jit:case_attr_class_reassign",
+    "jit:case_attr_mro_bases_change",
+    "jit:case_attr_property_added_later",
+    "jit:case_match_class_positional",
+    "jit:case_match_mapping",
+    "jit:case_match_no_capture",
+    "jit:case_read_before_assign",
+    "jit:case_walrus_dead_branch",
+    "jit_deopt:case_annotation_only_then_read",
+    "jit_deopt:case_attr_class_del_raises",
+    "jit_deopt:case_attr_class_reassign",
+    "jit_deopt:case_attr_mro_bases_change",
+    "jit_deopt:case_attr_property_added_later",
+    "jit_deopt:case_descriptor_nondata_vs_instance",
+    "jit_deopt:case_match_class_positional",
+    "jit_deopt:case_match_mapping",
+    "jit_deopt:case_match_no_capture",
+    "jit_deopt:case_read_before_assign",
+    "jit_deopt:case_walrus_dead_branch"
+  ],
+  "new_failures": [
+    "jit:case_annotation_only_then_read",
+    "jit:case_attr_class_del_raises",
+    "jit:case_attr_class_reassign",
+    "jit:case_attr_mro_bases_change",
+    "jit:case_attr_property_added_later",
+    "jit:case_match_class_positional",
+    "jit:case_match_mapping",
+    "jit:case_match_no_capture",
+    "jit:case_read_before_assign",
+    "jit:case_walrus_dead_branch",
+    "jit_deopt:case_annotation_only_then_read",
+    "jit_deopt:case_attr_class_del_raises",
+    "jit_deopt:case_attr_class_reassign",
+    "jit_deopt:case_attr_mro_bases_change",
+    "jit_deopt:case_attr_property_added_later",
+    "jit_deopt:case_descriptor_nondata_vs_instance",
+    "jit_deopt:case_match_class_positional",
+    "jit_deopt:case_match_mapping",
+    "jit_deopt:case_match_no_capture",
+    "jit_deopt:case_read_before_assign",
+    "jit_deopt:case_walrus_dead_branch"
+  ],
+  "fixed_vs_baseline": [],
+  "infra_errors": [],
+  "detail": {
+    "jit:case_match_class_positional": {
+      "kind": "diff",
+      "interp": "CASE case_match_class_positional OK (1, 2)",
+      "jit": "CASE case_match_class_positional EXC RuntimeError: MATCH_CLASS is not supported by the stock Python 3.11 CinderX fallback @case_match_class_positional+8"
+    },
+    "jit:case_match_mapping": {
+      "kind": "diff",
+      "interp": "CASE case_match_mapping OK ('point', 1, [('y', 2)])",
+      "jit": "CASE case_match_mapping EXC RuntimeError: MATCH_KEYS is not supported by the stock Python 3.11 CinderX fallback @case_match_mapping+3"
+    },
+    "jit_deopt:case_match_class_positional": {
+      "kind": "diff",
+      "interp": "CASE case_match_class_positional OK (1, 2)",
+      "jit_deopt": "CASE case_match_class_positional EXC RuntimeError: MATCH_CLASS is not supported by the stock Python 3.11 CinderX fallback @case_match_class_positional+8"
+    },
+    "jit_deopt:case_match_mapping": {
+      "kind": "diff",
+      "interp": "CASE case_match_mapping OK ('point', 1, [('y', 2)])",
+      "jit_deopt": "CASE case_match_mapping EXC RuntimeError: MATCH_KEYS is not supported by the stock Python 3.11 CinderX fallback @case_match_mapping+3"
+    },
+    "jit:case_attr_class_del_raises": {
+      "kind": "diff",
+      "interp": "CASE case_attr_class_del_raises OK ('temp', \"AttributeError: 'Temp' object has no attribute 'attr'\")",
+      "jit": "CASE case_attr_class_del_raises OK ('temp', 'temp')"
+    },
+    "jit:case_attr_class_reassign": {
+      "kind": "diff",
+      "interp": "CASE case_attr_class_reassign OK ('class-attr', 'mutated')",
+      "jit": "CASE case_attr_class_reassign OK ('class-attr', 'class-attr')"
+    },
+    "jit:case_attr_mro_bases_change": {
+      "kind": "diff",
+      "interp": "CASE case_attr_mro_bases_change OK ('from-A', 'from-B')",
+      "jit": "CASE case_attr_mro_bases_change OK ('from-A', 'from-A')"
+    },
+    "jit:case_attr_property_added_later": {
+      "kind": "diff",
+      "interp": "CASE case_attr_property_added_later OK ('plain', 'via-property')",
+      "jit": "CASE case_attr_property_added_later OK ('plain', 'plain')"
+    },
+    "jit_deopt:case_attr_class_del_raises": {
+      "kind": "diff",
+      "interp": "CASE case_attr_class_del_raises OK ('temp', \"AttributeError: 'Temp' object has no attribute 'attr'\")",
+      "jit_deopt": "CASE case_attr_class_del_raises OK ('temp', 'temp')"
+    },
+    "jit_deopt:case_attr_class_reassign": {
+      "kind": "diff",
+      "interp": "CASE case_attr_class_reassign OK ('class-attr', 'mutated')",
+      "jit_deopt": "CASE case_attr_class_reassign OK ('class-attr', 'class-attr')"
+    },
+    "jit_deopt:case_attr_mro_bases_change": {
+      "kind": "diff",
+      "interp": "CASE case_attr_mro_bases_change OK ('from-A', 'from-B')",
+      "jit_deopt": "CASE case_attr_mro_bases_change OK ('from-A', 'from-A')"
+    },
+    "jit_deopt:case_attr_property_added_later": {
+      "kind": "diff",
+      "interp": "CASE case_attr_property_added_later OK ('plain', 'via-property')",
+      "jit_deopt": "CASE case_attr_property_added_later OK ('plain', 'plain')"
+    },
+    "jit_deopt:case_descriptor_nondata_vs_instance": {
+      "kind": "diff",
+      "interp": "CASE case_descriptor_nondata_vs_instance OK ('non-data', 'instance-wins')",
+      "jit_deopt": "CASE case_descriptor_nondata_vs_instance OK ('from-A', 'instance-wins')"
+    },
+    "jit:case_annotation_only_then_read": {
+      "kind": "diff",
+      "interp": "CASE case_annotation_only_then_read EXC UnboundLocalError: cannot access local variable 'x' where it is not associated with a value @case_annotation_only_then_read+2",
+      "jit": "CASE case_annotation_only_then_read CRASH exit=-6"
+    },
+    "jit:case_match_no_capture": {
+      "kind": "diff",
+      "interp": "CASE case_match_no_capture EXC UnboundLocalError: cannot access local variable 'captured' where it is not associated with a value @case_match_no_capture+5",
+      "jit": "CASE case_match_no_capture EXC RuntimeError: MATCH_CLASS is not supported by the stock Python 3.11 CinderX fallback @case_match_no_capture+3"
+    },
+    "jit:case_read_before_assign": {
+      "kind": "diff",
+      "interp": "CASE case_read_before_assign EXC UnboundLocalError: cannot access local variable 'x' where it is not associated with a value @case_read_before_assign+3",
+      "jit": "CASE case_read_before_assign CRASH exit=-6"
+    },
+    "jit:case_walrus_dead_branch": {
+      "kind": "diff",
+      "interp": "CASE case_walrus_dead_branch EXC UnboundLocalError: cannot access local variable 'w' where it is not associated with a value @case_walrus_dead_branch+3",
+      "jit": "CASE case_walrus_dead_branch CRASH exit=-6"
+    },
+    "jit_deopt:case_annotation_only_then_read": {
+      "kind": "diff",
+      "interp": "CASE case_annotation_only_then_read EXC UnboundLocalError: cannot access local variable 'x' where it is not associated with a value @case_annotation_only_then_read+2",
+      "jit_deopt": "CASE case_annotation_only_then_read CRASH exit=-6"
+    },
+    "jit_deopt:case_match_no_capture": {
+      "kind": "diff",
+      "interp": "CASE case_match_no_capture EXC UnboundLocalError: cannot access local variable 'captured' where it is not associated with a value @case_match_no_capture+5",
+      "jit_deopt": "CASE case_match_no_capture EXC RuntimeError: MATCH_CLASS is not supported by the stock Python 3.11 CinderX fallback @case_match_no_capture+3"
+    },
+    "jit_deopt:case_read_before_assign": {
+      "kind": "diff",
+      "interp": "CASE case_read_before_assign EXC UnboundLocalError: cannot access local variable 'x' where it is not associated with a value @case_read_before_assign+3",
+      "jit_deopt": "CASE case_read_before_assign CRASH exit=-6"
+    },
+    "jit_deopt:case_walrus_dead_branch": {
+      "kind": "diff",
+      "interp": "CASE case_walrus_dead_branch EXC UnboundLocalError: cannot access local variable 'w' where it is not associated with a value @case_walrus_dead_branch+3",
+      "jit_deopt": "CASE case_walrus_dead_branch CRASH exit=-6"
+    }
+  }
+}
