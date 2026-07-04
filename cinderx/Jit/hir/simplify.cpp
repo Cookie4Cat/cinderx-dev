@@ -4,6 +4,11 @@
 
 #include "pycore_long.h"
 
+#if PY_VERSION_HEX < 0x030C0000
+#include "cinderx/Interpreter/cinder_opcode.h"
+#include "cinderx/Jit/bytecode.h"
+#endif
+
 #include "cinderx/Common/dict.h"
 #include "cinderx/Common/log.h"
 #include "cinderx/Common/property.h"
@@ -1663,6 +1668,22 @@ Register* simplifyLoadAttrSplitDict(
     return nullptr;
   }
 
+#if PY_VERSION_HEX < 0x030C0000
+  // 站点证据门（落后组轮）：解释器已把本站点特化为 WITH_HINT，即
+  // 接收者以物化形态为主（天生物化的分阶段初始化类，如 go 的
+  // Square）。values 投机对其恒假——deopt 风暴触发 ROI backoff 把
+  // 函数整体冻回解释器。此时放弃 split-dict 投机，交由缓存
+  // helper/stub 的带 hint 物化直读。仅正向证据（WITH_HINT）弃权；
+  // INSTANCE_VALUE 与未特化站点维持投机。
+  if (getConfig().specialized_opcodes) {
+    BytecodeInstruction bc_instr{
+        load_attr->frameState()->code, load_attr->frameState()->instrOffset()};
+    if (bc_instr.specializedOpcode() == LOAD_ATTR_WITH_HINT) {
+      return nullptr;
+    }
+  }
+#endif
+
   Register* receiver = load_attr->GetOperand(0);
   auto patchpoint = env.emitInstr<DeoptPatchpoint>(
       env.func.allocateCodePatcher<TypeDeoptPatcher>(type));
@@ -1671,16 +1692,28 @@ Register* simplifyLoadAttrSplitDict(
   env.emit<UseType>(receiver, receiver->type());
 
 #if PY_VERSION_HEX < 0x030C0000
-  // CPython 3.11 stores the inline values pointer in a separate pre-header slot
-  // from the managed dict pointer.  If values is null the instance dict has been
-  // materialized, so deopt to the generic LOAD_ATTR path instead of treating the
-  // dict pointer as tagged values.
+  // CPython 3.11 stores the inline values pointer in a separate pre-header
+  // slot from the managed dict pointer.  If values is null the instance dict
+  // has been materialized, so deopt to the generic LOAD_ATTR path instead of
+  // treating the dict pointer as tagged values.
+  // 注（IC 计数轮 go 案）：物化是持久状态，此守卫对"天生物化"型工作
+  // 负载（分阶段初始化超容量）每次访问必 deopt，由 ROI backoff 冻回
+  // 解释器形成均衡（上方 WITH_HINT 站点证据门为主防线）。曾试改
+  // CondBranch 回退缓存 helper，但 helper 调用每访问的代价使整体劣于
+  // 解释器行内 WITH_HINT（go 88→145ms），已回退。彻底解需与
+  // DescrOrClassVar hint 化、store 内联 stub 同轮落地后再评估。
   Register* values = env.emit<LoadField>(
       receiver, "__dict_values__", -4 * sizeof(PyObject*), TCUInt64);
   auto guard = env.emitInstr<Guard>(values);
   guard->setGuiltyReg(receiver);
   guard->setDescr("dict values check");
   Register* values_obj = env.emit<BitCast>(values, TOptObject);
+  Register* attr = env.emit<LoadField>(
+      values_obj, "attr", attr_idx * sizeof(PyObject*), TOptObject);
+  Register* checked_attr =
+      env.emit<CheckField>(attr, name, *load_attr->frameState());
+  static_cast<CheckField*>(checked_attr->instr())->setGuiltyReg(receiver);
+  return checked_attr;
 #else
   // PyDictOrValues is stored at -3 per _PyObject_DictOrValuesPointer.
   Register* obj_dict = env.emit<LoadField>(
@@ -1701,7 +1734,6 @@ Register* simplifyLoadAttrSplitDict(
   guard->setDescr("dict values check");
   Register* values = env.emit<IntBinaryOp>(BinaryOpKind::kAdd, dict_ptr, one);
   Register* values_obj = env.emit<BitCast>(values, TOptObject);
-#endif
   Register* attr = env.emit<LoadField>(
       values_obj, "attr", attr_idx * sizeof(PyObject*), TOptObject);
 
@@ -1710,6 +1742,7 @@ Register* simplifyLoadAttrSplitDict(
   static_cast<CheckField*>(checked_attr->instr())->setGuiltyReg(receiver);
 
   return checked_attr;
+#endif
 }
 #endif
 

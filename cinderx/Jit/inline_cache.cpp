@@ -467,6 +467,62 @@ static inline PyDictValues* ci_inline_values_311(PyObject* obj) {
       reinterpret_cast<char*>(obj) - 4 * sizeof(PyObject*));
 }
 
+static inline PyDictObject* ci_managed_dict_311(PyObject* obj) {
+  return *reinterpret_cast<PyDictObject**>(
+      reinterpret_cast<char*>(obj) - 3 * sizeof(PyObject*));
+}
+
+// [P2] PEP 509 版本发号：影子发号器（定义于 cinderx_ceval_shims.c，
+// Ci_InitOpcodes 以运行时当前值 + 2^40 播种，与 libpython 内部计数器
+// 不可能撞号）。物化实例字典是真实字典对象，覆写须镜像 stock
+// STORE_ATTR_WITH_HINT 的版本戳。
+extern "C" uint64_t ci_pydict_global_version_shadow;
+
+// 带 hint 的 unicode keys 名字定位（镜像 stock *_WITH_HINT 设计）：
+// me_key 指针比较自验证——hint 无论新旧乃至未初始化，越界或键不符即
+// 线性重算，无需任何版本前提。返回条目下标或 -1（名字不在键中）。
+static inline Py_ssize_t ci_hinted_keys_index_311(
+    PyDictKeysObject* dk,
+    PyObject* name,
+    Py_ssize_t* hint_io) {
+  Py_ssize_t hint = *hint_io;
+  if (hint >= 0 && hint < dk->dk_nentries &&
+      DK_UNICODE_ENTRIES(dk)[hint].me_key == name) {
+    return hint;
+  }
+  hint = getDictKeysIndex(dk, name);
+  *hint_io = hint;
+  return hint;
+}
+
+// 3.11：无副作用的实例属性直读（借引用；不存在返回 nullptr）。
+// _PyObject_GetDictPtr 在 3.11 对 values 形态实例有物化副作用（把
+// 共享 values 转为真实字典对象），任何高频慢路径禁用之——方法慢
+// 路径的物化副作用曾把整个工作负载的新生实例批量转入慢形态（IC
+// 计数轮 go 案）。values 形态经共享键定位直读；物化实例经 -3 槽
+// 字典查找（管理型实例字典恒为 unicode 键）。
+static PyObject* ci_peek_instance_attr_311(PyObject* obj, PyObject* name) {
+  PyTypeObject* tp = Py_TYPE(obj);
+  if (!PyType_HasFeature(tp, Py_TPFLAGS_MANAGED_DICT)) {
+    return nullptr;
+  }
+  PyDictValues* values = ci_inline_values_311(obj);
+  if (values != nullptr) {
+    PyHeapTypeObject* ht = reinterpret_cast<PyHeapTypeObject*>(tp);
+    PyDictKeysObject* dk = ht->ht_cached_keys;
+    if (dk == nullptr || !DK_IS_UNICODE(dk)) {
+      return nullptr;
+    }
+    Py_ssize_t ix = getDictKeysIndex(dk, name);
+    return ix >= 0 ? values->values[ix] : nullptr;
+  }
+  PyDictObject* dict = ci_managed_dict_311(obj);
+  if (dict == nullptr) {
+    return nullptr;
+  }
+  return PyDict_GetItem(reinterpret_cast<PyObject*>(dict), name);
+}
+
 // 3.11 写侧覆写快路径（IC 计数轮：richards/raytrace 每窗口数百万次
 // STORE_ATTR 全部落在既有值槽覆写）。等价于 stock
 // STORE_ATTR_INSTANCE_VALUE 的 old != NULL 分支：values 形态实例无
@@ -501,6 +557,32 @@ int SplitMutator::setAttr(PyObject* obj, PyObject* name, PyObject* value) {
         values->values[val_offset] = value;
         return 0;
       }
+      return PyObject_SetAttr(obj, name, value);
+    }
+    // 物化实例覆写：带 hint 直读槽位（split 包装写 ma_values、combined
+    // 写 me_value），镜像 stock STORE_ATTR_WITH_HINT 的 old 非空路径：
+    // GC 跟踪保障 + PEP 509 版本戳（[P2] 影子发号器）。插入（槽空/键
+    // 缺，涉及 ma_used 与插入序）回退通用协议。
+    PyDictObject* dict = ci_managed_dict_311(obj);
+    if (dict != nullptr && DK_IS_UNICODE(dict->ma_keys)) {
+      Py_ssize_t ix = ci_hinted_keys_index_311(dict->ma_keys, name, &mat_hint);
+      if (ix >= 0) {
+        PyObject** slot = dict->ma_values != nullptr
+            ? &dict->ma_values->values[ix]
+            : &DK_UNICODE_ENTRIES(dict->ma_keys)[ix].me_value;
+        PyObject* old = *slot;
+        if (old != nullptr) {
+          if (!_PyObject_GC_IS_TRACKED(reinterpret_cast<PyObject*>(dict)) &&
+              _PyObject_GC_MAY_BE_TRACKED(value)) {
+            PyObject_GC_Track(reinterpret_cast<PyObject*>(dict));
+          }
+          Py_INCREF(value);
+          *slot = value;
+          dict->ma_version_tag = ++ci_pydict_global_version_shadow;
+          Py_DECREF(old);
+          return 0;
+        }
+      }
     }
   }
   return PyObject_SetAttr(obj, name, value);
@@ -530,7 +612,28 @@ PyObject* SplitMutator::getAttrInlineKnownOffset(
     PyObject* name) {
   PyDictValues* values = ci_inline_values_311(obj);
   if (values == nullptr) {
-    // 实例字典已物化，回退通用协议（正确优先；物化实例为少数形态）。
+    // 实例字典已物化：带 hint 直读（IC 计数轮：go 每窗口 59 万次此
+    // 形态落全泛型）。物化时 new_dict 复用共享键与 values 数组（split
+    // 包装，读 ma_values）；后续键集变更转 combined（读 me_value）。
+    // 缺失语义与 values 快路径同一论证：fill 仅在类侧无遮蔽时选择
+    // split 形态，类型版本由条目 matches() 钉住，故槽空/键缺即
+    // AttributeError。
+    PyDictObject* dict = ci_managed_dict_311(obj);
+    if (dict != nullptr && DK_IS_UNICODE(dict->ma_keys)) {
+      Py_ssize_t ix = ci_hinted_keys_index_311(dict->ma_keys, name, &mat_hint);
+      if (ix >= 0) {
+        PyObject* result = dict->ma_values != nullptr
+            ? dict->ma_values->values[ix]
+            : DK_UNICODE_ENTRIES(dict->ma_keys)[ix].me_value;
+        if (result == nullptr) {
+          return raise_attribute_error(obj, name);
+        }
+        incICStat(g_ic_runtime_stats.la_mat_hint_hit);
+        Py_INCREF(result);
+        return result;
+      }
+      return raise_attribute_error(obj, name);
+    }
     incICStat(g_ic_runtime_stats.la_split_materialized);
     return PyObject_GetAttr(obj, name);
   }
@@ -623,6 +726,32 @@ PyObject* DescrOrClassVarMutator::getAttr(PyObject* obj, PyObject* name) {
     return getter(descr, obj, type);
   }
 
+#if PY_VERSION_HEX < 0x030C0000
+  // Check instance dict（无副作用直读：_PyObject_GetDictPtr 会物化
+  // values 形态实例）。
+  if (PyType_HasFeature(Py_TYPE(obj), Py_TPFLAGS_MANAGED_DICT)) {
+    if (PyObject* iattr = ci_peek_instance_attr_311(obj, name)) {
+      Py_INCREF(iattr);
+      return iattr;
+    }
+  } else {
+    Ref<> dict;
+    PyObject** dictptr = _PyObject_GetDictPtr(obj);
+    if (dictptr != nullptr) {
+      dict.reset(*dictptr);
+    }
+    if (dict != nullptr) {
+      if (keys_version == 0 ||
+          reinterpret_cast<PyDictObject*>(dict.get())->ma_keys->dk_version !=
+              keys_version) {
+        auto res = Ref<>::create(PyDict_GetItem(dict, name));
+        if (res != nullptr) {
+          return res.release();
+        }
+      }
+    }
+  }
+#else
   Ref<> dict;
   PyObject** dictptr = _PyObject_GetDictPtr(obj);
   if (dictptr != nullptr) {
@@ -640,6 +769,7 @@ PyObject* DescrOrClassVarMutator::getAttr(PyObject* obj, PyObject* name) {
       }
     }
   }
+#endif
 
   if (getter != nullptr) {
     // Non-data descriptor
@@ -692,6 +822,9 @@ void AttributeMutator::set_split(
   set_type(type, inline_values ? Kind::kSplitInline : Kind::kSplit);
   split_.val_offset = val_offset;
   split_.keys = keys;
+#if PY_VERSION_HEX < 0x030C0000
+  split_.mat_hint = -1;
+#endif
 }
 
 BorrowedRef<PyTypeObject> AttributeMutator::watchedDescrType() const {
@@ -1337,6 +1470,19 @@ LoadMethodResult LoadMethodCache::lookup(
 #endif
       if (!isValidKeysVersion(entry.keys_version, obj)) {
         incICStat(g_ic_runtime_stats.lm_keys_fail);
+        // 类型权威键版本已前移（共享键在 fill 后又插入了新名字，如
+        // 实例属性跨方法分批添加的初始化模式）时，条目永不可再命中
+        // ——不驱逐则该类型方法查找永久落慢路径且 fill 无空槽可填。
+        // 物化实例的瞬时不匹配（权威版本未动）不驱逐，保住 values
+        // 形态接收者的命中。
+        if (PyType_HasFeature(tp, Py_TPFLAGS_HEAPTYPE)) {
+          PyDictKeysObject* canonical = getSplitKeys(tp);
+          if (canonical == nullptr ||
+              canonical->dk_version != entry.keys_version) {
+            entry.type.reset();
+            entry.value.reset();
+          }
+        }
         continue;
       }
 
@@ -1347,6 +1493,51 @@ LoadMethodResult LoadMethodCache::lookup(
       return {result, obj};
     }
   }
+
+#if PY_VERSION_HEX < 0x030C0000
+  // 实例属性方法位：类型指针 + VALID 标志 + tp_version_tag 拉式验证
+  // （版本钉住"类侧无数据描述符遮蔽"这一 fill 前提），值经 me_key 自
+  // 验证 hint 从实例 values/字典逐次活读——借引用不驻留，属性删除或
+  // 实例无该键即自然未命中落慢路径。返回形态镜像 lookupSlowPath 的
+  // 实例字典分支：{Py_None, attr} 双新增引用。
+  if (ia_type_ == tp && Ci_Type_HasValidVersionTag(tp) &&
+      tp->tp_version_tag == ia_type_version_ &&
+      PyType_HasFeature(tp, Py_TPFLAGS_MANAGED_DICT)) {
+    PyObject* v = nullptr;
+    PyObject* raw = obj.get();
+    PyDictValues* values = *reinterpret_cast<PyDictValues**>(
+        reinterpret_cast<char*>(raw) - 4 * sizeof(PyObject*));
+    if (values != nullptr) {
+      PyHeapTypeObject* ht =
+          reinterpret_cast<PyHeapTypeObject*>(tp.get());
+      PyDictKeysObject* dk = ht->ht_cached_keys;
+      if (dk != nullptr && DK_IS_UNICODE(dk)) {
+        Py_ssize_t ix = ci_hinted_keys_index_311(dk, name, &ia_hint_);
+        if (ix >= 0) {
+          v = values->values[ix];
+        }
+      }
+    } else {
+      PyDictObject* dict = *reinterpret_cast<PyDictObject**>(
+          reinterpret_cast<char*>(raw) - 3 * sizeof(PyObject*));
+      if (dict != nullptr && DK_IS_UNICODE(dict->ma_keys)) {
+        Py_ssize_t ix =
+            ci_hinted_keys_index_311(dict->ma_keys, name, &ia_hint_);
+        if (ix >= 0) {
+          v = dict->ma_values != nullptr
+              ? dict->ma_values->values[ix]
+              : DK_UNICODE_ENTRIES(dict->ma_keys)[ix].me_value;
+        }
+      }
+    }
+    if (v != nullptr) {
+      incICStat(g_ic_runtime_stats.lm_ia_hit);
+      Py_INCREF(Py_None);
+      Py_INCREF(v);
+      return {Py_None, v};
+    }
+  }
+#endif
 
   incICStat(g_ic_runtime_stats.lm_slow);
   return lookupSlowPath(obj, name);
@@ -1422,6 +1613,44 @@ LoadMethodResult __attribute__((noinline)) LoadMethodCache::lookupSlowPath(
     }
   }
 
+#if PY_VERSION_HEX < 0x030C0000
+  if (PyType_HasFeature(tp, Py_TPFLAGS_MANAGED_DICT)) {
+    // 无副作用直读（_PyObject_GetDictPtr 会物化 values 形态实例，
+    // 方法慢路径高频，物化副作用曾把新生实例批量转入慢形态）。
+    attr = ci_peek_instance_attr_311(obj, name);
+    if (attr != nullptr) {
+      maybeCollectCacheStats(
+          cache_stats_, tp, name, CacheMissReason::kUncategorized);
+      // 记录实例属性方法位（本分支可达即类侧无数据描述符遮蔽；该
+      // 前提由 tp_version_tag 钉住，类侧任何变化经版本失效）。
+      if (ensureVersionTag(tp)) {
+        ia_type_ = tp;
+        ia_type_version_ = tp->tp_version_tag;
+        ia_hint_ = -1;
+      }
+      Py_INCREF(attr);
+      Py_XDECREF(descr);
+      Py_INCREF(Py_None);
+      return {Py_None, attr};
+    }
+  } else {
+    dictptr = _PyObject_GetDictPtr(obj);
+    if (dictptr != nullptr && (dict = *dictptr) != nullptr) {
+      Py_INCREF(dict);
+      attr = PyDict_GetItem(dict, name);
+      if (attr != nullptr) {
+        maybeCollectCacheStats(
+            cache_stats_, tp, name, CacheMissReason::kUncategorized);
+        Py_INCREF(attr);
+        Py_DECREF(dict);
+        Py_XDECREF(descr);
+        Py_INCREF(Py_None);
+        return {Py_None, attr};
+      }
+      Py_DECREF(dict);
+    }
+  }
+#else
   dictptr = _PyObject_GetDictPtr(obj);
   if (dictptr != nullptr && (dict = *dictptr) != nullptr) {
     Py_INCREF(dict);
@@ -1437,6 +1666,7 @@ LoadMethodResult __attribute__((noinline)) LoadMethodCache::lookupSlowPath(
     }
     Py_DECREF(dict);
   }
+#endif
 
   if (is_method) {
     fill(tp, descr, name);
