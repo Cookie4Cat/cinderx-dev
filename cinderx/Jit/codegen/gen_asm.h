@@ -135,6 +135,7 @@ class NativeGenerator {
   void generateDeoptExits(const asmjit::CodeHolder& code);
   void emitAarch64LoadAttrInvokeStub(const asmjit::CodeHolder& code);
   void emitAarch64LoadMethodInvokeStub(const asmjit::CodeHolder& code);
+  void emitAarch64StoreAttrInvokeStub(const asmjit::CodeHolder& code);
   void linkDeoptPatchers(const asmjit::CodeHolder& code);
   Py_ssize_t giJITDataOffset();
   void generateStaticEntryPoint(

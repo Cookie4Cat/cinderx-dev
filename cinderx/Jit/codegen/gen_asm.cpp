@@ -61,6 +61,10 @@ using namespace jit::hir;
 using namespace jit::lir;
 using namespace jit::util;
 
+// [P2] PEP 509 影子发号器（cinderx_ceval_shims.c 定义，Ci_InitOpcodes
+// 播种）；store stub 的物化覆写按 stock 语义戳 ma_version_tag。
+extern "C" uint64_t ci_pydict_global_version_shadow;
+
 namespace jit::codegen {
 
 namespace {
@@ -1632,6 +1636,12 @@ void NativeGenerator::emitAarch64LoadAttrInvokeStub(
     as_->b_ne(slow_path);
     as_->ldr(a64::x14, arch::ptr_offset(a64::x15, kMaValuesOffset));
     as_->cbz(a64::x14, load_me_value);
+    // split 包装容量守卫（同 store stub：共享键成长后 hint 可越界）。
+    as_->ldrb(
+        a64::w9,
+        arch::ptr_offset(a64::x14, -1, arch::AccessSize::k8));
+    as_->cmp(a64::x12, a64::x9);
+    as_->b_hs(slow_path);
     as_->add(a64::x14, a64::x14, a64::x12, a64::lsl(3));
     as_->ldr(a64::x9, a64::ptr(a64::x14)); // split 包装：ma_values[hint]
     as_->b(test_value);
@@ -1684,6 +1694,238 @@ void NativeGenerator::emitAarch64LoadAttrInvokeStub(
   as_->mov(
       arch::reg_scratch_br,
       reinterpret_cast<uint64_t>(jit::LoadAttrCache::invoke));
+  as_->br(arch::reg_scratch_br);
+#else
+  (void)code;
+#endif
+}
+
+void NativeGenerator::emitAarch64StoreAttrInvokeStub(
+    const asmjit::CodeHolder& code) {
+#if defined(CINDER_AARCH64) && !defined(Py_GIL_DISABLED) && \
+    PY_VERSION_HEX < 0x030C0000
+  if (!env_.store_attr_invoke_stub.isValid()) {
+    return;
+  }
+
+  CodeSectionOverride hot_override{as_, &code, &metadata_, CodeSection::kHot};
+
+  Label slow_path = as_->newLabel();
+  Label do_store = as_->newLabel();
+  Label ret_zero = as_->newLabel();
+
+  // 3.11 写侧内联快路径（go 三件套②）。条目判据与读侧 stub 一致
+  // （类型指针 + VALID/版本拉校验 + kSplitInlineKnownOffset）；命中
+  // 后 values 覆写或物化 hint 覆写行内完成，镜像 stock
+  // STORE_ATTR_INSTANCE_VALUE / STORE_ATTR_WITH_HINT 的 old 非空
+  // 路径。以下形态回落 helper：插入（槽空/键缺）、旧值 refcnt==1
+  // （dealloc 路径）、字典未被 GC 跟踪（track 语义）、general 键、
+  // 描述符/Combined 等其余 kind。物化覆写按 PEP 509 以 [P2] 影子
+  // 发号器戳 ma_version_tag。
+  constexpr int kEntryTypeOffset = static_cast<int>(
+      jit::AttributeCache::entriesOffset() +
+      jit::AttributeMutator::typeOffset());
+  constexpr int kEntryVersionOffset = static_cast<int>(
+      jit::AttributeCache::entriesOffset() +
+      jit::AttributeMutator::typeVersionOffset());
+  constexpr int kValOffsetOffset = static_cast<int>(
+      jit::AttributeCache::entriesOffset() +
+      jit::AttributeMutator::splitValOffsetOffset());
+  constexpr int kEntryMatHintOffset = static_cast<int>(
+      jit::AttributeCache::entriesOffset() +
+      jit::AttributeMutator::splitMatHintOffset());
+  constexpr int kEntrySize = sizeof(jit::AttributeMutator);
+  constexpr uint64_t kKindMask = jit::AttributeMutator::kindMask();
+  constexpr uint64_t kSplitInlineKnownOffsetKind =
+      jit::AttributeMutator::splitInlineKnownOffsetKind();
+  constexpr int kObTypeOffset = offsetof(PyObject, ob_type);
+  constexpr int kRefcountOffset = offsetof(PyObject, ob_refcnt);
+  constexpr int kTpFlagsOffset = offsetof(PyTypeObject, tp_flags);
+  constexpr int kTpVersionTagOffset = offsetof(PyTypeObject, tp_version_tag);
+  constexpr int kValuesPreheaderOffset =
+      -4 * static_cast<int>(sizeof(PyObject*));
+  constexpr int kDictPreheaderOffset =
+      -3 * static_cast<int>(sizeof(PyObject*));
+  constexpr int kMaVersionTagOffset =
+      offsetof(PyDictObject, ma_version_tag);
+  constexpr int kMaKeysOffset = offsetof(PyDictObject, ma_keys);
+  constexpr int kMaValuesOffset = offsetof(PyDictObject, ma_values);
+  constexpr int kDkKindOffset = offsetof(PyDictKeysObject, dk_kind);
+  constexpr int kDkLog2IndexBytesOffset =
+      offsetof(PyDictKeysObject, dk_log2_index_bytes);
+  constexpr int kDkNentriesOffset =
+      offsetof(PyDictKeysObject, dk_nentries);
+  constexpr int kDkIndicesOffset = offsetof(PyDictKeysObject, dk_indices);
+  // PyGC_Head 前置 16 字节，_gc_next 为其首字（非零即已跟踪）。
+  constexpr int kGcNextOffset = -16;
+
+  ASM_CHECK(as_->align(AlignMode::kCode, 8), GetFunction()->fullname);
+  as_->bind(env_.store_attr_invoke_stub);
+
+  // x0=cache, x1=obj, x2=name, x3=value
+  if (getConfig().collect_attr_cache_stats) {
+    as_->mov(
+        a64::x12,
+        reinterpret_cast<uint64_t>(&g_ic_runtime_stats.sa_stub_entries));
+    as_->ldr(a64::x11, arch::ptr_offset(a64::x12, 0));
+    as_->add(a64::x11, a64::x11, 1);
+    as_->str(a64::x11, arch::ptr_offset(a64::x12, 0));
+  }
+  as_->ldr(a64::x11, arch::ptr_offset(a64::x1, kObTypeOffset));
+
+  auto emit_store_attr_entry = [&](uint32_t entry_index, Label next_entry) {
+    const int entry_offset = static_cast<int>(entry_index) * kEntrySize;
+    Label materialized = as_->newLabel();
+
+    as_->ldr(
+        a64::x12,
+        arch::ptr_offset(a64::x0, kEntryTypeOffset + entry_offset));
+    as_->cbz(a64::x12, next_entry);
+    as_->mov(a64::x13, ~kKindMask);
+    as_->and_(a64::x13, a64::x12, a64::x13);
+    as_->cmp(a64::x13, a64::x11);
+    as_->b_ne(next_entry);
+    as_->ldr(a64::x14, arch::ptr_offset(a64::x13, kTpFlagsOffset));
+    as_->tst(a64::x14, Py_TPFLAGS_VALID_VERSION_TAG);
+    as_->b_eq(next_entry);
+    as_->ldr(
+        a64::w14,
+        arch::ptr_offset(
+            a64::x13, kTpVersionTagOffset, arch::AccessSize::k32));
+    as_->ldr(
+        a64::w15,
+        arch::ptr_offset(
+            a64::x0, kEntryVersionOffset + entry_offset,
+            arch::AccessSize::k32));
+    as_->cmp(a64::w14, a64::w15);
+    as_->b_ne(next_entry);
+    // 写侧条目 kind 恒为 kSplitInline（KnownOffset 晋升只在读侧
+    // getAttrInline 发生），接受 kSplitInline/kSplitInlineKnownOffset
+    // 两值：kind-2 ∈ {0,1}。
+    as_->and_(a64::x14, a64::x12, kKindMask);
+    arch::sub_immediate(
+        as_, a64::x14, a64::x14, kSplitInlineKnownOffsetKind - 1);
+    arch::cmp_immediate(as_, a64::x14, 1);
+    as_->b_hi(slow_path);
+
+    // values 形态：slot = values + val_offset*8；x15=0 表示无需版本戳。
+    // val_offset 可能为 -1（fill 时名字尚不在共享键），负值回落。
+    as_->ldr(a64::x15, arch::ptr_offset(a64::x1, kValuesPreheaderOffset));
+    as_->cbz(a64::x15, materialized);
+    as_->ldr(
+        a64::x14,
+        arch::ptr_offset(a64::x0, kValOffsetOffset + entry_offset));
+    as_->tbnz(a64::x14, 63, slow_path);
+    // 容量守卫：共享键可在实例创建后继续成长（laggards 轮实证），
+    // 旧实例 values 容量（预头 [-1] 字节）可能小于 val_offset——
+    // 越界即回落（helper 经 stock 协议物化处理）。无符号比较。
+    as_->ldrb(
+        a64::w9,
+        arch::ptr_offset(a64::x15, -1, arch::AccessSize::k8));
+    as_->cmp(a64::x14, a64::x9);
+    as_->b_hs(slow_path);
+    as_->add(a64::x14, a64::x15, a64::x14, a64::lsl(3));
+    as_->mov(a64::x15, 0);
+    as_->b(do_store);
+
+    // 物化实例：带 hint 覆写（me_key 自验证）。x15=dict 保留供版本戳。
+    as_->bind(materialized);
+    as_->ldr(a64::x15, arch::ptr_offset(a64::x1, kDictPreheaderOffset));
+    as_->cbz(a64::x15, slow_path);
+    as_->ldr(a64::x9, arch::ptr_offset(a64::x15, kGcNextOffset));
+    as_->cbz(a64::x9, slow_path);
+    as_->ldr(a64::x14, arch::ptr_offset(a64::x15, kMaKeysOffset));
+    as_->ldrb(
+        a64::w12,
+        arch::ptr_offset(a64::x14, kDkKindOffset, arch::AccessSize::k8));
+    as_->cbz(a64::w12, slow_path);
+    as_->ldr(
+        a64::x12,
+        arch::ptr_offset(a64::x0, kEntryMatHintOffset + entry_offset));
+    as_->ldr(a64::x9, arch::ptr_offset(a64::x14, kDkNentriesOffset));
+    as_->cmp(a64::x12, a64::x9);
+    as_->b_hs(slow_path);
+    as_->ldrb(
+        a64::w9,
+        arch::ptr_offset(
+            a64::x14, kDkLog2IndexBytesOffset, arch::AccessSize::k8));
+    as_->mov(a64::x10, 1);
+    as_->lsl(a64::x10, a64::x10, a64::x9);
+    as_->add(a64::x10, a64::x14, a64::x10);
+    arch::add_immediate(as_, a64::x10, a64::x10, kDkIndicesOffset);
+    as_->add(a64::x10, a64::x10, a64::x12, a64::lsl(4));
+    as_->ldr(a64::x9, a64::ptr(a64::x10)); // me_key
+    as_->cmp(a64::x9, a64::x2);
+    as_->b_ne(slow_path);
+    as_->ldr(a64::x14, arch::ptr_offset(a64::x15, kMaValuesOffset));
+    Label combined_slot = as_->newLabel();
+    as_->cbz(a64::x14, combined_slot);
+    // split 包装容量守卫：ma_values 为实例创建时的原数组（容量 [-1]
+    // 字节定格），共享键其后可成长——hint < nentries 仍可能越界。
+    as_->ldrb(
+        a64::w9,
+        arch::ptr_offset(a64::x14, -1, arch::AccessSize::k8));
+    as_->cmp(a64::x12, a64::x9);
+    as_->b_hs(slow_path);
+    as_->add(a64::x14, a64::x14, a64::x12, a64::lsl(3)); // split 包装
+    as_->b(do_store);
+    as_->bind(combined_slot);
+    arch::add_immediate(as_, a64::x14, a64::x10, 8); // ep->me_value
+    as_->b(do_store);
+  };
+
+  constexpr uint32_t kMaxStubEntries = 4;
+  const uint32_t stub_entries =
+      std::min<uint32_t>(jit::getConfig().attr_cache_size, kMaxStubEntries);
+  if (stub_entries == 0) {
+    as_->b(slow_path);
+  }
+  for (uint32_t entry_index = 0; entry_index < stub_entries; ++entry_index) {
+    const bool has_next_entry = entry_index + 1 != stub_entries;
+    Label next_entry = has_next_entry ? as_->newLabel() : slow_path;
+    emit_store_attr_entry(entry_index, next_entry);
+    if (has_next_entry) {
+      as_->bind(next_entry);
+    }
+  }
+
+  // 共享写块：x14=槽地址，x15=需版本戳的字典或 0，x3=value。
+  // 顺序镜像 stock：新值先入槽再减旧值（旧值 refcnt≥2 已保证不触发
+  // dealloc）；物化路径最后戳 ma_version_tag（[P2] 影子发号器，
+  // Ci_InitOpcodes 播种，语义同 DICT_NEXT_VERSION）。
+  as_->bind(do_store);
+  as_->ldr(a64::x9, a64::ptr(a64::x14)); // old
+  as_->cbz(a64::x9, slow_path);          // 插入回落
+  as_->ldr(a64::x12, arch::ptr_offset(a64::x9, kRefcountOffset));
+  arch::cmp_immediate(as_, a64::x12, 2);
+  as_->b_lt(slow_path);                  // dealloc 路径回落
+  as_->ldr(a64::x10, arch::ptr_offset(a64::x3, kRefcountOffset));
+  arch::add_immediate(as_, a64::x10, a64::x10, 1);
+  as_->str(a64::x10, arch::ptr_offset(a64::x3, kRefcountOffset));
+  as_->str(a64::x3, a64::ptr(a64::x14));
+  // old 的引用计数必须在 value incref 之后重读：old == value（同一
+  // 对象重复赋值）时，沿用 incref 前缓存的计数会以陈旧值-1 抹掉刚
+  // 加的 +1，每次调用净 -1 直至归零早释（go 三件套②排障实证；C++
+  // 参照实现因逐笔访存天然免疫）。
+  as_->ldr(a64::x12, arch::ptr_offset(a64::x9, kRefcountOffset));
+  arch::sub_immediate(as_, a64::x12, a64::x12, 1);
+  as_->str(a64::x12, arch::ptr_offset(a64::x9, kRefcountOffset));
+  as_->cbz(a64::x15, ret_zero);
+  as_->mov(
+      a64::x9,
+      reinterpret_cast<uint64_t>(&ci_pydict_global_version_shadow));
+  as_->ldr(a64::x10, arch::ptr_offset(a64::x9, 0));
+  arch::add_immediate(as_, a64::x10, a64::x10, 1);
+  as_->str(a64::x10, arch::ptr_offset(a64::x9, 0));
+  as_->str(a64::x10, arch::ptr_offset(a64::x15, kMaVersionTagOffset));
+  as_->bind(ret_zero);
+  as_->mov(a64::w0, 0);
+  as_->ret(arch::lr);
+
+  as_->bind(slow_path);
+  as_->mov(
+      arch::reg_scratch_br,
+      reinterpret_cast<uint64_t>(jit::StoreAttrCache::invoke));
   as_->br(arch::reg_scratch_br);
 #else
   (void)code;
@@ -2024,6 +2266,7 @@ void NativeGenerator::generateCode(
   generateDeoptExits(codeholder);
   emitAarch64LoadAttrInvokeStub(codeholder);
   emitAarch64LoadMethodInvokeStub(codeholder);
+  emitAarch64StoreAttrInvokeStub(codeholder);
 
   for (auto& [osr_idx, block] : env_.osr_entry_blocks) {
     Label stub_label = as_->newLabel();

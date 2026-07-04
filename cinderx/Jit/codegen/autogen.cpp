@@ -2147,6 +2147,32 @@ void translateIsTruthyFastPath(Environ* env, const Instruction* instr) {
 #endif
 }
 
+void translateStoreAttrCachedFastPath(
+    Environ* env,
+    const Instruction* instr) {
+#if defined(CINDER_AARCH64) && !defined(Py_GIL_DISABLED) && \
+    PY_VERSION_HEX < 0x030C0000
+  auto output = instr->output();
+  auto as = env->as;
+
+  if (!env->store_attr_invoke_stub.isValid()) {
+    env->store_attr_invoke_stub = as->newLabel();
+  }
+  emitCall(*env, env->store_attr_invoke_stub, instr);
+
+  if (output->type() != OperandBase::kNone) {
+    auto out_reg = AT::getGpOutput(output);
+    if (out_reg.isGpW()) {
+      as->mov(out_reg, a64::w0);
+    } else {
+      as->mov(out_reg, a64::x0);
+    }
+  }
+#else
+  translateCall(env, instr);
+#endif
+}
+
 void translateLoadAttrCachedFastPath(Environ* env, const Instruction* instr) {
 #if defined(CINDER_AARCH64) && !defined(Py_GIL_DISABLED) && \
     (PY_VERSION_HEX >= 0x030E0000 || PY_VERSION_HEX < 0x030C0000)
@@ -3826,6 +3852,9 @@ void AutoTranslator::translateInstr(Environ* env, const Instruction* instr)
       return;
     case Instruction::kIsTruthyFastPath:
       translateIsTruthyFastPath(env, instr);
+      return;
+    case Instruction::kStoreAttrCachedFastPath:
+      translateStoreAttrCachedFastPath(env, instr);
       return;
     case Instruction::kMove:
       translateMove(env, instr);
