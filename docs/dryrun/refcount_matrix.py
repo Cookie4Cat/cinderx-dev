@@ -58,6 +58,14 @@ def main() -> int:
     ]
 
     def snapshot():
+        # 类型方法缓存（MCACHE）在 3.11 对缓存名字持强引用，条目被
+        # 碰撞驱逐时合法释放——任何曾作为查找名的字符串目标都会因此
+        # 产生与被测代码无关的 ±1 漂移（闪烁案 case_sub_index_protocol/
+        # _pname：函数内建类使 tp_version 流水与名字哈希在窗口内随机
+        # 撞槽驱逐旧名；jit 模式因拉式验证/IC 填充的额外类型查找改变
+        # 缓存流量而更易触发）。快照前清空缓存，两侧均无 MCACHE 持
+        # 引用，判据确定化。
+        sys._clear_type_cache()
         return {n: sys.getrefcount(o) for n, o in targets.items()}
 
     results = {}
