@@ -8,6 +8,7 @@
 #include "cinderx/Common/extra-py-flags.h"
 #include "cinderx/Common/log.h"
 #include "cinderx/Common/util.h"
+#include "cinderx/Jit/context.h"
 #include "cinderx/Jit/disassembler.h"
 #include "cinderx/Jit/hir/printer.h"
 #include "cinderx/module_c_state.h"
@@ -25,8 +26,21 @@ bool isJitCompiled(const PyFunctionObject* func) {
     return false;
   }
   jit::ICodeAllocator* code_allocator = mod_state->code_allocator.get();
-  return code_allocator != nullptr &&
-      code_allocator->contains(reinterpret_cast<const void*>(func->vectorcall));
+  if (code_allocator == nullptr) {
+    return false;
+  }
+  if (code_allocator->contains(
+          reinterpret_cast<const void*>(func->vectorcall))) {
+    return true;
+  }
+  // 3.11：编译函数的 vectorcall 槽位安装的是递归守卫包装（context.cpp），
+  // 指针不落在代码池内，须回退到按上下文查询编译状态。
+  if (jit::isRecursionGuardVectorcall(func->vectorcall)) {
+    jit::Context* ctx = jit::getContext();
+    return ctx != nullptr &&
+        ctx->lookupFunc(const_cast<PyFunctionObject*>(func)) != nullptr;
+  }
+  return false;
 }
 
 } // extern "C"

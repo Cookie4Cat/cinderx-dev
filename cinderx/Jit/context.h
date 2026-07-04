@@ -614,4 +614,14 @@ extern AotContext g_aot_ctx;
 // This is equivalent to jitCtx() but can be used without depending on pyjit.
 Context* getContext();
 
+// Resolve the generated-code vectorcall entry for a JIT-compiled function.
+// On 3.11 func->vectorcall holds the recursion-guard wrapper instead of a
+// pointer into generated code, so offset-based reentry (JITRT_GET_REENTRY /
+// JITRT_GET_STATIC_ENTRY) must resolve the real entry through the context.
+vectorcallfunc jitVectorcallEntryBase(BorrowedRef<PyFunctionObject> func);
+
+// True if `entry` is the 3.11 recursion-guard wrapper installed on compiled
+// functions' vectorcall slot. Always false on 3.12+.
+bool isRecursionGuardVectorcall(vectorcallfunc entry);
+
 } // namespace jit

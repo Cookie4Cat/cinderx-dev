@@ -38,7 +38,66 @@
 #endif
 
 #include <cmath>
+#include <cstdlib>
+#include <cstring>
 #include <limits>
+
+namespace jit {
+namespace {
+
+// M6 异常注入 fuzz 状态（协议见 jit_rt.h）。语料执行为单线程，计数器
+// 不做原子化；多线程使用属正式开发范围。
+int64_t s_exc_inject_counter = 0;
+int64_t s_exc_inject_target = 0;
+bool s_exc_inject_enabled = false;
+bool s_exc_inject_inited = false;
+
+void excInjectReport() {
+  fprintf(
+      stderr,
+      "CI_EXC_INJECT_TOTAL=%lld\n",
+      static_cast<long long>(s_exc_inject_counter));
+}
+
+void excInjectInit() {
+  s_exc_inject_inited = true;
+  const char* v = getenv("CI_EXC_INJECT");
+  if (v == nullptr || *v == '\0') {
+    return;
+  }
+  s_exc_inject_enabled = true;
+  if (strcmp(v, "count") != 0) {
+    s_exc_inject_target = atoll(v);
+  }
+  std::atexit(excInjectReport);
+}
+
+} // namespace
+
+bool excInjectEnabled() {
+  if (!s_exc_inject_inited) {
+    excInjectInit();
+  }
+  return s_exc_inject_enabled;
+}
+
+bool excInjectFire() {
+  if (!s_exc_inject_inited) {
+    excInjectInit();
+  }
+  if (!s_exc_inject_enabled) {
+    return false;
+  }
+  int64_t n = ++s_exc_inject_counter;
+  if (s_exc_inject_target > 0 && n == s_exc_inject_target) {
+    PyErr_Format(
+        PyExc_RuntimeError, "ci-exc-inject #%lld", static_cast<long long>(n));
+    return true;
+  }
+  return false;
+}
+
+} // namespace jit
 
 // This is mostly taken from ceval.c _PyEval_EvalCodeWithName
 // We use the same logic to turn **args, nargsf, and kwnames into
@@ -223,7 +282,7 @@ PyObject* JITRT_CallWithKeywordArgs(
           kwdict,
           varargs)) {
     size_t new_nargsf = total_args;
-    return JITRT_GET_REENTRY(func->vectorcall)(
+    return JITRT_GET_REENTRY(jit::jitVectorcallEntryBase(func))(
         (PyObject*)func, arg_space.get(), new_nargsf, nullptr);
   }
 
@@ -280,7 +339,7 @@ JITRT_StaticCallFPReturn JITRT_CallWithIncorrectArgcountFPReturn(
   size_t new_nargsf = argcount;
 
   return reinterpret_cast<staticvectorcallfuncfp>(
-      JITRT_GET_REENTRY(func->vectorcall))(
+      JITRT_GET_REENTRY(jit::jitVectorcallEntryBase(func)))(
       (PyObject*)func,
       arg_space.get(),
       new_nargsf,
@@ -327,7 +386,7 @@ JITRT_StaticCallReturn JITRT_CallWithIncorrectArgcount(
   size_t new_nargsf = argcount;
 
   return reinterpret_cast<staticvectorcallfunc>(
-      JITRT_GET_REENTRY(func->vectorcall))(
+      JITRT_GET_REENTRY(jit::jitVectorcallEntryBase(func)))(
       (PyObject*)func,
       arg_space.get(),
       new_nargsf,
@@ -397,7 +456,7 @@ TRetType JITRT_CallStaticallyWithPrimitiveSignatureWorker(
     goto fail;
   }
 
-  return reinterpret_cast<TVectorcall>(JITRT_GET_REENTRY(func->vectorcall))(
+  return reinterpret_cast<TVectorcall>(JITRT_GET_REENTRY(jit::jitVectorcallEntryBase(func)))(
       (PyObject*)func, (PyObject**)arg_space.get(), nargsf, nullptr);
 
 fail:
@@ -1098,6 +1157,9 @@ PyObject* JITRT_Call(
   JIT_DCHECK(
       (nargsf & PY_VECTORCALL_ARGUMENTS_OFFSET),
       "JITRT_Call must always be called as a vectorcall");
+  if (jit::excInjectFire()) {
+    return nullptr;
+  }
 
   constexpr size_t kVectorcallOffset =
       static_cast<size_t>(PY_VECTORCALL_ARGUMENTS_OFFSET);
@@ -1144,6 +1206,9 @@ PyObject* JITRT_Vectorcall(
     PyObject* const* args,
     size_t nargsf,
     PyObject* kwnames) {
+  if (jit::excInjectFire()) {
+    return nullptr;
+  }
   PyThreadState* tstate = _PyThreadState_GET();
   PyObject* res =
       _PyObject_VectorcallTstate(tstate, callable, args, nargsf, kwnames);
@@ -1163,6 +1228,9 @@ PyObject* JITRT_VectorcallPythonFunction(
     size_t nargsf,
     PyObject* kwnames) {
   JIT_DCHECK(PyFunction_Check(callable), "expected exact Python function");
+  if (jit::excInjectFire()) {
+    return nullptr;
+  }
   PyFunctionObject* func = reinterpret_cast<PyFunctionObject*>(callable);
   return func->vectorcall(callable, args, nargsf, kwnames);
 }
