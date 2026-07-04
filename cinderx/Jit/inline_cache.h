@@ -49,6 +49,11 @@ struct SplitMutator {
 
   Py_ssize_t val_offset;
   PyDictKeysObject* keys; // Borrowed
+#if PY_VERSION_HEX < 0x030C0000
+  // 物化实例字典的 me_key 自验证 hint（任意值均安全：越界或键不符即
+  // 重算），读写侧共用。
+  Py_ssize_t mat_hint;
+#endif
 };
 
 // Mutator for an instance attribute that is stored in a combined dictionary
@@ -166,6 +171,10 @@ class AttributeMutator {
 #if PY_VERSION_HEX < 0x030C0000
   static constexpr size_t typeVersionOffset() {
     return offsetof(AttributeMutator, type_version_);
+  }
+  static constexpr size_t splitMatHintOffset() {
+    return offsetof(AttributeMutator, split_) +
+        offsetof(SplitMutator, mat_hint);
   }
 #endif
 
@@ -363,7 +372,9 @@ struct ICRuntimeStats {
   std::atomic<uint64_t> la_split_materialized{0};
   std::atomic<uint64_t> la_site_module_hit{0};
   std::atomic<uint64_t> la_site_type_hit{0};
+  std::atomic<uint64_t> la_mat_hint_hit{0};
   std::atomic<uint64_t> la_slow{0};
+  std::atomic<uint64_t> lm_ia_hit{0};
   std::atomic<uint64_t> lavog_calls{0};
   std::atomic<uint64_t> lavog_values_hit{0};
   std::atomic<uint64_t> lavog_generic{0};
@@ -448,6 +459,18 @@ class LoadMethodCache {
 
   std::array<Entry, 4> entries_;
   std::unique_ptr<CacheStats> cache_stats_;
+
+#if PY_VERSION_HEX < 0x030C0000
+  // 实例属性方法位（IC 计数轮：纯 Python pickle 的 self.read/readline
+  // 形态——绑定方法存于实例字典，类型侧 fill 永不适用，每次调用付
+  // 全量 _PyType_Lookup + 字典查找）。命中前提：类型指针 + VALID 标志
+  // + tp_version_tag 拉式验证（类侧新增数据描述符等变化经版本失效），
+  // 值经 me_key 自验证 hint 从实例字典/values 逐次活读（借引用不驻留，
+  // 删除即自然未命中）。
+  BorrowedRef<PyTypeObject> ia_type_;
+  uint32_t ia_type_version_{0};
+  Py_ssize_t ia_hint_{-1};
+#endif
 };
 
 // A cache for LoadMethodCached instructions where we expect the receiver to be

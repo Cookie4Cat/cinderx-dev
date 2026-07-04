@@ -3314,6 +3314,8 @@ PyObject* get_and_clear_inline_cache_stats(PyObject* /* self */, PyObject*) {
     set_counter("la_split_materialized", take(s.la_split_materialized));
     set_counter("la_site_module_hit", take(s.la_site_module_hit));
     set_counter("la_site_type_hit", take(s.la_site_type_hit));
+    set_counter("la_mat_hint_hit", take(s.la_mat_hint_hit));
+    set_counter("lm_ia_hit", take(s.lm_ia_hit));
     set_counter("la_slow", take(s.la_slow));
     set_counter("lavog_calls", take(s.lavog_calls));
     set_counter("lavog_values_hit", take(s.lavog_values_hit));

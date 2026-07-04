@@ -1158,87 +1158,6 @@ static bool exitsOnlyByRaising(BorrowedRef<PyCodeObject> code) {
   return has_raise;
 }
 
-static bool hasIntConstLocalBinaryAccumulator311(
-    BorrowedRef<PyCodeObject> code) {
-  constexpr int kMaxCompactAccumulatorLocalsPlus = 8;
-  BytecodeInstructionBlock bc_instrs{code};
-  bool has_disqualifying_call = false;
-  bool last_global_for_call_is_range = false;
-  for (auto instr : bc_instrs) {
-    if (instr.opcode() == LOAD_METHOD) {
-      has_disqualifying_call = true;
-      break;
-    }
-    if (instr.opcode() == LOAD_GLOBAL) {
-      BorrowedRef<> name =
-          PyTuple_GET_ITEM(code->co_names, loadGlobalIndex(instr.oparg()));
-      last_global_for_call_is_range =
-          PyUnicode_CompareWithASCIIString(name, "range") == 0;
-      continue;
-    }
-    if (instr.opcode() == CALL || instr.opcode() == CALL_FUNCTION_EX) {
-      if (!last_global_for_call_is_range) {
-        has_disqualifying_call = true;
-        break;
-      }
-      last_global_for_call_is_range = false;
-    }
-  }
-
-  for (auto it = bc_instrs.begin(); it != bc_instrs.end(); ++it) {
-    BytecodeInstruction load = *it;
-    if (load.opcode() != LOAD_FAST) {
-      continue;
-    }
-
-    auto const_it = it;
-    ++const_it;
-    if (const_it == bc_instrs.end()) {
-      return false;
-    }
-    BytecodeInstruction load_const = *const_it;
-    if (load_const.opcode() != LOAD_CONST ||
-        load_const.oparg() >= PyTuple_GET_SIZE(code->co_consts)) {
-      continue;
-    }
-    BorrowedRef<> const_value =
-        PyTuple_GET_ITEM(code->co_consts, load_const.oparg());
-    if (!PyLong_CheckExact(const_value)) {
-      continue;
-    }
-
-    auto binary_it = const_it;
-    ++binary_it;
-    if (binary_it == bc_instrs.end()) {
-      return false;
-    }
-    BytecodeInstruction binary = *binary_it;
-    if (binary.opcode() != BINARY_OP) {
-      continue;
-    }
-    auto inplace_op = getInPlaceOpKindFromOparg(binary.oparg());
-    if (!inplace_op.has_value()) {
-      continue;
-    }
-
-    auto store_it = binary_it;
-    ++store_it;
-    if (store_it == bc_instrs.end()) {
-      return false;
-    }
-    BytecodeInstruction store = *store_it;
-    if (store.opcode() == STORE_FAST && store.oparg() == load.oparg()) {
-      if ((*inplace_op == InPlaceOpKind::kAdd ||
-           *inplace_op == InPlaceOpKind::kSubtract) &&
-          numLocalsplus(code) <= kMaxCompactAccumulatorLocalsPlus &&
-          !has_disqualifying_call) {
-        continue;
-      }
-      return true;
-    }
-  }
-  return false;
-}
 
 #endif
 
@@ -1283,11 +1202,11 @@ std::unique_ptr<Function> HIRBuilder::buildHIR() {
         "functions that only exit by raising are unsupported on CPython 3.11 in {}",
         preloader_.fullname());
   }
-  if (hasIntConstLocalBinaryAccumulator311(code_)) {
-    JIT_THROW(
-        "int-constant local binary accumulator is unsupported on CPython 3.11 in {}",
-        preloader_.fullname());
-  }
+  // 整型常量累加器拒编阀（穿刺前端 e31387ad5 整取件）已移除：该模式
+  // 仅在"函数含方法调用或 localsplus>8"时拒编，小函数一直在编且语料
+  // 全绿，无任何文档化失败案例支撑；其代价是 go 等计分型热函数整体
+  // 落回解释执行（PMP：go 稳态 45% 在解释器）。若回归门禁再现原病，
+  // 以复现用例修根因而非恢复模式拒编。
 #endif
 #endif
 

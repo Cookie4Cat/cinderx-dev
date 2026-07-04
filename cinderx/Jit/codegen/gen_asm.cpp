@@ -1483,14 +1483,33 @@ void NativeGenerator::emitAarch64LoadAttrInvokeStub(
   // 3.11：条目有效性 = tp_version_tag 拉式校验（无 type watcher 的 D5
   // 语义，镜像 AttributeMutator::matches：VALID 标志位 + 版本相等）；
   // values 形态经 managed dict 预头 -4 槽直读（_PyObject_ValuesPointer），
-  // 槽空即已物化，回落 helper。
+  // 槽空即已物化，走行内带 hint 物化直读（me_key 自验证，miss 回落
+  // helper，helper 侧刷新 mat_hint）。
   constexpr int kEntryVersionOffset = static_cast<int>(
       jit::AttributeCache::entriesOffset() +
       jit::AttributeMutator::typeVersionOffset());
+  constexpr int kEntryMatHintOffset = static_cast<int>(
+      jit::AttributeCache::entriesOffset() +
+      jit::AttributeMutator::splitMatHintOffset());
   constexpr int kTpFlagsOffset = offsetof(PyTypeObject, tp_flags);
   constexpr int kTpVersionTagOffset = offsetof(PyTypeObject, tp_version_tag);
   constexpr int kValuesPreheaderOffset =
       -4 * static_cast<int>(sizeof(PyObject*));
+  constexpr int kDictPreheaderOffset =
+      -3 * static_cast<int>(sizeof(PyObject*));
+  constexpr int kMaKeysOffset = offsetof(PyDictObject, ma_keys);
+  constexpr int kMaValuesOffset = offsetof(PyDictObject, ma_values);
+  constexpr int kDkKindOffset = offsetof(PyDictKeysObject, dk_kind);
+  constexpr int kDkLog2SizeOffset =
+      offsetof(PyDictKeysObject, dk_log2_size);
+  constexpr int kDkLog2IndexBytesOffset =
+      offsetof(PyDictKeysObject, dk_log2_index_bytes);
+  constexpr int kDkNentriesOffset =
+      offsetof(PyDictKeysObject, dk_nentries);
+  constexpr int kDkIndicesOffset = offsetof(PyDictKeysObject, dk_indices);
+  static_assert(
+      sizeof(PyDictUnicodeEntry) == 16,
+      "materialized hint block assumes 16-byte unicode entries");
 #endif
 
   ASM_CHECK(as_->align(AlignMode::kCode, 8), GetFunction()->fullname);
@@ -1563,14 +1582,62 @@ void NativeGenerator::emitAarch64LoadAttrInvokeStub(
     as_->b(return_value);
 #else
     // 3.11 values 指针在预头 -4 槽；PyDictValues 即裸 values 数组
-    // （offsetof(values)==0）。
+    // （offsetof(values)==0）。槽空即已物化，转行内物化直读。
+    Label materialized = as_->newLabel();
+    Label load_me_value = as_->newLabel();
+    Label test_value = as_->newLabel();
     as_->ldr(a64::x15, arch::ptr_offset(a64::x1, kValuesPreheaderOffset));
-    as_->cbz(a64::x15, slow_path);
+    as_->cbz(a64::x15, materialized);
     as_->ldr(
         a64::x14,
         arch::ptr_offset(a64::x0, kValOffsetOffset + entry_offset));
     as_->add(a64::x15, a64::x15, a64::x14, a64::lsl(3));
     as_->ldr(a64::x9, a64::ptr(a64::x15));
+    as_->cbz(a64::x9, slow_path);
+    as_->b(return_value);
+
+    // 物化实例：带 hint 的字典直读（镜像 SplitMutator 物化分支 /
+    // stock *_WITH_HINT）。hint 取 mutator.split_.mat_hint（helper 慢
+    // 路径命中时刷新），me_key 指针比较自验证——越界或键不符回落
+    // helper。条目已命中（类型+版本），x11 的 ob_type 不再需要，可
+    // 复用。unicode 条目 16 字节（含 split 键）；general 键回落。
+    as_->bind(materialized);
+    as_->ldr(a64::x15, arch::ptr_offset(a64::x1, kDictPreheaderOffset));
+    as_->cbz(a64::x15, slow_path);
+    as_->ldr(a64::x14, arch::ptr_offset(a64::x15, kMaKeysOffset));
+    as_->ldrb(
+        a64::w12,
+        arch::ptr_offset(a64::x14, kDkKindOffset, arch::AccessSize::k8));
+    as_->cbz(a64::w12, slow_path);
+    as_->ldr(
+        a64::x12,
+        arch::ptr_offset(a64::x0, kEntryMatHintOffset + entry_offset));
+    as_->ldr(a64::x9, arch::ptr_offset(a64::x14, kDkNentriesOffset));
+    as_->cmp(a64::x12, a64::x9);
+    as_->b_hs(slow_path); // 无符号比较：负 hint（未初始化 -1）一并拦截
+    // entries = dk + dk_indices 偏移 + (1 << dk_log2_index_bytes)。
+    // 3.11 语义：dk_log2_index_bytes = 索引表总字节数的 log2（见
+    // DK_UNICODE_ENTRIES 宏），无需再乘表长。unicode 条目下标 ×16。
+    as_->ldrb(
+        a64::w9,
+        arch::ptr_offset(
+            a64::x14, kDkLog2IndexBytesOffset, arch::AccessSize::k8));
+    as_->mov(a64::x11, 1);
+    as_->lsl(a64::x11, a64::x11, a64::x9);
+    as_->add(a64::x11, a64::x14, a64::x11);
+    arch::add_immediate(as_, a64::x11, a64::x11, kDkIndicesOffset);
+    as_->add(a64::x11, a64::x11, a64::x12, a64::lsl(4));
+    as_->ldr(a64::x9, a64::ptr(a64::x11)); // me_key
+    as_->cmp(a64::x9, a64::x2);
+    as_->b_ne(slow_path);
+    as_->ldr(a64::x14, arch::ptr_offset(a64::x15, kMaValuesOffset));
+    as_->cbz(a64::x14, load_me_value);
+    as_->add(a64::x14, a64::x14, a64::x12, a64::lsl(3));
+    as_->ldr(a64::x9, a64::ptr(a64::x14)); // split 包装：ma_values[hint]
+    as_->b(test_value);
+    as_->bind(load_me_value);
+    as_->ldr(a64::x9, arch::ptr_offset(a64::x11, 8)); // combined：me_value
+    as_->bind(test_value);
     as_->cbz(a64::x9, slow_path);
     as_->b(return_value);
 #endif
