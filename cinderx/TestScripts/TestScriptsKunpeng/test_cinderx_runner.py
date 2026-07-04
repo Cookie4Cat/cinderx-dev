@@ -291,6 +291,56 @@ def run_suite(suite: dict, python: str, log_dir: Path) -> dict:
     }
 
 
+# 3.11 取舍清单首版（设计书 §4.3；2026-07 M9 预演盘点）。
+# 从 all_test_cinderx 文件清单排除：Static Python / compiler /
+# parallel GC / 子解释器 / 3.12+ 字节码 / perf 系不在 3.11 移植范围；
+# 另有模块级 import 即抛错的文件（_static、3.12+ _testcapi API），
+# 留在清单里会中断 pytest 收集、拖垮整个套件——它们的专属套件保留
+# 运行，以红色记录阻塞现状。
+EXCLUDED_TEST_FILES_311 = {
+    "test_asynclazyvalue.py",
+    "test_cinderjit.py",  # 模块级 import 链触及 _static，收集期即崩
+    "test_compiler_sbs_stdlib_0.py",
+    "test_compiler_sbs_stdlib_1.py",
+    "test_compiler_sbs_stdlib_2.py",
+    "test_compiler_sbs_stdlib_3.py",
+    "test_compiler_sbs_stdlib_4.py",
+    "test_compiler_sbs_stdlib_5.py",
+    "test_compiler_sbs_stdlib_6.py",
+    "test_compiler_sbs_stdlib_7.py",
+    "test_compiler_sbs_stdlib_8.py",
+    "test_compiler_sbs_stdlib_9.py",
+    "test_enabling_parallel_gc.py",
+    "test_jit_attr_cache.py",  # 同 test_cinderjit，_static 收集期崩
+    "test_jit_coroutines.py",  # 同上
+    "test_jit_perf_map.py",
+    "test_parallel_gc.py",
+    "test_perf_profiler_precompile.py",
+    "test_perfmaps.py",
+    "test_python312_bytecodes.py",
+    "test_python314_bytecodes.py",
+    "test_subinterpreters.py",
+    "test_type_cache.py",  # _testcapi.type_assign_version 为 3.12+ API
+}
+# 整套件排除（3.11 范围外，设计书明确不做）。
+EXCLUDED_SUITES_311 = {
+    "test_static_tests",
+    "test_compiler",
+    "test_parallel_gc",
+    "test_perf_profiler_precompile",
+}
+
+
+def target_python_version(python: str) -> tuple[int, int]:
+    out = subprocess.run(
+        [python, "-c", "import sys; print(sys.version_info[0], sys.version_info[1])"],
+        capture_output=True,
+        text=True,
+        check=True,
+    ).stdout.split()
+    return (int(out[0]), int(out[1]))
+
+
 def main(argv: list[str]) -> int:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--python", default=sys.executable)
@@ -302,23 +352,47 @@ def main(argv: list[str]) -> int:
     )
     parser.add_argument("--log-dir", required=True)
     parser.add_argument("--json-summary-file", required=True)
+    parser.add_argument(
+        "--keep-going",
+        action="store_true",
+        help="run all selected suites even after a suite fails",
+    )
     args = parser.parse_args(argv)
 
     log_dir = Path(args.log_dir)
     log_dir.mkdir(parents=True, exist_ok=True)
 
-    selected_suites = SUITES
+    # Lightweight frames are only implemented for 3.12+ frame layouts; on
+    # 3.11 forcing PYTHONJITLIGHTWEIGHTFRAME=1 crashes at cinderx.init()
+    # (materialized frames are the supported model there, design decision D4).
+    available_suites = SUITES
+    if target_python_version(args.python) < (3, 12):
+        for suite in SUITES:
+            env = suite.get("env")
+            if env and env.get("PYTHONJITLIGHTWEIGHTFRAME") == "1":
+                env["PYTHONJITLIGHTWEIGHTFRAME"] = "0"
+            if suite["name"] == "all_test_cinderx":
+                suite["args"] = [
+                    arg
+                    for arg in suite["args"]
+                    if os.path.basename(arg) not in EXCLUDED_TEST_FILES_311
+                ]
+        available_suites = [
+            suite for suite in SUITES if suite["name"] not in EXCLUDED_SUITES_311
+        ]
+
+    selected_suites = available_suites
     if args.suite:
         requested_suites = set(args.suite)
         selected_suites = [
-            suite for suite in SUITES if suite["name"] in requested_suites
+            suite for suite in available_suites if suite["name"] in requested_suites
         ]
 
     results = []
     for suite in selected_suites:
         result = run_suite(suite, args.python, log_dir)
         results.append(result)
-        if result["returncode"] != 0:
+        if result["returncode"] != 0 and not args.keep_going:
             break
 
     # Aggregate test-level counts across all suites

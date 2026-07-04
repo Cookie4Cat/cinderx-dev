@@ -58,6 +58,19 @@ PIPELINES = {
         ("runtime", True),
         ("cinderx_local", False, {"CINDERX_LOCAL_RUN_LIBTEST": "1"}),
     ),
+    # 3.11 管线（设计书 §4.2）：pr-311 分钟级；daily-311 追加 libtest
+    # 配置③（ASAN/refleak/热循环追踪待接入）。
+    "pr-311": (
+        ("diffgate_311", True),
+        ("runtime_311", True),
+        ("cinderx_local_311", False),
+    ),
+    "daily-311": (
+        ("diffgate_311", True),
+        ("runtime_311", True),
+        ("cinderx_local_311", False),
+        ("libtest_311", False),
+    ),
 }
 DAILY_COMPAT_GROUPS = (
     ("supported", "wheel_compat"),

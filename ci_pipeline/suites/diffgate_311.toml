@@ -1,0 +1,17 @@
+# 3.11 差分门禁（设计书 §4.2 pr-311 首位；M0 遗留的 run_gate 挂接）。
+# 要求 CINDERX_TEST_PYTHON 指向可导入 cinderx 的 3.11 解释器（wheel
+# 安装的 venv，或以 PYTHONPATH 指向构建产物）。基线只准收缩。
+fail_fast = true
+
+[target]
+python = "3.11"
+arch = "arm64"
+system = "Linux"
+
+[[jobs]]
+name = "diffgate_corpus"
+command = "\"$CINDERX_TEST_PYTHON\" ci_pipeline/diffgate/run_diffgate.py --out \"{run_dir}/diffgate-report.json\" --baseline ci_pipeline/diffgate/baselines/cp311.json"
+
+[[jobs]]
+name = "libtest_basic_diff"
+command = "\"$CINDERX_TEST_PYTHON\" ci_pipeline/diffgate/run_libtest_diff.py --out \"{run_dir}/libtest-basic-report.json\" --baseline ci_pipeline/diffgate/baselines/cp311-libtest-basic.json"

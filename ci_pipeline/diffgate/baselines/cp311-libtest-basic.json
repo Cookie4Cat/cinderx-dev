@@ -1,0 +1,6 @@
+{
+  "failures": [
+    "libtest:test_builtin",
+    "libtest:test_scope"
+  ]
+}

@@ -1,0 +1,21 @@
+# 3.11 原生 RuntimeTests（设计书 §4.3 三层点亮；构建排除清单见
+# cinderx/RuntimeTests/CMakeLists.txt 的 CINDERX_RUNTIME_TEST_EXCLUDES_311）。
+# 环境要求：CINDERX_TEST_PYTHON 必须指向带共享 libpython 的 3.11
+# （runtime_tests 为嵌入式可执行；manylinux 分发不带 libpython，目标
+# openEuler python3 为 --enable-shared，无此问题）。
+# 3.11 无 LWF/OSR 拆分档（D4：物化帧唯一形态）。
+fail_fast = true
+
+[target]
+python = "3.11"
+arch = "arm64"
+system = "Linux"
+
+[[jobs]]
+name = "runtime_tests"
+kind = "runtime_tests"
+coverage = false
+[jobs.env]
+PYTHONJITLIGHTWEIGHTFRAME = "0"
+CINDERX_OSR_ENABLED = "0"
+ENABLE_LIGHTWEIGHT_FRAMES = "1"

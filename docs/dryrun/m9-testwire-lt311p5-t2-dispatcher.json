@@ -1,0 +1,128 @@
+{
+  "bad": [
+    "test.test_builtin",
+    "test.test_coroutines",
+    "test.test_inspect",
+    "test.test_scope",
+    "test.test_sys",
+    "test.test_sys_settrace",
+    "test.test_traceback",
+    "test.test_weakref"
+  ],
+  "good": [
+    "test.test_augassign",
+    "test.test_call",
+    "test.test_contextlib",
+    "test.test_descr",
+    "test.test_descrtut",
+    "test.test_dict",
+    "test.test_exceptions",
+    "test.test_float",
+    "test.test_frame",
+    "test.test_gc",
+    "test.test_generators",
+    "test.test_genexps",
+    "test.test_grammar",
+    "test.test_int",
+    "test.test_keywordonlyarg",
+    "test.test_list",
+    "test.test_metaclass",
+    "test.test_property",
+    "test.test_raise",
+    "test.test_set",
+    "test.test_signal",
+    "test.test_super",
+    "test.test_sys_setprofile",
+    "test.test_tuple",
+    "test.test_types",
+    "test.test_unicode",
+    "test.test_unpack",
+    "test.test_unpack_ex",
+    "test.test_with",
+    "test.test_yield_from"
+  ],
+  "skipped": [],
+  "resource_denied": [],
+  "run_no_tests": [],
+  "worker_respawn_interval": 10,
+  "num_workers": 6,
+  "worker_process_count": 15,
+  "worker_runs": {
+    "167483": [
+      "test.test_grammar",
+      "test.test_set",
+      "test.test_gc"
+    ],
+    "167485": [
+      "test.test_descr",
+      "test.test_exceptions",
+      "test.test_scope",
+      "test.test_property",
+      "test.test_augassign",
+      "test.test_contextlib",
+      "test.test_coroutines"
+    ],
+    "167487": [
+      "test.test_builtin"
+    ],
+    "167489": [
+      "test.test_descrtut",
+      "test.test_list",
+      "test.test_float",
+      "test.test_unicode",
+      "test.test_with",
+      "test.test_generators",
+      "test.test_sys_setprofile",
+      "test.test_weakref"
+    ],
+    "167490": [
+      "test.test_types",
+      "test.test_tuple",
+      "test.test_call",
+      "test.test_keywordonlyarg",
+      "test.test_unpack",
+      "test.test_super",
+      "test.test_metaclass",
+      "test.test_genexps",
+      "test.test_yield_from",
+      "test.test_sys"
+    ],
+    "167493": [
+      "test.test_dict",
+      "test.test_int",
+      "test.test_traceback"
+    ],
+    "167512": [
+      "test.test_raise",
+      "test.test_signal"
+    ],
+    "167545": [
+      "test.test_unpack_ex",
+      "test.test_frame"
+    ],
+    "167565": [
+      "test.test_sys_settrace"
+    ],
+    "167624": [
+      "test.test_inspect"
+    ],
+    "167745": [
+      "test.test_builtin"
+    ],
+    "167751": [
+      "test.test_traceback"
+    ],
+    "167758": [
+      "test.test_scope",
+      "test.test_coroutines"
+    ],
+    "167762": [
+      "test.test_sys",
+      "test.test_sys_settrace",
+      "test.test_weakref"
+    ],
+    "167822": [
+      "test.test_inspect"
+    ]
+  }
+}
