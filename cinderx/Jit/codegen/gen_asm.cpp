@@ -1316,10 +1316,133 @@ void NativeGenerator::generateDeoptExits(const asmjit::CodeHolder& code) {
 #endif
 }
 
+void NativeGenerator::emitAarch64LoadMethodInvokeStub(
+    const asmjit::CodeHolder& code) {
+#if defined(CINDER_AARCH64) && !defined(Py_GIL_DISABLED) && \
+    PY_VERSION_HEX < 0x030C0000
+  if (!env_.load_method_invoke_stub.isValid()) {
+    return;
+  }
+
+  CodeSectionOverride hot_override{as_, &code, &metadata_, CodeSection::kHot};
+
+  Label slow_path = as_->newLabel();
+  Label hit = as_->newLabel();
+
+  // 3.11 方法缓存内联快路径（M9 IC 内联轮）。逐条目镜像
+  // LoadMethodCache::lookup 的命中判据：类型指针相等 + VALID 标志与
+  // tp_version_tag 拉式校验（D5，无 type watcher）+ 共享键版本校验
+  // （实例遮蔽防护：keys_version==0 直接有效；values 形态比对
+  // ht_cached_keys->dk_version；物化实例回落 helper）。命中返回
+  // (callable, self) 于 x0/x1，与 LoadMethodResult ABI 一致，两者均
+  // 新增引用（64 位 refcnt 直增，与 helper 的 Py_INCREF 等价）。
+  constexpr int kEntriesOffset =
+      static_cast<int>(jit::LoadMethodCache::entriesOffset());
+  constexpr int kEntrySize =
+      static_cast<int>(jit::LoadMethodCache::entrySize());
+  constexpr int kTypeOff =
+      static_cast<int>(jit::LoadMethodCache::entryTypeOffset());
+  constexpr int kValueOff =
+      static_cast<int>(jit::LoadMethodCache::entryValueOffset());
+  constexpr int kKeysVerOff =
+      static_cast<int>(jit::LoadMethodCache::entryKeysVersionOffset());
+  constexpr int kTypeVerOff =
+      static_cast<int>(jit::LoadMethodCache::entryTypeVersionOffset());
+  constexpr int kObTypeOffset = offsetof(PyObject, ob_type);
+  constexpr int kRefcountOffset = offsetof(PyObject, ob_refcnt);
+  constexpr int kTpFlagsOffset = offsetof(PyTypeObject, tp_flags);
+  constexpr int kTpVersionTagOffset = offsetof(PyTypeObject, tp_version_tag);
+  constexpr int kHtCachedKeysOffset =
+      offsetof(PyHeapTypeObject, ht_cached_keys);
+  constexpr int kDkVersionOffset = offsetof(PyDictKeysObject, dk_version);
+  constexpr int kValuesPreheaderOffset =
+      -4 * static_cast<int>(sizeof(PyObject*));
+
+  ASM_CHECK(as_->align(AlignMode::kCode, 8), GetFunction()->fullname);
+  as_->bind(env_.load_method_invoke_stub);
+
+  // x0=cache, x1=obj, x2=name
+  as_->ldr(a64::x11, arch::ptr_offset(a64::x1, kObTypeOffset));
+
+  auto emit_entry = [&](uint32_t entry_index, Label next_entry) {
+    const int off = kEntriesOffset + static_cast<int>(entry_index) * kEntrySize;
+    Label entry_hit = as_->newLabel();
+
+    as_->ldr(a64::x12, arch::ptr_offset(a64::x0, off + kTypeOff));
+    as_->cmp(a64::x12, a64::x11);
+    as_->b_ne(next_entry);
+
+    // 拉式版本校验（miss 语义交由 helper 复核/重填）。
+    as_->ldr(a64::x14, arch::ptr_offset(a64::x11, kTpFlagsOffset));
+    as_->tst(a64::x14, Py_TPFLAGS_VALID_VERSION_TAG);
+    as_->b_eq(next_entry);
+    as_->ldr(
+        a64::w14,
+        arch::ptr_offset(
+            a64::x11, kTpVersionTagOffset, arch::AccessSize::k32));
+    as_->ldr(
+        a64::w15,
+        arch::ptr_offset(a64::x0, off + kTypeVerOff, arch::AccessSize::k32));
+    as_->cmp(a64::w14, a64::w15);
+    as_->b_ne(next_entry);
+
+    // 共享键版本校验。
+    as_->ldr(
+        a64::w15,
+        arch::ptr_offset(a64::x0, off + kKeysVerOff, arch::AccessSize::k32));
+    as_->cbz(a64::w15, entry_hit);
+    as_->ldr(a64::x13, arch::ptr_offset(a64::x1, kValuesPreheaderOffset));
+    as_->cbz(a64::x13, slow_path);
+    as_->ldr(a64::x13, arch::ptr_offset(a64::x11, kHtCachedKeysOffset));
+    as_->cbz(a64::x13, slow_path);
+    as_->ldr(
+        a64::w14,
+        arch::ptr_offset(a64::x13, kDkVersionOffset, arch::AccessSize::k32));
+    as_->cmp(a64::w14, a64::w15);
+    as_->b_ne(slow_path);
+
+    as_->bind(entry_hit);
+    as_->ldr(a64::x9, arch::ptr_offset(a64::x0, off + kValueOff));
+    as_->cbz(a64::x9, next_entry);
+    as_->b(hit);
+  };
+
+  const uint32_t stub_entries =
+      static_cast<uint32_t>(jit::LoadMethodCache::numEntries());
+  for (uint32_t entry_index = 0; entry_index < stub_entries; ++entry_index) {
+    const bool has_next_entry = entry_index + 1 != stub_entries;
+    Label next_entry = has_next_entry ? as_->newLabel() : slow_path;
+    emit_entry(entry_index, next_entry);
+    if (has_next_entry) {
+      as_->bind(next_entry);
+    }
+  }
+
+  as_->bind(hit);
+  as_->ldr(a64::x12, arch::ptr_offset(a64::x9, kRefcountOffset));
+  arch::add_immediate(as_, a64::x12, a64::x12, 1);
+  as_->str(a64::x12, arch::ptr_offset(a64::x9, kRefcountOffset));
+  as_->ldr(a64::x12, arch::ptr_offset(a64::x1, kRefcountOffset));
+  arch::add_immediate(as_, a64::x12, a64::x12, 1);
+  as_->str(a64::x12, arch::ptr_offset(a64::x1, kRefcountOffset));
+  as_->mov(a64::x0, a64::x9);
+  // x1 已是 obj（self），恰为 LoadMethodResult 第二成员。
+  as_->ret(arch::lr);
+
+  as_->bind(slow_path);
+  as_->mov(
+      arch::reg_scratch_br,
+      reinterpret_cast<uint64_t>(jit::LoadMethodCache::lookupHelper));
+  as_->br(arch::reg_scratch_br);
+#else
+  (void)code;
+#endif
+}
+
 void NativeGenerator::emitAarch64LoadAttrInvokeStub(
     const asmjit::CodeHolder& code) {
-#if defined(CINDER_AARCH64) && PY_VERSION_HEX >= 0x030E0000 && \
-    !defined(Py_GIL_DISABLED)
+#if defined(CINDER_AARCH64) && !defined(Py_GIL_DISABLED) && \
+    (PY_VERSION_HEX >= 0x030E0000 || PY_VERSION_HEX < 0x030C0000)
   if (!env_.load_attr_invoke_stub.isValid()) {
     return;
   }
@@ -1341,10 +1464,24 @@ void NativeGenerator::emitAarch64LoadAttrInvokeStub(
   constexpr uint64_t kSplitInlineKnownOffsetKind =
       jit::AttributeMutator::splitInlineKnownOffsetKind();
   constexpr int kObTypeOffset = offsetof(PyObject, ob_type);
+  constexpr int kRefcountOffset = offsetof(PyObject, ob_refcnt);
+#if PY_VERSION_HEX >= 0x030E0000
   constexpr int kTpBasicSizeOffset = offsetof(PyTypeObject, tp_basicsize);
   constexpr int kInlineValuesValidOffset = offsetof(PyDictValues, valid);
   constexpr uint64_t kInlineValuesValuesOffset = offsetof(PyDictValues, values);
-  constexpr int kRefcountOffset = offsetof(PyObject, ob_refcnt);
+#else
+  // 3.11：条目有效性 = tp_version_tag 拉式校验（无 type watcher 的 D5
+  // 语义，镜像 AttributeMutator::matches：VALID 标志位 + 版本相等）；
+  // values 形态经 managed dict 预头 -4 槽直读（_PyObject_ValuesPointer），
+  // 槽空即已物化，回落 helper。
+  constexpr int kEntryVersionOffset = static_cast<int>(
+      jit::AttributeCache::entriesOffset() +
+      jit::AttributeMutator::typeVersionOffset());
+  constexpr int kTpFlagsOffset = offsetof(PyTypeObject, tp_flags);
+  constexpr int kTpVersionTagOffset = offsetof(PyTypeObject, tp_version_tag);
+  constexpr int kValuesPreheaderOffset =
+      -4 * static_cast<int>(sizeof(PyObject*));
+#endif
 
   ASM_CHECK(as_->align(AlignMode::kCode, 8), GetFunction()->fullname);
   as_->bind(env_.load_attr_invoke_stub);
@@ -1364,10 +1501,30 @@ void NativeGenerator::emitAarch64LoadAttrInvokeStub(
     as_->cmp(a64::x13, a64::x11);
     as_->b_ne(next_entry);
 
+#if PY_VERSION_HEX < 0x030C0000
+    // 拉式版本校验：VALID 标志清除或版本不等均按 miss 处理（helper 侧
+    // matches() 同判据，会重填或走慢路径）。
+    as_->ldr(a64::x14, arch::ptr_offset(a64::x13, kTpFlagsOffset));
+    as_->tst(a64::x14, Py_TPFLAGS_VALID_VERSION_TAG);
+    as_->b_eq(next_entry);
+    as_->ldr(
+        a64::w14,
+        arch::ptr_offset(
+            a64::x13, kTpVersionTagOffset, arch::AccessSize::k32));
+    as_->ldr(
+        a64::w15,
+        arch::ptr_offset(
+            a64::x0, kEntryVersionOffset + entry_offset,
+            arch::AccessSize::k32));
+    as_->cmp(a64::w14, a64::w15);
+    as_->b_ne(next_entry);
+#endif
+
     as_->and_(a64::x14, a64::x12, kKindMask);
     arch::cmp_immediate(as_, a64::x14, kSplitInlineKnownOffsetKind);
     as_->b_ne(slow_path);
 
+#if PY_VERSION_HEX >= 0x030E0000
     as_->ldr(a64::x14, arch::ptr_offset(a64::x13, kTpBasicSizeOffset));
     as_->add(a64::x15, a64::x1, a64::x14);
     as_->ldrb(
@@ -1384,6 +1541,19 @@ void NativeGenerator::emitAarch64LoadAttrInvokeStub(
     as_->ldr(a64::x9, a64::ptr(a64::x15));
     as_->cbz(a64::x9, slow_path);
     as_->b(return_value);
+#else
+    // 3.11 values 指针在预头 -4 槽；PyDictValues 即裸 values 数组
+    // （offsetof(values)==0）。
+    as_->ldr(a64::x15, arch::ptr_offset(a64::x1, kValuesPreheaderOffset));
+    as_->cbz(a64::x15, slow_path);
+    as_->ldr(
+        a64::x14,
+        arch::ptr_offset(a64::x0, kValOffsetOffset + entry_offset));
+    as_->add(a64::x15, a64::x15, a64::x14, a64::lsl(3));
+    as_->ldr(a64::x9, a64::ptr(a64::x15));
+    as_->cbz(a64::x9, slow_path);
+    as_->b(return_value);
+#endif
   };
 
   constexpr uint32_t kMaxStubEntries = 4;
@@ -1402,6 +1572,7 @@ void NativeGenerator::emitAarch64LoadAttrInvokeStub(
   }
 
   as_->bind(return_value);
+#if PY_VERSION_HEX >= 0x030E0000
   as_->ldr(
       a64::w12,
       arch::ptr_offset(a64::x9, kRefcountOffset, arch::AccessSize::k32));
@@ -1411,6 +1582,14 @@ void NativeGenerator::emitAarch64LoadAttrInvokeStub(
       a64::w12,
       arch::ptr_offset(a64::x9, kRefcountOffset, arch::AccessSize::k32));
   as_->bind(incref_done);
+#else
+  // 3.11：ob_refcnt 为 64 位 Py_ssize_t，无不朽位语义，普通自增
+  // （伪不朽单例的巨大计数自增无害，与 Py_INCREF 行为一致）。
+  (void)incref_done;
+  as_->ldr(a64::x12, arch::ptr_offset(a64::x9, kRefcountOffset));
+  arch::add_immediate(as_, a64::x12, a64::x12, 1);
+  as_->str(a64::x12, arch::ptr_offset(a64::x9, kRefcountOffset));
+#endif
   as_->mov(a64::x0, a64::x9);
   as_->ret(arch::lr);
 
@@ -1757,6 +1936,7 @@ void NativeGenerator::generateCode(
 
   generateDeoptExits(codeholder);
   emitAarch64LoadAttrInvokeStub(codeholder);
+  emitAarch64LoadMethodInvokeStub(codeholder);
 
   for (auto& [osr_idx, block] : env_.osr_entry_blocks) {
     Label stub_label = as_->newLabel();
