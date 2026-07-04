@@ -1,0 +1,10 @@
+{
+  "failures": [
+    "jit:case_gi_frame_lineno_at_suspension",
+    "jit:case_gi_frame_locals_at_suspension",
+    "jit:case_pep479_stopiteration_to_runtimeerror",
+    "jit_deopt:case_gi_frame_lineno_at_suspension",
+    "jit_deopt:case_gi_frame_locals_at_suspension",
+    "jit_deopt:case_pep479_stopiteration_to_runtimeerror"
+  ]
+}

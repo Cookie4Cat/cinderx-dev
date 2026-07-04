@@ -1263,9 +1263,13 @@ std::unique_ptr<Function> HIRBuilder::buildHIR() {
   code_has_backedge_ = codeHasBackedge(code_);
 
 #if PY_VERSION_HEX < 0x030C0000
-  if (code_->co_flags & kCoFlagsAnyGenerator) {
+  // D6：3.11 仅编译同步生成器；协程与异步生成器在 eligibility 层已拒编
+  //（pyjit.cpp forbidden_flags），此处为经其他编译入口进入时的后备阀。
+  if (code_->co_flags &
+      (CO_COROUTINE | CO_ITERABLE_COROUTINE | CO_ASYNC_GENERATOR)) {
     JIT_THROW(
-        "generators are unsupported on CPython 3.11 in {}",
+        "coroutines and async generators are unsupported on CPython 3.11 "
+        "in {}",
         preloader_.fullname());
   }
 #if PY_VERSION_HEX >= 0x030B0000
