@@ -2382,8 +2382,13 @@ LIRGenerator::TranslatedBlock LIRGenerator::TranslateOneBasicBlock(
         auto false_addr = reinterpret_cast<uint64_t>(Py_False);
         Instruction* temp_true = bbb.appendInstr(
             Instruction::kMove, OutVReg{OperandBase::k64bit}, Imm{true_addr});
+        // The Select codegen template (csel on aarch64) needs all three
+        // value operands in registers; materialize the false side just like
+        // the true side instead of passing a raw address immediate.
+        Instruction* temp_false = bbb.appendInstr(
+            Instruction::kMove, OutVReg{OperandBase::k64bit}, Imm{false_addr});
         bbb.appendInstr(
-            dest, Instruction::kSelect, src, temp_true, Imm{false_addr});
+            dest, Instruction::kSelect, src, temp_true, temp_false);
         break;
       }
       case Opcode::kPrimitiveBox: {

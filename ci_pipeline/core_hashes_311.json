@@ -18,11 +18,11 @@
     "cinderx/Interpreter/3.11/cinderx_opcode_targets.h": "ea30f843dffbd4cf79feb3407838a5fe8a24a8af0ed891b667603050656d5161",
     "cinderx/Interpreter/3.11/cinderx_specialize.c": "cd7fe0b00baebfe7f32bc5f41b222808cb7405baf27deea0359f64e739206063",
     "cinderx/Interpreter/3.11/extract_ceval_extras.py": "fc6ad6745fd2ee02907727251800d1af72853742483f951de46b1c553a3ea2f2",
-    "cinderx/Interpreter/3.11/interpreter.c": "4d2b6df7f9b8ac7b01cb61d41aaf4c88fc8147e45d123375dfa9dbe99895fea3",
+    "cinderx/Interpreter/3.11/interpreter.c": "88d5a1de5b4248ccbaefaf322b4ac4bd26bd24695c6dd40f414c56af21a5b5dd",
     "cinderx/PythonLib/opcodes/3.11/opcode.py": "ee10cdee637396c2a5d15aef53232cfa5792bd96fd2ae6356661a2ba14ccfd72",
     "cinderx/UpstreamBorrow/borrowed-3.11-fallback.c": "23d6480dd7c0cb44f02556abbf0a00e244e6f3d08d965ababc1b8e60fb9fd9d4"
   },
-  "generated_utc": "2026-07-03T18:01:01+00:00",
+  "generated_utc": "2026-07-04T02:15:58+00:00",
   "patterns": [
     "cinderx/Interpreter/3.11/**/*",
     "cinderx/PythonLib/opcodes/3.11/opcode.py",

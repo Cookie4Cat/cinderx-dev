@@ -13,6 +13,19 @@ void Ci_InitOpcodes() {
   // See [P2] in cinderx_ceval.c: park the vendored loop's dict-version
   // shadow counter far above the runtime's own allocator.
   (void)Ci_SeedDictVersionShadow();
+
+  // 3.11 has no immortal objects (PEP 683 is 3.12+), but JIT codegen
+  // borrows the singletons without increfs on paths where 3.12+ relies on
+  // immortality (e.g. PrimitiveBoxBool selecting Py_True/Py_False as a
+  // "new" reference). Pseudo-immortalize them via the python.h shim so
+  // every such path is safe wholesale; small ints are not included because
+  // their JIT paths carry explicit increfs and blanket-immortalizing them
+  // would blind refleak tooling.
+  _Py_SetImmortal(Py_True);
+  _Py_SetImmortal(Py_False);
+  _Py_SetImmortal(Py_None);
+  _Py_SetImmortal(Py_NotImplemented);
+  _Py_SetImmortal(Py_Ellipsis);
 }
 
 // The vendored upstream v3.11.6 eval loop (Interpreter/3.11/cinderx_ceval.c).

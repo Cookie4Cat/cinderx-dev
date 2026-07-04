@@ -74,3 +74,43 @@ heisenbug 定位+修复 ~50 分钟（gdb 三轮：崩点反汇编→调用方→
 5. LIR 替身签名 static_assert 防线；
 6. auto-JIT 引导接入（届时 `Ci_MaybeScheduleAutoJIT` 与 M2 直通版
    interpreter.c 合流）。
+
+## 第二轮（同日）：118 → 74 → 21，三个系统性家族歼灭
+
+1. **LOAD_FAST 未绑定检查缺失**（unbound 错误路径 SEGV 族）：3.11 没有
+   LOAD_FAST_CHECK/LOAD_FAST 之分（3.12 的确定性赋值分析产物），移植版
+   只对 LOAD_FAST_CHECK 发 CheckVar → 3.11 普通 LOAD_FAST 读未绑定局部
+   直接把 NULL 喂给下游（PyNumber_InPlaceAdd(NULL) 段错误）。修复：
+   3.11 上每个 LOAD_FAST 发 CheckVar（与解释器一致）。清 12 案。
+2. **csel 模板 vs LIR 立即数传播**（"59 crash 雪崩"的真源头）：操作数
+   拷贝传播把常量 Move 折进 Select 输入，aarch64 csel 模板要求全寄存器
+   → JIT_CHECK abort → **单进程 harness 后续全部 case 雪崩记崩**（59 个
+   crash 实为 1 个 bug 的下游）。触发条件教科书级：shape 函数先执行
+   （vendored specialize 完成 quickening）后再编译同族 case 才可达。
+   修复：模板内 Imm 物化到 x13/x14（DISALLOWED 集合内的专用 scratch）。
+3. **单例不朽性假设烧穿 3.11**（关停期 FatalRefcountError 族）：
+   PrimitiveBoxBool 把 Py_True/Py_False 当"新引用"返回但不 incref——
+   3.12+ 靠 PEP 683 无害，3.11 每调用净 -1，True 被 dealloc
+   （bool_dealloc Fatal，逐 case gc.collect 全绿定位到关停期，skip 二分
+   → op_ge__int3__int0，活体 refcount 探针 dTrue=-1000 实锤）。修复：
+   按端口自己的 CIX_PSEUDO_IMMORTAL 设计，在 Ci_InitOpcodes 把五个单例
+   （True/False/None/NotImplemented/Ellipsis）伪不朽化——一处修复覆盖
+   全部"借用不 incref"路径。小整数不纳入（其路径已带显式 incref，
+   全面不朽化会致盲 refleak 工具）。**refleak 工具需特判伪不朽对象**
+   （M2 遗留清单追加）。
+
+## 剩余 21（正式 M4/M7 清单）
+
+- crash 3 案 ×2 模式：annotation_only_then_read / read_before_assign /
+  walrus_dead_branch——同为"imm vs aarch64 模板契约"家族第三例
+  （translateMove 的 VecD 路径，编译期 SIGABRT，复现 10 行）。**正式修法
+  建议升维**：与其逐模板加固，在 LIR 拷贝传播/后分配层给"模板不可接受
+  imm 的操作数位"建统一约束表——三例同族已证明逐处补是打地鼠。
+- other 15：attr_class 系 8 条 = **M0 早已分类的"IC 对类变异不失效"**
+  （watcher 空桩的必然，M7 版本号守卫的既定范围，非 M4 缺陷）；
+  match 语句系 3 条 + 杂项 4 条待 M4 正式聚类。
+
+## 第二轮工时
+
+~3 小时（LOAD_FAST 族 40 分钟；csel 族定位 1 小时——含 quickening 触发
+条件推理；不朽性族 1 小时——gc 定位 + skip 二分 + 活体探针；收尾 20 分钟）。
