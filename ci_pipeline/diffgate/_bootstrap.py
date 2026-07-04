@@ -74,6 +74,15 @@ def main():
     for name, fn in cases:
         fns = [fn] + list(getattr(fn, "helpers", ()))
         if jit is not None:
+            # 编译前先解释执行一遍完成 quickening（特化缓存就位），
+            # 镜像 auto 阈值"热身后编译"的真实时序：未量化编译走不到
+            # WITH_VALUES 等特化快路径及其守卫，正是有机 deopt-resume
+            # 家族（M9R3）长期漏网的覆盖缺口。语料纪律要求用例自恢复，
+            # 重复执行输出不变；热身轮的异常同样完成量化，照常吞掉。
+            try:
+                fn()
+            except BaseException:
+                pass
             for f in fns:
                 try:
                     jit.force_compile(f)

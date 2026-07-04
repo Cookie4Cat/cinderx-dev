@@ -261,23 +261,51 @@ void* CompiledFunction::staticEntry() const {
 }
 
 void CompiledFunction::addFunction(BorrowedRef<PyFunctionObject> func) {
+#if PY_VERSION_HEX < 0x030C0000
+  // 3.11 没有 function watcher（DEALLOC 事件不可得），借用引用无法在
+  // 函数死亡时经 funcDestroyed() 摘除，遗留的悬垂指针会在 clear() 的
+  // vectorcall 复位循环中造成对已释放函数对象的 UAF 写（M9 预演
+  // spectral_norm 案）。3.11 改为持有强引用，并在 traverse 中上报：
+  // 函数 __dict__ 中对 CompiledFunction 的强引用与此处构成引用环，
+  // 由 GC 统一回收（clear() 即 tp_clear 断环点）。
+  if (functions_.insert(func.get()).second) {
+    Py_INCREF(func.get());
+  }
+#else
   // Store a borrowed reference to the function. The function is responsible
   // for removing itself via funcDestroyed() when it is deallocated.
   // We don't incref to avoid preventing garbage collection of functions
   // when multiple functions share the same CompiledFunction.
   functions_.insert(func.get());
+#endif
 }
 
 void CompiledFunction::removeFunction(BorrowedRef<PyFunctionObject> func) {
+#if PY_VERSION_HEX < 0x030C0000
+  auto it = functions_.find(func.get());
+  if (it != functions_.end()) {
+    functions_.erase(it);
+    Py_DECREF(func.get());
+  }
+#else
   // Remove the borrowed reference. No decref needed since we don't own it.
   functions_.erase(func.get());
+#endif
 }
 
 int CompiledFunction::traverse(visitproc visit, void* arg) {
+#if PY_VERSION_HEX < 0x030C0000
+  // 3.11 持有函数的强引用（见 addFunction），必须上报给 GC 才能回收
+  // 函数与 CompiledFunction 之间的引用环。
+  for (PyFunctionObject* func : functions_) {
+    Py_VISIT(reinterpret_cast<PyObject*>(func));
+  }
+#else
   // Don't traverse functions_ - these are borrowed references that we don't
   // own. The functions are responsible for removing themselves via
   // funcDestroyed() when they are deallocated. Not traversing them allows
   // functions to be garbage collected independently of this CompiledFunction.
+#endif
 
   // Traverse all references held by the CodeRuntime.
   if (data_.runtime != nullptr) {
@@ -306,11 +334,23 @@ void CompiledFunction::clear(bool context_finalizing) {
     // things with functions still running.
     auto funcs_to_deopt = std::move(functions_);
 
+#if PY_VERSION_HEX < 0x030C0000
+    // 3.11 持有强引用：函数对象此刻必然存活，但可能已经历 GC 的
+    // tp_clear（func_code 已清空），不得读取 func_code 决定入口；3.11
+    // 不支持 Static Python，解释器入口恒为 Ci_PyFunction_Vectorcall。
+    // 复位后归还引用（与 addFunction 的 incref 配对），并清理 Context
+    // 中以函数指针为键的簿记（3.14 由 func watcher 在函数死亡时完成）。
+    for (PyFunctionObject* func : funcs_to_deopt) {
+      func->vectorcall = Ci_PyFunction_Vectorcall;
+      Py_DECREF(reinterpret_cast<PyObject*>(func));
+    }
+#else
     // Deopt all associated functions. No decref needed since these are borrowed
     // refs.
     for (PyFunctionObject* func : funcs_to_deopt) {
       func->vectorcall = getInterpretedVectorcall(func);
     }
+#endif
 
     owner_ = nullptr;
   }

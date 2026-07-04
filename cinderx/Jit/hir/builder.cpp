@@ -3948,6 +3948,11 @@ bool HIRBuilder::tryEmitLoadMethodWithValues311(
         receiver, expected_receiver_type, receiver, tc.frame);
     receiver = guard->output();
   }
+  // 钉住类型依赖：下方的版本比较与方法常量加载读的都是 owner_type
+  // 常量，其正确性隐式依赖 receiver 恰为该类型；没有显式 use 的话
+  // GuardTypeRemoval 会把上面的 GuardType 判定为可删（M9 raytrace
+  // 错派发案：Sphere 通过 Halfspace 的版本守卫拿走其方法常量）。
+  tc.emit<UseType>(receiver, expected_receiver_type);
 
   auto emit_guard = [&](Register* condition,
                         Register* guilty,
@@ -4938,12 +4943,6 @@ void HIRBuilder::emitLoadGlobal(
   int name_idx = loadGlobalIndex(bc_instr.oparg());
   Register* result = temps_.AllocateStack();
 
-  if constexpr (PY_VERSION_HEX < 0x030E0000) {
-    if (bc_instr.oparg() & 1) {
-      emitPushNull(tc);
-    }
-  }
-
   auto try_fast_path = [&] {
 #if PY_VERSION_HEX < 0x030C0000
     return tryEmitLoadGlobalModuleValue311(tc, bc_instr, name_idx, result);
@@ -4976,6 +4975,18 @@ void HIRBuilder::emitLoadGlobal(
 
   if (!try_fast_path()) {
     tc.emit<LoadGlobal>(result, name_idx, tc.frame);
+  }
+
+  // 3.13 之前 NULL 槽位于全局值之下（[NULL, value]），但 NULL 必须等
+  // 上方（可能 deopt 的）加载发射完成后才推入模拟栈：守卫携带的
+  // FrameState 是"重新执行整条 LOAD_GLOBAL"的恢复状态，重执行本身会
+  // 再推一次 NULL，若快照里已含 NULL 则恢复后栈上多出一个哨兵，后续
+  // 调用窗口整体错位（M9 有机 deopt-resume 案，sqlglot 现场）。模拟栈
+  // 的最终压栈顺序不受影响。
+  if constexpr (PY_VERSION_HEX < 0x030E0000) {
+    if (bc_instr.oparg() & 1) {
+      emitPushNull(tc);
+    }
   }
 
   tc.frame.stack.push(result);

@@ -329,3 +329,31 @@ def case_yield_from_across_checkpoint():
 
 
 case_yield_from_across_checkpoint.helpers = (gen_delegate, gen_acc)
+
+
+def gen_boom():
+    yield 1
+    raise ValueError("boom")
+
+
+def case_gen_exception_exit_state():
+    # M8"完成路径运行态残留"案的蒸馏：异常退出后生成器必须为完成态
+    # （后续 next 得 StopIteration 而非 "generator already executing"），
+    # 且析构/close 不产生 Exception ignored。
+    g = gen_boom()
+    out = [next(g)]
+    try:
+        next(g)
+    except ValueError as exc:
+        out.append(("ve", str(exc)))
+    try:
+        next(g)
+        out.append("no-exc!?")
+    except StopIteration:
+        out.append("exhausted")
+    except ValueError as exc:
+        out.append(("already-executing", str(exc)))
+    return out
+
+
+case_gen_exception_exit_state.helpers = (gen_boom,)

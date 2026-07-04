@@ -39,12 +39,12 @@ BENCHES = {
     "generators": ("bm_generators", [], []),
     "unpickle_pure_python": (
         "bm_pickle",
-        ["unpickle_pure_python"],
+        ["unpickle", "--pure-python"],
         [os.path.join(STDLIB, "pickle.py")],
     ),
     "pickle_pure_python": (
         "bm_pickle",
-        ["pickle_pure_python"],
+        ["pickle", "--pure-python"],
         [os.path.join(STDLIB, "pickle.py")],
     ),
     "chaos": ("bm_chaos", [], []),
@@ -99,10 +99,13 @@ def run_side(bench, side, out_json, timeout):
         env["PYTHONPATH"] = f"{SC_DIR}:{CINDERX_PP}"
         env["PYTHONJITAUTO"] = os.environ.get("M9_THRESHOLD", "2")
         env["CI_JIT_AUTO_ONLY_PREFIX"] = prefixes
-        cmd += [
-            "--inherit-environ",
-            "PYTHONPATH,PYTHONJITAUTO,CI_JIT_AUTO_ONLY_PREFIX",
-        ]
+        # M9_MCS 可选设置多段代码布局对照（M9R3 期间曾用于二分 SIGILL，
+        # 根因定案后默认不再干预布局配置）。
+        inherit = "PYTHONPATH,PYTHONJITAUTO,CI_JIT_AUTO_ONLY_PREFIX"
+        if os.environ.get("M9_MCS"):
+            env["PYTHONJITMULTIPLECODESECTIONS"] = os.environ["M9_MCS"]
+            inherit += ",PYTHONJITMULTIPLECODESECTIONS"
+        cmd += ["--inherit-environ", inherit]
     if os.path.exists(out_json):
         os.unlink(out_json)
     try:
