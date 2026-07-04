@@ -143,3 +143,47 @@ def case_polymorphic_with_values_method_dispatch():
 
 
 case_polymorphic_with_values_method_dispatch.helpers = (_poly_call,)
+
+
+class _ExitCtx:
+    # [P5] 现场蒸馏：__exit__ 体内剥离 exc 的最后一个 traceback 引用后，
+    # tb 实参的借用生命周期只能依靠调用方（WITH_EXCEPT_START）持有的
+    # 引用；补丁前该引用在调用发起前即被归还，编译版 __exit__ 的任意
+    # 后续 deopt 物化都会对尸体增减引用（M9 全表面 SEGV 四案）。
+    def __exit__(self, exc_type, exc_value, tb):
+        exc_value.with_traceback(None)
+        _mod_fn(1, 2)  # LOAD_GLOBAL 守卫窗口（deopt 触发位）
+        return True
+
+    def __enter__(self):
+        return self
+
+
+def _with_exit_deopt_call():
+    with _ExitCtx():
+        raise ValueError("boom")
+    return "handled"
+
+
+def case_deopt_exit_strips_traceback():
+    out = []
+    g = globals()
+    added = []
+    try:
+        for i in range(40):
+            out.append(_with_exit_deopt_call())
+            if i == 30:
+                name = "_dg_scratch_key_p5"
+                g[name] = i  # dk_version 漂移 → __exit__ 内 LOAD_GLOBAL 守卫失败
+                added.append(name)
+        out.append(_with_exit_deopt_call())
+    finally:
+        for name in added:
+            g.pop(name, None)
+    return out[-2:]
+
+
+case_deopt_exit_strips_traceback.helpers = (
+    _with_exit_deopt_call,
+    _ExitCtx.__exit__,
+)

@@ -1,9 +1,6 @@
 {
   "failures": [
     "libtest:test_builtin",
-    "libtest:test_exceptions",
-    "libtest:test_list",
-    "libtest:test_scope",
-    "libtest:test_tuple"
+    "libtest:test_scope"
   ]
 }
