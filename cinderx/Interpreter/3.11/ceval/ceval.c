@@ -4437,12 +4437,20 @@ handle_eval_breaker:
             assert(val && PyExceptionInstance_Check(val));
             exc = PyExceptionInstance_Class(val);
             tb = PyException_GetTraceback(val);
-            Py_XDECREF(tb);
+            /* [P5] traceback 引用持有跨越 __exit__ 调用；台账见
+               cinderx_ceval.c。上游在此立即归还新引用、以借用形式传参：
+               解释器被调方会立刻把实参 incref 进自身帧，故 stock 安全；
+               JIT 被调方按借用约定持有实参，若 __exit__ 体内剥离 exc 的
+               最后一个 traceback 引用（unittest _AssertRaisesContext.
+               __exit__ 的 with_traceback(None) 即是），借用当场悬垂，
+               其后任意 deopt 物化都会复活尸体（M9 全表面 SEGV 四案
+               根因）。持有引用跨越调用消除该暴露，用户可见语义不变。 */
             assert(PyLong_Check(PEEK(3)));
             exit_func = PEEK(4);
             PyObject *stack[4] = {NULL, exc, val, tb};
             res = PyObject_Vectorcall(exit_func, stack + 1,
                     3 | PY_VECTORCALL_ARGUMENTS_OFFSET, NULL);
+            Py_XDECREF(tb);
             if (res == NULL)
                 goto error;
 

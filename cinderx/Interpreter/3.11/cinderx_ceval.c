@@ -57,4 +57,15 @@ extern void Ci_AutoJitCountFramePush311(
 // DEOPT（fail-safe）。
 extern void* Ci_StockEntry311;
 
+// [P5]（源级补丁，WITH_EXCEPT_START）traceback 引用持有跨越 __exit__
+// 调用。上游取得 traceback 后立即归还新引用、把借用指针放进实参窗口：
+// 解释器被调方入帧即 incref 实参，借用窗口极短，stock 安全；JIT 被调方
+// 遵循"实参借用自调用方数组"约定全程不 incref，一旦 __exit__ 体内剥离
+// exc 的最后一个 traceback 引用（unittest _AssertRaisesContext.__exit__
+// 的 with_traceback(None)），借用寄存器当场悬垂，其后任意 deopt 物化会
+// 对尸体 incref/decref（M9 全表面 SEGV 四案：test_builtin/list/tuple/
+// exceptions 共同根因）。补丁把 Py_XDECREF 移至调用之后，引用持有跨越
+// 调用，用户可见语义不变。注意：这是"调用方借用实参窗口 vs JIT 借用
+// 约定"这一普遍健全性缺口的定点封堵，普遍解（如物化帧入口 incref
+// 实参并计量其调用开销）移交正式 M5/M6 决策。
 #include "ceval/ceval.c"
