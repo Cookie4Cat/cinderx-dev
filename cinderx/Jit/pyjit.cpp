@@ -4682,8 +4682,59 @@ extern "C" void Ci_MaybeScheduleAutoJIT(
   scheduleJitCompile(func_ref);
 }
 
+#if PY_VERSION_HEX < 0x030C0000
+// 预演范围阀共享判定：
+// 1) 跳过合成/冻结文件名（<frozen importlib._bootstrap> 等）——import
+//    机器在编译态的有机 deopt-resume 存在已立案崩溃（M9 预演日志）；
+// 2) 设置 CI_JIT_AUTO_ONLY_PREFIX（冒号分隔的路径前缀）时，仅编译
+//    文件名命中前缀的代码——用于把基准测量的编译面收窄到工作负载
+//    文件（有机 deopt-resume 的 prev_instr 失效案定位期间的预演口径）。
+static bool ci_autoJit311AllowsCode(PyCodeObject* code) {
+  if (code == nullptr || code->co_filename == nullptr ||
+      !PyUnicode_Check(code->co_filename)) {
+    return true;
+  }
+  Py_ssize_t len = 0;
+  const char* filename = PyUnicode_AsUTF8AndSize(code->co_filename, &len);
+  if (filename == nullptr) {
+    PyErr_Clear();
+    return false;
+  }
+  if (len > 0 && filename[0] == '<') {
+    return false;
+  }
+  static const char* prefixes = getenv("CI_JIT_AUTO_ONLY_PREFIX");
+  if (prefixes == nullptr || *prefixes == '\0') {
+    return true;
+  }
+  const char* p = prefixes;
+  while (*p != '\0') {
+    const char* colon = strchr(p, ':');
+    size_t n = colon != nullptr ? static_cast<size_t>(colon - p)
+                                : strlen(p);
+    if (n > 0 && static_cast<size_t>(len) >= n &&
+        strncmp(filename, p, n) == 0) {
+      return true;
+    }
+    if (colon == nullptr) {
+      break;
+    }
+    p = colon + 1;
+  }
+  return false;
+}
+#endif
+
 bool scheduleJitCompile(BorrowedRef<PyFunctionObject> func) {
   FreeThreadedJITEntrypointGuard guard;
+
+#if PY_VERSION_HEX < 0x030C0000
+  // 预演范围阀（与 Ci_MaybeInstallAutoJitEntry311 相同）。
+  if (!ci_autoJit311AllowsCode(
+          reinterpret_cast<PyCodeObject*>(func->func_code))) {
+    return true;
+  }
+#endif
 
   if (shouldSkipAutoJitScheduleForRoiBackoffFrozen(func)) {
     return true;
@@ -5046,3 +5097,33 @@ Result compilePreloaderImpl(
 }
 
 } // namespace jit
+
+#if PY_VERSION_HEX < 0x030C0000
+// 3.11 无 function watcher，函数创建时无法回调安装 auto-JIT 入口。
+// 求值器（Interpreter/3.11/interpreter.c 的 Ci_EvalFrame）在函数首次以
+// 解释方式进入时调用本桥接完成惰性接线。预演版语义：首次解释执行时
+// 安装强制编译入口，函数第二次被调用即编译（等效 PYTHONJITAUTO=2）。
+// 不采用 jitVectorcall 计数入口的原因：其阈值计数依赖 CodeExtra，而
+// CodeExtra 在 3.14 经 code watcher 于代码对象创建时分配，3.11 无
+// watcher 则计数恒为零、永不达阈值——按需分配 CodeExtra 属正式 M9
+// 接线范围。仅当槽位仍为解释器默认入口时安装，不覆盖已编译入口、
+// 递归守卫包装或强制编译入口。
+extern "C" int Ci_MaybeInstallAutoJitEntry311(PyFunctionObject* func) {
+  if (func == nullptr || !jit::isJitUsable()) {
+    return 0;
+  }
+  if (!jit::getConfig().compile_after_n_calls.has_value()) {
+    return 0;
+  }
+  if (func->vectorcall != getInterpretedVectorcall(func)) {
+    return 0;
+  }
+  // 预演范围阀：见 ci_autoJit311AllowsCode 处注释。
+  if (!jit::ci_autoJit311AllowsCode(
+          reinterpret_cast<PyCodeObject*>(func->func_code))) {
+    return 0;
+  }
+  setVectorcall(func, forcedJitVectorcall);
+  return 1;
+}
+#endif

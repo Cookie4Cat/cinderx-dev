@@ -1,0 +1,121 @@
+{
+ "go": {
+  "a": "OK",
+  "a_mean": 0.060801034715647496,
+  "b": "OK",
+  "b_mean": 1.7890431857357423,
+  "ratio": 0.03398522472817957
+ },
+ "hexiom": {
+  "a": "OK",
+  "a_mean": 0.0029688375764332403,
+  "b": "OK",
+  "b_mean": 0.022806821344420313,
+  "ratio": 0.13017322894755634
+ },
+ "richards": {
+  "a": "OK",
+  "a_mean": 0.023011795159739754,
+  "b": "OK",
+  "b_mean": 0.04452953493843476,
+  "ratio": 0.5167760047697599
+ },
+ "richards_super": {
+  "a": "OK",
+  "a_mean": 0.028744527053398392,
+  "b": "OK",
+  "b_mean": 0.04844225439398239,
+  "ratio": 0.5933771541600488
+ },
+ "deltablue": {
+  "a": "OK",
+  "a_mean": 0.0017915237239018702,
+  "b": "FAIL rc=1     raise RuntimeError(\"%s failed with exit code %s\" | RuntimeError: /opt/_internal/cpython-3.11.15/bin/python failed with exit code -11"
+ },
+ "raytrace": {
+  "a": "OK",
+  "a_mean": 0.13882876864324015,
+  "b": "FAIL rc=1     raise RuntimeError(\"%s failed with exit code %s\" | RuntimeError: /opt/_internal/cpython-3.11.15/bin/python failed with exit code 1"
+ },
+ "generators": {
+  "a": "OK",
+  "a_mean": 0.019618008375012628,
+  "b": "OK",
+  "b_mean": 0.030580444486501317,
+  "ratio": 0.6415213612631537
+ },
+ "unpickle_pure_python": {
+  "a": "FAIL rc=2                         {pickle,pickle_dict,pickle_list,unpickle,unpickle_list} | run_benchmark.py: error: argument benchmark: invalid choice: 'unpickle_pure_python' (choose from 'pickle', 'pickle_dict', 'pickle_list', 'unpickle', 'unpickle_list')",
+  "b": "FAIL rc=2                         {pickle,pickle_dict,pickle_list,unpickle,unpickle_list} | run_benchmark.py: error: argument benchmark: invalid choice: 'unpickle_pure_python' (choose from 'pickle', 'pickle_dict', 'pickle_list', 'unpickle', 'unpickle_list')"
+ },
+ "pickle_pure_python": {
+  "a": "FAIL rc=2                         {pickle,pickle_dict,pickle_list,unpickle,unpickle_list} | run_benchmark.py: error: argument benchmark: invalid choice: 'pickle_pure_python' (choose from 'pickle', 'pickle_dict', 'pickle_list', 'unpickle', 'unpickle_list')",
+  "b": "FAIL rc=2                         {pickle,pickle_dict,pickle_list,unpickle,unpickle_list} | run_benchmark.py: error: argument benchmark: invalid choice: 'pickle_pure_python' (choose from 'pickle', 'pickle_dict', 'pickle_list', 'unpickle', 'unpickle_list')"
+ },
+ "chaos": {
+  "a": "OK",
+  "a_mean": 0.033175280480645594,
+  "b": "OK",
+  "b_mean": 0.06172952513831357,
+  "ratio": 0.537429704931502
+ },
+ "nbody": {
+  "a": "OK",
+  "a_mean": 0.048130750788065293,
+  "b": "OK",
+  "b_mean": 0.038959536134886244,
+  "ratio": 1.2354035895454798
+ },
+ "regex_compile": {
+  "a": "OK",
+  "a_mean": 0.05346625867920617,
+  "b": "OK",
+  "b_mean": 0.06659176993804673,
+  "ratio": 0.8028958943267043
+ },
+ "spectral_norm": {
+  "a": "OK",
+  "a_mean": 0.04955701780660699,
+  "b": "OK",
+  "b_mean": 0.06688151100339988,
+  "ratio": 0.7409673774279381
+ },
+ "sqlglot_v2_parse": {
+  "a": "OK",
+  "a_mean": 0.0005288114551755522,
+  "b": "FAIL rc=1            ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^ | TypeError: 'dict_itemiterator' object is not callable"
+ },
+ "sqlglot_v2_transpile": {
+  "a": "OK",
+  "a_mean": 0.0008101000157087886,
+  "b": "FAIL rc=1            ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^ | TypeError: 'dict_itemiterator' object is not callable"
+ },
+ "fannkuch": {
+  "a": "OK",
+  "a_mean": 0.20772347679982583,
+  "b": "OK",
+  "b_mean": 0.21006136365855735,
+  "ratio": 0.9888704575748084
+ },
+ "scimark": {
+  "a": "OK",
+  "a_mean": 0.06186469828884583,
+  "b": "OK",
+  "b_mean": 0.9279308098735055,
+  "ratio": 0.06666951633740792
+ },
+ "nqueens": {
+  "a": "OK",
+  "a_mean": 0.04343100826566418,
+  "b": "OK",
+  "b_mean": 0.04771487779604892,
+  "ratio": 0.9102194173336127
+ },
+ "float": {
+  "a": "OK",
+  "a_mean": 0.03459753868325303,
+  "b": "OK",
+  "b_mean": 0.03914874822366983,
+  "ratio": 0.8837457199291731
+ }
+}

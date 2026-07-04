@@ -521,7 +521,18 @@ bool Context::finalizeFunc(
   removeDeoptedFunc(func);
 
 #if PY_VERSION_HEX < 0x030C0000
-  setVectorcall(func, recursionGuardedVectorcall);
+  // CI_JIT_NO_ENTRY_GUARD=1（M9 预演专用）：安装裸编译入口以隔离守卫
+  // 包装的每调用开销（哈希查找 + 额外 C 帧 + 递归计数），代价是放弃
+  // 递归深度检查与 tracing pause——仅限基准测量，不得用于正确性口径。
+  static const bool no_entry_guard = [] {
+    const char* v = getenv("CI_JIT_NO_ENTRY_GUARD");
+    return v != nullptr && *v != '\0' && *v != '0';
+  }();
+  if (no_entry_guard) {
+    setVectorcall(func, compiled->vectorcallEntry());
+  } else {
+    setVectorcall(func, recursionGuardedVectorcall);
+  }
 #else
   setVectorcall(func, compiled->vectorcallEntry());
 #endif

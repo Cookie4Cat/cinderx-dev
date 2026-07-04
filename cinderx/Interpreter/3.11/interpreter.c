@@ -34,10 +34,19 @@ extern PyObject* Ci_EvalFrameDefault_311(
     _PyInterpreterFrame* frame,
     int throwflag);
 
+// pyjit.cpp：函数槽位仍为解释器默认入口时安装 auto-JIT 计数入口。
+extern int Ci_MaybeInstallAutoJitEntry311(PyFunctionObject* func);
+
 PyObject* _Py_HOT_FUNCTION
 Ci_EvalFrame(PyThreadState* tstate, _PyInterpreterFrame* frame, int throwflag) {
-  // Route through the vendored 3.11.6 loop. Call counting and auto-JIT
-  // scheduling land with the bytecode-frontend milestone.
+  // 3.11 无 function watcher：auto-JIT 引导在此惰性接线——函数首次以
+  // 解释方式进入求值器时安装计数入口，后续调用经 vectorcall 计数并在
+  // 达到阈值后编译（vendored CALL 特化在自定义 eval_frame 下 DEOPT 走
+  // 通用调用路径，故所有 Python 调用都会经过 vectorcall）。正式开发可
+  // 为该检查加缓存快路径。
+  if (frame->f_func != NULL) {
+    (void)Ci_MaybeInstallAutoJitEntry311(frame->f_func);
+  }
   return Ci_EvalFrameDefault_311(tstate, frame, throwflag);
 }
 
