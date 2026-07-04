@@ -1,0 +1,6 @@
+{
+  "failures": [
+    "jit:case_gi_frame_locals_at_suspension",
+    "jit_deopt:case_gi_frame_locals_at_suspension"
+  ]
+}
