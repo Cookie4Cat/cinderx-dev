@@ -31,4 +31,30 @@
 // rename.)
 #define _pydict_global_version ci_pydict_global_version_shadow
 
+// [P3]（源级补丁，ceval.c start_frame 处）auto-JIT 帧压栈计数。3.11 无
+// code watcher，计数式 auto 的每 code 调用计数改在解释循环帧压栈点完成
+// ——该点同时覆盖 vectorcall 入口与特化 CALL 的内联压栈，是 3.11 上
+// 唯一能数全所有解释执行的位置。钩子实现位于 pyjit.cpp（CodeExtra 按需
+// 分配 + 阈值到达即编译）。P1/P2 为宏级补丁、基座源逐字不动；P3/P4 为
+// 首两个源级补丁：宏无法改写结构体字段访问与 opcode 处理器内部语句，
+// 补丁位点以 [P3]/[P4] 注释标记，哈希锁同步更新（正式移植转独立
+// .patch 文件走 D3 补丁台账评审）。
+struct _ts;
+struct _PyInterpreterFrame;
+extern void Ci_AutoJitCountFramePush311(
+    struct _ts* tstate,
+    struct _PyInterpreterFrame* frame);
+
+// [P4]（源级补丁，CALL_PY_EXACT_ARGS / CALL_PY_WITH_DEFAULTS）特化调用
+// 内联压栈的守卫由"装了自定义求值器就一刀切 DEOPT"改为按被调方判定：
+// 仅当被调方仍为解释器默认入口时内联压栈，编译入口/包装入口经通用调用
+// 路径进入 JIT。原 stock 检查服务于任意第三方求值器必须看见每个帧的
+// PEP 523 语义；本端口的求值器就是本循环自身，内联压栈的帧同样在本
+// 循环内执行，语义等价，而一刀切 DEOPT 使所有解释器间调用退化为通用
+// 路径（M9 首轮实测的主要结构税之一）。Ci_StockEntry311 为解释器默认
+// vectorcall 入口的 void* 镜像（跨 TU 函数指针类型摩擦规避），由 JIT
+// initialize() 赋值；未初始化时为空指针，比较恒不相等，行为退回一刀切
+// DEOPT（fail-safe）。
+extern void* Ci_StockEntry311;
+
 #include "ceval/ceval.c"
