@@ -114,3 +114,37 @@ heisenbug 定位+修复 ~50 分钟（gdb 三轮：崩点反汇编→调用方→
 
 ~3 小时（LOAD_FAST 族 40 分钟；csel 族定位 1 小时——含 quickening 触发
 条件推理；不朽性族 1 小时——gc 定位 + skip 二分 + 活体探针；收尾 20 分钟）。
+
+## 第三轮（07-04）：语料 21 → 9，M4 范围内失败清零
+
+1. **"无可达正常返回"函数的编译处理**（剩余 3 项编译期中止的根因）：
+   全部路径均被必然抛出的守卫（如静态未绑定局部变量的 CheckVar，输出
+   Bottom 类型）支配的函数，SSA 简化后 HIR 中不再有 Return 终结符；
+   3.11 材料化帧的出口块以正常返回的 phi 汇聚返回值，零输入 phi 在
+   后续改写中产生空操作数，代码生成无法处理。处置：在 LIR 生成入口
+   增加检查（与前端既有模式阀并列），此类函数拒绝编译并回退解释器，
+   行为与解释器一致（三个用例的 UnboundLocalError 逐字符一致）。
+   检查置于 LIR 层而非 buildHIR：死 Return 由 SSA 简化阶段剪除，
+   buildHIR 时尚存在。3.14 不受影响（轻量帧尾声不经出口 phi）。
+2. **MATCH_* 操作码在 3.11 上改为拒编**：运行期助手在 borrow fallback
+   中为占位实现（第五处占位实现，此次表现为运行期 RuntimeError 与
+   解释器行为可见不一致），拒编回退后行为等价。match 语句的翻译支持
+   列入正式 M4 工作项。
+3. **opcode 三态矩阵产出**（M4 出口条件②）：89 个操作码"已编译且
+   deopt 模式通过"，缺口恰为 MATCH_CLASS/MATCH_KEYS/MATCH_MAPPING
+   三项，与失败清单互相印证。工具与矩阵文件已入库
+   （docs/dryrun/opcode_tristate_matrix.py、opcode-tristate-matrix.json）。
+4. **unbound 矩阵全部通过**（M4 出口条件③）：r3final 报告中
+   corpus_unbound 家族零失败。
+
+### 终态（r3final 基线，docs/dryrun/m4-diffgate-baseline-r3final.json）
+
+9 项失败 = attr 类变异后缓存未失效 8 项 + descriptor 类 1 项（仅
+jit_deopt 模式），全部属于 M7 版本号守卫的既定工作范围（watcher 在
+3.11 为占位实现的必然结果，M0 阶段即有分类）。**M4 范围内失败为零**。
+
+### 第三轮工时
+
+~2 小时（出口 phi 问题的定位与两次定位修正 ~1.2 小时——教训：修复
+位置需以"该信息何时可得"为准，Return 剪除时机决定检查必须在 SSA 之后；
+MATCH 拒编与矩阵工具 ~40 分钟）。

@@ -1,0 +1,88 @@
+{
+  "python": "3.11.15 (main, Jun  6 2026, 08:01:57) [GCC 14.2.1 20250110 (Red Hat 14.2.1-11)]",
+  "modules": [
+    "corpus_calls",
+    "corpus_controlflow",
+    "corpus_frames",
+    "corpus_hotloops",
+    "corpus_ic_mutation",
+    "corpus_operators",
+    "corpus_unbound"
+  ],
+  "total_cases": 918,
+  "modes": [
+    "jit",
+    "jit_deopt"
+  ],
+  "failures": [
+    "jit:case_attr_class_del_raises",
+    "jit:case_attr_class_reassign",
+    "jit:case_attr_mro_bases_change",
+    "jit:case_attr_property_added_later",
+    "jit_deopt:case_attr_class_del_raises",
+    "jit_deopt:case_attr_class_reassign",
+    "jit_deopt:case_attr_mro_bases_change",
+    "jit_deopt:case_attr_property_added_later",
+    "jit_deopt:case_descriptor_nondata_vs_instance"
+  ],
+  "new_failures": [
+    "jit:case_attr_class_del_raises",
+    "jit:case_attr_class_reassign",
+    "jit:case_attr_mro_bases_change",
+    "jit:case_attr_property_added_later",
+    "jit_deopt:case_attr_class_del_raises",
+    "jit_deopt:case_attr_class_reassign",
+    "jit_deopt:case_attr_mro_bases_change",
+    "jit_deopt:case_attr_property_added_later",
+    "jit_deopt:case_descriptor_nondata_vs_instance"
+  ],
+  "fixed_vs_baseline": [],
+  "infra_errors": [],
+  "detail": {
+    "jit:case_attr_class_del_raises": {
+      "kind": "diff",
+      "interp": "CASE case_attr_class_del_raises OK ('temp', \"AttributeError: 'Temp' object has no attribute 'attr'\")",
+      "jit": "CASE case_attr_class_del_raises OK ('temp', 'temp')"
+    },
+    "jit:case_attr_class_reassign": {
+      "kind": "diff",
+      "interp": "CASE case_attr_class_reassign OK ('class-attr', 'mutated')",
+      "jit": "CASE case_attr_class_reassign OK ('class-attr', 'class-attr')"
+    },
+    "jit:case_attr_mro_bases_change": {
+      "kind": "diff",
+      "interp": "CASE case_attr_mro_bases_change OK ('from-A', 'from-B')",
+      "jit": "CASE case_attr_mro_bases_change OK ('from-A', 'from-A')"
+    },
+    "jit:case_attr_property_added_later": {
+      "kind": "diff",
+      "interp": "CASE case_attr_property_added_later OK ('plain', 'via-property')",
+      "jit": "CASE case_attr_property_added_later OK ('plain', 'plain')"
+    },
+    "jit_deopt:case_attr_class_del_raises": {
+      "kind": "diff",
+      "interp": "CASE case_attr_class_del_raises OK ('temp', \"AttributeError: 'Temp' object has no attribute 'attr'\")",
+      "jit_deopt": "CASE case_attr_class_del_raises OK ('temp', 'temp')"
+    },
+    "jit_deopt:case_attr_class_reassign": {
+      "kind": "diff",
+      "interp": "CASE case_attr_class_reassign OK ('class-attr', 'mutated')",
+      "jit_deopt": "CASE case_attr_class_reassign OK ('class-attr', 'class-attr')"
+    },
+    "jit_deopt:case_attr_mro_bases_change": {
+      "kind": "diff",
+      "interp": "CASE case_attr_mro_bases_change OK ('from-A', 'from-B')",
+      "jit_deopt": "CASE case_attr_mro_bases_change OK ('from-A', 'from-A')"
+    },
+    "jit_deopt:case_attr_property_added_later": {
+      "kind": "diff",
+      "interp": "CASE case_attr_property_added_later OK ('plain', 'via-property')",
+      "jit_deopt": "CASE case_attr_property_added_later OK ('plain', 'plain')"
+    },
+    "jit_deopt:case_descriptor_nondata_vs_instance": {
+      "kind": "diff",
+      "interp": "CASE case_descriptor_nondata_vs_instance OK ('non-data', 'instance-wins')",
+      "jit_deopt": "CASE case_descriptor_nondata_vs_instance OK ('from-A', 'instance-wins')"
+    }
+  }
+}
