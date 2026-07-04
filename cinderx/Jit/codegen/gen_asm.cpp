@@ -391,6 +391,20 @@ PyObject* resumeInInterpreter(
       Py_DECREF(gen_to_cleanup);
     }
 
+#if PY_VERSION_HEX < 0x030C0000
+    // On 3.11, entry-frame cleanup is the caller's responsibility: stock
+    // _PyEval_Vector runs _PyEvalFrameClearAndPop after EvalFrame returns,
+    // and the eval loop only pops frames it pushed itself. Mirror that here
+    // for the deopted frame; without it every deopt (including every
+    // raising call, which exits through the deopt path) leaks the frame's
+    // function and code references and its datastack slot. Generator
+    // frames are owned and cleared by their generator object.
+    if (frame->owner == FRAME_OWNED_BY_THREAD) {
+      _PyFrame_Clear(frame);
+      Cix_PyThreadState_PopFrame(tstate, frame);
+    }
+#endif
+
     frame = prev_frame;
 
     err_occurred = result == nullptr;
