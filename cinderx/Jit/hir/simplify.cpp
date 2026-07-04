@@ -718,6 +718,13 @@ Register* simplifyLoadTypeMethodCached(Env& env, const LoadMethod* load_meth) {
   Register* receiver = load_meth->GetOperand(0);
   const int cache_id = env.func.env.allocateLoadTypeMethodCache();
   env.emit<UseType>(receiver, TType);
+#if PY_VERSION_HEX < 0x030C0000
+  // D5：3.11 无 type watcher，内联 [type, value] 槽对无法拉式验证版本，
+  // 不发射内联快路径；统一调用 Fill helper，命中判定（含 tp_version_tag
+  // 校验）在 LoadTypeMethodCache::lookup 内完成。
+  return env.emit<FillTypeMethodCache>(
+      receiver, load_meth->name_idx(), cache_id, *load_meth->frameState());
+#else
   Register* guard = env.emit<LoadTypeMethodCacheEntryType>(cache_id);
   Register* type_matches =
       env.emit<PrimitiveCompare>(PrimitiveCompareOp::kEqual, guard, receiver);
@@ -733,6 +740,7 @@ Register* simplifyLoadTypeMethodCached(Env& env, const LoadMethod* load_meth) {
         return env.emit<FillTypeMethodCache>(
             receiver, name_idx, cache_id, *load_meth->frameState());
       });
+#endif
 }
 
 Register* simplifyLoadMethod(Env& env, const LoadMethod* load_meth) {
@@ -1935,6 +1943,13 @@ Register* simplifyLoadAttrTypeReceiver(Env& env, const LoadAttr* load_attr) {
 
   const int cache_id = env.func.env.allocateLoadTypeAttrCache();
   env.emit<UseType>(receiver, TType);
+#if PY_VERSION_HEX < 0x030C0000
+  // D5：3.11 无 type watcher，内联 [type, value] 槽对无法拉式验证版本，
+  // 不发射内联快路径；统一调用 Fill helper，命中判定（含 tp_version_tag
+  // 校验）在 LoadTypeAttrCache::invoke 内完成。
+  return env.emit<FillTypeAttrCache>(
+      receiver, load_attr->name_idx(), cache_id, *load_attr->frameState());
+#else
   Register* guard = env.emit<LoadTypeAttrCacheEntryType>(cache_id);
   Register* type_matches =
       env.emit<PrimitiveCompare>(PrimitiveCompareOp::kEqual, guard, receiver);
@@ -1950,6 +1965,7 @@ Register* simplifyLoadAttrTypeReceiver(Env& env, const LoadAttr* load_attr) {
         return env.emit<FillTypeAttrCache>(
             receiver, name_idx, cache_id, *load_attr->frameState());
       });
+#endif
 }
 
 Register* simplifyLoadAttr(Env& env, const LoadAttr* load_attr) {

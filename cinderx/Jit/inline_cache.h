@@ -5,6 +5,7 @@
 #include "cinderx/python.h"
 
 #include "cinderx/Common/dict.h"
+#include "cinderx/Common/py-portability.h"
 #include "cinderx/Common/ref.h"
 #include "cinderx/Common/util.h"
 #include "cinderx/Jit/config.h"
@@ -102,6 +103,23 @@ class AttributeMutator {
     // clear tagged bits and return
     return reinterpret_cast<PyTypeObject*>(type_ & ~kindMask());
   }
+
+  // 命中判定。3.12+ 仅比较类型指针（type watcher 负责回调失效）；3.11 无
+  // type watcher，额外以 tp_version_tag 拉式验证（D5）。验证不通过时调用
+  // 方不得解引用条目内的借引用（D9）。
+  bool matches(PyTypeObject* tp) const {
+    if (type() != tp) {
+      return false;
+    }
+#if PY_VERSION_HEX < 0x030C0000
+    if (!Ci_Type_HasValidVersionTag(tp) ||
+        tp->tp_version_tag != type_version_) {
+      return false;
+    }
+#endif
+    return true;
+  }
+
   void reset();
   bool isEmpty() const {
     return type_ == 0;
@@ -147,6 +165,10 @@ class AttributeMutator {
   uintptr_t type_; // This value stores both a PyTypeObject* for the type object
                    // and the Kind enum value which are bitpacked together to
                    // reduce memory consumption
+#if PY_VERSION_HEX < 0x030C0000
+  // set_type 记录时的 tp_version_tag，matches() 命中前拉式验证（D5）。
+  uint32_t type_version_{0};
+#endif
   union {
     SplitMutator split_;
     CombinedMutator combined_;
@@ -262,6 +284,11 @@ class LoadTypeAttrCache {
   // address.
   PyTypeObject* type_;
   PyObject* value_;
+#if PY_VERSION_HEX < 0x030C0000
+  // fill 记录时的 tp_version_tag；3.11 不发射内联 [type, value] 快路径，
+  // 命中判定在 invoke() 内完成并以此拉式验证（D5）。
+  uint32_t version_{0};
+#endif
 };
 
 #define FOREACH_CACHE_MISS_REASON(V) \
@@ -294,6 +321,11 @@ class LoadMethodCache {
     BorrowedRef<PyTypeObject> type;
     BorrowedRef<> value;
     uint32_t keys_version;
+#if PY_VERSION_HEX < 0x030C0000
+    // fill 记录时的 tp_version_tag，命中前拉式验证（D5，3.11 无 type
+    // watcher）。
+    uint32_t type_version{0};
+#endif
 
     bool isValidKeysVersion(BorrowedRef<> obj);
   };
@@ -365,6 +397,11 @@ class LoadTypeMethodCache {
   BorrowedRef<> value_;
   std::unique_ptr<CacheStats> cache_stats_;
   bool is_unbound_meth_;
+#if PY_VERSION_HEX < 0x030C0000
+  // fill 记录时的 tp_version_tag；3.11 不发射内联类型比较快路径，命中
+  // 判定在 lookup() 内完成并以此拉式验证（D5）。
+  uint32_t version_{0};
+#endif
 };
 
 // A cache for an individual LoadModuleAttrCached instruction.

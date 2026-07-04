@@ -679,6 +679,10 @@ void AttributeMutator::set_type(PyTypeObject* type, Kind kind) {
   JIT_CHECK((raw & kindMask()) == 0, "PyTypeObject* expected to be aligned");
   auto mask = static_cast<uintptr_t>(kind);
   type_ = raw | mask;
+#if PY_VERSION_HEX < 0x030C0000
+  // fill 侧已由 Ci_Type_HasValidVersionTag 保证此时 tag 有效。
+  type_version_ = type->tp_version_tag;
+#endif
 }
 
 AttributeCache::AttributeCache() {
@@ -860,9 +864,16 @@ int StoreAttrCache::invoke(
 int StoreAttrCache::doInvoke(PyObject* obj, PyObject* name, PyObject* value) {
   BorrowedRef<PyTypeObject> tp = Py_TYPE(obj);
   for (auto& entry : entries()) {
-    if (entry.type() == tp) {
+    if (entry.type() != tp) {
+      continue;
+    }
+    if (entry.matches(tp)) {
       return entry.setAttr(obj, name, value);
     }
+    // 类型指针相同但版本失效：该条目不可能再次命中（版本号单调递增），
+    // 立即清空释放槽位；期间不触碰条目内的借引用（D9）。
+    entry.reset();
+    break;
   }
   return invokeSlowPath(obj, name, value);
 }
@@ -893,9 +904,16 @@ LoadAttrCache::invoke(LoadAttrCache* cache, PyObject* obj, PyObject* name) {
 PyObject* LoadAttrCache::doInvoke(PyObject* obj, PyObject* name) {
   PyTypeObject* tp = Py_TYPE(obj);
   for (auto& entry : entries()) {
-    if (entry.type() == tp) {
+    if (entry.type() != tp) {
+      continue;
+    }
+    if (entry.matches(tp)) {
       return entry.getAttr(obj, name);
     }
+    // 类型指针相同但版本失效：该条目不可能再次命中（版本号单调递增），
+    // 立即清空释放槽位；期间不触碰条目内的借引用（D9）。
+    entry.reset();
+    break;
   }
   return invokeSlowPath(obj, name);
 }
@@ -931,6 +949,17 @@ PyObject* LoadTypeAttrCache::invoke(
     LoadTypeAttrCache* cache,
     PyObject* obj,
     PyObject* name) {
+#if PY_VERSION_HEX < 0x030C0000
+  // 3.11 不发射内联 [type, value] 快路径（无 type watcher，槽对无法拉式
+  // 验证），命中判定在此完成：类型指针与 tp_version_tag 双重校验（D5），
+  // 校验通过前不使用缓存值（D9）。
+  if (reinterpret_cast<PyObject*>(cache->type_) == obj &&
+      cache->value_ != nullptr && Ci_Type_HasValidVersionTag(cache->type_) &&
+      cache->type_->tp_version_tag == cache->version_) {
+    Py_INCREF(cache->value_);
+    return cache->value_;
+  }
+#endif
   // The fast path is handled by direct memory access via valueAddr().
   return cache->invokeSlowPath(obj, name);
 }
@@ -1032,6 +1061,10 @@ void LoadTypeAttrCache::fill(
   ltac_watcher.unwatch(type_, this);
   type_ = type;
   value_ = value;
+#if PY_VERSION_HEX < 0x030C0000
+  // 上方 Ci_Type_HasValidVersionTag 已保证此时 tag 有效。
+  version_ = type->tp_version_tag;
+#endif
   ltac_watcher.watch(type_, this);
 }
 
@@ -1143,6 +1176,16 @@ LoadMethodResult LoadMethodCache::lookup(
 
   for (auto& entry : entries_) {
     if (entry.type == tp) {
+#if PY_VERSION_HEX < 0x030C0000
+      // D5：3.11 无 type watcher，命中前以 tp_version_tag 拉式验证；
+      // 失效条目立即清空（不触碰其中借引用，D9）。
+      if (!Ci_Type_HasValidVersionTag(tp) ||
+          tp->tp_version_tag != entry.type_version) {
+        entry.type.reset();
+        entry.value.reset();
+        continue;
+      }
+#endif
       if (!isValidKeysVersion(entry.keys_version, obj)) {
         continue;
       }
@@ -1294,6 +1337,10 @@ void LoadMethodCache::fill(
       entry.type = type;
       entry.value = value;
       entry.keys_version = keys_version;
+#if PY_VERSION_HEX < 0x030C0000
+      // 上方 Ci_Type_HasValidVersionTag 已保证此时 tag 有效。
+      entry.type_version = type->tp_version_tag;
+#endif
       return;
     }
   }
@@ -1329,6 +1376,16 @@ LoadMethodResult LoadTypeMethodCache::getValueHelper(
 LoadMethodResult LoadTypeMethodCache::lookup(
     BorrowedRef<PyTypeObject> obj,
     BorrowedRef<> name) {
+#if PY_VERSION_HEX < 0x030C0000
+  // 3.11 不发射内联类型比较快路径（无 type watcher，槽对无法拉式验证），
+  // 命中判定在此完成：类型指针与 tp_version_tag 双重校验（D5），校验
+  // 通过前不使用缓存值（D9）。
+  if (type_ == obj && value_ != nullptr &&
+      Ci_Type_HasValidVersionTag(type_) &&
+      type_->tp_version_tag == version_) {
+    return getValueHelper(this, obj.getObj());
+  }
+#endif
   PyTypeObject* metatype = Py_TYPE(obj);
   if (metatype->tp_getattro != PyType_Type.tp_getattro) {
     maybeCollectCacheStats(
@@ -1499,6 +1556,10 @@ void LoadTypeMethodCache::fill(
   type_ = type;
   value_ = value;
   is_unbound_meth_ = is_unbound_meth;
+#if PY_VERSION_HEX < 0x030C0000
+  // 上方 Ci_Type_HasValidVersionTag 已保证此时 tag 有效。
+  version_ = type->tp_version_tag;
+#endif
   ltm_watcher.watch(type_, this);
 }
 
