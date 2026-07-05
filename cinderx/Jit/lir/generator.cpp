@@ -368,9 +368,9 @@ class FrameInitPlan {
   template <typename Provider>
   static FrameInitPlan build(
       Provider&& provider,
-      [[maybe_unused]] int nlocalsplus = 0) {
+      const FrameInitTable& table = kFrameInitTable,
+      int nlocalsplus = 0) {
     FrameInitPlan plan;
-    constexpr auto& table = kFrameInitTable;
     for (size_t i = 0; i < table.num_fields; i++) {
       const auto& field = table.fields[i];
       Instruction* val = provider(field.kind, field.data_type);
@@ -410,13 +410,11 @@ class FrameInitPlan {
       plan.groups_[plan.num_groups_++] = {
           static_cast<uint8_t>(start), static_cast<uint8_t>(i - start)};
     }
-#ifndef ENABLE_LIGHTWEIGHT_FRAMES
     if (nlocalsplus > 0) {
       plan.localsplus_zero_offset_ =
           static_cast<int32_t>(offsetof(_PyInterpreterFrame, localsplus));
       plan.localsplus_zero_count_ = nlocalsplus;
     }
-#endif
     return plan;
   }
 
@@ -1177,7 +1175,14 @@ void LIRGenerator::GenerateExitBlocks() {
     // Unlink frame before epilogue. Non-generators always unlink.
     bool has_freevars = func_->code != nullptr && func_->code->co_nfreevars > 0;
     if (func_->frameMode == FrameMode::kNormal) {
-      bbb.appendInvokeInstruction(JITRT_UnlinkFrame, env_->asm_tstate);
+#if PY_VERSION_HEX < 0x030C0000
+      if (canInlineNormalFrame()) {
+        emitInlineUnlinkNormalFrame(bbb);
+      } else
+#endif
+      {
+        bbb.appendInvokeInstruction(JITRT_UnlinkFrame, env_->asm_tstate);
+      }
     } else {
       PyObject* executable;
       std::optional<destructor> exec_dtor;
@@ -4795,7 +4800,15 @@ LIRGenerator::TranslatedBlock LIRGenerator::TranslateOneBasicBlock(
               }
               JIT_ABORT("Unexpected FrameFieldKind");
             },
-            code->co_nlocalsplus);
+            kFrameInitTable,
+#ifdef ENABLE_LIGHTWEIGHT_FRAMES
+            // 轻量帧惰性物化，localsplus 不预置零（与旧行为一致：
+            // 置零逻辑此前被旗标门排除）。
+            0
+#else
+            code->co_nlocalsplus
+#endif
+        );
         plan.emit(bbb, callee_frame);
 
 #if PY_VERSION_HEX >= 0x030E0000 && defined(ENABLE_LIGHTWEIGHT_FRAMES)
@@ -5720,6 +5733,11 @@ void LIRGenerator::emitLoadFrame(BasicBlockBuilder& bbb) {
 #endif
   } else if (func_->frameMode == FrameMode::kNormal) {
     bbb.annotateNext("Allocate and link interpreter frame");
+#if PY_VERSION_HEX < 0x030C0000
+    if (canInlineNormalFrame()) {
+      emitInlineLinkNormalFrame(bbb);
+    } else
+#endif
     if (kPyDebug) {
       env_->asm_tstate = bbb.appendCallInstruction(
           OutVReg{},
@@ -5876,7 +5894,9 @@ void LIRGenerator::emitLoadFrame(BasicBlockBuilder& bbb) {
           }
           JIT_ABORT("Unexpected FrameFieldKind");
         },
-        func_->code->co_nlocalsplus);
+        kFrameInitTable,
+        // 轻量帧惰性物化，localsplus 不预置零。
+        0);
     plan.emit(bbb, frame);
 
 #if PY_VERSION_HEX >= 0x030E0000 && defined(ENABLE_LIGHTWEIGHT_FRAMES)
@@ -5962,6 +5982,251 @@ void LIRGenerator::emitLoadFrame(BasicBlockBuilder& bbb) {
   bbb.annotateNext("Load current interpreter frame");
   env_->asm_interpreter_frame = makeCurrentFrameAccessor(bbb).load();
 }
+
+#if PY_VERSION_HEX < 0x030C0000
+namespace {
+// 帧仪式行内化的测量/排障开关（默认行内；置 1 恢复 C helper 路径）。
+bool inlineNormalFrameDisabled() {
+  static const bool disabled = [] {
+    const char* v = getenv("CI_JIT_NO_INLINE_FRAME");
+    return v != nullptr && *v != '\0' && *v != '0';
+  }();
+  return disabled;
+}
+} // namespace
+
+// 3.11 普通（物化）帧仪式行内化的静态资格：cell/free 变量为零（否则
+// InitFrameCellVars 写入 localsplus，出口无法静态证明全 NULL）、非
+// 调试构建。资格在编译期逐函数判定，入口与出口必须同判（同一谓词）。
+bool LIRGenerator::canInlineNormalFrame() const {
+  BorrowedRef<PyCodeObject> code = func_->code;
+  return !kPyDebug && code != nullptr && code->co_ncellvars == 0 &&
+      code->co_nfreevars == 0 && !inlineNormalFrameDisabled();
+}
+
+// 入口：行内分配+初始化+链接解释器帧，镜像
+// JITRT_AllocateAndLinkInterpreterFrame_Release =
+// _PyThreadState_PushFrame 快路径 + _PyFrame_InitializeSpecials +
+// localsplus 置空 + previous/current_frame 链接。所有布局量
+// （framesize/nlocalsplus/code/prev_instr）为编译期常量；数据栈越界
+// 回落 C 全路径（含新 chunk 分配）。引用会计与 C 版逐项等价：f_func、
+// f_code 各持一强引用，f_globals/f_builtins 借用（每调用从 func 现读，
+// 与 InitializeSpecials 同源）。
+void LIRGenerator::emitInlineLinkNormalFrame(BasicBlockBuilder& bbb) {
+  BorrowedRef<PyCodeObject> code = func_->code;
+
+  bbb.annotateNext("Inline frame link: load tstate");
+  env_->asm_tstate = bbb.appendInstr(OutVReg{}, Instruction::kLoadThreadState);
+
+  auto slow_block = bbb.allocateBlock();
+  auto done_block = bbb.allocateBlock();
+
+  const int32_t frame_bytes = static_cast<int32_t>(
+      (code->co_nlocalsplus + code->co_stacksize + FRAME_SPECIALS_SIZE) *
+      kPointerSize);
+  bbb.annotateNext("Inline frame link: datastack bump");
+  Instruction* top = bbb.appendInstr(
+      OutVReg{},
+      Instruction::kMove,
+      Ind{env_->asm_tstate,
+          static_cast<int32_t>(offsetof(PyThreadState, datastack_top))});
+  Instruction* limit = bbb.appendInstr(
+      OutVReg{},
+      Instruction::kMove,
+      Ind{env_->asm_tstate,
+          static_cast<int32_t>(offsetof(PyThreadState, datastack_limit))});
+  Instruction* new_top =
+      bbb.appendInstr(OutVReg{}, Instruction::kLea, Ind{top, frame_bytes});
+  bbb.appendInstr(Instruction::kCmp, new_top, limit);
+  // 镜像 stock：top + size >= limit 即溢出（无符号指针比较）。
+  bbb.appendBranch(Instruction::kBranchAE, slow_block);
+
+  auto fast_block = bbb.allocateBlock();
+  bbb.appendBlock(fast_block);
+  bbb.appendInstr(
+      OutInd{env_->asm_tstate,
+             static_cast<int32_t>(offsetof(PyThreadState, datastack_top))},
+      Instruction::kMove,
+      new_top);
+  Instruction* frame = top;
+
+  CurrentFrameAccessor cfa = makeCurrentFrameAccessor(bbb);
+  Instruction* prev_frame = cfa.load();
+
+  Instruction* code_reg = nullptr;
+  Instruction* zero_reg = nullptr;
+  auto plan = FrameInitPlan::build(
+      [&](FrameFieldKind kind, DataType dt) -> Instruction* {
+        switch (kind) {
+          case FrameFieldKind::kExecutable:
+            JIT_DCHECK(code_reg == nullptr, "should only be emitted once");
+            code_reg = bbb.appendInstr(
+                OutVReg{},
+                Instruction::kMove,
+                reinterpret_cast<PyObject*>(code.get()));
+            return code_reg;
+          case FrameFieldKind::kPrevFrame:
+            return prev_frame;
+          case FrameFieldKind::kFuncObj:
+            return env_->asm_func;
+          case FrameFieldKind::kInstrPtr:
+            return bbb.appendInstr(
+                OutVReg{},
+                Instruction::kMove,
+                _PyCode_CODE(code.get()) - 1);
+          case FrameFieldKind::kStackPointer:
+            // <0x030E：stacktop = nlocalsplus（32 位立即数）。
+            return bbb.appendInstr(
+                OutVReg{dt},
+                Instruction::kMove,
+                Imm{static_cast<uint64_t>(code->co_nlocalsplus), dt});
+          case FrameFieldKind::kBuiltins:
+            return bbb.appendInstr(
+                OutVReg{},
+                Instruction::kMove,
+                Ind{env_->asm_func,
+                    offsetof(PyFunctionObject, func_builtins)});
+          case FrameFieldKind::kGlobals:
+            return bbb.appendInstr(
+                OutVReg{},
+                Instruction::kMove,
+                Ind{env_->asm_func, offsetof(PyFunctionObject, func_globals)});
+          case FrameFieldKind::kZero:
+          case FrameFieldKind::kOwnerThread:
+            static_assert(
+                FRAME_OWNED_BY_THREAD == 0,
+                "FRAME_OWNED_BY_THREAD has changed");
+            if (zero_reg == nullptr) {
+              zero_reg =
+                  bbb.appendInstr(OutVReg{dt}, Instruction::kMove, Imm{0, dt});
+            }
+            return zero_reg;
+          default:
+            JIT_ABORT("Unexpected FrameFieldKind for normal frame");
+        }
+      },
+      kNormalFrameInitTable,
+      code->co_nlocalsplus);
+  plan.emit(bbb, frame);
+
+  // 引用会计：f_func 与 f_code 各持一强引用（镜像调用方 Py_NewRef(func)
+  // + InitializeSpecials 的 Py_NewRef(code)）。
+  bbb.annotateNext("Inline frame link: incref func/code");
+  makeIncref(bbb, env_->asm_func, false);
+  JIT_DCHECK(code_reg != nullptr, "executable field missing from plan");
+  makeIncref(bbb, code_reg, false);
+
+  bbb.annotateNext("Inline frame link: set current frame");
+  cfa.store(frame);
+  bbb.appendBranch(Instruction::kBranch, done_block);
+
+  // slow_block 仅为分支目标（fast 块已以无条件跳转终结，不可再挂
+  // fallthrough 后继）——switchBlock 而非 appendBlock。
+  bbb.switchBlock(slow_block);
+  if (getConfig().multiple_code_sections) {
+    slow_block->setSection(codegen::CodeSection::kCold);
+  }
+  // 数据栈溢出：C 全路径重做分配+初始化+链接（返回值即 tstate，与
+  // kLoadThreadState 同值，无需合流）。
+  bbb.appendCallInstruction(
+      OutVReg{},
+      JITRT_AllocateAndLinkInterpreterFrame_Release,
+      env_->asm_func);
+  bbb.appendBranch(Instruction::kBranch, done_block);
+
+  bbb.switchBlock(done_block);
+}
+
+// 出口：行内解链+清理+弹栈，镜像 JITRT_UnlinkFrame 的普通帧路径。
+// 三前置检查（检查期零突变，任一失败整体回落 C）：① frame_obj 已
+// 物化（逃逸帧归属转移）；② f_locals 已写（PyEval_GetLocals 族可在
+// 无 frame_obj 时直写）；③ 帧位于 chunk 基（弹出须释放 chunk）。
+// 三项皆空时 cell-free 资格保证 localsplus 自入口起全 NULL——
+// ClearExceptCode 的逐槽 XDECREF 与 f_locals 清理为空操作，剩余
+// 语义 = 解链（先于清理，GH-99729）+ f_func/f_code 各减一强引用 +
+// datastack_top 回拨。
+void LIRGenerator::emitInlineUnlinkNormalFrame(BasicBlockBuilder& bbb) {
+  BorrowedRef<PyCodeObject> code = func_->code;
+  CurrentFrameAccessor cfa = makeCurrentFrameAccessor(bbb);
+  Instruction* frame = cfa.load();
+
+  auto slow_block = bbb.allocateBlock();
+  auto done_block = bbb.allocateBlock();
+
+  bbb.annotateNext("Inline frame unlink: escape checks");
+  Instruction* frame_obj = bbb.appendInstr(
+      OutVReg{},
+      Instruction::kMove,
+      Ind{frame,
+          static_cast<int32_t>(offsetof(_PyInterpreterFrame, frame_obj))});
+  bbb.appendInstr(Instruction::kTest, frame_obj, frame_obj);
+  bbb.appendBranch(Instruction::kBranchNZ, slow_block);
+
+  auto check_locals = bbb.allocateBlock();
+  bbb.appendBlock(check_locals);
+  Instruction* f_locals = bbb.appendInstr(
+      OutVReg{},
+      Instruction::kMove,
+      Ind{frame,
+          static_cast<int32_t>(offsetof(_PyInterpreterFrame, f_locals))});
+  bbb.appendInstr(Instruction::kTest, f_locals, f_locals);
+  bbb.appendBranch(Instruction::kBranchNZ, slow_block);
+
+  auto check_chunk = bbb.allocateBlock();
+  bbb.appendBlock(check_chunk);
+  Instruction* chunk = bbb.appendInstr(
+      OutVReg{},
+      Instruction::kMove,
+      Ind{env_->asm_tstate,
+          static_cast<int32_t>(offsetof(PyThreadState, datastack_chunk))});
+  Instruction* chunk_data = bbb.appendInstr(
+      OutVReg{},
+      Instruction::kLea,
+      Ind{chunk, static_cast<int32_t>(offsetof(_PyStackChunk, data))});
+  bbb.appendInstr(Instruction::kCmp, frame, chunk_data);
+  bbb.appendBranch(Instruction::kBranchE, slow_block);
+
+  auto fast_block = bbb.allocateBlock();
+  bbb.appendBlock(fast_block);
+  bbb.annotateNext("Inline frame unlink: relink previous");
+  Instruction* prev = bbb.appendInstr(
+      OutVReg{},
+      Instruction::kMove,
+      Ind{frame,
+          static_cast<int32_t>(offsetof(_PyInterpreterFrame, previous))});
+  cfa.store(prev);
+
+  bbb.annotateNext("Inline frame unlink: decref func/code");
+  makeDecref(
+      bbb,
+      env_->asm_func,
+      std::optional<destructor>(PyFunction_Type.tp_dealloc),
+      false);
+  Instruction* code_reg = bbb.appendInstr(
+      OutVReg{},
+      Instruction::kMove,
+      reinterpret_cast<PyObject*>(code.get()));
+  makeDecref(
+      bbb, code_reg, std::optional<destructor>(PyCode_Type.tp_dealloc), false);
+
+  bbb.annotateNext("Inline frame unlink: pop datastack");
+  bbb.appendInstr(
+      OutInd{env_->asm_tstate,
+             static_cast<int32_t>(offsetof(PyThreadState, datastack_top))},
+      Instruction::kMove,
+      frame);
+  bbb.appendBranch(Instruction::kBranch, done_block);
+
+  bbb.switchBlock(slow_block);
+  if (getConfig().multiple_code_sections) {
+    slow_block->setSection(codegen::CodeSection::kCold);
+  }
+  bbb.appendInvokeInstruction(JITRT_UnlinkFrame, env_->asm_tstate);
+  bbb.appendBranch(Instruction::kBranch, done_block);
+
+  bbb.switchBlock(done_block);
+}
+#endif // PY_VERSION_HEX < 0x030C0000
 
 void LIRGenerator::emitUnlinkFrame(
     BasicBlockBuilder& bbb,
