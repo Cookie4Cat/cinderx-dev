@@ -1,136 +1,143 @@
-# CPython 3.11 适配里程碑预演报告（M0–M1）
+# CPython 3.11 适配预演总报告（M0–M9 速通 + 性能十六轮）
 
-> 记录日期：2026-07-03（预备夜）｜ 分支：dryrun/m0-gates、dryrun/m1-build
-> 基线：dryrun-311-base（kunpeng 仓 dev @75f0f552）
-> 性质：工程预演。完成标准为“基本功能可运行 + 问题清单 + 工时记录”，
-> 预演代码不直接进入正式开发。
+> 时间：2026-07-03 晚 — 2026-07-05 ｜ 基线：kunpeng 仓 dev @75f0f552
+> 性质：工程预演（dry-run）。出口 = 基本功能可运行 + 坑清单 + 实测
+> 工时 + 可复用资产；预演代码不直接进入正式开发，按产出物白名单移交。
+> 分支轨迹：dryrun/m0-gates … dryrun/m9-crash-hunt，MR #2–#34 全部合入。
 
-## 0. MR 范围重构（2026-07-03 深夜二轮）
+## 一、执行摘要
 
-原 dryrun/m1-build 分支（81 文件 +8179 行）把验证分支的**全部**内容按整
-体移植带入，混入了设计书 M1 之外的 M3/M4/M8 级功能（HIR 字节码翻译、
-frame 运行时、auto-JIT 引导、功能测试）。按"MR 只做 M1"重构为：
+**预演超额完成。** 原定出口为"冒烟级可运行"；实际达成：
 
-- **dryrun/m1-build（MR #3，本分支）= 纯 M1**：构建门控 + 生成物 +
-  borrow/垫片 + 共享代码 3.11 编译守卫 + 范围外空壳化 + **JIT 拒编
-  安全阀**（3.11 上 `compileFunction`/eligibility 一律拒绝——3.11 形态
-  为"可构建、可导入、JIT 惰性"）+ 哈希/SRPM 门禁原型。
-  59 文件 +4216 行，其中约六成为生成物/桩/守卫/脚本；builder.cpp 从
-  +1029 收敛到 +4（两处纯编译守卫）。
-- **dryrun/m1-full-port（存档分支）**：完整移植内容原样保留，
-  M2/M3/M4/M8 各里程碑从中按范围取料（翻译层、frame 运行时、
-  auto-JIT 引导、311 功能测试均在其中）。
-- 拆分方法论：以 kunpeng 基线为起点、编译器驱动，逐错误对照全量移植版
-  判"纯守卫→照搬 / 功能实现→拒编桩"；共 6 轮编译迭代收敛。
+- **性能：19 基准 pyperformance A/B 几何均值 1.059（诚实口径：全表面
+  auto=2 编译、无范围阀、19/19 全绿），全面越过 stock 持平线。**
+  战役轨迹 0.432 → 1.059（首轮可比口径起算）。单项：richards 2.311、
+  richards_super 2.247、fannkuch 1.320、deltablue 1.293、nbody 1.228、
+  sqlglot 1.225/1.065、chaos 1.024、raytrace 1.001。
+- **正确性：全表面编译无已知崩溃面。** diffgate 923 用例全绿（穿刺
+  时代 75 失败起步）；refcount 矩阵六组零漂移；libtest 差分唯余
+  test_scope 一项在追踪（修复分支现成待并）与 test_builtin 微漂移
+  （锚点差异，正式目标自然消失）。
+- **门禁体系、构建配方、方法论红线全部沉淀为可移交资产。**
 
-## 1. 执行摘要
+## 二、里程碑编年（含实测工时）
 
-- **M0（测试与门禁基线）：完成。** 差分门禁框架、918 用例语料、基础 libtest
-  差分、opcode 覆盖工具、允许偏差清单及钉住测试全部就位，已作为 MR #2 提交。
-- **M1（3.11 构建打通）：完成（预演口径），四项补全全部销账（2026-07-03
-  深夜补全轮）。** 验证分支移植后 3.11 编译错误 352→0；**完整 pip wheel
-  流程打通**（cp311 wheel 39MB，新鲜 venv 安装+导入+force_compile 全过）；
-  **3.14 反向回归修复归零**（118 错 → builder.cpp 两处合并伤 → 双版本
-  编译+冒烟全绿）；哈希门禁与 SRPM diff 原型产出并跑出真实判决。JIT 编译
-  后执行存在 frame 布局 SEGV（定位明确，归 M2/M4）。详见 §4 与 M1-log。
-- **最高价值发现**：碰共享文件必然破坏 3.14（builder.cpp 合并引入 118 个
-  3.14 编译错误），且部分错误源于“为 3.11 加的 #if 守卫破坏了 3.14 的
-  switch 结构”——用铁证支持了设计书 §6 的**双版本编译门禁**必要性。
-  补全轮进一步证明：118 错实为两处花括号级合并伤（其一在 `#if >=030E`
-  内、3.11 编译永不可见），**只有多版本真实编译能扫出**。
-- **D7 机器判定（补全轮新增）**：openEuler 24.03-LTS-SP3
-  python3-3.11.6-31（52 发行版补丁）与上游 v3.11.6 在 19 个 JIT 核心
-  文件上逐字节一致，**判决 vendor-from-upstream**——M2 的 ceval vendor
-  与 borrow 源直接锚定上游 v3.11.6。
+| 里程碑 | 交付 | 工时 |
+|---|---|---|
+| M0 | 差分门禁框架 + 918 语料 + libtest 差分 + opcode 覆盖工具 | 预备夜 |
+| M1 | 3.11 可构建可导入 + JIT 拒编阀 + 哈希/SRPM 门禁；D7 判决 vendor-from-upstream | — |
+| M2 | 逐字 vendor ceval/specialize/frame（哈希锁）；libtest 25/26 直接等价 | ~3.5h |
+| M3 | LWF 编译期默认无版本意识 SEGV 定案（D4）；逃逸帧 take_ownership | ~2.5h |
+| M4×3 | 语料 118→9：替身 ABI 错位、csel 立即数、单例不朽性烧穿等家族歼灭 | ~7.5h |
+| M5 | 异常路径帧泄漏（调用方清帧责任）修复；refcount 矩阵工具 | ~2.5h |
+| M6 | 递归守卫包装、D8 tracing 预演、异常注入 fuzz 基建 | ~2.5h |
+| M7 | D5 拉式版本守卫（watcher 空桩案）；diffgate 首次全绿 | ~1.5h |
+| M8 | D6 生成器；gi_code/STACK_CLEAR 引用会计双缺陷互掩案 | ~3h |
+| M9 基建 | auto-JIT 接线（[P3]/[P4]）、有机 deopt 六根因、测试套件接入、全表面 SEGV 四案（[P5]） | ~13h |
+| 性能十六轮 | 见下表 | ~45h |
 
-## 2. 六个必答问题的回答
+## 三、性能战役编年（几何均值轨迹）
 
-| # | 问题 | 预演结论 |
-|---|------|----------|
-| 1 | vendored ceval 补丁数量与规模 | **未触及**：验证分支未复制 ceval（用 stock 循环 + PEP 523），M2 仍是唯一无参考区，本预演未推进到 M2 |
-| 2 | Borrow 清单长度、生成 vs 手写取舍 | 清单 ≈30 符号（fallback.c +504 行）；预演中发现它**缺 `_PyThreadState_PopFrame`**（不在 3.11 动态符号表），需自行补实现（已完成，镜像 CPython pystate.c 语义）。补全轮评估：全部符号可在上游 3.11.6 源逐字对应，**生成管线原理上可行**，正式 M1 建议转 template+gen_cached，源锚定上游 v3.11.6（D7 判决支撑） |
-| 3 | libtest JIT-off 等价失败规模 | **未推进到**（JIT 执行 SEGV 挡在前面）。M0 已备好 26 模块差分工具 |
-| 4 | 6-MR 切分是否需调整 | **需调整**：M1 内部至少应拆为“移植（机械）/构建修复（手工）/范围外空壳化”三个可评审单元；builder.cpp 这类大合并文件应单独成 MR 并强制双版本编译 |
-| 5 | 编码代理效率数据 | 移植+45 处冲突解决约 45 分钟；构建修复约 10 轮迭代约 2 小时。瓶颈在**编译-诊断-修复循环的串行等待**（每轮 3–5 分钟编译），非编写 |
-| 6 | 计划外依赖/顺序问题 | 见 §3 修复分类账。核心：kunpeng 新子系统对 3.11 无守卫、三方合并机械伤、3.14 反向回归 |
+| 轮 | 内容 | A/B |
+|---|---|---|
+| 首轮水位 | 结构性差距定案 | 0.432 |
+| R2/R3 | [P3][P4] 真 auto + 六根因修复，19/19 首次全绿 | 0.729 |
+| IC 内联 | SplitMutator 真实现 + attr/method 内联 stub | 0.794 |
+| 见证门控 | TypeExact 守卫风暴根治（richards 首破 1.0） | 0.808 |
+| 计数矩阵 | 常驻 IC 计数基建 + method stub 死代码案 + store 侧 | 0.838 |
+| 落后组 | 天生物化 hint 化 + 共享键成长驱逐 | 0.858 |
+| IsTruthy | TBool 行内快路径 | 0.859 |
+| go 三件套 | DescrOrClassVar hint + store 内联 stub（容量越界/别名案） | 0.874 |
+| 策略层试验与关闭 | 密度冻结实现后按用户决策默认全关，诚实基线 | 0.863→0.845 |
+| go 基础 | kind 直方图归因修正：终身 kSplitInline 案 + lm 楔死 | 0.865 |
+| 帧协议轴 | send 链压层 + 入口每调用哈希消解 | 0.892 |
+| 帧仪式行内化 | 建帧/拆帧编译期常量折叠（deltablue 首超 stock） | 0.933 |
+| inline/LWF 拍板 | 三证据判决：LWF 不移植、内联暂缓（实验件入库） | 0.933 |
+| PGO/LTO | 三相配方（编译器自身提速计入短窗） | 0.964 |
+| 入口守卫消解 | 递归/tracing 下沉序言（零失败簿记账本） | 0.989 |
+| 持平冲刺 | P3 瘦身 + 诚实口径切换 | 旧轴 1.000 |
+| 崩溃销案 | 幻影 LWF 帧头 GC 遍历案 + 家族审计收官 | **1.059** |
 
-## 3. M1 修复分类账（正式开发 MR 评审清单素材）
+## 四、可移交技术资产
 
-编译错误收敛：352 → 164 → 39 → 29 → 11 → 1 → 25(OSR) → 3 → 2 → 0（约 10 轮）。
+1. **vendored 解释器与补丁台账 [P1]–[P5]**（哈希锁 20 文件）：
+   影子版本发号器、auto-JIT 帧压栈计数（已瘦身）、CALL 特化按被调
+   方判定、WITH_EXCEPT_START 借用窗口封堵。
+2. **拉式 IC 体系**（3.11 无 watcher 的完整替代）：条目级
+   tp_version_tag 三重校验、attr/method/store 三套 aarch64 内联
+   stub（kind 2/3 双收、物化 me_key 自验证 hint、split 包装容量守
+   卫）、模块/类属性站点扩展、共享键成长驱逐、kind 直方图诊断计数
+   器（PYTHONJITCOLLECTINLINECACHESTATS）。
+3. **帧与调用协议**：普通帧建帧/拆帧编译期常量折叠（FrameInitPlan
+   双表）、入口守卫序言化（预检不落账 + 建帧扣减 + 三点补账 + OSR
+   对冲，CodeRuntime 旗标三方同源）、入口分派 jit_compiled 元组缓
+   存、gen send 链压层。
+4. **构建配方**：PGO+LTO 三相脚本
+   ci_pipeline/scripts/build_pgo_lto_311.sh（A/B 实测 +3.1pp）；
+   CMake 接线本已完备仅需操作化。
+5. **门禁体系**：diffgate 923 语料（三模式差分）、refcount 矩阵
+   （六组、确定化判据）、基础 libtest 差分（微漂移基线）、配置③
+   双阈值 libtest、RuntimeTests/test_cinderx 接入、四套冒烟（含
+   entry_guard 语义冒烟、store 同值覆写引用平衡）、3.14 反向编译
+   双绿闸、异常注入 fuzz（CI_EXC_INJECT）。
+6. **测量工具**：run_ab.py（诚实口径 + AB_LEGACY_PREFIX 历史轴）、
+   attach 循环 PMP 配方、双模对照法（编译 vs 巨阈值纯解释）。
+7. **实验开关（默认全关）**：CI_JIT_INLINER + GuardIs 函数常量化
+   前门、CI_JIT_NO_ENTRY_GUARD、自适应策略层三旋钮（ROI/密度/试用）。
 
-1. **三方合并机械伤**（编译器/链接器能抓，但耗时）：公共 `}` 被吞（code_extra
-   ×2、inline_cache、pyjit ×2）、公共 `#endif` 残留（code_patcher）、头文件
-   声明与定义分道（compileFunction 默认参数 → 链接期 undefined symbol）。
-   → 沉淀：**花括号+预处理器配平自检脚本**（与基线做增量对比过滤字面量噪音）。
-2. **语义静默漂移**（编译器不一定抓）：python.h 的 atomic 头排序块被 kunpeng
-   加了 `>=030C` 条件，自动合并后验证分支专为 3.11 写的 `#undef HAVE_STD_ATOMIC`
-   变成死代码，错误爆在两层 include 之外。→ **版本条件的合并必须逐处人工确认**。
-3. **命名漂移**：codeExtraIfPresent → codeExtraIfExists。
-4. **kunpeng 新子系统无 3.11 意识**（本预演最系统性的一类）：
-   behavior_classifier（331 个 case 标签需 #ifdef 包裹）、tree_iter pass
-   （3.13+ dict 内联 values）、slot 快路径、inline_cache 的 PyDictOrValues 分支。
-   其中 inline_cache 的守卫是 `<030E`，**在 3.14 上恒假、是死代码，所以从未
-   在 3.14 CI 暴露**——只有真正的 3.11 编译尝试能扫出。
-5. **3.11 符号缺口**：`_PyThreadState_PopFrame` 补 fallback 实现；
-   `PyUnstable_Long_*`、`_Py_atomic_*_ptr/int` 系加 python.h 垫片。
-6. **范围外子系统空壳化**（设计既定决策）：OSR 五函数（3.11 无 OSR）、
-   AsyncLazyValue、anext builtins 补丁（与方法表守卫对齐）。
+## 五、方法论红线清单（正式开发必读）
 
-## 4. 四项补全的真实状态（2026-07-03 深夜补全轮全部销账）
+1. 跨版本引用会计必须成对审计"谁持强引用"（M8 双缺陷互掩案）。
+2. builder 内联守卫的 FrameState 必须等于指令边界前状态（sqlglot 案）。
+3. 守卫用例必须逐轴变异，不只同类型改版本轴（raytrace 错派发案）。
+4. 行内化 C++ 参照代码时，读-改-写跨越其它对象访问者，别名场景必须重读（store stub 案）。
+5. **镜像 C 结构体字段的行内 asm 必须 static_assert 字段宽度**（use_tracing uint8 案：padding 垃圾按分配布局随机显形）。
+6. **编译旗标门内读版本特定内存布局的代码必须再加运行时模式门**；审计以"读布局的辅助函数"为索引全量走查（幻影 LWF 帧头家族）。
+7. 被解释器每帧调用的钩子不可对 init 期可变配置做 static 缓存（P3 案：auto-JIT 整体静默失效）。
+8. 新调用形 LIR 指令五点接线清单，postalloc 操作码保留条件为高危遗漏位（method stub 死代码案）。
+9. LIR 无条件跳转终结的块之后放置纯分支目标块用 switchBlock 而非 appendBlock。
+10. macOS 绑定挂载陈旧构建陷阱：每次构建前后 md5 确证；docker cp 保留宿主 mtime 使 make 不重编。
+11. 换库前必杀跑动中的 A/B；A/B 单跑可疑项必复测；受控进程内稳态为单项判据、A/B 为套件级回归检查。
+12. 自适应策略评审基线必须同日同构建（跨构建布局漂移 ±6%）。
+13. 跨会话禁止共享工作树（checkout 直通容器构建输入）。
+14. gdb 批处理脚本 continue 前必须 run；-O2 下函数断点可能永不解析，归因用 C++ 计数器直方图。
+15. 布局敏感崩溃取证："最小侵入即压制"提示布局依赖，核心转储+崩溃帧参数直读优先；行号漂移先对准当前源码再下结论。
 
-- **① wheel 打包：完成。** 两个真实坑，均已修：
-  1. opcodes 命名：正解是 `git mv 3_11 → 3.11` 对齐上游带点约定（纯路径
-     访问、无包导入），setup.py 还原原样、零特例；
-  2. `CINDERX_LOCAL_DEPS_DIR` 期望 `<dir>/<name>` git clone 布局（校验
-     origin+tag），与 FetchContent 缓存布局（`fmt-src` 等）互斥——正式 CI
-     的 deps 缓存必须按前者自建。
-  结果：cp311 wheel（39MB）构建成功，新鲜 venv 安装+导入+init+
-  force_compile 全过。**M1 出口①闭环**。
-- **② 3.14 不破坏：已修复归零。** 118 错收敛为 builder.cpp 两处合并伤
-  （emitLoadAttr 悬挂 `if {`、METHOD_WITH_VALUES case 缺 `}`——后者藏在
-  `#if >=030E` 内 3.11 编译不可见）。修复后 3.14 全量编译（53/53）+
-  import/force_compile/执行冒烟全绿，3.11 同源重编亦绿。**双版本编译门禁
-  的必要性与可行性同时被实证**（M1 出口③预演口径达成）。
-- **③ JIT 执行 SEGV**：**定位完成，状态无变化（补全轮复测复现如旧）**。
-  崩在 `JITRT_UnlinkFrame` → `_PyFrame_ClearExceptCode`（fallback.c:282，
-  `Py_CLEAR(frame->frame_obj)`），即 JIT frame 的 unlink/布局路径，高度
-  怀疑与 co_framesize 替代公式相关。frame 模型深水区，归 **M2/M3/M4**。
-- **④ borrow 生成 / 哈希门禁 / SRPM diff：完成。**
-  - `verify_core_hashes.py`：7 文件锁定，注入验证通过（改一字节→exit 1→
-    还原复绿），M1 出口④原型达成；构建期挂接留正式 M1；
-  - `verify_openeuler_core_diff.py`：SRPM %prep 后 vs 上游 v3.11.6，
-    19 核心文件逐字节一致 → **vendor-from-upstream 判决**（M1 出口⑤）；
-    跨发行版 %prep 需垫 `%package_help` 宏（openEuler-rpm-config 专属）；
-  - borrow 生成：≈30 符号全部可上游逐字对应，生成管线原理可行，
-    正式 M1 转 template+gen_cached。
+## 六、风险与未决（正式开发输入）
 
-## 5. 对正式开发的具体建议
+**未决问题（均有档案/复现/专项）：**
+- test_scope 实例泄漏：根因已明（M9R3 CF 强引用有根链），修复分支
+  dryrun/m9-nested-func-leak 验证过待并；
+- 编译态递归配额减半异常（千次异常后可达深度减半）：确定性复现
+  脚本在案，专项已立；
+- pickle 分发脊柱两道拒编门（try-loop-handler 阀 + 无正常返回阀）：
+  专项已立，解法方向随案移交；
+- 挂起帧 f_locals 空（任意点 localsplus 重建）：正式 M6 主体；
+- descr 自身类型二重版本、refleak gen 专项、ASAN 全量未跑。
 
-1. **M1 必须以“3.11 + 3.14 双版本全量编译通过”为出口条件**，不能只验 3.11——
-   本预演证明单版本绿会放过大量反向回归（尤其 `<030E` 死代码守卫类）。
-2. **builder.cpp（+1496 行，最大冲突文件）应单独成 MR**，逐块标注每个
-   `#if` 在 3.11/3.12/3.14 三个版本下的花括号与分支平衡。
-3. **验证分支的性能层（d4380b72）确认放弃移植**：其自建 IC 体系
-   （LoadAttrCachedFastPath 等）与 kunpeng 现行架构互斥，M5/M7/M9 须基于
-   kunpeng 架构重写，验证分支仅作行为参考。
-4. **验证分支 watcher 全为空桩** → M7 的版本号守卫是真实从零工作量，
-   inline_cache.cpp 的 687 行仅缓存结构可参考、失效机制不存在。
-5. **配平自检脚本沉淀为 MR 前置检查**（花括号 + 预处理器 vs 基线增量）。
-6. wheel 打包的 opcodes 命名一致性、borrow 生成管线、源码哈希门禁、SRPM diff
-   四项均已在预演中打通或产出原型（见 §4），正式 M1 的剩余工程化工作：
-   哈希门禁挂接构建期、borrow 转 template+gen_cached、deps 缓存按
-   CINDERX_LOCAL_DEPS_DIR 布局自建、配平自检脚本沉淀（仍未做）。
+**结构性判断（已有决定性数据）：**
+- **编译价值按形态分化**：go 纯解释 72ms 反胜编译 96ms、pickle 同向；
+  richards 编译 2.3x 碾压。余量组（go 0.67/pickle 0.71/generators
+  0.83）的补齐路径 = 选择性编译（策略层三旋钮现成，默认关待决策）
+  或编译产物赢过 PEP 659 行内特化（typed 级，超预演范围）；
+- **LWF 不移植**（3.11 帧税已由常量折叠路线收割，相对成绩已超
+  3.14 LWF）；**现版内联器净负**（跨版本互证），内联轴先决顺序 =
+  产物质量 → 多帧 deopt 重建 → 内联体帧语义 → speculative。
 
-## 6. 工时（预备夜实测，供 M1 估算校准）
+**环境差异风险（manylinux 预演 → openEuler 正式）：**
+- borrow 44 符号为静态 libpython 悲观上界，openEuler --enable-shared
+  预计近零，须目标容器复测；
+- TLS tstate 偏移探测在剥符号静态 Python 上被禁用（预演用烘焙
+  gilstate 地址），openEuler 形态待验；
+- test_builtin 微漂移随 3.11.6 锚点对齐自然消失；
+- PGO 训练集须换正式基准全集并入构建管线；
+- 本报告全部性能数字为单机（Apple Silicon Docker aarch64）p3v5
+  预演严谨度，正式结论需目标机完整协议复测。
 
-| 阶段 | 实测 |
-|---|---|
-| 验证分支移植 + 45 处冲突解决 | ~45 分钟 |
-| 构建修复（约 10 轮编译-诊断循环） | ~2 小时 |
-| 补全调查（wheel/3.14/SEGV 定位） | ~40 分钟 |
-| 补全轮（wheel 两坑修复+3.14 归零+两脚本+SRPM 管线） | ~1.5 小时 |
-| **M1 预演合计** | **~5 小时** |
+## 七、建议的正式开发顺序
 
-外推：正式 M1 加上双版本门禁、borrow 生成、哈希/SRPM、builder.cpp 逐块核对，
-按设计书 0.5 人月估算基本合理，但 builder.cpp 双版本合并是被低估的单点，
-建议单独留 buffer。
+1. 按里程碑设计书 M0–M9 展开，预演资产按白名单取用（门禁先行）；
+2. 崩溃/泄漏类档案（第六节）在对应里程碑内优先销账；
+3. 性能层按本战役定型顺序移植：拉式 IC → 帧仪式行内化 → 入口守卫
+   序言化 → PGO/LTO 配方 → 按目标机重新归因再取余量；
+4. 选择性编译决策在性能基线稳定后以双模对照数据重启。
