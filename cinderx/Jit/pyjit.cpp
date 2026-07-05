@@ -1392,6 +1392,12 @@ FlagProcessor initFlagProcessor() {
   // configurations do not build inline frames that cannot be safely unlinked.
   bool force_disable_inliner_for_normal_frame =
       getConfig().frame_mode != FrameMode::kLightweight;
+  // 拍板件实验开关：CI_JIT_INLINER=1 在 normal 帧模式强开 HIR 内联器
+  // （用于 3.11 内联帧缺口的失败形态盘点与量化，非生产口径）。
+  if (const char* v = getenv("CI_JIT_INLINER");
+      v != nullptr && *v != '\0' && *v != '0') {
+    force_disable_inliner_for_normal_frame = false;
+  }
   if (force_disable_inliner_for_normal_frame) {
     getMutableConfig().hir_opts.inliner = false;
   }

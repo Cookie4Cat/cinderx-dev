@@ -4845,6 +4845,17 @@ bool HIRBuilder::tryEmitLoadGlobalModuleValue311(
       fmt::format("LOAD_GLOBAL_MODULE: {}", PyUnicode_AsUTF8(name)));
 
   tc.emit<RefineType>(result, TObject, result);
+
+  // 内联器前门（实验，仅 hir_opts.inliner 开启时发射）：编译期窥得的
+  // 全局值是函数对象时，追加同一性守卫把结果精化为带值规格的常量——
+  // 3.11 的守卫式装载只保证"当前值"，而内联器要求
+  // hasValueSpec(TFunc)（镜像 3.14 分支 GuardIs 形态）。全局重绑定
+  // 即守卫失败 deopt。整数等其它常量形态不做（避免语义面扩大）。
+  if (getConfig().hir_opts.inliner && PyFunction_Check(value)) {
+    auto is_guard = tc.emit<GuardIs>(result, value, result);
+    is_guard->setDescr(
+        fmt::format("LOAD_GLOBAL_MODULE func: {}", PyUnicode_AsUTF8(name)));
+  }
   return true;
 }
 #endif
