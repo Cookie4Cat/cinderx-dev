@@ -245,6 +245,28 @@ static inline void Ci_code_extra_disable_auto_jit(CodeExtra* extra) {
   extra->flags |= CI_CODE_EXTRA_AUTO_JIT_DISABLED;
 }
 
+#if PY_VERSION_HEX < 0x030C0000
+/* 3.11 的 co_extra 数组布局私藏于 codeobject.c（头文件刻意不导出，
+ * _PyCode_GetExtra 是出线调用）。按 vendored 3.11.6 逐字镜像做只读
+ * 直读——与内联 stub 镜像 dict 预头布局同一论证：版本锚定、只读、
+ * 写入仍走 PyUnstable_Code_SetExtra 正门。热路径消费者：入口分派的
+ * 编译入口缓存（context.cpp）、[P3] 帧压栈计数的已决快速返回。 */
+typedef struct {
+  Py_ssize_t ce_size;
+  void* ce_extras[1];
+} CiCodeObjectExtra311;
+
+static inline CodeExtra* Ci_code_extra_fast_read_311(
+    PyCodeObject* code,
+    Py_ssize_t index) {
+  CiCodeObjectExtra311* co_extra = (CiCodeObjectExtra311*)code->co_extra;
+  if (index < 0 || co_extra == NULL || index >= co_extra->ce_size) {
+    return NULL;
+  }
+  return (CodeExtra*)co_extra->ce_extras[index];
+}
+#endif
+
 #endif
 
 #ifdef __cplusplus

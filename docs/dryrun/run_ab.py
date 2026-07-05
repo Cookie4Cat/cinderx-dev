@@ -5,11 +5,12 @@ Reference protocol from the 3.14 runs: auto-JIT threshold 2, pyperf
 warmups 3. Dry-run rigor: --processes 3 --values 5 (formal runs use
 pyperformance defaults, ~20 processes).
 
-B-side scoping (dry-run caveat): CI_JIT_AUTO_ONLY_PREFIX confines
-compilation to the workload files listed per benchmark, because organic
-deopt-resume on the full stdlib surface has an open crash case (see
-M9-log). Benchmarks whose hot code lives outside the prefix therefore
-understate JIT effect.
+B-side scoping removed (parity round): the organic deopt-resume crash
+that motivated CI_JIT_AUTO_ONLY_PREFIX was fixed in M9R3 (six root
+causes); full-surface libtest at auto=24 has only two tracked known
+divergences. The B side now compiles the full surface (honest config);
+set AB_LEGACY_PREFIX=1 to restore the old scoped behaviour for
+comparisons against pre-parity archives.
 
 Usage (inside container):
   python3.11 run_ab.py --out /tmp/m9ab [--benches a,b,c]
@@ -92,16 +93,19 @@ def run_side(bench, side, out_json, timeout):
     cmd = [sys.executable, script, *extra_argv, "-o", out_json, *PERF_ARGS]
     env = dict(os.environ)
     if side == "b":
-        # 工作负载模块（richards 等）安装于 site-packages，编译前缀取
-        # site-packages 全域 + 各基准的 stdlib 例外；stdlib 与冻结模块
-        # 仍被排除（有机 deopt-resume 已立案，见 M9-log）。
-        prefixes = ":".join([SITE, *extra_prefixes])
+        # 持平轮起 B 侧默认全表面编译（诚实口径）：范围阀的历史动因
+        #（有机 deopt-resume 未决崩溃）已于 M9R3 六根因修复；全表面
+        # libtest 仅剩两项已知跟踪项。AB_LEGACY_PREFIX=1 恢复旧口径
+        # 以对照历史存档。
         env["PYTHONPATH"] = f"{SC_DIR}:{CINDERX_PP}"
         env["PYTHONJITAUTO"] = os.environ.get("M9_THRESHOLD", "2")
-        env["CI_JIT_AUTO_ONLY_PREFIX"] = prefixes
+        if os.environ.get("AB_LEGACY_PREFIX"):
+            env["CI_JIT_AUTO_ONLY_PREFIX"] = ":".join([SITE, *extra_prefixes])
         # M9_MCS 可选设置多段代码布局对照（M9R3 期间曾用于二分 SIGILL，
         # 根因定案后默认不再干预布局配置）。
-        inherit = "PYTHONPATH,PYTHONJITAUTO,CI_JIT_AUTO_ONLY_PREFIX"
+        inherit = "PYTHONPATH,PYTHONJITAUTO"
+        if "CI_JIT_AUTO_ONLY_PREFIX" in env:
+            inherit += ",CI_JIT_AUTO_ONLY_PREFIX"
         if os.environ.get("M9_MCS"):
             env["PYTHONJITMULTIPLECODESECTIONS"] = os.environ["M9_MCS"]
             inherit += ",PYTHONJITMULTIPLECODESECTIONS"

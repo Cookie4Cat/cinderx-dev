@@ -5235,25 +5235,55 @@ extern "C" void* Ci_StockEntry311 = nullptr;
 extern "C" void Ci_AutoJitCountFramePush311(
     PyThreadState* /* tstate */,
     _PyInterpreterFrame* frame) {
-  auto limit = jit::getConfig().compile_after_n_calls;
+  // [P3] 每帧压栈热路径（纯解释口径实测原版 +28%）：瘦身三件——
+  // ① 配置静态缓存（阈值/extra 槽位在 init 后不变）；② co_extra
+  // 行内直读替代 PyUnstable_Code_GetExtra 出线调用；③ "已决"快速
+  // 返回（已禁用/已编译/计数已过阈的 code 不再进入慢段——永不热的
+  // 代码此前每次压栈都付前缀比对与全套检查）。慢段（首见分配 extra、
+  // 前缀过滤、达阈编译）逻辑原样。
+  // 注意:不可 static 缓存——本钩子在 cinderx.init() 期间(旗标处理
+  // 完成前)即随首批解释帧执行,static 会把未初始化的 nullopt 焊死,
+  // auto-JIT 整体失效(本轮实测:richards 全员解释)。getConfig() 是
+  // 全局结构直读,非成本中心。
+  const std::optional<size_t> limit = jit::getConfig().compile_after_n_calls;
   if (!limit.has_value()) {
     return;
   }
   PyFunctionObject* func = frame->f_func;
-  if (func == nullptr || !jit::isJitUsable()) {
+  if (func == nullptr) {
     return;
   }
   BorrowedRef<PyCodeObject> code{frame->f_code};
+  cinderx::ModuleState* mod_state = cinderx::getModuleState();
+  CodeExtra* extra = mod_state != nullptr
+      ? Ci_code_extra_fast_read_311(code, mod_state->code_extra_index)
+      : nullptr;
+  if (extra != nullptr) {
+    if (Ci_code_extra_auto_jit_disabled(extra)) {
+      return;
+    }
+    uint64_t calls = Ci_code_extra_get_calls(extra);
+    if (calls >= *limit) {
+      // 已达阈：编译早已尝试过（成功则调用不再经解释入口，失败则
+      // disabled 位已置）；计数不再推进。
+      return;
+    }
+  }
+  if (!jit::isJitUsable()) {
+    return;
+  }
   if (!jit::ci_autoJit311AllowsCode(code)) {
     return;
   }
-  CodeExtra* extra = codeExtra(code);
   if (extra == nullptr) {
-    PyErr_Clear();
-    return;
-  }
-  if (Ci_code_extra_auto_jit_disabled(extra)) {
-    return;
+    extra = codeExtra(code);
+    if (extra == nullptr) {
+      PyErr_Clear();
+      return;
+    }
+    if (Ci_code_extra_auto_jit_disabled(extra)) {
+      return;
+    }
   }
   Ci_code_extra_incr_calls(extra);
   if (Ci_code_extra_get_calls(extra) != *limit) {

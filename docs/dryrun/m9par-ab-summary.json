@@ -1,0 +1,129 @@
+{
+ "go": {
+  "a": "OK",
+  "a_mean": 0.06410639759463568,
+  "b": "OK",
+  "b_mean": 0.09943547840230167,
+  "ratio": 0.6447034662544731
+ },
+ "hexiom": {
+  "a": "OK",
+  "a_mean": 0.002948500117054209,
+  "b": "OK",
+  "b_mean": 0.0033240467397263273,
+  "ratio": 0.8870212568963343
+ },
+ "richards": {
+  "a": "OK",
+  "a_mean": 0.023184632284877202,
+  "b": "OK",
+  "b_mean": 0.010050787751485284,
+  "ratio": 2.306747775213045
+ },
+ "richards_super": {
+  "a": "OK",
+  "a_mean": 0.028525625347780685,
+  "b": "OK",
+  "b_mean": 0.012769976700656115,
+  "ratio": 2.233804024584873
+ },
+ "deltablue": {
+  "a": "OK",
+  "a_mean": 0.0017300128825202894,
+  "b": "OK",
+  "b_mean": 0.0013568926136940719,
+  "ratio": 1.2749814281989615
+ },
+ "raytrace": {
+  "a": "OK",
+  "a_mean": 0.13883572053164245,
+  "b": "OK",
+  "b_mean": 0.1396395732027789,
+  "ratio": 0.9942433749065595
+ },
+ "generators": {
+  "a": "OK",
+  "a_mean": 0.02238305757055059,
+  "b": "OK",
+  "b_mean": 0.02655766555884232,
+  "ratio": 0.8428096784695821
+ },
+ "unpickle_pure_python": {
+  "a": "OK",
+  "a_mean": 0.00010759614412866844,
+  "b": "OK",
+  "b_mean": 0.00013395638549506354,
+  "ratio": 0.8032177318835875
+ },
+ "pickle_pure_python": {
+  "a": "OK",
+  "a_mean": 0.00013683902308306035,
+  "b": "OK",
+  "b_mean": 0.00018995311169419437,
+  "ratio": 0.7203831612053693
+ },
+ "chaos": {
+  "a": "OK",
+  "a_mean": 0.032969241177973646,
+  "b": "OK",
+  "b_mean": 0.03254110606697699,
+  "ratio": 1.013156747349505
+ },
+ "nbody": {
+  "a": "OK",
+  "a_mean": 0.04771507877546052,
+  "b": "OK",
+  "b_mean": 0.038602108523870506,
+  "ratio": 1.2360744166592559
+ },
+ "regex_compile": {
+  "a": "OK",
+  "a_mean": 0.05336333221445481,
+  "b": "FAIL rc=1     raise RuntimeError(\"%s failed with exit code %s\" | RuntimeError: /opt/_internal/cpython-3.11.15/bin/python3.11 failed with exit code -11"
+ },
+ "spectral_norm": {
+  "a": "OK",
+  "a_mean": 0.05162601255190869,
+  "b": "OK",
+  "b_mean": 0.05726287378929555,
+  "ratio": 0.9015616774993122
+ },
+ "sqlglot_v2_parse": {
+  "a": "OK",
+  "a_mean": 0.0005375853094543951,
+  "b": "OK",
+  "b_mean": 0.0004311231122604416,
+  "ratio": 1.2469415212646722
+ },
+ "sqlglot_v2_transpile": {
+  "a": "OK",
+  "a_mean": 0.0008102010489286234,
+  "b": "OK",
+  "b_mean": 0.0007564163744973485,
+  "ratio": 1.071104587690894
+ },
+ "fannkuch": {
+  "a": "OK",
+  "a_mean": 0.207308421159784,
+  "b": "OK",
+  "b_mean": 0.15532571775838733,
+  "ratio": 1.3346690049245866
+ },
+ "scimark": {
+  "a": "OK",
+  "a_mean": 0.06182413324442071,
+  "b": "FAIL rc=1     raise RuntimeError(\"%s failed with exit code %s\" | RuntimeError: /opt/_internal/cpython-3.11.15/bin/python3.11 failed with exit code -11"
+ },
+ "nqueens": {
+  "a": "OK",
+  "a_mean": 0.042515364739422995,
+  "b": "FAIL rc=1     raise RuntimeError(\"%s failed with exit code %s\" | RuntimeError: /opt/_internal/cpython-3.11.15/bin/python3.11 failed with exit code -11"
+ },
+ "float": {
+  "a": "OK",
+  "a_mean": 0.03502147422793011,
+  "b": "OK",
+  "b_mean": 0.03606240079582979,
+  "ratio": 0.9711354057154161
+ }
+}

@@ -581,24 +581,15 @@ static PyObject* __attribute__((noinline)) probationTimedCall(
 // 不符（无 extra/缓存空/globals 或 builtins 不同）回落 compiled_codes_
 // 哈希查找。守卫包装此前每次调用都付哈希（CI_JIT_NO_ENTRY_GUARD
 // 注释点名的三项每调用开销之一，PMP 各调用密集项 ~2%）。
-// 3.11 的 co_extra 数组布局私藏于 codeobject.c（头文件刻意不导出，
-// _PyCode_GetExtra 是 PLT 出线调用）。此处按 vendored 3.11.6 逐字镜像
-// 只读直读——与内联 stub 镜像 dict 预头布局同一论证：版本锚定、只读、
-// 写入仍走 PyUnstable_Code_SetExtra 正门。
-struct CiCodeObjectExtra311 {
-  Py_ssize_t ce_size;
-  void* ce_extras[1];
-};
-
 static CompiledFunction* lookupCompiledForCall(
     BorrowedRef<PyFunctionObject> func) {
   auto code = reinterpret_cast<PyCodeObject*>(func->func_code);
   cinderx::ModuleState* mod_state = cinderx::getModuleState();
   if (mod_state != nullptr) {
-    Py_ssize_t index = mod_state->code_extra_index;
-    auto* co_extra = reinterpret_cast<CiCodeObjectExtra311*>(code->co_extra);
-    if (index >= 0 && co_extra != nullptr && index < co_extra->ce_size) {
-      auto* extra = reinterpret_cast<CodeExtra*>(co_extra->ce_extras[index]);
+    // co_extra 行内直读（共享镜像结构，见 code_extra.h 论证）。
+    CodeExtra* extra =
+        Ci_code_extra_fast_read_311(code, mod_state->code_extra_index);
+    {
       if (extra != nullptr) {
         auto* compiled = reinterpret_cast<CompiledFunction*>(
             _Py_atomic_load_ptr_acquire(&extra->jit_compiled));
