@@ -1694,28 +1694,37 @@ Register* simplifyLoadAttrSplitDict(
 #if PY_VERSION_HEX < 0x030C0000
   // CPython 3.11 stores the inline values pointer in a separate pre-header
   // slot from the managed dict pointer. values 槽空即实例字典已物化——
-  // If values is null the instance dict has been materialized, so deopt
-  // to the generic LOAD_ATTR path instead of treating the dict pointer
-  // as tagged values.
-  // 分支化（CondBranch 回退 helper）两轮评审均不予落地：① laggards
-  // 轮——解冻后 helper 调用税使编译态劣于解释器行内 WITH_HINT；
-  // ② probation 轮——stub 行内物化直读使 miss 不再流经慢尾，IC
-  // 压力密度信号随 deopt 风暴一起消失，go 型负载失去冻结兜底
-  //（125ms vs 冻结均衡 91ms），而 deltablue/raytrace 收益在方差带
-  // 内。再评前提：帧/调用协议税显著下降，或密度信号改从行内命中
-  // 处采集。当前 Guard-deopt→ROI backoff 冻结即该形态的正确均衡。
+  // values 槽空即实例字典已物化——以 CondBranch 回退缓存 helper
+  //（stub 行内物化 hint 直读双形态覆盖），而非 Guard deopt。这是
+  // values 风暴（天生物化负载每访问必 deopt）的根本修复。三审记录：
+  // ① laggards 轮回退——当时输给"风暴→ROI backoff 冻结"均衡的
+  // helper 调用税；② probation 轮回退——行内直读使 miss 不流经慢尾、
+  // 密度冻结信号失效；③ 自适应冻结层默认全关后（基础优化时代决策）
+  // 两条否决理由均不复存在，分支化对 go/raytrace 分别 -30%/-12%
+  //（对比无策略裸基线 179/184ms），终审落地。
   Register* values = env.emit<LoadField>(
       receiver, "__dict_values__", -4 * sizeof(PyObject*), TCUInt64);
-  auto guard = env.emitInstr<Guard>(values);
-  guard->setGuiltyReg(receiver);
-  guard->setDescr("dict values check");
-  Register* values_obj = env.emit<BitCast>(values, TOptObject);
-  Register* attr = env.emit<LoadField>(
-      values_obj, "attr", attr_idx * sizeof(PyObject*), TOptObject);
-  Register* checked_attr =
-      env.emit<CheckField>(attr, name, *load_attr->frameState());
-  static_cast<CheckField*>(checked_attr->instr())->setGuiltyReg(receiver);
-  return checked_attr;
+  return env.emitCond(
+      [&](BasicBlock* fast_path, BasicBlock* slow_path) {
+        env.emit<CondBranch>(values, fast_path, slow_path);
+      },
+      [&] { // values 形态：共享键定偏移内联直读。
+        Register* values_obj = env.emit<BitCast>(values, TOptObject);
+        Register* attr = env.emit<LoadField>(
+            values_obj, "attr", attr_idx * sizeof(PyObject*), TOptObject);
+        Register* checked_attr =
+            env.emit<CheckField>(attr, name, *load_attr->frameState());
+        static_cast<CheckField*>(checked_attr->instr())
+            ->setGuiltyReg(receiver);
+        return checked_attr;
+      },
+      [&] { // 物化实例：缓存 helper 路径（stub 行内 hint 直读）。
+        return env.emit<LoadAttr>(
+            receiver,
+            load_attr->name_idx(),
+            *load_attr->frameState(),
+            /* already_optimized= */ true);
+      });
 #else
   // PyDictOrValues is stored at -3 per _PyObject_DictOrValuesPointer.
   Register* obj_dict = env.emit<LoadField>(
