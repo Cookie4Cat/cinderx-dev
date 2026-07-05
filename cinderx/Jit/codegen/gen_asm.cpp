@@ -166,6 +166,14 @@ DeoptResult prepareForDeopt(
   JIT_CHECK(deopt_idx != -1ull, "deopt_idx must be valid");
   const DeoptMetadata& deopt_meta = code_runtime->getDeoptMetadata(deopt_idx);
   PyThreadState* tstate = _PyThreadState_UncheckedGet();
+#if PY_VERSION_HEX < 0x030C0000
+  // 入口守卫行内化的 deopt 补账：deopt 出口绕过 EpilogueEnd 的递归
+  // 归还，此处按编译单元旗标补一。后续 resumeInInterpreter 的解释
+  // 执行自带 Enter/Leave，两本账互不侵扰。
+  if (code_runtime->entryGuardInlined()) {
+    tstate->recursion_remaining++;
+  }
+#endif
   bool is_instrumentation_deopt = false;
   _PyInterpreterFrame* frame = interpFrameFromThreadState(tstate);
 
@@ -961,6 +969,34 @@ int32_t osrLocalsplusOffset(int localsplus_index) {
 
 void NativeGenerator::emitOSRFrameSetup(const jit::OSRMetadata& metadata) {
   generateFunctionEntry();
+#if PY_VERSION_HEX < 0x030C0000
+  if (env_.code_rt->entryGuardInlined()) {
+    // OSR 进入未经建帧处的递归扣减，而退出会走 EpilogueEnd 补账
+    //（或 deopt 补账）——此处扣减配平。解释器侧本次调用的 Enter 由
+    // 其自身 Leave 归还，两本账互不侵扰。
+    as_->mov(
+        a64::x9,
+        reinterpret_cast<uint64_t>(
+            &ThreadedCompileContext::interpreter()
+                 ->runtime->gilstate.tstate_current));
+    as_->ldr(a64::x9, a64::ptr(a64::x9));
+    as_->ldr(
+        a64::w10,
+        arch::ptr_offset(
+            a64::x9,
+            static_cast<int32_t>(
+                offsetof(PyThreadState, recursion_remaining)),
+            arch::AccessSize::k32));
+    as_->sub(a64::w10, a64::w10, 1);
+    as_->str(
+        a64::w10,
+        arch::ptr_offset(
+            a64::x9,
+            static_cast<int32_t>(
+                offsetof(PyThreadState, recursion_remaining)),
+            arch::AccessSize::k32));
+  }
+#endif
   arch::sub_immediate(
       as_,
       a64::sp,
@@ -2208,6 +2244,25 @@ void NativeGenerator::generateCode(
     generateStaticEntryPoint(env_.finish_frame_setup, static_jmp_location);
   }
 
+#if defined(CINDER_AARCH64) && PY_VERSION_HEX < 0x030C0000
+  // 入口守卫行内化的分流出口（守卫包装消解）。放在重入桩之前——
+  // 重入桩到 vectorcall 入口的字节距离是 JITRT_CALL_REENTRY_OFFSET
+  // 硬不变量，不可插入其间。tracing 激活或递归将溢时整调用尾转
+  // stock 解释器入口（x0-x3 处于原始 vectorcall 形态、未压栈）：
+  // 解释器自带递归计数与 CheckRecursiveCall 语义（余量/抛错），
+  // 编译侧预检不落账，失败路径零簿记。
+  Label entry_guard_divert = as_->newLabel();
+  const bool entry_guard = env_.code_rt->entryGuardInlined();
+  if (entry_guard) {
+    auto divert_cursor = as_->cursor();
+    as_->bind(entry_guard_divert);
+    as_->mov(
+        a64::x16, reinterpret_cast<uint64_t>(&_PyFunction_Vectorcall));
+    as_->br(a64::x16);
+    env_.addAnnotation("Entry guard divert", divert_cursor);
+  }
+#endif
+
   // Reentry point: dispatched to from JITRT_CallWithIncorrectArgcount and
   // JITRT_CallWithKeywordArgs after argument binding. Must be exactly
   // JITRT_CALL_REENTRY_OFFSET bytes before the vectorcall entry.
@@ -2234,6 +2289,51 @@ void NativeGenerator::generateCode(
   // list, so the vectorcall entry falls through to them.
   Label vectorcall_entry_label = as_->newLabel();
   as_->bind(vectorcall_entry_label);
+
+#if defined(CINDER_AARCH64) && PY_VERSION_HEX < 0x030C0000
+  if (entry_guard) {
+    // 守卫包装两检查的行内形态：① tracing 激活 → 分流；② 递归余量
+    // 预检（只读不写，写账在建帧处）→ 将溢即分流。绑参重入路径按
+    // 设计跳过本段（外层调用已检）。
+    auto guard_cursor = as_->cursor();
+    // tstate = _PyRuntime.gilstate.tstate_current（地址发射期烘焙；与
+    // PyThreadState_GET 同源，GIL 下即当前线程态。本目标 TLS 偏移探测
+    // 被安全禁用，不可用 TPIDR 路径）。
+    as_->mov(
+        a64::x9,
+        reinterpret_cast<uint64_t>(
+            &ThreadedCompileContext::interpreter()
+                 ->runtime->gilstate.tstate_current));
+    as_->ldr(a64::x9, a64::ptr(a64::x9));
+    as_->ldr(
+        a64::x10,
+        arch::ptr_offset(
+            a64::x9, static_cast<int32_t>(offsetof(PyThreadState, cframe))));
+    // 3.11 的 use_tracing 是 uint8_t——必须按字节读，32 位读会带进
+    // 相邻 padding 垃圾使分流恒真（deltablue 全员被打回解释器，
+    // richards 的 padding 恰零而无恙——本轮排障实录）。
+    static_assert(
+        sizeof(reinterpret_cast<_PyCFrame*>(0)->use_tracing) == 1,
+        "use_tracing width changed");
+    as_->ldrb(
+        a64::w10,
+        arch::ptr_offset(
+            a64::x10,
+            static_cast<int32_t>(offsetof(_PyCFrame, use_tracing)),
+            arch::AccessSize::k8));
+    as_->cbnz(a64::w10, entry_guard_divert);
+    as_->ldr(
+        a64::w10,
+        arch::ptr_offset(
+            a64::x9,
+            static_cast<int32_t>(
+                offsetof(PyThreadState, recursion_remaining)),
+            arch::AccessSize::k32));
+    as_->cmp(a64::w10, 0);
+    as_->b_le(entry_guard_divert);
+    env_.addAnnotation("Entry guard (tracing + recursion precheck)", guard_cursor);
+  }
+#endif
 
   // Append suffix blocks to the block list. These come after the body's exit
   // block but before code emission.
