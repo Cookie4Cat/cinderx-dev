@@ -1896,7 +1896,17 @@ JITRT_GenSendRes JITRT_GenSend(
   }
 #endif
 
-  auto gen_status = PyIter_Send(gen, v, &retval);
+  // 行内镜像 stock PyIter_Send 的首分支：受代理方有 am_send 槽（JIT
+  // 生成器恒真；槽内容尊重暂停期的 with_deopt 换装）即经槽直调，免去
+  // 每次 yield-from/await 迭代的 PLT 穿越与再分发（generators PMP
+  // ~4%）。无槽类型回落原路径。
+  PySendResult gen_status;
+  PyAsyncMethods* am = Py_TYPE(gen)->tp_as_async;
+  if (am != nullptr && am->am_send != nullptr) {
+    gen_status = am->am_send(gen, v, &retval);
+  } else {
+    gen_status = PyIter_Send(gen, v, &retval);
+  }
 
   if (gen_status == PYGEN_RETURN) {
     return {retval, 1};

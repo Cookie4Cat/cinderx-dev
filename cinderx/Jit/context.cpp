@@ -574,6 +574,44 @@ static PyObject* __attribute__((noinline)) probationTimedCall(
   return result;
 }
 
+// 编译入口每调用查找的快路径。CodeExtra.jit_compiled 是 finalize/
+// uncompile 双侧维护的 (code, globals, builtins) 精确元组缓存（见
+// cacheCompiledOnCode/uncacheCompiledOnCode 与函数创建重挂接读者），
+// 此处 co_extra 行内直读 + 两次指针比较即可命中绝大多数调用；任何
+// 不符（无 extra/缓存空/globals 或 builtins 不同）回落 compiled_codes_
+// 哈希查找。守卫包装此前每次调用都付哈希（CI_JIT_NO_ENTRY_GUARD
+// 注释点名的三项每调用开销之一，PMP 各调用密集项 ~2%）。
+// 3.11 的 co_extra 数组布局私藏于 codeobject.c（头文件刻意不导出，
+// _PyCode_GetExtra 是 PLT 出线调用）。此处按 vendored 3.11.6 逐字镜像
+// 只读直读——与内联 stub 镜像 dict 预头布局同一论证：版本锚定、只读、
+// 写入仍走 PyUnstable_Code_SetExtra 正门。
+struct CiCodeObjectExtra311 {
+  Py_ssize_t ce_size;
+  void* ce_extras[1];
+};
+
+static CompiledFunction* lookupCompiledForCall(
+    BorrowedRef<PyFunctionObject> func) {
+  auto code = reinterpret_cast<PyCodeObject*>(func->func_code);
+  cinderx::ModuleState* mod_state = cinderx::getModuleState();
+  if (mod_state != nullptr) {
+    Py_ssize_t index = mod_state->code_extra_index;
+    auto* co_extra = reinterpret_cast<CiCodeObjectExtra311*>(code->co_extra);
+    if (index >= 0 && co_extra != nullptr && index < co_extra->ce_size) {
+      auto* extra = reinterpret_cast<CodeExtra*>(co_extra->ce_extras[index]);
+      if (extra != nullptr) {
+        auto* compiled = reinterpret_cast<CompiledFunction*>(
+            _Py_atomic_load_ptr_acquire(&extra->jit_compiled));
+        if (compiled != nullptr && extra->jit_globals == func->func_globals &&
+            extra->jit_builtins == func->func_builtins) {
+          return compiled;
+        }
+      }
+    }
+  }
+  return getContext() != nullptr ? getContext()->lookupFunc(func) : nullptr;
+}
+
 static PyObject* recursionGuardedVectorcall(
     PyObject* func_obj,
     PyObject* const* stack,
@@ -626,9 +664,7 @@ static PyObject* recursionGuardedVectorcall(
   }
   if (kTimedProbation && extra != nullptr && extra->probation_ctl != 0) {
     result = probationTimedCall(func, extra, stack, nargsf, kwnames);
-  } else if (
-      CompiledFunction* compiled =
-          getContext() != nullptr ? getContext()->lookupFunc(func) : nullptr) {
+  } else if (CompiledFunction* compiled = lookupCompiledForCall(func)) {
     result = compiled->vectorcallEntry()(func_obj, stack, nargsf, kwnames);
   } else {
     // 安装与调用之间函数被去优化：退回解释器入口。

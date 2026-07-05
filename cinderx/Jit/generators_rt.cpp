@@ -7,6 +7,7 @@
 #include "internal/pycore_genobject.h"
 #include "internal/pycore_object.h" // _PyObject_GC_UNTRACK()
 #include "internal/pycore_pyerrors.h" // _PyErr_ClearExcState()
+#include "internal/pycore_pystate.h" // _PyThreadState_GET()
 
 #include "cinderx/Common/log.h"
 #include "cinderx/Jit/config.h"
@@ -354,7 +355,9 @@ PySendResult jitgen_am_send(PyObject* obj, PyObject* arg, PyObject** presult) {
     arg = Py_None;
   }
 
-  PyThreadState* tstate = PyThreadState_Get();
+  // 每 send 一次的线程态获取走内部内联读（跨 so 的 PyThreadState_Get
+  // PLT 穿越在 generators PMP 中独占 ~4%）。
+  PyThreadState* tstate = _PyThreadState_GET();
   _PyErr_StackItem* prev_exc_info = tstate->exc_info;
   gen->gi_exc_state.previous_item = prev_exc_info;
   tstate->exc_info = &gen->gi_exc_state;
