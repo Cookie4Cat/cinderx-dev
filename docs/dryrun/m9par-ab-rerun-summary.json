@@ -1,0 +1,17 @@
+{
+ "regex_compile": {
+  "a": "OK",
+  "a_mean": 0.0512498200017338,
+  "b": "FAIL rc=1     raise RuntimeError(\"%s failed with exit code %s\" | RuntimeError: /opt/_internal/cpython-3.11.15/bin/python3.11 failed with exit code -11"
+ },
+ "scimark": {
+  "a": "OK",
+  "a_mean": 0.05932847372508453,
+  "b": "FAIL rc=1     raise RuntimeError(\"%s failed with exit code %s\" | RuntimeError: /opt/_internal/cpython-3.11.15/bin/python3.11 failed with exit code -11"
+ },
+ "nqueens": {
+  "a": "OK",
+  "a_mean": 0.042079861570770545,
+  "b": "FAIL rc=1     raise RuntimeError(\"%s failed with exit code %s\" | RuntimeError: /opt/_internal/cpython-3.11.15/bin/python3.11 failed with exit code -11"
+ }
+}
