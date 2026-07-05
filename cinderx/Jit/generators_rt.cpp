@@ -29,7 +29,9 @@ bool deopt_jit_gen_with_footer(
     bool tree_iter_cleared);
 
 PyObject* JitGenObject::yieldFrom() {
-  if (gi_frame_state == FRAME_CREATED || FRAME_STATE_FINISHED(gi_frame_state)) {
+  // 与 stock _PyGen_yf 同门槛：仅挂起态有值。原判据放过 EXECUTING，
+  // 会按陈旧 yieldPoint 读 spill 槽并对垃圾 INCREF（同 traverse 案）。
+  if (gi_frame_state != FRAME_SUSPENDED) {
     return nullptr;
   }
   GenDataFooter* gen_footer = genDataFooter();
@@ -213,11 +215,15 @@ int jitgen_traverse(PyObject* obj, visitproc visit, void* arg) {
   JitGenObject* jit_gen = JitGenObject::cast(obj);
   if (jit_gen != nullptr) {
     const GenDataFooter* gen_footer = jit_gen->genDataFooter();
-    // Only visit JIT-specific live values if we have a valid yield point.
-    // If yieldPoint is null, the generator hasn't yielded yet or has completed,
-    // but we still need to call PyGen_Type.tp_traverse below to visit standard
-    // generator references (gi_code, gi_frame, etc.).
-    if (gen_footer->yieldPoint != nullptr) {
+    // 加固：仅在 FRAME_SUSPENDED 时才按 yieldPoint 元数据访问 spill
+    // 区。yieldPoint 只在 yield 时写入、恢复执行时不清——运行中/已
+    // 完成的生成器其 spill 槽已被后续执行复用改写，按陈旧元数据把槽
+    // 内容当 PyObject* 交给 visit 是与下方 LWF 头槽案同型的任意指针
+    // 解引用风险（推理封堵，非本轮观测到的崩因；观测崩因见下方 LWF
+    // 块注释）。执行态的寄存器持有引用对 GC 不可见是安全方向：GC 将
+    // 未解释的引用计数视为外部根而保活。
+    if (jit_gen->gi_frame_state == FRAME_SUSPENDED &&
+        gen_footer->yieldPoint != nullptr) {
       size_t deopt_idx = gen_footer->yieldPoint->deoptIdx();
       const DeoptMetadata& meta =
           gen_footer->code_rt->getDeoptMetadata(deopt_idx);
@@ -247,7 +253,19 @@ int jitgen_traverse(PyObject* obj, visitproc visit, void* arg) {
     // FrameHeader and contains func_closure with closure cells that may
     // participate in reference cycles. We must visit it explicitly since
     // _PyFrame_Traverse won't see it.
-    if (jit_gen->gi_frame_state < FRAME_CLEARED) {
+    //
+    // 必须以运行时 frame_mode 再门一层：本块此前仅有编译旗标门，而
+    // 3.11 运行时是 kNormal 物化帧、没有 LWF 帧头——jitFrameGetFunction
+    // 的 <0x030E 分支读"帧前头槽"在该布局下是邻居垃圾字节，交给
+    // Py_VISIT 即任意指针解引用。全表面编译轮实锤：pyperf worker 的
+    // stdlib 生成器在 GC 遍历时踩中（核心转储 func=0x210/0xa00000000），
+    // regex/scimark/nqueens 三基准 worker SIGSEGV 与 libtest
+    // test_builtin "GC 期崩溃"同根——jitFrame* 头部辅助族 3.11 调用
+    // 点审计（M9R3 移交项）的最后一处漏网（同族其余三处均已有运行时
+    // 门）。垃圾恰为 NULL 时 Py_VISIT 安全跳过，故随分配布局显形——
+    //"最小侵入即压制"的根源。
+    if (getConfig().frame_mode == FrameMode::kLightweight &&
+        jit_gen->gi_frame_state < FRAME_CLEARED) {
       _PyInterpreterFrame* frame = generatorFrame(jit_gen);
       BorrowedRef<PyFunctionObject> func = jitFrameGetFunction(frame);
       Py_VISIT(func.get());
