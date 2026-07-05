@@ -1693,15 +1693,17 @@ Register* simplifyLoadAttrSplitDict(
 
 #if PY_VERSION_HEX < 0x030C0000
   // CPython 3.11 stores the inline values pointer in a separate pre-header
-  // slot from the managed dict pointer.  If values is null the instance dict
-  // has been materialized, so deopt to the generic LOAD_ATTR path instead of
-  // treating the dict pointer as tagged values.
-  // 注（IC 计数轮 go 案）：物化是持久状态，此守卫对"天生物化"型工作
-  // 负载（分阶段初始化超容量）每次访问必 deopt，由 ROI backoff 冻回
-  // 解释器形成均衡（上方 WITH_HINT 站点证据门为主防线）。曾试改
-  // CondBranch 回退缓存 helper，但 helper 调用每访问的代价使整体劣于
-  // 解释器行内 WITH_HINT（go 88→145ms），已回退。彻底解需与
-  // DescrOrClassVar hint 化、store 内联 stub 同轮落地后再评估。
+  // slot from the managed dict pointer. values 槽空即实例字典已物化——
+  // If values is null the instance dict has been materialized, so deopt
+  // to the generic LOAD_ATTR path instead of treating the dict pointer
+  // as tagged values.
+  // 分支化（CondBranch 回退 helper）两轮评审均不予落地：① laggards
+  // 轮——解冻后 helper 调用税使编译态劣于解释器行内 WITH_HINT；
+  // ② probation 轮——stub 行内物化直读使 miss 不再流经慢尾，IC
+  // 压力密度信号随 deopt 风暴一起消失，go 型负载失去冻结兜底
+  //（125ms vs 冻结均衡 91ms），而 deltablue/raytrace 收益在方差带
+  // 内。再评前提：帧/调用协议税显著下降，或密度信号改从行内命中
+  // 处采集。当前 Guard-deopt→ROI backoff 冻结即该形态的正确均衡。
   Register* values = env.emit<LoadField>(
       receiver, "__dict_values__", -4 * sizeof(PyObject*), TCUInt64);
   auto guard = env.emitInstr<Guard>(values);

@@ -231,6 +231,20 @@ struct Config {
   // repeatedly deopts. Enabled by default; disable with
   // CINDERX_AUTOJIT_ROI_BACKOFF=0 when isolating A/B or rolling back.
   bool roi_backoff_enabled{true};
+
+  // 试用期计时判定（研究旋钮，默认关）：0 关闭；>0 为每臂样本数 K。
+  // 实测结论：亚微秒级调用的计时噪声与"逐函数贪心 vs 全局混合成本"
+  // 的错配使其在贴近均势的负载上净伤害（见 M9 probation 轮日志），
+  // 生产判据用下方 IC 压力密度。
+  size_t probation_calls{0};
+  // 冻结判据余量（百分比）：jit 均时 > interp 均时 × pct/100 即冻结。
+  size_t probation_margin_pct{125};
+
+  // IC 压力密度冻结（go 三件套③生产判据）：每 4096 次调用为一窗，
+  // 窗内 stub 慢路径进入数 / 调用数 超过该比值即卸载冻结（0 关闭）。
+  // 依据计数矩阵实测：go 型（天生物化+类默认值遮蔽）≈11/调用，
+  // richards/deltablue ≈1.5-1.7/调用——阈值 4 干净分离。
+  size_t ic_pressure_ratio{4};
   size_t roi_deopt_budget_base{32};
   size_t roi_backoff_max_rounds{1};
   size_t roi_rewarm_factor{64};

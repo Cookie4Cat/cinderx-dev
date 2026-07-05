@@ -12,6 +12,7 @@
 #include "cinderx/Common/dict.h"
 #include "cinderx/Common/log.h"
 #include "cinderx/Common/py-portability.h"
+#include "cinderx/Common/util.h"
 #include "cinderx/Jit/config.h"
 #include "cinderx/Jit/elf/reader.h"
 #include "cinderx/StaticPython/classloader.h"
@@ -457,6 +458,122 @@ void Context::finalizeMultiThreadedCompile() {
 // 入口经此包装补齐与解释器一致的计数与检查。prologue 级检查需要帧链接前
 // 的错误出口，当前代码生成层没有该路径；生成器 resume 路径不经 vectorcall，
 // 仍不在保护范围内（见 M6 预演日志）。
+// 试用期计时判定（go 三件套③）：编译后的前 2K 次调用按奇偶交替走
+// 解释/编译两条入口并计时，等样本均时对比（带余量）裁决——编译态
+// 确实劣于解释态（如天生物化负载的属性访问税）则卸载并冻结回解释
+// 器。计数阈值无法区分"慢路径多但净更快"（richards）与"净更慢"
+// （go），时间是唯一干净判据。嵌套/递归调用两臂同等承受计时叠加；
+// 生成器函数在安装点豁免（resume 不经 vectorcall，创建耗时不代表
+// 执行）。冷路径 noinline，转正后仅付一次 probation_ctl 加载。
+void probationFreeze(BorrowedRef<PyFunctionObject> func);
+
+// 试用期全局令牌：同一时刻只允许一个 code 处于计时试用。并发试用会
+// 交叉污染（预热期整棵调用树同时试用，调用方的编译臂内嵌着被调方的
+// 解释臂，反之亦然），裁决近乎随机。ctl==2 表示排队等令牌，期间按
+// 编译态正常执行；令牌释放后由下一次调用惰性接棒。
+static std::atomic<PyCodeObject*> g_probation_token{nullptr};
+
+static PyObject* __attribute__((noinline)) probationTimedCall(
+    BorrowedRef<PyFunctionObject> func,
+    CodeExtra* extra,
+    PyObject* const* stack,
+    size_t nargsf,
+    PyObject* kwnames) {
+  BorrowedRef<PyCodeObject> code{func->func_code};
+  if (extra->probation_ctl == 2) {
+    PyCodeObject* expected = nullptr;
+    if (!g_probation_token.compare_exchange_strong(
+            expected, code.get(), std::memory_order_acq_rel)) {
+      // 令牌被他人持有：按编译态正常执行；以 probation_seq 计等待
+      // 次数，超限即窃取令牌（防冷函数长期持有导致队列饥饿——被窃
+      // 者在其计时路径发现令牌易主后自行重新排队）。
+      if (++extra->probation_seq >= 512) {
+        g_probation_token.store(code.get(), std::memory_order_release);
+      } else {
+        CompiledFunction* compiled =
+            getContext() != nullptr ? getContext()->lookupFunc(func)
+                                    : nullptr;
+        if (compiled == nullptr) {
+          extra->probation_ctl = 0;
+          return getInterpretedVectorcall(func)(
+              func.getObj(), stack, nargsf, kwnames);
+        }
+        return compiled->vectorcallEntry()(
+            func.getObj(), stack, nargsf, kwnames);
+      }
+    }
+    extra->probation_ctl = 1;
+    extra->probation_seq = 0;
+    extra->probation_interp_ns = 0;
+    extra->probation_jit_ns = 0;
+  }
+  if (g_probation_token.load(std::memory_order_acquire) != code.get()) {
+    // 令牌被窃：重新排队，本次按编译态执行。
+    extra->probation_ctl = 2;
+    extra->probation_seq = 0;
+    CompiledFunction* compiled =
+        getContext() != nullptr ? getContext()->lookupFunc(func) : nullptr;
+    if (compiled == nullptr) {
+      extra->probation_ctl = 0;
+      return getInterpretedVectorcall(func)(
+          func.getObj(), stack, nargsf, kwnames);
+    }
+    return compiled->vectorcallEntry()(func.getObj(), stack, nargsf, kwnames);
+  }
+  // 块式交替采样：32 次同臂连续调用为一块（偶块=编译、奇块=解释），
+  // 每臂首块弃权（icache/分支预热），其后每臂累计 K 样本后裁决。
+  // 亚微秒级调用的逐次计时被时钟开销与量化噪声支配，按块聚合把
+  // 噪声均摊到块内样本上。
+  constexpr uint32_t kProbationBlock = 32;
+  uint32_t seq = extra->probation_seq++;
+  uint32_t block = seq / kProbationBlock;
+  bool interp_turn = (block & 1) != 0;
+  struct timespec t0;
+  struct timespec t1;
+  clock_gettime(CLOCK_MONOTONIC_RAW, &t0);
+  PyObject* result;
+  if (interp_turn) {
+    result = getInterpretedVectorcall(func)(
+        func.getObj(), stack, nargsf, kwnames);
+  } else {
+    CompiledFunction* compiled =
+        getContext() != nullptr ? getContext()->lookupFunc(func) : nullptr;
+    if (compiled == nullptr) {
+      // 试用期间被他因卸载（如 ROI backoff）：终止试用并交还令牌。
+      extra->probation_ctl = 0;
+      g_probation_token.store(nullptr, std::memory_order_release);
+      return getInterpretedVectorcall(func)(
+          func.getObj(), stack, nargsf, kwnames);
+    }
+    result = compiled->vectorcallEntry()(func.getObj(), stack, nargsf, kwnames);
+  }
+  clock_gettime(CLOCK_MONOTONIC_RAW, &t1);
+  uint64_t ns = static_cast<uint64_t>(t1.tv_sec - t0.tv_sec) * 1000000000ull +
+      static_cast<uint64_t>(t1.tv_nsec - t0.tv_nsec);
+  if (block >= 2) {
+    if (interp_turn) {
+      extra->probation_interp_ns += ns;
+    } else {
+      extra->probation_jit_ns += ns;
+    }
+  }
+  size_t k = getConfig().probation_calls;
+  // 总样本 = 预热两块 + 每臂 K（向上取整到块边界）。
+  uint32_t accum_blocks_per_arm =
+      static_cast<uint32_t>((k + kProbationBlock - 1) / kProbationBlock);
+  uint32_t total = (2 + 2 * accum_blocks_per_arm) * kProbationBlock;
+  if (seq + 1 >= total) {
+    extra->probation_ctl = 0;
+    g_probation_token.store(nullptr, std::memory_order_release);
+    if (extra->probation_interp_ns > 0 &&
+        extra->probation_jit_ns * 100 >
+            extra->probation_interp_ns * getConfig().probation_margin_pct) {
+      probationFreeze(func);
+    }
+  }
+  return result;
+}
+
 static PyObject* recursionGuardedVectorcall(
     PyObject* func_obj,
     PyObject* const* stack,
@@ -474,7 +591,43 @@ static PyObject* recursionGuardedVectorcall(
     return nullptr;
   }
   PyObject* result;
-  if (CompiledFunction* compiled =
+  // 每调用热路径预算：一次全局节拍自增+掩码测试。策略工作（codeExtra
+  // 查表、计数、窗口裁决）1/16 采样进入；计时试用（研究旋钮）启用时
+  // 才逐调用查表。
+  static const size_t kPressureRatio = getConfig().ic_pressure_ratio;
+  static const bool kTimedProbation = getConfig().probation_calls > 0;
+  static uint64_t g_call_tick = 0;
+  CodeExtra* extra = nullptr;
+  if (kTimedProbation) {
+    extra = codeExtraIfExists(reinterpret_cast<PyCodeObject*>(func->func_code));
+  }
+  if (kPressureRatio > 0 && ((++g_call_tick & 15) == 0)) {
+    // IC 压力密度窗口裁决（生产判据）：采样计调用（×16 折算），每
+    // 折算 4096 次调用对比窗内 stub 慢路径进入数，密度超阈即卸载
+    // 冻结——时间上编译态劣于解释器行内特化的形态（天生物化负载）
+    // 密度比均势负载高一个量级（计数矩阵实测 ~11 vs ~1.7 每调用）。
+    if (extra == nullptr) {
+      extra =
+          codeExtraIfExists(reinterpret_cast<PyCodeObject*>(func->func_code));
+    }
+    if (extra != nullptr) {
+      Ci_code_extra_incr_calls(extra);
+      uint64_t sampled = Ci_code_extra_get_calls(extra);
+      if ((sampled & 255) == 0) { // ≈4096 次调用
+        if (extra->ic_slow_pressure > kPressureRatio * 4096) {
+          _Py_LeaveRecursiveCallTstate(tstate);
+          probationFreeze(func);
+          return getInterpretedVectorcall(func)(
+              func_obj, stack, nargsf, kwnames);
+        }
+        extra->ic_slow_pressure = 0;
+      }
+    }
+  }
+  if (kTimedProbation && extra != nullptr && extra->probation_ctl != 0) {
+    result = probationTimedCall(func, extra, stack, nargsf, kwnames);
+  } else if (
+      CompiledFunction* compiled =
           getContext() != nullptr ? getContext()->lookupFunc(func) : nullptr) {
     result = compiled->vectorcallEntry()(func_obj, stack, nargsf, kwnames);
   } else {
@@ -532,6 +685,19 @@ bool Context::finalizeFunc(
     setVectorcall(func, compiled->vectorcallEntry());
   } else {
     setVectorcall(func, recursionGuardedVectorcall);
+    // 启动试用期计时（生成器豁免：resume 不经 vectorcall；重编译后
+    // 允许再次试用）。
+    if (getConfig().probation_calls > 0) {
+      BorrowedRef<PyCodeObject> code{func->func_code};
+      if (!(code->co_flags & kCoFlagsAnyGenerator)) {
+        if (CodeExtra* extra = codeExtra(code)) {
+          extra->probation_seq = 0;
+          extra->probation_interp_ns = 0;
+          extra->probation_jit_ns = 0;
+          extra->probation_ctl = 2; // 排队等全局令牌
+        }
+      }
+    }
   }
 #else
   setVectorcall(func, compiled->vectorcallEntry());
