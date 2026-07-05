@@ -230,7 +230,13 @@ struct Config {
   // Minimal dynamic feedback for code that compiles successfully but then
   // repeatedly deopts. Enabled by default; disable with
   // CINDERX_AUTOJIT_ROI_BACKOFF=0 when isolating A/B or rolling back.
-  bool roi_backoff_enabled{true};
+  // 自适应冻结层默认全关（基础优化时代决策）：冻结/卸载把病理形态
+  // 从剖析视野中藏起来（witness 轮取证成本的直接来源）、给 A/B 引入
+  // 冻结时机方差，且"过滤"不解决根因。deopt 风暴、helper 密度等病灶
+  // 应直接暴露给 PMP/计数矩阵驱动根本修复；策略层留作收尾阶段按需
+  // 启用的旋钮（CINDERX_AUTOJIT_ROI_BACKOFF / _IC_PRESSURE_RATIO /
+  // _PROBATION）。
+  bool roi_backoff_enabled{false};
 
   // 试用期计时判定（研究旋钮，默认关）：0 关闭；>0 为每臂样本数 K。
   // 实测结论：亚微秒级调用的计时噪声与"逐函数贪心 vs 全局混合成本"
@@ -240,11 +246,11 @@ struct Config {
   // 冻结判据余量（百分比）：jit 均时 > interp 均时 × pct/100 即冻结。
   size_t probation_margin_pct{125};
 
-  // IC 压力密度冻结（go 三件套③生产判据）：每 4096 次调用为一窗，
-  // 窗内 stub 慢路径进入数 / 调用数 超过该比值即卸载冻结（0 关闭）。
-  // 依据计数矩阵实测：go 型（天生物化+类默认值遮蔽）≈11/调用，
-  // richards/deltablue ≈1.5-1.7/调用——阈值 4 干净分离。
-  size_t ic_pressure_ratio{4};
+  // IC 压力密度冻结：每 4096 次调用为一窗，窗内 stub 慢路径进入数 /
+  // 调用数 超过该比值即卸载冻结（0 关闭，默认关——见上方策略层
+  // 决策注释）。判别量依据计数矩阵实测：go 型（天生物化+类默认值
+  // 遮蔽）≈11/调用，richards/deltablue ≈1.5-1.7/调用，阈值 4 分离。
+  size_t ic_pressure_ratio{0};
   size_t roi_deopt_budget_base{32};
   size_t roi_backoff_max_rounds{1};
   size_t roi_rewarm_factor{64};
