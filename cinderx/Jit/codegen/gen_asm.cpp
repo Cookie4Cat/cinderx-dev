@@ -1509,6 +1509,7 @@ void NativeGenerator::emitAarch64LoadAttrInvokeStub(
   constexpr int kEntryMatHintOffset = static_cast<int>(
       jit::AttributeCache::entriesOffset() +
       jit::AttributeMutator::splitMatHintOffset());
+  constexpr uint64_t kSplitInlineKind = kSplitInlineKnownOffsetKind - 1;
   constexpr int kTpFlagsOffset = offsetof(PyTypeObject, tp_flags);
   constexpr int kTpVersionTagOffset = offsetof(PyTypeObject, tp_version_tag);
   constexpr int kValuesPreheaderOffset =
@@ -1578,8 +1579,19 @@ void NativeGenerator::emitAarch64LoadAttrInvokeStub(
 #endif
 
     as_->and_(a64::x14, a64::x12, kKindMask);
+#if PY_VERSION_HEX < 0x030C0000
+    // 收 kSplitInline(2)/kSplitInlineKnownOffset(3) 两 kind（同 store
+    // stub 的教训：天生物化形态 val_offset 永不可解析、条目终身
+    // kind 2，只认 3 即 go 型负载全 miss）。kind 2 的 values 形态
+    // val_offset 为 -1，由下方符号守卫回落；物化形态 hint 块两 kind
+    // 通用（同一 SplitMutator.mat_hint）。
+    arch::sub_immediate(as_, a64::x14, a64::x14, kSplitInlineKind);
+    arch::cmp_immediate(as_, a64::x14, 1);
+    as_->b_hi(slow_path);
+#else
     arch::cmp_immediate(as_, a64::x14, kSplitInlineKnownOffsetKind);
     as_->b_ne(slow_path);
+#endif
 
 #if PY_VERSION_HEX >= 0x030E0000
     as_->ldr(a64::x14, arch::ptr_offset(a64::x13, kTpBasicSizeOffset));
@@ -1609,6 +1621,7 @@ void NativeGenerator::emitAarch64LoadAttrInvokeStub(
     as_->ldr(
         a64::x14,
         arch::ptr_offset(a64::x0, kValOffsetOffset + entry_offset));
+    as_->tbnz(a64::x14, 63, slow_path); // kind 2 val_offset==-1：未解析
     as_->add(a64::x15, a64::x15, a64::x14, a64::lsl(3));
     as_->ldr(a64::x9, a64::ptr(a64::x15));
     as_->cbz(a64::x9, slow_path);
