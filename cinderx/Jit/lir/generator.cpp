@@ -1183,6 +1183,12 @@ void LIRGenerator::GenerateExitBlocks() {
       {
         bbb.appendInvokeInstruction(JITRT_UnlinkFrame, env_->asm_tstate);
       }
+#if PY_VERSION_HEX < 0x030C0000
+      if (env_->code_rt->entryGuardInlined()) {
+        bbb.annotateNext("Recursion leave (inline entry guard)");
+        emitRecursionLeave(bbb);
+      }
+#endif
     } else {
       PyObject* executable;
       std::optional<destructor> exec_dtor;
@@ -5750,6 +5756,13 @@ void LIRGenerator::emitLoadFrame(BasicBlockBuilder& bbb) {
           JITRT_AllocateAndLinkInterpreterFrame_Release,
           env_->asm_func);
     }
+#if PY_VERSION_HEX < 0x030C0000
+    if (emitsInlineEntryGuard()) {
+      env_->code_rt->setEntryGuardInlined(true);
+      bbb.annotateNext("Recursion enter (inline entry guard)");
+      emitRecursionEnter(bbb);
+    }
+#endif
   }
 #ifdef ENABLE_LIGHTWEIGHT_FRAMES
   else if (func_->frameMode == FrameMode::kLightweight) {
@@ -6002,6 +6015,68 @@ bool LIRGenerator::canInlineNormalFrame() const {
   BorrowedRef<PyCodeObject> code = func_->code;
   return !kPyDebug && code != nullptr && code->co_ncellvars == 0 &&
       code->co_nfreevars == 0 && !inlineNormalFrameDisabled();
+}
+
+// 入口守卫行内化资格（3.11 aarch64）：守卫包装的两项检查（递归深度、
+// tracing 分流）下沉到编译码后，包装层整体消解（finalize 直装编译
+// 入口）。排除项：生成器（初始调用经 Yield 机制退出，退出面不闭合，
+// 维持包装）；静态类型参数函数（typecheck 失败出口不经建帧）；自适应
+// 策略层启用时（策略寄生于包装）；CI_JIT_NO_ENTRY_GUARD 裸口径。
+bool LIRGenerator::emitsInlineEntryGuard() const {
+#if defined(CINDER_AARCH64)
+  static const bool bare_entry = [] {
+    const char* v = getenv("CI_JIT_NO_ENTRY_GUARD");
+    return v != nullptr && *v != '\0' && *v != '0';
+  }();
+  if (bare_entry) {
+    return false;
+  }
+  const Config& config = getConfig();
+  if (config.ic_pressure_ratio > 0 || config.probation_calls > 0 ||
+      config.roi_backoff_enabled) {
+    return false;
+  }
+  // tstate 取法为烘焙 &_PyRuntime.gilstate.tstate_current 直读（本目标
+  // 的 TLS 偏移探测被安全禁用，tstate_offset 恒 -1；直读与
+  // PyThreadState_GET 同源，GIL 下有效），不依赖 TLS。
+  return func_->code != nullptr &&
+      !(func_->code->co_flags & kCoFlagsAnyGenerator) &&
+      !func_->has_primitive_args;
+#else
+  return false;
+#endif
+}
+
+// 递归账本扣减（建帧处，stock 顺序：帧入链后计数）。溢出预检在
+// vectorcall 入口 asm（gen_asm）以"不落账直接尾转解释器"处理——
+// 本处扣减无条件，与 EpilogueEnd 补账 / deopt 补账（prepareForDeopt）
+// / OSR 入口对冲严格配平。绑参失败路径从未到达建帧，天然无账。
+void LIRGenerator::emitRecursionEnter(BasicBlockBuilder& bbb) {
+  constexpr int32_t kRemainingOffset =
+      static_cast<int32_t>(offsetof(PyThreadState, recursion_remaining));
+  Instruction* rem = bbb.appendInstr(
+      OutVReg{DataType::k32bit},
+      Instruction::kMove,
+      Ind{env_->asm_tstate, kRemainingOffset});
+  bbb.appendInstr(Instruction::kDec, rem);
+  bbb.appendInstr(
+      OutInd{env_->asm_tstate, kRemainingOffset, DataType::k32bit},
+      Instruction::kMove,
+      rem);
+}
+
+void LIRGenerator::emitRecursionLeave(BasicBlockBuilder& bbb) {
+  constexpr int32_t kRemainingOffset =
+      static_cast<int32_t>(offsetof(PyThreadState, recursion_remaining));
+  Instruction* rem = bbb.appendInstr(
+      OutVReg{DataType::k32bit},
+      Instruction::kMove,
+      Ind{env_->asm_tstate, kRemainingOffset});
+  bbb.appendInstr(Instruction::kInc, rem);
+  bbb.appendInstr(
+      OutInd{env_->asm_tstate, kRemainingOffset, DataType::k32bit},
+      Instruction::kMove,
+      rem);
 }
 
 // 入口：行内分配+初始化+链接解释器帧，镜像

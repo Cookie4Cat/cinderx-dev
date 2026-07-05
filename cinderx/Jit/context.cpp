@@ -719,6 +719,11 @@ bool Context::finalizeFunc(
   }();
   if (no_entry_guard) {
     setVectorcall(func, compiled->vectorcallEntry());
+  } else if (compiled->runtime()->entryGuardInlined()) {
+    // 入口守卫行内化：两检查已下沉编译序言（tracing 分流 + 递归预检
+    // /账本），守卫包装消解，直装编译入口。资格与发射同源
+    //（CodeRuntime 旗标，LIR 生成期判定）。
+    setVectorcall(func, compiled->vectorcallEntry());
   } else {
     setVectorcall(func, recursionGuardedVectorcall);
     // 启动试用期计时（生成器豁免：resume 不经 vectorcall；重编译后

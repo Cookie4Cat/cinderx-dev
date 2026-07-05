@@ -176,6 +176,11 @@ class LIRGenerator {
   bool canInlineNormalFrame() const;
   void emitInlineLinkNormalFrame(BasicBlockBuilder& bbb);
   void emitInlineUnlinkNormalFrame(BasicBlockBuilder& bbb);
+
+  // 入口守卫行内化（守卫包装消解）：资格谓词与递归账本的进出发射。
+  bool emitsInlineEntryGuard() const;
+  void emitRecursionEnter(BasicBlockBuilder& bbb);
+  void emitRecursionLeave(BasicBlockBuilder& bbb);
 #endif
 
   void makeIncref(

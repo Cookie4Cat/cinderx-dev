@@ -99,6 +99,16 @@ class alignas(16) CodeRuntime {
   int frameSize() const;
   void setFrameSize(int size);
 
+  // 3.11 入口守卫行内化（递归预检 + tracing 分流下沉编译序言，守卫
+  // 包装消解）。LIR 生成期按静态资格判定并置位，入口 asm 发射、
+  // finalize 直装与 deopt 补账三方以此为唯一真源。
+  bool entryGuardInlined() const {
+    return entry_guard_inlined_;
+  }
+  void setEntryGuardInlined(bool v) {
+    entry_guard_inlined_ = v;
+  }
+
   // Get and set the number of spill words for generators.
   uint32_t spillWords() const;
   void setSpillWords(uint32_t words);
@@ -148,6 +158,7 @@ class alignas(16) CodeRuntime {
   }
 #endif
  private:
+  bool entry_guard_inlined_{false};
   BorrowedRef<PyCodeObject> code_;
   BorrowedRef<PyDictObject> builtins_;
   BorrowedRef<PyDictObject> globals_;
