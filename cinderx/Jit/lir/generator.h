@@ -170,6 +170,14 @@ class LIRGenerator {
       Instruction* instr,
       const hir::DeoptBase& hir_instr);
 
+#if PY_VERSION_HEX < 0x030C0000
+  // 3.11 普通帧仪式行内化（入口 alloc+init+link / 出口 unlink+clear+pop，
+  // 编译期常量折叠；cell/free 变量非零的函数回落 C helper）。
+  bool canInlineNormalFrame() const;
+  void emitInlineLinkNormalFrame(BasicBlockBuilder& bbb);
+  void emitInlineUnlinkNormalFrame(BasicBlockBuilder& bbb);
+#endif
+
   void makeIncref(
       BasicBlockBuilder& bbb,
       lir::Instruction* instr,
