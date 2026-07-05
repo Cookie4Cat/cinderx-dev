@@ -635,6 +635,40 @@ PyObject* SplitMutator::getAttr(PyObject* obj, PyObject* name) {
 
 PyObject* SplitMutator::getAttrInline(PyObject* obj, PyObject* name) {
   if (!ensureValueOffset(name)) {
+    // 名字不在共享键：天生物化形态（分步初始化超出共享键容量的类，
+    // 实例出生即物化，属性只存在于自身组合字典的替换键集里），
+    // val_offset 永远无法解析、条目终身停留本 kind——此前每次命中
+    // 落 PyObject_GetAttr 全泛型（go 每窗口 400 万次）。改带 hint
+    // 物化直读。缺失语义比 KnownOffset 更强：fill 选择 split 形态
+    // 的前提是 _PyType_Lookup(type, name) == nullptr（类侧查无此名，
+    // 连非数据描述符都没有）且类型版本被条目 matches() 钉住，故
+    // 通用协议只剩实例字典一步，键缺/槽空即 AttributeError。
+    PyDictValues* values = ci_inline_values_311(obj);
+    if (values != nullptr) {
+      // values 形态而名字不在共享键 ⇒ 实例字典必无此名。
+      return raise_attribute_error(obj, name);
+    }
+    PyDictObject* dict = ci_managed_dict_311(obj);
+    if (dict != nullptr && DK_IS_UNICODE(dict->ma_keys)) {
+      Py_ssize_t ix = ci_hinted_keys_index_311(dict->ma_keys, name, &mat_hint);
+      if (ix >= 0) {
+        if (dict->ma_values != nullptr &&
+            !ci_split_values_in_capacity_311(dict->ma_values, ix)) {
+          return raise_attribute_error(obj, name);
+        }
+        PyObject* result = dict->ma_values != nullptr
+            ? dict->ma_values->values[ix]
+            : DK_UNICODE_ENTRIES(dict->ma_keys)[ix].me_value;
+        if (result == nullptr) {
+          return raise_attribute_error(obj, name);
+        }
+        incICStat(g_ic_runtime_stats.la_mat_hint_hit);
+        Py_INCREF(result);
+        return result;
+      }
+      return raise_attribute_error(obj, name);
+    }
+    // 字典缺失或 general 键等罕见形态：维持通用协议。
     return PyObject_GetAttr(obj, name);
   }
   AttributeMutator::changeKindFromSplitInline(
@@ -1198,6 +1232,7 @@ PyObject* LoadAttrCache::doInvoke(PyObject* obj, PyObject* name) {
     }
     if (entry.matches(tp)) {
       incICStat(g_ic_runtime_stats.la_entry_hit);
+      incICStat(g_ic_runtime_stats.la_hit_kind[entry.kindBits()]);
       return entry.getAttr(obj, name);
     }
     // 类型指针相同但版本失效：该条目不可能再次命中（版本号单调递增），
@@ -1515,6 +1550,40 @@ LoadMethodResult LoadMethodCache::lookup(
 #endif
       if (!isValidKeysVersion(entry.keys_version, obj)) {
         incICStat(g_ic_runtime_stats.lm_keys_fail);
+#if PY_VERSION_HEX < 0x030C0000
+        // 组合字典接收者（键对象已更换，如天生物化的分阶段初始化类）
+        // 的共享键版本判据永不可比——改做带 hint 的实例遮蔽直判：
+        // 名字不在实例字典（或 split 包装槽为空）即缓存有效（类侧
+        // 变化由条目级 tp_version_tag 拉式校验钉住）。此前该形态使
+        // 方法缓存楔死：规范版本未动故不驱逐、槽全占故 fill 永不
+        // 成功，每次查找付 4 次键版本败 + 全量 _PyType_Lookup
+        //（go 案：150 万次/窗口）。
+        {
+          PyDictObject* dict = ci_managed_dict_311(obj.get());
+          if (dict != nullptr && DK_IS_UNICODE(dict->ma_keys)) {
+            Py_ssize_t ix =
+                ci_hinted_keys_index_311(dict->ma_keys, name, &ia_hint_);
+            bool shadowed = false;
+            if (ix >= 0) {
+              if (dict->ma_values != nullptr) {
+                shadowed =
+                    ci_split_values_in_capacity_311(dict->ma_values, ix) &&
+                    dict->ma_values->values[ix] != nullptr;
+              } else {
+                shadowed =
+                    DK_UNICODE_ENTRIES(dict->ma_keys)[ix].me_value != nullptr;
+              }
+            }
+            if (!shadowed) {
+              incICStat(g_ic_runtime_stats.lm_scan_hit);
+              PyObject* result = entry.value;
+              Py_INCREF(result);
+              Py_INCREF(obj);
+              return {result, obj};
+            }
+          }
+        }
+#endif
         // 类型权威键版本已前移（共享键在 fill 后又插入了新名字，如
         // 实例属性跨方法分批添加的初始化模式）时，条目永不可再命中
         // ——不驱逐则该类型方法查找永久落慢路径且 fill 无空槽可填。

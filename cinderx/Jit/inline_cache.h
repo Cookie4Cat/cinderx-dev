@@ -183,6 +183,10 @@ class AttributeMutator {
   }
 #endif
 
+  uintptr_t kindBits() const {
+    return type_ & kindMask();
+  }
+
  private:
   void set_type(PyTypeObject* type, Kind kind);
   Kind get_kind() const {
@@ -374,6 +378,8 @@ struct ICRuntimeStats {
   uint64_t sa_stub_entries{0};
   std::atomic<uint64_t> la_invoke{0};
   std::atomic<uint64_t> la_entry_hit{0};
+  // 条目命中的 kind 直方图（诊断用）
+  std::atomic<uint64_t> la_hit_kind[8] = {};
   std::atomic<uint64_t> la_split_values_hit{0};
   std::atomic<uint64_t> la_split_materialized{0};
   std::atomic<uint64_t> la_site_module_hit{0};

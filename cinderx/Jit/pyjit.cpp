@@ -3333,6 +3333,10 @@ PyObject* get_and_clear_inline_cache_stats(PyObject* /* self */, PyObject*) {
     };
     set_counter("la_invoke", take(s.la_invoke));
     set_counter("la_entry_hit", take(s.la_entry_hit));
+    for (int k = 0; k < 8; ++k) {
+      set_counter(
+          fmt::format("la_hit_kind_{}", k).c_str(), take(s.la_hit_kind[k]));
+    }
     set_counter("la_split_values_hit", take(s.la_split_values_hit));
     set_counter("la_split_materialized", take(s.la_split_materialized));
     set_counter("la_site_module_hit", take(s.la_site_module_hit));
