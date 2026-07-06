@@ -5,6 +5,11 @@
 #include "internal/pycore_ceval.h"
 #include "internal/pycore_pystate.h"
 
+#if PY_VERSION_HEX < 0x030C0000
+// PyMemberDef 与 T_OBJECT_EX（la 桩 kind-6 内联，劣化归因轮 C3）。
+#include <structmember.h>
+#endif
+
 #include "cinderx/Common/extra-py-flags.h"
 #include "cinderx/Common/log.h"
 #include "cinderx/Common/py-portability.h"
@@ -1565,6 +1570,39 @@ void NativeGenerator::emitAarch64LoadAttrInvokeStub(
   static_assert(
       sizeof(PyDictUnicodeEntry) == 16,
       "materialized hint block assumes 16-byte unicode entries");
+  // kind-7（kDescrOrClassVar）内联快路径常量（劣化归因轮 C3）。
+  constexpr int kEntryDcvDescrOffset = static_cast<int>(
+      jit::AttributeCache::entriesOffset() +
+      jit::AttributeMutator::dcvDescrOffset());
+  constexpr int kEntryDcvKeysVerOffset = static_cast<int>(
+      jit::AttributeCache::entriesOffset() +
+      jit::AttributeMutator::dcvKeysVersionOffset());
+  constexpr int kEntryDcvMatHintOffset = static_cast<int>(
+      jit::AttributeCache::entriesOffset() +
+      jit::AttributeMutator::dcvMatHintOffset());
+  constexpr uint64_t kDescrOrClassVarKind =
+      jit::AttributeMutator::descrOrClassVarKind();
+  constexpr int kTpDescrGetOffset = offsetof(PyTypeObject, tp_descr_get);
+  constexpr int kHtCachedKeysOffsetLa =
+      offsetof(PyHeapTypeObject, ht_cached_keys);
+  constexpr int kDkVersionOffsetLa = offsetof(PyDictKeysObject, dk_version);
+  static_assert(
+      sizeof(reinterpret_cast<PyDictKeysObject*>(0)->dk_version) == 4,
+      "kind-7 fast form assumes 32-bit dk_version");
+  // kind-6（kMemberDescr，__slots__ 属性）内联常量。
+  constexpr int kTpDictoffsetOffset = offsetof(PyTypeObject, tp_dictoffset);
+  constexpr uint64_t kMemberDescrKind = jit::AttributeMutator::memberDescrKind();
+  constexpr int kEntryMemberDefOffset = static_cast<int>(
+      jit::AttributeCache::entriesOffset() +
+      jit::AttributeMutator::memberDefOffset());
+  constexpr int kMemberDefTypeOffset = offsetof(PyMemberDef, type);
+  constexpr int kMemberDefOffsetOffset = offsetof(PyMemberDef, offset);
+  static_assert(
+      sizeof(reinterpret_cast<PyMemberDef*>(0)->type) == 4,
+      "kind-6 member type field assumed 32-bit");
+  static_assert(
+      sizeof(reinterpret_cast<PyMemberDef*>(0)->offset) == 8,
+      "kind-6 member offset field assumed 64-bit");
 #endif
 
   ASM_CHECK(as_->align(AlignMode::kCode, 8), GetFunction()->fullname);
@@ -1620,10 +1658,13 @@ void NativeGenerator::emitAarch64LoadAttrInvokeStub(
     // stub 的教训：天生物化形态 val_offset 永不可解析、条目终身
     // kind 2，只认 3 即 go 型负载全 miss）。kind 2 的 values 形态
     // val_offset 为 -1，由下方符号守卫回落；物化形态 hint 块两 kind
-    // 通用（同一 SplitMutator.mat_hint）。
+    // 通用（同一 SplitMutator.mat_hint）。kind 6/7 转支线（C3），主
+    // 路径指令序不变。
+    Label kind67_check = as_->newLabel();
+    Label kind7_check = as_->newLabel();
     arch::sub_immediate(as_, a64::x14, a64::x14, kSplitInlineKind);
     arch::cmp_immediate(as_, a64::x14, 1);
-    as_->b_hi(slow_path);
+    as_->b_hi(kind67_check);
 #else
     arch::cmp_immediate(as_, a64::x14, kSplitInlineKnownOffsetKind);
     as_->b_ne(slow_path);
@@ -1712,6 +1753,114 @@ void NativeGenerator::emitAarch64LoadAttrInvokeStub(
     as_->ldr(a64::x9, arch::ptr_offset(a64::x11, 8)); // combined：me_value
     as_->bind(test_value);
     as_->cbz(a64::x9, slow_path);
+    as_->b(return_value);
+
+    // ---- kind-6/7 支线（劣化归因轮 C3）----
+    // kind-6（kMemberDescr，__slots__ 属性）：memberdef→offset→对象体
+    // 直读。只收 T_OBJECT_EX（类机器为 __slots__ 生成的形态；其余
+    // 成员类型转换语义留 PyMember_GetOne）；空槽（未赋值 slot）回落
+    // helper 抛 AttributeError。sqlglot Expression 全 __slots__，
+    // 434 万次/值即此形态。
+    as_->bind(kind67_check);
+    arch::cmp_immediate(as_, a64::x14, kMemberDescrKind - kSplitInlineKind);
+    as_->b_ne(kind7_check);
+    as_->ldr(
+        a64::x9,
+        arch::ptr_offset(a64::x0, kEntryMemberDefOffset + entry_offset));
+    as_->cbz(a64::x9, slow_path);
+    as_->ldr(
+        a64::w10,
+        arch::ptr_offset(
+            a64::x9, kMemberDefTypeOffset, arch::AccessSize::k32));
+    arch::cmp_immediate(as_, a64::x10, T_OBJECT_EX);
+    as_->b_ne(slow_path);
+    as_->ldr(
+        a64::x10,
+        arch::ptr_offset(a64::x9, kMemberDefOffsetOffset));
+    as_->ldr(a64::x9, a64::ptr(a64::x1, a64::x10));
+    as_->cbz(a64::x9, slow_path); // 空 slot → helper 抛错
+    as_->b(return_value);
+
+    // kind-7（kDescrOrClassVar）：只内联"无 getter"形态（纯类变量/无
+    // 描述符协议对象）：数据/非数据描述符的 get 调用本就要出线，留
+    // helper 保持完整定序语义。接收者限定 values 形（物化实例回落
+    // helper 的带 hint 物化读）。两形：
+    //  - 快形：fill 时名字不在共享键（keys_version 记录当时 dk 版本）。
+    //    values 形实例的属性名集合 ⊆ 共享键名集，dk 版本未动即无遮蔽
+    //    可能，直返 descr；
+    //  - 探测形：名字在共享键内（keys_version==0），mat_hint 自验证
+    //    （me_key 指针比较，helper 命中时刷新），values[hint] 非空即
+    //    遮蔽值、空槽即未遮蔽返回 descr。kind-7 无"确定 miss 抛错"
+    //    路径（descr 恒在），与 helper/raise 漏斗语义无交集。
+    as_->bind(kind7_check);
+    arch::cmp_immediate(
+        as_, a64::x14, kDescrOrClassVarKind - kSplitInlineKind);
+    as_->b_ne(slow_path);
+    as_->ldr(
+        a64::x9,
+        arch::ptr_offset(a64::x0, kEntryDcvDescrOffset + entry_offset));
+    as_->cbz(a64::x9, slow_path);
+    as_->ldr(a64::x12, arch::ptr_offset(a64::x9, kObTypeOffset));
+    as_->ldr(a64::x12, arch::ptr_offset(a64::x12, kTpDescrGetOffset));
+    as_->cbnz(a64::x12, slow_path);
+    // MANAGED_DICT 标志门（镜像 helper：预头 -4/-3 槽仅 managed dict
+    // 类型存在，非 managed 类型读预头即越界）。非 managed 且
+    // tp_dictoffset==0（__slots__ 类）：无实例字典、无遮蔽可能，
+    // 直返 descr——sqlglot 的"__slots__ 实例读类变量"41 万次/值
+    // 即此形。tp_dictoffset!=0 的传统字典类型回落 helper。
+    Label kind7_managed = as_->newLabel();
+    as_->ldr(a64::x10, arch::ptr_offset(a64::x13, kTpFlagsOffset));
+    as_->tst(a64::x10, Py_TPFLAGS_MANAGED_DICT);
+    as_->b_ne(kind7_managed);
+    as_->ldr(a64::x10, arch::ptr_offset(a64::x13, kTpDictoffsetOffset));
+    as_->cbnz(a64::x10, slow_path);
+    as_->b(return_value); // x9 = descr
+    as_->bind(kind7_managed);
+    as_->ldr(a64::x15, arch::ptr_offset(a64::x1, kValuesPreheaderOffset));
+    as_->cbz(a64::x15, slow_path);
+    as_->ldr(a64::x12, arch::ptr_offset(a64::x13, kHtCachedKeysOffsetLa));
+    as_->cbz(a64::x12, slow_path);
+    Label kind7_probe = as_->newLabel();
+    as_->ldr(
+        a64::w14,
+        arch::ptr_offset(
+            a64::x0,
+            kEntryDcvKeysVerOffset + entry_offset,
+            arch::AccessSize::k32));
+    as_->cbz(a64::w14, kind7_probe);
+    as_->ldr(
+        a64::w10,
+        arch::ptr_offset(a64::x12, kDkVersionOffsetLa, arch::AccessSize::k32));
+    as_->cmp(a64::w10, a64::w14);
+    as_->b_ne(slow_path);
+    as_->b(return_value); // x9 = descr
+    as_->bind(kind7_probe);
+    as_->ldrb(
+        a64::w10,
+        arch::ptr_offset(a64::x12, kDkKindOffset, arch::AccessSize::k8));
+    as_->cbz(a64::w10, slow_path); // general 键防御（共享键恒 unicode）
+    as_->ldr(
+        a64::x14,
+        arch::ptr_offset(a64::x0, kEntryDcvMatHintOffset + entry_offset));
+    as_->ldr(a64::x10, arch::ptr_offset(a64::x12, kDkNentriesOffset));
+    as_->cmp(a64::x14, a64::x10);
+    as_->b_hs(slow_path); // 无符号比较：负/未初始化 hint 一并拦截
+    as_->ldrb(
+        a64::w10,
+        arch::ptr_offset(
+            a64::x12, kDkLog2IndexBytesOffset, arch::AccessSize::k8));
+    as_->mov(a64::x11, 1); // 条目已命中，x11 可复用（同物化块约定）
+    as_->lsl(a64::x11, a64::x11, a64::x10);
+    as_->add(a64::x11, a64::x12, a64::x11);
+    arch::add_immediate(as_, a64::x11, a64::x11, kDkIndicesOffset);
+    as_->add(a64::x11, a64::x11, a64::x14, a64::lsl(4));
+    as_->ldr(a64::x10, a64::ptr(a64::x11)); // me_key
+    as_->cmp(a64::x10, a64::x2);
+    as_->b_ne(slow_path);
+    as_->add(a64::x15, a64::x15, a64::x14, a64::lsl(3));
+    as_->ldr(a64::x10, a64::ptr(a64::x15)); // values[hint]
+    as_->cbz(a64::x10, return_value); // 空槽：未遮蔽 → descr（x9 已持）
+    as_->mov(a64::x9, a64::x10); // 遮蔽值
     as_->b(return_value);
 #endif
   };
