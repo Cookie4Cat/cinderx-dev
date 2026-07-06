@@ -3,6 +3,7 @@
 #include "cinderx/Jit/lir/generator.h"
 
 extern "C" {
+#include "internal/pycore_call.h"
 #include "internal/pycore_ceval.h"
 #include "internal/pycore_intrinsics.h"
 
@@ -897,7 +898,11 @@ void GenerateArgcountCheckBlocks(
     kw_dispatch->allocateInstr(
         Instruction::kCall,
         nullptr,
-        Imm{reinterpret_cast<uint64_t>(JITRT_CallWithKeywordArgs)});
+        // Args are stack allocated in the simple version so only
+        // use if we have a reasonable number of arguments.
+        Imm{reinterpret_cast<uint64_t>(
+            num_args < 30 ? JITRT_CallWithKeywordArgsSimple
+                          : JITRT_CallWithKeywordArgs)});
     kw_dispatch->allocateInstr(
         Instruction::kBranch, nullptr, AsmLbl{prologue_exit});
 
@@ -982,6 +987,7 @@ void GeneratePrimitiveArgsPrologueBlock(
   auto helper = returns_primitive_double
       ? reinterpret_cast<uint64_t>(JITRT_CallStaticallyWithPrimitiveSignatureFP)
       : reinterpret_cast<uint64_t>(JITRT_CallStaticallyWithPrimitiveSignature);
+
   block->allocateInstr(Instruction::kCall, nullptr, Imm{helper});
 
   // The helper either handled the call (result in return register) and we
@@ -2785,7 +2791,8 @@ LIRGenerator::TranslatedBlock LIRGenerator::TranslateOneBasicBlock(
               PyUnicode_AsUTF8(code->co_filename),
               PyUnicode_AsUTF8(code->co_name));
         }
-        bbb.appendCallInstruction(
+        appendCall2RetValues(
+            bbb,
             instr->output(),
             LoadTypeMethodCache::lookupHelper,
             cache_entry,
@@ -2813,7 +2820,8 @@ LIRGenerator::TranslatedBlock LIRGenerator::TranslateOneBasicBlock(
         auto instr = static_cast<const LoadTypeMethodCacheEntryValue*>(&i);
         LoadTypeMethodCache* cache =
             load_type_method_caches_.at(instr->cache_id());
-        bbb.appendCallInstruction(
+        appendCall2RetValues(
+            bbb,
             instr->output(),
             LoadTypeMethodCache::getValueHelper,
             cache,
@@ -2825,7 +2833,7 @@ LIRGenerator::TranslatedBlock LIRGenerator::TranslateOneBasicBlock(
         hir::Register* dst = instr->output();
         hir::Register* base = instr->receiver();
         Instruction* name = getNameFromIdx(bbb, instr);
-        bbb.appendCallInstruction(dst, JITRT_GetMethod, base, name);
+        appendCall2RetValues(bbb, dst, JITRT_GetMethod, base, name);
         break;
       }
       case Opcode::kLoadMethodCached: {
@@ -2843,8 +2851,8 @@ LIRGenerator::TranslatedBlock LIRGenerator::TranslateOneBasicBlock(
               PyUnicode_AsUTF8(code->co_filename),
               PyUnicode_AsUTF8(code->co_name));
         }
-        bbb.appendCallInstruction(
-            dst, LoadMethodCache::lookupHelper, cache, base, name);
+        appendCall2RetValues(
+            bbb, dst, LoadMethodCache::lookupHelper, cache, base, name);
         break;
       }
       case Opcode::kLoadModuleAttrCached: {
@@ -2869,7 +2877,8 @@ LIRGenerator::TranslatedBlock LIRGenerator::TranslateOneBasicBlock(
         auto instr = static_cast<const LoadModuleMethodCached*>(&i);
         Instruction* name = getNameFromIdx(bbb, instr);
         auto cache_entry = getContext()->allocateLoadModuleMethodCache();
-        bbb.appendCallInstruction(
+        appendCall2RetValues(
+            bbb,
             instr->output(),
             LoadModuleMethodCache::lookupHelper,
             cache_entry,
@@ -2885,7 +2894,8 @@ LIRGenerator::TranslatedBlock LIRGenerator::TranslateOneBasicBlock(
       case Opcode::kLoadMethodSuper: {
         auto instr = static_cast<const LoadMethodSuper*>(&i);
         Instruction* name = getNameFromIdx(bbb, instr);
-        bbb.appendCallInstruction(
+        appendCall2RetValues(
+            bbb,
             instr->output(),
             JITRT_GetMethodFromSuper,
             instr->global_super(),
@@ -3482,19 +3492,20 @@ LIRGenerator::TranslatedBlock LIRGenerator::TranslateOneBasicBlock(
           break;
         }
         size_t flags = 0;
-        uint64_t func = reinterpret_cast<uint64_t>(_PyObject_Vectorcall);
+        uint64_t func = reinterpret_cast<uint64_t>(_PyObject_VectorcallTstate);
         if (!(hir_instr.func()->type() <= TFunc)) {
           // Calls to things which aren't simple Python functions will
           // need to check the eval breaker. We do this in a helper instead
           // of injecting it after every call.
-          func = reinterpret_cast<uint64_t>(JITRT_Vectorcall);
+          func = reinterpret_cast<uint64_t>(JITRT_VectorcallTstate);
         }
         Instruction* instr = bbb.appendInstr(
             hir_instr.output(),
-            Instruction::kVectorCall,
+            Instruction::kVectorCallTstate,
             // TASK(T140174965): This should be MemImm.
             Imm{func},
-            Imm{flags});
+            Imm{flags},
+            VReg{env_->asm_tstate});
         for (hir::Register* arg : hir_instr.GetOperands()) {
           instr->addOperands(VReg{bbb.getDefInstr(arg)});
         }
@@ -3608,10 +3619,11 @@ LIRGenerator::TranslatedBlock LIRGenerator::TranslateOneBasicBlock(
         size_t flags = 0;
         Instruction* instr = bbb.appendInstr(
             hir_instr.output(),
-            Instruction::kVectorCall,
+            Instruction::kVectorCallTstate,
             // TASK(T140174965): This should be MemImm.
             Imm{reinterpret_cast<uint64_t>(JITRT_Call)},
-            Imm{flags});
+            Imm{flags},
+            VReg{env_->asm_tstate});
         for (hir::Register* arg : hir_instr.GetOperands()) {
           instr->addOperands(VReg{bbb.getDefInstr(arg)});
         }
@@ -4707,15 +4719,16 @@ LIRGenerator::TranslatedBlock LIRGenerator::TranslateOneBasicBlock(
         const auto& instr = static_cast<const BuildString&>(i);
 
         // using vectorcall here although this is not strictly a vector call.
-        // the callable is always null, and all the components to be
+        // tstate and the callable are always null, and all the components to be
         // concatenated will be in the args argument.
 
         Instruction* lir = bbb.appendInstr(
             instr.output(),
-            Instruction::kVectorCall,
+            Instruction::kVectorCallTstate,
             JITRT_BuildString,
             nullptr,
             nullptr);
+        lir->addOperands(Imm{0});
         for (size_t operandIdx = 0; operandIdx < instr.NumOperands();
              operandIdx++) {
           lir->addOperands(VReg{bbb.getDefInstr(instr.GetOperand(operandIdx))});
@@ -4838,10 +4851,10 @@ LIRGenerator::TranslatedBlock LIRGenerator::TranslateOneBasicBlock(
                 : JITRT_GenSend);
         // Note: asm_interpreter_frame isn't right for inlined functions, but we
         // never inline generators so this is fine for now.
-        bbb.appendInstr(
+        appendCall2RetValues(
+            bbb,
             hir_instr.output(),
-            Instruction::kCall,
-            Imm{func},
+            func,
             hir_instr.GetOperand(0),
             hir_instr.GetOperand(1),
             Imm{0},
@@ -4875,7 +4888,8 @@ LIRGenerator::TranslatedBlock LIRGenerator::TranslateOneBasicBlock(
       }
       case Opcode::kLoadSpecial: {
         auto& load_special = static_cast<const LoadSpecial&>(i);
-        bbb.appendCallInstruction(
+        appendCall2RetValues(
+            bbb,
             load_special.output(),
             JITRT_LoadSpecial,
             load_special.GetOperand(0),
@@ -5202,11 +5216,12 @@ void LIRGenerator::emitLoadFrame(BasicBlockBuilder& bbb) {
         AsmLbl{env_->gen_resume_entry_label});
     // spill_words is read from CodeRuntime by the runtime function,
     // so we don't need to pass it explicitly.
-    env_->asm_tstate = bbb.appendInstr(
-        OutVReg{},
-        Instruction::kCall,
-        Imm{reinterpret_cast<uint64_t>(
-            JITRT_AllocateAndLinkGenAndInterpreterFrame)},
+    Instruction* footer = nullptr;
+    appendCall2RetValues(
+        bbb,
+        env_->asm_tstate,
+        footer,
+        JITRT_AllocateAndLinkGenAndInterpreterFrame,
         env_->asm_func,
         Imm{reinterpret_cast<uint64_t>(env_->code_rt)},
         VReg{resume_label},
@@ -5217,7 +5232,7 @@ void LIRGenerator::emitLoadFrame(BasicBlockBuilder& bbb) {
     bbb.appendInstr(
         OutPhyReg{codegen::arch::reg_frame_pointer_loc},
         Instruction::kMove,
-        PhyReg{codegen::arch::reg_general_auxilary_return_loc});
+        VReg{footer});
 #if defined(CINDER_AARCH64) && defined(ENABLE_LIGHTWEIGHT_FRAMES)
     if (getConfig().frame_mode == FrameMode::kLightweight) {
       // Now that FP points at the heap-allocated GenDataFooter, compute the

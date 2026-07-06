@@ -3462,7 +3462,7 @@ void AutoTranslator::translateInstr(Environ* env, const Instruction* instr)
       return;
     case Instruction::kNone:
     case Instruction::kNop:
-    case Instruction::kVectorCall:
+    case Instruction::kVectorCallTstate:
     case Instruction::kVarArgCall:
     case Instruction::kSext:
     case Instruction::kZext:
@@ -3780,7 +3780,7 @@ void AutoTranslator::translateInstr(Environ* env, const Instruction* instr)
       return;
     case Instruction::kNone:
     case Instruction::kNop:
-    case Instruction::kVectorCall:
+    case Instruction::kVectorCallTstate:
     case Instruction::kVarArgCall:
     case Instruction::kSext:
     case Instruction::kZext:

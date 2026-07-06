@@ -37,6 +37,7 @@
 #endif
 
 #include <cmath>
+#include <cstdlib>
 #include <limits>
 
 // This is mostly taken from ceval.c _PyEval_EvalCodeWithName
@@ -288,7 +289,12 @@ JITRT_StaticCallFPReturn JITRT_CallWithIncorrectArgcountFPReturn(
       (PyObject*)defaulted_args);
 }
 
-JITRT_StaticCallReturn JITRT_CallWithIncorrectArgcount(
+#ifdef _WIN32
+PyObject*
+#else
+JITRT_StaticCallReturn
+#endif
+JITRT_CallWithIncorrectArgcount(
     PyFunctionObject* func,
     PyObject** args,
     size_t nargsf,
@@ -299,7 +305,11 @@ JITRT_StaticCallReturn JITRT_CallWithIncorrectArgcount(
     // Fallback to the default _PyFunction_Vectorcall implementation
     // to produce an appropriate exception.
     auto interpVectorcall = getInterpretedVectorcall(func);
+#ifdef _WIN32
+    return interpVectorcall((PyObject*)func, args, nargsf, nullptr);
+#else
     return {interpVectorcall((PyObject*)func, args, nargsf, nullptr), nullptr};
+#endif
   }
   Py_ssize_t defcount = PyTuple_GET_SIZE(defaults);
   Py_ssize_t nargs = PyVectorcall_NARGS(nargsf);
@@ -309,7 +319,11 @@ JITRT_StaticCallReturn JITRT_CallWithIncorrectArgcount(
   if (nargs + defcount < argcount || nargs > argcount) {
     // Not enough args with defaults, or too many args without defaults.
     auto interpVectorcall = getInterpretedVectorcall(func);
+#ifdef _WIN32
+    return interpVectorcall((PyObject*)func, args, nargsf, nullptr);
+#else
     return {interpVectorcall((PyObject*)func, args, nargsf, nullptr), nullptr};
+#endif
   }
 
   Py_ssize_t i;
@@ -325,6 +339,10 @@ JITRT_StaticCallReturn JITRT_CallWithIncorrectArgcount(
 
   size_t new_nargsf = argcount;
 
+#ifdef _WIN32
+  return JITRT_GET_REENTRY(func->vectorcall)(
+      (PyObject*)func, arg_space.get(), new_nargsf, (PyObject*)defaulted_args);
+#else
   return reinterpret_cast<staticvectorcallfunc>(
       JITRT_GET_REENTRY(func->vectorcall))(
       (PyObject*)func,
@@ -333,6 +351,7 @@ JITRT_StaticCallReturn JITRT_CallWithIncorrectArgcount(
       // We lie to C++ here, and smuggle in the number of defaulted args filled
       // in.
       (PyObject*)defaulted_args);
+#endif
 }
 
 bool JITRT_PackStaticArgs(
@@ -1024,6 +1043,7 @@ JITRT_CallFunctionEx(PyObject* func, PyObject* pargs, PyObject* kwargs) {
 }
 
 PyObject* JITRT_Call(
+    PyThreadState* tstate,
     PyObject* callable,
     PyObject* const* args,
     size_t nargsf,
@@ -1052,7 +1072,6 @@ PyObject* JITRT_Call(
     }
   }
 
-  PyThreadState* tstate = _PyThreadState_GET();
   PyObject* res =
       _PyObject_VectorcallTstate(tstate, callable, args, nargsf, kwnames);
   // In 3.12 calls to non-Python functions will check for the eval breaker
@@ -1065,12 +1084,12 @@ PyObject* JITRT_Call(
   return res;
 }
 
-PyObject* JITRT_Vectorcall(
+PyObject* JITRT_VectorcallTstate(
+    PyThreadState* tstate,
     PyObject* callable,
     PyObject* const* args,
     size_t nargsf,
     PyObject* kwnames) {
-  PyThreadState* tstate = _PyThreadState_GET();
   PyObject* res =
       _PyObject_VectorcallTstate(tstate, callable, args, nargsf, kwnames);
   // In 3.12 calls to non-Python functions will check for the eval breaker
@@ -1666,6 +1685,7 @@ PyObject* JITRT_FormatValue(
 }
 
 PyObject* JITRT_BuildString(
+    PyThreadState* /*tstate*/,
     void* /*unused*/,
     PyObject** args,
     size_t nargsf,
@@ -2572,4 +2592,125 @@ void JITRT_TreeIterLeaveCurrentNode(jit::GenDataFooter* footer) {
 
 void JITRT_ClearTreeIterState(jit::GenDataFooter* footer) {
   jit::clearTreeIterState(footer);
+}
+
+static int JITRT_BindKeywordArgsSimple(
+    PyFunctionObject* func,
+    PyObject** args,
+    size_t nargsf,
+    PyObject* kwnames,
+    PyObject** arg_space,
+    Py_ssize_t total_args) {
+  PyCodeObject* co = (PyCodeObject*)func->func_code;
+  Py_ssize_t argcount = PyVectorcall_NARGS(nargsf);
+  if (argcount > co->co_argcount) {
+    return 0;
+  }
+
+  for (int i = 0; i < total_args; i++) {
+    arg_space[i] = nullptr;
+  }
+
+  // Copy all positional arguments into local variables
+  Py_ssize_t n = std::min<Py_ssize_t>(argcount, co->co_argcount);
+  for (Py_ssize_t j = 0; j < n; j++) {
+    arg_space[j] = args[j];
+  }
+
+  // Handle keyword arguments
+  if (kwnames != nullptr) {
+    for (Py_ssize_t i = 0; i < PyTuple_Size(kwnames); i++) {
+      PyObject* keyword = PyTuple_GET_ITEM(kwnames, i);
+      PyObject* value = args[argcount + i];
+      Py_ssize_t j;
+
+      if (keyword == nullptr || !PyUnicode_Check(keyword)) {
+        return 0;
+      }
+
+      // Speed hack: do raw pointer compares.
+      for (j = co->co_posonlyargcount; j < total_args; j++) {
+        PyObject* name = jit::getVarname(co, j);
+        if (name == keyword) {
+          goto kw_found;
+        }
+      }
+
+      // Slow fallback
+      for (j = co->co_posonlyargcount; j < total_args; j++) {
+        PyObject* name = jit::getVarname(co, j);
+        int cmp = PyObject_RichCompareBool(keyword, name, Py_EQ);
+        if (cmp > 0) {
+          goto kw_found;
+        } else if (cmp < 0) {
+          return 0;
+        }
+      }
+
+      return 0;
+
+    kw_found:
+      if (arg_space[j] != nullptr) {
+        return 0;
+      }
+      arg_space[j] = value;
+    }
+  }
+
+  // Check number of positional arguments
+  if ((argcount > co->co_argcount) && kwnames == nullptr) {
+    return 0;
+  }
+
+  // Add missing positional arguments (copy default values from defs)
+  if (argcount < co->co_argcount) {
+    PyObject* defaults = func->func_defaults;
+    Py_ssize_t defcount = defaults == nullptr ? 0 : PyTuple_Size(defaults);
+    Py_ssize_t first_default_arg = co->co_argcount - defcount;
+
+    for (Py_ssize_t i = argcount; i < first_default_arg; i++) {
+      if (arg_space[i] == nullptr) {
+        return 0;
+      }
+    }
+
+    if (defaults != nullptr) {
+      PyObject* const* defs = &((PyTupleObject*)defaults)->ob_item[0];
+      Py_ssize_t arg_index = std::max(argcount, first_default_arg);
+      for (; arg_index < co->co_argcount; arg_index++) {
+        if (arg_space[arg_index] == nullptr) {
+          Py_ssize_t def_index = arg_index - first_default_arg;
+          arg_space[arg_index] = defs[def_index];
+        }
+      }
+    }
+  }
+
+  return 1;
+}
+
+PyObject* JITRT_CallWithKeywordArgsSimple(
+    PyFunctionObject* func,
+    PyObject** args,
+    size_t nargsf,
+    PyObject* kwnames) {
+  PyCodeObject* co = (PyCodeObject*)func->func_code;
+  JIT_DCHECK(
+      !(co->co_flags & (CO_VARARGS | CO_VARKEYWORDS)),
+      "JITRT_CallWithKeywordArgsSimple doesn't support varargs");
+  JIT_DCHECK(
+      !co->co_kwonlyargcount,
+      "JITRT_CallWithKeywordArgsSimple doesn't support kw only args");
+  const Py_ssize_t total_args = co->co_argcount;
+
+  // stack allocate
+  auto arg_space = (PyObject**)alloca(total_args * sizeof(PyObject*));
+
+  if (JITRT_BindKeywordArgsSimple(func, args, nargsf, kwnames, arg_space, total_args)) {
+    size_t new_nargsf = total_args;
+    return JITRT_GET_REENTRY(func->vectorcall)(
+        (PyObject*)func, arg_space, new_nargsf, nullptr);
+  }
+
+  return Ci_PyFunction_Vectorcall((PyObject*)func, args, nargsf, kwnames);
 }

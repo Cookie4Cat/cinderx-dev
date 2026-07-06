@@ -18,6 +18,17 @@ namespace jit::lir {
 
 namespace {
 
+// kPointerSize is sizeof(void*) cast to an int32_t for arithmetic use.
+constexpr int32_t kPointerSize = static_cast<int32_t>(sizeof(void*));
+
+// Shadow space reserved by the x64 Windows calling convention. On System V
+// x64 and non-x64 platforms this is 0.
+#if defined(CINDER_X86_64) && defined(_WIN32)
+constexpr int kShadowSpaceSize = 4 * kPointerSize;
+#else
+constexpr int kShadowSpaceSize = 0;
+#endif
+
 RewriteResult removePhiInstructions(instr_iter_t instr_iter) {
   auto& instr = *instr_iter;
 
@@ -202,66 +213,146 @@ int prepareArgsArray(
   return rsp_sub;
 }
 
-int rewriteVectorCallFunctions(instr_iter_t instr_iter, int base_offset) {
+int rewriteVectorCallCommon(
+    instr_iter_t instr_iter,
+    int base_offset,
+    int reg_offset,
+    size_t callable_input,
+    size_t first_arg) {
   auto instr = instr_iter->get();
-
-  // For vector calls there are 4 fixed arguments:
-  // * #0   - runtime helper function
-  // * #1   - flags to be added to nargsf
-  // * #2   - callable
-  // * #n-1 - kwnames
-  constexpr int kFirstArg = 3;
-
   auto flag = instr->getInput(1)->getConstant();
-  auto num_args = instr->getNumInputs() - kFirstArg - 1;
+  auto num_args = instr->getNumInputs() - first_arg - 1;
 
   // first argument
   auto block = instr->basicblock();
   auto move = block->allocateInstrBefore(instr_iter, Instruction::kMove);
-  move->output()->setPhyRegister(ARGUMENT_REGS[0]);
-  move->output()->setDataType(instr->getInput(2)->dataType());
-  move->appendInput(instr->releaseInput(2)); // callable
+  move->output()->setPhyRegister(ARGUMENT_REGS[reg_offset]);
+  move->output()->setDataType(instr->getInput(callable_input)->dataType());
+  move->appendInput(instr->releaseInput(callable_input));
 
   constexpr PhyLocation TMP_REG = arch::reg_scratch_0_loc;
+
+  // If kwnames needs the stack, shift the args buffer past the shadow space
+  // and kwnames slot so they don't overlap.  Without this, with 5+ Python
+  // args the args array at RSP+8 extends past RSP+kShadowSpaceSize and
+  // writing kwnames there clobbers an arg.
+  size_t kwnames_idx = static_cast<size_t>(reg_offset + 3);
+  if (kwnames_idx >= ARGUMENT_REGS.size()) {
+    base_offset = std::max(base_offset, kShadowSpaceSize + kPointerSize);
+  }
+
   int rsp_sub = prepareArgsArray(
       instr_iter,
       num_args,
       flag | PY_VECTORCALL_ARGUMENTS_OFFSET,
-      kFirstArg,
-      ARGUMENT_REGS[1],
-      ARGUMENT_REGS[2],
+      first_arg,
+      ARGUMENT_REGS[reg_offset + 1],
+      ARGUMENT_REGS[reg_offset + 2],
       base_offset);
 
-  // check if kwnames is provided
   auto last_input = instr->releaseInput(instr->getNumInputs() - 1);
-  if (last_input->isImm()) {
-    JIT_DCHECK(last_input->getConstant() == 0, "kwnames must be 0 or variable");
-    block->allocateInstrBefore(
-        instr_iter,
-        Instruction::kXor,
-        PhyReg(ARGUMENT_REGS[3]),
-        PhyReg(ARGUMENT_REGS[3]));
+  if (kwnames_idx < ARGUMENT_REGS.size()) {
+    // kwnames fits in a register.
+    if (last_input->isImm()) {
+      JIT_DCHECK(
+          last_input->getConstant() == 0, "kwnames must be 0 or variable");
+      block->allocateInstrBefore(
+          instr_iter,
+          Instruction::kXor,
+          PhyReg(ARGUMENT_REGS[kwnames_idx]),
+          PhyReg(ARGUMENT_REGS[kwnames_idx]));
+    } else {
+      auto move_2 = block->allocateInstrBefore(
+          instr_iter,
+          Instruction::kMove,
+          OutPhyReg(ARGUMENT_REGS[kwnames_idx]));
+      move_2->appendInput(std::move(last_input));
+
+      size_t ob_size_offs = offsetof(PyVarObject, ob_size);
+      block->allocateInstrBefore(
+          instr_iter,
+          Instruction::kMove,
+          OutPhyReg(TMP_REG),
+          Ind(ARGUMENT_REGS[kwnames_idx], (int32_t)ob_size_offs));
+
+      block->allocateInstrBefore(
+          instr_iter,
+          Instruction::kSub,
+          PhyReg(ARGUMENT_REGS[reg_offset + 2]),
+          PhyReg(TMP_REG));
+    }
   } else {
-    auto move_2 = block->allocateInstrBefore(
-        instr_iter, Instruction::kMove, OutPhyReg(ARGUMENT_REGS[3]));
-    move_2->appendInput(std::move(last_input));
+    // kwnames doesn't fit in a register (Windows x64 with 5+ C-level args).
+    // Pass it at [RSP + kShadowSpaceSize] (first stack argument slot in
+    // the Windows x64 calling convention).  The args buffer was shifted
+    // past this slot via base_offset above.
+    constexpr auto sp = arch::reg_stack_pointer_loc;
+    int kwnames_stk_offset = kShadowSpaceSize;
+    if (last_input->isImm()) {
+      JIT_DCHECK(
+          last_input->getConstant() == 0, "kwnames must be 0 or variable");
+      block->allocateInstrBefore(
+          instr_iter,
+          Instruction::kMove,
+          OutInd{sp, kwnames_stk_offset, DataType::k64bit},
+          Imm{0, DataType::k64bit});
+    } else {
+      insertMoveToMemoryLocation(
+          block, instr_iter, sp, kwnames_stk_offset, last_input.get(), TMP_REG);
 
-    // Subtract the length of kwnames (always a tuple) from nargsf (arg2)
-    size_t ob_size_offs = offsetof(PyVarObject, ob_size);
-    block->allocateInstrBefore(
-        instr_iter,
-        Instruction::kMove,
-        OutPhyReg(TMP_REG),
-        Ind(ARGUMENT_REGS[3], (int32_t)ob_size_offs));
+      // Subtract kwnames tuple length from nargsf.
+      block->allocateInstrBefore(
+          instr_iter,
+          Instruction::kMove,
+          OutPhyReg(TMP_REG),
+          Ind(sp, kwnames_stk_offset));
 
-    block->allocateInstrBefore(
-        instr_iter,
-        Instruction::kSub,
-        PhyReg(ARGUMENT_REGS[2]),
-        PhyReg(TMP_REG));
+      size_t ob_size_offs = offsetof(PyVarObject, ob_size);
+      block->allocateInstrBefore(
+          instr_iter,
+          Instruction::kMove,
+          OutPhyReg(TMP_REG),
+          Ind(TMP_REG, (int32_t)ob_size_offs));
+
+      block->allocateInstrBefore(
+          instr_iter,
+          Instruction::kSub,
+          PhyReg(ARGUMENT_REGS[reg_offset + 2]),
+          PhyReg(TMP_REG));
+    }
+    // Total stack = shifted base_offset + args buffer.
+    rsp_sub = base_offset + rsp_sub;
+    if (rsp_sub % kStackAlign != 0) {
+      rsp_sub += kStackAlign - (rsp_sub % kStackAlign);
+    }
   }
 
   return rsp_sub;
+}
+
+int rewriteVectorCallTstateFunctions(
+    instr_iter_t instr_iter,
+    int base_offset) {
+  auto instr = instr_iter->get();
+
+  // For vector calls with tstate there are 5 fixed arguments:
+  // * #0   - runtime helper function
+  // * #1   - flags to be added to nargsf
+  // * #2   - tstate
+  // * #3   - callable
+  // * #n-1 - kwnames
+  constexpr int kFirstArg = 4;
+
+  // move tstate to first argument register
+  auto block = instr->basicblock();
+  auto move_tstate =
+      block->allocateInstrBefore(instr_iter, Instruction::kMove);
+  move_tstate->output()->setPhyRegister(ARGUMENT_REGS[0]);
+  move_tstate->output()->setDataType(instr->getInput(2)->dataType());
+  move_tstate->appendInput(instr->releaseInput(2)); // tstate
+
+  return rewriteVectorCallCommon(
+      instr_iter, base_offset, 1, 3, kFirstArg);
 }
 
 int rewriteVarArgCall(instr_iter_t instr_iter, int base_offset) {
@@ -295,7 +386,7 @@ RewriteResult rewriteCallInstrs(instr_iter_t instr_iter, Environ* env) {
         std::max<int>(env->max_arg_buffer_size, base_offset + rsp_sub);
     return kChanged;
   } else if (
-      !instr->isCall() && !instr->isVectorCall() &&
+      !instr->isCall() && !instr->isVectorCallTstate() &&
       !instr->isLoadAttrCachedFastPath()) {
     return kUnchanged;
   }
@@ -309,8 +400,8 @@ RewriteResult rewriteCallInstrs(instr_iter_t instr_iter, Environ* env) {
   int rsp_sub = 0;
   auto block = instr->basicblock();
 
-  if (instr->isVectorCall()) {
-    rsp_sub = rewriteVectorCallFunctions(instr_iter, base_offset);
+  if (instr->isVectorCallTstate()) {
+    rsp_sub = rewriteVectorCallTstateFunctions(instr_iter, base_offset);
   } else {
     rsp_sub = rewriteRegularFunction(instr_iter, base_offset);
   }
@@ -920,7 +1011,7 @@ RewriteResult rewriteMemoryInputsToReg(instr_iter_t instr_iter) {
     case Instruction::kNop:
     case Instruction::kUnreachable:
     case Instruction::kCall:
-    case Instruction::kVectorCall:
+    case Instruction::kVectorCallTstate:
     case Instruction::kVarArgCall:
     case Instruction::kA64GuardCC:
     case Instruction::kGuard:

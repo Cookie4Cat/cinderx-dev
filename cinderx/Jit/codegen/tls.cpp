@@ -101,6 +101,51 @@ void initThreadStateOffset() {
   module_state->tstate_offset =
       parseThreadStatePrologue(ts_func, kMaxThreadStatePrologueInsns)
           .value_or(-1);
+#ifdef __linux__
+  // TLSDESC fallback: if the initial-exec pattern didn't match, check for
+  // a TLSDESC sequence. When the descriptor is already resolved its
+  // resolver is _dl_tlsdesc_return which just returns desc[1] — the TLS
+  // offset we need.
+  if (module_state->tstate_offset == -1 &&
+      ts_func[0] == 0xa9bf7bfd && // stp x29, x30, [sp, #-16]!
+      ts_func[1] == 0x910003fd && // mov x29, sp
+      (ts_func[2] & 0x9f00001f) == 0x90000000 && // adrp x0, #imm
+      (ts_func[3] & 0xffc003ff) == 0xf9400001 && // ldr x1, [x0, #imm]
+      (ts_func[4] & 0xffc003ff) == 0x91000000 && // add x0, x0, #imm
+      ts_func[5] == 0xd63f0020) // blr x1
+  {
+    // Decode adrp x0, #imm -> page address
+    uint32_t adrp = ts_func[2];
+    int64_t immlo = (adrp >> 29) & 0x3;
+    int64_t immhi = (adrp >> 5) & 0x7ffff;
+    int64_t page_off = ((immhi << 2) | immlo) << 12;
+    // Sign-extend from 33 bits (21-bit imm << 12)
+    if (page_off & (1LL << 32)) {
+      page_off |= ~((1LL << 33) - 1);
+    }
+    uintptr_t adrp_pc = reinterpret_cast<uintptr_t>(&ts_func[2]);
+    uintptr_t page_base = (adrp_pc & ~0xfffULL) + page_off;
+
+    // Decode add x0, x0, #imm -> lo12 byte offset
+    uint32_t add_insn = ts_func[4];
+    uint32_t lo12 = (add_insn >> 10) & 0xfff;
+    if (add_insn & (1 << 22)) {
+      lo12 <<= 12;
+    }
+
+    // descriptor[0] = resolver, descriptor[1] = arg (the TLS offset)
+    auto* desc = reinterpret_cast<uintptr_t*>(page_base + lo12);
+    int32_t current_offset = static_cast<int32_t>(desc[1]);
+
+    // Verify the offset is correct by comparing against the actual function.
+    uintptr_t tp;
+    asm volatile("mrs %0, tpidr_el0" : "=r"(tp));
+    auto* from_offset = *reinterpret_cast<PyThreadState**>(tp + current_offset);
+    if (from_offset == _PyThreadState_GetCurrent()) {
+      module_state->tstate_offset = current_offset;
+    }
+  }
+#endif
 #else
   CINDER_UNSUPPORTED
 #endif

@@ -276,6 +276,67 @@ class LIRGenerator {
 
   Function* lir_func_{nullptr};
 
+  // Emit a call to a C++ function that returns a two-field struct...
+  template <typename Func, typename... Args>
+  void appendCall2RetValues(
+      BasicBlockBuilder& bbb,
+      hir::Register* dst,
+      Func func,
+      Args&&... args) {
+#if defined(CINDER_X86_64) && defined(_WIN32)
+    // Windows x64 hidden pointer ABI
+    Instruction* ret_struct = bbb.appendInstr(
+        OutVReg{},
+        Instruction::kLea,
+        Stk{PhyLocation(env_->win_struct_ret_offset)});
+    bbb.appendInstr(
+        OutVReg{},
+        Instruction::kCall,
+        func,
+        VReg{ret_struct},
+        std::forward<Args>(args)...);
+    bbb.appendInstr(dst, Instruction::kMove, Ind{ret_struct, 0});
+    bbb.appendInstr(
+        OutPhyReg{codegen::arch::reg_general_auxilary_return_loc},
+        Instruction::kMove,
+        Ind{ret_struct, 8});
+#else
+    bbb.appendInstr(dst, Instruction::kCall, func, std::forward<Args>(args)...);
+#endif
+  }
+
+  template <typename Func, typename... Args>
+  void appendCall2RetValues(
+      BasicBlockBuilder& bbb,
+      Instruction*& first_out,
+      Instruction*& second_out,
+      Func func,
+      Args&&... args) {
+#if defined(CINDER_X86_64) && defined(_WIN32)
+    Instruction* ret_struct = bbb.appendInstr(
+        OutVReg{},
+        Instruction::kLea,
+        Stk{PhyLocation(env_->win_struct_ret_offset)});
+    bbb.appendInstr(
+        OutVReg{},
+        Instruction::kCall,
+        func,
+        VReg{ret_struct},
+        std::forward<Args>(args)...);
+    first_out =
+        bbb.appendInstr(OutVReg{}, Instruction::kMove, Ind{ret_struct, 0});
+    second_out =
+        bbb.appendInstr(OutVReg{}, Instruction::kMove, Ind{ret_struct, 8});
+#else
+    first_out = bbb.appendInstr(
+        OutVReg{}, Instruction::kCall, func, std::forward<Args>(args)...);
+    second_out = bbb.appendInstr(
+        OutVReg{},
+        Instruction::kMove,
+        PhyReg{codegen::arch::reg_general_auxilary_return_loc});
+#endif
+  }
+
 #if defined(CINDER_AARCH64)
   // Address of the deopt_idx field in the FrameHeader, computed once per
   // function in the entry block. Used by TranslateOneBasicBlock to store the
