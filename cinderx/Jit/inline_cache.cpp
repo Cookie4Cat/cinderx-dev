@@ -101,9 +101,56 @@ inline PyDictObject* get_or_allocate_dict(
   return dict;
 }
 
+#if PY_VERSION_HEX < 0x030C0000
+// slot_tp_getattr_hook 探针（劣化归因轮 C2）：定义 __getattr__（而非
+// __getattribute__）的类，tp_getattro 为 typeobject.c 的静态函数
+// slot_tp_getattr_hook——语义 = 先走 GenericGetAttr，AttributeError
+// 时才进 __getattr__。该符号不导出，首次调用时经探针类捕获。命中侧
+// 缓存对这类接收者语义不变（通用阶段找到即 hook 的返回值），可安全
+// 放行填充；探针失败返回 nullptr，一切比较落空即行为不变。
+getattrofunc ciSlotTpGetattrHook() {
+  static getattrofunc hook = []() -> getattrofunc {
+    auto globals = Ref<>::steal(PyDict_New());
+    if (globals == nullptr) {
+      PyErr_Clear();
+      return nullptr;
+    }
+    auto res = Ref<>::steal(PyRun_String(
+        "class _CixGetattrProbe:\n"
+        "    def __getattr__(self, name):\n"
+        "        raise AttributeError(name)\n",
+        Py_file_input,
+        globals,
+        globals));
+    if (res == nullptr) {
+      PyErr_Clear();
+      return nullptr;
+    }
+    PyObject* cls = PyDict_GetItemString(globals, "_CixGetattrProbe");
+    if (cls == nullptr || !PyType_Check(cls)) {
+      return nullptr;
+    }
+    getattrofunc fn = reinterpret_cast<PyTypeObject*>(cls)->tp_getattro;
+    return fn == PyObject_GenericGetAttr ? nullptr : fn;
+  }();
+  return hook;
+}
+#endif
+
 PyObject* __attribute__((noinline)) raise_attribute_error(
     PyObject* obj,
     PyObject* name) {
+#if PY_VERSION_HEX < 0x030C0000
+  // 各缓存 kind 的"确定 miss"统一漏斗。__getattr__ 类（C2 放行填充
+  // 的接收者）在此不得直接抛错——hook 语义为通用阶段未找到时进
+  // __getattr__ 兜底。改走完整协议（含 __getattr__；sphinx Config
+  // 惰性填充模式实测教训：新实例空槽 miss 直接抛错会绕过兜底，
+  // 全部构建瞬间失败）。通用类行为不变。
+  getattrofunc hook = ciSlotTpGetattrHook();
+  if (hook != nullptr && Py_TYPE(obj)->tp_getattro == hook) {
+    return PyObject_GetAttr(obj, name);
+  }
+#endif
   PyErr_Format(
       PyExc_AttributeError,
       "'%.50s' object has no attribute '%U'",
@@ -146,7 +193,9 @@ void maybeCollectCacheStats(
     BorrowedRef<PyTypeObject> tp,
     BorrowedRef<> name,
     CacheMissReason reason) {
-  if (!getConfig().collect_attr_cache_stats) {
+  // stat 可为空：initCacheStats 只在 LIR 分配点按旗标配套调用，运行期
+  // 增设的缓存（如 lm 的类型接收者委托实例）未必初始化过。
+  if (stat == nullptr || !getConfig().collect_attr_cache_stats) {
     return;
   }
   std::string key =
@@ -1241,7 +1290,11 @@ PyObject* LoadAttrCache::doInvoke(PyObject* obj, PyObject* name) {
     break;
   }
 #if PY_VERSION_HEX < 0x030C0000
-  if (PyObject* result = siteExtGetAttr(obj)) {
+  if (PyType_Check(obj)) {
+    if (PyObject* result = typeRecvGetAttr(obj)) {
+      return result;
+    }
+  } else if (PyObject* result = siteExtGetAttr(obj)) {
     return result;
   }
 #endif
@@ -1266,7 +1319,23 @@ PyObject* __attribute__((noinline)) LoadAttrCache::invokeSlowPath(
     fill(type, name);
   }
 #if PY_VERSION_HEX < 0x030C0000
-  else {
+  else if (PyType_Check(obj)) {
+    // C1：类型接收者多条目缓存（元类型 getattro，通用 fill 拒收）。
+    typeRecvTryFill(obj, name, result);
+  } else if (
+      ciSlotTpGetattrHook() != nullptr &&
+      type->tp_getattro == ciSlotTpGetattrHook()) {
+    // C2：__getattr__ 类（slot_tp_getattr_hook）——命中侧语义与
+    // GenericGetAttr 同一。仅当结果溯源到通用阶段（实例属性直读或
+    // MRO 解析同一对象）才填充；__getattr__ 兜底产物动态，不缓存。
+    // 填充后命中即通用阶段命中，__getattr__ 不再参与；属性删除/类
+    // 变更经既有共享键版本与 tp_version_tag 校验自然失效回慢路径，
+    // 彼时重新走完整 hook 语义。
+    if (ci_peek_instance_attr_311(obj, name) == result.get() ||
+        _PyType_Lookup(type, name) == result.get()) {
+      fill(type, name);
+    }
+  } else {
     siteExtTryFill(obj, name, result);
   }
 #endif
@@ -1533,6 +1602,24 @@ LoadMethodResult LoadMethodCache::lookup(
     BorrowedRef<> obj,
     BorrowedRef<> name) {
   incICStat(g_ic_runtime_stats.lm_helper);
+#if PY_VERSION_HEX < 0x030C0000
+  // C1：类型对象作接收者——通用条目按元类型键控永不命中，慢路径又对
+  // type_getattro 早退拒填。委托类型方法缓存（type_getattro 语义 +
+  // tp_version_tag 拉式校验）。惰性分配。
+  if (PyType_Check(obj)) {
+    if (type_recv_cache_ == nullptr) {
+      type_recv_cache_ = std::make_unique<LoadTypeMethodCache>();
+      if (cache_stats_ != nullptr) {
+        type_recv_cache_->initCacheStats(
+            cache_stats_->filename.c_str(),
+            cache_stats_->method_name.c_str());
+      }
+    }
+    return type_recv_cache_->lookup(
+        BorrowedRef<PyTypeObject>{reinterpret_cast<PyTypeObject*>(obj.get())},
+        name);
+  }
+#endif
   BorrowedRef<PyTypeObject> tp = Py_TYPE(obj);
 
   for (auto& entry : entries_) {
@@ -1699,6 +1786,24 @@ LoadMethodResult __attribute__((noinline)) LoadMethodCache::lookupSlowPath(
   if ((tp->tp_getattro != PyObject_GenericGetAttr)) {
     PyObject* res = PyObject_GetAttr(obj, name);
     if (res != nullptr) {
+#if PY_VERSION_HEX < 0x030C0000
+      // C2（劣化归因轮）：slot_tp_getattr_hook（定义 __getattr__ 的
+      // 类）语义 = 先 GenericGetAttr、未找到才进 __getattr__。命中
+      // 溯源到类侧函数（绑定方法的 __func__ 与 MRO 解析同一）即回填
+      // 通用条目——后续命中走条目/桩快路径，实例遮蔽由共享键版本
+      // 防护；类侧变更由 tp_version_tag 拉式校验。填充后通用阶段
+      // 必命中，__getattr__ 不再参与，语义不变。__getattr__ 兜底
+      // 产物（代理转发等动态结果）不溯源不缓存。
+      getattrofunc hook = ciSlotTpGetattrHook();
+      if (hook != nullptr && tp->tp_getattro == hook &&
+          PyMethod_Check(res) && PyMethod_GET_SELF(res) == obj.get()) {
+        BorrowedRef<> func{PyMethod_GET_FUNCTION(res)};
+        BorrowedRef<> descr = _PyType_Lookup(tp, name);
+        if (descr == func && PyFunction_Check(descr.get())) {
+          fill(tp, descr, name);
+        }
+      }
+#endif
       maybeCollectCacheStats(
           cache_stats_, tp, name, CacheMissReason::kWrongTpGetAttro);
       Py_INCREF(Py_None);
@@ -2200,19 +2305,140 @@ void AttributeCache::siteExtTryFill(
     }
     return;
   }
-  if (PyType_Check(obj)) {
-    auto tp = reinterpret_cast<PyTypeObject*>(obj);
-    PyObject* value = _PyType_Lookup(tp, name);
-    // 仅纯类变量：解析值无 __get__ 且泛型协议返回原对象（排除元类
-    // 数据描述符、classmethod/staticmethod/函数等描述符形态）。
-    if (value != nullptr && value == result &&
-        Py_TYPE(value)->tp_descr_get == nullptr && ensureVersionTag(tp)) {
-      site_container_ = obj;
-      site_value_ = value;
-      site_version_ = tp->tp_version_tag;
-      site_kind_ = SiteExtKind::kTypeAttr;
-    }
+  // 类型接收者不再走单槽 siteExt（多态受者单槽即失效），改由
+  // typeRecv* 多条目缓存承接（劣化归因轮 C1）；kTypeAttr 枚举值保留
+  // 以兼容既有槽位状态。
+}
+
+PyObject* AttributeCache::typeRecvGetAttr(PyObject* obj) {
+  if (type_recv_ == nullptr) {
+    return nullptr;
   }
+  auto tp = reinterpret_cast<PyTypeObject*>(obj);
+  PyTypeObject* metatype = Py_TYPE(obj);
+  for (auto& e : type_recv_->entries) {
+    if (e.form == TypeRecvEntry::Form::kNone) {
+      continue;
+    }
+    if (e.form == TypeRecvEntry::Form::kValue) {
+      if (e.recv != tp) {
+        continue;
+      }
+      // 元类型版本校验（元类型侧无新增数据描述符遮蔽）+ 受者版本
+      // 校验（其 MRO 任意层变更经 PyType_Modified 传播）。失效即
+      // 清槽（版本单调，该条目不可能再命中；清槽期间不触碰借引用，
+      // D9）。
+      if (!Ci_Type_HasValidVersionTag(metatype) ||
+          metatype->tp_version_tag != e.meta_version) {
+        e = TypeRecvEntry{};
+        return nullptr;
+      }
+      if (!Ci_Type_HasValidVersionTag(tp) ||
+          tp->tp_version_tag != e.recv_version) {
+        e = TypeRecvEntry{};
+        return nullptr;
+      }
+      incICStat(g_ic_runtime_stats.la_site_type_hit);
+      return Py_NewRef(e.payload);
+    }
+    // kMetaDescr：按元类型键控（同名数据描述符对该元类型的一切类
+    // 通用），受者无关；元类型版本钉住描述符身份，数据描述符优先级
+    // 不受受者字典影响，受者版本无需校验。
+    if (e.recv != metatype) {
+      continue;
+    }
+    if (!Ci_Type_HasValidVersionTag(metatype) ||
+        metatype->tp_version_tag != e.meta_version) {
+      e = TypeRecvEntry{};
+      return nullptr;
+    }
+    incICStat(g_ic_runtime_stats.la_site_type_hit);
+    descrgetfunc get = Py_TYPE(e.payload)->tp_descr_get;
+    return get(e.payload, obj, reinterpret_cast<PyObject*>(metatype));
+  }
+  return nullptr;
+}
+
+void AttributeCache::typeRecvTryFill(
+    PyObject* obj,
+    PyObject* name,
+    PyObject* result) {
+  auto tp = reinterpret_cast<PyTypeObject*>(obj);
+  PyTypeObject* metatype = Py_TYPE(obj);
+  // 仅标准 type_getattro 语义可复刻；自定义元类型 getattro 不缓存。
+  if (metatype->tp_getattro != PyType_Type.tp_getattro ||
+      !ensureVersionTag(metatype)) {
+    return;
+  }
+  if (type_recv_ == nullptr) {
+    type_recv_ = std::make_unique<TypeRecvEntries>();
+  }
+  // 槽位选择：同键旧槽优先（重填），其次空槽，否则轮转替换（多态
+  // 类型受者轮换是本缓存的核心场景）。kMetaDescr 以元类型为键。
+  auto pick_slot = [&](PyTypeObject* key) -> TypeRecvEntry* {
+    TypeRecvEntry* slot = nullptr;
+    for (auto& e : type_recv_->entries) {
+      if (e.recv == key) {
+        return &e;
+      }
+      if (slot == nullptr && e.form == TypeRecvEntry::Form::kNone) {
+        slot = &e;
+      }
+    }
+    if (slot == nullptr) {
+      slot = &type_recv_->entries[type_recv_->rr];
+      type_recv_->rr = (type_recv_->rr + 1) % TypeRecvEntries::kNumEntries;
+    }
+    return slot;
+  };
+
+  BorrowedRef<> meta_attr = _PyType_Lookup(metatype, name);
+  if (meta_attr != nullptr &&
+      Py_TYPE(meta_attr.get())->tp_descr_get != nullptr &&
+      PyDescr_IsData(meta_attr.get())) {
+    // kMetaDescr：元类型数据描述符（getset 如 __name__/__dict__），
+    // 按元类型键控——对该元类型的一切类通用。与 result 的一致性由
+    // type_getattro 语义保证（数据描述符必胜）。
+    *pick_slot(metatype) = TypeRecvEntry{
+        metatype,
+        0,
+        metatype->tp_version_tag,
+        TypeRecvEntry::Form::kMetaDescr,
+        meta_attr.get()};
+    return;
+  }
+  TypeRecvEntry* slot = pick_slot(tp);
+
+  BorrowedRef<> raw = _PyType_Lookup(tp, name);
+  if (raw == nullptr) {
+    return;
+  }
+  PyObject* payload = nullptr;
+  PyTypeObject* rt = Py_TYPE(raw.get());
+  if (raw.get() == result) {
+    // 身份稳定形态：无 __get__ 的纯类变量，或"类上访问自返"的已知
+    // 描述符类型（函数/wrapper/method 描述符——get(attr, NULL, type)
+    // 恒返自身）。自定义描述符即使本次自返也不收（可能有状态）。
+    if (rt->tp_descr_get == nullptr || rt == &PyFunction_Type ||
+        rt == &PyWrapperDescr_Type || rt == &PyMethodDescr_Type) {
+      payload = raw.get();
+    }
+  } else if (
+      rt == &PyStaticMethod_Type &&
+      Ci_PyStaticMethod_GetFunc(raw.get()) == result) {
+    // staticmethod 解包稳定（payload 存底层函数，寿命随 staticmethod
+    // 对象在受者字典中的存活，由受者版本钉住）。
+    payload = result;
+  }
+  if (payload == nullptr || !ensureVersionTag(tp)) {
+    return;
+  }
+  *slot = TypeRecvEntry{
+      tp,
+      tp->tp_version_tag,
+      metatype->tp_version_tag,
+      TypeRecvEntry::Form::kValue,
+      payload};
 }
 
 #endif // PY_VERSION_HEX < 0x030C0000

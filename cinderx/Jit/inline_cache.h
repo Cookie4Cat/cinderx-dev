@@ -251,6 +251,41 @@ class AttributeCache {
   BorrowedRef<> site_value_;
   uint64_t site_version_{0};
   SiteExtKind site_kind_{SiteExtKind::kNone};
+
+  // 类型接收者多条目缓存（劣化归因轮 C1）：受者为类型对象时通用条目
+  // 按元类型键控失效、fill 又对 type_getattro 拒填，此前永久慢路径
+  //（pprint 的 type(obj).__repr__ 单站点 1440 万次/值即此形态，且
+  // 受者多态——dict/list/str 轮换——单槽 siteExt 无法承接）。
+  // 两种可缓存形态：
+  //  - kValue：解析结果与受者 MRO 原始属性同一（无 __get__ 的纯类
+  //    变量；函数/wrapper/method 描述符在类上访问自返；staticmethod
+  //    解包）。受者与元类型 tp_version_tag 双拉式校验。
+  //  - kMetaDescr：元类型数据描述符（type.__name__ 等 getset），缓存
+  //    描述符本体、命中时活调其 get；元类型版本单校验（数据描述符
+  //    优先级不受受者字典影响）。
+  // 借引用在版本校验通过前不被解引用（D9）；条目轮转替换以适配
+  // 多态受者。惰性分配：绝大多数站点不涉类型受者，零内存税。
+  struct TypeRecvEntry {
+    // kValue：recv = 受者类型；kMetaDescr：recv = 元类型——同名的
+    // 元类型数据描述符对该元类型的一切实例（类）通用（type.__name__
+    // 的 getset 对几十个节点类是同一个），按元类型键控使单条目吸收
+    // 全部多态受者（docutils 形态实测 4 槽轮转被打穿）。
+    PyTypeObject* recv{nullptr}; // 仅指针比对，命中前版本校验
+    uint32_t recv_version{0};
+    uint32_t meta_version{0};
+    enum class Form : uint8_t { kNone, kValue, kMetaDescr } form{Form::kNone};
+    PyObject* payload{nullptr}; // 借引用
+  };
+  struct TypeRecvEntries {
+    static constexpr size_t kNumEntries = 8;
+    TypeRecvEntry entries[kNumEntries];
+    size_t rr{0};
+  };
+
+  PyObject* typeRecvGetAttr(PyObject* obj);
+  void typeRecvTryFill(PyObject* obj, PyObject* name, PyObject* result);
+
+  std::unique_ptr<TypeRecvEntries> type_recv_;
 #endif
 
   AttributeMutator entries_[0];
@@ -413,6 +448,8 @@ inline void incICStat(std::atomic<uint64_t>& counter) {
   }
 }
 
+class LoadTypeMethodCache;
+
 class LoadMethodCache {
  public:
   struct Entry {
@@ -471,6 +508,15 @@ class LoadMethodCache {
 
   std::array<Entry, 4> entries_;
   std::unique_ptr<CacheStats> cache_stats_;
+#if PY_VERSION_HEX < 0x030C0000
+  // 类型接收者委托缓存（劣化归因轮 C1）：通用条目按 Py_TYPE(obj)
+  //（元类型）键控，慢路径又因 type_getattro ≠ GenericGetAttr 早退
+  // 拒填，类型对象作接收者此前永久慢路径（docutils 的
+  // type.__init__/__new__ 各 12 万次/值即此形态）。委托既有
+  // LoadTypeMethodCache（type_getattro 语义复刻 + tp_version_tag
+  // 拉式校验，D5）。惰性分配，零成本于不涉类型受者的站点。
+  std::unique_ptr<LoadTypeMethodCache> type_recv_cache_;
+#endif
 
 #if PY_VERSION_HEX < 0x030C0000
   // 实例属性方法位（IC 计数轮：纯 Python pickle 的 self.read/readline
