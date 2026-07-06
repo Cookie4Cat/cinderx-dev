@@ -4519,6 +4519,13 @@ int initialize() {
   }
 #endif
 
+#if PY_VERSION_HEX < 0x030C0000
+  // C2 探针预热：探针类创建执行 Python 代码，必须在无在途异常的
+  // init 期完成，不留惰性初始化窗口（PGO 构建下 import enum 异常
+  // 传播中途首触发的实测事故）。
+  warmSlotTpGetattrHookProbe();
+#endif
+
   std::unique_ptr<JITList> jit_list;
   if (!getConfig().jit_list.filename.empty()) {
     if (getConfig().allow_jit_list_wildcards) {

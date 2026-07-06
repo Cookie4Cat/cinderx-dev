@@ -109,29 +109,41 @@ inline PyDictObject* get_or_allocate_dict(
 // 缓存对这类接收者语义不变（通用阶段找到即 hook 的返回值），可安全
 // 放行填充；探针失败返回 nullptr，一切比较落空即行为不变。
 getattrofunc ciSlotTpGetattrHook() {
+  // 惰性初始化必须对"在异常传播中途被首次触发"免疫：执行探针类
+  // 创建前 Fetch 保存在途异常、结束后 Restore——否则本函数内的
+  // PyErr_Clear 会清掉别人的在途异常，NULL 无异常上浮成
+  // SystemError（PGO 构建下 import enum 途中首触发的实测事故；
+  // 另有 warmSlotTpGetattrHookProbe 在 init 期预热消灭惰性窗口，
+  // 本保护为纵深防御）。
   static getattrofunc hook = []() -> getattrofunc {
-    auto globals = Ref<>::steal(PyDict_New());
-    if (globals == nullptr) {
-      PyErr_Clear();
-      return nullptr;
+    PyObject *exc_type, *exc_value, *exc_tb;
+    PyErr_Fetch(&exc_type, &exc_value, &exc_tb);
+    getattrofunc result = nullptr;
+    {
+      auto globals = Ref<>::steal(PyDict_New());
+      if (globals != nullptr) {
+        auto res = Ref<>::steal(PyRun_String(
+            "class _CixGetattrProbe:\n"
+            "    def __getattr__(self, name):\n"
+            "        raise AttributeError(name)\n",
+            Py_file_input,
+            globals,
+            globals));
+        if (res != nullptr) {
+          PyObject* cls = PyDict_GetItemString(globals, "_CixGetattrProbe");
+          if (cls != nullptr && PyType_Check(cls)) {
+            getattrofunc fn = reinterpret_cast<PyTypeObject*>(cls)->tp_getattro;
+            result = fn == PyObject_GenericGetAttr ? nullptr : fn;
+          }
+        } else {
+          PyErr_Clear();
+        }
+      } else {
+        PyErr_Clear();
+      }
     }
-    auto res = Ref<>::steal(PyRun_String(
-        "class _CixGetattrProbe:\n"
-        "    def __getattr__(self, name):\n"
-        "        raise AttributeError(name)\n",
-        Py_file_input,
-        globals,
-        globals));
-    if (res == nullptr) {
-      PyErr_Clear();
-      return nullptr;
-    }
-    PyObject* cls = PyDict_GetItemString(globals, "_CixGetattrProbe");
-    if (cls == nullptr || !PyType_Check(cls)) {
-      return nullptr;
-    }
-    getattrofunc fn = reinterpret_cast<PyTypeObject*>(cls)->tp_getattro;
-    return fn == PyObject_GenericGetAttr ? nullptr : fn;
+    PyErr_Restore(exc_type, exc_value, exc_tb);
+    return result;
   }();
   return hook;
 }
@@ -2365,8 +2377,15 @@ void AttributeCache::typeRecvTryFill(
     PyObject* result) {
   auto tp = reinterpret_cast<PyTypeObject*>(obj);
   PyTypeObject* metatype = Py_TYPE(obj);
-  // 仅标准 type_getattro 语义可复刻；自定义元类型 getattro 不缓存。
-  if (metatype->tp_getattro != PyType_Type.tp_getattro ||
+  // 标准 type_getattro 可复刻；带 __getattr__ 的元类型（slot hook，
+  // 如 EnumType——枚举成员访问 TokenType.BREAK 形态，sqlglot 56 万
+  // 次/值）命中侧同样可复刻：hook 前半即 type_getattro，类 dict
+  // 命中即返回、不进 __getattr__。本缓存 miss 返回 nullptr 自然
+  // 回落完整协议（含 __getattr__ 兜底），无"确定 miss 抛错"路径，
+  // 语义安全。其余自定义元类型 getattro 不缓存。
+  if ((metatype->tp_getattro != PyType_Type.tp_getattro &&
+       (ciSlotTpGetattrHook() == nullptr ||
+        metatype->tp_getattro != ciSlotTpGetattrHook())) ||
       !ensureVersionTag(metatype)) {
     return;
   }
@@ -2509,6 +2528,12 @@ LoadModuleMethodCache::lookupSlowPath(BorrowedRef<> obj, BorrowedRef<> name) {
   }
   return {nullptr, nullptr};
 }
+
+#if PY_VERSION_HEX < 0x030C0000
+void warmSlotTpGetattrHookProbe() {
+  ciSlotTpGetattrHook();
+}
+#endif
 
 void notifyICsTypeChanged(BorrowedRef<PyTypeObject> type) {
   ac_watcher.typeChanged(type);

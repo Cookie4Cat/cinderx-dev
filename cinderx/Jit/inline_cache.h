@@ -181,6 +181,30 @@ class AttributeMutator {
     return offsetof(AttributeMutator, split_) +
         offsetof(SplitMutator, mat_hint);
   }
+  // kind-6/7（kMemberDescr/kDescrOrClassVar）内联快路径的条目布局
+  // 访问器（劣化归因轮 C3；gen_asm la 桩汇编发射用）。
+  static constexpr uintptr_t descrOrClassVarKind() {
+    return static_cast<uintptr_t>(Kind::kDescrOrClassVar);
+  }
+  static constexpr uintptr_t memberDescrKind() {
+    return static_cast<uintptr_t>(Kind::kMemberDescr);
+  }
+  static constexpr size_t memberDefOffset() {
+    return offsetof(AttributeMutator, member_descr_) +
+        offsetof(MemberDescrMutator, memberdef);
+  }
+  static constexpr size_t dcvDescrOffset() {
+    return offsetof(AttributeMutator, descr_or_cvar_) +
+        offsetof(DescrOrClassVarMutator, descr);
+  }
+  static constexpr size_t dcvKeysVersionOffset() {
+    return offsetof(AttributeMutator, descr_or_cvar_) +
+        offsetof(DescrOrClassVarMutator, keys_version);
+  }
+  static constexpr size_t dcvMatHintOffset() {
+    return offsetof(AttributeMutator, descr_or_cvar_) +
+        offsetof(DescrOrClassVarMutator, mat_hint);
+  }
 #endif
 
   uintptr_t kindBits() const {
@@ -642,6 +666,12 @@ class LoadModuleMethodCache {
 
 // Invalidate all load/store attr caches for type
 void notifyICsTypeChanged(BorrowedRef<PyTypeObject> type);
+
+#if PY_VERSION_HEX < 0x030C0000
+// init 期预热 slot_tp_getattr_hook 探针（C2）：消灭惰性初始化窗口，
+// 避免首次触发落在异常传播中途（探针建类执行 Python 代码）。
+void warmSlotTpGetattrHookProbe();
+#endif
 
 } // namespace jit
 
