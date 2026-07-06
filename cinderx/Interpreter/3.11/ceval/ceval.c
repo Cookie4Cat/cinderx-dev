@@ -1700,8 +1700,12 @@ _PyEval_EvalFrameDefault(PyThreadState *tstate, _PyInterpreterFrame *frame, int 
 
 
 start_frame:
-    /* [P3] auto-JIT frame-push counting; see cinderx_ceval.c ledger. */
+#ifndef CI_T1_NO_AUTOJIT_HOOK
+    /* [P3] auto-JIT frame-push counting; see cinderx_ceval.c ledger.
+       CI_T1_NO_AUTOJIT_HOOK 为 T1 本底税测量护栏（量化钩子调用位点
+       本身的成本，测量构建专用，禁用于交付）。 */
     Ci_AutoJitCountFramePush311(tstate, frame);
+#endif
     if (_Py_EnterRecursiveCallTstate(tstate, "")) {
         tstate->recursion_remaining--;
         goto exit_unwind;

@@ -526,6 +526,11 @@ target_include_directories(
   PUBLIC
   ${PROJECT_SOURCE_DIR}/Interpreter/${PY_VERSION}/Includes
 )
+# vendored 求值循环以 -O3 编译（T1 本底税专项）：项目默认构建为
+# -O2，而 stock CPython 的 ceval 为 -O3（configure 默认 OPT）——巨型
+# 派发循环是两档差异最大的代码形态，-O2 是 vendored 本底税的构成项
+# 之一（auto=0 判别口径实测见 M10-t1 轮志）。
+target_compile_options(interpreter PRIVATE -O3)
 
 ########################################
 # Immortalize/
