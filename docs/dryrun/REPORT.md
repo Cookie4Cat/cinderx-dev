@@ -114,18 +114,17 @@
   专项已立，解法方向随案移交；
 - 挂起帧 f_locals 空（任意点 localsplus 重建）：正式 M6 主体；
 - descr 自身类型二重版本、refleak gen 专项、ASAN 全量未跑；
-- **PGO-use 相概率性错译（阻断级，工具链专项待立）**：GCC-14
-  PGO×LTO 下 PGO-use 相偶发错译，编译码 raise 路径丢异常
-  → `SystemError: error return without exception set`（import enum
-  或 test_slice 等 raise 密集路径即触发）。特征：**同源码同流程两次
-  洁净构建一红一绿（训练 profile 时序抖动改变 gcda 即诱发）**，命中
-  函数面随 profile 变动；纯 LTO/插桩相/plain 构建全绿，仅 PGO-use
-  相炸；IC 缓存全关仍炸（非运行时逻辑）。真凶为既有 raise/deopt
-  路径潜伏 UB 或工具链交互。缓解已落：构建配方相四**产物正确性
-  验收步**（快速探针 + 红态 gcda/.so 取证归档，拦最粗红态；完整
-  正确性仍靠交付构建过 diffgate+libtest）。根因定位（profile 目录级
-  二分 → TU → 函数）作为工具链专项立项。**正式 PGO 交付前此项必须
-  收口，否则性能口径暂退纯 LTO**。
+- **PGO-use 相概率性红态（已收口，判决翻案）**：原判"GCC-14
+  PGO×LTO 工具链错译"撤销。根因为移植层缺陷：deopt 垫片对
+  resumeInInterpreter 第四实参（is_instrumentation_deopt）的装配
+  被 3.12 版本门跳过，3.11 下该 bool 实为 prepareForDeopt 返回后的
+  未定义寄存器残值——残值非零即错入 instrumentation 恢复语义，
+  kRaise 不再重执行，异常凭空丢失。"概率性/构建相关"的表象来自
+  各构建寄存器分配骰子（plain/纯 LTO 侥幸残 0）。已修复
+  （generator.cpp 版本门移除，两架构同修）并经红态 gcda 原位重建
+  判决绿转；相四产物验收步保留为构建体系常设防线（探针剔除
+  test_builtin 基线已知项）。详见 M10-pgo-rootcause-log.md。
+  **PGO 交付口径恢复的工具链障碍不复存在**。
 
 **结构性判断（已有决定性数据）：**
 - **编译价值按形态分化**：go 纯解释 72ms 反胜编译 96ms、pickle 同向；
