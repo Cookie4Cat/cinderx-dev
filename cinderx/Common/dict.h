@@ -56,7 +56,11 @@ static inline Py_ssize_t getDictKeysIndex(
 #endif
   for (Py_ssize_t i = 0; i < keys->dk_nentries; i++) {
     PyDictUnicodeEntry* ep = &DK_UNICODE_ENTRIES(keys)[i];
-    if (PyUnicode_Compare(name, ep->me_key) == 0) {
+    // Deleted entries stay within dk_nentries with me_key == NULL (3.11
+    // unicode-keys delitem semantics). Split shared keys never see
+    // deletions, but materialized (combined) instance dicts do; without
+    // the NULL check PyUnicode_Compare dereferences NULL.
+    if (ep->me_key != NULL && PyUnicode_Compare(name, ep->me_key) == 0) {
       return i;
     }
   }
