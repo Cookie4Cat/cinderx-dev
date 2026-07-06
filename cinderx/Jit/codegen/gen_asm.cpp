@@ -2251,9 +2251,11 @@ void NativeGenerator::generateCode(
   // stock 解释器入口（x0-x3 处于原始 vectorcall 形态、未压栈）：
   // 解释器自带递归计数与 CheckRecursiveCall 语义（余量/抛错），
   // 编译侧预检不落账，失败路径零簿记。
+  // 分流出口无条件发射：入口守卫（可配置开关）与 __code__ 身份校验
+  // （无条件，见 vectorcall 入口处）共用。
   Label entry_guard_divert = as_->newLabel();
   const bool entry_guard = env_.code_rt->entryGuardInlined();
-  if (entry_guard) {
+  {
     auto divert_cursor = as_->cursor();
     as_->bind(entry_guard_divert);
     as_->mov(
@@ -2291,6 +2293,26 @@ void NativeGenerator::generateCode(
   as_->bind(vectorcall_entry_label);
 
 #if defined(CINDER_AARCH64) && PY_VERSION_HEX < 0x030C0000
+  {
+    // __code__ 身份校验（无条件）：3.11 无 function watcher，函数对象
+    // 可在运行期替换 __code__（networkx argmap 惰性编译即"首调后自
+    // 替换 __code__"模式），而编译产物绑定的是编译时的 code 对象。
+    // 入口比对 func->func_code 与烘焙 code 指针，不符即整调用分流
+    // stock 解释器入口（届时按新 code 正确执行）。绑参重入路径从
+    // 本检查之后进入，外层调用已检。
+    auto code_check_cursor = as_->cursor();
+    as_->ldr(
+        a64::x9,
+        arch::ptr_offset(
+            a64::x0,
+            static_cast<int32_t>(offsetof(PyFunctionObject, func_code))));
+    as_->mov(
+        a64::x10,
+        reinterpret_cast<uint64_t>(GetFunction()->code.get()));
+    as_->cmp(a64::x9, a64::x10);
+    as_->b_ne(entry_guard_divert);
+    env_.addAnnotation("Code identity check", code_check_cursor);
+  }
   if (entry_guard) {
     // 守卫包装两检查的行内形态：① tracing 激活 → 分流；② 递归余量
     // 预检（只读不写，写账在建帧处）→ 将溢即分流。绑参重入路径按

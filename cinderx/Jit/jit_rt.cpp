@@ -1171,11 +1171,32 @@ PyObject* JITRT_Call(
   constexpr size_t kVectorcallOffset =
       static_cast<size_t>(PY_VECTORCALL_ARGUMENTS_OFFSET);
 
-#if PY_VERSION_HEX >= 0x030B0000
-  // CPython 3.11+ LOAD_METHOD pushes a callable followed by either the
-  // receiver or NULL. If the second slot is NULL, call the callable without
-  // that artificial leading argument.
+#if PY_VERSION_HEX >= 0x030C0000
+  // CPython 3.12+ pushes the callable followed by either the receiver or
+  // NULL. If the second slot is NULL, call the callable without that
+  // artificial leading argument.
   if (args[0] == nullptr) {
+    args += 1;
+    nargsf = (nargsf - 1) & ~kVectorcallOffset;
+  }
+#elif PY_VERSION_HEX >= 0x030B0000
+  // On 3.11 two pair conventions reach this helper, distinguished by where
+  // the NULL sits (a real argument can never be NULL):
+  //
+  // 1. Raw bytecode order (NULL below the callable): PUSH_NULL and
+  //    LOAD_GLOBAL-with-NULL-flag push a literal NULL first — 3.11 emits
+  //    that form for any call with keyword arguments. The simplifier
+  //    normally erases the NULL from CallMethod, but it has an iteration/
+  //    new-block budget and huge functions can leak the raw form through;
+  //    correctness must not depend on that pass.
+  if (callable == nullptr) {
+    callable = args[0];
+    args += 1;
+    nargsf = (nargsf - 1) & ~kVectorcallOffset;
+  } else if (PyVectorcall_NARGS(nargsf) >= 1 && args[0] == nullptr) {
+    // 2. Normalized LoadMethodResult order {callable, self_or_null} (the
+    //    struct constructor converts the interpreter's None-convention on
+    //    3.11+): a NULL second slot means "no receiver" — drop it.
     args += 1;
     nargsf = (nargsf - 1) & ~kVectorcallOffset;
   }
