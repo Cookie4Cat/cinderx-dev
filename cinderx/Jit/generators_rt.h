@@ -61,6 +61,13 @@ struct JitGenObject : PyGenObject {
   PyObject* yieldFrom();
 };
 
+// 恢复快路径：规范 am_send 槽指针（身份比对用）与免检直调入口。
+// 槽被 with_deopt 换装或对象深度 deopt 后类型已变时指针不等，调用方
+// 回落槽调；比对通过即蕴含"对象为 JitGen 且槽未换装"。
+using JitGenSendFunc = PySendResult (*)(PyObject*, PyObject*, PyObject**);
+JitGenSendFunc jitGenCanonicalAmSend();
+PySendResult jitGenSendFast(PyObject* gen, PyObject* arg, PyObject** presult);
+
 // Converts a JitGenObject into a regular PyGenObject. This assumes deopting
 // the associated frame will be done elsewhere.
 void deopt_jit_gen_object_only(JitGenObject* gen);

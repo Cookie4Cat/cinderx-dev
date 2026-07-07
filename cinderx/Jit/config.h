@@ -190,6 +190,13 @@ struct Config {
   //（raytrace t=4 风暴案）。
   bool adaptive_despec{true};
   size_t despec_deopt_threshold{64};
+  // 同步生成器自动编译（3.11）。三态实测其编译净效应为负（interp
+  // 86.0 ms vs JIT 96.6 ms，恢复仪式固定成本主导，微小生成器体收益
+  // 归零；派发层合并实测墙钟中性——成本在本体与溅射恢复），默认不
+  // 自动编译、回退解释器；协程/异步生成器不受此开关影响
+  //（协程编译净效应 +13%，且 D6 本就禁编协程本体）。force_compile
+  // 不受限。yield 点溅射瘦身落地后可重估。
+  bool compile_sync_generators{false};
   // Enable OSR hot-loop detection. OSR is production-off by default and must
   // be explicitly enabled by -X osr-enabled or CINDERX_OSR_ENABLED.
   bool osr_enabled{false};
