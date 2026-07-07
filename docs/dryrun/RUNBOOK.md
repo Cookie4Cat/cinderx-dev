@@ -3,7 +3,8 @@
 > 面向接手继续优化的同事。环境为 manylinux aarch64 容器（预演机为
 > Apple Silicon Docker，容器名 dryrun-perf）；openEuler 正式目标机
 > 需按 REPORT.md 第六节的环境差异项复核。总报告见 REPORT.md，
-> 各轮技术细节见 M9-*-log.md。
+> 各轮技术细节见 M9-*/M10-*-log.md；静默缺陷与配置盲区的防线
+> 方法论见 METHODOLOGY-hidden-defects.md。
 
 ## 一、环境布局
 
