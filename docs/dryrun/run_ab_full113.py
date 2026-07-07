@@ -129,7 +129,22 @@ def main():
     ap.add_argument("--out", required=True)
     ap.add_argument("--benches", default=None)
     ap.add_argument("--timeout", type=int, default=1200)
+    ap.add_argument(
+        "--a-from",
+        default=None,
+        help="仅跑 B 侧；A 侧均值取自既有 summary.json（stock 基线跨轮"
+        "稳定，复测 JIT 侧时免跑 A 省一半时长）",
+    )
     args = ap.parse_args()
+
+    a_ref = {}
+    if args.a_from:
+        import json as _json
+
+        with open(args.a_from) as fp:
+            for k, v in _json.load(fp).items():
+                if isinstance(v, dict) and v.get("a_mean"):
+                    a_ref[k] = v["a_mean"]
 
     os.makedirs(args.out, exist_ok=True)
     ensure_sitecustomize()
@@ -144,7 +159,10 @@ def main():
             results[bench] = {"a": "UNKNOWN BENCH"}
             continue
         row = {}
-        for side in ("a", "b"):
+        if args.a_from and bench in a_ref:
+            row["a"] = "REF"
+            row["a_mean"] = a_ref[bench]
+        for side in (("b",) if args.a_from and bench in a_ref else ("a", "b")):
             out_json = os.path.join(args.out, f"{bench}-{side}.json")
             status = run_side(jobs[bench], side, out_json, args.timeout)
             row[side] = status
@@ -173,7 +191,11 @@ def main():
             % (len(ratios), geo),
             flush=True,
         )
-    bad = [k for k, r in results.items() if r.get("a") != "OK" or r.get("b") != "OK"]
+    bad = [
+        k
+        for k, r in results.items()
+        if r.get("a") not in ("OK", "REF") or r.get("b") != "OK"
+    ]
     if bad:
         print("FAIL/TIMEOUT list: " + ", ".join(sorted(bad)), flush=True)
 
