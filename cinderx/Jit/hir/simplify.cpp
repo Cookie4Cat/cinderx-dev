@@ -865,52 +865,52 @@ Register* trySimplifyArraySubscr(Env& env, const BinaryOp* instr) {
   });
 }
 
-Register* simplifyBinaryOp(Env& env, const BinaryOp* instr) {
-  BinaryOpKind op = instr->op();
-  Register* lhs = instr->left();
-  Register* rhs = instr->right();
-
-  if (op == BinaryOpKind::kSubscript) {
-    if (lhs->isA(TDictExact)) {
-      return env.emit<DictSubscr>(lhs, rhs, *instr->frameState());
-    }
-    if (Register* array_result = trySimplifyArraySubscr(env, instr)) {
-      return array_result;
-    }
-    if (!rhs->isA(TLongExact)) {
-      return nullptr;
-    }
-    Type lhs_type = lhs->type();
-    Type rhs_type = rhs->type();
-    if (lhs_type <= TTupleExact && lhs_type.hasObjectSpec() &&
-        rhs_type.hasObjectSpec()) {
-      int overflow;
-      Py_ssize_t index =
-          PyLong_AsLongAndOverflow(rhs_type.objectSpec(), &overflow);
-      if (!overflow) {
-        PyObject* lhs_obj = lhs_type.objectSpec();
-        if (index >= 0 && index < PyTuple_GET_SIZE(lhs_obj)) {
-          BorrowedRef<> item = PyTuple_GET_ITEM(lhs_obj, index);
-          env.emit<UseType>(lhs, lhs_type);
-          env.emit<UseType>(rhs, rhs_type);
-          return env.emit<LoadConst>(
-              Type::fromObject(env.func.env.addReference(item)));
-        }
-        // Fallthrough
+Register* simplifySubscript(
+    Env& env,
+    Register* lhs,
+    Register* rhs,
+    const FrameState* frame_state,
+    const BinaryOp* instr) {
+  if (lhs->isA(TDictExact)) {
+    return env.emit<DictSubscr>(lhs, rhs, *frame_state);
+  }
+  if (Register* array_result = trySimplifyArraySubscr(env, instr)) {
+    return array_result;
+  }
+  if (!rhs->isA(TLongExact)) {
+    return nullptr;
+  }
+  Type lhs_type = lhs->type();
+  Type rhs_type = rhs->type();
+  if (lhs_type <= TTupleExact && lhs_type.hasObjectSpec() &&
+      rhs_type.hasObjectSpec()) {
+    int overflow;
+    Py_ssize_t index =
+        PyLong_AsLongAndOverflow(rhs_type.objectSpec(), &overflow);
+    if (!overflow) {
+      PyObject* lhs_obj = lhs_type.objectSpec();
+      if (index >= 0 && index < PyTuple_GET_SIZE(lhs_obj)) {
+        BorrowedRef<> item = PyTuple_GET_ITEM(lhs_obj, index);
+        env.emit<UseType>(lhs, lhs_type);
+        env.emit<UseType>(rhs, rhs_type);
+        return env.emit<LoadConst>(
+            Type::fromObject(env.func.env.addReference(item)));
       }
       // Fallthrough
     }
-// TODO(T255264263). Enable this again. See P2169673256.
-#ifndef Py_GIL_DISABLED
+    // Fallthrough
+  }
+  // TODO(T255264263). Enable this again. See P2169673256.
+  if (!kFreeThreadedBuild) {
     if (lhs->isA(TListExact) || lhs->isA(TTupleExact)) {
       // TASK(T93509109): Replace TCInt64 with a less platform-specific
       // representation of the type, which should be analagous to Py_ssize_t.
       env.emit<UseType>(lhs, lhs->isA(TListExact) ? TListExact : TTupleExact);
       env.emit<UseType>(rhs, TLongExact);
       Register* right_index = env.emit<IndexUnbox>(rhs);
-      env.emit<IsNegativeAndErrOccurred>(right_index, *instr->frameState());
+      env.emit<IsNegativeAndErrOccurred>(right_index, *frame_state);
       Register* adjusted_idx =
-          env.emit<CheckSequenceBounds>(lhs, right_index, *instr->frameState());
+          env.emit<CheckSequenceBounds>(lhs, right_index, *frame_state);
       Py_ssize_t offset = offsetof(PyTupleObject, ob_item);
       Register* array = lhs;
       // Lists carry a nested array of ob_item whereas tuples are variable-sized
@@ -922,55 +922,65 @@ Register* simplifyBinaryOp(Env& env, const BinaryOp* instr) {
       }
       return env.emit<LoadArrayItem>(array, adjusted_idx, lhs, offset, TObject);
     }
-#endif
-    if (lhs_type <= TUnicodeExact && rhs_type <= TLongExact) { // Unicode subscr
-      if (lhs_type.hasObjectSpec() && rhs_type.hasObjectSpec()) {
-        // This isn't safe in the multi-threaded compilation on 3.12 because
-        // we don't hold the GIL which is required for
-        // PyUnicode_InternInPlace.
-        RETURN_MULTITHREADED_COMPILE(nullptr);
+  }
+  if (lhs_type <= TUnicodeExact && rhs_type <= TLongExact) { // Unicode subscr
+    if (lhs_type.hasObjectSpec() && rhs_type.hasObjectSpec()) {
+      // This isn't safe in the multi-threaded compilation on 3.12 because
+      // we don't hold the GIL which is required for
+      // PyUnicode_InternInPlace.
+      RETURN_MULTITHREADED_COMPILE(nullptr);
 
-        // Constant propagation
-        Py_ssize_t idx = PyLong_AsSsize_t(rhs_type.objectSpec());
-        if (idx == -1 && PyErr_Occurred()) {
-          PyErr_Clear();
-          return nullptr;
-        }
-        Py_ssize_t n = PyUnicode_GetLength(lhs_type.objectSpec());
-
-        if (idx < -n || idx >= n) {
-          return nullptr;
-        }
-
-        if (idx < 0) {
-          idx += n;
-        }
-
-        ThreadedCompileSerialize guard;
-        Py_UCS4 c = PyUnicode_ReadChar(lhs_type.objectSpec(), idx);
-        PyObject* substr =
-            PyUnicode_FromKindAndData(PyUnicode_4BYTE_KIND, &c, 1);
-        if (substr == nullptr) {
-          return nullptr;
-        }
-        PyUnicode_InternInPlace(&substr);
-        Ref<> result = Ref<>::steal(substr);
-
-        // Use exact types since we're relying on the object specializations.
-        env.emit<UseType>(lhs, lhs_type);
-        env.emit<UseType>(rhs, rhs_type);
-        return env.emit<LoadConst>(
-            Type::fromObject(env.func.env.addReference(std::move(result))));
-      } else {
-        env.emit<UseType>(lhs, TUnicodeExact);
-        env.emit<UseType>(rhs, TLongExact);
-        Register* unboxed_idx = env.emit<IndexUnbox>(rhs);
-        env.emit<IsNegativeAndErrOccurred>(unboxed_idx, *instr->frameState());
-        Register* adjusted_idx = env.emit<CheckSequenceBounds>(
-            lhs, unboxed_idx, *instr->frameState());
-        return env.emit<UnicodeSubscr>(lhs, adjusted_idx, *instr->frameState());
+      // Constant propagation
+      Py_ssize_t idx = PyLong_AsSsize_t(rhs_type.objectSpec());
+      if (idx == -1 && PyErr_Occurred()) {
+        PyErr_Clear();
+        return nullptr;
       }
+      Py_ssize_t n = PyUnicode_GetLength(lhs_type.objectSpec());
+
+      if (idx < -n || idx >= n) {
+        return nullptr;
+      }
+
+      if (idx < 0) {
+        idx += n;
+      }
+
+      ThreadedCompileSerialize guard;
+      Py_UCS4 c = PyUnicode_ReadChar(lhs_type.objectSpec(), idx);
+      PyObject* substr =
+          PyUnicode_FromKindAndData(PyUnicode_4BYTE_KIND, &c, 1);
+      if (substr == nullptr) {
+        return nullptr;
+      }
+      PyUnicode_InternInPlace(&substr);
+      Ref<> result = Ref<>::steal(substr);
+
+      // Use exact types since we're relying on the object specializations.
+      env.emit<UseType>(lhs, lhs_type);
+      env.emit<UseType>(rhs, rhs_type);
+      return env.emit<LoadConst>(
+          Type::fromObject(env.func.env.addReference(std::move(result))));
+    } else {
+      env.emit<UseType>(lhs, TUnicodeExact);
+      env.emit<UseType>(rhs, TLongExact);
+      Register* unboxed_idx = env.emit<IndexUnbox>(rhs);
+      env.emit<IsNegativeAndErrOccurred>(unboxed_idx, *frame_state);
+      Register* adjusted_idx = env.emit<CheckSequenceBounds>(
+          lhs, unboxed_idx, *frame_state);
+      return env.emit<UnicodeSubscr>(lhs, adjusted_idx, *frame_state);
     }
+  }
+  return nullptr;
+}
+
+Register* simplifyBinaryOp(Env& env, const BinaryOp* instr) {
+  BinaryOpKind op = instr->op();
+  Register* lhs = instr->left();
+  Register* rhs = instr->right();
+
+  if (op == BinaryOpKind::kSubscript) {
+    return simplifySubscript(env, lhs, rhs, instr->frameState(), instr);
   }
 
   if (lhs->isA(TLongExact) && rhs->isA(TLongExact)) {
