@@ -69,6 +69,12 @@ typedef struct CodeExtra {
   // IC 压力密度（生产判据）：本 code 各内联 stub 慢路径进入计数，
   // 由 stub 慢尾直增（发射期烘焙地址），入口包装器按调用窗对比。
   uint64_t ic_slow_pressure;
+  // 守卫自适应去特化（adaptive despec）：kGuardFailure 深度 deopt
+  // 计数与粘滞态。despec_state：0=正常，1=已触发（去特化重编，永不
+  // 回退）。单次观测型投机（特化形类型守卫）赌错时由此止损：越限即
+  // 卸载并以去特化输入重编，多态受者的 deopt 风暴被一次重编封顶。
+  uint32_t despec_deopt_count;
+  uint32_t despec_state;
 } CodeExtra;
 
 #define CI_CODE_EXTRA_AUTO_JIT_DISABLED 1
@@ -133,6 +139,30 @@ static inline uint32_t Ci_code_extra_incr_roi_deopt_count(CodeExtra* extra) {
   uint32_t old =
       __atomic_fetch_add(&extra->roi_deopt_count, 1, __ATOMIC_RELAXED);
   return old == UINT32_MAX ? UINT32_MAX : old + 1;
+}
+
+static inline uint32_t Ci_code_extra_load_despec_relaxed(
+    const CodeExtra* extra) {
+  return __atomic_load_n(&extra->despec_state, __ATOMIC_RELAXED);
+}
+
+static inline uint32_t Ci_code_extra_incr_despec_count(CodeExtra* extra) {
+  uint32_t old =
+      __atomic_fetch_add(&extra->despec_deopt_count, 1, __ATOMIC_RELAXED);
+  return old == UINT32_MAX ? UINT32_MAX : old + 1;
+}
+
+static inline int Ci_code_extra_cas_despec(
+    CodeExtra* extra,
+    uint32_t* expected,
+    uint32_t desired) {
+  return __atomic_compare_exchange_n(
+      &extra->despec_state,
+      expected,
+      desired,
+      0,
+      __ATOMIC_RELEASE,
+      __ATOMIC_RELAXED);
 }
 
 static inline void Ci_code_extra_store_roi_deopt_count_relaxed(
@@ -218,6 +248,30 @@ static inline uint32_t Ci_code_extra_incr_roi_deopt_count(CodeExtra* extra) {
     extra->roi_deopt_count += 1;
   }
   return extra->roi_deopt_count;
+}
+
+static inline uint32_t Ci_code_extra_load_despec_relaxed(
+    const CodeExtra* extra) {
+  return extra->despec_state;
+}
+
+static inline uint32_t Ci_code_extra_incr_despec_count(CodeExtra* extra) {
+  if (extra->despec_deopt_count != UINT32_MAX) {
+    extra->despec_deopt_count += 1;
+  }
+  return extra->despec_deopt_count;
+}
+
+static inline int Ci_code_extra_cas_despec(
+    CodeExtra* extra,
+    uint32_t* expected,
+    uint32_t desired) {
+  if (extra->despec_state != *expected) {
+    *expected = extra->despec_state;
+    return 0;
+  }
+  extra->despec_state = desired;
+  return 1;
 }
 
 static inline void Ci_code_extra_store_roi_deopt_count_relaxed(

@@ -96,7 +96,7 @@ def run_side(job, side, out_json, timeout):
         env["PYTHONPATH"] = DEPS
     else:
         env["PYTHONPATH"] = f"{SC_DIR}:{CINDERX_PP}:{DEPS}"
-        env["PYTHONJITAUTO"] = os.environ.get("M9_THRESHOLD", "2")
+        env["PYTHONJITAUTO"] = os.environ.get("M9_THRESHOLD", "4")
         cmd += ["--inherit-environ", "PYTHONPATH,PYTHONJITAUTO"]
     if side == "a":
         cmd += ["--inherit-environ", "PYTHONPATH"]
