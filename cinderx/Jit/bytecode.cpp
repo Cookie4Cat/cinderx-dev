@@ -2,6 +2,10 @@
 
 #include "cinderx/Jit/bytecode.h"
 
+#include "cinderx/Common/code.h"
+#include "cinderx/Common/code_extra.h"
+#include "cinderx/Jit/config.h"
+
 extern "C" {
 #include "internal/pycore_code.h"
 }
@@ -152,6 +156,18 @@ int BytecodeInstruction::uninstrumentedOpcode() const {
 
 int BytecodeInstruction::specializedOpcode() const {
   int opcode = uninstrumentedOpcode();
+
+#if PY_VERSION_HEX < 0x030C0000
+  // 守卫自适应去特化：粘滞位置位后本 code 的一切特化形按生形翻译
+  //（本函数是全部特化消费的单控制点，含 BINARY_OP/COMPARE 类型守卫
+  // 与属性投机的识别）。
+  if (getConfig().adaptive_despec) {
+    CodeExtra* extra = codeExtraIfExists(code_);
+    if (extra != nullptr && Ci_code_extra_load_despec_relaxed(extra) != 0) {
+      return unspecialize(opcode);
+    }
+  }
+#endif
 
   switch (opcode) {
     case BINARY_OP_ADD_FLOAT:

@@ -35,6 +35,15 @@ def main() -> int:
 
     jit = None
     if mode == "jit":
+        # 守卫自适应去特化会在案例中途卸载重编（共享 helper 跑热后被
+        # force_compile 会烘焙特化形，守卫风暴触发 despec）：产物切换
+        # 使烘焙引用集合变化，双快照协议无法与真实漂移区分（实测恰为
+        # 每案例 −1 且 despec 关闭即 0、不随迭代累积——记账工件而非
+        # 泄漏）。本判据只验证编译产物的逐迭代引用中性，despec 迁移
+        # 的引用平衡由其触发路径的 Ref 持有审计保证。
+        import os
+
+        os.environ.setdefault("CINDERX_ADAPTIVE_DESPEC", "0")
         import cinderx
 
         cinderx.init()

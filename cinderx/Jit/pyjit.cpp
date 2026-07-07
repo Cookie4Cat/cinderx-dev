@@ -95,6 +95,7 @@ struct AutoJitGateStats {
   std::atomic<uint64_t> roi_uncompile{0};
   std::atomic<uint64_t> roi_recompile{0};
   std::atomic<uint64_t> roi_frozen{0};
+  std::atomic<uint64_t> adaptive_despec{0};
   std::atomic<uint64_t> probation_frozen{0};
 };
 
@@ -130,6 +131,7 @@ void clearAutoJitGateStats() {
   g_auto_jit_gate_stats.roi_uncompile.store(0, std::memory_order_relaxed);
   g_auto_jit_gate_stats.roi_recompile.store(0, std::memory_order_relaxed);
   g_auto_jit_gate_stats.roi_frozen.store(0, std::memory_order_relaxed);
+  g_auto_jit_gate_stats.adaptive_despec.store(0, std::memory_order_relaxed);
   g_auto_jit_gate_stats.probation_frozen.store(0, std::memory_order_relaxed);
 }
 
@@ -1363,6 +1365,20 @@ FlagProcessor initFlagProcessor() {
       getMutableConfig().early_quicken,
       "Quicken bytecode on the second warmup event (3.11) so low-threshold "
       "auto-JIT compiles from specialized bytecode.");
+
+  flag_processor.addOption(
+      "jit-adaptive-despec",
+      "CINDERX_ADAPTIVE_DESPEC",
+      getMutableConfig().adaptive_despec,
+      "Uncompile and recompile without specialized-opcode consumption after "
+      "repeated guard-failure deopts (3.11).");
+
+  flag_processor.addOption(
+      "jit-adaptive-despec-threshold",
+      "CINDERX_ADAPTIVE_DESPEC_THRESHOLD",
+      getMutableConfig().despec_deopt_threshold,
+      "Guard-failure deopt count per code object that triggers adaptive "
+      "despecialization.");
 
   flag_processor.addOption(
       "osr-enabled",
@@ -3253,7 +3269,11 @@ PyObject* autojit_gate_stats(PyObject* /* self */, PyObject*) {
       setAutoJitGateStat(
           stats, "roi_recompile", g_auto_jit_gate_stats.roi_recompile) != 0 ||
       setAutoJitGateStat(
-          stats, "roi_frozen", g_auto_jit_gate_stats.roi_frozen) != 0) {
+          stats, "roi_frozen", g_auto_jit_gate_stats.roi_frozen) != 0 ||
+      setAutoJitGateStat(
+          stats,
+          "adaptive_despec",
+          g_auto_jit_gate_stats.adaptive_despec) != 0) {
     return nullptr;
   }
 
@@ -4487,6 +4507,58 @@ void recordDeoptForRoiBackoff(
 
   PreservePythonError preserve_error;
   triggerRoiBackoff(code, extra, ctl);
+}
+
+void recordDeoptForDespec(
+    CodeRuntime* code_runtime,
+    DeoptReason reason,
+    bool is_instrumentation_deopt) {
+  if (!getConfig().adaptive_despec || code_runtime == nullptr ||
+      is_instrumentation_deopt || reason != DeoptReason::kGuardFailure) {
+    return;
+  }
+
+  BorrowedRef<PyCodeObject> code = code_runtime->code();
+  CodeExtra* extra = codeExtra(code);
+  if (extra == nullptr) {
+    return;
+  }
+  if (Ci_code_extra_load_despec_relaxed(extra) != 0) {
+    return;
+  }
+  uint32_t count = Ci_code_extra_incr_despec_count(extra);
+  if (count < getConfig().despec_deopt_threshold) {
+    return;
+  }
+  // CAS 保证触发一次；粘滞位同时是 specializedOpcode() 的去特化开关，
+  // 先置位再卸载，重编必然读到去特化输入。
+  uint32_t expected = 0;
+  if (!Ci_code_extra_cas_despec(extra, &expected, 1)) {
+    return;
+  }
+
+  PreservePythonError preserve_error;
+  FreeThreadedJITEntrypointGuard guard;
+
+  std::vector<Ref<PyFunctionObject>> funcs;
+  if (jitCtx() != nullptr) {
+    for (auto& entry : jitCtx()->compiledFuncs()) {
+      BorrowedRef<PyFunctionObject> func = entry.first;
+      if (reinterpret_cast<PyCodeObject*>(func->func_code) == code.get()) {
+        funcs.emplace_back(Ref<PyFunctionObject>::create(func.get()));
+      }
+    }
+  }
+  for (auto& func : funcs) {
+    uncompileImpl(func);
+  }
+  // [P3] 钩子对已越阈 code 走"已决快速返回"，卸载后不会自然重编——
+  // 与 backoff 非冻结分支同法，就地调度重编（粘滞位已置，重编读到
+  // 去特化输入）。
+  for (auto& func : funcs) {
+    scheduleJitCompile(func);
+  }
+  incAutoJitGateStat(g_auto_jit_gate_stats.adaptive_despec);
 }
 
 int initialize() {

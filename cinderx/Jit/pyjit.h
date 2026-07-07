@@ -54,6 +54,14 @@ void recordDeoptForRoiBackoff(
     DeoptReason reason,
     bool is_instrumentation_deopt);
 
+// 守卫自适应去特化：kGuardFailure 深度 deopt 按 code 计数，越限即
+// 卸载并置粘滞位，[P3] 计数已越阈使其在下次调用以去特化输入重编
+//（specializedOpcode() 消费点见 bytecode.cpp）。
+void recordDeoptForDespec(
+    CodeRuntime* code_runtime,
+    DeoptReason reason,
+    bool is_instrumentation_deopt);
+
 bool roiBackoffAllowsCompile(BorrowedRef<PyCodeObject> code);
 
 /*

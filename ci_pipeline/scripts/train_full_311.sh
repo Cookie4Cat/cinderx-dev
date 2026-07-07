@@ -21,7 +21,7 @@ SMOKE=${TRAIN_SMOKE:-/src/docs/dryrun/smoke}
 cd /tmp
 
 run() { # $1=bench dir  $2=extra args
-  PYTHONPATH=$PP PYTHONJITAUTO=2 $PY $BM/$1/run_benchmark.py \
+  PYTHONPATH=$PP PYTHONJITAUTO=4 $PY $BM/$1/run_benchmark.py \
     --inherit-environ PYTHONPATH,PYTHONJITAUTO -p1 -w0 -n1 $2 \
     -o /tmp/trf_$1.json >/dev/null 2>&1 || true
 }
@@ -34,5 +34,5 @@ done
 run bm_pickle "--pure-python pickle"
 
 for s in smoke_laggards smoke_ic_round smoke_frame_inline smoke_entry_guard smoke_m10_fixes; do
-  PYTHONPATH=$PP PYTHONJITAUTO=2 $PY $SMOKE/$s.py >/dev/null 2>&1 || true
+  PYTHONPATH=$PP PYTHONJITAUTO=4 $PY $SMOKE/$s.py >/dev/null 2>&1 || true
 done

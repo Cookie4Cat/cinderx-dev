@@ -293,6 +293,8 @@ DeoptResult prepareForDeopt(
   }
   jit::recordDeoptForRoiBackoff(
       code_runtime, deopt_meta.reason, is_instrumentation_deopt);
+  jit::recordDeoptForDespec(
+      code_runtime, deopt_meta.reason, is_instrumentation_deopt);
   return {frame, is_instrumentation_deopt};
 }
 

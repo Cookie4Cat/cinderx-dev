@@ -184,6 +184,12 @@ struct Config {
   // 事件即特化，使低阈值 auto-JIT 编译读到成熟字节码（早产编译对策，
   // spectral 验尸轮）。
   bool early_quicken{true};
+  // 守卫自适应去特化（3.11）：kGuardFailure 深度 deopt 按 code 计数，
+  // 越限即卸载并以去特化输入重编（粘滞一次性）。为单次观测型特化
+  // 守卫提供止损线：单态受者放胆投机，多态受者的 deopt 风暴被封顶
+  //（raytrace t=4 风暴案）。
+  bool adaptive_despec{true};
+  size_t despec_deopt_threshold{64};
   // Enable OSR hot-loop detection. OSR is production-off by default and must
   // be explicitly enabled by -X osr-enabled or CINDERX_OSR_ENABLED.
   bool osr_enabled{false};
