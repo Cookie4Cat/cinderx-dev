@@ -1279,6 +1279,11 @@ PyObject* JITRT_Call(
   return res;
 }
 
+// 产物侧调用直派的慢路径槽:行内选径以"从地址装载目标"统一快慢两臂
+// (快臂地址=&callable->vectorcall,慢臂地址=本槽),免分支免越界读。
+void* g_JITRT_Vectorcall_slot = reinterpret_cast<void*>(JITRT_Vectorcall);
+void* g_JITRT_Call_slot = reinterpret_cast<void*>(JITRT_Call);
+
 PyObject* JITRT_Vectorcall(
     PyObject* callable,
     PyObject* const* args,

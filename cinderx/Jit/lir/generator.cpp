@@ -3874,6 +3874,72 @@ LIRGenerator::TranslatedBlock LIRGenerator::TranslateOneBasicBlock(
         }
         size_t flags = 0;
 #if PY_VERSION_HEX < 0x030C0000
+        // 产物侧调用直派（deepcopy 验尸轮：泛型 VectorCall 的 C 夹层
+        // 合奏约 7.7% 周期）。exc-inject 未启用时目标在行内选径：被调
+        // 方为 PyFunction 则直读其 vectorcall 槽（与 helper 签名/协议
+        // 同形，被调方入口自带递归与 eval-breaker 语义），否则经慢路
+        // 径槽装载 JITRT_Vectorcall（保留 C 可调用体的周期检查）。
+        // 快慢两臂统一为"从地址装载目标"：快臂地址 = &callable->
+        // vectorcall，慢臂地址 = &g_JITRT_Vectorcall_slot——非函数
+        // 对象不做越界字段读，且免块分裂（csel 选地址）。exc-inject
+        // 启用时保留 helper 发射以维持注入位点覆盖面。
+        if (!excInjectEnabled()) {
+          Instruction* callable = bbb.getDefInstr(hir_instr.func());
+          Instruction* target = nullptr;
+          constexpr int32_t kVectorcallOffset =
+              static_cast<int32_t>(offsetof(PyFunctionObject, vectorcall));
+          if (hir_instr.func()->type() <= TFunc) {
+            target = bbb.appendInstr(
+                Instruction::kMove,
+                OutVReg{OperandBase::k64bit},
+                Ind{callable, kVectorcallOffset});
+          } else {
+            Instruction* type_reg = bbb.appendInstr(
+                Instruction::kMove,
+                OutVReg{OperandBase::k64bit},
+                Ind{callable,
+                    static_cast<int32_t>(offsetof(PyObject, ob_type))});
+            Instruction* func_type = bbb.appendInstr(
+                Instruction::kMove,
+                OutVReg{OperandBase::k64bit},
+                Imm{reinterpret_cast<uint64_t>(&PyFunction_Type)});
+            Instruction* is_func = bbb.appendInstr(
+                Instruction::kEqual,
+                OutVReg{OperandBase::k8bit},
+                type_reg,
+                func_type);
+            Instruction* addr_fast = bbb.appendInstr(
+                Instruction::kLea,
+                OutVReg{OperandBase::k64bit},
+                Ind{callable, kVectorcallOffset});
+            Instruction* addr_slow = bbb.appendInstr(
+                Instruction::kMove,
+                OutVReg{OperandBase::k64bit},
+                Imm{reinterpret_cast<uint64_t>(&g_JITRT_Vectorcall_slot)});
+            Instruction* addr = bbb.appendInstr(
+                Instruction::kSelect,
+                OutVReg{OperandBase::k64bit},
+                is_func,
+                addr_fast,
+                addr_slow);
+            target = bbb.appendInstr(
+                Instruction::kMove,
+                OutVReg{OperandBase::k64bit},
+                Ind{addr, 0});
+          }
+          Instruction* instr = bbb.appendInstr(
+              hir_instr.output(),
+              Instruction::kVectorCall,
+              target,
+              Imm{flags});
+          for (hir::Register* arg : hir_instr.GetOperands()) {
+            instr->addOperands(VReg{bbb.getDefInstr(arg)});
+          }
+          if (!(hir_instr.flags() & CallFlags::KwArgs)) {
+            instr->addOperands(Imm{0});
+          }
+          break;
+        }
         uint64_t func =
             reinterpret_cast<uint64_t>(JITRT_VectorcallPythonFunction);
 #else
@@ -4006,12 +4072,112 @@ LIRGenerator::TranslatedBlock LIRGenerator::TranslateOneBasicBlock(
       case Opcode::kCallMethod: {
         auto& hir_instr = static_cast<const CallMethod&>(i);
         size_t flags = 0;
-        Instruction* instr = bbb.appendInstr(
-            hir_instr.output(),
-            Instruction::kVectorCall,
-            // TASK(T140174965): This should be MemImm.
-            Imm{reinterpret_cast<uint64_t>(JITRT_Call)},
-            Imm{flags});
+        Instruction* target_instr = nullptr;
+#if PY_VERSION_HEX < 0x030C0000
+        // 方法调用直派（与 kVectorCall 同学说）。JITRT_Call 额外承担
+        // LOAD_METHOD 回落协议（callable 为 NULL/None 时取 args[0] 并
+        // 移位），行内选径须先以哨兵对象免除空指针类型读：NULL/None
+        // 先被 csel 替换为哨兵（Py_True），其类型必非 PyFunction_Type，
+        // 自然落慢臂进 helper 走移位协议；直臂用原 callable 调 vectorcall
+        // 槽（未移位，语义与 helper 的非回落分支一致）。
+        if (!excInjectEnabled()) {
+          Instruction* callable = bbb.getDefInstr(hir_instr.func());
+          constexpr int32_t kVectorcallOffset =
+              static_cast<int32_t>(offsetof(PyFunctionObject, vectorcall));
+          Instruction* sentinel = bbb.appendInstr(
+              Instruction::kMove,
+              OutVReg{OperandBase::k64bit},
+              Imm{reinterpret_cast<uint64_t>(Py_True)});
+          Instruction* zero = bbb.appendInstr(
+              Instruction::kMove, OutVReg{OperandBase::k64bit}, Imm{0});
+          Instruction* is_null = bbb.appendInstr(
+              Instruction::kEqual,
+              OutVReg{OperandBase::k8bit},
+              callable,
+              zero);
+          Instruction* safe1 = bbb.appendInstr(
+              Instruction::kSelect,
+              OutVReg{OperandBase::k64bit},
+              is_null,
+              sentinel,
+              callable);
+          Instruction* none_obj = bbb.appendInstr(
+              Instruction::kMove,
+              OutVReg{OperandBase::k64bit},
+              Imm{reinterpret_cast<uint64_t>(Py_None)});
+          Instruction* is_none = bbb.appendInstr(
+              Instruction::kEqual,
+              OutVReg{OperandBase::k8bit},
+              safe1,
+              none_obj);
+          Instruction* safe = bbb.appendInstr(
+              Instruction::kSelect,
+              OutVReg{OperandBase::k64bit},
+              is_none,
+              sentinel,
+              safe1);
+          Instruction* type_reg = bbb.appendInstr(
+              Instruction::kMove,
+              OutVReg{OperandBase::k64bit},
+              Ind{safe, static_cast<int32_t>(offsetof(PyObject, ob_type))});
+          Instruction* func_type = bbb.appendInstr(
+              Instruction::kMove,
+              OutVReg{OperandBase::k64bit},
+              Imm{reinterpret_cast<uint64_t>(&PyFunction_Type)});
+          Instruction* is_func = bbb.appendInstr(
+              Instruction::kEqual,
+              OutVReg{OperandBase::k8bit},
+              type_reg,
+              func_type);
+          Instruction* addr_fast = bbb.appendInstr(
+              Instruction::kLea,
+              OutVReg{OperandBase::k64bit},
+              Ind{safe, kVectorcallOffset});
+          Instruction* addr_slow = bbb.appendInstr(
+              Instruction::kMove,
+              OutVReg{OperandBase::k64bit},
+              Imm{reinterpret_cast<uint64_t>(&g_JITRT_Call_slot)});
+          Instruction* addr_by_type = bbb.appendInstr(
+              Instruction::kSelect,
+              OutVReg{OperandBase::k64bit},
+              is_func,
+              addr_fast,
+              addr_slow);
+          // JITRT_Call 的 3.11 双 NULL 约定之二:callable 非空但
+          // args[0](receiver 槽)为 NULL 表示"无接收者,须丢弃首槽"
+          //(kw 调用原始形/LoadMethodResult 规范形,simplifier 预算
+          // 漏网时由 helper 兜底)。直臂不做移位,receiver 槽为空时
+          // 必须落慢臂。
+          Instruction* self_def = bbb.getDefInstr(hir_instr.self());
+          Instruction* self_is_null = bbb.appendInstr(
+              Instruction::kEqual,
+              OutVReg{OperandBase::k8bit},
+              self_def,
+              zero);
+          Instruction* addr = bbb.appendInstr(
+              Instruction::kSelect,
+              OutVReg{OperandBase::k64bit},
+              self_is_null,
+              addr_slow,
+              addr_by_type);
+          target_instr = bbb.appendInstr(
+              Instruction::kMove,
+              OutVReg{OperandBase::k64bit},
+              Ind{addr, 0});
+        }
+#endif
+        Instruction* instr = target_instr != nullptr
+            ? bbb.appendInstr(
+                  hir_instr.output(),
+                  Instruction::kVectorCall,
+                  target_instr,
+                  Imm{flags})
+            : bbb.appendInstr(
+                  hir_instr.output(),
+                  Instruction::kVectorCall,
+                  // TASK(T140174965): This should be MemImm.
+                  Imm{reinterpret_cast<uint64_t>(JITRT_Call)},
+                  Imm{flags});
         for (hir::Register* arg : hir_instr.GetOperands()) {
           instr->addOperands(VReg{bbb.getDefInstr(arg)});
         }
