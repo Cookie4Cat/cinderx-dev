@@ -87,6 +87,17 @@ std::vector<BorrowedRef<PyFunctionObject>> preloadFuncAndDeps(
 void codeDestroyed(BorrowedRef<PyCodeObject> code);
 void funcDestroyed(BorrowedRef<PyFunctionObject> func);
 void funcModified(BorrowedRef<PyFunctionObject> func);
+
+#if PY_VERSION_HEX < 0x030C0000
+// 3.11 无 function watcher（PyFunction_EVENT_DESTROY 为 3.12+），
+// funcDestroyed 在 3.11 下无人触发：已编译函数对象死亡后注册表悬垂，
+// finalize() 对尸体写 vectorcall（异步负载在 auto>2 阈值实测 SIGSEGV；
+// auto=2 下为静默越界写）。以 weakref 回调复刻 watcher：CPython 析构
+// 顺序中 PyObject_ClearWeakRefs 先于字段清理，回调期对象字段完整，
+// 可安全走完整 funcDestroyed 注销链。编译注册时布防。
+void watchFuncDeath311(BorrowedRef<PyFunctionObject> func);
+void clearFuncDeathWatches311();
+#endif
 void typeDestroyed(BorrowedRef<PyTypeObject> type);
 void typeModified(BorrowedRef<PyTypeObject> type);
 void typeNameModified(BorrowedRef<PyTypeObject> type);

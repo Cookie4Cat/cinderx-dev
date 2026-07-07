@@ -27,6 +27,11 @@
 
 namespace jit {
 
+#if PY_VERSION_HEX < 0x030C0000
+// 定义于 pyjit.cpp；此处前向声明以避免 context → pyjit 头文件反向依赖。
+void watchFuncDeath311(BorrowedRef<PyFunctionObject> func);
+#endif
+
 AotContext g_aot_ctx;
 
 std::recursive_mutex& freeThreadedJITEntrypointMutex() {
@@ -699,6 +704,13 @@ bool Context::finalizeFunc(
 
   // In case the function had previously been deopted.
   removeDeoptedFunc(func);
+
+#if PY_VERSION_HEX < 0x030C0000
+  // 3.11 无 function watcher：布防 weakref 死亡看护，函数对象析构时
+  // 走完整 funcDestroyed 注销链（缺失时注册表悬垂，finalize() 对尸体
+  // 写 vectorcall——异步负载 auto>2 实测 SIGSEGV）。声明见 pyjit.h。
+  watchFuncDeath311(func);
+#endif
 
 #if PY_VERSION_HEX < 0x030C0000
   // CI_JIT_NO_ENTRY_GUARD=1（M9 预演专用）：安装裸编译入口以隔离守卫

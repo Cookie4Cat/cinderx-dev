@@ -1,7 +1,7 @@
 {
   "comment": "Locked hashes for the CPython 3.11 vendored/generated core set. Regenerate with verify_core_hashes.py --generate; the diff of this file is what reviewers approve.",
   "files": {
-    "cinderx/Interpreter/3.11/ceval/ceval.c": "c66ea40f0f5ba3a45cb0b7ab2e091082d79b9ed18089127bdc768ea42d7c0e97",
+    "cinderx/Interpreter/3.11/ceval/ceval.c": "7b15a6f22fada333a78a0428386db64800c4061325a32de1ed8919e2c4bdc115",
     "cinderx/Interpreter/3.11/ceval/ceval_gil.h": "7d63160d44026ed38e342bcbcc6f606d39a1dc6f354595343e21d4bee3cead41",
     "cinderx/Interpreter/3.11/ceval/condvar.h": "b6628d26bbffd17df45d3a079d368087980aeeecc62a49099de3b5d488885454",
     "cinderx/Interpreter/3.11/ceval/frame.c": "1b9c9a7d265a6287fb9d4bc607bc62eb14521eb5c180b45c9a6ec9ec30390492",
@@ -11,7 +11,7 @@
     "cinderx/Interpreter/3.11/cinder_opcode.h": "0f3fb4523195076b3aebe0f68dc489d6438e25df93681f76786cf559400f11cc",
     "cinderx/Interpreter/3.11/cinder_opcode_ids.h": "f7a9ab46a5c1f5e06f299e241c2e808bf6e2431c1b882270798152c12bbcbb77",
     "cinderx/Interpreter/3.11/cinder_opcode_metadata.h": "1bc8f9266497855a96da5f217da1226698a69aa8783d4fdc763aa315afdaa8c5",
-    "cinderx/Interpreter/3.11/cinderx_ceval.c": "13c851afa3101db09980755edfd4162c1b44b0c01ab9c7cf74d024f533b54ce8",
+    "cinderx/Interpreter/3.11/cinderx_ceval.c": "f180ca3bac3af7120df397db30894b916240159aee848ae06b686f6b7093f6d5",
     "cinderx/Interpreter/3.11/cinderx_ceval_extras.c": "1b6fb215ebda6aaf84fc843e847586348cd9e1cf9181dbd3f10a9afac1dcc1aa",
     "cinderx/Interpreter/3.11/cinderx_ceval_shims.c": "eb2b876e1812dee43132ed328c2e199a23dbae55ea6522145118b39937064a95",
     "cinderx/Interpreter/3.11/cinderx_frame.c": "601163dbb9bd8eedf29373457a75e64cf05af955444a0a47ba95c097f46e2583",
@@ -22,7 +22,7 @@
     "cinderx/PythonLib/opcodes/3.11/opcode.py": "ee10cdee637396c2a5d15aef53232cfa5792bd96fd2ae6356661a2ba14ccfd72",
     "cinderx/UpstreamBorrow/borrowed-3.11-fallback.c": "23d6480dd7c0cb44f02556abbf0a00e244e6f3d08d965ababc1b8e60fb9fd9d4"
   },
-  "generated_utc": "2026-07-04T11:17:05+00:00",
+  "generated_utc": "2026-07-07T05:06:20+00:00",
   "patterns": [
     "cinderx/Interpreter/3.11/**/*",
     "cinderx/PythonLib/opcodes/3.11/opcode.py",

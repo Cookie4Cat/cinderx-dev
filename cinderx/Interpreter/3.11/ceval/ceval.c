@@ -35,6 +35,21 @@
 #include <ctype.h>
 #include <stdbool.h>
 
+/* [P6] 提前 quickening；台账见 cinderx_ceval.c。步进为 1 时与 stock 的
+   _PyCode_Warmup 逐字等价。 */
+extern int Ci_QuickenWarmupStep_311;
+static inline void
+Ci_CodeWarmupStep_311(PyCodeObject *code)
+{
+    if (code->co_warmup != 0) {
+        code->co_warmup += Ci_QuickenWarmupStep_311;
+        if (code->co_warmup >= 0) {
+            code->co_warmup = 0;
+            _PyCode_Quicken(code);
+        }
+    }
+}
+
 #ifdef Py_DEBUG
    /* For debugging the interpreter: */
 #  define LLTRACE  1      /* Low-level trace feature */
@@ -1766,7 +1781,8 @@ handle_eval_breaker:
         }
 
         TARGET(RESUME) {
-            _PyCode_Warmup(frame->f_code);
+            /* [P6] early quickening; see cinderx_ceval.c ledger. */
+            Ci_CodeWarmupStep_311(frame->f_code);
             JUMP_TO_INSTRUCTION(RESUME_QUICK);
         }
 
@@ -3989,7 +4005,8 @@ handle_eval_breaker:
         }
 
         TARGET(JUMP_BACKWARD) {
-            _PyCode_Warmup(frame->f_code);
+            /* [P6] early quickening; see cinderx_ceval.c ledger. */
+            Ci_CodeWarmupStep_311(frame->f_code);
             JUMP_TO_INSTRUCTION(JUMP_BACKWARD_QUICK);
         }
 
