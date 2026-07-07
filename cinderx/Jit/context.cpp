@@ -23,6 +23,9 @@
 #ifndef WIN32
 #include <dlfcn.h>
 #include <sys/mman.h>
+
+#include <deque>
+#include <mutex>
 #endif
 
 namespace jit {
@@ -472,11 +475,169 @@ void Context::finalizeMultiThreadedCompile() {
 // 执行）。冷路径 noinline，转正后仅付一次 probation_ctl 加载。
 void probationFreeze(BorrowedRef<PyFunctionObject> func);
 
-// 试用期全局令牌：同一时刻只允许一个 code 处于计时试用。并发试用会
-// 交叉污染（预热期整棵调用树同时试用，调用方的编译臂内嵌着被调方的
-// 解释臂，反之亦然），裁决近乎随机。ctl==2 表示排队等令牌，期间按
-// 编译态正常执行；令牌释放后由下一次调用惰性接棒。
-static std::atomic<PyCodeObject*> g_probation_token{nullptr};
+// 试用期 v2 排队授予。v1 令牌复盘：ctl==2 等待者每次调用 CAS 同一条
+// 全局缓存线，长队列（auto=4 下近 200 code 串行试用）期间整程放血
+// （richards 实测 -28%，冻结数仅 1——伤害来自排队税而非误冻）。
+// v2 不变量：同一时刻至多一个 code 处于计时试用（ctl==1），排队者
+// （ctl==2）静默按编译态执行、零全局触碰；裁决/超时/换届时在冷路径
+// 链式授予下一个。所有路径都在 GIL 下执行，互斥锁仅为防御性。
+struct ProbationQueue {
+  std::mutex mutex;
+  std::deque<Ref<PyCodeObject>> pending;
+  Ref<PyCodeObject> active;
+  uint64_t active_grant_ns{0};
+  size_t enrolled{0};
+};
+
+static ProbationQueue& probationQueue() {
+  static ProbationQueue q;
+  return q;
+}
+
+// 诊断计数（CINDERX_PROBATION_DEBUG=1 时进程退出打印）。
+struct ProbationStats {
+  uint64_t enrolled_direct{0};
+  uint64_t enrolled_queued{0};
+  uint64_t enroll_capped{0};
+  uint64_t verdict_acquit{0};
+  uint64_t verdict_freeze{0};
+  uint64_t timeout_acquit{0};
+  uint64_t reap_dethrone{0};
+  uint64_t uncompiled_abort{0};
+  uint64_t promoted{0};
+  uint64_t pending_compiled_calls{0};
+  uint64_t wrapper_interp_falls{0};
+};
+static ProbationStats g_probation_stats;
+void probationDebugDump();
+void probationDebugDump() {
+  if (getenv("CINDERX_PROBATION_DEBUG") == nullptr) {
+    return;
+  }
+  const ProbationStats& s = g_probation_stats;
+  fprintf(
+      stderr,
+      "[probation] direct=%llu queued=%llu capped=%llu acquit=%llu "
+      "freeze=%llu timeout=%llu reap=%llu uncompiled=%llu promoted=%llu\n",
+      (unsigned long long)s.enrolled_direct,
+      (unsigned long long)s.enrolled_queued,
+      (unsigned long long)s.enroll_capped,
+      (unsigned long long)s.verdict_acquit,
+      (unsigned long long)s.verdict_freeze,
+      (unsigned long long)s.timeout_acquit,
+      (unsigned long long)s.reap_dethrone,
+      (unsigned long long)s.uncompiled_abort,
+      (unsigned long long)s.promoted);
+  fprintf(
+      stderr,
+      "[probation] pending_compiled_calls=%llu wrapper_interp_falls=%llu\n",
+      (unsigned long long)s.pending_compiled_calls,
+      (unsigned long long)s.wrapper_interp_falls);
+}
+
+static uint64_t probationNowNs() {
+  struct timespec ts;
+  clock_gettime(CLOCK_MONOTONIC_RAW, &ts);
+  return static_cast<uint64_t>(ts.tv_sec) * 1000000000ull +
+      static_cast<uint64_t>(ts.tv_nsec);
+}
+
+// 队列容量帽：auto 模式下热 code 最先到达编译，首批之外的长尾不再
+// 试用（直接按正常链安装入口），把试用时代的包装器税限定在有限窗口。
+constexpr size_t kProbationEnrollCap = 64;
+// 持有者墙钟死线：调用稀疏的 code 不得长期占据试用位（其间新编译
+// 的 code 都在排队背包装器）。超时按通过裁决（编译态无罪推定）。
+// 诊断可调（CINDERX_AUTOJIT_PROBATION_DEADLINE_MS）。
+static uint64_t probationDeadlineNs() {
+  static const uint64_t ns = [] {
+    const char* v = getenv("CINDERX_AUTOJIT_PROBATION_DEADLINE_MS");
+    return (v != nullptr && *v != '\0') ? strtoull(v, nullptr, 10) * 1000000ull
+                                        : 20'000'000ull;
+  }();
+  return ns;
+}
+
+// 授予下一个排队者（须持锁）。
+static void probationAdvanceLocked(ProbationQueue& q) {
+  q.active.reset();
+  while (!q.pending.empty()) {
+    Ref<PyCodeObject> code = std::move(q.pending.front());
+    q.pending.pop_front();
+    CodeExtra* extra = codeExtraIfExists(code);
+    if (extra == nullptr || extra->probation_ctl != 2) {
+      continue; // 已被他因裁决或卸载
+    }
+    extra->probation_seq = 0;
+    extra->probation_interp_ns = 0;
+    extra->probation_jit_ns = 0;
+    extra->probation_ctl = 1;
+    q.active_grant_ns = probationNowNs();
+    q.active = std::move(code);
+    return;
+  }
+}
+
+// 结束当前 code 的试用（裁决出炉/超时/被他因卸载）并让贤。
+static void probationConclude(CodeExtra* extra) {
+  extra->probation_ctl = 0;
+  ProbationQueue& q = probationQueue();
+  std::lock_guard<std::mutex> lock(q.mutex);
+  probationAdvanceLocked(q);
+}
+
+// 僵死持有者换届（冷路径，排队者采样调用与编译报名两处驱动）：
+// 持有者被授予后若很少被调用，其计时路径不触发、死线无人检查。
+// 超时视为样本不足，无罪推定（ctl=0，下次调用晋升）。
+static void __attribute__((noinline)) probationReapStale() {
+  ProbationQueue& q = probationQueue();
+  std::lock_guard<std::mutex> lock(q.mutex);
+  if (q.active != nullptr &&
+      probationNowNs() - q.active_grant_ns > probationDeadlineNs()) {
+    if (CodeExtra* stale = codeExtraIfExists(q.active)) {
+      if (stale->probation_ctl == 1) {
+        stale->probation_ctl = 0;
+      }
+    }
+    ++g_probation_stats.reap_dethrone;
+    probationAdvanceLocked(q);
+  }
+}
+
+// 首次调用时报名试用（包装器 ctl==3 冷路径）。报名发生在"被调用时"
+// 而非"编译完成时"——首版在 finalize 报名，队列被启动期温函数
+// （最先越过 auto 阈值的 import/harness 机械）占满，且首个授予者是
+// 再也不被调用的死 code，链式授予永久卡死、63 个排队者的包装器态
+// 经调用方特化形连环 DEOPT 放血（richards 实测 -27%，13.7k 次排队
+// 调用 ≈ 每次 ~1µs）。按调用报名后：死 code 永不报名（零成本），
+// 排队者必然在被调用中，裁决必然推进，试用时代有界。
+static void __attribute__((noinline)) probationEnrollOnCall(
+    BorrowedRef<PyCodeObject> code,
+    CodeExtra* extra) {
+  ProbationQueue& q = probationQueue();
+  std::lock_guard<std::mutex> lock(q.mutex);
+  if (extra->probation_ctl != 3) {
+    return;
+  }
+  if (q.enrolled >= kProbationEnrollCap) {
+    ++g_probation_stats.enroll_capped;
+    extra->probation_ctl = 0; // 免试转正，下次调用晋升
+    return;
+  }
+  ++q.enrolled;
+  if (q.active == nullptr && q.pending.empty()) {
+    extra->probation_seq = 0;
+    extra->probation_interp_ns = 0;
+    extra->probation_jit_ns = 0;
+    extra->probation_ctl = 1;
+    q.active_grant_ns = probationNowNs();
+    q.active = Ref<PyCodeObject>::create(code);
+    ++g_probation_stats.enrolled_direct;
+  } else {
+    extra->probation_ctl = 2;
+    q.pending.emplace_back(Ref<PyCodeObject>::create(code));
+    ++g_probation_stats.enrolled_queued;
+  }
+}
 
 static PyObject* __attribute__((noinline)) probationTimedCall(
     BorrowedRef<PyFunctionObject> func,
@@ -484,47 +645,6 @@ static PyObject* __attribute__((noinline)) probationTimedCall(
     PyObject* const* stack,
     size_t nargsf,
     PyObject* kwnames) {
-  BorrowedRef<PyCodeObject> code{func->func_code};
-  if (extra->probation_ctl == 2) {
-    PyCodeObject* expected = nullptr;
-    if (!g_probation_token.compare_exchange_strong(
-            expected, code.get(), std::memory_order_acq_rel)) {
-      // 令牌被他人持有：按编译态正常执行；以 probation_seq 计等待
-      // 次数，超限即窃取令牌（防冷函数长期持有导致队列饥饿——被窃
-      // 者在其计时路径发现令牌易主后自行重新排队）。
-      if (++extra->probation_seq >= 512) {
-        g_probation_token.store(code.get(), std::memory_order_release);
-      } else {
-        CompiledFunction* compiled =
-            getContext() != nullptr ? getContext()->lookupFunc(func)
-                                    : nullptr;
-        if (compiled == nullptr) {
-          extra->probation_ctl = 0;
-          return getInterpretedVectorcall(func)(
-              func.getObj(), stack, nargsf, kwnames);
-        }
-        return compiled->vectorcallEntry()(
-            func.getObj(), stack, nargsf, kwnames);
-      }
-    }
-    extra->probation_ctl = 1;
-    extra->probation_seq = 0;
-    extra->probation_interp_ns = 0;
-    extra->probation_jit_ns = 0;
-  }
-  if (g_probation_token.load(std::memory_order_acquire) != code.get()) {
-    // 令牌被窃：重新排队，本次按编译态执行。
-    extra->probation_ctl = 2;
-    extra->probation_seq = 0;
-    CompiledFunction* compiled =
-        getContext() != nullptr ? getContext()->lookupFunc(func) : nullptr;
-    if (compiled == nullptr) {
-      extra->probation_ctl = 0;
-      return getInterpretedVectorcall(func)(
-          func.getObj(), stack, nargsf, kwnames);
-    }
-    return compiled->vectorcallEntry()(func.getObj(), stack, nargsf, kwnames);
-  }
   // 块式交替采样：32 次同臂连续调用为一块（偶块=编译、奇块=解释），
   // 每臂首块弃权（icache/分支预热），其后每臂累计 K 样本后裁决。
   // 亚微秒级调用的逐次计时被时钟开销与量化噪声支配，按块聚合把
@@ -544,17 +664,20 @@ static PyObject* __attribute__((noinline)) probationTimedCall(
     CompiledFunction* compiled =
         getContext() != nullptr ? getContext()->lookupFunc(func) : nullptr;
     if (compiled == nullptr) {
-      // 试用期间被他因卸载（如 ROI backoff）：终止试用并交还令牌。
-      extra->probation_ctl = 0;
-      g_probation_token.store(nullptr, std::memory_order_release);
+      // 试用期间被他因卸载（如 despec/ROI backoff）：终止试用让贤。
+      ++g_probation_stats.uncompiled_abort;
+      probationConclude(extra);
       return getInterpretedVectorcall(func)(
           func.getObj(), stack, nargsf, kwnames);
     }
     result = compiled->vectorcallEntry()(func.getObj(), stack, nargsf, kwnames);
   }
   clock_gettime(CLOCK_MONOTONIC_RAW, &t1);
-  uint64_t ns = static_cast<uint64_t>(t1.tv_sec - t0.tv_sec) * 1000000000ull +
-      static_cast<uint64_t>(t1.tv_nsec - t0.tv_nsec);
+  uint64_t t1_ns = static_cast<uint64_t>(t1.tv_sec) * 1000000000ull +
+      static_cast<uint64_t>(t1.tv_nsec);
+  uint64_t ns = t1_ns -
+      (static_cast<uint64_t>(t0.tv_sec) * 1000000000ull +
+       static_cast<uint64_t>(t0.tv_nsec));
   if (block >= 2) {
     if (interp_turn) {
       extra->probation_interp_ns += ns;
@@ -562,18 +685,28 @@ static PyObject* __attribute__((noinline)) probationTimedCall(
       extra->probation_jit_ns += ns;
     }
   }
+  if (t1_ns - probationQueue().active_grant_ns > probationDeadlineNs()) {
+    // 超时：样本不足以裁决，无罪推定，让贤。
+    ++g_probation_stats.timeout_acquit;
+    probationConclude(extra);
+    return result;
+  }
   size_t k = getConfig().probation_calls;
   // 总样本 = 预热两块 + 每臂 K（向上取整到块边界）。
   uint32_t accum_blocks_per_arm =
       static_cast<uint32_t>((k + kProbationBlock - 1) / kProbationBlock);
   uint32_t total = (2 + 2 * accum_blocks_per_arm) * kProbationBlock;
   if (seq + 1 >= total) {
-    extra->probation_ctl = 0;
-    g_probation_token.store(nullptr, std::memory_order_release);
-    if (extra->probation_interp_ns > 0 &&
-        extra->probation_jit_ns * 100 >
-            extra->probation_interp_ns * getConfig().probation_margin_pct) {
+    // 先让贤再冻结（冻结会卸载并触发入口重装，不应在持有试用位时做）。
+    uint64_t interp_ns = extra->probation_interp_ns;
+    uint64_t jit_ns = extra->probation_jit_ns;
+    probationConclude(extra);
+    if (interp_ns > 0 &&
+        jit_ns * 100 > interp_ns * getConfig().probation_margin_pct) {
+      ++g_probation_stats.verdict_freeze;
       probationFreeze(func);
+    } else {
+      ++g_probation_stats.verdict_acquit;
     }
   }
   return result;
@@ -658,12 +791,31 @@ static PyObject* recursionGuardedVectorcall(
       }
     }
   }
-  if (kTimedProbation && extra != nullptr && extra->probation_ctl != 0) {
+  if (kTimedProbation && extra != nullptr && extra->probation_ctl == 1) {
     result = probationTimedCall(func, extra, stack, nargsf, kwnames);
   } else if (CompiledFunction* compiled = lookupCompiledForCall(func)) {
+    if (kTimedProbation && extra != nullptr) {
+      if (extra->probation_ctl == 0) {
+        // 已通过裁决且入口守卫已行内化：晋升裸编译入口，本包装器就此
+        // 退场（v1 的通过者永久背包装器哈希税在此消除）。
+        if (compiled->runtime()->entryGuardInlined()) {
+          setVectorcall(func, compiled->vectorcallEntry());
+          ++g_probation_stats.promoted;
+        }
+      } else if (extra->probation_ctl == 3) {
+        probationEnrollOnCall(
+            BorrowedRef<PyCodeObject>{func->func_code}, extra);
+      } else if (++g_probation_stats.pending_compiled_calls &&
+                 (++extra->probation_seq & 255) == 0) {
+        // 排队者（ctl==2）以自身调用采样驱动队列活性兜底（持有者
+        // 中途被卸载且不再被调用时换届）。
+        probationReapStale();
+      }
+    }
     result = compiled->vectorcallEntry()(func_obj, stack, nargsf, kwnames);
   } else {
     // 安装与调用之间函数被去优化：退回解释器入口。
+    ++g_probation_stats.wrapper_interp_falls;
     result = getInterpretedVectorcall(func)(func_obj, stack, nargsf, kwnames);
   }
   _Py_LeaveRecursiveCallTstate(tstate);
@@ -720,7 +872,27 @@ bool Context::finalizeFunc(
     const char* v = getenv("CI_JIT_NO_ENTRY_GUARD");
     return v != nullptr && *v != '\0' && *v != '0';
   }();
-  if (no_entry_guard) {
+  bool probation_armed = false;
+  if (!no_entry_guard && getConfig().probation_calls > 0) {
+    // 试用期武装（覆盖全部 code，含入口守卫行内化者）：仅置位挂
+    // 包装器，报名推迟到首次真实调用（见 probationEnrollOnCall 注释
+    // ——finalize 期报名会被启动期温函数占满队列且死 code 卡死链）。
+    // 生成器豁免（resume 不经 vectorcall）；despec 重编译后允许再次
+    // 试用。通过裁决后由包装器晋升裸入口，武装态对不被调用的 code
+    // 零成本。
+    BorrowedRef<PyCodeObject> code{func->func_code};
+    if (!(code->co_flags & kCoFlagsAnyGenerator)) {
+      if (CodeExtra* extra = codeExtra(code)) {
+        if (extra->probation_ctl == 0) {
+          extra->probation_ctl = 3;
+        }
+        probation_armed = true;
+      }
+    }
+  }
+  if (probation_armed) {
+    setVectorcall(func, recursionGuardedVectorcall);
+  } else if (no_entry_guard) {
     setVectorcall(func, compiled->vectorcallEntry());
   } else if (compiled->runtime()->entryGuardInlined()) {
     // 入口守卫行内化：两检查已下沉编译序言（tracing 分流 + 递归预检
@@ -729,19 +901,6 @@ bool Context::finalizeFunc(
     setVectorcall(func, compiled->vectorcallEntry());
   } else {
     setVectorcall(func, recursionGuardedVectorcall);
-    // 启动试用期计时（生成器豁免：resume 不经 vectorcall；重编译后
-    // 允许再次试用）。
-    if (getConfig().probation_calls > 0) {
-      BorrowedRef<PyCodeObject> code{func->func_code};
-      if (!(code->co_flags & kCoFlagsAnyGenerator)) {
-        if (CodeExtra* extra = codeExtra(code)) {
-          extra->probation_seq = 0;
-          extra->probation_interp_ns = 0;
-          extra->probation_jit_ns = 0;
-          extra->probation_ctl = 2; // 排队等全局令牌
-        }
-      }
-    }
   }
 #else
   setVectorcall(func, compiled->vectorcallEntry());

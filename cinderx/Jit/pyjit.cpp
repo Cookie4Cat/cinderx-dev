@@ -4738,6 +4738,9 @@ int initialize() {
 }
 
 void finalize() {
+  // 试用期诊断计数（CINDERX_PROBATION_DEBUG=1 时打印,定义于 context.cpp）。
+  extern void probationDebugDump();
+  probationDebugDump();
   FreeThreadedJITEntrypointGuard guard;
   if (!isJitInitialized()) {
     return;

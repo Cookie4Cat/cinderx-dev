@@ -61,7 +61,9 @@ typedef struct CodeExtra {
   // 入口包装器内按奇偶交替走解释/编译两条入口并计时，等样本均时对比
   // （带余量）决定转正或卸载冻结——时间维度直接回答"编译态是否劣于
   // 解释态"（计数阈值无法区分慢路径多但净更快的形态）。
-  // probation_ctl：0=未启或已裁决，1=试用中。
+  // probation_ctl：0=未启或已裁决，1=计时试用中（全局至多一个），
+  // 2=排队等授予（静默按编译态执行，零全局触碰），3=已武装未报名
+  // （编译完成但尚未被调用；首次调用时报名）。
   uint32_t probation_ctl;
   uint32_t probation_seq;
   uint64_t probation_interp_ns;
