@@ -78,4 +78,17 @@ extern void* Ci_StockEntry311;
 // 与 stock 逐字等价）。run-once 无循环代码仍永不付 quicken 税；带
 // 循环的 code 至迟在首调内成熟，使 auto=2 也能读到特化码流。
 extern int Ci_QuickenWarmupStep_311;
+
+// [P7]（源级补丁，CALL）泛型调用的行内压栈门与 [P4] 同学说：stock 的
+// `eval_frame == NULL` 检查在本端口恒假（求值器即本循环自身），使全部
+// 未特化的 Python-Python 调用退化为 PyObject_Vectorcall 跨 .so 乒乓
+//（PLT 出线 → libpython 派发 → 间接跳回本 .so 的默认入口）。3.11 对
+// 生成器/协程函数调用不做 CALL 特化（specialize.c 一律 SPEC_FAIL），
+// 该乒乓在协程创建密集形态（每 await 建一协程）是主要外围税之一
+//（协程解释态验尸：调用派发组 +0.95ms/29.7ms）。补丁为原门补充
+// 被调方判定：被调方 vectorcall 仍为解释器默认入口（Ci_StockEntry311）
+// 时行内压栈——压栈帧同样在本循环内执行且经过 start_frame 的 [P3]
+// 计数钩子，语义等价；编译入口/包装入口不满足判据，经通用路径进 JIT
+//（与 [P4] 特化形一致）。Ci_StockEntry311 未初始化时为空，行为退回
+// stock 一刀切。
 #include "ceval/ceval.c"

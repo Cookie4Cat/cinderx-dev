@@ -69,6 +69,10 @@ bool JitGenFreeList::fromThisArena(void* ptr) {
   return ptr >= &entries_ && ptr < &entries_[kGenFreeListEntries - 1] + 1;
 }
 
+bool JitGenFreeList::owns(PyObject* ptr) {
+  return fromThisArena(ptr);
+}
+
 void JitGenFreeList::free(PyObject* ptr) {
   if (!fromThisArena(ptr)) {
     PyObject_GC_Del(ptr);
@@ -141,6 +145,10 @@ std::pair<JitGenObject*, size_t> JITGenFreeThreadedFreeList::allocate(
 
 void JITGenFreeThreadedFreeList::free(PyObject* ptr) {
   PyObject_GC_Del(ptr);
+}
+
+bool JITGenFreeThreadedFreeList::owns(PyObject*) {
+  return false;
 }
 
 } // namespace jit

@@ -34,6 +34,7 @@ class JitGenFreeList : public IJitGenFreeList {
       BorrowedRef<PyCodeObject> code,
       uint64_t jit_spill_words) override;
   void free(PyObject* ptr) override;
+  bool owns(PyObject* ptr) override;
 
  private:
   void* rawAllocate();
@@ -58,6 +59,7 @@ class JITGenFreeThreadedFreeList : public IJitGenFreeList {
       BorrowedRef<PyCodeObject> code,
       uint64_t jit_spill_words) override;
   void free(PyObject* ptr) override;
+  bool owns(PyObject* ptr) override;
 };
 
 } // namespace jit

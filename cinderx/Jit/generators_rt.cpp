@@ -164,27 +164,40 @@ void deopt_finished_coro_object_only(JitGenObject* gen) {
 }
 
 void jitgen_dealloc(PyObject* self) {
-  // Clear TreeIter state before deopt so the footer pointer is still valid.
   JitGenObject* jit_gen = JitGenObject::cast(self);
-  GenDataFooter* gen_footer = nullptr;
-  bool fast_finished_coro = false;
-  if (jit_gen != nullptr) {
-    gen_footer = jit_gen->genDataFooter();
-#if PY_VERSION_HEX >= 0x030E0000
-    // Older frame layouts need the generic deopt path's reified-frame cleanup.
-    fast_finished_coro =
-        Py_IS_TYPE(self, cinderx::getModuleState()->coro_type) &&
-        gen_footer->yieldPoint == nullptr &&
-        gen_footer->tree_iter_state == nullptr &&
-        jit_gen->gi_frame_state == FRAME_CLEARED &&
-        jit_gen->gi_weakreflist == nullptr &&
-        reinterpret_cast<PyCoroObject*>(jit_gen)->cr_origin_or_finalizer ==
-            nullptr &&
-        generatorFrame(jit_gen)->previous == nullptr;
-#endif
-    if (!fast_finished_coro) {
-      clearTreeIterState(gen_footer);
+  if (jit_gen == nullptr) {
+    // 纯解释生成器/协程,以及深度 deopt 后类型已还原的对象。内存不在
+    // free-list arena 时来自 PyObject_GC_NewVar,直接交还 stock 析构器
+    // （libpython 宏内联 + PGO 产物）;此前无差别走
+    // gen_dealloc_with_custom_free 的出口函数版 GC 记账与虚调用
+    // free-list,是协程解释态剖面的主要外围税之一。arena 内存
+    // （deopt 后类型还原但存储仍在池内）必须保留自定义释放。
+    if (!cinderx::getModuleState()->jit_gen_free_list->owns(self)) {
+      (Py_IS_TYPE(self, &PyCoro_Type) ? original_coro_dealloc
+                                      : original_gen_dealloc)(self);
+      return;
     }
+    gen_dealloc_with_custom_free(self);
+    return;
+  }
+
+  // Clear TreeIter state before deopt so the footer pointer is still valid.
+  GenDataFooter* gen_footer = jit_gen->genDataFooter();
+  bool fast_finished_coro = false;
+#if PY_VERSION_HEX >= 0x030E0000
+  // Older frame layouts need the generic deopt path's reified-frame cleanup.
+  fast_finished_coro =
+      Py_IS_TYPE(self, cinderx::getModuleState()->coro_type) &&
+      gen_footer->yieldPoint == nullptr &&
+      gen_footer->tree_iter_state == nullptr &&
+      jit_gen->gi_frame_state == FRAME_CLEARED &&
+      jit_gen->gi_weakreflist == nullptr &&
+      reinterpret_cast<PyCoroObject*>(jit_gen)->cr_origin_or_finalizer ==
+          nullptr &&
+      generatorFrame(jit_gen)->previous == nullptr;
+#endif
+  if (!fast_finished_coro) {
+    clearTreeIterState(gen_footer);
   }
 
   if (fast_finished_coro) {
@@ -194,10 +207,7 @@ void jitgen_dealloc(PyObject* self) {
   }
 
   bool deopted = true;
-  if (jit_gen == nullptr) {
-    deopted = deopt_jit_gen(self);
-  } else if (
-      gen_footer->yieldPoint == nullptr &&
+  if (gen_footer->yieldPoint == nullptr &&
       FRAME_STATE_FINISHED(jit_gen->gi_frame_state)) {
     deopt_jit_gen_object_only(jit_gen);
   } else {

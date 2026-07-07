@@ -1718,8 +1718,15 @@ start_frame:
 #ifndef CI_T1_NO_AUTOJIT_HOOK
     /* [P3] auto-JIT frame-push counting; see cinderx_ceval.c ledger.
        CI_T1_NO_AUTOJIT_HOOK 为 T1 本底税测量护栏（量化钩子调用位点
-       本身的成本，测量构建专用，禁用于交付）。 */
-    Ci_AutoJitCountFramePush311(tstate, frame);
+       本身的成本，测量构建专用，禁用于交付）。
+       生成器属主帧（yield/await 恢复）不计数：生成器体的调用次数由
+       创建时的线程属主帧记账（RETURN_GENERATOR 在创建帧内执行），
+       按恢复计数既失真（一次调用多次恢复）又构成协程/生成器密集形态
+       的每恢复固定税（协程解释态验尸：钩子 5.45% 周期，而 D6 下协程
+       体永不可编译）。 */
+    if (frame->owner != FRAME_OWNED_BY_GENERATOR) {
+        Ci_AutoJitCountFramePush311(tstate, frame);
+    }
 #endif
     if (_Py_EnterRecursiveCallTstate(tstate, "")) {
         tstate->recursion_remaining--;
@@ -4757,7 +4764,10 @@ handle_eval_breaker:
             PyObject *function = PEEK(total_args + 1);
             int positional_args = total_args - KWNAMES_LEN();
             // Check if the call can be inlined or not
-            if (Py_TYPE(function) == &PyFunction_Type && tstate->interp->eval_frame == NULL) {
+            /* [P7] callee-aware inline gate; see cinderx_ceval.c ledger. */
+            if (Py_TYPE(function) == &PyFunction_Type &&
+                (tstate->interp->eval_frame == NULL ||
+                 (void *)((PyFunctionObject *)function)->vectorcall == Ci_StockEntry311)) {
                 int code_flags = ((PyCodeObject*)PyFunction_GET_CODE(function))->co_flags;
                 PyObject *locals = code_flags & CO_OPTIMIZED ? NULL : PyFunction_GET_GLOBALS(function);
                 STACK_SHRINK(total_args);

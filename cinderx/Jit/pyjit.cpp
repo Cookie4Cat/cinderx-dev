@@ -4693,6 +4693,15 @@ int initialize() {
   getMutableConfig().state = State::kRunning;
   syncOSRFlags();
 
+#if PY_VERSION_HEX < 0x030C0000
+  // [P4]/[P7] 被调方感知行内门的判据：解释器默认 vectorcall 入口。
+  // 置于 auto 分支之外——jit-list/auto=0 形态下 vendored 循环同样在
+  // 跑，行内压栈同样语义等价；此前仅 auto 分支赋值，使这些形态的
+  // 特化调用与行内门永久 DEOPT 到通用路径（历史"auto=0 解释态偏慢"
+  // 的归因之一）。
+  Ci_StockEntry311 = reinterpret_cast<void*>(Ci_PyFunction_Vectorcall);
+#endif
+
   mod_state->jit_list = std::move(jit_list);
 
   // JIT is now fully initialized.  If it was configured to run automatically on
@@ -4710,9 +4719,7 @@ int initialize() {
 #if PY_VERSION_HEX < 0x030C0000
       // 3.11 计数式 auto 由 vendored 循环 [P3] 帧压栈钩子驱动（存量与
       // 新建函数在执行时被统一计数），不做启动期存量函数入口安装，
-      // 避免双机制并存。
-      Ci_StockEntry311 =
-          reinterpret_cast<void*>(Ci_PyFunction_Vectorcall);
+      // 避免双机制并存。Ci_StockEntry311 的赋值见上方 auto 无关段。
       // [P6] 提前 quickening：步进 4 = 第 2 个 warmup 事件（第 2 次进入
       // 或首个回边）即 quicken，使低阈值编译读到特化字节码；旗标关闭
       // 时保持 stock 步进 1。
