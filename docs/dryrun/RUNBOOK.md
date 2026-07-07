@@ -38,9 +38,14 @@ docker exec dryrun-perf bash -c '
 ```bash
 BUILD_TREE=/src/scratch/temp.linux-aarch64-cpython-311 \
 CMAKE_BIN=<cmake 路径> \
-TRAIN_CMD='<代表性负载与冒烟，见脚本头注释>' \
+TRAIN_CMD='bash /src/ci_pipeline/scripts/train_full_311.sh' \
   bash /src/ci_pipeline/scripts/build_pgo_lto_311.sh
 ```
+
+训练负载定稿为 16 基准多形态混合 + 冒烟、全程 JIT-on
+（train_full_311.sh，训练集实验矩阵结论见
+M10-pgo-trainset-log.md；勿加解释态训练遍——实测稀释 JIT 态
+画像净负，解释器纯本底对训练内容不敏感）。
 
 注意：PGO-use 状态下改源码重编会报 coverage-mismatch 错——**开发
 迭代期先复原普通构建**（`cmake -DENABLE_PGO_USE=OFF -DENABLE_LTO=OFF .`），
