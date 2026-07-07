@@ -956,6 +956,56 @@ PyObject* JITRT_LoadGlobalModuleValue(
   Py_INCREF(result);
   return result;
 }
+
+// LOAD_GLOBAL 的 builtins 命中形（镜像 stock LOAD_GLOBAL_BUILTIN 的
+// 双 keys_version 守卫）：globals 版本钉住"名字仍不在模块层"（3.11
+// 字典键结构任何变更都使 dk_version 失效），builtins 版本钉住条目
+// 布局，索引直读。任一失配返回空由守卫 deopt 兜底。
+PyObject* JITRT_LoadGlobalBuiltinValue311(
+    PyObject* globals,
+    PyObject* builtins,
+    PyObject* name,
+    uint32_t globals_keys_version,
+    uint32_t builtins_keys_version,
+    Py_ssize_t index) {
+  if (!PyDict_CheckExact(globals) || !PyDict_CheckExact(builtins) ||
+      index < 0) {
+    return nullptr;
+  }
+
+  auto gdict = reinterpret_cast<PyDictObject*>(globals);
+  if (gdict->ma_keys->dk_version != globals_keys_version ||
+      gdict->ma_values != nullptr) {
+    return nullptr;
+  }
+
+  auto bdict = reinterpret_cast<PyDictObject*>(builtins);
+  PyDictKeysObject* bkeys = bdict->ma_keys;
+  if (bkeys->dk_version != builtins_keys_version ||
+      index >= bkeys->dk_nentries || bdict->ma_values != nullptr ||
+      !hasOnlyUnicodeKeys(builtins)) {
+    return nullptr;
+  }
+
+  PyDictUnicodeEntry* entry = &DK_UNICODE_ENTRIES(bkeys)[index];
+  if (entry->me_key == nullptr || entry->me_value == nullptr) {
+    return nullptr;
+  }
+  if (entry->me_key != name) {
+    int equal = PyObject_RichCompareBool(entry->me_key, name, Py_EQ);
+    if (equal < 0) {
+      PyErr_Clear();
+      return nullptr;
+    }
+    if (!equal) {
+      return nullptr;
+    }
+  }
+
+  PyObject* result = entry->me_value;
+  Py_INCREF(result);
+  return result;
+}
 #endif
 
 PyObject* JITRT_LoadGlobalFromThreadState(

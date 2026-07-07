@@ -523,6 +523,11 @@ class HIRBuilder {
       const jit::BytecodeInstruction& bc_instr,
       int name_idx,
       Register* result);
+
+  bool tryEmitLoadGlobalBuiltinValue311(
+      TranslationContext& tc,
+      BorrowedRef<> name,
+      Register* result);
 #endif
 
   void emitBuildInterpolation(
