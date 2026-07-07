@@ -81,6 +81,10 @@ class LIRGenerator {
   jit::codegen::Environ* env_{nullptr};
 
   bool is_gen_{false};
+  // 3.11:函数无任何可达正常返回(如 pickle _Unpickler.load——try 内
+  // 无限循环,唯一 return 在异常 handler 内,handler 经 deopt 走解释
+  // 器)。出口块按无前驱合成:phi 换常量,EpilogueEnd 照常。
+  bool has_no_normal_return_{false};
 
   BasicBlock* entry_block_{nullptr};
   BasicBlock* frame_setup_block_{nullptr};

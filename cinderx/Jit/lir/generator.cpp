@@ -1170,7 +1170,14 @@ void LIRGenerator::GenerateExitBlocks() {
     bbb.switchBlock(block);
 
     auto ret_data_type = hirTypeToDataType(func_->return_type);
-    exit_phi_ = bbb.appendInstr(OutVReg{ret_data_type}, Instruction::kPhi);
+    if (has_no_normal_return_) {
+      // 无可达正常返回(见 generator.h 成员注释):出口块无前驱,零输入
+      // phi 无法物化,改为常量占位喂 EpilogueEnd(不可达,值无意义)。
+      exit_phi_ = bbb.appendInstr(
+          OutVReg{ret_data_type}, Instruction::kMove, Imm{0});
+    } else {
+      exit_phi_ = bbb.appendInstr(OutVReg{ret_data_type}, Instruction::kPhi);
+    }
 
     // Unlink frame before epilogue. Non-generators always unlink.
     bool has_freevars = func_->code != nullptr && func_->code->co_nfreevars > 0;
@@ -1315,10 +1322,7 @@ std::unique_ptr<jit::lir::Function> LIRGenerator::TranslateFunction() {
       }
     }
     if (!has_return) {
-      JIT_THROW(
-          "functions with no reachable normal return are unsupported on "
-          "CPython 3.11 in {}",
-          func_->fullname);
+      has_no_normal_return_ = true;
     }
   }
 #endif
