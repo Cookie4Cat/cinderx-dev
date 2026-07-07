@@ -4773,6 +4773,88 @@ void HIRBuilder::emitSequenceSet(
 }
 
 #if PY_VERSION_HEX < 0x030C0000
+// LOAD_GLOBAL 的 builtins 命中形（由 tryEmitLoadGlobalModuleValue311
+// 在模块层未命中时调用，调用方已完成 stable_frame/specialized_opcodes
+// 与 globals 组合表检查）。双 keys_version 守卫语义见
+// JITRT_LoadGlobalBuiltinValue311 注释。
+bool HIRBuilder::tryEmitLoadGlobalBuiltinValue311(
+    TranslationContext& tc,
+    BorrowedRef<> name,
+    Register* result) {
+  BorrowedRef<PyDictObject> globals = preloader_.globals();
+  BorrowedRef<PyDictObject> builtins = preloader_.builtins();
+  if (builtins == nullptr || !PyDict_CheckExact(builtins) ||
+      builtins->ma_values != nullptr ||
+      !hasOnlyUnicodeKeys(BorrowedRef<>{builtins})) {
+    return false;
+  }
+
+  PyObject* value = PyDict_GetItemWithError(BorrowedRef<>{builtins}, name);
+  if (value == nullptr) {
+    if (PyErr_Occurred()) {
+      PyErr_Clear();
+    }
+    return false;
+  }
+
+  Py_ssize_t index = findActiveUnicodeDictEntryIndex(builtins, name, value);
+  if (index < 0) {
+    return false;
+  }
+  uint32_t globals_keys_version = dictGetKeysVersion(nullptr, globals->ma_keys);
+  uint32_t builtins_keys_version =
+      dictGetKeysVersion(nullptr, builtins->ma_keys);
+  if (globals_keys_version == 0 || builtins_keys_version == 0) {
+    return false;
+  }
+
+  Register* globals_reg = temps_.AllocateNonStack();
+  tc.emit<LoadConst>(
+      globals_reg,
+      Type::fromObject(env_->addReference(BorrowedRef<>{globals})));
+
+  Register* builtins_reg = temps_.AllocateNonStack();
+  tc.emit<LoadConst>(
+      builtins_reg,
+      Type::fromObject(env_->addReference(BorrowedRef<>{builtins})));
+
+  Register* name_reg = temps_.AllocateNonStack();
+  tc.emit<LoadConst>(name_reg, Type::fromObject(env_->addReference(name)));
+
+  Register* gver_reg = temps_.AllocateNonStack();
+  tc.emit<LoadConst>(
+      gver_reg, Type::fromCUInt(globals_keys_version, TCUInt32));
+
+  Register* bver_reg = temps_.AllocateNonStack();
+  tc.emit<LoadConst>(
+      bver_reg, Type::fromCUInt(builtins_keys_version, TCUInt32));
+
+  Register* index_reg = temps_.AllocateNonStack();
+  tc.emit<LoadConst>(index_reg, Type::fromCInt(index, TCInt64));
+
+  auto call = tc.emit<CallStatic>(
+      6,
+      result,
+      reinterpret_cast<void*>(JITRT_LoadGlobalBuiltinValue311),
+      TOptObject);
+  call->SetOperand(0, globals_reg);
+  call->SetOperand(1, builtins_reg);
+  call->SetOperand(2, name_reg);
+  call->SetOperand(3, gver_reg);
+  call->SetOperand(4, bver_reg);
+  call->SetOperand(5, index_reg);
+
+  tc.emitSnapshot();
+  auto guard = tc.emit<Guard>(result);
+  guard->setFrameState(tc.frame);
+  guard->setGuiltyReg(result);
+  guard->setDescr(
+      fmt::format("LOAD_GLOBAL_BUILTIN: {}", PyUnicode_AsUTF8(name)));
+
+  tc.emit<RefineType>(result, TObject, result);
+  return true;
+}
+
 bool HIRBuilder::tryEmitLoadGlobalModuleValue311(
     TranslationContext& tc,
     const jit::BytecodeInstruction& bc_instr,
@@ -4794,7 +4876,13 @@ bool HIRBuilder::tryEmitLoadGlobalModuleValue311(
     if (PyErr_Occurred()) {
       PyErr_Clear();
     }
-    return false;
+    // builtins 命中形（镜像 stock LOAD_GLOBAL_BUILTIN）：名字不在模块
+    // 层时改钉双 keys_version——globals 版本保证"仍未被模块层遮蔽"，
+    // builtins 版本保证条目布局，索引直读。deepcopy 验尸实测：温函数
+    // 家族的 LoadGlobal 位点大半是 builtins 名（id/type/getattr/
+    // isinstance 等），此前一律落回逐次双字典查找的泛型 helper，而
+    // 解释器同位点走 LOAD_GLOBAL_BUILTIN 行内特化。
+    return tryEmitLoadGlobalBuiltinValue311(tc, name, result);
   }
 
   Py_ssize_t index = -1;

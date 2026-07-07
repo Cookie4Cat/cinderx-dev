@@ -129,6 +129,14 @@ PyObject* JITRT_LoadGlobalModuleValue(
     PyObject* name,
     uint32_t keys_version,
     Py_ssize_t index);
+
+PyObject* JITRT_LoadGlobalBuiltinValue311(
+    PyObject* globals,
+    PyObject* builtins,
+    PyObject* name,
+    uint32_t globals_keys_version,
+    uint32_t builtins_keys_version,
+    Py_ssize_t index);
 #endif
 
 /*
