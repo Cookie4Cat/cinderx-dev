@@ -340,12 +340,14 @@ Ref<> send_core(JitGenObject* jit_gen, PyObject* arg, PyThreadState* tstate) {
 // handles sending in values, and calls send_core() above to dispatch to a
 // JIT function rather than executing with the interpreter. If any of the
 // inputs would lead to an exception, try to deopt and hand back to the CPython
-// version.
-PySendResult jitgen_am_send(PyObject* obj, PyObject* arg, PyObject** presult) {
-  JitGenObject* gen = JitGenObject::cast(obj);
-  if (gen == nullptr) {
-    return Py_TYPE(obj)->tp_as_async->am_send(obj, arg, presult);
-  }
+// version. 恢复快路径拆分：类型判定后的主体独立为
+// jitgenSendImplInternal，供 JITRT_GenSend/iternext 经规范槽指针比对
+// 免检直调（槽被 with_deopt 换装时指针不等，调用方回落槽调）。
+PySendResult jitgenSendImplInternal(
+    JitGenObject* gen,
+    PyObject* arg,
+    PyObject** presult) {
+  PyObject* obj = reinterpret_cast<PyObject*>(gen);
 
   // A finalizer can re-enter a generator while its return-path refcount
   // cleanup is still running.  At that point the generator is already
@@ -481,6 +483,15 @@ PySendResult jitgen_am_send(PyObject* obj, PyObject* arg, PyObject** presult) {
   return result ? PYGEN_RETURN : PYGEN_ERROR;
 }
 
+// 规范 am_send 槽实现：类型判定薄壳，主体在 jitgenSendImplInternal。
+PySendResult jitgen_am_send(PyObject* obj, PyObject* arg, PyObject** presult) {
+  JitGenObject* gen = JitGenObject::cast(obj);
+  if (gen == nullptr) {
+    return Py_TYPE(obj)->tp_as_async->am_send(obj, arg, presult);
+  }
+  return jitgenSendImplInternal(gen, arg, presult);
+}
+
 // Wrapper installed as am_send when the JIT is paused (e.g. instrumentation
 // active). Deopts the generator so it resumes in interpreter mode with proper
 // monitoring support, then delegates to the (now CPython) type's am_send.
@@ -508,8 +519,14 @@ PyObject* jitgen_send(PyObject* obj, PyObject* arg) {
 
 PyObject* jitgen_iternext(PyObject* obj) {
   PyObject* result = nullptr;
-  if (Py_TYPE(obj)->tp_as_async->am_send(obj, nullptr, &result) ==
-      PYGEN_RETURN) {
+  // 恢复快路径：槽即规范实现则免槽间接跳与二次类型检查（with_deopt
+  // 换装或对象已深度 deopt 时槽指针不等，回落槽调）。
+  PyAsyncMethods* am = Py_TYPE(obj)->tp_as_async;
+  PySendResult st = am->am_send == jitgen_am_send
+      ? jitgenSendImplInternal(
+            reinterpret_cast<JitGenObject*>(obj), nullptr, &result)
+      : am->am_send(obj, nullptr, &result);
+  if (st == PYGEN_RETURN) {
     if (result != Py_None) {
       _PyGen_SetStopIterationValue(result);
     }
@@ -717,6 +734,17 @@ static PyAsyncMethods* jitcorowrapper_async_methods = nullptr;
 
 #endif
 } // namespace
+
+// 恢复快路径导出（声明见 generators_rt.h）：规范槽指针供调用方比对
+// 身份，比对通过即免槽间接跳与二次类型检查直调主体。
+JitGenSendFunc jitGenCanonicalAmSend() {
+  return jitgen_am_send;
+}
+
+PySendResult jitGenSendFast(PyObject* gen, PyObject* arg, PyObject** presult) {
+  return jitgenSendImplInternal(
+      reinterpret_cast<JitGenObject*>(gen), arg, presult);
+}
 
 PyTypeObject _JitCoroWrapper_Type = {
     PyVarObject_HEAD_INIT(NULL, 0) "coroutine_wrapper",

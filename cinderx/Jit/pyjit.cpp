@@ -1374,6 +1374,13 @@ FlagProcessor initFlagProcessor() {
       "repeated guard-failure deopts (3.11).");
 
   flag_processor.addOption(
+      "jit-compile-sync-generators",
+      "PYTHONJITCOMPILESYNCGENERATORS",
+      getMutableConfig().compile_sync_generators,
+      "Auto-compile synchronous generator functions (3.11; net-negative by "
+      "default, resume ceremony dominates trivial bodies).");
+
+  flag_processor.addOption(
       "jit-adaptive-despec-threshold",
       "CINDERX_ADAPTIVE_DESPEC_THRESHOLD",
       getMutableConfig().despec_deopt_threshold,
@@ -4932,8 +4939,17 @@ extern "C" void Ci_MaybeScheduleAutoJIT(
 //    文件名命中前缀的代码——用于把基准测量的编译面收窄到工作负载
 //    文件（有机 deopt-resume 的 prev_instr 失效案定位期间的预演口径）。
 static bool ci_autoJit311AllowsCode(PyCodeObject* code) {
-  if (code == nullptr || code->co_filename == nullptr ||
-      !PyUnicode_Check(code->co_filename)) {
+  if (code == nullptr) {
+    return true;
+  }
+  // 同步生成器默认不自动编译（编译净效应为负，见 config.h 注释）；
+  // 协程/异步生成器位含协程语义，不在此列。
+  if (!jit::getConfig().compile_sync_generators &&
+      (code->co_flags & CO_GENERATOR) &&
+      !(code->co_flags & (CO_COROUTINE | CO_ASYNC_GENERATOR))) {
+    return false;
+  }
+  if (code->co_filename == nullptr || !PyUnicode_Check(code->co_filename)) {
     return true;
   }
   Py_ssize_t len = 0;

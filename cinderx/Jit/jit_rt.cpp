@@ -1923,7 +1923,13 @@ JITRT_GenSendRes JITRT_GenSend(
   // ~4%）。无槽类型回落原路径。
   PySendResult gen_status;
   PyAsyncMethods* am = Py_TYPE(gen)->tp_as_async;
-  if (am != nullptr && am->am_send != nullptr) {
+  // 恢复快路径：槽即规范 JitGen send（身份蕴含类型与未换装），免槽
+  // 间接跳与 am_send 内的二次类型检查（generators 剖面：三层派发占
+  // ~25% 周期，本快路径合并为一层）。
+  static const jit::JitGenSendFunc canonical_send = jit::jitGenCanonicalAmSend();
+  if (am != nullptr && am->am_send == canonical_send) {
+    gen_status = jit::jitGenSendFast(gen, v, &retval);
+  } else if (am != nullptr && am->am_send != nullptr) {
     gen_status = am->am_send(gen, v, &retval);
   } else {
     gen_status = PyIter_Send(gen, v, &retval);
