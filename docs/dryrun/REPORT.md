@@ -136,7 +136,13 @@
   或编译产物赢过 PEP 659 行内特化（typed 级，超预演范围）；
 - **LWF 不移植**（3.11 帧税已由常量折叠路线收割，相对成绩已超
   3.14 LWF）；**现版内联器净负**（跨版本互证），内联轴先决顺序 =
-  产物质量 → 多帧 deopt 重建 → 内联体帧语义 → speculative。
+  产物质量 → 多帧 deopt 重建 → 内联体帧语义 → speculative；
+- **早产编译与阈值三难**（spectral 验尸轮）：auto=2 在 quickening
+  （第 8 次调用）前编译，HIR 恒读生字节码；阈值提至 16 可收数值类
+  型情报（spectral 类 +21pp）但少调次大函数类（nbody 的 advance）
+  因覆盖损失回退——**完整解 = 阈值提升 × OSR 环内接管联动**（后备：
+  成熟度感知二次编译），交付阈值维持 2；属性/方法单观测精确类型
+  投机已定性为多态陷阱并默认关（specialized_attr_speculation）。
 
 **环境差异风险（manylinux 预演 → openEuler 正式）：**
 - borrow 44 符号为静态 libpython 悲观上界，openEuler --enable-shared

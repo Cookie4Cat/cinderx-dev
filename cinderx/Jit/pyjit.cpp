@@ -1349,6 +1349,13 @@ FlagProcessor initFlagProcessor() {
       "JIT specialized opcodes or to fall back to their generic counterparts.");
 
   flag_processor.addOption(
+      "jit-attr-speculation",
+      "PYTHONJITATTRSPECULATION",
+      getMutableConfig().specialized_attr_speculation,
+      "Speculate exact receiver types from interpreter attr/method caches "
+      "(hazardous for polymorphic receivers; off by default).");
+
+  flag_processor.addOption(
       "osr-enabled",
       "CINDERX_OSR_ENABLED",
       getMutableConfig().osr_enabled,

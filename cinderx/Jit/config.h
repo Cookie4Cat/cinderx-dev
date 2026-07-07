@@ -173,6 +173,13 @@ struct Config {
   // Whether or not to JIT specialized opcodes or to fall back to their generic
   // counterparts.
   bool specialized_opcodes{true};
+  // 属性/方法特化形（LOAD_ATTR_INSTANCE_VALUE/LOAD_METHOD_WITH_VALUES）
+  // 的精确接收者类型投机。解释器缓存只有单次观测、无多态证据，多态
+  // 受者（如 richards 的 Task 子类族）下守卫连环失败成 deopt 陷阱
+  // （t=16 实测 richards 49→72 ms），故独立于 specialized_opcodes
+  // 默认关；数值/比较/下标族的类型守卫收益（spectral_norm +21pp）
+  // 不受本开关影响。
+  bool specialized_attr_speculation{false};
   // Enable OSR hot-loop detection. OSR is production-off by default and must
   // be explicitly enabled by -X osr-enabled or CINDERX_OSR_ENABLED.
   bool osr_enabled{false};

@@ -3738,7 +3738,10 @@ bool HIRBuilder::tryEmitLoadAttrInstanceValue311(
     Register* receiver,
     int name_idx) {
 #if PY_VERSION_HEX < 0x030C0000
+  // 精确接收者类型投机默认关（specialized_attr_speculation）：解释器
+  // 缓存单次观测无多态证据，多态受者下守卫连环失败成 deopt 陷阱。
   if (!getConfig().specialized_opcodes ||
+      !getConfig().specialized_attr_speculation ||
       bc_instr.specializedOpcode() != LOAD_ATTR_INSTANCE_VALUE) {
     return false;
   }
@@ -3819,7 +3822,9 @@ bool HIRBuilder::tryEmitLoadMethodWithValues311(
     TranslationContext& tc,
     const jit::BytecodeInstruction& bc_instr) {
 #if PY_VERSION_HEX < 0x030C0000
+  // 同 tryEmitLoadAttrInstanceValue311：接收者精确类型投机默认关。
   if (!getConfig().specialized_opcodes ||
+      !getConfig().specialized_attr_speculation ||
       bc_instr.specializedOpcode() != LOAD_METHOD_WITH_VALUES) {
     return false;
   }
