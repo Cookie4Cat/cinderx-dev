@@ -68,4 +68,14 @@ extern void* Ci_StockEntry311;
 // 调用，用户可见语义不变。注意：这是"调用方借用实参窗口 vs JIT 借用
 // 约定"这一普遍健全性缺口的定点封堵，普遍解（如物化帧入口 incref
 // 实参并计量其调用开销）移交正式 M5/M6 决策。
+
+// [P6]（源级补丁，RESUME / JUMP_BACKWARD）提前 quickening。HIR 前端
+// 消费自适应字节码，而 stock 的 QUICKENING_WARMUP_DELAY=8 使 auto-JIT
+// 低阈值编译恒读未特化码流（spectral 验尸轮：同函数冷编译 114 ms vs
+// 熟后编译 92 ms）。补丁把 warmup 步进从 1 提为 Ci_QuickenWarmupStep_311
+//（JIT initialize() 按 jit-early-quicken 旗标置 4，即第 2 个 warmup
+// 事件——第 2 次进入或首个回边——即 quicken；未初始化时为 1，行为
+// 与 stock 逐字等价）。run-once 无循环代码仍永不付 quicken 税；带
+// 循环的 code 至迟在首调内成熟，使 auto=2 也能读到特化码流。
+extern int Ci_QuickenWarmupStep_311;
 #include "ceval/ceval.c"

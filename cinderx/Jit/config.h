@@ -180,6 +180,10 @@ struct Config {
   // 默认关；数值/比较/下标族的类型守卫收益（spectral_norm +21pp）
   // 不受本开关影响。
   bool specialized_attr_speculation{false};
+  // [P6] 提前 quickening（3.11）：warmup 步进提为 4，第 2 个 warmup
+  // 事件即特化，使低阈值 auto-JIT 编译读到成熟字节码（早产编译对策，
+  // spectral 验尸轮）。
+  bool early_quicken{true};
   // Enable OSR hot-loop detection. OSR is production-off by default and must
   // be explicitly enabled by -X osr-enabled or CINDERX_OSR_ENABLED.
   bool osr_enabled{false};

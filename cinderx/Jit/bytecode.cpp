@@ -173,14 +173,15 @@ int BytecodeInstruction::specializedOpcode() const {
 #ifdef BINARY_OP_SUBSCR_TUPLE_INT
     case BINARY_OP_SUBSCR_TUPLE_INT:
 #endif
-#if PY_VERSION_HEX < 0x030C0000
-    case COMPARE_OP_FLOAT_JUMP:
-    case COMPARE_OP_INT_JUMP:
-    case COMPARE_OP_STR_JUMP:
-#endif
+#if PY_VERSION_HEX >= 0x030C0000
+    // COMPARE_OP 特化形在 3.11 下的 HIR 翻译显著劣于去特化生形
+    // （提前 quickening 轮实测：raytrace 保留该族 191.8 ms vs 摘除
+    // 124.6 ms，浮点比较密集负载全族受累），3.11 摘除、去特化走
+    // 既有生形翻译；3.12+ 名单不变。
     case COMPARE_OP_FLOAT:
     case COMPARE_OP_INT:
     case COMPARE_OP_STR:
+#endif
 #if PY_VERSION_HEX >= 0x030E0000
     case TO_BOOL_BOOL:
     case TO_BOOL_INT:
@@ -190,6 +191,8 @@ int BytecodeInstruction::specializedOpcode() const {
 #endif
     case LOAD_ATTR_SLOT:
 #if PY_VERSION_HEX < 0x030C0000
+    // 投机消费另由 specialized_attr_speculation 旗标（默认关）控制，
+    // 此处保留识别。
     case LOAD_ATTR_INSTANCE_VALUE:
     case LOAD_METHOD_WITH_VALUES:
     case LOAD_GLOBAL_MODULE:

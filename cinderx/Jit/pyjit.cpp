@@ -73,6 +73,8 @@ using namespace jit;
 #if PY_VERSION_HEX < 0x030C0000
 // vendored 循环 [P4] 的解释器默认入口镜像；定义见本文件尾。
 extern "C" void* Ci_StockEntry311;
+// vendored 循环 [P6] 的 warmup 步进；定义见本文件尾。
+extern "C" int Ci_QuickenWarmupStep_311;
 #endif
 
 namespace {
@@ -1356,6 +1358,13 @@ FlagProcessor initFlagProcessor() {
       "(hazardous for polymorphic receivers; off by default).");
 
   flag_processor.addOption(
+      "jit-early-quicken",
+      "PYTHONJITEARLYQUICKEN",
+      getMutableConfig().early_quicken,
+      "Quicken bytecode on the second warmup event (3.11) so low-threshold "
+      "auto-JIT compiles from specialized bytecode.");
+
+  flag_processor.addOption(
       "osr-enabled",
       "CINDERX_OSR_ENABLED",
       getMutableConfig().osr_enabled,
@@ -1965,6 +1974,11 @@ bool deoptFuncImpl(BorrowedRef<PyFunctionObject> func) {
     return false;
   }
 
+  // 注册表（CompiledFunction）可能持有该函数的最后一个强引用（已编译
+  // 闭包在用户侧弃引后由注册表续命）：removeCompiledFunc 放引即死，
+  // 其后 setVectorcall 写尸体（asyncio gather 闭包在 auto>2 实测
+  // SIGSEGV，命中与堆布局相关呈概率性）。deopt 全程持强引用护体。
+  auto keep_alive = Ref<PyFunctionObject>::create(func);
   if (!jitCtx()->removeCompiledFunc(func)) {
     return false;
   }
@@ -4620,6 +4634,10 @@ int initialize() {
       // 避免双机制并存。
       Ci_StockEntry311 =
           reinterpret_cast<void*>(Ci_PyFunction_Vectorcall);
+      // [P6] 提前 quickening：步进 4 = 第 2 个 warmup 事件（第 2 次进入
+      // 或首个回边）即 quicken，使低阈值编译读到特化字节码；旗标关闭
+      // 时保持 stock 步进 1。
+      Ci_QuickenWarmupStep_311 = getConfig().early_quicken ? 4 : 1;
 #else
       schedule_existing_functions_for_jit(*compile_n);
 #endif
@@ -4659,14 +4677,29 @@ void finalize() {
   // Deopt all compiled functions before releasing references. This ensures
   // that if any JIT Python functions are invoked as side-effects during the
   // remainder of shutdown, they will go through the interpreter.
+  // 逐条从活表取 begin() 推进而非持迭代器遍历：deopt 过程可能 DECREF
+  // 掉某函数的最后引用，3.11 weakref 死亡看护回调随之重入并擦除任意
+  // 表项（asyncio gather 闭包实测），持迭代器遍历在此失效。
   auto& shutdown_funcs = jitCtx()->compiledFuncs();
-  for (auto it = shutdown_funcs.begin(); it != shutdown_funcs.end();) {
-    BorrowedRef<PyFunctionObject> func = it->first;
-    // Advance before deoptFuncImpl() which erases func from funcs,
-    // invalidating the iterator pointing to it.
-    ++it;
+  while (!shutdown_funcs.empty()) {
+    size_t before = shutdown_funcs.size();
+    BorrowedRef<PyFunctionObject> func = shutdown_funcs.begin()->first;
     deoptFuncImpl(func);
+    if (shutdown_funcs.size() >= before) {
+      // 异常路径未推进（正常路径 deoptFuncImpl 已移除表项）：按键显式
+      // 移除防死循环。
+      jitCtx()->removeCompiledFunc(func);
+      if (shutdown_funcs.size() >= before) {
+        break;
+      }
+    }
   }
+
+#if PY_VERSION_HEX < 0x030C0000
+  // 撤除 weakref 死亡看护：finalize 后注册表已空，遗留回调无意义，
+  // 归还持有的 weakref 强引用。
+  clearFuncDeathWatches311();
+#endif
 
   // Always release references from Context objects: C++ clients may have
   // invoked the JIT directly without initializing a full jit::Context.
@@ -5078,6 +5111,75 @@ void codeDestroyed(BorrowedRef<PyCodeObject> code) {
   }
 }
 
+#if PY_VERSION_HEX < 0x030C0000
+namespace {
+
+// weakref 对象 → 函数裸指针。持 weakref 强引用保持回调布防；回调或
+// clearFuncDeathWatches311() 归还。裸指针仅作注册表键，回调期对象
+// 字段仍完整（见 pyjit.h 注释）。
+std::unordered_map<PyObject*, PyFunctionObject*>& funcDeathWatches311() {
+  static std::unordered_map<PyObject*, PyFunctionObject*> watches;
+  return watches;
+}
+
+PyObject* funcDeathCallback311(PyObject* /* self */, PyObject* wr) {
+  auto& watches = funcDeathWatches311();
+  auto it = watches.find(wr);
+  if (it != watches.end()) {
+    if (getenv("CI_DEATHWATCH_DEBUG")) {
+      fprintf(stderr, "[deathwatch %d] fire %p\n", (int)getpid(), (void*)it->second);
+    }
+    funcDestroyed(it->second);
+    watches.erase(it);
+    Py_DECREF(wr);
+  }
+  Py_RETURN_NONE;
+}
+
+PyMethodDef g_func_death_callback_def_311 = {
+    "ci_func_death_watch_311",
+    funcDeathCallback311,
+    METH_O,
+    nullptr};
+
+} // namespace
+
+void watchFuncDeath311(BorrowedRef<PyFunctionObject> func) {
+  static PyObject* callback =
+      PyCFunction_New(&g_func_death_callback_def_311, nullptr);
+  if (callback == nullptr) {
+    PyErr_Clear();
+    return;
+  }
+  PyObject* wr =
+      PyWeakref_NewRef(reinterpret_cast<PyObject*>(func.get()), callback);
+  if (wr == nullptr) {
+    PyErr_Clear();
+    if (getenv("CI_DEATHWATCH_DEBUG")) {
+      fprintf(stderr, "[deathwatch] ARM-FAIL %p\n", (void*)func.get());
+    }
+    return;
+  }
+  funcDeathWatches311().emplace(wr, func.get());
+  if (getenv("CI_DEATHWATCH_DEBUG")) {
+    fprintf(
+        stderr,
+        "[deathwatch %d] arm %p %s\n",
+        (int)getpid(),
+        (void*)func.get(),
+        PyUnicode_AsUTF8(func->func_qualname));
+  }
+}
+
+void clearFuncDeathWatches311() {
+  auto& watches = funcDeathWatches311();
+  for (auto& [wr, func] : watches) {
+    Py_DECREF(wr);
+  }
+  watches.clear();
+}
+#endif
+
 void funcDestroyed(BorrowedRef<PyFunctionObject> func) {
   auto mod_state = cinderx::getModuleState();
   if (!mod_state) {
@@ -5240,6 +5342,11 @@ Result compilePreloaderImpl(
 // 调用的按被调方判定使用（见 cinderx_ceval.c 台账）。initialize() 赋值；
 // 为空时 [P4] 恒 DEOPT，退回一刀切语义（fail-safe）。
 extern "C" void* Ci_StockEntry311 = nullptr;
+
+// [P6] warmup 步进（vendored 循环 RESUME/JUMP_BACKWARD 处消费，见
+// cinderx_ceval.c 台账）。缺省 1 与 stock 逐字等价；initialize() 按
+// jit-early-quicken 旗标置 4。
+extern "C" int Ci_QuickenWarmupStep_311 = 1;
 
 // [P3] 帧压栈计数钩子（vendored 循环 start_frame 处调用）：计数式
 // auto-JIT 的 3.11 实现。CodeExtra 由 codeExtra() 按需分配（3.14 经
