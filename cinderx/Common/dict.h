@@ -48,23 +48,66 @@ static inline bool hasOnlyUnicodeKeys(PyObject* dict) {
   return DK_IS_UNICODE(((PyDictObject*)dict)->ma_keys);
 }
 
+// 变宽索引槽读取（dk_indices 按 DK_SIZE 选 1/2/4/8 字节宽）。CPython 的
+// dictkeys_get_index 为 dictobject.c 静态函数不可链接，按同布局复刻。
+static inline Py_ssize_t dictKeysGetIndexSlot(
+    const PyDictKeysObject* keys,
+    size_t i) {
+  int log2size = DK_LOG_SIZE(keys);
+  if (log2size < 8) {
+    return ((const int8_t*)keys->dk_indices)[i];
+  }
+  if (log2size < 16) {
+    return ((const int16_t*)keys->dk_indices)[i];
+  }
+#if SIZEOF_VOID_P > 4
+  if (log2size >= 32) {
+    return ((const int64_t*)keys->dk_indices)[i];
+  }
+#endif
+  return ((const int32_t*)keys->dk_indices)[i];
+}
+
 static inline Py_ssize_t getDictKeysIndex(
     PyDictKeysObject* keys,
     PyObject* name) {
 #if PY_VERSION_HEX >= 0x030E0000
   return _PyDictKeys_StringLookupSplit(keys, name);
-#endif
-  for (Py_ssize_t i = 0; i < keys->dk_nentries; i++) {
-    PyDictUnicodeEntry* ep = &DK_UNICODE_ENTRIES(keys)[i];
-    // Deleted entries stay within dk_nentries with me_key == NULL (3.11
-    // unicode-keys delitem semantics). Split shared keys never see
-    // deletions, but materialized (combined) instance dicts do; without
-    // the NULL check PyUnicode_Compare dereferences NULL.
-    if (ep->me_key != NULL && PyUnicode_Compare(name, ep->me_key) == 0) {
-      return i;
-    }
+#else
+  // unicode 键表哈希探测（CPython unicodekeys_lookup_unicode 不可链接，
+  // 按 3.11 布局复刻：驻留名指针等值快判 + 哈希预判 + 扰动开放寻址；
+  // 删除槽为 DKIX_DUMMY 继续探测）。此前实现为逐条目线性扫，物化大
+  // 字典受者下 IC 慢路径呈 O(键数)——sqlalchemy 编译净效应 −26% 的
+  // 主体（M10 sqla 净效应轮）。
+  if (!DK_IS_UNICODE(keys)) {
+    return -1;
   }
-  return -1;
+  Py_hash_t hash = ((PyASCIIObject*)name)->hash;
+  if (hash == -1) {
+    hash = PyObject_Hash(name);
+  }
+  size_t mask = (size_t)(DK_SIZE(keys) - 1);
+  size_t perturb = (size_t)hash;
+  size_t i = (size_t)hash & mask;
+  for (;;) {
+    Py_ssize_t ix = dictKeysGetIndexSlot(keys, i);
+    if (ix >= 0) {
+      PyDictUnicodeEntry* ep = &DK_UNICODE_ENTRIES(keys)[ix];
+      if (ep->me_key == name) {
+        return ix;
+      }
+      if (ep->me_key != NULL &&
+          ((PyASCIIObject*)ep->me_key)->hash == hash &&
+          PyUnicode_Compare(name, ep->me_key) == 0) {
+        return ix;
+      }
+    } else if (ix == DKIX_EMPTY) {
+      return -1;
+    }
+    perturb >>= 5; // PERTURB_SHIFT（dictobject.c）
+    i = mask & (i * 5 + perturb + 1);
+  }
+#endif
 }
 
 // We can't borrow this from CPython because it exists but is not
