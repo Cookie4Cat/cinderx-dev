@@ -6653,9 +6653,12 @@ void GenerateDeoptTrampolineBlocks(
         OutPhyReg{codegen::ARGUMENT_REGS[0]},
         PhyReg{codegen::arch::reg_general_return_loc});
   }
-#if PY_VERSION_HEX >= 0x030C0000
   // Fourth argument: is_instrumentation_deopt returned by
   // prepareForDeopt.  Save it before being overwritten below.
+  // resumeInInterpreter 在 3.11 同样使用四参签名，此装配不得设版本门：
+  // 缺失时该实参寄存器为 prepareForDeopt 返回后的未定义残值，残值非零
+  // 即被当作 instrumentation deopt，kRaise 恢复流程绕过重执行、异常
+  // 凭空丢失（构建期概率性红态根因，见 M10-pgo-rootcause-log.md）。
   if (codegen::ARGUMENT_REGS[3] !=
       codegen::arch::reg_general_auxilary_return_loc) {
     block->allocateInstr(
@@ -6664,7 +6667,6 @@ void GenerateDeoptTrampolineBlocks(
         OutPhyReg{codegen::ARGUMENT_REGS[3]},
         PhyReg{codegen::arch::reg_general_auxilary_return_loc});
   }
-#endif
   // arg1 = code_rt from stack (fp - 3*8)
   block->allocateInstr(
       Instruction::kMove,

@@ -45,20 +45,22 @@ make _cinderx -j"$JOBS"
 echo "done: $(md5sum "$BUILD_TREE"/../lib.linux-*/_cinderx.so 2>/dev/null || true)"
 
 echo "== 相四:产物正确性验收 =="
-# 训练 profile 内容存在非确定性（pyperf 校准/时序），实测个别 profile
-# 组合会诱发 PGO-use 相的错译（JIT 编译码 raise 路径异常丢失，
-# import enum 即触发 SystemError——工具链交互专项跟踪中）。相三产物
-# 必须通过快速正确性探针方可交付；失败保留 gcda 取证并整链报错。
+# 历史（M10 PGO 根因专项已收口）：曾出现 profile 依赖的概率性红态
+# （JIT 编译码 raise 丢异常，import enum 触发 SystemError），根因为
+# deopt 垫片第四实参装配的 3.11 版本门缺陷（generator.cpp，非工具链
+# 问题），已修复。本验收步保留为构建体系常设防线：产物必须通过快速
+# 正确性探针方可交付；失败保留 gcda 取证并整链报错。
 VERIFY_CMD=${VERIFY_CMD:-}
 VERIFY_PY=${VERIFY_PY:-/opt/python/cp311-cp311/bin/python3.11}
 VERIFY_PP=${VERIFY_PP:-/tmp/m9sc:/src/scratch/lib.linux-aarch64-cpython-311:/src/cinderx/PythonLib}
 if [ -z "$VERIFY_CMD" ]; then
-  # 快速兜底探针：覆盖 import 期与若干 raise 密集 stdlib 模块（PGO
-  # 错译特征为编译码 raise 丢异常，命中面随 profile 变动，故探针面
-  # 尽量宽）。注意：这是快速兜底，非完整正确性验收——交付构建仍须
-  # 过完整 diffgate + libtest 快速档（SR3 门禁），相四仅拦最粗红态。
+  # 快速兜底探针：覆盖 import 期与若干 raise 密集 stdlib 模块。注意：
+  # 这是快速兜底，非完整正确性验收——交付构建仍须过完整 diffgate +
+  # libtest 快速档（SR3 门禁），相四仅拦最粗红态。探针模块须全部为
+  # JIT 基线绿（test_builtin 属既有基线分歧项，不得入探针，否则绿链
+  # 被恒判红）。
   VERIFY_CMD="PYTHONPATH=$VERIFY_PP PYTHONJITAUTO=2 $VERIFY_PY -m test \
-    test_slice test_exceptions test_raise test_builtin test_int \
+    test_slice test_exceptions test_raise test_int \
     -q >/dev/null 2>&1 && PYTHONPATH=$VERIFY_PP PYTHONJITAUTO=2 $VERIFY_PY \
     -c 'import enum, re, dataclasses, typing, functools; print(1)'"
 fi
