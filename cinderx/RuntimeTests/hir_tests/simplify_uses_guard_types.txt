@@ -76,14 +76,15 @@ fun test {
     }
     UseType<ListExact> v2
     UseType<LongExact> v3
-    v7:CInt64 = IndexUnbox<IndexError> v3
-    v8:CInt64 = IsNegativeAndErrOccurred v7 {
+    v7:CBool = IsCompactLong v3
+    Guard v7 {
       FrameState {
         CurInstrOffset 6
         Locals<2> v0 v1
       }
     }
-    v9:CInt64 = CheckSequenceBounds v2 v7 {
+    v8:CInt64 = CompactLongUnbox v3
+    v9:CInt64 = CheckSequenceBounds v2 v8 {
       FrameState {
         CurInstrOffset 6
         Locals<2> v0 v1
@@ -204,14 +205,15 @@ fun test {
     }
     UseType<TupleExact> v2
     UseType<LongExact> v3
-    v7:CInt64 = IndexUnbox<IndexError> v3
-    v8:CInt64 = IsNegativeAndErrOccurred v7 {
+    v7:CBool = IsCompactLong v3
+    Guard v7 {
       FrameState {
         CurInstrOffset 6
         Locals<2> v0 v1
       }
     }
-    v9:CInt64 = CheckSequenceBounds v2 v7 {
+    v8:CInt64 = CompactLongUnbox v3
+    v9:CInt64 = CheckSequenceBounds v2 v8 {
       FrameState {
         CurInstrOffset 6
         Locals<2> v0 v1

@@ -2306,22 +2306,16 @@ void HIRBuilder::emitBinaryOp(
         tc.emit<GuardType>(right, TUnicodeExact, right, tc.frame);
         break;
       case BINARY_SUBSCR_DICT:
-#ifdef BINARY_OP_SUBSCR_DICT
       case BINARY_OP_SUBSCR_DICT:
-#endif
         tc.emit<GuardType>(left, TDictExact, left, tc.frame);
         break;
       case BINARY_SUBSCR_LIST_INT:
-#ifdef BINARY_OP_SUBSCR_LIST_INT
       case BINARY_OP_SUBSCR_LIST_INT:
-#endif
         tc.emit<GuardType>(left, TListExact, left, tc.frame);
         tc.emit<GuardType>(right, TLongExact, right, tc.frame);
         break;
       case BINARY_SUBSCR_TUPLE_INT:
-#ifdef BINARY_OP_SUBSCR_TUPLE_INT
       case BINARY_OP_SUBSCR_TUPLE_INT:
-#endif
         tc.emit<GuardType>(left, TTupleExact, left, tc.frame);
         tc.emit<GuardType>(right, TLongExact, right, tc.frame);
         break;

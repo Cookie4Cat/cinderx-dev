@@ -1167,7 +1167,8 @@ fun jittestmodule:test {
     }
     UseType<TupleExact> v19
     UseType<LongExact> v43
-    v55:CInt64 = IsNegativeAndErrOccurred v33 {
+    v59:CBool = IsCompactLong v33
+    Guard v59 {
       FrameState {
         CurInstrOffset 42
         Locals<3> v19 v33 v34
@@ -1448,6 +1449,142 @@ fun jittestmodule:test {
       }
     }
     Return<CInt8> v17
+  }
+}
+--- Test Name ---
+StoreSubscrFromListIsSpecialized
+--- Input ---
+def test():
+    ls = [1, 2, 3]
+    ls[1] = 42
+    return ls[1]
+--- Expected 3.12 ---
+fun jittestmodule:test {
+  bb 0 {
+    v9:Func = LoadCurrentFunc
+    LoadFrame
+    v10:Nullptr = LoadConst<Nullptr>
+    Snapshot
+    v11:CInt32 = LoadEvalBreaker
+    CondBranch<2, 1> v11
+  }
+
+  bb 2 (preds 0) {
+    Snapshot
+    v12:CInt32 = RunPeriodicTasks {
+      FrameState {
+        CurInstrOffset 0
+        Locals<1> v10
+      }
+    }
+    Branch<1>
+  }
+
+  bb 1 (preds 0, 2) {
+    Snapshot
+    v13:MortalListExact = MakeList<0> {
+      FrameState {
+        CurInstrOffset 2
+        Locals<1> v10
+      }
+    }
+    Snapshot
+    v14:MortalTupleExact[tuple:0xdeadbeef] = LoadConst<MortalTupleExact[tuple:0xdeadbeef]>
+    v15:ImmortalNoneType = ListExtend v13 v14 {
+      FrameState {
+        CurInstrOffset 6
+        Locals<1> v10
+      }
+    }
+    UseType<ListExact> v13
+    UseType<ImmortalLongExact[1]> v15
+    v16:CBool = IsCompactLong v15
+    Guard v16 {
+    }
+    v17:CInt64[1] = CompactLongUnbox v15
+    v18:ImmortalLongExact[1] = LoadConst<ImmortalLongExact[1]>
+    v19:CInt64 = CheckSequenceBounds v13 v17 {
+    }
+    v20:CPtr = LoadField<ob_item@24, CPtr, borrowed> v13
+    StoreArrayItem v20 v19 v18 v13
+    Snapshot
+    v21:ImmortalLongExact[1] = LoadConst<ImmortalLongExact[1]>
+    v22:CInt64 = CheckSequenceBounds v13 v21 {
+    }
+    v23:CPtr = LoadField<ob_item@24, CPtr, borrowed> v13
+    v24:Object = LoadArrayItem v23 v22 v13
+    Return v24
+  }
+}
+--- Expected 3.14 ---
+fun jittestmodule:test {
+  bb 0 {
+    v19:Func = LoadCurrentFunc
+    LoadFrame
+    v20:Nullptr = LoadConst<Nullptr>
+    Snapshot
+    v21:CInt64 = LoadEvalBreaker
+    CondBranch<2, 1> v21
+  }
+
+  bb 2 (preds 0) {
+    Snapshot
+    v22:CInt32 = RunPeriodicTasks {
+      FrameState {
+        CurInstrOffset 0
+        Locals<1> v20
+      }
+    }
+    Branch<1>
+  }
+
+  bb 1 (preds 0, 2) {
+    Snapshot
+    v24:MortalListExact = MakeList<0> {
+      FrameState {
+        CurInstrOffset 2
+        Locals<1> v20
+      }
+    }
+    Snapshot
+    v25:MortalTupleExact[tuple:0xdeadbeef] = LoadConst<MortalTupleExact[tuple:0xdeadbeef]>
+    v26:ImmortalNoneType = ListExtend v24 v25 {
+      FrameState {
+        CurInstrOffset 6
+        Locals<1> v20
+        Stack<1> v24
+      }
+    }
+    Snapshot
+    v28:ImmortalLongExact[42] = LoadConst<ImmortalLongExact[42]>
+    Snapshot
+    v29:ImmortalLongExact[1] = LoadConst<ImmortalLongExact[1]>
+    Snapshot
+    v40:CInt64[1] = LoadConst<CInt64[1]>
+    v42:CInt64[0] = LoadConst<CInt64[0]>
+    v32:CInt64 = CheckSequenceBounds v24 v40 {
+      FrameState {
+        CurInstrOffset 20
+        Locals<1> v24
+      }
+    }
+    v33:CPtr = LoadField<ob_item@24, CPtr, borrowed> v24
+    StoreArrayItem v33 v32 v28 v24
+    Snapshot
+    v34:ImmortalLongExact[1] = LoadConst<ImmortalLongExact[1]>
+    Snapshot
+    v41:CInt64[1] = LoadConst<CInt64[1]>
+    v43:CInt64[0] = LoadConst<CInt64[0]>
+    v37:CInt64 = CheckSequenceBounds v24 v41 {
+      FrameState {
+        CurInstrOffset 32
+        Locals<1> v24
+      }
+    }
+    v38:CPtr = LoadField<ob_item@24, CPtr, borrowed> v24
+    v39:Object = LoadArrayItem v38 v37 v24
+    Snapshot
+    Return v39
   }
 }
 --- End ---

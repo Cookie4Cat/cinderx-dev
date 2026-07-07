@@ -662,9 +662,17 @@ fun jittestmodule:test {
     Snapshot
     UseType<ListExact> v16
     UseType<LongExact> v23
-    v47:CInt64[1] = LoadConst<CInt64[1]>
-    v48:CInt64[0] = LoadConst<CInt64[0]>
-    v44:CInt64 = CheckSequenceBounds v16 v47 {
+    UseType<ImmortalLongExact[1]> v23
+    v47:CBool[true] = LoadConst<CBool[true]>
+    Guard v47 {
+      FrameState {
+        CurInstrOffset 4
+        Locals<2> v16 v23
+      }
+    }
+    UseType<ImmortalLongExact[1]> v23
+    v48:CInt64[1] = LoadConst<CInt64[1]>
+    v44:CInt64 = CheckSequenceBounds v16 v48 {
       FrameState {
         CurInstrOffset 4
         Locals<2> v16 v23

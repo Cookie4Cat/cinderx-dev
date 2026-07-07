@@ -903,14 +903,17 @@ Register* simplifySubscript(
   // TODO(T255264263). Enable this again. See P2169673256.
   if (!kFreeThreadedBuild) {
     if (lhs->isA(TListExact) || lhs->isA(TTupleExact)) {
-      // TASK(T93509109): Replace TCInt64 with a less platform-specific
-      // representation of the type, which should be analagous to Py_ssize_t.
       env.emit<UseType>(lhs, lhs->isA(TListExact) ? TListExact : TTupleExact);
       env.emit<UseType>(rhs, TLongExact);
-      Register* right_index = env.emit<IndexUnbox>(rhs);
-      env.emit<IsNegativeAndErrOccurred>(right_index, *frame_state);
+
+      // C4: Replace IndexUnbox + IsNegativeAndErrOccurred with
+      // IsCompactLong + Guard + CompactLongUnbox
+      Register* is_compact = env.emit<IsCompactLong>(rhs);
+      env.emitInstr<Guard>(is_compact, *frame_state);
+      Register* unboxed_idx = env.emit<CompactLongUnbox>(rhs);
+
       Register* adjusted_idx =
-          env.emit<CheckSequenceBounds>(lhs, right_index, *frame_state);
+          env.emit<CheckSequenceBounds>(lhs, unboxed_idx, *frame_state);
       Py_ssize_t offset = offsetof(PyTupleObject, ob_item);
       Register* array = lhs;
       // Lists carry a nested array of ob_item whereas tuples are variable-sized
@@ -2445,6 +2448,34 @@ Register* simplifyStoreSubscr(Env& env, const StoreSubscr* instr) {
         instr->GetOperand(2));
 
     env.emit<CheckNeg>(output, *instr->frameState());
+    return nullptr;
+  }
+
+  // C3: Add STORE_SUBSCR_LIST_INT fast path (C4: compact long unbox)
+  if (!kFreeThreadedBuild &&
+      instr->GetOperand(0)->isA(TListExact) &&
+      instr->GetOperand(1)->isA(TLongExact)) {
+    env.emit<UseType>(instr->GetOperand(0), TListExact);
+    env.emit<UseType>(instr->GetOperand(1), TLongExact);
+
+    // C4: IsCompactLong + Guard + CompactLongUnbox
+    Register* is_compact = env.emit<IsCompactLong>(instr->GetOperand(1));
+    env.emitInstr<Guard>(is_compact, *instr->frameState());
+    Register* unboxed_idx = env.emit<CompactLongUnbox>(instr->GetOperand(1));
+
+    Register* adjusted_idx =
+        env.emit<CheckSequenceBounds>(
+            instr->GetOperand(0), unboxed_idx, *instr->frameState());
+
+    // Load old value, incref to keep alive, store new value, then decref old
+    Register* ob_item = env.emit<LoadField>(
+        instr->GetOperand(0),
+        "ob_item",
+        offsetof(PyListObject, ob_item),
+        TCPtr);
+    env.emitInstr<StoreArrayItem>(
+        ob_item, adjusted_idx, instr->GetOperand(2),
+        instr->GetOperand(0), TObject);
     return nullptr;
   }
 
