@@ -4624,7 +4624,7 @@ void HIRBuilder::emitSequenceSet(
 // LOAD_GLOBAL 的 builtins 命中形（由 tryEmitLoadGlobalModuleValue311
 // 在模块层未命中时调用，调用方已完成 stable_frame/specialized_opcodes
 // 与 globals 组合表检查）。双 keys_version 守卫语义见
-// JITRT_LoadGlobalBuiltinValue311 注释。
+// 行内守卫装载注释(本文件 builtins 形发射处)。
 bool HIRBuilder::tryEmitLoadGlobalBuiltinValue311(
     TranslationContext& tc,
     BorrowedRef<> name,
@@ -4656,50 +4656,60 @@ bool HIRBuilder::tryEmitLoadGlobalBuiltinValue311(
     return false;
   }
 
-  Register* globals_reg = temps_.AllocateNonStack();
-  tc.emit<LoadConst>(
-      globals_reg,
-      Type::fromObject(env_->addReference(BorrowedRef<>{globals})));
+  // 行内双版本守卫装载(镜像解释器 LOAD_GLOBAL_BUILTIN 的行内形):
+  // dk_version 版本号全局单调分配,版本命中即钉死键结构与条目布局,
+  // 条目值偏移为编译期常量、值经版本钉定非空(删除/重排必失效版本),
+  // 装载后 incref 交付新引用。此前经 CallStatic 进 C helper 做同一
+  // 组检查,deepcopy_reduce 剖面 helper 自身 2.7%——builtins 名为
+  // 最高频装载,C 往返税按调用线性放大。守卫失败按 deopt 回解释器
+  // 重执行本条 LOAD_GLOBAL(语义与 helper 空返回一致)。
+  PyDictKeysObject* bkeys_probe = builtins->ma_keys;
+  ptrdiff_t value_off =
+      reinterpret_cast<const char*>(
+          &DK_UNICODE_ENTRIES(bkeys_probe)[index].me_value) -
+      reinterpret_cast<const char*>(bkeys_probe);
 
-  Register* builtins_reg = temps_.AllocateNonStack();
-  tc.emit<LoadConst>(
-      builtins_reg,
-      Type::fromObject(env_->addReference(BorrowedRef<>{builtins})));
+  auto emit_keys_version_guard = [&](BorrowedRef<PyDictObject> dict,
+                                     uint32_t expected_version,
+                                     const char* what) -> Register* {
+    Register* dict_reg = temps_.AllocateNonStack();
+    tc.emit<LoadConst>(
+        dict_reg, Type::fromObject(env_->addReference(BorrowedRef<>{dict})));
+    Register* keys_reg = temps_.AllocateNonStack();
+    tc.emit<LoadField>(
+        keys_reg, dict_reg, "ma_keys", offsetof(PyDictObject, ma_keys), TCPtr);
+    Register* ver_reg = temps_.AllocateNonStack();
+    tc.emit<LoadField>(
+        ver_reg,
+        keys_reg,
+        "dk_version",
+        offsetof(PyDictKeysObject, dk_version),
+        TCUInt32);
+    Register* expected_reg = temps_.AllocateNonStack();
+    tc.emit<LoadConst>(
+        expected_reg, Type::fromCUInt(expected_version, TCUInt32));
+    Register* ok_reg = temps_.AllocateNonStack();
+    tc.emit<PrimitiveCompare>(
+        ok_reg, PrimitiveCompareOp::kEqual, ver_reg, expected_reg);
+    tc.emitSnapshot();
+    auto guard = tc.emit<Guard>(ok_reg);
+    guard->setFrameState(tc.frame);
+    guard->setDescr(fmt::format("{}: {}", what, PyUnicode_AsUTF8(name)));
+    return keys_reg;
+  };
 
-  Register* name_reg = temps_.AllocateNonStack();
-  tc.emit<LoadConst>(name_reg, Type::fromObject(env_->addReference(name)));
+  emit_keys_version_guard(
+      globals, globals_keys_version, "LOAD_GLOBAL_BUILTIN globals ver");
+  Register* bkeys_reg = emit_keys_version_guard(
+      builtins, builtins_keys_version, "LOAD_GLOBAL_BUILTIN builtins ver");
 
-  Register* gver_reg = temps_.AllocateNonStack();
-  tc.emit<LoadConst>(
-      gver_reg, Type::fromCUInt(globals_keys_version, TCUInt32));
-
-  Register* bver_reg = temps_.AllocateNonStack();
-  tc.emit<LoadConst>(
-      bver_reg, Type::fromCUInt(builtins_keys_version, TCUInt32));
-
-  Register* index_reg = temps_.AllocateNonStack();
-  tc.emit<LoadConst>(index_reg, Type::fromCInt(index, TCInt64));
-
-  auto call = tc.emit<CallStatic>(
-      6,
+  tc.emit<LoadField>(
       result,
-      reinterpret_cast<void*>(JITRT_LoadGlobalBuiltinValue311),
-      TOptObject);
-  call->SetOperand(0, globals_reg);
-  call->SetOperand(1, builtins_reg);
-  call->SetOperand(2, name_reg);
-  call->SetOperand(3, gver_reg);
-  call->SetOperand(4, bver_reg);
-  call->SetOperand(5, index_reg);
-
-  tc.emitSnapshot();
-  auto guard = tc.emit<Guard>(result);
-  guard->setFrameState(tc.frame);
-  guard->setGuiltyReg(result);
-  guard->setDescr(
-      fmt::format("LOAD_GLOBAL_BUILTIN: {}", PyUnicode_AsUTF8(name)));
-
-  tc.emit<RefineType>(result, TObject, result);
+      bkeys_reg,
+      "me_value",
+      static_cast<std::size_t>(value_off),
+      TObject);
+  tc.emit<Incref>(result);
   return true;
 }
 
@@ -4752,40 +4762,61 @@ bool HIRBuilder::tryEmitLoadGlobalModuleValue311(
     return false;
   }
 
+  // 行内版本守卫装载(与 builtins 形同构,单版本):版本命中钉死键
+  // 结构与条目布局,条目值偏移为编译期常量;值级替换(globals[k]=v
+  // 覆写既有键)不改 dk_version,故值经运行期条目槽活读而非烘焙。
+  // 守卫失败按 deopt 回解释器重执行本条 LOAD_GLOBAL。
+  PyDictKeysObject* gkeys_probe = globals->ma_keys;
+  ptrdiff_t value_off =
+      reinterpret_cast<const char*>(
+          &DK_UNICODE_ENTRIES(gkeys_probe)[index].me_value) -
+      reinterpret_cast<const char*>(gkeys_probe);
+
   Register* globals_reg = temps_.AllocateNonStack();
   tc.emit<LoadConst>(
       globals_reg,
       Type::fromObject(env_->addReference(BorrowedRef<>{globals})));
-
-  Register* name_reg = temps_.AllocateNonStack();
-  tc.emit<LoadConst>(
-      name_reg, Type::fromObject(env_->addReference(name)));
-
-  Register* keys_version_reg = temps_.AllocateNonStack();
-  tc.emit<LoadConst>(
-      keys_version_reg, Type::fromCUInt(keys_version, TCUInt32));
-
-  Register* index_reg = temps_.AllocateNonStack();
-  tc.emit<LoadConst>(index_reg, Type::fromCInt(index, TCInt64));
-
-  auto call = tc.emit<CallStatic>(
-      4,
-      result,
-      reinterpret_cast<void*>(JITRT_LoadGlobalModuleValue),
-      TOptObject);
-  call->SetOperand(0, globals_reg);
-  call->SetOperand(1, name_reg);
-  call->SetOperand(2, keys_version_reg);
-  call->SetOperand(3, index_reg);
-
+  Register* keys_reg = temps_.AllocateNonStack();
+  tc.emit<LoadField>(
+      keys_reg,
+      globals_reg,
+      "ma_keys",
+      offsetof(PyDictObject, ma_keys),
+      TCPtr);
+  Register* ver_reg = temps_.AllocateNonStack();
+  tc.emit<LoadField>(
+      ver_reg,
+      keys_reg,
+      "dk_version",
+      offsetof(PyDictKeysObject, dk_version),
+      TCUInt32);
+  Register* expected_reg = temps_.AllocateNonStack();
+  tc.emit<LoadConst>(expected_reg, Type::fromCUInt(keys_version, TCUInt32));
+  Register* ok_reg = temps_.AllocateNonStack();
+  tc.emit<PrimitiveCompare>(
+      ok_reg, PrimitiveCompareOp::kEqual, ver_reg, expected_reg);
   tc.emitSnapshot();
-  auto guard = tc.emit<Guard>(result);
+  auto guard = tc.emit<Guard>(ok_reg);
   guard->setFrameState(tc.frame);
-  guard->setGuiltyReg(result);
   guard->setDescr(
-      fmt::format("LOAD_GLOBAL_MODULE: {}", PyUnicode_AsUTF8(name)));
+      fmt::format("LOAD_GLOBAL_MODULE ver: {}", PyUnicode_AsUTF8(name)));
 
-  tc.emit<RefineType>(result, TObject, result);
+  // 值槽活读:版本钉定期内条目可被同键覆写,不烘焙具体值。
+  Register* raw_reg = temps_.AllocateNonStack();
+  tc.emit<LoadField>(
+      raw_reg,
+      keys_reg,
+      "me_value",
+      static_cast<std::size_t>(value_off),
+      TOptObject);
+  tc.emitSnapshot();
+  auto nn_guard = tc.emit<Guard>(raw_reg);
+  nn_guard->setFrameState(tc.frame);
+  nn_guard->setGuiltyReg(raw_reg);
+  nn_guard->setDescr(
+      fmt::format("LOAD_GLOBAL_MODULE: {}", PyUnicode_AsUTF8(name)));
+  tc.emit<RefineType>(result, TObject, raw_reg);
+  tc.emit<Incref>(result);
 
   // 内联器前门（实验，仅 hir_opts.inliner 开启时发射）：编译期窥得的
   // 全局值是函数对象时，追加同一性守卫把结果精化为带值规格的常量——
