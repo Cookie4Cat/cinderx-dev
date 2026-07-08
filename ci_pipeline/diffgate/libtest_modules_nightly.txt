@@ -1,0 +1,7 @@
+# libtest C 档夜间带：重量模块，不挂 MR 级门禁，收口链/夜间独立跑。
+# 建议 --timeout 1200（asyncio 整包分钟级）。
+# 首测 2026-07-08：4/4 双臂一致，零分歧（无需独立基线）。
+test_asyncio
+test_threading
+test_io
+test_typing
