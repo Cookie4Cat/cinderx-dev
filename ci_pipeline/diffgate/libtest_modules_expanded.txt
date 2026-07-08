@@ -1,0 +1,31 @@
+# libtest 扩充清单（M10 libtest-expand 轮）：basic 26 之外的两档增补。
+# 第一档：本战役改动面直接覆盖（copy/pickle/协程族/异常组/调用机器/
+#         code 对象/import/仅位参）。挂 MR 级门禁。
+# 第二档：JIT 通用高危面（对象模型/回溯与帧内省/tracing/GC 与弱引用/
+#         迭代协议/可调用体/二元派发）。挂合并前收口链。
+# 已知分歧见 baselines/cp311-libtest-expanded.json。
+# --- 第一档 ---
+test_copy
+test_pickle
+test_coroutines
+test_asyncgen
+test_yield_from
+test_except_star
+test_exception_group
+test_extcall
+test_funcattrs
+test_code
+test_import
+test_positional_only_arg
+# --- 第二档 ---
+test_descr
+test_metaclass
+test_isinstance
+test_traceback
+test_frame
+test_sys_settrace
+test_gc
+test_weakref
+test_iter
+test_functools
+test_binop

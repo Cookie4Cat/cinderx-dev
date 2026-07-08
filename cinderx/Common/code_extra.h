@@ -331,6 +331,37 @@ static inline CodeExtra* Ci_code_extra_fast_read_311(
   }
   return (CodeExtra*)co_extra->ce_extras[index];
 }
+
+/* 写侧同布局镜像。与 _PyCode_SetExtra 的唯一差异是容量策略：数组只扩到
+ * 本索引+1，不按 interp 的 co_extra_user_count 拉满。code_dealloc 对
+ * ce_size 覆盖的每个索引无条件调用注册 freefunc（NULL 槽亦然），按全量
+ * 拉满会把第三方 freefunc（可能是 Python 级回调，如 test_code 的 ctypes
+ * 闭包）的触发面扩大到本运行时碰过的一切 code——关机晚期死亡的 code 将
+ * 在模块 globals 已清空后回调 Python 而段错。仅用于向空槽写入（本运行时
+ * 两处调用方均先查后建），不承接换值时旧值的 freefunc 释放语义。 */
+static inline int Ci_code_extra_set_min_311(
+    PyCodeObject* code,
+    Py_ssize_t index,
+    void* extra) {
+  CiCodeObjectExtra311* co_extra = (CiCodeObjectExtra311*)code->co_extra;
+  if (co_extra == NULL || co_extra->ce_size <= index) {
+    Py_ssize_t old_size = co_extra == NULL ? 0 : co_extra->ce_size;
+    CiCodeObjectExtra311* grown = (CiCodeObjectExtra311*)PyMem_Realloc(
+        co_extra,
+        sizeof(CiCodeObjectExtra311) + (size_t)index * sizeof(void*));
+    if (grown == NULL) {
+      return -1;
+    }
+    for (Py_ssize_t i = old_size; i <= index; i++) {
+      grown->ce_extras[i] = NULL;
+    }
+    grown->ce_size = index + 1;
+    code->co_extra = grown;
+    co_extra = grown;
+  }
+  co_extra->ce_extras[index] = extra;
+  return 0;
+}
 #endif
 
 #endif
