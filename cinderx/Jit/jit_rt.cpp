@@ -270,7 +270,16 @@ PyObject* JITRT_CallWithKeywordArgs(
   const Py_ssize_t total_args = co->co_argcount + co->co_kwonlyargcount +
       ((co->co_flags & CO_VARKEYWORDS) ? 1 : 0) +
       ((co->co_flags & CO_VARARGS) ? 1 : 0);
-  auto arg_space = std::make_unique<PyObject*[]>(total_args);
+  // kwargs 绑定是每调用热路径(ORM 类负载 kwargs 无处不在),小参数
+  // 窗用栈缓冲免堆分配(与缺省补齐 helper 同方,生命期覆盖再入调用)。
+  constexpr Py_ssize_t kStackArgSpace = 16;
+  PyObject* stack_space[kStackArgSpace];
+  std::unique_ptr<PyObject*[]> heap_space;
+  PyObject** arg_space = stack_space;
+  if (total_args > kStackArgSpace) {
+    heap_space = std::make_unique<PyObject*[]>(total_args);
+    arg_space = heap_space.get();
+  }
   Ref<PyObject> kwdict, varargs;
 
   if (JITRT_BindKeywordArgs(
@@ -278,13 +287,13 @@ PyObject* JITRT_CallWithKeywordArgs(
           args,
           nargsf,
           kwnames,
-          arg_space.get(),
+          arg_space,
           total_args,
           kwdict,
           varargs)) {
     size_t new_nargsf = total_args;
     return JITRT_GET_REENTRY(jit::jitVectorcallEntryBase(func))(
-        (PyObject*)func, arg_space.get(), new_nargsf, nullptr);
+        (PyObject*)func, arg_space, new_nargsf, nullptr);
   }
 
   return Ci_PyFunction_Vectorcall((PyObject*)func, args, nargsf, kwnames);
