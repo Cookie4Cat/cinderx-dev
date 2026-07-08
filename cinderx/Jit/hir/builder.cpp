@@ -1010,155 +1010,6 @@ bool HIRBuilder::isSimpleLeafFunction(BorrowedRef<PyCodeObject> code) {
 
 #if PY_VERSION_HEX < 0x030C0000
 static std::optional<InPlaceOpKind> getInPlaceOpKindFromOparg(int oparg);
-
-#if PY_VERSION_HEX >= 0x030B0000
-struct ExceptionTableEntry311 {
-  BCOffset start;
-  BCOffset end;
-  BCOffset target;
-};
-
-static bool parseExceptionTableVarint311(
-    const uint8_t*& cur,
-    const uint8_t* end,
-    int& value) {
-  if (cur == end) {
-    return false;
-  }
-  uint8_t byte = *cur++;
-  value = byte & 0x3f;
-  while (byte & 0x40) {
-    if (cur == end) {
-      return false;
-    }
-    value <<= 6;
-    byte = *cur++;
-    value |= byte & 0x3f;
-  }
-  return true;
-}
-
-static std::vector<ExceptionTableEntry311> parseExceptionTable311(
-    BorrowedRef<PyCodeObject> code) {
-  PyObject* table = code->co_exceptiontable;
-  JIT_CHECK(PyBytes_Check(table), "co_exceptiontable must be bytes");
-
-  const auto* cur =
-      reinterpret_cast<const uint8_t*>(PyBytes_AS_STRING(table));
-  const auto* end = cur + PyBytes_GET_SIZE(table);
-  std::vector<ExceptionTableEntry311> entries;
-
-  while (cur != end) {
-    int start = 0;
-    int length = 0;
-    int target = 0;
-    int depth_lasti = 0;
-    if (!parseExceptionTableVarint311(cur, end, start) ||
-        !parseExceptionTableVarint311(cur, end, length) ||
-        !parseExceptionTableVarint311(cur, end, target) ||
-        !parseExceptionTableVarint311(cur, end, depth_lasti)) {
-      JIT_THROW("malformed CPython 3.11 exception table");
-    }
-    start *= sizeof(_Py_CODEUNIT);
-    length *= sizeof(_Py_CODEUNIT);
-    target *= sizeof(_Py_CODEUNIT);
-    entries.push_back(ExceptionTableEntry311{
-        BCOffset{start}, BCOffset{start + length}, BCOffset{target}});
-  }
-
-  return entries;
-}
-
-static bool hasReturningHandler311(
-    const BytecodeInstructionBlock& bc_instrs,
-    BCOffset target,
-    BCOffset end) {
-  for (const auto& instr : bc_instrs) {
-    BCOffset off = instr.baseOffset();
-    if (off < target || off >= end) {
-      continue;
-    }
-    switch (instr.opcode()) {
-      case RETURN_VALUE:
-      case RETURN_PRIMITIVE:
-      case RETURN_CONST:
-        return true;
-    }
-  }
-  return false;
-}
-
-static bool hasBackwardBranchInRange311(
-    const BytecodeInstructionBlock& bc_instrs,
-    BCOffset start,
-    BCOffset end) {
-  for (const auto& instr : bc_instrs) {
-    BCOffset off = instr.baseOffset();
-    if (off < start || off >= end) {
-      continue;
-    }
-    if (instr.isBackwardBranch()) {
-      return true;
-    }
-  }
-  return false;
-}
-
-static bool hasTryLoopReturningHandler311(BorrowedRef<PyCodeObject> code) {
-  if (PyBytes_GET_SIZE(code->co_exceptiontable) == 0) {
-    return false;
-  }
-
-  BytecodeInstructionBlock bc_instrs{code};
-  std::vector<ExceptionTableEntry311> entries = parseExceptionTable311(code);
-  std::vector<BCOffset> handler_targets;
-  handler_targets.reserve(entries.size());
-  for (const auto& entry : entries) {
-    handler_targets.push_back(entry.target);
-  }
-  std::sort(handler_targets.begin(), handler_targets.end());
-  handler_targets.erase(
-      std::unique(handler_targets.begin(), handler_targets.end()),
-      handler_targets.end());
-
-  BCOffset code_end = BCIndex{countIndices(code)}.asOffset();
-  for (const auto& entry : entries) {
-    if (!hasBackwardBranchInRange311(bc_instrs, entry.start, entry.end)) {
-      continue;
-    }
-    auto next_target = std::upper_bound(
-        handler_targets.begin(), handler_targets.end(), entry.target);
-    BCOffset handler_end =
-        next_target == handler_targets.end() ? code_end : *next_target;
-    if (hasReturningHandler311(bc_instrs, entry.target, handler_end)) {
-      return true;
-    }
-  }
-
-  return false;
-}
-#endif
-
-static bool exitsOnlyByRaising(BorrowedRef<PyCodeObject> code) {
-  bool has_raise = false;
-  for (const auto& instr : BytecodeInstructionBlock{code}) {
-    switch (instr.opcode()) {
-      case RAISE_VARARGS:
-      case RERAISE:
-        has_raise = true;
-        break;
-      case RETURN_VALUE:
-      case RETURN_PRIMITIVE:
-      case RETURN_CONST:
-      case YIELD_VALUE:
-      case YIELD_FROM:
-        return false;
-    }
-  }
-  return has_raise;
-}
-
-
 #endif
 
 std::unique_ptr<Function> buildHIR(const Preloader& preloader) {
@@ -1192,16 +1043,13 @@ std::unique_ptr<Function> HIRBuilder::buildHIR() {
         preloader_.fullname());
   }
 #if PY_VERSION_HEX >= 0x030B0000
-  if (hasTryLoopReturningHandler311(code_)) {
-    JIT_THROW(
-        "try-loop exception handlers that return are unsupported on CPython 3.11 in {}",
-        preloader_.fullname());
-  }
-  if (exitsOnlyByRaising(code_)) {
-    JIT_THROW(
-        "functions that only exit by raising are unsupported on CPython 3.11 in {}",
-        preloader_.fullname());
-  }
+  // "try 内回跳循环且 handler 返回"阀与"无可达正常返回"阀（均为
+  // 穿刺时代压制件）已移除：其历史动因（有机 deopt-resume 崩溃族）
+  // 已于 M9R3 六根因修复；handler 在 3.11 异常模型下经 deopt 走
+  // 解释器执行，形态本身无编译器语义缺口。两阀的代价是 pickle 热
+  // 脊柱（_Unpickler.load：try 内无限循环、唯一 return 在 _Stop
+  // handler 内）整体落回解释执行。若回归门禁再现原病，以复现用例
+  // 修根因而非恢复模式拒编（与下方整型累加器阀同判例）。
   // 整型常量累加器拒编阀（穿刺前端 e31387ad5 整取件）已移除：该模式
   // 仅在"函数含方法调用或 localsplus>8"时拒编，小函数一直在编且语料
   // 全绿，无任何文档化失败案例支撑；其代价是 go 等计分型热函数整体
