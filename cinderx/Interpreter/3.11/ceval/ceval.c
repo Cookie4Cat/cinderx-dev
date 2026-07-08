@@ -7441,16 +7441,37 @@ import_name(PyThreadState *tstate, _PyInterpreterFrame *frame,
     PyObject *import_func, *res;
     PyObject* stack[5];
 
-    import_func = _PyDict_GetItemWithError(frame->f_builtins, &_Py_ID(__import__));
-    if (import_func == NULL) {
-        if (!_PyErr_Occurred(tstate)) {
-            _PyErr_SetString(tstate, PyExc_ImportError, "__import__ not found");
+    /* [P8] 上游回迁(3.11.6 后修复):exec/eval 允许非 dict 的
+       __builtins__ 映射,原实现无条件走 _PyDict_GetItemWithError,
+       mapping 受者触发 SystemError(dictobject 内部参数检查)而非
+       ImportError——test_builtin.test_exec_builtins_mapping_import
+       双模复现。按上游终态:dict 精确型走字典借引用查找后转持有,
+       其余走 PyObject_GetItem(新引用),KeyError 转 ImportError;
+       快路径归还引用后原路返回。 */
+    if (PyDict_CheckExact(frame->f_builtins)) {
+        import_func = _PyDict_GetItemWithError(
+                frame->f_builtins, &_Py_ID(__import__));
+        if (import_func == NULL) {
+            if (!_PyErr_Occurred(tstate)) {
+                _PyErr_SetString(tstate, PyExc_ImportError, "__import__ not found");
+            }
+            return NULL;
         }
-        return NULL;
+        Py_INCREF(import_func);
+    }
+    else {
+        import_func = PyObject_GetItem(frame->f_builtins, &_Py_ID(__import__));
+        if (import_func == NULL) {
+            if (_PyErr_ExceptionMatches(tstate, PyExc_KeyError)) {
+                _PyErr_SetString(tstate, PyExc_ImportError, "__import__ not found");
+            }
+            return NULL;
+        }
     }
     PyObject *locals = frame->f_locals;
     /* Fast path for not overloaded __import__. */
     if (import_func == tstate->interp->import_func) {
+        Py_DECREF(import_func);
         int ilevel = _PyLong_AsInt(level);
         if (ilevel == -1 && _PyErr_Occurred(tstate)) {
             return NULL;
@@ -7463,8 +7484,6 @@ import_name(PyThreadState *tstate, _PyInterpreterFrame *frame,
                         ilevel);
         return res;
     }
-
-    Py_INCREF(import_func);
 
     stack[0] = name;
     stack[1] = frame->f_globals;
