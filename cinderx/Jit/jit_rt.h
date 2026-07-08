@@ -124,24 +124,10 @@ PyObject*
 JITRT_LoadGlobal(PyObject* globals, PyObject* builtins, PyObject* name);
 
 #if PY_VERSION_HEX < 0x030C0000
-PyObject* JITRT_LoadGlobalModuleValue(
-    PyObject* globals,
-    PyObject* name,
-    uint32_t keys_version,
-    Py_ssize_t index);
-
 // 产物侧调用直派慢路径槽(值恒为 &JITRT_Vectorcall,行内选径经此
 // 地址装载以统一快慢两臂)。
 extern void* g_JITRT_Vectorcall_slot;
 extern void* g_JITRT_Call_slot;
-
-PyObject* JITRT_LoadGlobalBuiltinValue311(
-    PyObject* globals,
-    PyObject* builtins,
-    PyObject* name,
-    uint32_t globals_keys_version,
-    uint32_t builtins_keys_version,
-    Py_ssize_t index);
 #endif
 
 /*
