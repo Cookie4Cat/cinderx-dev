@@ -1,5 +1,7 @@
 {
   "failures": [
-    "libtest:test_descr"
+    "libtest:test_descr",
+    "libtest:test_dis",
+    "libtest:test_inspect"
   ]
 }

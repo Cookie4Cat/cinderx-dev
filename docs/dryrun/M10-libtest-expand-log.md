@@ -91,7 +91,39 @@ SF-572567 查漏检查在两次 `gc.get_objects()` 计数间执行 10 次
   `baselines/cp311-libtest-expanded.json`、
   `docs/dryrun/smoke/smoke_libtest_expand.py`。
 
-## 六、遗留与教训
+## 六、第三波扩充（A+B 档，2026-07-08 追录）
+
+A 档语言面扫尾 17（itertools/richcmp/fstring/dataclasses/
+contextlib_async/sort/index/long/bool/complex/abc/class/subclassinit/
+enumerate/range/format/bytes）+ B 档语义可见性专项 6（finalization/
+dis/inspect/sys_setprofile/cprofile/enum），auto=4 双臂差分。
+结果 21/23 一致；test_finalization 通过（本轮析构面修复经受住最强
+专项）；两项 DIVERGE 均为 FAIL（非崩溃），归因如下：
+
+**test_dis（test_loop_quicken）= 特化拒填家族的 dis 可见投影**。
+期望特化为 CALL_PY_WITH_DEFAULTS 的位点在本运行时停在
+CALL_ADAPTIVE；加热 500 次不转化、auto=0（零编译、仅 init）同样
+拒绝——函数入口包装使上游 specialize_py_call 拒填，即劣化归因轮
+记档的"特化拒填"共因在反汇编断言面的显形。语义行为不变
+（CALL_ADAPTIVE 正常执行），判定机制性已知分歧，入基线。
+
+**test_inspect（test_stack）= UpdatePrevInstr 行去重的编译帧
+mid-call positions 错列**。fodder 的 eggs 帧在调用中途报告列跨度
+9..16（行首指令 LOAD_GLOBAL 的跨度）而非 9..24（完整调用表达式）。
+定界三证：解释态两形复现均正确；auto=24 与 auto=0 均通过（纯编译
+帧面）；insert_update_prev_instr.cpp:122 确认去重键为行号——行内
+仅首指令处更新 prev_instr。主仓同病已修（去重键改 bc offset），
+311 因簿记密度代价（参见第 D 轮 UpdatePrevInstr 上界 −2.3% 测量）
+未回迁。判定已知家族入基线；**修复候选记档：回迁 bc-offset 去重，
+落地前须同味 A/B 定价**（每编译函数簿记密度上升，方向与 D 轮相反）。
+
+清单与基线随本节更新：libtest_modules_expanded.txt 增至 46 模块，
+基线增 libtest:test_dis、libtest:test_inspect 两项（合计 3 项已知
+分歧）。C 档（asyncio/threading/io/typing）维持夜间带定位，未挂
+MR 门禁。第三波后差分门禁覆盖 72/407，解释器相关面基本饱和，
+后续增补边际信号趋零。
+
+## 七、遗留与教训
 
 - **兜底符号约定审计**：borrowed-3.11-fallback.c 是"vendored 基版
   与运行时差配"缺陷面的近亲——我们自写的内部符号兜底与 vanilla

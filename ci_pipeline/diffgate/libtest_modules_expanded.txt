@@ -29,3 +29,28 @@ test_weakref
 test_iter
 test_functools
 test_binop
+# --- 第三波 A 档：语言面扫尾 ---
+test_itertools
+test_richcmp
+test_fstring
+test_dataclasses
+test_contextlib_async
+test_sort
+test_index
+test_long
+test_bool
+test_complex
+test_abc
+test_class
+test_subclassinit
+test_enumerate
+test_range
+test_format
+test_bytes
+# --- 第三波 B 档：语义可见性专项 ---
+test_finalization
+test_dis
+test_inspect
+test_sys_setprofile
+test_cprofile
+test_enum
