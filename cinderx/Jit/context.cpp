@@ -856,18 +856,21 @@ static PyObject* recursionGuardedVectorcall(
       }
     }
   }
+  if (kExcFuse && extra != nullptr && extra->probation_ctl == 4 &&
+      ++extra->probation_seq >= kExcRateProbationCalls) {
+    // 异常率试用裁决必须先于编译入口查找:裁决可能冻结(卸载全部
+    // 关联函数),先查后判会调用悬垂的编译入口——首版实测时序敏感
+    // 栈损毁(argparse/docutils/sphinx 族 SIGABRT,gdb 下时序改变
+    // 即隐身)。前移后冻结生效时下方查找自然落空、本次调用即走
+    // 解释入口。
+    excRateProbationJudge(func, extra);
+  }
   if (kTimedProbation && extra != nullptr && extra->probation_ctl == 1) {
     result = probationTimedCall(func, extra, stack, nargsf, kwnames);
   } else if (CompiledFunction* compiled = lookupCompiledForCall(func)) {
-    if (kExcFuse && extra != nullptr && extra->probation_ctl == 4) {
-      // 异常率试用:按调用计数,K 次后裁决(异常增量由 deopt 路径
-      // 记入 exc_deopt_count)。
-      if (++extra->probation_seq >= kExcRateProbationCalls) {
-        excRateProbationJudge(func, extra);
-      }
-    } else if (kExcFuse && !kTimedProbation && extra != nullptr &&
-               extra->probation_ctl == 0 &&
-               compiled->runtime()->entryGuardInlined()) {
+    if (kExcFuse && !kTimedProbation && extra != nullptr &&
+        extra->probation_ctl == 0 &&
+        compiled->runtime()->entryGuardInlined()) {
       // 试用结束(转正)后晋升裸入口,包装器退场。
       setVectorcall(func, compiled->vectorcallEntry());
     }
