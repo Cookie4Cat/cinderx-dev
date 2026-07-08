@@ -170,7 +170,10 @@ PyObject* _PyGen_yf(PyGenObject* gen) {
   if (gen->gi_frame_state == FRAME_SUSPENDED) {
     _PyInterpreterFrame* frame = (_PyInterpreterFrame*)gen->gi_iframe;
     PyObject* yf = _PyFrame_StackPeek(frame);
-    return yf == Py_None ? NULL : yf;
+    // 约定与 stock Objects/genobject.c 同名函数一致：返回新引用。
+    // 调用方（vendored GET_AWAITABLE、StaticPython awaitable、JitGen_yf
+    // 的 JIT 记账）均按新引用配对 Py_DECREF。
+    return yf == Py_None ? NULL : Py_NewRef(yf);
   }
   return NULL;
 }

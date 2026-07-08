@@ -246,7 +246,12 @@ BackedgeCounters* getOrCreateBackedgeCounters(PyCodeObject* code) {
     return nullptr;
   }
 
+#if PY_VERSION_HEX < 0x030C0000
+  // 最小容量写入：不把 extras 数组扩到第三方索引（见 code_extra.h 论证）。
+  if (Ci_code_extra_set_min_311(code, extra_index, counters) < 0) {
+#else
   if (PyUnstable_Code_SetExtra(code_obj, extra_index, counters) < 0) {
+#endif
     PyErr_Clear();
     PyMem_Free(counters);
     return nullptr;
