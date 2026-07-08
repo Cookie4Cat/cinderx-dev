@@ -62,6 +62,13 @@ void recordDeoptForDespec(
     DeoptReason reason,
     bool is_instrumentation_deopt);
 
+// 异常 deopt 熔断:直线型 code 的 UnhandledException deopt 越限即
+// 冻结回解释器(见 pyjit.cpp 实现注释)。
+void recordDeoptForExcFuse(
+    CodeRuntime* code_runtime,
+    DeoptReason reason,
+    bool is_instrumentation_deopt);
+
 bool roiBackoffAllowsCompile(BorrowedRef<PyCodeObject> code);
 
 /*

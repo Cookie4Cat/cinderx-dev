@@ -639,6 +639,62 @@ static void __attribute__((noinline)) probationEnrollOnCall(
   }
 }
 
+// 异常率试用(exc-rate probation,ctl==4):异常 deopt 熔断的裁决层。
+// 首次越限只挂计数包装器,其后 K 次调用内统计异常 deopt 增量,
+// 异常/调用 ≥ 1/2 判"每调用必炸"冻结(解释器原生处理异常,零
+// deopt 税);否则永久转正(ctl=0,包装器晋升裸入口)。与计时试用
+// 不同:计数无交叉污染,免全局队列,各 code 独立并行。
+// 窗口 256:须跨越负载相位(首版 64 恰可整窗落在混合负载的高异常
+// 率相内,copy._keep_alive 在普通 deepcopy 形被相位采样误冻)。
+constexpr uint32_t kExcRateProbationCalls = 256;
+
+static PyObject* recursionGuardedVectorcall(
+    PyObject* func_obj,
+    PyObject* const* stack,
+    size_t nargsf,
+    PyObject* kwnames);
+
+void excRateProbationArm(BorrowedRef<PyCodeObject> code, CodeExtra* extra) {
+  if (extra->probation_ctl != 0) {
+    return;
+  }
+  Context* ctx = getContext();
+  if (ctx == nullptr) {
+    return;
+  }
+  bool armed = false;
+  for (auto& entry : ctx->compiledFuncs()) {
+    BorrowedRef<PyFunctionObject> f = entry.first;
+    if (reinterpret_cast<PyCodeObject*>(f->func_code) == code.get()) {
+      setVectorcall(f, recursionGuardedVectorcall);
+      armed = true;
+    }
+  }
+  if (armed) {
+    extra->probation_seq = 0;
+    extra->probation_interp_ns = extra->exc_deopt_count; // 起点快照
+    extra->probation_ctl = 4;
+  }
+}
+
+static void __attribute__((noinline)) excRateProbationJudge(
+    BorrowedRef<PyFunctionObject> func,
+    CodeExtra* extra) {
+  uint32_t exc_delta = extra->exc_deopt_count -
+      static_cast<uint32_t>(extra->probation_interp_ns);
+  extra->probation_ctl = 0;
+  // 冻结阈 40%:同一 copy._keep_alive 在 reduce 形实测率 ~50%
+  // (冻结净赚 -7%)、普通 deepcopy 形 ~33%(冻结实测净亏 +11%,
+  // dict/list/subdict 三次调用一次 KeyError)——经验分界取两侧
+  // 实测点之间。转正判决经 skey 粘滞位固化,不再武装复审(首版
+  // 转正不粘滞,计数续涨反复再武装,包装态抖动实测两基准全面劣化)。
+  if (exc_delta * 5 >= kExcRateProbationCalls * 2) {
+    probationFreeze(func);
+  } else {
+    Ci_code_extra_or_skey_release(extra, CI_CODE_EXTRA_SKEY_EXC_JUDGED_BIT);
+  }
+}
+
 static PyObject* __attribute__((noinline)) probationTimedCall(
     BorrowedRef<PyFunctionObject> func,
     CodeExtra* extra,
@@ -763,10 +819,19 @@ static PyObject* recursionGuardedVectorcall(
   // 才逐调用查表。
   static const size_t kPressureRatio = getConfig().ic_pressure_ratio;
   static const bool kTimedProbation = getConfig().probation_calls > 0;
+  static const bool kExcFuse = getConfig().exc_deopt_fuse;
   static uint64_t g_call_tick = 0;
   CodeExtra* extra = nullptr;
-  if (kTimedProbation) {
-    extra = codeExtraIfExists(reinterpret_cast<PyCodeObject*>(func->func_code));
+  if (kTimedProbation || kExcFuse) {
+    // co_extra 行内快读(与 lookupCompiledForCall 同款):本包装器是
+    // 未行内化守卫函数的默认入口,exc-fuse 默认开使此路径每调用执行
+    // ——出线 _PyCode_GetExtra 版本实测 deepcopy/pprint +15%。
+    cinderx::ModuleState* mod_state = cinderx::getModuleState();
+    if (mod_state != nullptr) {
+      extra = Ci_code_extra_fast_read_311(
+          reinterpret_cast<PyCodeObject*>(func->func_code),
+          mod_state->code_extra_index);
+    }
   }
   if (kPressureRatio > 0 && ((++g_call_tick & 15) == 0)) {
     // IC 压力密度窗口裁决（生产判据）：采样计调用（×16 折算），每
@@ -794,6 +859,18 @@ static PyObject* recursionGuardedVectorcall(
   if (kTimedProbation && extra != nullptr && extra->probation_ctl == 1) {
     result = probationTimedCall(func, extra, stack, nargsf, kwnames);
   } else if (CompiledFunction* compiled = lookupCompiledForCall(func)) {
+    if (kExcFuse && extra != nullptr && extra->probation_ctl == 4) {
+      // 异常率试用:按调用计数,K 次后裁决(异常增量由 deopt 路径
+      // 记入 exc_deopt_count)。
+      if (++extra->probation_seq >= kExcRateProbationCalls) {
+        excRateProbationJudge(func, extra);
+      }
+    } else if (kExcFuse && !kTimedProbation && extra != nullptr &&
+               extra->probation_ctl == 0 &&
+               compiled->runtime()->entryGuardInlined()) {
+      // 试用结束(转正)后晋升裸入口,包装器退场。
+      setVectorcall(func, compiled->vectorcallEntry());
+    }
     if (kTimedProbation && extra != nullptr) {
       if (extra->probation_ctl == 0) {
         // 已通过裁决且入口守卫已行内化：晋升裸编译入口，本包装器就此

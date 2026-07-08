@@ -190,6 +190,10 @@ struct Config {
   //（raytrace t=4 风暴案）。
   bool adaptive_despec{true};
   size_t despec_deopt_threshold{64};
+  // 异常 deopt 熔断:直线型 code 的 UnhandledException deopt 越限
+  // 即冻结回解释器(见 code_extra.h exc_deopt_count 注释)。
+  bool exc_deopt_fuse{true};
+  size_t exc_deopt_fuse_threshold{8};
   // 同步生成器自动编译（3.11）。三态实测其编译净效应为负（interp
   // 86.0 ms vs JIT 96.6 ms，恢复仪式固定成本主导，微小生成器体收益
   // 归零；派发层合并实测墙钟中性——成本在本体与溅射恢复），默认不

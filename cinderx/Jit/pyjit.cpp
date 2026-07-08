@@ -1381,6 +1381,13 @@ FlagProcessor initFlagProcessor() {
       "default, resume ceremony dominates trivial bodies).");
 
   flag_processor.addOption(
+      "jit-exc-deopt-fuse",
+      "CINDERX_EXC_DEOPT_FUSE",
+      getMutableConfig().exc_deopt_fuse,
+      "Freeze loop-free compiled code back to the interpreter after "
+      "repeated unhandled-exception deopts (per-call exception idioms).");
+
+  flag_processor.addOption(
       "jit-adaptive-despec-threshold",
       "CINDERX_ADAPTIVE_DESPEC_THRESHOLD",
       getMutableConfig().despec_deopt_threshold,
@@ -4566,6 +4573,82 @@ void recordDeoptForDespec(
     scheduleJitCompile(func);
   }
   incAutoJitGateStat(g_auto_jit_gate_stats.adaptive_despec);
+}
+
+// 异常 deopt 熔断(exc-deopt fuse):无回边 code 的 UnhandledException
+// 深度 deopt 计数,越限即卸载并冻结(DecidedCold+ROI FROZEN,经
+// probationFreeze 原语)。直线型函数无法摊薄每调用 deopt;冻结后
+// 解释器原生处理其异常,零 deopt 税。带回边 code 与
+// instrumentation deopt 不计。判据与实现动机见 M10-950-twins 续轮
+// 轮志(copy._keep_alive 案:每次 deepcopy 一次 KeyError deopt)。
+// 定义于 context.cpp:武装异常率试用(包装器计数+比率裁决)。
+void excRateProbationArm(BorrowedRef<PyCodeObject> code, CodeExtra* extra);
+
+// 直线型判定(镜像 hir/builder.cpp 匿名空间的 codeHasBackedge,
+// 本地实现避免头文件面扩散;两处语义须保持一致)。
+static bool ciCodeHasBackedge311(BorrowedRef<PyCodeObject> code) {
+  for (const auto& bc_instr : BytecodeInstructionBlock{code}) {
+    if (bc_instr.isBranch() &&
+        bc_instr.getJumpTarget() <= bc_instr.baseOffset()) {
+      return true;
+    }
+  }
+  return false;
+}
+
+void recordDeoptForExcFuse(
+    CodeRuntime* code_runtime,
+    DeoptReason reason,
+    bool is_instrumentation_deopt) {
+  if (!getConfig().exc_deopt_fuse ||
+      !getConfig().compile_after_n_calls.has_value() ||
+      code_runtime == nullptr || is_instrumentation_deopt ||
+      reason != DeoptReason::kUnhandledException) {
+    return;
+  }
+  BorrowedRef<PyCodeObject> code = code_runtime->code();
+  if (code == nullptr) {
+    return;
+  }
+  // 深度 deopt 本已昂贵,本钩子必须近零增量:co_extra 行内快读 +
+  // 纯字段检查在前;回边扫描(逐字节码)只在武装决策点执行——每
+  // code 至多一次(首版把扫描放在每次异常 deopt 必经路上,deepcopy
+  // 每基准迭代 1800 次 KeyError deopt 全额付扫描,实测 +40%)。
+  cinderx::ModuleState* mod_state = cinderx::getModuleState();
+  if (mod_state == nullptr) {
+    return;
+  }
+  CodeExtra* extra =
+      Ci_code_extra_fast_read_311(code.get(), mod_state->code_extra_index);
+  if (extra == nullptr) {
+    return;
+  }
+  uint32_t ctl = Ci_code_extra_load_roi_ctl_relaxed(extra);
+  if (roiBackoffCtlFrozen(ctl)) {
+    return; // 已冻结(本熔断或他因)
+  }
+  ++extra->exc_deopt_count;
+  if (extra->probation_ctl != 0) {
+    return; // 已在试用(计数照走,裁决由包装器执行)
+  }
+  if (Ci_code_extra_load_skey_acquire(extra) &
+      CI_CODE_EXTRA_SKEY_EXC_JUDGED_BIT) {
+    return; // 已转正,判决粘滞,不复审
+  }
+  if (extra->exc_deopt_count < getConfig().exc_deopt_fuse_threshold) {
+    return;
+  }
+  if (ciCodeHasBackedge311(code)) {
+    // 带回边者永不武装:置粘滞位免除后续一切检查与重扫。
+    Ci_code_extra_or_skey_release(extra, CI_CODE_EXTRA_SKEY_EXC_JUDGED_BIT);
+    return;
+  }
+  // 越限不直接冻结:同一 code 的异常率随负载而变(copy._keep_alive
+  // 在 reduce 形近乎每调用必炸、冻结净赚;在普通 deepcopy 一次
+  // KeyError 摊多次正常调用、冻结净亏——纯计数首版实测 deepcopy
+  // +11% 误伤)。改为武装"异常率试用":挂计数包装器,K 次调用内按
+  // 异常/调用比裁决(见 context.cpp excRateProbationArm)。
+  excRateProbationArm(code, extra);
 }
 
 int initialize() {

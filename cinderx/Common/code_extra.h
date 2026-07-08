@@ -12,6 +12,9 @@
 //              is reserved for future flags so payload width can stay stable.
 #define CI_CODE_EXTRA_SKEY_VALID_BIT 0x80000000u
 #define CI_CODE_EXTRA_SKEY_DECIDED_COLD_BIT 0x40000000u
+// 异常率试用已裁决(转正粘滞位):置位后不再武装/复审(冻结判决经
+// ROI FROZEN 位天然粘滞,本位服务转正方向)。
+#define CI_CODE_EXTRA_SKEY_EXC_JUDGED_BIT 0x20000000u
 #define CI_CODE_EXTRA_SKEY_PAYLOAD_MASK 0x00FFFFFFu
 
 // roi_ctl bit layout for dynamic negative-ROI backoff:
@@ -77,6 +80,13 @@ typedef struct CodeExtra {
   // 卸载并以去特化输入重编，多态受者的 deopt 风暴被一次重编封顶。
   uint32_t despec_deopt_count;
   uint32_t despec_state;
+  // 异常 deopt 熔断(exc-deopt fuse):无回边(直线型)code 的
+  // UnhandledException 深度 deopt 计数。直线型函数按定义无法摊薄
+  // 每调用 deopt(典型:copy._keep_alive 的"try 取 except KeyError
+  // 置初值"惯用形,每次 deepcopy 全额付一次 deopt 物化),越限即
+  // 卸载并冻结回解释器(解释器原生处理该异常,零 deopt 税);带
+  // 循环 code 不受此熔断(如 pickle load,一次 deopt 摊数千次派发)。
+  uint32_t exc_deopt_count;
 } CodeExtra;
 
 #define CI_CODE_EXTRA_AUTO_JIT_DISABLED 1

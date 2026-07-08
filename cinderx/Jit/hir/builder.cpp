@@ -4703,13 +4703,15 @@ bool HIRBuilder::tryEmitLoadGlobalBuiltinValue311(
   Register* bkeys_reg = emit_keys_version_guard(
       builtins, builtins_keys_version, "LOAD_GLOBAL_BUILTIN builtins ver");
 
+  // 借用装载:引用账全权交 HIR 引用计数插入 pass(按消费点自动
+  // 平衡)。手工 Incref 会与 pass 的自动份重复——#62 首版双
+  // incref 单 decref,with-语句族 refcount 矩阵实测每执行 +1 泄漏。
   tc.emit<LoadField>(
       result,
       bkeys_reg,
       "me_value",
       static_cast<std::size_t>(value_off),
       TObject);
-  tc.emit<Incref>(result);
   return true;
 }
 
@@ -4815,8 +4817,8 @@ bool HIRBuilder::tryEmitLoadGlobalModuleValue311(
   nn_guard->setGuiltyReg(raw_reg);
   nn_guard->setDescr(
       fmt::format("LOAD_GLOBAL_MODULE: {}", PyUnicode_AsUTF8(name)));
+  // 借用装载,引用账交 pass(见 builtins 形注释)。
   tc.emit<RefineType>(result, TObject, raw_reg);
-  tc.emit<Incref>(result);
 
   // 内联器前门（实验，仅 hir_opts.inliner 开启时发射）：编译期窥得的
   // 全局值是函数对象时，追加同一性守卫把结果精化为带值规格的常量——
