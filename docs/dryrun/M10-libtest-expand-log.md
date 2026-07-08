@@ -123,6 +123,16 @@ mid-call positions 错列**。fodder 的 eggs 帧在调用中途报告列跨度
 MR 门禁。第三波后差分门禁覆盖 72/407，解释器相关面基本饱和，
 后续增补边际信号趋零。
 
+### C 档夜间带首测（2026-07-08 追录）
+
+test_asyncio（整包）/test_threading/test_io/test_typing，auto=4
+双臂、单模块超时 1200s：**4/4 一致，零分歧**。asyncio 整包为
+[P7]/协程机器与真实事件循环的压测面，threading 覆盖编译队列与
+IC 变异的并发面，均无信号。清单固化为
+`ci_pipeline/diffgate/libtest_modules_nightly.txt`（无需独立基线），
+定位收口链/夜间独立跑。至此差分门禁覆盖 76/407：MR 级 46 +
+基础 26（部分重叠）+ 夜间带 4，解释器相关面收官。
+
 ## 七、遗留与教训
 
 - **兜底符号约定审计**：borrowed-3.11-fallback.c 是"vendored 基版
