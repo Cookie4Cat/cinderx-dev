@@ -1587,6 +1587,7 @@ void NativeGenerator::emitAarch64LoadAttrInvokeStub(
   constexpr uint64_t kDescrOrClassVarKind =
       jit::AttributeMutator::descrOrClassVarKind();
   constexpr int kTpDescrGetOffset = offsetof(PyTypeObject, tp_descr_get);
+  constexpr int kTpDescrSetOffset = offsetof(PyTypeObject, tp_descr_set);
   constexpr int kHtCachedKeysOffsetLa =
       offsetof(PyHeapTypeObject, ht_cached_keys);
   constexpr int kDkVersionOffsetLa = offsetof(PyDictKeysObject, dk_version);
@@ -1785,17 +1786,24 @@ void NativeGenerator::emitAarch64LoadAttrInvokeStub(
     as_->cbz(a64::x9, slow_path); // 空 slot → helper 抛错
     as_->b(return_value);
 
-    // kind-7（kDescrOrClassVar）：只内联"无 getter"形态（纯类变量/无
-    // 描述符协议对象）：数据/非数据描述符的 get 调用本就要出线，留
-    // helper 保持完整定序语义。接收者限定 values 形（物化实例回落
-    // helper 的带 hint 物化读）。两形：
+    // kind-7（kDescrOrClassVar）：内联"非数据"形态（tp_descr_set 为
+    // 空）。数据描述符的 get 调用与定序留 helper。非数据形态实例字典
+    // 优先——遮蔽命中可行内直返（借引→INCREF，与 helper peek 同构）；
+    // "确定无遮蔽"的结论点须重查 tp_descr_get：纯类变量直返 descr，
+    // 带 getter（绑定方法/`__get__` 缓存惯用形未命中时）出线调用。
+    // 原判据"无 getter"整型排除了 SQLAlchemy 事件派发的"__get__ +
+    // 首访缓存进 __dict__"惯用形——稳态全是遮蔽命中却每次出线
+    // （sqlalchemy_imperative 69 万次/20 迭代）。三形：
     //  - 快形：fill 时名字不在共享键（keys_version 记录当时 dk 版本）。
     //    values 形实例的属性名集合 ⊆ 共享键名集，dk 版本未动即无遮蔽
-    //    可能，直返 descr；
+    //    可能，转结论点；
     //  - 探测形：名字在共享键内（keys_version==0），mat_hint 自验证
     //    （me_key 指针比较，helper 命中时刷新），values[hint] 非空即
-    //    遮蔽值、空槽即未遮蔽返回 descr。kind-7 无"确定 miss 抛错"
-    //    路径（descr 恒在），与 helper/raise 漏斗语义无交集。
+    //    遮蔽值、空槽即未遮蔽转结论点；
+    //  - 物化形：-3 槽字典带 hint 直读（镜像 kind-2 物化块 / helper
+    //    peek 的物化分支），me_key 自验证，split 包装含容量守卫。
+    // kind-7 无"确定 miss 抛错"路径（descr 恒在），与 helper/raise
+    // 漏斗语义无交集。
     as_->bind(kind7_check);
     arch::cmp_immediate(
         as_, a64::x14, kDescrOrClassVarKind - kSplitInlineKind);
@@ -1805,8 +1813,10 @@ void NativeGenerator::emitAarch64LoadAttrInvokeStub(
         arch::ptr_offset(a64::x0, kEntryDcvDescrOffset + entry_offset));
     as_->cbz(a64::x9, slow_path);
     as_->ldr(a64::x12, arch::ptr_offset(a64::x9, kObTypeOffset));
-    as_->ldr(a64::x12, arch::ptr_offset(a64::x12, kTpDescrGetOffset));
+    as_->ldr(a64::x12, arch::ptr_offset(a64::x12, kTpDescrSetOffset));
     as_->cbnz(a64::x12, slow_path);
+    Label kind7_descr = as_->newLabel();
+    Label kind7_materialized = as_->newLabel();
     // MANAGED_DICT 标志门（镜像 helper：预头 -4/-3 槽仅 managed dict
     // 类型存在，非 managed 类型读预头即越界）。非 managed 且
     // tp_dictoffset==0（__slots__ 类）：无实例字典、无遮蔽可能，
@@ -1818,10 +1828,10 @@ void NativeGenerator::emitAarch64LoadAttrInvokeStub(
     as_->b_ne(kind7_managed);
     as_->ldr(a64::x10, arch::ptr_offset(a64::x13, kTpDictoffsetOffset));
     as_->cbnz(a64::x10, slow_path);
-    as_->b(return_value); // x9 = descr
+    as_->b(kind7_descr); // 无实例字典 → 无遮蔽结论点
     as_->bind(kind7_managed);
     as_->ldr(a64::x15, arch::ptr_offset(a64::x1, kValuesPreheaderOffset));
-    as_->cbz(a64::x15, slow_path);
+    as_->cbz(a64::x15, kind7_materialized);
     as_->ldr(a64::x12, arch::ptr_offset(a64::x13, kHtCachedKeysOffsetLa));
     as_->cbz(a64::x12, slow_path);
     Label kind7_probe = as_->newLabel();
@@ -1837,7 +1847,7 @@ void NativeGenerator::emitAarch64LoadAttrInvokeStub(
         arch::ptr_offset(a64::x12, kDkVersionOffsetLa, arch::AccessSize::k32));
     as_->cmp(a64::w10, a64::w14);
     as_->b_ne(slow_path);
-    as_->b(return_value); // x9 = descr
+    as_->b(kind7_descr); // 无遮蔽结论点
     as_->bind(kind7_probe);
     as_->ldrb(
         a64::w10,
@@ -1863,9 +1873,65 @@ void NativeGenerator::emitAarch64LoadAttrInvokeStub(
     as_->b_ne(slow_path);
     as_->add(a64::x15, a64::x15, a64::x14, a64::lsl(3));
     as_->ldr(a64::x10, a64::ptr(a64::x15)); // values[hint]
-    as_->cbz(a64::x10, return_value); // 空槽：未遮蔽 → descr（x9 已持）
+    as_->cbz(a64::x10, kind7_descr); // 空槽：未遮蔽 → 结论点
     as_->mov(a64::x9, a64::x10); // 遮蔽值
     as_->b(return_value);
+
+    // ---- kind-7 物化形：-3 槽字典带 hint 遮蔽探测（镜像 kind-2 物化
+    // 块与 helper peek 物化分支；x9=descr 全程保持）----
+    as_->bind(kind7_materialized);
+    Label kind7_mat_combined = as_->newLabel();
+    Label kind7_mat_test = as_->newLabel();
+    as_->ldr(a64::x15, arch::ptr_offset(a64::x1, kDictPreheaderOffset));
+    as_->cbz(a64::x15, slow_path);
+    as_->ldr(a64::x14, arch::ptr_offset(a64::x15, kMaKeysOffset));
+    as_->ldrb(
+        a64::w10,
+        arch::ptr_offset(a64::x14, kDkKindOffset, arch::AccessSize::k8));
+    as_->cbz(a64::w10, slow_path); // general 键罕见形态回落
+    as_->ldr(
+        a64::x12,
+        arch::ptr_offset(a64::x0, kEntryDcvMatHintOffset + entry_offset));
+    as_->ldr(a64::x10, arch::ptr_offset(a64::x14, kDkNentriesOffset));
+    as_->cmp(a64::x12, a64::x10);
+    as_->b_hs(slow_path); // 无符号比较：负/未初始化 hint 一并拦截
+    as_->ldrb(
+        a64::w10,
+        arch::ptr_offset(
+            a64::x14, kDkLog2IndexBytesOffset, arch::AccessSize::k8));
+    as_->mov(a64::x11, 1);
+    as_->lsl(a64::x11, a64::x11, a64::x10);
+    as_->add(a64::x11, a64::x14, a64::x11);
+    arch::add_immediate(as_, a64::x11, a64::x11, kDkIndicesOffset);
+    as_->add(a64::x11, a64::x11, a64::x12, a64::lsl(4));
+    as_->ldr(a64::x10, a64::ptr(a64::x11)); // me_key
+    as_->cmp(a64::x10, a64::x2);
+    as_->b_ne(slow_path); // 键不符/hint 失效 → helper 刷新
+    as_->ldr(a64::x14, arch::ptr_offset(a64::x15, kMaValuesOffset));
+    as_->cbz(a64::x14, kind7_mat_combined);
+    // split 包装容量守卫（共享键成长后 hint 可越界）
+    as_->ldrb(
+        a64::w10,
+        arch::ptr_offset(a64::x14, -1, arch::AccessSize::k8));
+    as_->cmp(a64::x12, a64::x10);
+    as_->b_hs(slow_path);
+    as_->add(a64::x14, a64::x14, a64::x12, a64::lsl(3));
+    as_->ldr(a64::x10, a64::ptr(a64::x14)); // split 包装：ma_values[hint]
+    as_->b(kind7_mat_test);
+    as_->bind(kind7_mat_combined);
+    as_->ldr(a64::x10, arch::ptr_offset(a64::x11, 8)); // combined：me_value
+    as_->bind(kind7_mat_test);
+    as_->cbz(a64::x10, kind7_descr); // 值空：未遮蔽 → 结论点
+    as_->mov(a64::x9, a64::x10); // 遮蔽值
+    as_->b(return_value);
+
+    // ---- 无遮蔽结论点：纯类变量直返 descr；带 getter（绑定方法等
+    // 非数据描述符）必须出线经 helper 调用 __get__ ----
+    as_->bind(kind7_descr);
+    as_->ldr(a64::x10, arch::ptr_offset(a64::x9, kObTypeOffset));
+    as_->ldr(a64::x10, arch::ptr_offset(a64::x10, kTpDescrGetOffset));
+    as_->cbnz(a64::x10, slow_path);
+    as_->b(return_value); // x9 = descr
 #endif
   };
 
