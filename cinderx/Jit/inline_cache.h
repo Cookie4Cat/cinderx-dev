@@ -458,6 +458,12 @@ struct ICRuntimeStats {
   std::atomic<uint64_t> sa_invoke{0};
   std::atomic<uint64_t> sa_entry_hit{0};
   std::atomic<uint64_t> sa_slow{0};
+  // 写侧 helper 分型（插入形轮）：values 覆写/values 插入/物化覆写/
+  // 通用协议回退，用于定位 stub 漏接的形态构成。
+  std::atomic<uint64_t> sa_values_overwrite{0};
+  std::atomic<uint64_t> sa_values_insert{0};
+  std::atomic<uint64_t> sa_mat_overwrite{0};
+  std::atomic<uint64_t> sa_generic_fallback{0};
 };
 
 extern ICRuntimeStats g_ic_runtime_stats;
