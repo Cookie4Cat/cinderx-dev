@@ -2033,6 +2033,17 @@ void NativeGenerator::emitAarch64StoreAttrInvokeStub(
   constexpr uint64_t kKindMask = jit::AttributeMutator::kindMask();
   constexpr uint64_t kSplitInlineKnownOffsetKind =
       jit::AttributeMutator::splitInlineKnownOffsetKind();
+  constexpr uint64_t kDescrOrClassVarKind =
+      jit::AttributeMutator::descrOrClassVarKind();
+  constexpr int kEntryDcvDescrOffset = static_cast<int>(
+      jit::AttributeCache::entriesOffset() +
+      jit::AttributeMutator::dcvDescrOffset());
+  constexpr int kEntryDcvMatHintOffset = static_cast<int>(
+      jit::AttributeCache::entriesOffset() +
+      jit::AttributeMutator::dcvMatHintOffset());
+  constexpr int kTpDescrSetOffset = offsetof(PyTypeObject, tp_descr_set);
+  constexpr int kHtCachedKeysOffsetSa =
+      offsetof(PyHeapTypeObject, ht_cached_keys);
   constexpr int kObTypeOffset = offsetof(PyObject, ob_type);
   constexpr int kRefcountOffset = offsetof(PyObject, ob_refcnt);
   constexpr int kTpFlagsOffset = offsetof(PyTypeObject, tp_flags);
@@ -2094,14 +2105,17 @@ void NativeGenerator::emitAarch64StoreAttrInvokeStub(
             arch::AccessSize::k32));
     as_->cmp(a64::w14, a64::w15);
     as_->b_ne(next_entry);
-    // 写侧条目 kind 恒为 kSplitInline（KnownOffset 晋升只在读侧
-    // getAttrInline 发生），接受 kSplitInline/kSplitInlineKnownOffset
-    // 两值：kind-2 ∈ {0,1}。
+    // 写侧接受 kSplitInline/kSplitInlineKnownOffset（差值 ∈ {0,1}）；
+    // 其余转 kind-7 支线判定（非数据描述符位点的实例字典遮蔽写——
+    // __get__ 首访缓存惯用形的写侧孪生）。
+    Label kind7_sa = as_->newLabel();
+    Label k7s_materialized = as_->newLabel();
+    Label k7s_combined = as_->newLabel();
     as_->and_(a64::x14, a64::x12, kKindMask);
     arch::sub_immediate(
         as_, a64::x14, a64::x14, kSplitInlineKnownOffsetKind - 1);
     arch::cmp_immediate(as_, a64::x14, 1);
-    as_->b_hi(slow_path);
+    as_->b_hi(kind7_sa);
 
     // values 形态：slot = values + val_offset*8；x15=0 表示无需版本戳。
     // val_offset 可能为 -1（fill 时名字尚不在共享键），负值回落。
@@ -2165,6 +2179,108 @@ void NativeGenerator::emitAarch64StoreAttrInvokeStub(
     as_->add(a64::x14, a64::x14, a64::x12, a64::lsl(3)); // split 包装
     as_->b(do_store);
     as_->bind(combined_slot);
+    arch::add_immediate(as_, a64::x14, a64::x10, 8); // ep->me_value
+    as_->b(do_store);
+
+    // ---- kind-7（kDescrOrClassVar）遮蔽写支线 ----
+    // 准入：非数据（tp_descr_set==NULL，数据描述符 setter 出线）+
+    // MANAGED_DICT 接收者。values 形按共享键 hint 自验证定槽（覆写
+    // 与插入均汇入共享写块——插入经 values_insert 完成插入序记录）；
+    // 物化形按字典键 hint 自验证定槽（覆写共享写块戳版本；插入经
+    // values_insert 的 x15 非零判定回落 helper）。hint 与读侧共用，
+    // helper 写侧同步刷新。
+    as_->bind(kind7_sa);
+    arch::cmp_immediate(
+        as_,
+        a64::x14,
+        kDescrOrClassVarKind - (kSplitInlineKnownOffsetKind - 1));
+    as_->b_ne(slow_path);
+    as_->ldr(
+        a64::x9,
+        arch::ptr_offset(a64::x0, kEntryDcvDescrOffset + entry_offset));
+    as_->cbz(a64::x9, slow_path);
+    as_->ldr(a64::x9, arch::ptr_offset(a64::x9, kObTypeOffset));
+    as_->ldr(a64::x9, arch::ptr_offset(a64::x9, kTpDescrSetOffset));
+    as_->cbnz(a64::x9, slow_path);
+    as_->ldr(a64::x9, arch::ptr_offset(a64::x13, kTpFlagsOffset));
+    as_->tst(a64::x9, Py_TPFLAGS_MANAGED_DICT);
+    as_->b_eq(slow_path);
+    as_->ldr(a64::x15, arch::ptr_offset(a64::x1, kValuesPreheaderOffset));
+    as_->cbz(a64::x15, k7s_materialized);
+    // values 形：共享键 hint 处 me_key==name 自验证，槽 = values+ix*8。
+    as_->ldr(a64::x12, arch::ptr_offset(a64::x13, kHtCachedKeysOffsetSa));
+    as_->cbz(a64::x12, slow_path);
+    as_->ldrb(
+        a64::w9,
+        arch::ptr_offset(a64::x12, kDkKindOffset, arch::AccessSize::k8));
+    as_->cbz(a64::w9, slow_path);
+    as_->ldr(
+        a64::x14,
+        arch::ptr_offset(a64::x0, kEntryDcvMatHintOffset + entry_offset));
+    as_->ldr(a64::x9, arch::ptr_offset(a64::x12, kDkNentriesOffset));
+    as_->cmp(a64::x14, a64::x9);
+    as_->b_hs(slow_path); // 无符号比较：负/未初始化 hint 一并拦截
+    as_->ldrb(
+        a64::w9,
+        arch::ptr_offset(
+            a64::x12, kDkLog2IndexBytesOffset, arch::AccessSize::k8));
+    as_->mov(a64::x10, 1);
+    as_->lsl(a64::x10, a64::x10, a64::x9);
+    as_->add(a64::x10, a64::x12, a64::x10);
+    arch::add_immediate(as_, a64::x10, a64::x10, kDkIndicesOffset);
+    as_->add(a64::x10, a64::x10, a64::x14, a64::lsl(4));
+    as_->ldr(a64::x9, a64::ptr(a64::x10)); // me_key
+    as_->cmp(a64::x9, a64::x2);
+    as_->b_ne(slow_path);
+    // 容量守卫：values 预头 [-1] 字节（共享键成长后 ix 可越界）。
+    as_->ldrb(
+        a64::w9,
+        arch::ptr_offset(a64::x15, -1, arch::AccessSize::k8));
+    as_->cmp(a64::x14, a64::x9);
+    as_->b_hs(slow_path);
+    as_->add(a64::x14, a64::x15, a64::x14, a64::lsl(3));
+    as_->mov(a64::x15, 0);
+    as_->b(do_store);
+    // 物化形：字典键 hint 自验证（同 kind-2 物化块惯用形）。
+    as_->bind(k7s_materialized);
+    as_->ldr(a64::x15, arch::ptr_offset(a64::x1, kDictPreheaderOffset));
+    as_->cbz(a64::x15, slow_path);
+    as_->ldr(a64::x9, arch::ptr_offset(a64::x15, kGcNextOffset));
+    as_->cbz(a64::x9, slow_path); // 未跟踪字典回落（track 语义在 helper）
+    as_->ldr(a64::x14, arch::ptr_offset(a64::x15, kMaKeysOffset));
+    as_->ldrb(
+        a64::w12,
+        arch::ptr_offset(a64::x14, kDkKindOffset, arch::AccessSize::k8));
+    as_->cbz(a64::w12, slow_path);
+    as_->ldr(
+        a64::x12,
+        arch::ptr_offset(a64::x0, kEntryDcvMatHintOffset + entry_offset));
+    as_->ldr(a64::x9, arch::ptr_offset(a64::x14, kDkNentriesOffset));
+    as_->cmp(a64::x12, a64::x9);
+    as_->b_hs(slow_path);
+    as_->ldrb(
+        a64::w9,
+        arch::ptr_offset(
+            a64::x14, kDkLog2IndexBytesOffset, arch::AccessSize::k8));
+    as_->mov(a64::x10, 1);
+    as_->lsl(a64::x10, a64::x10, a64::x9);
+    as_->add(a64::x10, a64::x14, a64::x10);
+    arch::add_immediate(as_, a64::x10, a64::x10, kDkIndicesOffset);
+    as_->add(a64::x10, a64::x10, a64::x12, a64::lsl(4));
+    as_->ldr(a64::x9, a64::ptr(a64::x10)); // me_key
+    as_->cmp(a64::x9, a64::x2);
+    as_->b_ne(slow_path);
+    as_->ldr(a64::x14, arch::ptr_offset(a64::x15, kMaValuesOffset));
+    as_->cbz(a64::x14, k7s_combined);
+    // split 包装容量守卫（共享键成长后 hint 可越界）。
+    as_->ldrb(
+        a64::w9,
+        arch::ptr_offset(a64::x14, -1, arch::AccessSize::k8));
+    as_->cmp(a64::x12, a64::x9);
+    as_->b_hs(slow_path);
+    as_->add(a64::x14, a64::x14, a64::x12, a64::lsl(3)); // split 包装
+    as_->b(do_store);
+    as_->bind(k7s_combined);
     arch::add_immediate(as_, a64::x14, a64::x10, 8); // ep->me_value
     as_->b(do_store);
   };

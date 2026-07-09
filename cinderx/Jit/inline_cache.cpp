@@ -617,6 +617,55 @@ static PyObject* ci_peek_instance_attr_311(PyObject* obj, PyObject* name) {
   return ci_peek_instance_attr_hinted_311(obj, name, &hint);
 }
 
+// values 形槽位写入（覆写与插入，镜像 stock STORE_ATTR_INSTANCE_VALUE
+// 两分支）。返回 0 成功；-1 表示插入超容量，调用方回落通用协议
+// （stock 同点物化）。ix 须已通过容量守卫。
+static inline int ci_values_slot_store_311(
+    PyDictValues* values,
+    Py_ssize_t ix,
+    PyObject* value) {
+  PyObject* old = values->values[ix];
+  if (old != nullptr) {
+    Py_INCREF(value);
+    values->values[ix] = value;
+    Py_DECREF(old);
+    return 0;
+  }
+  uint8_t* size_ptr = reinterpret_cast<uint8_t*>(values) - 2;
+  int size = *size_ptr;
+  if (size + 2 < reinterpret_cast<uint8_t*>(values)[-1]) {
+    size++;
+    size_ptr[-size] = static_cast<uint8_t>(ix);
+    *size_ptr = size;
+    Py_INCREF(value);
+    values->values[ix] = value;
+    return 0;
+  }
+  return -1;
+}
+
+// 物化实例字典的槽位覆写（GC 跟踪保障 + PEP 509 版本戳，镜像 stock
+// STORE_ATTR_WITH_HINT 的 old 非空路径）。返回 0 成功；-1 表示槽空
+// （插入），调用方回落通用协议。
+static inline int ci_mat_dict_slot_store_311(
+    PyDictObject* dict,
+    PyObject** slot,
+    PyObject* value) {
+  PyObject* old = *slot;
+  if (old == nullptr) {
+    return -1;
+  }
+  if (!_PyObject_GC_IS_TRACKED(reinterpret_cast<PyObject*>(dict)) &&
+      _PyObject_GC_MAY_BE_TRACKED(value)) {
+    PyObject_GC_Track(reinterpret_cast<PyObject*>(dict));
+  }
+  Py_INCREF(value);
+  *slot = value;
+  dict->ma_version_tag = ++ci_pydict_global_version_shadow;
+  Py_DECREF(old);
+  return 0;
+}
+
 // 3.11 写侧覆写快路径（IC 计数轮：richards/raytrace 每窗口数百万次
 // STORE_ATTR 全部落在既有值槽覆写）。等价于 stock
 // STORE_ATTR_INSTANCE_VALUE 的 old != NULL 分支：values 形态实例无
@@ -838,6 +887,47 @@ int DescrOrClassVarMutator::setAttr(
     auto descr_guard = Ref<>::create(descr);
     return setter(descr, obj, value);
   }
+#if PY_VERSION_HEX < 0x030C0000
+  // 非数据描述符的实例字典遮蔽写，按 stock GenericSetAttr 次序：
+  // values 形先走 StoreInstanceAttribute 等价路径，保持 split 形态。
+  // 原实现先调 _PyObject_GetDictPtr——其对 values 形实例有物化副作用
+  // （stock 同位点不物化），首次遮蔽写即把接收者打成物化形，损伤
+  // 后续读写快路径形态。hint 与读侧共用（values 形对共享键、物化形
+  // 对字典键，me_key 自验证两态迁移安全）。
+  PyTypeObject* tp = Py_TYPE(obj);
+  if (PyType_HasFeature(tp, Py_TPFLAGS_MANAGED_DICT)) {
+    PyDictValues* values = ci_inline_values_311(obj);
+    if (values != nullptr) {
+      PyHeapTypeObject* ht = reinterpret_cast<PyHeapTypeObject*>(tp);
+      PyDictKeysObject* dk = ht->ht_cached_keys;
+      if (dk != nullptr && DK_IS_UNICODE(dk)) {
+        Py_ssize_t ix = ci_hinted_keys_index_311(dk, name, &mat_hint);
+        if (ix >= 0 && ci_split_values_in_capacity_311(values, ix) &&
+            ci_values_slot_store_311(values, ix, value) == 0) {
+          return 0;
+        }
+      }
+      // 名字不在共享键/超容量：回落通用协议（stock 同点物化）。
+    } else {
+      PyDictObject* dict = ci_managed_dict_311(obj);
+      if (dict != nullptr && DK_IS_UNICODE(dict->ma_keys)) {
+        Py_ssize_t ix =
+            ci_hinted_keys_index_311(dict->ma_keys, name, &mat_hint);
+        if (ix >= 0 &&
+            (dict->ma_values == nullptr ||
+             ci_split_values_in_capacity_311(dict->ma_values, ix))) {
+          PyObject** slot = dict->ma_values != nullptr
+              ? &dict->ma_values->values[ix]
+              : &DK_UNICODE_ENTRIES(dict->ma_keys)[ix].me_value;
+          if (ci_mat_dict_slot_store_311(dict, slot, value) == 0) {
+            return 0;
+          }
+        }
+      }
+      // 插入/hint 未决：回落通用协议。
+    }
+  }
+#endif
   PyObject** dictptr = _PyObject_GetDictPtr(obj);
   if (dictptr == nullptr) {
     PyErr_Format(
@@ -1254,6 +1344,7 @@ int StoreAttrCache::doInvoke(PyObject* obj, PyObject* name, PyObject* value) {
     }
     if (entry.matches(tp)) {
       incICStat(g_ic_runtime_stats.sa_entry_hit);
+      incICStat(g_ic_runtime_stats.sa_hit_kind[entry.kindBits()]);
       return entry.setAttr(obj, name, value);
     }
     // 类型指针相同但版本失效：该条目不可能再次命中（版本号单调递增），

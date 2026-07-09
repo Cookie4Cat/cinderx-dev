@@ -86,6 +86,46 @@ def main():
         set_cba(o)
         assert vars(o) == {"c": 30, "b": 20, "a": 10}, vars(o)
 
+    # ⑦ kind-7 遮蔽写（非数据描述符位点的实例字典写）。
+    class Memo:
+        def __get__(self, obj, owner=None):
+            if obj is None:
+                return self
+            val = obj.base * 10
+            obj.cached = val  # 遮蔽写位点（kind-7 store）
+            return val
+
+    class Q:
+        cached = Memo()
+
+        def __init__(self, base):
+            self.base = base
+
+    def touch(q):
+        q.cached = q.cached + 1  # 读（描述符/遮蔽）+ 遮蔽覆写
+        return q.cached
+
+    # 预热：位点编译 + 条目定型。
+    for i in range(64):
+        q = Q(i)
+        touch(q)
+    # values 形遮蔽写：首写为插入、再写为覆写；描述符本体不受扰动。
+    q = Q(7)
+    assert touch(q) == 71
+    assert q.cached == 71
+    assert touch(q) == 72
+    assert type(Q.__dict__["cached"]) is Memo
+    # 删除遮蔽后描述符复现，再写重建遮蔽。
+    del q.cached
+    assert q.cached == 70  # __get__ 重新缓存
+    q.cached = 5
+    assert q.cached == 5
+    # 物化后的遮蔽覆写。
+    vars(q)
+    q.cached = 9
+    assert q.cached == 9
+    assert vars(q)["cached"] == 9
+
     print("OK smoke_store_insert")
     return 0
 
