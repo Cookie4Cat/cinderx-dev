@@ -457,6 +457,8 @@ struct ICRuntimeStats {
   std::atomic<uint64_t> lm_fill{0};
   std::atomic<uint64_t> sa_invoke{0};
   std::atomic<uint64_t> sa_entry_hit{0};
+  // 写侧条目命中的 kind 直方图（诊断用，与 la_hit_kind 同构）
+  std::atomic<uint64_t> sa_hit_kind[8] = {};
   std::atomic<uint64_t> sa_slow{0};
   // 写侧 helper 分型（插入形轮）：values 覆写/values 插入/物化覆写/
   // 通用协议回退，用于定位 stub 漏接的形态构成。

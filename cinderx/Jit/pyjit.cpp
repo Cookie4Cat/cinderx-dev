@@ -3416,6 +3416,10 @@ PyObject* get_and_clear_inline_cache_stats(PyObject* /* self */, PyObject*) {
     set_counter("lm_fill", take(s.lm_fill));
     set_counter("sa_invoke", take(s.sa_invoke));
     set_counter("sa_entry_hit", take(s.sa_entry_hit));
+    for (size_t k = 0; k < 8; k++) {
+      set_counter(
+          fmt::format("sa_hit_kind_{}", k).c_str(), take(s.sa_hit_kind[k]));
+    }
     set_counter("sa_slow", take(s.sa_slow));
     set_counter("sa_values_overwrite", take(s.sa_values_overwrite));
     set_counter("sa_values_insert", take(s.sa_values_insert));
