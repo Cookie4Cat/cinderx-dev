@@ -2188,9 +2188,15 @@ void NativeGenerator::emitAarch64StoreAttrInvokeStub(
   // 顺序镜像 stock：新值先入槽再减旧值（旧值 refcnt≥2 已保证不触发
   // dealloc）；物化路径最后戳 ma_version_tag（[P2] 影子发号器，
   // Ci_InitOpcodes 播种，语义同 DICT_NEXT_VERSION）。
+  // 插入（old==NULL）：values 形转行内插入（镜像 helper
+  // SplitMutator::setAttr 插入分支 / stock STORE_ATTR_INSTANCE_VALUE
+  // 的 old==NULL 路径——槽写入 + 插入序字节记录，无版本戳无 GC
+  // 跟踪对象）；物化形插入涉 ma_used/插入序/resize，维持回落
+  // （stock STORE_ATTR_WITH_HINT 对插入同样 DEOPT，系 parity）。
+  Label values_insert = as_->newLabel();
   as_->bind(do_store);
   as_->ldr(a64::x9, a64::ptr(a64::x14)); // old
-  as_->cbz(a64::x9, slow_path);          // 插入回落
+  as_->cbz(a64::x9, values_insert);
   as_->ldr(a64::x12, arch::ptr_offset(a64::x9, kRefcountOffset));
   arch::cmp_immediate(as_, a64::x12, 2);
   as_->b_lt(slow_path);                  // dealloc 路径回落
@@ -2216,6 +2222,36 @@ void NativeGenerator::emitAarch64StoreAttrInvokeStub(
   as_->bind(ret_zero);
   as_->mov(a64::w0, 0);
   as_->ret(arch::lr);
+
+  // values 形行内插入。x14=槽地址（values + ix*8），x15 恒为 0（进入
+  // do_store 前 values 支路置 0，物化支路持字典指针）；values 基址与
+  // 下标经 x1 预头槽与槽地址差回算。容量判据与 helper 同式
+  // （size+2 < capacity，越界回落 helper 走通用协议物化）；插入序
+  // 字节位于 values-2-新size（vendored 3.11.6 预头布局，与 helper
+  // 逐字同构）。
+  as_->bind(values_insert);
+  as_->cbnz(a64::x15, slow_path); // 物化形插入回落
+  as_->ldr(a64::x10, arch::ptr_offset(a64::x1, kValuesPreheaderOffset));
+  as_->sub(a64::x12, a64::x14, a64::x10);
+  as_->lsr(a64::x12, a64::x12, 3); // ix = val_offset
+  as_->ldrb(
+      a64::w9, arch::ptr_offset(a64::x10, -2, arch::AccessSize::k8));
+  as_->ldrb(
+      a64::w11, arch::ptr_offset(a64::x10, -1, arch::AccessSize::k8));
+  as_->add(a64::w13, a64::w9, 2);
+  as_->cmp(a64::w13, a64::w11);
+  as_->b_hs(slow_path); // size+2 >= capacity → helper
+  as_->add(a64::w9, a64::w9, 1); // 新 size（32 位运算高位清零）
+  as_->sub(a64::x11, a64::x10, a64::x9);
+  as_->strb(
+      a64::w12, arch::ptr_offset(a64::x11, -2, arch::AccessSize::k8));
+  as_->strb(
+      a64::w9, arch::ptr_offset(a64::x10, -2, arch::AccessSize::k8));
+  as_->ldr(a64::x10, arch::ptr_offset(a64::x3, kRefcountOffset));
+  arch::add_immediate(as_, a64::x10, a64::x10, 1);
+  as_->str(a64::x10, arch::ptr_offset(a64::x3, kRefcountOffset));
+  as_->str(a64::x3, a64::ptr(a64::x14));
+  as_->b(ret_zero);
 
   as_->bind(slow_path);
   if (getConfig().ic_pressure_ratio > 0) {

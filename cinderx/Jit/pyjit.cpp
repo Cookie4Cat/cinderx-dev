@@ -3417,6 +3417,10 @@ PyObject* get_and_clear_inline_cache_stats(PyObject* /* self */, PyObject*) {
     set_counter("sa_invoke", take(s.sa_invoke));
     set_counter("sa_entry_hit", take(s.sa_entry_hit));
     set_counter("sa_slow", take(s.sa_slow));
+    set_counter("sa_values_overwrite", take(s.sa_values_overwrite));
+    set_counter("sa_values_insert", take(s.sa_values_insert));
+    set_counter("sa_mat_overwrite", take(s.sa_mat_overwrite));
+    set_counter("sa_generic_fallback", take(s.sa_generic_fallback));
   }
 
   // la_slow 站点归属直方图（读出即清零）。

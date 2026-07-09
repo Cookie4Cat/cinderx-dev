@@ -630,6 +630,7 @@ int SplitMutator::setAttr(PyObject* obj, PyObject* name, PyObject* value) {
     if (values != nullptr) {
       PyObject* old = values->values[val_offset];
       if (old != nullptr) {
+        incICStat(g_ic_runtime_stats.sa_values_overwrite);
         Py_INCREF(value);
         values->values[val_offset] = value;
         Py_DECREF(old);
@@ -644,6 +645,7 @@ int SplitMutator::setAttr(PyObject* obj, PyObject* name, PyObject* value) {
       uint8_t* size_ptr = reinterpret_cast<uint8_t*>(values) - 2;
       int size = *size_ptr;
       if (size + 2 < reinterpret_cast<uint8_t*>(values)[-1]) {
+        incICStat(g_ic_runtime_stats.sa_values_insert);
         size++;
         size_ptr[-size] = static_cast<uint8_t>(val_offset);
         *size_ptr = size;
@@ -668,6 +670,7 @@ int SplitMutator::setAttr(PyObject* obj, PyObject* name, PyObject* value) {
             : &DK_UNICODE_ENTRIES(dict->ma_keys)[ix].me_value;
         PyObject* old = *slot;
         if (old != nullptr) {
+          incICStat(g_ic_runtime_stats.sa_mat_overwrite);
           if (!_PyObject_GC_IS_TRACKED(reinterpret_cast<PyObject*>(dict)) &&
               _PyObject_GC_MAY_BE_TRACKED(value)) {
             PyObject_GC_Track(reinterpret_cast<PyObject*>(dict));
@@ -681,6 +684,7 @@ int SplitMutator::setAttr(PyObject* obj, PyObject* name, PyObject* value) {
       }
     }
   }
+  incICStat(g_ic_runtime_stats.sa_generic_fallback);
   return PyObject_SetAttr(obj, name, value);
 }
 
