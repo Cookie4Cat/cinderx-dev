@@ -4266,6 +4266,10 @@ LIRGenerator::TranslatedBlock LIRGenerator::TranslateOneBasicBlock(
         // Snapshots are purely informative
         break;
       }
+      case Opcode::kUseObj: {
+        // UseObjs are purely informative.
+        break;
+      }
       case Opcode::kUseType: {
         // UseTypes are purely informative
         break;
