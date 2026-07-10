@@ -761,6 +761,107 @@ bool hasArraySubscrFastPathEvidence(
   return container->isA(array_guard) || sub->isA(TLongExact);
 }
 
+Register*
+checkConstantListOrTupleIndex(Env& env, Register* container, Register* index) {
+  int overflow;
+  Py_ssize_t index_val =
+      PyLong_AsLongAndOverflow(index->type().objectSpec(), &overflow);
+  if (overflow) {
+    return nullptr;
+  }
+
+  if (container->isA(TTupleExact) && container->instr()->IsMakeTuple()) {
+    size_t length =
+        static_cast<const MakeTuple*>(container->instr())->nvalues();
+    if (index_val < 0) {
+      index_val += length;
+    }
+    if (static_cast<size_t>(index_val) < length) {
+      env.emit<UseType>(container, container->type());
+      env.emit<UseType>(index, index->type());
+      return env.emit<LoadConst>(Type::fromCInt(index_val, TCInt64));
+    }
+    return nullptr;
+  }
+
+  env.emit<UseType>(container, container->type());
+  env.emit<UseType>(index, index->type());
+
+  Register* length = emitGetLengthInt64(env, container);
+  if (index_val < 0) {
+    Register* tmp = env.emit<LoadConst>(Type::fromCInt(index_val, TCInt64));
+    index = env.emit<IntBinaryOp>(BinaryOpKind::kAdd, tmp, length);
+  } else {
+    index = env.emit<LoadConst>(Type::fromCInt(index_val, TCInt64));
+  }
+  // Unsigned comparison rejects too-large positive indices and normalized
+  // indices that remain negative (for example len=3, index=-4).
+  Register* in_bounds = env.emit<PrimitiveCompare>(
+      PrimitiveCompareOp::kLessThanUnsigned, index, length);
+  env.emit<Guard>(in_bounds);
+  return index;
+}
+
+Register* unboxAndCheckListOrTupleIndex(
+    Env& env,
+    const DeoptBase* instr,
+    Register* container,
+    Register* index) {
+  JIT_CHECK(
+      container->isA(TListExact) || container->isA(TTupleExact),
+      "container must be a TListExact or TTupleExact, not a {}",
+      container->type());
+  JIT_CHECK(
+      index->isA(TLongExact),
+      "index must be a TLongExact, not a {}",
+      index->type());
+  JIT_CHECK(!kFreeThreadedBuild, "only valid for the default build");
+
+  if (index->type().hasObjectSpec()) {
+    return checkConstantListOrTupleIndex(env, container, index);
+  }
+
+  env.emit<UseType>(
+      container, container->isA(TListExact) ? TListExact : TTupleExact);
+  env.emit<UseType>(index, TLongExact);
+
+  Register* is_compact_long = env.emit<IsCompactLong>(index);
+  env.emit<Guard>(is_compact_long);
+  Register* unboxed_index = env.emit<CompactLongUnbox>(index);
+
+  Register* length = emitGetLengthInt64(env, container);
+  Register* zero = env.emit<LoadConst>(Type::fromCInt(0, TCInt64));
+  Register* is_negative = env.emit<PrimitiveCompare>(
+      PrimitiveCompareOp::kLessThan, unboxed_index, zero);
+
+  // Capture state before emitCond splits the block. Some HIR shapes have no
+  // separately dominating Snapshot, so use the instruction's own FrameState
+  // as the safe replay point in that case.
+  const FrameState* dominating_fs = instr->getDominatingFrameState();
+  if (dominating_fs == nullptr) {
+    dominating_fs = instr->frameState();
+  }
+  JIT_CHECK(
+      dominating_fs != nullptr,
+      "no FrameState available for list/tuple index bounds check");
+
+  Register* normalized_index = env.emitCond(
+      [&](BasicBlock* true_bb, BasicBlock* false_bb) {
+        env.emit<CondBranch>(is_negative, true_bb, false_bb);
+      },
+      [&] {
+        return env.emit<IntBinaryOp>(
+            BinaryOpKind::kAdd, unboxed_index, length);
+      },
+      [&] { return unboxed_index; });
+
+  env.emit<Snapshot>(*dominating_fs);
+  Register* in_bounds = env.emit<PrimitiveCompare>(
+      PrimitiveCompareOp::kLessThanUnsigned, normalized_index, length);
+  env.emit<Guard>(in_bounds);
+  return normalized_index;
+}
+
 // Emit the array.array('d') BINARY_SUBSCR fast path. When the container's
 // static type is already array.array, or the index is already known to be a
 // Python int, speculatively guard on array.array('d') and lower the load to an
@@ -903,17 +1004,11 @@ Register* simplifySubscript(
   // TODO(T255264263). Enable this again. See P2169673256.
   if (!kFreeThreadedBuild) {
     if (lhs->isA(TListExact) || lhs->isA(TTupleExact)) {
-      env.emit<UseType>(lhs, lhs->isA(TListExact) ? TListExact : TTupleExact);
-      env.emit<UseType>(rhs, TLongExact);
-
-      // C4: Replace IndexUnbox + IsNegativeAndErrOccurred with
-      // IsCompactLong + Guard + CompactLongUnbox
-      Register* is_compact = env.emit<IsCompactLong>(rhs);
-      env.emitInstr<Guard>(is_compact, *frame_state);
-      Register* unboxed_idx = env.emit<CompactLongUnbox>(rhs);
-
       Register* adjusted_idx =
-          env.emit<CheckSequenceBounds>(lhs, unboxed_idx, *frame_state);
+          unboxAndCheckListOrTupleIndex(env, instr, lhs, rhs);
+      if (adjusted_idx == nullptr) {
+        return nullptr;
+      }
       Py_ssize_t offset = offsetof(PyTupleObject, ob_item);
       Register* array = lhs;
       // Lists carry a nested array of ob_item whereas tuples are variable-sized
@@ -2451,31 +2546,33 @@ Register* simplifyStoreSubscr(Env& env, const StoreSubscr* instr) {
     return nullptr;
   }
 
-  // C3: Add STORE_SUBSCR_LIST_INT fast path (C4: compact long unbox)
+  // C3/C4/C5: direct list[int] store with compact-index unboxing and inlined
+  // negative-index normalization/bounds checking.
   if (!kFreeThreadedBuild &&
       instr->GetOperand(0)->isA(TListExact) &&
       instr->GetOperand(1)->isA(TLongExact)) {
-    env.emit<UseType>(instr->GetOperand(0), TListExact);
-    env.emit<UseType>(instr->GetOperand(1), TLongExact);
-
-    // C4: IsCompactLong + Guard + CompactLongUnbox
-    Register* is_compact = env.emit<IsCompactLong>(instr->GetOperand(1));
-    env.emitInstr<Guard>(is_compact, *instr->frameState());
-    Register* unboxed_idx = env.emit<CompactLongUnbox>(instr->GetOperand(1));
-
+    Register* container = instr->GetOperand(0);
+    Register* index = instr->GetOperand(1);
+    Register* value = instr->GetOperand(2);
     Register* adjusted_idx =
-        env.emit<CheckSequenceBounds>(
-            instr->GetOperand(0), unboxed_idx, *instr->frameState());
+        unboxAndCheckListOrTupleIndex(env, instr, container, index);
+    if (adjusted_idx == nullptr) {
+      return nullptr;
+    }
 
-    // Load old value, incref to keep alive, store new value, then decref old
     Register* ob_item = env.emit<LoadField>(
-        instr->GetOperand(0),
+        container,
         "ob_item",
         offsetof(PyListObject, ob_item),
         TCPtr);
-    env.emitInstr<StoreArrayItem>(
-        ob_item, adjusted_idx, instr->GetOperand(2),
-        instr->GetOperand(0), TObject);
+    // Transfer the slot's old owned reference into HIR, overwrite the slot,
+    // then keep the old object alive until the write is complete. Refcount
+    // insertion will place the old-value decref after UseObj.
+    Register* old_value = env.emit<LoadArrayItem>(
+        ob_item, adjusted_idx, container, 0, TObject, false);
+    env.emit<StoreArrayItem>(ob_item, adjusted_idx, value, container, TObject);
+    env.emit<UseObj>(old_value);
+    env.optimized = true;
     return nullptr;
   }
 

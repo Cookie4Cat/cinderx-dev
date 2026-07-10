@@ -2470,8 +2470,7 @@ void HIRBuilder::emitLoadIterableArg(
     CFG& cfg,
     TranslationContext& tc,
     const jit::BytecodeInstruction& bc_instr) {
-  auto iterable = tc.frame.stack.pop();
-  Register* tuple;
+  auto iterable = tc.frame.stack.top();
   if (iterable->type() != TTupleExact) {
     TranslationContext tuple_path{cfg.AllocateBlock(), tc.frame};
     tuple_path.emitSnapshot();
@@ -2480,19 +2479,18 @@ void HIRBuilder::emitLoadIterableArg(
     tc.emit<CondBranchCheckType>(
         iterable, TTuple, tuple_path.block, non_tuple_path.block);
     tc.block = cfg.AllocateBlock();
+    Register* tuple = temps_.AllocateStack();
+    tc.frame.stack.topPut(0, tuple);
     tc.emitSnapshot();
-
-    tuple = temps_.AllocateStack();
 
     tuple_path.emit<Assign>(tuple, iterable);
     tuple_path.emit<Branch>(tc.block);
 
-    non_tuple_path.emit<GetTuple>(tuple, iterable, tc.frame);
+    non_tuple_path.emit<GetTuple>(tuple, iterable, non_tuple_path.frame);
     non_tuple_path.emit<Branch>(tc.block);
-  } else {
-    tuple = iterable;
   }
 
+  auto tuple = tc.frame.stack.pop();
   auto tmp = temps_.AllocateStack();
   auto tup_idx = temps_.AllocateStack();
   auto element = temps_.AllocateStack();
@@ -4574,9 +4572,15 @@ void HIRBuilder::emitStoreSubscr(
   Register* container = stack.pop();
   Register* value = stack.pop();
 
+  int specialized_opcode = -1;
+  if (getConfig().specialized_opcodes) {
+    specialized_opcode = bc_instr.specializedOpcode();
+  }
+
   // Fast path for array.array('d') store
   if (getConfig().specialized_opcodes &&
-      bc_instr.specializedOpcode() != STORE_SUBSCR_DICT) {
+      specialized_opcode != STORE_SUBSCR_DICT &&
+      specialized_opcode != STORE_SUBSCR_LIST_INT) {
     auto* array_type = getStdlibArrayType();
     if (array_type != nullptr) {
       Type array_type_guard = Type::fromTypeExact(array_type);
@@ -4610,9 +4614,13 @@ void HIRBuilder::emitStoreSubscr(
     }
   }
 
-  if (getConfig().specialized_opcodes &&
-      bc_instr.specializedOpcode() == STORE_SUBSCR_DICT) {
-    tc.emit<GuardType>(container, TDictExact, container, tc.frame);
+  if (getConfig().specialized_opcodes) {
+    if (specialized_opcode == STORE_SUBSCR_DICT) {
+      tc.emit<GuardType>(container, TDictExact, container, tc.frame);
+    } else if (specialized_opcode == STORE_SUBSCR_LIST_INT) {
+      tc.emit<GuardType>(container, TListExact, container, tc.frame);
+      tc.emit<GuardType>(sub, TLongExact, sub, tc.frame);
+    }
   }
 
   tc.emit<StoreSubscr>(container, sub, value, tc.frame);
