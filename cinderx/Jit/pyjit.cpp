@@ -1381,6 +1381,13 @@ FlagProcessor initFlagProcessor() {
       "default, resume ceremony dominates trivial bodies).");
 
   flag_processor.addOption(
+      "jit-shared-attr-stubs",
+      "PYTHONJITSHAREDATTRSTUBS",
+      getMutableConfig().shared_attr_stubs,
+      "Share one process-wide copy of the aarch64 attribute-cache stubs "
+      "across compiled functions (3.11).");
+
+  flag_processor.addOption(
       "jit-fresh-attach-budget",
       "PYTHONJITFRESHATTACHBUDGET",
       getMutableConfig().fresh_attach_budget,

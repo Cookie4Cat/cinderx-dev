@@ -244,12 +244,23 @@ class AttributeCache {
     return offsetof(AttributeCache, entries_);
   }
 
+  // 共享桩前置（桩共享轮）：slow 尾的 IC 压力计数地址由发射期烘焙
+  // 迁为 cache 字段——桩经 x0=cache 取得，发射体不再 per-code。
+  static constexpr size_t pressureSlotOffset() {
+    return offsetof(AttributeCache, pressure_slot_);
+  }
+  void setPressureSlot(uint64_t* slot) {
+    pressure_slot_ = slot;
+  }
+
  protected:
   std::span<AttributeMutator> entries() {
     return {entries_, getConfig().attr_cache_size};
   }
 
   AttributeMutator* findEmptyEntry();
+
+  uint64_t* pressure_slot_{nullptr};
 
   void fill(BorrowedRef<PyTypeObject> type, BorrowedRef<> name);
 
@@ -520,6 +531,9 @@ class LoadMethodCache {
   static constexpr size_t numEntries() {
     return 4;
   }
+  static constexpr size_t pressureSlotOffset() {
+    return offsetof(LoadMethodCache, pressure_slot_);
+  }
 #endif
 
   ~LoadMethodCache();
@@ -540,6 +554,14 @@ class LoadMethodCache {
 
   std::array<Entry, 4> entries_;
   std::unique_ptr<CacheStats> cache_stats_;
+
+ public:
+  void setPressureSlot(uint64_t* slot) {
+    pressure_slot_ = slot;
+  }
+
+ private:
+  uint64_t* pressure_slot_{nullptr};
 #if PY_VERSION_HEX < 0x030C0000
   // 类型接收者委托缓存（劣化归因轮 C1）：通用条目按 Py_TYPE(obj)
   //（元类型）键控，慢路径又因 type_getattro ≠ GenericGetAttr 早退

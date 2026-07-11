@@ -358,6 +358,23 @@ class Context : public IJitContext, public CompiledFunctionOwner {
 
   // Allocate a new attribute cache.
   LoadAttrCache* allocateLoadAttrCache();
+
+  // 进程级共享 attr 桩登记（桩共享轮）。三槽 = la/lm/sa。代码页由
+  // bump 分配器进程级常驻，裸地址终身有效，无需钉宿主。发布仅一次
+  //（首个发射完整桩体的函数），其后读者取址发射跳板。
+  enum SharedAttrStub : size_t {
+    kSharedStubLoadAttr = 0,
+    kSharedStubLoadMethod = 1,
+    kSharedStubStoreAttr = 2,
+  };
+  uint64_t sharedAttrStub(size_t which) const {
+    return shared_attr_stubs_[which].load(std::memory_order_acquire);
+  }
+  void maybePublishSharedAttrStub(size_t which, uint64_t addr) {
+    uint64_t expected = 0;
+    shared_attr_stubs_[which].compare_exchange_strong(
+        expected, addr, std::memory_order_release);
+  }
   LoadTypeAttrCache* allocateLoadTypeAttrCache();
   LoadMethodCache* allocateLoadMethodCache();
   LoadModuleAttrCache* allocateLoadModuleAttrCache();
@@ -503,6 +520,8 @@ class Context : public IJitContext, public CompiledFunctionOwner {
    * builtins and globals objects.
    */
   UnorderedMap<CompilationKey, BorrowedRef<CompiledFunction>> compiled_codes_;
+
+  std::array<std::atomic<uint64_t>, 3> shared_attr_stubs_{};
 
   /* Set of which functions have JIT-compiled entrypoints. */
   UnorderedMap<BorrowedRef<PyFunctionObject>, BorrowedRef<CompiledFunction>>

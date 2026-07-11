@@ -1410,6 +1410,18 @@ void NativeGenerator::emitAarch64LoadMethodInvokeStub(
 
   ASM_CHECK(as_->align(AlignMode::kCode, 8), GetFunction()->fullname);
   as_->bind(env_.load_method_invoke_stub);
+  // 共享桩跳板（桩共享轮）：Context 已有本家族共享桩地址时,本函数只
+  // 发射一次绝对跳转,完整桩体由首个函数发射并登记。
+  if (getConfig().shared_attr_stubs && getContext() != nullptr) {
+    if (uint64_t shared =
+            getContext()->sharedAttrStub(Context::kSharedStubLoadMethod)) {
+      as_->mov(arch::reg_scratch_br, shared);
+      as_->br(arch::reg_scratch_br);
+      return;
+    }
+  }
+  env_.emitted_full_lm_stub = true;
+
 
   // x0=cache, x1=obj, x2=name
   if (getConfig().collect_attr_cache_stats) {
@@ -1492,16 +1504,17 @@ void NativeGenerator::emitAarch64LoadMethodInvokeStub(
   as_->bind(slow_path);
   if (getConfig().ic_pressure_ratio > 0) {
     // IC 压力密度（go 三件套③）：慢路径进入计数直增本 code 的
-    // CodeExtra 槽（发射期烘焙地址），入口包装器按调用窗裁决。
-    if (CodeExtra* extra = codeExtra(GetFunction()->code)) {
-      // LSE stadd：单指令内存原子加，免 load-use 停顿（miss 密集而
-      // 密度未超阈的负载不为计数额外买单）。
-      as_->mov(
-          a64::x9,
-          reinterpret_cast<uint64_t>(&extra->ic_slow_pressure));
-      as_->mov(a64::x10, 1);
-      as_->stadd(a64::x10, a64::ptr(a64::x9));
-    }
+    // CodeExtra 槽。地址自 cache 字段取（共享桩前置：发射体不再
+    // per-code），分配注入见 lir/generator.cpp；槽空跳过。
+    Label no_pressure_slot = as_->newLabel();
+    as_->ldr(
+        a64::x9,
+        arch::ptr_offset(a64::x0, static_cast<int>(jit::LoadMethodCache::pressureSlotOffset())));
+    as_->cbz(a64::x9, no_pressure_slot);
+    // LSE stadd：单指令内存原子加，免 load-use 停顿。
+    as_->mov(a64::x10, 1);
+    as_->stadd(a64::x10, a64::ptr(a64::x9));
+    as_->bind(no_pressure_slot);
   }
   as_->mov(
       arch::reg_scratch_br,
@@ -1612,6 +1625,18 @@ void NativeGenerator::emitAarch64LoadAttrInvokeStub(
 
   ASM_CHECK(as_->align(AlignMode::kCode, 8), GetFunction()->fullname);
   as_->bind(env_.load_attr_invoke_stub);
+  // 共享桩跳板（桩共享轮）：Context 已有本家族共享桩地址时,本函数只
+  // 发射一次绝对跳转,完整桩体由首个函数发射并登记。
+  if (getConfig().shared_attr_stubs && getContext() != nullptr) {
+    if (uint64_t shared =
+            getContext()->sharedAttrStub(Context::kSharedStubLoadAttr)) {
+      as_->mov(arch::reg_scratch_br, shared);
+      as_->br(arch::reg_scratch_br);
+      return;
+    }
+  }
+  env_.emitted_full_la_stub = true;
+
 
   // x0=cache, x1=obj, x2=name
   if (getConfig().collect_attr_cache_stats) {
@@ -1975,16 +2000,17 @@ void NativeGenerator::emitAarch64LoadAttrInvokeStub(
   as_->bind(slow_path);
   if (getConfig().ic_pressure_ratio > 0) {
     // IC 压力密度（go 三件套③）：慢路径进入计数直增本 code 的
-    // CodeExtra 槽（发射期烘焙地址），入口包装器按调用窗裁决。
-    if (CodeExtra* extra = codeExtra(GetFunction()->code)) {
-      // LSE stadd：单指令内存原子加，免 load-use 停顿（miss 密集而
-      // 密度未超阈的负载不为计数额外买单）。
-      as_->mov(
-          a64::x9,
-          reinterpret_cast<uint64_t>(&extra->ic_slow_pressure));
-      as_->mov(a64::x10, 1);
-      as_->stadd(a64::x10, a64::ptr(a64::x9));
-    }
+    // CodeExtra 槽。地址自 cache 字段取（共享桩前置：发射体不再
+    // per-code），分配注入见 lir/generator.cpp；槽空跳过。
+    Label no_pressure_slot = as_->newLabel();
+    as_->ldr(
+        a64::x9,
+        arch::ptr_offset(a64::x0, static_cast<int>(jit::AttributeCache::pressureSlotOffset())));
+    as_->cbz(a64::x9, no_pressure_slot);
+    // LSE stadd：单指令内存原子加，免 load-use 停顿。
+    as_->mov(a64::x10, 1);
+    as_->stadd(a64::x10, a64::ptr(a64::x9));
+    as_->bind(no_pressure_slot);
   }
   as_->mov(
       arch::reg_scratch_br,
@@ -2067,6 +2093,18 @@ void NativeGenerator::emitAarch64StoreAttrInvokeStub(
 
   ASM_CHECK(as_->align(AlignMode::kCode, 8), GetFunction()->fullname);
   as_->bind(env_.store_attr_invoke_stub);
+  // 共享桩跳板（桩共享轮）：Context 已有本家族共享桩地址时,本函数只
+  // 发射一次绝对跳转,完整桩体由首个函数发射并登记。
+  if (getConfig().shared_attr_stubs && getContext() != nullptr) {
+    if (uint64_t shared =
+            getContext()->sharedAttrStub(Context::kSharedStubStoreAttr)) {
+      as_->mov(arch::reg_scratch_br, shared);
+      as_->br(arch::reg_scratch_br);
+      return;
+    }
+  }
+  env_.emitted_full_sa_stub = true;
+
 
   // x0=cache, x1=obj, x2=name, x3=value
   if (getConfig().collect_attr_cache_stats) {
@@ -2372,16 +2410,17 @@ void NativeGenerator::emitAarch64StoreAttrInvokeStub(
   as_->bind(slow_path);
   if (getConfig().ic_pressure_ratio > 0) {
     // IC 压力密度（go 三件套③）：慢路径进入计数直增本 code 的
-    // CodeExtra 槽（发射期烘焙地址），入口包装器按调用窗裁决。
-    if (CodeExtra* extra = codeExtra(GetFunction()->code)) {
-      // LSE stadd：单指令内存原子加，免 load-use 停顿（miss 密集而
-      // 密度未超阈的负载不为计数额外买单）。
-      as_->mov(
-          a64::x9,
-          reinterpret_cast<uint64_t>(&extra->ic_slow_pressure));
-      as_->mov(a64::x10, 1);
-      as_->stadd(a64::x10, a64::ptr(a64::x9));
-    }
+    // CodeExtra 槽。地址自 cache 字段取（共享桩前置：发射体不再
+    // per-code），分配注入见 lir/generator.cpp；槽空跳过。
+    Label no_pressure_slot = as_->newLabel();
+    as_->ldr(
+        a64::x9,
+        arch::ptr_offset(a64::x0, static_cast<int>(jit::AttributeCache::pressureSlotOffset())));
+    as_->cbz(a64::x9, no_pressure_slot);
+    // LSE stadd：单指令内存原子加，免 load-use 停顿。
+    as_->mov(a64::x10, 1);
+    as_->stadd(a64::x10, a64::ptr(a64::x9));
+    as_->bind(no_pressure_slot);
   }
   as_->mov(
       arch::reg_scratch_br,
@@ -2837,6 +2876,33 @@ void NativeGenerator::generateCode(
 #endif
 
   code_start_ = finalizeCode(*as_, GetFunction()->fullname);
+
+#if defined(CINDER_AARCH64) && !defined(Py_GIL_DISABLED) && \
+    PY_VERSION_HEX < 0x030C0000
+  // 共享桩登记（桩共享轮）：本函数发射了完整桩体的家族,把落定地址
+  // 发布到 Context（发布一次,CAS 幂等;代码页进程级常驻,无需钉宿主）。
+  if (getConfig().shared_attr_stubs && getContext() != nullptr) {
+    uint64_t stub_base = codeholder.baseAddress();
+    auto publish = [&](bool emitted, const asmjit::Label& label, size_t which) {
+      if (emitted && label.isValid()) {
+        getContext()->maybePublishSharedAttrStub(
+            which, stub_base + codeholder.labelOffsetFromBase(label));
+      }
+    };
+    publish(
+        env_.emitted_full_la_stub,
+        env_.load_attr_invoke_stub,
+        Context::kSharedStubLoadAttr);
+    publish(
+        env_.emitted_full_lm_stub,
+        env_.load_method_invoke_stub,
+        Context::kSharedStubLoadMethod);
+    publish(
+        env_.emitted_full_sa_stub,
+        env_.store_attr_invoke_stub,
+        Context::kSharedStubStoreAttr);
+  }
+#endif
 
   // ------------- code_start_
   // ^

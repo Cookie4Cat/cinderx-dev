@@ -252,6 +252,10 @@ struct Config {
   // 新鲜函数对象全簿记挂接的每 code 预算（挂接断链轮）：稳定小实例集
   // 全额受益，海量翻新闭包的挂接税由此封顶。0 关闭挂接。
   size_t fresh_attach_budget{8};
+  // 进程级共享 attr 桩（桩共享轮）：la/lm/sa 内联桩由首个发射完整桩体
+  // 的函数登记，其后函数以 8 字节级跳板复用——每函数桩开销 2-3KB →
+  // 数十字节，宽热面负载的指令缓存足迹随之收敛。
+  bool shared_attr_stubs{true};
   // Enable AutoJIT behavior classification for PYTHONJITAUTO=auto[:N]. Plain
   // numeric PYTHONJITAUTO and Python APIs keep this disabled.
   bool auto_classify{false};
