@@ -2859,6 +2859,13 @@ LIRGenerator::TranslatedBlock LIRGenerator::TranslateOneBasicBlock(
         hir::Register* base = instr->GetOperand(0);
         Instruction* name = getNameFromIdx(bbb, instr);
         auto cache = getContext()->allocateLoadAttrCache();
+        if (func_->code != nullptr) {
+          // 共享桩前置：压力计数地址挂 cache（unit 测试直构 HIR 时
+          // code 可为空）。
+          if (CodeExtra* extra = codeExtra(func_->code)) {
+            cache->setPressureSlot(&extra->ic_slow_pressure);
+          }
+        }
 // 3.11 一并启用内联快路径 stub：条目命中改为 tp_version_tag 拉式校验
 // （无 type watcher 的 D5 语义，与 AttributeMutator::matches 一致），
 // values 形态经预头 -4 槽直读（M9 性能归因轮）。
@@ -2986,6 +2993,13 @@ LIRGenerator::TranslatedBlock LIRGenerator::TranslateOneBasicBlock(
         hir::Register* base = instr->receiver();
         Instruction* name = getNameFromIdx(bbb, instr);
         auto cache = getContext()->allocateLoadMethodCache();
+        if (func_->code != nullptr) {
+          // 共享桩前置：压力计数地址挂 cache（unit 测试直构 HIR 时
+          // code 可为空）。
+          if (CodeExtra* extra = codeExtra(func_->code)) {
+            cache->setPressureSlot(&extra->ic_slow_pressure);
+          }
+        }
         if (getConfig().collect_attr_cache_stats) {
           BorrowedRef<PyCodeObject> code = instr->frameState()->code;
           cache->initCacheStats(
@@ -3846,6 +3860,13 @@ LIRGenerator::TranslatedBlock LIRGenerator::TranslateOneBasicBlock(
         Instruction* name = getNameFromIdx(bbb, instr);
         hir::Register* value = instr->GetOperand(1);
         auto cache = getContext()->allocateStoreAttrCache();
+        if (func_->code != nullptr) {
+          // 共享桩前置：压力计数地址挂 cache（unit 测试直构 HIR 时
+          // code 可为空）。
+          if (CodeExtra* extra = codeExtra(func_->code)) {
+            cache->setPressureSlot(&extra->ic_slow_pressure);
+          }
+        }
 // 3.11 写侧内联快路径 stub（go 三件套②）：values 覆写与物化 hint
 // 覆写行内完成，插入/删除/描述符与 refcnt==1 的旧值（dealloc 路径）
 // 回落 helper。调用形指令，结果 0/-1 与 helper 一致。

@@ -107,6 +107,11 @@ struct Environ {
   asmjit::Label load_attr_invoke_stub;
   asmjit::Label load_method_invoke_stub;
   asmjit::Label store_attr_invoke_stub;
+  // 本函数是否发射了完整桩体（而非共享跳板）——finalize 后据此登记
+  // 共享桩地址。
+  bool emitted_full_la_stub{false};
+  bool emitted_full_lm_stub{false};
+  bool emitted_full_sa_stub{false};
 
   struct IndirectInfo {
     explicit IndirectInfo(void** indirect_ptr) : indirect(indirect_ptr) {}
