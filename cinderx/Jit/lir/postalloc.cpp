@@ -296,7 +296,8 @@ RewriteResult rewriteCallInstrs(instr_iter_t instr_iter, Environ* env) {
     return kChanged;
   } else if (
       !instr->isCall() && !instr->isVectorCall() &&
-      !instr->isCallSiteVectorCall() && !instr->isLoadAttrCachedFastPath() &&
+      !instr->isCallSiteVectorCall() && !instr->isCallSiteCallMethod() &&
+      !instr->isLoadAttrCachedFastPath() &&
       !instr->isLoadMethodCachedFastPath() && !instr->isIsTruthyFastPath() &&
       !instr->isStoreAttrCachedFastPath()) {
     return kUnchanged;
@@ -308,7 +309,8 @@ RewriteResult rewriteCallInstrs(instr_iter_t instr_iter, Environ* env) {
   // 操作数布局取参越界。
   if ((instr->isCall() || instr->isLoadAttrCachedFastPath() ||
        instr->isLoadMethodCachedFastPath() || instr->isIsTruthyFastPath() ||
-       instr->isStoreAttrCachedFastPath() || instr->isCallSiteVectorCall()) &&
+       instr->isStoreAttrCachedFastPath() || instr->isCallSiteVectorCall() ||
+       instr->isCallSiteCallMethod()) &&
       instr->getNumInputs() == 1 && output->isNone()) {
     return kUnchanged;
   }
@@ -316,7 +318,8 @@ RewriteResult rewriteCallInstrs(instr_iter_t instr_iter, Environ* env) {
   int rsp_sub = 0;
   auto block = instr->basicblock();
 
-  if (instr->isVectorCall() || instr->isCallSiteVectorCall()) {
+  if (instr->isVectorCall() || instr->isCallSiteVectorCall() ||
+      instr->isCallSiteCallMethod()) {
     // 入口缓存形与泛型 VectorCall 操作数布局同构，实参搬移同款改写
     //（[0] 为 cache 地址 Imm，改写不触碰）。
     rsp_sub = rewriteVectorCallFunctions(instr_iter, base_offset);
@@ -331,7 +334,8 @@ RewriteResult rewriteCallInstrs(instr_iter_t instr_iter, Environ* env) {
   //（translate 需按 cache 地址发射探测序列而非直呼）。
   if (!instr->isLoadAttrCachedFastPath() &&
       !instr->isLoadMethodCachedFastPath() && !instr->isIsTruthyFastPath() &&
-      !instr->isStoreAttrCachedFastPath() && !instr->isCallSiteVectorCall()) {
+      !instr->isStoreAttrCachedFastPath() && !instr->isCallSiteVectorCall() &&
+      !instr->isCallSiteCallMethod()) {
     instr->setOpcode(Instruction::kCall);
   }
 
@@ -937,6 +941,7 @@ RewriteResult rewriteMemoryInputsToReg(instr_iter_t instr_iter) {
     case Instruction::kCall:
     case Instruction::kVectorCall:
     case Instruction::kCallSiteVectorCall:
+    case Instruction::kCallSiteCallMethod:
     case Instruction::kVarArgCall:
     case Instruction::kA64GuardCC:
     case Instruction::kGuard:

@@ -4129,6 +4129,29 @@ LIRGenerator::TranslatedBlock LIRGenerator::TranslateOneBasicBlock(
         // 自然落慢臂进 helper 走移位协议；直臂用原 callable 调 vectorcall
         // 槽（未移位，语义与 helper 的非回落分支一致）。
         if (!excInjectEnabled()) {
+#if defined(CINDER_AARCH64) && !defined(Py_GIL_DISABLED)
+          if (getConfig().call_entry_cache && getContext() != nullptr &&
+              !(hir_instr.flags() & CallFlags::KwArgs)) {
+            // 方法调用形入口缓存（被调方行内压栈轮）：哨兵/csel 选径
+            // 链整体由探测序列替代——callable 空/None 与 receiver 空
+            // 槽（JITRT_Call 双 NULL 约定）行内前置检查直落 JITRT_Call
+            // 槽（回落移位协议保留），其余同 VectorCall 形（三守卫命
+            // 中直达；函数形 miss 共用 miss helper——该路径 callable
+            // 已过精确函数检查，helper 的非函数兜底分支不可达，语义
+            // 差异面为零）。
+            auto* cache = getContext()->allocateCallSiteEntryCache();
+            Instruction* instr = bbb.appendInstr(
+                hir_instr.output(),
+                Instruction::kCallSiteCallMethod,
+                Imm{reinterpret_cast<uint64_t>(cache)},
+                Imm{flags});
+            for (hir::Register* arg : hir_instr.GetOperands()) {
+              instr->addOperands(VReg{bbb.getDefInstr(arg)});
+            }
+            instr->addOperands(Imm{0});
+            break;
+          }
+#endif
           Instruction* callable = bbb.getDefInstr(hir_instr.func());
           constexpr int32_t kVectorcallOffset =
               static_cast<int32_t>(offsetof(PyFunctionObject, vectorcall));

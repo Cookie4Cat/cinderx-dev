@@ -128,6 +128,16 @@ enum OperandSizeType {
     1,                                                                        \
     {1},                                                                      \
     1)                                                                        \
+  /* 方法调用形入口缓存（CallMethod 位点）：探测另带 callable 空/ */   \
+  /* None 与 receiver 空槽前置检查，慢臂经 JITRT_Call 槽（回落 */      \
+  /* 移位协议）。 */                                                          \
+  X(CallSiteCallMethod,                                                       \
+    false,                                                                    \
+    FlagEffects::kInvalidate,                                                 \
+    kAlways64,                                                                \
+    1,                                                                        \
+    {1},                                                                      \
+    1)                                                                        \
   X(VarArgCall, false, FlagEffects::kInvalidate, kDefault, 1, {1})            \
   X(Guard, false, FlagEffects::kInvalidate, kDefault, 1, {0, 0, 1, 1}, 1)     \
   X(DeoptPatchpoint, false, FlagEffects::kInvalidate, kDefault, 0, {1, 1}, 1) \

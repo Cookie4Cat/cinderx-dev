@@ -2193,12 +2193,29 @@ void translateCallSiteVectorCall(Environ* env, const Instruction* instr) {
   auto output = instr->output();
   uint64_t cache_addr =
       static_cast<uint64_t>(instr->getInput(0)->getConstant());
+  // 方法调用形（CallSiteCallMethod）：另带前置检查——callable 空/
+  // None（LOAD_METHOD 回落形，真 callable 在 args[0]）与 receiver
+  // 空槽（JITRT_Call 双 NULL 约定之二："无接收者,须丢弃首槽"）直落
+  // 慢臂；慢臂槽为 g_JITRT_Call_slot（保留回落移位协议与周期检查）。
+  const bool method_form =
+      instr->opcode() == Instruction::kCallSiteCallMethod;
+  void** slow_slot =
+      method_form ? &g_JITRT_Call_slot : &g_JITRT_Vectorcall_slot;
 
   asmjit::Label miss_func = as->newLabel();
   asmjit::Label generic = as->newLabel();
   asmjit::Label generic_func = as->newLabel();
   asmjit::Label do_call = as->newLabel();
   asmjit::Label done = as->newLabel();
+
+  if (method_form) {
+    as->cbz(a64::x0, generic);
+    as->mov(a64::x11, reinterpret_cast<uint64_t>(Py_None));
+    as->cmp(a64::x0, a64::x11);
+    as->b_eq(generic);
+    as->ldr(a64::x14, a64::ptr(a64::x1)); // receiver 槽 args[0]
+    as->cbz(a64::x14, generic);
+  }
 
   as->ldr(
       a64::x10,
@@ -2264,9 +2281,7 @@ void translateCallSiteVectorCall(Environ* env, const Instruction* instr) {
   as->b(do_call);
 
   as->bind(generic);
-  as->mov(
-      arch::reg_scratch_br,
-      reinterpret_cast<uint64_t>(&g_JITRT_Vectorcall_slot));
+  as->mov(arch::reg_scratch_br, reinterpret_cast<uint64_t>(slow_slot));
   as->ldr(arch::reg_scratch_br, a64::ptr(arch::reg_scratch_br));
   as->b(do_call);
 
@@ -3679,6 +3694,7 @@ void AutoTranslator::translateInstr(Environ* env, const Instruction* instr)
     case Instruction::kNop:
     case Instruction::kVectorCall:
     case Instruction::kCallSiteVectorCall:
+    case Instruction::kCallSiteCallMethod:
     case Instruction::kVarArgCall:
     case Instruction::kSext:
     case Instruction::kZext:
@@ -3953,6 +3969,7 @@ void AutoTranslator::translateInstr(Environ* env, const Instruction* instr)
       translateCall(env, instr);
       return;
     case Instruction::kCallSiteVectorCall:
+    case Instruction::kCallSiteCallMethod:
       translateCallSiteVectorCall(env, instr);
       return;
     case Instruction::kLoadAttrCachedFastPath:
