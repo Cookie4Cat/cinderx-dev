@@ -431,13 +431,12 @@ bool roiBackoffReasonCounts(DeoptReason reason, bool is_instrumentation_deopt) {
   if (is_instrumentation_deopt) {
     return false;
   }
-  // 仅守卫失败计入回退记账(与 despec 记账同一纪律)。异常出口
-  // deopt 是异常惯用形代码的常态成本——解释态同样支付异常处理,
-  // 不指示产物质量;此前全类计入使 argparse/gettext 类"异常当
-  // 控制流"负载反复触发卸载-重编振荡,稳态剖面 ~27% 落在编译器
-  // 自身(落后带验尸轮定罪)。异常率过高的函数由 exc-fuse 按率
-  // 冻结,职责归位。
-  return reason == DeoptReason::kGuardFailure;
+  // 守卫失败走渐进轮次(重编可能经 despec 摘守卫改善);异常出口
+  // deopt 走终局冻结支线(见 recordDeoptForRoiBackoff——重编除不掉
+  // 异常出口,渐进轮次只会卸载-重编振荡,argparse/gettext 异常惯用
+  // 形定罪)。其余原因(周期任务等)不计。
+  return reason == DeoptReason::kGuardFailure ||
+      reason == DeoptReason::kUnhandledException;
 }
 
 bool roiBackoffCtlFrozen(uint32_t ctl) {
@@ -4545,6 +4544,26 @@ void recordDeoptForRoiBackoff(
 
   uint32_t ctl = Ci_code_extra_load_roi_ctl_relaxed(extra);
   if (roiBackoffCtlFrozen(ctl) || roiBackoffCtlPending(ctl)) {
+    return;
+  }
+
+  if (reason == DeoptReason::kUnhandledException) {
+    // 异常慢性户终局冻结支线:异常出口无守卫可摘,重编不改变行为,
+    // 渐进轮次只会卸载-重编振荡(argparse/gettext 异常惯用形——
+    // 编译态每次异常付 deopt 帧重建后余程解释执行,稳态解释器份额
+    // 32.6% 几乎追平纯解释态,+23% 即此"两头付费"税)。计数过阈
+    // (复用 despec 阈值)将轮次置为末轮触发,一次卸载即 FROZEN。
+    uint32_t count = Ci_code_extra_incr_roi_deopt_count(extra);
+    if (count < getConfig().despec_deopt_threshold) {
+      return;
+    }
+    uint32_t max_rounds =
+        static_cast<uint32_t>(getConfig().roi_backoff_max_rounds);
+    uint32_t final_ctl =
+        roiBackoffCtlForRound(max_rounds == 0 ? 0 : max_rounds - 1);
+    Ci_code_extra_store_roi_ctl_release(extra, final_ctl);
+    PreservePythonError preserve_error;
+    triggerRoiBackoff(code, extra, final_ctl);
     return;
   }
 
