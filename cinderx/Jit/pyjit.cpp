@@ -1395,6 +1395,14 @@ FlagProcessor initFlagProcessor() {
       "compiled entry (3.11; 0 disables re-attachment).");
 
   flag_processor.addOption(
+      "jit-call-entry-cache",
+      "PYTHONJITCALLENTRYCACHE",
+      getMutableConfig().call_entry_cache,
+      "Cache the callee entry point at VectorCall sites and dispatch through "
+      "a direct-call entry that skips the argument-binding prologue (3.11 "
+      "aarch64).");
+
+  flag_processor.addOption(
       "jit-exc-deopt-fuse",
       "CINDERX_EXC_DEOPT_FUSE",
       getMutableConfig().exc_deopt_fuse,

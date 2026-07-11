@@ -204,6 +204,21 @@ PyObject* JITRT_Vectorcall(
     size_t nargsf,
     PyObject* kwnames);
 
+#if PY_VERSION_HEX < 0x030C0000
+namespace jit {
+// 调用位点入口缓存 miss helper（被调方行内压栈轮）。实现在 context.cpp
+// 的 namespace jit 内（需其文件内静态 lookupCompiledForCall），故偏离
+// JITRT 全局命名惯例入 jit 命名空间。约定：第四实参位承载 cache 指针
+// 而非 kwnames（被探测位点 kwnames 恒为 NULL）；派发语义与行内选径
+// 两臂逐字一致，另做一次填充尝试（预算内）。
+PyObject* JITRT_CallSiteEntryMiss(
+    PyObject* callable,
+    PyObject** args,
+    size_t nargsf,
+    void* cache_raw);
+} // namespace jit
+#endif
+
 /*
  * Performs a vectorcall to an exact Python function, skipping the generic
  * callable dispatch.

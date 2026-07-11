@@ -10,11 +10,13 @@
 #include "cinderx/Common/code.h"
 #include "cinderx/Common/code_extra.h"
 #include "cinderx/Common/dict.h"
+#include "cinderx/Common/extra-py-flags.h"
 #include "cinderx/Common/log.h"
 #include "cinderx/Common/py-portability.h"
 #include "cinderx/Common/util.h"
 #include "cinderx/Jit/config.h"
 #include "cinderx/Jit/elf/reader.h"
+#include "cinderx/Jit/jit_rt.h"
 #include "cinderx/StaticPython/classloader.h"
 #include "cinderx/module_c_state.h"
 #include "cinderx/module_state.h"
@@ -356,6 +358,12 @@ LoadTypeMethodCache* Context::allocateLoadTypeMethodCache() {
 StoreAttrCache* Context::allocateStoreAttrCache() {
   return store_attr_caches_.allocate();
 }
+
+#if PY_VERSION_HEX < 0x030C0000
+CallSiteEntryCache* Context::allocateCallSiteEntryCache() {
+  return call_site_entry_caches_.allocate();
+}
+#endif
 
 const Builtins& Context::builtins() {
   // Lock-free fast path followed by single-lock slow path during
@@ -795,6 +803,56 @@ static CompiledFunction* lookupCompiledForCall(
     }
   }
   return getContext() != nullptr ? getContext()->lookupFunc(func) : nullptr;
+}
+
+// 调用位点入口缓存 miss helper（被调方行内压栈轮）。被探测位点的
+// kwnames 恒为 NULL（KwArgs 位点不发射探测），x3 实参位由探测序列
+// 改载 cache 指针。派发语义与旧行内选径两臂逐字一致：精确 PyFunction
+// 直呼其 vectorcall 槽，其余经 JITRT_Vectorcall 慢路径槽（保留 C 可
+// 调用体的周期检查）。填充在派发前完成（预算内）：
+//  · 直达填充条件 = 已晋升裸编译入口（vectorcall == 编译入口，试用
+//    包装器/挂接前形态不满足即退中性）、存在直达入口、无 varargs/
+//    kwonly、位点实参数 == co_argcount（32 位镜像 prologue 行内比较
+//    口径）、非静态入口（静态原型走类型检查链，不可绕过）；
+//  · 否则中性填充 = 记录当前 vectorcall 为快目标，命中语义与旧快臂
+//    的逐调用槽装载一致。转正/挂接/重编改变 vectorcall 后恒等守卫
+//    失效回本 helper，预算内允许重填以跟进生命周期迁移。
+PyObject* JITRT_CallSiteEntryMiss(
+    PyObject* callable,
+    PyObject** args,
+    size_t nargsf,
+    void* cache_raw) {
+  auto* cache = reinterpret_cast<CallSiteEntryCache*>(cache_raw);
+  bool is_function = Py_IS_TYPE(callable, &PyFunction_Type);
+  if (cache->helper_budget > 0) {
+    cache->helper_budget--;
+    if (is_function) {
+      BorrowedRef<PyFunctionObject> func{callable};
+      auto* code = reinterpret_cast<PyCodeObject*>(func->func_code);
+      void* fast = reinterpret_cast<void*>(func->vectorcall);
+      if (CompiledFunction* compiled = lookupCompiledForCall(func)) {
+        void* direct = compiled->directCallEntry();
+        if (direct != nullptr &&
+            func->vectorcall == compiled->vectorcallEntry() &&
+            !(code->co_flags & (CO_VARARGS | CO_VARKEYWORDS)) &&
+            code->co_kwonlyargcount == 0 &&
+            !(code->co_flags & CI_CO_STATICALLY_COMPILED) &&
+            static_cast<uint32_t>(nargsf) ==
+                static_cast<uint32_t>(code->co_argcount)) {
+          fast = direct;
+        }
+      }
+      cache->code = func->func_code;
+      cache->vectorcall = reinterpret_cast<void*>(func->vectorcall);
+      cache->fast_target = fast;
+    }
+  }
+  if (is_function) {
+    return reinterpret_cast<PyFunctionObject*>(callable)->vectorcall(
+        callable, args, nargsf, nullptr);
+  }
+  return reinterpret_cast<vectorcallfunc>(g_JITRT_Vectorcall_slot)(
+      callable, args, nargsf, nullptr);
 }
 
 static PyObject* recursionGuardedVectorcall(

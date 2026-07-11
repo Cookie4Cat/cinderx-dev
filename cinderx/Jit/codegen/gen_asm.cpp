@@ -2654,6 +2654,9 @@ void NativeGenerator::generateCode(
     generateStaticEntryPoint(env_.finish_frame_setup, static_jmp_location);
   }
 
+  Label correct_args_entry = as_->newLabel();
+  [[maybe_unused]] Label direct_call_entry_label;
+
 #if defined(CINDER_AARCH64) && PY_VERSION_HEX < 0x030C0000
   // 入口守卫行内化的分流出口（守卫包装消解）。放在重入桩之前——
   // 重入桩到 vectorcall 入口的字节距离是 JITRT_CALL_REENTRY_OFFSET
@@ -2661,8 +2664,8 @@ void NativeGenerator::generateCode(
   // stock 解释器入口（x0-x3 处于原始 vectorcall 形态、未压栈）：
   // 解释器自带递归计数与 CheckRecursiveCall 语义（余量/抛错），
   // 编译侧预检不落账，失败路径零簿记。
-  // 分流出口无条件发射：入口守卫（可配置开关）与 __code__ 身份校验
-  // （无条件，见 vectorcall 入口处）共用。
+  // 分流出口无条件发射：入口守卫（可配置开关）、__code__ 身份校验
+  // （无条件，见 vectorcall 入口处）与直达入口守卫共用。
   Label entry_guard_divert = as_->newLabel();
   const bool entry_guard = env_.code_rt->entryGuardInlined();
   {
@@ -2673,13 +2676,72 @@ void NativeGenerator::generateCode(
     as_->br(a64::x16);
     env_.addAnnotation("Entry guard divert", divert_cursor);
   }
+
+  // 入口守卫序列（vectorcall 入口行内形态与直达入口共用）：① tracing
+  // 激活 → 分流；② 递归余量预检（只读不写，写账在建帧处）→ 将溢即
+  // 分流。建帧前执行，仅用 x9/x10，x0-x3 原封。
+  auto emit_entry_guard = [&]() {
+    // tstate = _PyRuntime.gilstate.tstate_current（地址发射期烘焙；与
+    // PyThreadState_GET 同源，GIL 下即当前线程态。本目标 TLS 偏移探测
+    // 被安全禁用，不可用 TPIDR 路径）。
+    as_->mov(
+        a64::x9,
+        reinterpret_cast<uint64_t>(
+            &ThreadedCompileContext::interpreter()
+                 ->runtime->gilstate.tstate_current));
+    as_->ldr(a64::x9, a64::ptr(a64::x9));
+    as_->ldr(
+        a64::x10,
+        arch::ptr_offset(
+            a64::x9, static_cast<int32_t>(offsetof(PyThreadState, cframe))));
+    // 3.11 的 use_tracing 是 uint8_t——必须按字节读，32 位读会带进
+    // 相邻 padding 垃圾使分流恒真（deltablue 全员被打回解释器，
+    // richards 的 padding 恰零而无恙——排障实录）。
+    static_assert(
+        sizeof(reinterpret_cast<_PyCFrame*>(0)->use_tracing) == 1,
+        "use_tracing width changed");
+    as_->ldrb(
+        a64::w10,
+        arch::ptr_offset(
+            a64::x10,
+            static_cast<int32_t>(offsetof(_PyCFrame, use_tracing)),
+            arch::AccessSize::k8));
+    as_->cbnz(a64::w10, entry_guard_divert);
+    as_->ldr(
+        a64::w10,
+        arch::ptr_offset(
+            a64::x9,
+            static_cast<int32_t>(
+                offsetof(PyThreadState, recursion_remaining)),
+            arch::AccessSize::k32));
+    as_->cmp(a64::w10, 0);
+    as_->b_le(entry_guard_divert);
+  };
+
+  if (getConfig().call_entry_cache) {
+    // 直达入口（被调方行内压栈轮）：调用位点入口缓存命中的跳转目标。
+    // __code__ 身份校验由调用方缓存的 func_code 恒等守卫等价承担；
+    // 参数计数/缺省/kwnames 链由填充条件（无 varargs/kwonly、位点实
+    // 参数==co_argcount、kwnames==NULL）一次性保证；tracing 与递归
+    // 语义经共用守卫原样保留——守卫无条件发射，不依赖
+    // entryGuardInlined（直达路径绕过包装器形态，须自带守卫）。位于
+    // 重入桩之前的安全区，尾部显式跳转复用重入建帧码，不触碰
+    // JITRT_CALL_REENTRY_OFFSET 硬不变量区间。x3 在被探测位点恒为 0
+    // （kwnames 空位点才发射探测，postalloc 发射 xor x3,x3），分流
+    // 形态与 vectorcall 约定一致。
+    direct_call_entry_label = as_->newLabel();
+    auto direct_cursor = as_->cursor();
+    as_->bind(direct_call_entry_label);
+    emit_entry_guard();
+    as_->b(correct_args_entry);
+    env_.addAnnotation("Direct-call entry", direct_cursor);
+  }
 #endif
 
   // Reentry point: dispatched to from JITRT_CallWithIncorrectArgcount and
   // JITRT_CallWithKeywordArgs after argument binding. Must be exactly
   // JITRT_CALL_REENTRY_OFFSET bytes before the vectorcall entry.
   auto arg_reentry_cursor = as_->cursor();
-  Label correct_args_entry = as_->newLabel();
   as_->bind(correct_args_entry);
   generateFunctionEntry();
 
@@ -2724,45 +2786,10 @@ void NativeGenerator::generateCode(
     env_.addAnnotation("Code identity check", code_check_cursor);
   }
   if (entry_guard) {
-    // 守卫包装两检查的行内形态：① tracing 激活 → 分流；② 递归余量
-    // 预检（只读不写，写账在建帧处）→ 将溢即分流。绑参重入路径按
-    // 设计跳过本段（外层调用已检）。
+    // 守卫包装两检查的行内形态（序列本体见 emit_entry_guard）。绑参
+    // 重入路径按设计跳过本段（外层调用已检）。
     auto guard_cursor = as_->cursor();
-    // tstate = _PyRuntime.gilstate.tstate_current（地址发射期烘焙；与
-    // PyThreadState_GET 同源，GIL 下即当前线程态。本目标 TLS 偏移探测
-    // 被安全禁用，不可用 TPIDR 路径）。
-    as_->mov(
-        a64::x9,
-        reinterpret_cast<uint64_t>(
-            &ThreadedCompileContext::interpreter()
-                 ->runtime->gilstate.tstate_current));
-    as_->ldr(a64::x9, a64::ptr(a64::x9));
-    as_->ldr(
-        a64::x10,
-        arch::ptr_offset(
-            a64::x9, static_cast<int32_t>(offsetof(PyThreadState, cframe))));
-    // 3.11 的 use_tracing 是 uint8_t——必须按字节读，32 位读会带进
-    // 相邻 padding 垃圾使分流恒真（deltablue 全员被打回解释器，
-    // richards 的 padding 恰零而无恙——本轮排障实录）。
-    static_assert(
-        sizeof(reinterpret_cast<_PyCFrame*>(0)->use_tracing) == 1,
-        "use_tracing width changed");
-    as_->ldrb(
-        a64::w10,
-        arch::ptr_offset(
-            a64::x10,
-            static_cast<int32_t>(offsetof(_PyCFrame, use_tracing)),
-            arch::AccessSize::k8));
-    as_->cbnz(a64::w10, entry_guard_divert);
-    as_->ldr(
-        a64::w10,
-        arch::ptr_offset(
-            a64::x9,
-            static_cast<int32_t>(
-                offsetof(PyThreadState, recursion_remaining)),
-            arch::AccessSize::k32));
-    as_->cmp(a64::w10, 0);
-    as_->b_le(entry_guard_divert);
+    emit_entry_guard();
     env_.addAnnotation("Entry guard (tracing + recursion precheck)", guard_cursor);
   }
 #endif
@@ -2946,6 +2973,15 @@ void NativeGenerator::generateCode(
 
   vectorcall_entry_ = static_cast<char*>(code_start_) +
       codeholder.labelOffsetFromBase(vectorcall_entry_label);
+
+#if defined(CINDER_AARCH64) && PY_VERSION_HEX < 0x030C0000
+  // 直达入口地址落定（被调方行内压栈轮）：标签解析为绝对地址，经
+  // CompiledFunctionData 存放，miss helper 填充时读取。
+  if (direct_call_entry_label.isValid()) {
+    direct_call_entry_ = static_cast<char*>(code_start_) +
+        codeholder.labelOffsetFromBase(direct_call_entry_label);
+  }
+#endif
 
   for (auto& entry : env_.unresolved_gen_entry_labels) {
     entry.first->setResumeTarget(

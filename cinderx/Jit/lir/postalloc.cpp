@@ -296,16 +296,19 @@ RewriteResult rewriteCallInstrs(instr_iter_t instr_iter, Environ* env) {
     return kChanged;
   } else if (
       !instr->isCall() && !instr->isVectorCall() &&
-      !instr->isLoadAttrCachedFastPath() &&
+      !instr->isCallSiteVectorCall() && !instr->isLoadAttrCachedFastPath() &&
       !instr->isLoadMethodCachedFastPath() && !instr->isIsTruthyFastPath() &&
       !instr->isStoreAttrCachedFastPath()) {
     return kUnchanged;
   }
 
   auto output = instr->output();
+  // 已改写形早退（重入判据 = 仅剩自身操作数且输出已摘）：保留操作码
+  // 的调用形指令（快路径/入口缓存形）必须在列，否则二遍改写按原始
+  // 操作数布局取参越界。
   if ((instr->isCall() || instr->isLoadAttrCachedFastPath() ||
        instr->isLoadMethodCachedFastPath() || instr->isIsTruthyFastPath() ||
-       instr->isStoreAttrCachedFastPath()) &&
+       instr->isStoreAttrCachedFastPath() || instr->isCallSiteVectorCall()) &&
       instr->getNumInputs() == 1 && output->isNone()) {
     return kUnchanged;
   }
@@ -313,7 +316,9 @@ RewriteResult rewriteCallInstrs(instr_iter_t instr_iter, Environ* env) {
   int rsp_sub = 0;
   auto block = instr->basicblock();
 
-  if (instr->isVectorCall()) {
+  if (instr->isVectorCall() || instr->isCallSiteVectorCall()) {
+    // 入口缓存形与泛型 VectorCall 操作数布局同构，实参搬移同款改写
+    //（[0] 为 cache 地址 Imm，改写不触碰）。
     rsp_sub = rewriteVectorCallFunctions(instr_iter, base_offset);
   } else {
     rsp_sub = rewriteRegularFunction(instr_iter, base_offset);
@@ -322,10 +327,11 @@ RewriteResult rewriteCallInstrs(instr_iter_t instr_iter, Environ* env) {
   instr->setNumInputs(1); // leave function self operand only
   // 快路径调用形指令必须保留自身操作码：改写为 kCall 会让 translate
   // 直呼函数操作数（helper），内联 stub 从不被进入（计数矩阵抓获：
-  // lm_stub_entries 恒 0 而 lm_helper 数百万）。
+  // lm_stub_entries 恒 0 而 lm_helper 数百万）。入口缓存形同理保留
+  //（translate 需按 cache 地址发射探测序列而非直呼）。
   if (!instr->isLoadAttrCachedFastPath() &&
       !instr->isLoadMethodCachedFastPath() && !instr->isIsTruthyFastPath() &&
-      !instr->isStoreAttrCachedFastPath()) {
+      !instr->isStoreAttrCachedFastPath() && !instr->isCallSiteVectorCall()) {
     instr->setOpcode(Instruction::kCall);
   }
 
@@ -930,6 +936,7 @@ RewriteResult rewriteMemoryInputsToReg(instr_iter_t instr_iter) {
     case Instruction::kUnreachable:
     case Instruction::kCall:
     case Instruction::kVectorCall:
+    case Instruction::kCallSiteVectorCall:
     case Instruction::kVarArgCall:
     case Instruction::kA64GuardCC:
     case Instruction::kGuard:

@@ -90,6 +90,10 @@ namespace jit {
 struct CompiledFunctionData {
   std::span<const std::byte> code;
   vectorcallfunc vectorcall_entry{nullptr};
+  // 直达入口（被调方行内压栈轮，aarch64/3.11）：调用位点入口缓存
+  // 命中的跳转目标——tracing/递归守卫 + 建帧 + 直入 correct_arg_count，
+  // 跳过 __code__ 校验与参数计数链。未发射（配置关闭或非本目标）为空。
+  void* direct_call_entry{nullptr};
   int stack_size{0};
   int spill_stack_size{0};
   std::chrono::nanoseconds compile_time{};
@@ -150,6 +154,11 @@ class CompiledFunction {
 
   vectorcallfunc vectorcallEntry() const {
     return data_.vectorcall_entry;
+  }
+
+  // 直达入口（被调方行内压栈轮）。未发射为空。
+  void* directCallEntry() const {
+    return data_.direct_call_entry;
   }
 
   void* staticEntry() const;

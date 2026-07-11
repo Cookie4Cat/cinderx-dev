@@ -3918,6 +3918,29 @@ LIRGenerator::TranslatedBlock LIRGenerator::TranslateOneBasicBlock(
                 Instruction::kMove,
                 OutVReg{OperandBase::k64bit},
                 Ind{callable, kVectorcallOffset});
+#if defined(CINDER_AARCH64) && !defined(Py_GIL_DISABLED)
+          } else if (
+              getConfig().call_entry_cache && getContext() != nullptr &&
+              !(hir_instr.flags() & CallFlags::KwArgs)) {
+            // 调用位点入口缓存形（被调方行内压栈轮）：选径/装载链整体
+            // 由专属翻译器的探测序列替代——{精确函数类型, func_code
+            // 恒等, vectorcall 恒等} 三守卫命中 blr 缓存快目标（被调方
+            // 直达入口或中性填充），函数形 miss 预算内携 cache 落
+            // JITRT_CallSiteEntryMiss 填充，非函数与预算耗尽回旧臂
+            // 形态。仅 kwnames 空位点（x3 由实参搬移置零，miss 臂借
+            // 该位传 cache）。操作数布局与泛型 VectorCall 同构。
+            auto* cache = getContext()->allocateCallSiteEntryCache();
+            Instruction* instr = bbb.appendInstr(
+                hir_instr.output(),
+                Instruction::kCallSiteVectorCall,
+                Imm{reinterpret_cast<uint64_t>(cache)},
+                Imm{flags});
+            for (hir::Register* arg : hir_instr.GetOperands()) {
+              instr->addOperands(VReg{bbb.getDefInstr(arg)});
+            }
+            instr->addOperands(Imm{0});
+            break;
+#endif
           } else {
             Instruction* type_reg = bbb.appendInstr(
                 Instruction::kMove,

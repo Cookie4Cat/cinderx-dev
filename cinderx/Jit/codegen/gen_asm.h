@@ -59,6 +59,14 @@ class NativeGenerator {
   // Python call.
   void* getStaticEntry();
 
+  // 直达入口（被调方行内压栈轮，aarch64/3.11）：调用位点入口缓存命中
+  // 的跳转目标。未发射（配置关闭或非本目标）为空。
+  //
+  // Note: getVectorcallEntry() **must** be called before this is called.
+  void* getDirectCallEntry() const {
+    return direct_call_entry_;
+  }
+
   int GetCompiledFunctionStackSize() const;
   int GetCompiledFunctionSpillStackSize() const;
   const hir::Function* GetFunction() const {
@@ -80,6 +88,7 @@ class NativeGenerator {
   const hir::Function* func_;
   void* code_start_{nullptr};
   void* vectorcall_entry_{nullptr};
+  void* direct_call_entry_{nullptr};
   arch::Builder* as_{nullptr};
   CodeHolderMetadata metadata_{CodeSection::kHot};
 
