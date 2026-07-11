@@ -568,6 +568,12 @@ class LoadMethodCache {
   static constexpr size_t pressureSlotOffset() {
     return offsetof(LoadMethodCache, pressure_slot_);
   }
+  // 物化受者救援直判的 me_key 自验证 hint（与 helper 的
+  // ci_hinted_keys_index_311 共用同一槽,任意值均安全:越界或键不符
+  // 即回落 helper 重算并刷新）。
+  static constexpr size_t iaHintOffset() {
+    return offsetof(LoadMethodCache, ia_hint_);
+  }
 #endif
 
   ~LoadMethodCache();
