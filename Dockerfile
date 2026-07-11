@@ -1,6 +1,9 @@
 ARG PYTHON_VERSION=3.14.3
 ARG PYPERFORMANCE_VERSION=1.13.0
+ARG PYPERF_VERSION=2.10.0
 ARG GCC_VERSION=14.2.0
+ARG PIP_INDEX_URL=https://mirrors.huaweicloud.com/repository/pypi/simple
+
 
 FROM openeuler/openeuler:24.03-lts-sp3
 
@@ -8,9 +11,12 @@ FROM openeuler/openeuler:24.03-lts-sp3
 # They inherit the default values declared above FROM.
 ARG PYTHON_VERSION
 ARG PYPERFORMANCE_VERSION
+ARG PYPERF_VERSION
 ARG GCC_VERSION
+ARG PIP_INDEX_URL
 
 ENV LANG=en_US.UTF-8
+ENV PIP_INDEX_URL=${PIP_INDEX_URL}
 
 RUN dnf install -y \
     gcc \
@@ -69,11 +75,11 @@ RUN wget https://mirrors.huaweicloud.com/python//${PYTHON_VERSION}/Python-${PYTH
 
 RUN python3 -m pip install --upgrade pip setuptools wheel
 
-RUN pip3 install pyperformance==${PYPERFORMANCE_VERSION}
+RUN pip3 install pyperformance==${PYPERFORMANCE_VERSION} pyperf==${PYPERF_VERSION}
 
 WORKDIR /workspace/cinderx
 
-RUN python3 -m pyperformance venv create --inherit-environ http_proxy,https_proxy
+RUN python3 -m pyperformance venv create --inherit-environ http_proxy,https_proxy,PIP_INDEX_URL
 
 RUN sed -i 's/^include-system-site-packages = false/include-system-site-packages = true/' venv/cpython*/pyvenv.cfg
 
