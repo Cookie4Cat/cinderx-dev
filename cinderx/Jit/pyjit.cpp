@@ -4998,6 +4998,12 @@ bool tryAttachCachedCompiledEntry(BorrowedRef<PyFunctionObject> func) {
       extra->jit_builtins != func->func_builtins) {
     return false;
   }
+  // finalizeFunc() 内部的分配（func_dict 建立等）可触发 GC：当 compiled
+  // 的既有锚点全部悬于濒死函数对象（热路径每轮新建又即弃的推导式/
+  // lambda 实例）时，回收会在 finalize 中途析构 compiled 并清空槽位，
+  // 返回后继续使用即 UAF（挂接断链轮插桩实证：CACHE→ATTACH×5→第 6 次
+  // 挂接中 CLEAR→崩）。跨 finalize 持强引用钉住。
+  auto compiled_guard = Ref<CompiledFunction>::create(compiled);
   // finalizeFunc() does the full association (compiled_funcs_ tracking,
   // CompiledFunction function set, func_dict strong ref, vectorcall + static
   // entry), so deopt and GC behave identically to the slow path.
@@ -5574,8 +5580,26 @@ extern "C" void Ci_AutoJitCountFramePush311(
     }
     uint64_t calls = Ci_code_extra_get_calls(extra);
     if (calls >= *limit) {
-      // 已达阈：编译早已尝试过（成功则调用不再经解释入口，失败则
-      // disabled 位已置）；计数不再推进。
+      // 已达阈：常驻函数编译成功后调用不再经解释入口，失败者
+      // disabled 位已置，计数不再推进。例外是热路径每轮新建的
+      // 闭包/lambda——新函数对象共享已编译的 code，入口仍为
+      // StockEntry，经 [P7] 行内推入直达此处而被原速返永久困在
+      // 解释态（中间带体检：bpe_tokeniser 断点采样 591/600 集中
+      // 于每轮新建的 max key lambda）。处置为**带预算的全簿记挂接**：
+      // 每 code 前 N 个新鲜实例经 tryAttachCachedCompiledEntry 挂接
+      // （finalizeFunc 全簿记，直达裸编译入口），超出预算即停——
+      // 海量翻新闭包（sqlglot 型，每实例仅调用数次）的挂接税被硬性
+      // 封顶（无预算的直挂版实测 sqlglot +57%/sympy +25%；轻挂接
+      // 包装器版虽零簿记但常驻包装税且无兑现），稳定小实例集
+      // （deepcopy 型嵌套函数）获得全额收益。冻结/卸载态的
+      // jit_compiled 已被清空，天然不参与。
+      if (_Py_atomic_load_ptr_relaxed(&extra->jit_compiled) != nullptr &&
+          extra->fresh_attach_count < CI_CODE_EXTRA_FRESH_ATTACH_BUDGET &&
+          func->vectorcall ==
+              reinterpret_cast<vectorcallfunc>(Ci_StockEntry311)) {
+        extra->fresh_attach_count++;
+        jit::tryAttachCachedCompiledEntry(func);
+      }
       return;
     }
   }
