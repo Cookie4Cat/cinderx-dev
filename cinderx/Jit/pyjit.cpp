@@ -4557,6 +4557,14 @@ void recordDeoptForRoiBackoff(
     if (count < getConfig().despec_deopt_threshold) {
       return;
     }
+    // 率判据(防长命函数被偶发异常累积误冻):采样调用数(×16 折算)
+    // 下异常 deopt 率 <5% 时清零重计——低率异常出口摊薄后编译仍
+    // 净赚,冻结只该给"异常当控制流"的慢性形态。
+    uint64_t calls_scaled = Ci_code_extra_get_calls(extra) * 16;
+    if (calls_scaled > static_cast<uint64_t>(count) * 20) {
+      Ci_code_extra_store_roi_deopt_count_relaxed(extra, 0);
+      return;
+    }
     uint32_t max_rounds =
         static_cast<uint32_t>(getConfig().roi_backoff_max_rounds);
     uint32_t final_ctl =
