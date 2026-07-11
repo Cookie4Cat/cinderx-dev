@@ -431,7 +431,13 @@ bool roiBackoffReasonCounts(DeoptReason reason, bool is_instrumentation_deopt) {
   if (is_instrumentation_deopt) {
     return false;
   }
-  return reason != DeoptReason::kPeriodicTaskFailure;
+  // 仅守卫失败计入回退记账(与 despec 记账同一纪律)。异常出口
+  // deopt 是异常惯用形代码的常态成本——解释态同样支付异常处理,
+  // 不指示产物质量;此前全类计入使 argparse/gettext 类"异常当
+  // 控制流"负载反复触发卸载-重编振荡,稳态剖面 ~27% 落在编译器
+  // 自身(落后带验尸轮定罪)。异常率过高的函数由 exc-fuse 按率
+  // 冻结,职责归位。
+  return reason == DeoptReason::kGuardFailure;
 }
 
 bool roiBackoffCtlFrozen(uint32_t ctl) {
