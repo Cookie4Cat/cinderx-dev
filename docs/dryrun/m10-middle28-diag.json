@@ -1,0 +1,23 @@
+{
+ "mdp": {
+  "bench_kind": "time",
+  "warm_iters": 2,
+  "steady_iters": 7,
+  "compiled": 225,
+  "jit_code_kb": 1452,
+  "deopt_total": 1,
+  "deopt_top": [
+   {
+    "reason": "GuardFailure",
+    "descr": "LOAD_GLOBAL_MODULE ver: kind",
+    "func": "run_once",
+    "n": 1
+   }
+  ],
+  "shares": {
+   "cpython_c": 67.3,
+   "interp": 5.3,
+   "jit_rt": 0.4
+  }
+ }
+}
