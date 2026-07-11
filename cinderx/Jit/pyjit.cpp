@@ -1381,6 +1381,13 @@ FlagProcessor initFlagProcessor() {
       "default, resume ceremony dominates trivial bodies).");
 
   flag_processor.addOption(
+      "jit-fresh-attach-budget",
+      "PYTHONJITFRESHATTACHBUDGET",
+      getMutableConfig().fresh_attach_budget,
+      "Per-code budget of fresh function objects to attach to an existing "
+      "compiled entry (3.11; 0 disables re-attachment).");
+
+  flag_processor.addOption(
       "jit-exc-deopt-fuse",
       "CINDERX_EXC_DEOPT_FUSE",
       getMutableConfig().exc_deopt_fuse,
@@ -5594,7 +5601,7 @@ extern "C" void Ci_AutoJitCountFramePush311(
       // （deepcopy 型嵌套函数）获得全额收益。冻结/卸载态的
       // jit_compiled 已被清空，天然不参与。
       if (_Py_atomic_load_ptr_relaxed(&extra->jit_compiled) != nullptr &&
-          extra->fresh_attach_count < CI_CODE_EXTRA_FRESH_ATTACH_BUDGET &&
+          extra->fresh_attach_count < jit::getConfig().fresh_attach_budget &&
           func->vectorcall ==
               reinterpret_cast<vectorcallfunc>(Ci_StockEntry311)) {
         extra->fresh_attach_count++;

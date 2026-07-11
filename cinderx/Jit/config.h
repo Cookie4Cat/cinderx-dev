@@ -249,6 +249,9 @@ struct Config {
   // inline caches used by the JIT.
   uint32_t attr_cache_size{4};
   std::optional<uint32_t> compile_after_n_calls;
+  // 新鲜函数对象全簿记挂接的每 code 预算（挂接断链轮）：稳定小实例集
+  // 全额受益，海量翻新闭包的挂接税由此封顶。0 关闭挂接。
+  size_t fresh_attach_budget{8};
   // Enable AutoJIT behavior classification for PYTHONJITAUTO=auto[:N]. Plain
   // numeric PYTHONJITAUTO and Python APIs keep this disabled.
   bool auto_classify{false};
