@@ -300,6 +300,7 @@ std::optional<CompiledFunctionData> Compiler::Compile(
   CompiledFunctionData compiled_data;
   compiled_data.code = code;
   compiled_data.vectorcall_entry = entry;
+  compiled_data.direct_call_entry = ngen->getDirectCallEntry();
   compiled_data.stack_size = stack_size;
   compiled_data.spill_stack_size = spill_stack_size;
   compiled_data.inline_function_stats = std::move(inline_stats);

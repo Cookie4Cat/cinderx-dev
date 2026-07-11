@@ -20,6 +20,40 @@
 
 namespace jit {
 
+#if PY_VERSION_HEX < 0x030C0000
+// 调用位点入口缓存（被调方行内压栈轮）：VectorCall 位点的单态缓存。
+// 探测守卫 = 精确 PyFunction 类型 + {func_code 恒等, vectorcall 恒等}
+// 双比对：code 恒等等价承担被调方入口的 __code__ 身份校验（防运行期
+// 换 code 直跑旧产物），vectorcall 恒等使 deopt/重编/试用转正/挂接
+// 天然失效。命中 blr fast_target：
+//  · 直达填充 —— 被调方直达入口（自带 tracing 分流与递归余量预检，
+//    见 gen_asm 直达入口块），跳过 __code__ 校验与参数计数链；填充
+//    条件（无 varargs/kwonly、位点实参数==co_argcount、非静态入口、
+//    已晋升裸编译入口）一次性保证参数仪式可省。
+//  · 中性填充 —— fast_target=填充时的 func->vectorcall 值，语义与旧
+//    快臂的逐调用槽装载一致；稳定而未编译/未转正/参数不整的被调方
+//    由此免于每调用落 miss helper。
+// code 为借用指针仅作恒等比较：code 亡后地址复用要求命中同时满足
+// vectorcall 恒等——直达填充的入口地址由 bump 分配器保证终身不复用，
+// 中性填充的 fast_target 语义即"调用该 vectorcall 值"，恒等成立则
+// 派发正确。helper_budget 由 miss helper 每次递减，归零后探测序列
+// 行内短路回旧臂形态，封顶多态位点的 helper 往返税。字段偏移被
+// codegen 探测序列硬编码（见 static_assert）。
+struct CallSiteEntryCache {
+  PyObject* code{nullptr}; // 借用，仅恒等比较
+  void* vectorcall{nullptr};
+  void* fast_target{nullptr};
+  uint8_t helper_budget{64};
+};
+
+static_assert(
+    offsetof(CallSiteEntryCache, code) == 0 &&
+        offsetof(CallSiteEntryCache, vectorcall) == 8 &&
+        offsetof(CallSiteEntryCache, fast_target) == 16 &&
+        offsetof(CallSiteEntryCache, helper_budget) == 24,
+    "codegen probe hardcodes CallSiteEntryCache layout");
+#endif
+
 // Mutator for an instance attribute that is stored in a split dictionary
 struct SplitMutator {
   PyObject* getAttr(PyObject* obj, PyObject* name);

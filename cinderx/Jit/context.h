@@ -381,6 +381,11 @@ class Context : public IJitContext, public CompiledFunctionOwner {
   LoadModuleMethodCache* allocateLoadModuleMethodCache();
   LoadTypeMethodCache* allocateLoadTypeMethodCache();
   StoreAttrCache* allocateStoreAttrCache();
+#if PY_VERSION_HEX < 0x030C0000
+  // 调用位点入口缓存（被调方行内压栈轮）。SlabArena 进程级常驻，
+  // 裸地址烘焙进调用位点探测序列。
+  CallSiteEntryCache* allocateCallSiteEntryCache();
+#endif
 
   const Builtins& builtins();
 
@@ -469,6 +474,9 @@ class Context : public IJitContext, public CompiledFunctionOwner {
   SlabArena<LoadTypeMethodCache> load_type_method_caches_;
   SlabArena<StoreAttrCache, AttributeCacheSizeTrait> store_attr_caches_;
   SlabArena<void*> pointer_caches_;
+#if PY_VERSION_HEX < 0x030C0000
+  SlabArena<CallSiteEntryCache> call_site_entry_caches_;
+#endif
 
   FunctionEntryCacheMap function_entry_caches_;
 

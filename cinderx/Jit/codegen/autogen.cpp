@@ -9,6 +9,7 @@
 #include "cinderx/Jit/codegen/arch.h"
 #include "cinderx/Jit/codegen/gen_asm_utils.h"
 #include "cinderx/Jit/frame.h"
+#include "cinderx/Jit/inline_cache.h"
 #include "cinderx/Jit/generators_rt.h"
 #include "cinderx/Jit/hir/hir.h"
 #include "cinderx/Jit/jit_rt.h"
@@ -2173,6 +2174,127 @@ void translateStoreAttrCachedFastPath(
 #endif
 }
 
+void translateCallSiteVectorCall(Environ* env, const Instruction* instr) {
+#if defined(CINDER_AARCH64) && !defined(Py_GIL_DISABLED) && \
+    PY_VERSION_HEX < 0x030C0000
+  // 调用位点入口缓存探测（被调方行内压栈轮）。postalloc 已按
+  // vectorcall 约定装配 x0=callable/x1=args/x2=nargsf/x3=0（kwnames
+  // 空位点才发射本指令）；调用形语义保证 x9-x15 此刻无活值。三段
+  // 守卫：① 精确函数类型——非函数直落旧慢臂槽（同时免除对非函数
+  // 对象的越界字段读）；② func_code 恒等——等价承担被调方入口的
+  // __code__ 身份校验；③ vectorcall 恒等——deopt/重编/试用转正/
+  // 挂接改变入口后天然失效。命中 blr fast_target（被调方直达入口，
+  // 或中性填充=旧快臂的逐调用槽装载语义）。函数形 miss 预算内改载
+  // x3=cache（该位点 kwnames 恒 NULL，helper 知情）落 miss helper
+  // 填充；预算耗尽行内短路 x13（func->vectorcall 已装载）＝旧快臂
+  // 形态。全路径汇于单一 blr，返回值/调试位置处理与 translateCall
+  // 同款。缓存字段偏移由 inline_cache.h 的 static_assert 锁定。
+  auto as = env->as;
+  auto output = instr->output();
+  uint64_t cache_addr =
+      static_cast<uint64_t>(instr->getInput(0)->getConstant());
+  // 方法调用形（CallSiteCallMethod）：另带前置检查——callable 空/
+  // None（LOAD_METHOD 回落形，真 callable 在 args[0]）与 receiver
+  // 空槽（JITRT_Call 双 NULL 约定之二："无接收者,须丢弃首槽"）直落
+  // 慢臂；慢臂槽为 g_JITRT_Call_slot（保留回落移位协议与周期检查）。
+  const bool method_form =
+      instr->opcode() == Instruction::kCallSiteCallMethod;
+  void** slow_slot =
+      method_form ? &g_JITRT_Call_slot : &g_JITRT_Vectorcall_slot;
+
+  asmjit::Label miss_func = as->newLabel();
+  asmjit::Label generic = as->newLabel();
+  asmjit::Label generic_func = as->newLabel();
+  asmjit::Label do_call = as->newLabel();
+  asmjit::Label done = as->newLabel();
+
+  if (method_form) {
+    as->cbz(a64::x0, generic);
+    as->mov(a64::x11, reinterpret_cast<uint64_t>(Py_None));
+    as->cmp(a64::x0, a64::x11);
+    as->b_eq(generic);
+    as->ldr(a64::x14, a64::ptr(a64::x1)); // receiver 槽 args[0]
+    as->cbz(a64::x14, generic);
+  }
+
+  as->ldr(
+      a64::x10,
+      arch::ptr_offset(
+          a64::x0, static_cast<int32_t>(offsetof(PyObject, ob_type))));
+  as->mov(a64::x11, reinterpret_cast<uint64_t>(&PyFunction_Type));
+  as->cmp(a64::x10, a64::x11);
+  as->b_ne(generic);
+  as->mov(a64::x9, cache_addr);
+  as->ldp(a64::x10, a64::x11, a64::ptr(a64::x9));
+  as->ldr(
+      a64::x12,
+      arch::ptr_offset(
+          a64::x0,
+          static_cast<int32_t>(offsetof(PyFunctionObject, func_code))));
+  as->ldr(
+      a64::x13,
+      arch::ptr_offset(
+          a64::x0,
+          static_cast<int32_t>(offsetof(PyFunctionObject, vectorcall))));
+  as->cmp(a64::x10, a64::x12);
+  as->b_ne(miss_func);
+  as->cmp(a64::x11, a64::x13);
+  as->b_ne(miss_func);
+  as->ldr(
+      arch::reg_scratch_br,
+      arch::ptr_offset(
+          a64::x9,
+          static_cast<int32_t>(offsetof(jit::CallSiteEntryCache, fast_target))));
+
+  as->bind(do_call);
+  as->blr(arch::reg_scratch_br);
+
+  if (instr->origin()) {
+    asmjit::Label label = as->newLabel();
+    as->bind(label);
+    env->pending_debug_locs.emplace_back(label, instr->origin());
+  }
+
+  if (output->type() != OperandBase::kNone) {
+    auto out_reg = AT::getGpOutput(output);
+    if (out_reg.isGpW()) {
+      as->mov(out_reg, a64::w0);
+    } else {
+      as->mov(out_reg, a64::x0);
+    }
+  }
+  as->b(done);
+
+  as->bind(miss_func);
+  as->ldrb(
+      a64::w10,
+      arch::ptr_offset(
+          a64::x9,
+          static_cast<int32_t>(
+              offsetof(jit::CallSiteEntryCache, helper_budget)),
+          arch::AccessSize::k8));
+  as->cbz(a64::w10, generic_func);
+  as->mov(a64::x3, a64::x9);
+  as->mov(
+      arch::reg_scratch_br,
+      reinterpret_cast<uint64_t>(jit::JITRT_CallSiteEntryMiss));
+  as->b(do_call);
+
+  as->bind(generic);
+  as->mov(arch::reg_scratch_br, reinterpret_cast<uint64_t>(slow_slot));
+  as->ldr(arch::reg_scratch_br, a64::ptr(arch::reg_scratch_br));
+  as->b(do_call);
+
+  as->bind(generic_func);
+  as->mov(arch::reg_scratch_br, a64::x13);
+  as->b(do_call);
+
+  as->bind(done);
+#else
+  JIT_ABORT("CallSiteVectorCall is aarch64 3.11 only");
+#endif
+}
+
 void translateLoadAttrCachedFastPath(Environ* env, const Instruction* instr) {
 #if defined(CINDER_AARCH64) && !defined(Py_GIL_DISABLED) && \
     (PY_VERSION_HEX >= 0x030E0000 || PY_VERSION_HEX < 0x030C0000)
@@ -3571,6 +3693,8 @@ void AutoTranslator::translateInstr(Environ* env, const Instruction* instr)
     case Instruction::kNone:
     case Instruction::kNop:
     case Instruction::kVectorCall:
+    case Instruction::kCallSiteVectorCall:
+    case Instruction::kCallSiteCallMethod:
     case Instruction::kVarArgCall:
     case Instruction::kSext:
     case Instruction::kZext:
@@ -3843,6 +3967,10 @@ void AutoTranslator::translateInstr(Environ* env, const Instruction* instr)
     }
     case Instruction::kCall:
       translateCall(env, instr);
+      return;
+    case Instruction::kCallSiteVectorCall:
+    case Instruction::kCallSiteCallMethod:
+      translateCallSiteVectorCall(env, instr);
       return;
     case Instruction::kLoadAttrCachedFastPath:
       translateLoadAttrCachedFastPath(env, instr);

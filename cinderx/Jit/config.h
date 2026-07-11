@@ -256,6 +256,10 @@ struct Config {
   // 的函数登记，其后函数以 8 字节级跳板复用——每函数桩开销 2-3KB →
   // 数十字节，宽热面负载的指令缓存足迹随之收敛。
   bool shared_attr_stubs{true};
+  // 调用位点入口缓存（被调方行内压栈轮）：VectorCall 位点单态缓存
+  // {func_code, vectorcall} 守卫对 + 快目标，命中经被调方直达入口
+  // （自带 tracing/递归守卫）跳过 __code__ 校验与参数计数链。
+  bool call_entry_cache{true};
   // Enable AutoJIT behavior classification for PYTHONJITAUTO=auto[:N]. Plain
   // numeric PYTHONJITAUTO and Python APIs keep this disabled.
   bool auto_classify{false};

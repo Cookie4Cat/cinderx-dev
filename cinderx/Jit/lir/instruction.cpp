@@ -315,6 +315,8 @@ bool Instruction::isCallLike() const {
     case kStoreAttrCachedFastPath:
     case kVarArgCall:
     case kVectorCall:
+    case kCallSiteVectorCall:
+    case kCallSiteCallMethod:
       return true;
     default:
       return false;
