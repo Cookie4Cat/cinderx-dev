@@ -87,7 +87,16 @@ typedef struct CodeExtra {
   // 卸载并冻结回解释器(解释器原生处理该异常,零 deopt 税);带
   // 循环 code 不受此熔断(如 pickle load,一次 deopt 摊数千次派发)。
   uint32_t exc_deopt_count;
+  // 新鲜函数对象挂接预算（挂接断链轮）：热路径每轮新建的闭包/lambda
+  // 共享已编译 code，为新实例做全簿记挂接（finalizeFunc）以复用产物；
+  // 每 code 前 N 个实例内有效，超出即停——海量翻新闭包（sqlglot 型，
+  // 每实例仅调用数次）的挂接税由此封顶，稳定小实例集（deepcopy 型）
+  // 获得全额收益。
+  uint32_t fresh_attach_count;
 } CodeExtra;
+
+// 每 code 新鲜实例全簿记挂接的预算上限。
+#define CI_CODE_EXTRA_FRESH_ATTACH_BUDGET 8u
 
 #define CI_CODE_EXTRA_AUTO_JIT_DISABLED 1
 
