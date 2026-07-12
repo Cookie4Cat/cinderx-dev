@@ -264,6 +264,7 @@ static std::string format_immediates(const Function* func, const Instr& instr) {
     case Opcode::kGetLength:
     case Opcode::kGetTuple:
     case Opcode::kGuard:
+    case Opcode::kUseObj:
     case Opcode::kIncref:
     case Opcode::kInitialYield:
     case Opcode::kInvokeIterNext:

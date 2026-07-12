@@ -4900,6 +4900,10 @@ LIRGenerator::TranslatedBlock LIRGenerator::TranslateOneBasicBlock(
         // UseTypes are purely informative
         break;
       }
+      case Opcode::kUseObj: {
+        // UseObjs only anchor liveness for the refcount pass
+        break;
+      }
       case Opcode::kHintType: {
         // HintTypes are purely informative
         break;

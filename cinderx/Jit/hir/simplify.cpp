@@ -768,18 +768,24 @@ Register* simplifyLoadMethod(Env& env, const LoadMethod* load_meth) {
 }
 
 bool hasArraySubscrFastPathEvidence(
+    const BinaryOp* instr,
     Register* container,
     Register* sub,
     Type array_guard) {
-  return container->isA(array_guard) || sub->isA(TLongExact);
+  return container->isA(array_guard) || sub->isA(TLongExact) ||
+      instr->isSubscrAdaptiveStuck();
 }
 
-// Emit the array.array('d') BINARY_SUBSCR fast path. When the container's
-// static type is already array.array, or the index is already known to be a
-// Python int, speculatively guard on array.array('d') and lower the load to an
-// inlined LoadArrayItem(TCDouble) + PrimitiveBox. Otherwise fall back to a
-// generic BinaryOp<Subscript>. Returns the merged value, or nullptr if the fast
-// path does not apply (caller continues with the normal subscript lowering).
+// Emit the array.array BINARY_SUBSCR fast path ('d' float / 'i' int
+// elements). When the container's static type is already array.array, the
+// index is already known to be a Python int, or the site's interpreter
+// specialization failed (isSubscrAdaptiveStuck — discriminating evidence for
+// non-list/tuple/dict/getitem containers such as array.array), speculatively
+// branch on array.array and lower the load to an inlined LoadArrayItem +
+// PrimitiveBox dispatched on the runtime typecode. Otherwise fall back to a
+// generic BinaryOp<Subscript>. Returns the merged value, or nullptr if the
+// fast path does not apply (caller continues with the normal subscript
+// lowering).
 //
 // This runs in the Simplify pass rather than the HIR builder so that it only
 // fires after earlier type propagation has had a chance to prove either the
@@ -806,7 +812,7 @@ Register* trySimplifyArraySubscr(Env& env, const BinaryOp* instr) {
   if (!container->type().couldBe(array_guard)) {
     return nullptr;
   }
-  if (!hasArraySubscrFastPathEvidence(container, sub, array_guard)) {
+  if (!hasArraySubscrFastPathEvidence(instr, container, sub, array_guard)) {
     return nullptr;
   }
 
@@ -815,9 +821,12 @@ Register* trySimplifyArraySubscr(Env& env, const BinaryOp* instr) {
 
   BasicBlock* arr_ok = cfg.AllocateBlock();
   BasicBlock* idx_ok = cfg.AllocateBlock();
-  BasicBlock* tc_ok = cfg.AllocateBlock();
+  BasicBlock* chk_i = cfg.AllocateBlock();
+  BasicBlock* tc_ok_d = cfg.AllocateBlock();
+  BasicBlock* tc_ok_i = cfg.AllocateBlock();
   BasicBlock* slow = cfg.AllocateBlock();
-  env.new_blocks += 5; // arr_ok, idx_ok, tc_ok, slow, and the split-off tail.
+  // arr_ok, idx_ok, chk_i, tc_ok_d, tc_ok_i, slow, and the split-off tail.
+  env.new_blocks += 7;
 
   // Guard: container is array.array. Split the continuation into `done`.
   env.emit<CondBranchCheckType>(container, array_guard, arr_ok, slow);
@@ -829,31 +838,49 @@ Register* trySimplifyArraySubscr(Env& env, const BinaryOp* instr) {
   Register* arr = env.emit<RefineType>(array_guard, container);
   env.emit<CondBranchCheckType>(sub, TLongExact, idx_ok, slow);
 
-  // --- idx_ok: index is an int, unbox it and check the typecode == 'd' ---
+  // --- idx_ok: index is an int; unbox, bounds check, dispatch on typecode ---
   env.block = idx_ok;
   env.cursor = idx_ok->end();
   Register* idx = env.emit<RefineType>(TLongExact, sub);
   Register* unboxed_idx = env.emit<PrimitiveUnbox>(idx, TCInt64);
   env.emit<IsNegativeAndErrOccurred>(unboxed_idx, frame);
-  Register* descr = env.emit<LoadField>(
-      arr, "ob_descr", offsetof(StdlibArrayObject, ob_descr), TCPtr);
-  Register* typecode = env.emit<LoadField>(
-      descr, "typecode", offsetof(StdlibArrayDescr, typecode), TCInt8);
-  Register* expected_tc = env.emit<LoadConst>(Type::fromCInt('d', TCInt8));
-  Register* tc_match = env.emit<PrimitiveCompare>(
-      PrimitiveCompareOp::kEqual, typecode, expected_tc);
-  env.emit<CondBranch>(tc_match, tc_ok, slow);
-
-  // --- tc_ok: bounds check, then inlined native load + box ---
-  env.block = tc_ok;
-  env.cursor = tc_ok->end();
+  // Bounds semantics are typecode-independent; check once for both arms.
   Register* adjusted_idx =
       env.emit<CheckSequenceBounds>(arr, unboxed_idx, frame);
   Register* ob_item = env.emit<LoadField>(
       arr, "ob_item", offsetof(StdlibArrayObject, ob_item), TCPtr);
+  Register* descr = env.emit<LoadField>(
+      arr, "ob_descr", offsetof(StdlibArrayObject, ob_descr), TCPtr);
+  Register* typecode = env.emit<LoadField>(
+      descr, "typecode", offsetof(StdlibArrayDescr, typecode), TCInt8);
+  Register* expected_d = env.emit<LoadConst>(Type::fromCInt('d', TCInt8));
+  Register* tc_match_d = env.emit<PrimitiveCompare>(
+      PrimitiveCompareOp::kEqual, typecode, expected_d);
+  env.emit<CondBranch>(tc_match_d, tc_ok_d, chk_i);
+
+  // --- chk_i: not 'd'; accept 'i', anything else goes slow ---
+  env.block = chk_i;
+  env.cursor = chk_i->end();
+  Register* expected_i = env.emit<LoadConst>(Type::fromCInt('i', TCInt8));
+  Register* tc_match_i = env.emit<PrimitiveCompare>(
+      PrimitiveCompareOp::kEqual, typecode, expected_i);
+  env.emit<CondBranch>(tc_match_i, tc_ok_i, slow);
+
+  // --- tc_ok_d: inlined native double load + box ---
+  env.block = tc_ok_d;
+  env.cursor = tc_ok_d->end();
   Register* raw_double = env.emit<LoadArrayItem>(
       ob_item, adjusted_idx, arr, static_cast<intptr_t>(0), TCDouble);
-  Register* fast_result = env.emit<PrimitiveBox>(raw_double, TCDouble, frame);
+  Register* boxed_double = env.emit<PrimitiveBox>(raw_double, TCDouble, frame);
+  env.emit<Branch>(done);
+
+  // --- tc_ok_i: inlined native int32 load, sign-extend, box ---
+  env.block = tc_ok_i;
+  env.cursor = tc_ok_i->end();
+  Register* raw_int32 = env.emit<LoadArrayItem>(
+      ob_item, adjusted_idx, arr, static_cast<intptr_t>(0), TCInt32);
+  Register* widened = env.emit<PrimitiveConvert>(raw_int32, TCInt64);
+  Register* boxed_int = env.emit<PrimitiveBox>(widened, TCInt64, frame);
   env.emit<Branch>(done);
 
   // --- slow: generic subscript (PyObject_GetItem) ---
@@ -873,7 +900,8 @@ Register* trySimplifyArraySubscr(Env& env, const BinaryOp* instr) {
   env.block = done;
   env.cursor = done->begin();
   return env.emit<Phi>(std::unordered_map<BasicBlock*, Register*>{
-      {tc_ok, fast_result},
+      {tc_ok_d, boxed_double},
+      {tc_ok_i, boxed_int},
       {slow, slow_result},
   });
 }
@@ -2648,6 +2676,42 @@ Register* simplifyStoreSubscr(Env& env, const StoreSubscr* instr) {
     env.emit<CheckNeg>(output, *instr->frameState());
     return nullptr;
   }
+
+// TODO(T255264263). Keep parity with the list read lowering above, which is
+// also disabled on free-threaded builds.
+#ifndef Py_GIL_DISABLED
+  Register* container = instr->GetOperand(0);
+  Register* sub = instr->GetOperand(1);
+  Register* value = instr->GetOperand(2);
+  if (container->isA(TListExact) && sub->isA(TLongExact)) {
+    // Inline list element store, mirroring the read-side lowering and
+    // list_ass_item(): bounds-checked raw store that steals a reference to
+    // the new value, with the displaced element released only after the
+    // overwrite (its destructor can re-enter and observe the list).
+    env.emit<UseType>(container, TListExact);
+    env.emit<UseType>(sub, TLongExact);
+    Register* unboxed_idx = env.emit<IndexUnbox>(sub);
+    env.emit<IsNegativeAndErrOccurred>(unboxed_idx, *instr->frameState());
+    Register* adjusted_idx = env.emit<CheckSequenceBounds>(
+        container, unboxed_idx, *instr->frameState());
+    Register* ob_item = env.emit<LoadField>(
+        container, "ob_item", offsetof(PyListObject, ob_item), TCPtr);
+    // borrowed=false: adopt the reference the slot currently holds so the
+    // refcount pass releases it once `old` dies.
+    Register* old = env.emit<LoadArrayItem>(
+        ob_item,
+        adjusted_idx,
+        container,
+        static_cast<intptr_t>(0),
+        TObject,
+        /*borrowed=*/false);
+    env.emit<StoreArrayItem>(ob_item, adjusted_idx, value, container, TObject);
+    // Liveness anchor: keeps `old` alive past the store so its release
+    // cannot precede the overwrite (UseType would be dropped by DCE).
+    env.emit<UseObj>(old);
+    return nullptr;
+  }
+#endif
 
   return nullptr;
 }

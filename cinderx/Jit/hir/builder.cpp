@@ -409,10 +409,12 @@ bool hasArraySubscrStoreFastPathEvidence(
     Register* container,
     Register* sub,
     Register* value,
-    Type array_type) {
-  return container->isA(array_type) ||
+    Type array_type,
+    bool adaptive_stuck) {
+  return container->isA(array_type) || adaptive_stuck ||
       (registerHasTypeEvidence(sub, TLongExact) &&
-       registerHasTypeEvidence(value, TFloatExact));
+       (registerHasTypeEvidence(value, TFloatExact) ||
+        registerHasTypeEvidence(value, TLongExact)));
 }
 struct LoadSuperAttrPattern311 {
   int global_super_idx;
@@ -2666,7 +2668,16 @@ void HIRBuilder::emitBinaryOp(
     op_kind = *opt_op_kind;
   }
 
-  tc.emit<BinaryOp>(result, op_kind, left, right, tc.frame);
+  bool subscr_stuck = op_kind == BinaryOpKind::kSubscript &&
+      getConfig().specialized_opcodes && bc_instr.isSubscrAdaptiveStuck();
+  tc.emit<BinaryOp>(
+      result,
+      op_kind,
+      left,
+      right,
+      tc.frame,
+      /* array_subscr_slow_path= */ false,
+      subscr_stuck);
   stack.push(result);
 }
 
@@ -5361,6 +5372,7 @@ BasicBlock* HIRBuilder::emitArrayTypecodeCheck(
     CFG& cfg,
     TranslationContext& tc,
     Register* container,
+    char expected,
     BasicBlock* slow_path) {
   auto descr = temps_.AllocateStack();
   tc.emit<LoadField>(
@@ -5373,7 +5385,7 @@ BasicBlock* HIRBuilder::emitArrayTypecodeCheck(
   tc.emit<LoadField>(
       typecode, descr, "typecode", offsetof(StdlibArrayDescr, typecode), TCInt8);
   auto expected_tc = temps_.AllocateStack();
-  tc.emit<LoadConst>(expected_tc, Type::fromCInt('d', TCInt8));
+  tc.emit<LoadConst>(expected_tc, Type::fromCInt(expected, TCInt8));
   auto tc_match = temps_.AllocateStack();
   tc.emit<PrimitiveCompare>(
       tc_match, PrimitiveCompareOp::kEqual, typecode, expected_tc);
@@ -5505,14 +5517,30 @@ void HIRBuilder::emitStoreSubscr(
   Register* container = stack.pop();
   Register* value = stack.pop();
 
-  // Fast path for array.array('d') store
+#if PY_VERSION_HEX < 0x030C0000
+  // 解释器反馈:list[int] 写位点。发类型守卫后交由 simplifyStoreSubscr
+  // 落成行内存储(镜像读侧 BINARY_SUBSCR_LIST_INT 的守卫→下沉分工)。
+  if (getConfig().specialized_opcodes &&
+      bc_instr.specializedOpcode() == STORE_SUBSCR_LIST_INT) {
+    tc.emit<GuardType>(container, TListExact, container, tc.frame);
+    tc.emit<GuardType>(sub, TLongExact, sub, tc.frame);
+    tc.emit<StoreSubscr>(container, sub, value, tc.frame);
+    return;
+  }
+#endif
+
+  // Fast path for array.array store ('d' float / 'i' int values)
   if (getConfig().specialized_opcodes &&
       bc_instr.specializedOpcode() != STORE_SUBSCR_DICT) {
     auto* array_type = getStdlibArrayType();
     if (array_type != nullptr) {
       Type array_type_guard = Type::fromTypeExact(array_type);
       if (!hasArraySubscrStoreFastPathEvidence(
-              container, sub, value, array_type_guard)) {
+              container,
+              sub,
+              value,
+              array_type_guard,
+              bc_instr.isSubscrAdaptiveStuck())) {
         tc.emit<StoreSubscr>(container, sub, value, tc.frame);
         return;
       }
@@ -5549,11 +5577,13 @@ void HIRBuilder::emitStoreSubscr(
   tc.emit<StoreSubscr>(container, sub, value, tc.frame);
 }
 
-// Store fast path for array.array('d'). Container is already known to be
-// array.array via the outer guard. Emits the value type check, typecode
-// check, bounds check, and direct store. Returns true if the full fast
-// path was emitted; false if setup failed (caller should fall through to
-// the generic path).
+// Store fast path for array.array. Container is already known to be
+// array.array via the outer guard. Dispatches on the value type: float
+// values pair with typecode 'd', int values (after an int32 range check)
+// with typecode 'i'. Emits the value type check, typecode check, bounds
+// check, and direct store. Returns true if the full fast path was
+// emitted; false if setup failed (caller should fall through to the
+// generic path).
 bool HIRBuilder::tryStoreSubscrArray(
     CFG& cfg,
     TranslationContext& tc,
@@ -5566,20 +5596,8 @@ bool HIRBuilder::tryStoreSubscrArray(
   // Route non-int indices (e.g. slices) to the generic store path.
   Register* unboxed_idx = emitArrayIndexGuard(cfg, tc, sub, slow_path);
 
-  // Route non-float values to the generic store path (also handles
-  // int-to-double coercion that stock array assignment performs).
-  BasicBlock* val_ok = cfg.AllocateBlock();
-  tc.emit<CondBranchCheckType>(value, TFloatExact, val_ok, slow_path);
-  tc.block = val_ok;
-  tc.emit<RefineType>(value, TFloatExact, value);
-  Register* unboxed_value = temps_.AllocateStack();
-  tc.emit<PrimitiveUnbox>(unboxed_value, value, TCDouble);
-
-  // Check typecode == 'd'
-  BasicBlock* tc_ok = emitArrayTypecodeCheck(cfg, tc, container, slow_path);
-
-  // typecode matched — bounds check + store
-  tc.block = tc_ok;
+  // Bounds semantics (negative adjust + IndexError) are typecode-independent,
+  // so the check and the ob_item load are shared by both value arms.
   auto adjusted_idx = temps_.AllocateStack();
   tc.emit<CheckSequenceBounds>(adjusted_idx, container, unboxed_idx, tc.frame);
   auto ob_item = temps_.AllocateStack();
@@ -5589,8 +5607,59 @@ bool HIRBuilder::tryStoreSubscrArray(
       "ob_item",
       offsetof(StdlibArrayObject, ob_item),
       TCPtr);
+
+  // Value dispatch: float → 'd', int → 'i', anything else → generic path
+  // (which also handles the int-to-double coercion stock array('d')
+  // assignment performs).
+  BasicBlock* val_float = cfg.AllocateBlock();
+  BasicBlock* chk_int = cfg.AllocateBlock();
+  tc.emit<CondBranchCheckType>(value, TFloatExact, val_float, chk_int);
+
+  // --- float value, typecode 'd' ---
+  tc.block = val_float;
+  tc.emit<RefineType>(value, TFloatExact, value);
+  Register* unboxed_value = temps_.AllocateStack();
+  tc.emit<PrimitiveUnbox>(unboxed_value, value, TCDouble);
+  BasicBlock* tc_ok_d =
+      emitArrayTypecodeCheck(cfg, tc, container, 'd', slow_path);
+  tc.block = tc_ok_d;
   tc.emit<StoreArrayItem>(
       ob_item, adjusted_idx, unboxed_value, container, TCDouble);
+  tc.emit<Branch>(done_path);
+
+  // --- int value, typecode 'i' ---
+  tc.block = chk_int;
+  BasicBlock* val_int = cfg.AllocateBlock();
+  tc.emit<CondBranchCheckType>(value, TLongExact, val_int, slow_path);
+  tc.block = val_int;
+  tc.emit<RefineType>(value, TLongExact, value);
+  Register* unboxed_iv = temps_.AllocateStack();
+  tc.emit<PrimitiveUnbox>(unboxed_iv, value, TCInt64);
+  Register* iv_err = temps_.AllocateStack();
+  tc.emit<IsNegativeAndErrOccurred>(iv_err, unboxed_iv, tc.frame);
+  // Out-of-range values must raise OverflowError; route them to the
+  // generic path instead of truncating.
+  Register* i32_min = temps_.AllocateStack();
+  tc.emit<LoadConst>(i32_min, Type::fromCInt(INT32_MIN, TCInt64));
+  Register* i32_max = temps_.AllocateStack();
+  tc.emit<LoadConst>(i32_max, Type::fromCInt(INT32_MAX, TCInt64));
+  Register* ge_min = temps_.AllocateStack();
+  tc.emit<PrimitiveCompare>(
+      ge_min, PrimitiveCompareOp::kGreaterThanEqual, unboxed_iv, i32_min);
+  BasicBlock* min_ok = cfg.AllocateBlock();
+  tc.emit<CondBranch>(ge_min, min_ok, slow_path);
+  tc.block = min_ok;
+  Register* le_max = temps_.AllocateStack();
+  tc.emit<PrimitiveCompare>(
+      le_max, PrimitiveCompareOp::kLessThanEqual, unboxed_iv, i32_max);
+  BasicBlock* range_ok = cfg.AllocateBlock();
+  tc.emit<CondBranch>(le_max, range_ok, slow_path);
+  tc.block = range_ok;
+  BasicBlock* tc_ok_i =
+      emitArrayTypecodeCheck(cfg, tc, container, 'i', slow_path);
+  tc.block = tc_ok_i;
+  tc.emit<StoreArrayItem>(
+      ob_item, adjusted_idx, unboxed_iv, container, TCInt32);
   tc.emit<Branch>(done_path);
 
   // --- Slow path ---

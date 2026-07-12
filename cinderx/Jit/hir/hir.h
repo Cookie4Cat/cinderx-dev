@@ -568,10 +568,12 @@ class INSTR_CLASS(
       Register* left,
       Register* right,
       const FrameState& frame,
-      bool array_subscr_slow_path = false)
+      bool array_subscr_slow_path = false,
+      bool subscr_adaptive_stuck = false)
       : InstrT(dst, left, right, frame),
         op_(op),
-        array_subscr_slow_path_(array_subscr_slow_path) {}
+        array_subscr_slow_path_(array_subscr_slow_path),
+        subscr_adaptive_stuck_(subscr_adaptive_stuck) {}
 
   BinaryOpKind op() const {
     return op_;
@@ -589,9 +591,17 @@ class INSTR_CLASS(
     return array_subscr_slow_path_;
   }
 
+  // Subscript site whose interpreter specialization was attempted and
+  // failed (see BytecodeInstruction::isSubscrAdaptiveStuck). Used as
+  // emission evidence for the speculative array.array fast path.
+  bool isSubscrAdaptiveStuck() const {
+    return subscr_adaptive_stuck_;
+  }
+
  private:
   BinaryOpKind op_;
   bool array_subscr_slow_path_;
+  bool subscr_adaptive_stuck_;
 };
 
 #define FOREACH_UNARY_OP_KIND(V) \
@@ -2825,6 +2835,17 @@ class INSTR_CLASS(Return, (), Operands<1>) {
 //
 // Ensures that we don't accidentally remove a type check (such as in GuardType)
 // despite a register not having any explicit users
+// Anchor a reference-counted value as live at this point without any
+// runtime effect. Placed after a raw memory overwrite so the refcount
+// pass releases the displaced (adopted) value only once the new value is
+// in place; destructors re-entering via the container must not observe
+// the pre-store state. Unlike UseType, survives dead-code elimination by
+// explicit exemption.
+class INSTR_CLASS(UseObj, (TObject), Operands<1>) {
+ public:
+  explicit UseObj(Register* val) : InstrT(val) {}
+};
+
 class INSTR_CLASS(UseType, (), Operands<1>) {
  public:
   UseType(Register* val, Type type) : InstrT(val), type_(type) {}
