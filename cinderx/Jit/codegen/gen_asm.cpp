@@ -1407,6 +1407,17 @@ void NativeGenerator::emitAarch64LoadMethodInvokeStub(
   constexpr int kDkVersionOffset = offsetof(PyDictKeysObject, dk_version);
   constexpr int kValuesPreheaderOffset =
       -4 * static_cast<int>(sizeof(PyObject*));
+  constexpr int kDictPreheaderOffset =
+      -3 * static_cast<int>(sizeof(PyObject*));
+  constexpr int kMaKeysOffset = offsetof(PyDictObject, ma_keys);
+  constexpr int kMaValuesOffset = offsetof(PyDictObject, ma_values);
+  constexpr int kDkKindOffset = offsetof(PyDictKeysObject, dk_kind);
+  constexpr int kDkLog2IndexBytesOffset =
+      offsetof(PyDictKeysObject, dk_log2_index_bytes);
+  constexpr int kDkNentriesOffset = offsetof(PyDictKeysObject, dk_nentries);
+  constexpr int kDkIndicesOffset = offsetof(PyDictKeysObject, dk_indices);
+  constexpr int kIaHintOffset =
+      static_cast<int>(jit::LoadMethodCache::iaHintOffset());
 
   ASM_CHECK(as_->align(AlignMode::kCode, 8), GetFunction()->fullname);
   as_->bind(env_.load_method_invoke_stub);
@@ -1436,9 +1447,18 @@ void NativeGenerator::emitAarch64LoadMethodInvokeStub(
   }
   as_->ldr(a64::x11, arch::ptr_offset(a64::x1, kObTypeOffset));
 
+  // 物化受者救援直判（sqla 三残项轮，镜像 helper 的组合字典带 hint
+  // 遮蔽直判与 la 桩 kind-7 物化块）：条目类型/版本已验而共享键版本
+  // 不可比（实例已物化,-4 values 槽为空）时，不再直落 helper——经
+  // -3 槽字典以 me_key 自验证 hint 探测"名字是否被实例遮蔽"，未遮蔽
+  // 即条目值有效（类侧变化由条目级 tp_version_tag 拉式校验钉住）。
+  // 遮蔽/hint 失效/general 键/split 包装越界一律回落 helper（重算并
+  // 刷新 hint）。进入约定：x9=条目 value（已判非空）,x1=obj,x2=name,
+  // x0=cache;x11(tp) 此后不再需要,作 scratch。
+  Label mat_rescue = as_->newLabel();
+
   auto emit_entry = [&](uint32_t entry_index, Label next_entry) {
     const int off = kEntriesOffset + static_cast<int>(entry_index) * kEntrySize;
-    Label entry_hit = as_->newLabel();
 
     as_->ldr(a64::x12, arch::ptr_offset(a64::x0, off + kTypeOff));
     as_->cmp(a64::x12, a64::x11);
@@ -1458,13 +1478,17 @@ void NativeGenerator::emitAarch64LoadMethodInvokeStub(
     as_->cmp(a64::w14, a64::w15);
     as_->b_ne(next_entry);
 
+    // 条目值前置装载（keys 校验各出口共用;空槽仍试后继条目）。
+    as_->ldr(a64::x9, arch::ptr_offset(a64::x0, off + kValueOff));
+    as_->cbz(a64::x9, next_entry);
+
     // 共享键版本校验。
     as_->ldr(
         a64::w15,
         arch::ptr_offset(a64::x0, off + kKeysVerOff, arch::AccessSize::k32));
-    as_->cbz(a64::w15, entry_hit);
+    as_->cbz(a64::w15, hit);
     as_->ldr(a64::x13, arch::ptr_offset(a64::x1, kValuesPreheaderOffset));
-    as_->cbz(a64::x13, slow_path);
+    as_->cbz(a64::x13, mat_rescue);
     as_->ldr(a64::x13, arch::ptr_offset(a64::x11, kHtCachedKeysOffset));
     as_->cbz(a64::x13, slow_path);
     as_->ldr(
@@ -1472,10 +1496,6 @@ void NativeGenerator::emitAarch64LoadMethodInvokeStub(
         arch::ptr_offset(a64::x13, kDkVersionOffset, arch::AccessSize::k32));
     as_->cmp(a64::w14, a64::w15);
     as_->b_ne(slow_path);
-
-    as_->bind(entry_hit);
-    as_->ldr(a64::x9, arch::ptr_offset(a64::x0, off + kValueOff));
-    as_->cbz(a64::x9, next_entry);
     as_->b(hit);
   };
 
@@ -1488,6 +1508,68 @@ void NativeGenerator::emitAarch64LoadMethodInvokeStub(
     if (has_next_entry) {
       as_->bind(next_entry);
     }
+  }
+
+  // ---- 物化受者救援块（cache 级 ia_hint,条目无关;进入约定:x9=条目
+  // 值,w15=条目 keys_version,x11=tp）。三段镜像 helper 判据:
+  // ① 非管理字典受者回落——其 -4/-3 preheader 属对象外内存,不可
+  //    解引用（tp_dictoffset 形态由 helper 通用判据处理）;
+  // ② 无实例字典 → 无遮蔽可言,条目直接有效;物化字典自身
+  //    dk_version == 条目版本 → isValidKeysVersion 同判有效（物化
+  //    继承共享键的常见形,直方图大头 ≥2.2 万/趟）;
+  // ③ 版本不等 → me_key 自验证 hint 遮蔽直判（helper 组合字典带
+  //    hint 直判的行内形,go 案机制）。----
+  {
+    Label mat_combined = as_->newLabel();
+    Label mat_test = as_->newLabel();
+    as_->bind(mat_rescue);
+    as_->ldr(a64::x10, arch::ptr_offset(a64::x11, kTpFlagsOffset));
+    as_->tst(a64::x10, Py_TPFLAGS_MANAGED_DICT);
+    as_->b_eq(slow_path);
+    as_->ldr(a64::x13, arch::ptr_offset(a64::x1, kDictPreheaderOffset));
+    as_->cbz(a64::x13, hit); // 无实例字典 → 条目有效
+    as_->ldr(a64::x14, arch::ptr_offset(a64::x13, kMaKeysOffset));
+    as_->ldr(
+        a64::w10,
+        arch::ptr_offset(a64::x14, kDkVersionOffset, arch::AccessSize::k32));
+    as_->cmp(a64::w10, a64::w15);
+    as_->b_eq(hit); // 物化字典键版本与条目版本一致 → 条目有效
+    as_->ldrb(
+        a64::w10,
+        arch::ptr_offset(a64::x14, kDkKindOffset, arch::AccessSize::k8));
+    as_->cbz(a64::w10, slow_path); // general 键罕见形态回落
+    as_->ldr(a64::x12, arch::ptr_offset(a64::x0, kIaHintOffset));
+    as_->ldr(a64::x10, arch::ptr_offset(a64::x14, kDkNentriesOffset));
+    as_->cmp(a64::x12, a64::x10);
+    as_->b_hs(slow_path); // 无符号比较：负/未初始化 hint 一并拦截
+    as_->ldrb(
+        a64::w10,
+        arch::ptr_offset(
+            a64::x14, kDkLog2IndexBytesOffset, arch::AccessSize::k8));
+    as_->mov(a64::x11, 1); // 条目已命中，x11(tp) 可复用
+    as_->lsl(a64::x11, a64::x11, a64::x10);
+    as_->add(a64::x11, a64::x14, a64::x11);
+    arch::add_immediate(as_, a64::x11, a64::x11, kDkIndicesOffset);
+    as_->add(a64::x11, a64::x11, a64::x12, a64::lsl(4));
+    as_->ldr(a64::x10, a64::ptr(a64::x11)); // me_key
+    as_->cmp(a64::x10, a64::x2);
+    as_->b_ne(slow_path); // 键不符/hint 失效 → helper 刷新
+    as_->ldr(a64::x14, arch::ptr_offset(a64::x13, kMaValuesOffset));
+    as_->cbz(a64::x14, mat_combined);
+    // split 包装容量守卫（共享键成长后 hint 可越界）
+    as_->ldrb(
+        a64::w10, arch::ptr_offset(a64::x14, -1, arch::AccessSize::k8));
+    as_->cmp(a64::x12, a64::x10);
+    as_->b_hs(slow_path);
+    as_->add(a64::x14, a64::x14, a64::x12, a64::lsl(3));
+    as_->ldr(a64::x10, a64::ptr(a64::x14)); // split 包装：ma_values[hint]
+    as_->b(mat_test);
+    as_->bind(mat_combined);
+    as_->ldr(a64::x10, arch::ptr_offset(a64::x11, 8)); // combined：me_value
+    as_->bind(mat_test);
+    // 遮蔽（实例属性胜出）→ helper;未遮蔽 → 条目方法有效。
+    as_->cbnz(a64::x10, slow_path);
+    as_->b(hit);
   }
 
   as_->bind(hit);
