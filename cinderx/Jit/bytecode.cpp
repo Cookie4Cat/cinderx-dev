@@ -206,7 +206,9 @@ int BytecodeInstruction::specializedOpcode() const {
     // despec 武装态下的受控重测,若风暴复现即回摘。
     case COMPARE_OP_FLOAT_JUMP:
     case COMPARE_OP_INT_JUMP:
-    case COMPARE_OP_STR_JUMP:
+    // STR_JUMP 不放行:simplify 无 Unicode 比较降级,守卫纯付风险
+    // 零回报——v26 实测字符串比较密集族回归(tomli_loads −14%/
+    // django_template −5%),INT/FLOAT 数值族净正(float +3.8%)。
 #endif
 #if PY_VERSION_HEX >= 0x030C0000
 #endif

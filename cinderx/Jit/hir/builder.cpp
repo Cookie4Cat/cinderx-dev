@@ -3232,10 +3232,6 @@ void HIRBuilder::emitCompareOp(
           tc.emit<GuardType>(right, TLongExact, right, tc.frame);
         }
         break;
-      case COMPARE_OP_STR_JUMP:
-        tc.emit<GuardType>(left, TUnicodeExact, left, tc.frame);
-        tc.emit<GuardType>(right, TUnicodeExact, right, tc.frame);
-        break;
 #endif
       default:
         break;
