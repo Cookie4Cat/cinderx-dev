@@ -33,17 +33,33 @@ constexpr size_t kAllocSize = 1024 * 1024 * 2;
 // Allocate memory for JIT'd code.
 uint8_t* allocPages(size_t size) {
 #ifndef WIN32
-  void* res = mmap(
+  // 2MiB 对齐(系统工程轮③):THP(madvise 模式)只回填 2MiB 对齐
+  // 窗口,匿名 mmap 不保证对齐——未对齐的 2MiB 块内不含任何对齐
+  // 窗口,MADV_HUGEPAGE 实际零生效(smaps AnonHugePages=0 实录)。
+  // 超额 kAllocSize 分配后裁剪首尾,保证起址 2MiB 对齐。
+  size_t padded = size + kAllocSize;
+  void* raw = mmap(
       nullptr,
-      size,
+      padded,
       PROT_EXEC | PROT_READ | PROT_WRITE,
       MAP_PRIVATE | MAP_ANONYMOUS,
       -1,
       0);
   JIT_CHECK(
-      res != MAP_FAILED,
+      raw != MAP_FAILED,
       "Failed to allocate {} bytes of memory for code",
-      size);
+      padded);
+  uintptr_t base = reinterpret_cast<uintptr_t>(raw);
+  uintptr_t aligned = (base + kAllocSize - 1) & ~(kAllocSize - 1);
+  size_t head = aligned - base;
+  if (head != 0) {
+    munmap(raw, head);
+  }
+  size_t tail = padded - head - size;
+  if (tail != 0) {
+    munmap(reinterpret_cast<void*>(aligned + size), tail);
+  }
+  void* res = reinterpret_cast<void*>(aligned);
 #else
   void* res = VirtualAlloc(
       nullptr, size, MEM_COMMIT | MEM_RESERVE, PAGE_EXECUTE_READWRITE);
