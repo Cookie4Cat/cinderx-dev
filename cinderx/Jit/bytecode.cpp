@@ -197,13 +197,18 @@ int BytecodeInstruction::specializedOpcode() const {
     case COMPARE_OP_FLOAT:
     case COMPARE_OP_INT:
     case COMPARE_OP_STR:
+#endif
 #if PY_VERSION_HEX < 0x030C0000
     // 3.11 的比较特化名带 _JUMP 后缀(COMPARE_OP 融合轮):不入白名单
-    // 则被打回生形,builder 的类型守卫发射永不可达。
+    // 则被打回生形,builder 的类型守卫发射永不可达。前一版嵌套在
+    // >=3.12 守卫内被预处理吃掉(定罪实录)。上方"提前 quickening 轮
+    // raytrace 191.8 vs 124.6"判决成立于 despec 诞生同轮——本轮为
+    // despec 武装态下的受控重测,若风暴复现即回摘。
     case COMPARE_OP_FLOAT_JUMP:
     case COMPARE_OP_INT_JUMP:
     case COMPARE_OP_STR_JUMP:
 #endif
+#if PY_VERSION_HEX >= 0x030C0000
 #endif
 #if PY_VERSION_HEX >= 0x030E0000
     case TO_BOOL_BOOL:
