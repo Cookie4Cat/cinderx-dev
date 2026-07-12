@@ -1,6 +1,8 @@
 // Copyright (c) Meta Platforms, Inc. and affiliates.
 
 #include "cinderx/Jit/jit_rt.h"
+#include "cinderx/Common/code.h"
+#include "cinderx/Common/code_extra.h"
 
 #include "internal/pycore_call.h"
 #include "internal/pycore_ceval.h"
@@ -152,7 +154,41 @@ static int JITRT_BindKeywordArgs(
 
   // Handle keyword arguments passed as two strided arrays
   if (kwnames != nullptr) {
-    for (Py_ssize_t i = 0; i < PyTuple_Size(kwnames); i++) {
+    Py_ssize_t nkw = PyTuple_Size(kwnames);
+    // kwnames 绑定缓存(sqla 三残项轮③):命中判据=逐索引 kwname 身份
+    // 相等(比较活元组条目,缓存指针只比较不解引用,ABA 构造性安全,
+    // 见 code_extra.h)。命中后仅剩槽位直store+重复检查(与慢路径
+    // kw_found 同语义),消 nkw×total_args 扫描。
+    constexpr Py_ssize_t kKwBindCap =
+        static_cast<Py_ssize_t>(sizeof(((CodeExtra*)0)->kwbind_slots));
+    CodeExtra* kw_extra = nullptr;
+    bool kw_cacheable = false;
+    uint8_t kw_slots_tmp[kKwBindCap];
+    if (nkw > 0 && nkw <= kKwBindCap && total_args <= 255 &&
+        !(co->co_flags & (CO_VARARGS | CO_VARKEYWORDS))) {
+      kw_extra = codeExtraIfExists(co);
+      if (kw_extra != nullptr &&
+          kw_extra->kwbind_nkw == static_cast<uint16_t>(nkw)) {
+        Py_ssize_t i = 0;
+        for (; i < nkw; i++) {
+          if (PyTuple_GET_ITEM(kwnames, i) != kw_extra->kwbind_names[i]) {
+            break;
+          }
+        }
+        if (i == nkw) {
+          for (i = 0; i < nkw; i++) {
+            Py_ssize_t j = kw_extra->kwbind_slots[i];
+            if (arg_space[j] != nullptr) {
+              return 0;
+            }
+            arg_space[j] = args[argcount + i];
+          }
+          goto kw_bound;
+        }
+      }
+      kw_cacheable = true;
+    }
+    for (Py_ssize_t i = 0; i < nkw; i++) {
       PyObject* keyword = PyTuple_GET_ITEM(kwnames, i);
       PyObject* value = args[argcount + i];
       Py_ssize_t j;
@@ -169,6 +205,9 @@ static int JITRT_BindKeywordArgs(
           goto kw_found;
         }
       }
+
+      // 富比较命中/落 kwdict 的形态不缓存(身份判据不成立)。
+      kw_cacheable = false;
 
       // Slow fallback, just in case
       for (j = co->co_posonlyargcount; j < total_args; j++) {
@@ -191,7 +230,19 @@ static int JITRT_BindKeywordArgs(
         return 0;
       }
       arg_space[j] = value;
+      if (kw_cacheable) {
+        kw_slots_tmp[i] = static_cast<uint8_t>(j);
+      }
     }
+    if (kw_cacheable && kw_extra != nullptr) {
+      // last-wins 单条目填充(GIL 下顺序写即可;读者同 GIL)。
+      for (Py_ssize_t i = 0; i < nkw; i++) {
+        kw_extra->kwbind_names[i] = PyTuple_GET_ITEM(kwnames, i);
+        kw_extra->kwbind_slots[i] = kw_slots_tmp[i];
+      }
+      kw_extra->kwbind_nkw = static_cast<uint16_t>(nkw);
+    }
+  kw_bound:;
   }
 
   // Check the number of positional arguments

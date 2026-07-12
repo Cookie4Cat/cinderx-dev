@@ -2116,6 +2116,8 @@ void NativeGenerator::emitAarch64StoreAttrInvokeStub(
   Label slow_path = as_->newLabel();
   Label do_store = as_->newLabel();
   Label ret_zero = as_->newLabel();
+  // kind-6 成员写共享块入口(条目侧装载 memberdef 后跳入)。
+  Label kind6_sa = as_->newLabel();
 
   // 3.11 写侧内联快路径（go 三件套②）。条目判据与读侧 stub 一致
   // （类型指针 + VALID/版本拉校验 + kSplitInlineKnownOffset）；命中
@@ -2310,6 +2312,26 @@ void NativeGenerator::emitAarch64StoreAttrInvokeStub(
     // values_insert 的 x15 非零判定回落 helper）。hint 与读侧共用，
     // helper 写侧同步刷新。
     as_->bind(kind7_sa);
+    // kind-6(kMemberDescr)分流:装载本条目 memberdef 入 x9 后进共享
+    // 写块(__slots__ 成员店,sqla 直方图 10.5k/趟)。
+    Label not_kind6 = as_->newLabel();
+    arch::cmp_immediate(
+        as_,
+        a64::x14,
+        jit::AttributeMutator::memberDescrKind() -
+            (kSplitInlineKnownOffsetKind - 1));
+    as_->b_ne(not_kind6);
+    as_->ldr(
+        a64::x9,
+        arch::ptr_offset(
+            a64::x0,
+            static_cast<int>(
+                jit::AttributeCache::entriesOffset() +
+                jit::AttributeMutator::memberDefOffset()) +
+                entry_offset));
+    as_->cbz(a64::x9, slow_path);
+    as_->b(kind6_sa);
+    as_->bind(not_kind6);
     arch::cmp_immediate(
         as_,
         a64::x14,
@@ -2487,6 +2509,49 @@ void NativeGenerator::emitAarch64StoreAttrInvokeStub(
   arch::add_immediate(as_, a64::x10, a64::x10, 1);
   as_->str(a64::x10, arch::ptr_offset(a64::x3, kRefcountOffset));
   as_->str(a64::x3, a64::ptr(a64::x14));
+  as_->b(ret_zero);
+
+  // ---- kind-6 成员写(PyMember_SetOne 的 T_OBJECT_EX 行内形)。进入
+  // 约定:x9=memberdef,x1=obj,x3=value。只收 T_OBJECT_EX 且 flags==0
+  //(READONLY 等回落);删除形(value==NULL)回落 helper。旧值末引用
+  //(refcnt==1)回落——行内不做 dealloc(任意重入)。序:预检旧值
+  // 计数→减旧→增新→店;old==value 别名时 N≥2 恒成立,先减后增
+  // 净零,与 helper 端逐笔访存语义一致。----
+  as_->bind(kind6_sa);
+  as_->cbz(a64::x3, slow_path);
+  as_->ldr(
+      a64::w10,
+      arch::ptr_offset(
+          a64::x9,
+          static_cast<int32_t>(offsetof(PyMemberDef, type)),
+          arch::AccessSize::k32));
+  arch::cmp_immediate(as_, a64::x10, T_OBJECT_EX);
+  as_->b_ne(slow_path);
+  as_->ldr(
+      a64::w10,
+      arch::ptr_offset(
+          a64::x9,
+          static_cast<int32_t>(offsetof(PyMemberDef, flags)),
+          arch::AccessSize::k32));
+  as_->cbnz(a64::w10, slow_path);
+  as_->ldr(
+      a64::x10,
+      arch::ptr_offset(
+          a64::x9, static_cast<int32_t>(offsetof(PyMemberDef, offset))));
+  as_->add(a64::x10, a64::x1, a64::x10);
+  as_->ldr(a64::x12, a64::ptr(a64::x10));
+  Label k6_store = as_->newLabel();
+  as_->cbz(a64::x12, k6_store);
+  as_->ldr(a64::x14, arch::ptr_offset(a64::x12, kRefcountOffset));
+  arch::cmp_immediate(as_, a64::x14, 1);
+  as_->b_eq(slow_path);
+  arch::sub_immediate(as_, a64::x14, a64::x14, 1);
+  as_->str(a64::x14, arch::ptr_offset(a64::x12, kRefcountOffset));
+  as_->bind(k6_store);
+  as_->ldr(a64::x14, arch::ptr_offset(a64::x3, kRefcountOffset));
+  arch::add_immediate(as_, a64::x14, a64::x14, 1);
+  as_->str(a64::x14, arch::ptr_offset(a64::x3, kRefcountOffset));
+  as_->str(a64::x3, a64::ptr(a64::x10));
   as_->b(ret_zero);
 
   as_->bind(slow_path);

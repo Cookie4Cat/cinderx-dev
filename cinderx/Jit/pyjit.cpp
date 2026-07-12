@@ -1379,6 +1379,14 @@ FlagProcessor initFlagProcessor() {
       "repeated guard-failure deopts (3.11).");
 
   flag_processor.addOption(
+      "jit-sync-gen-min-units",
+      "PYTHONJITSYNCGENMINUNITS",
+      getMutableConfig().sync_gen_min_units,
+      "Auto-compile synchronous generators whose bytecode unit count is at "
+      "least this threshold (3.11; 0 disables size-gated generator "
+      "compilation).");
+
+  flag_processor.addOption(
       "jit-compile-sync-generators",
       "PYTHONJITCOMPILESYNCGENERATORS",
       getMutableConfig().compile_sync_generators,
@@ -5104,12 +5112,18 @@ static bool ci_autoJit311AllowsCode(PyCodeObject* code) {
   if (code == nullptr) {
     return true;
   }
-  // 同步生成器默认不自动编译（编译净效应为负，见 config.h 注释）；
-  // 协程/异步生成器位含协程语义，不在此列。
-  if (!jit::getConfig().compile_sync_generators &&
-      (code->co_flags & CO_GENERATOR) &&
-      !(code->co_flags & (CO_COROUTINE | CO_ASYNC_GENERATOR))) {
-    return false;
+  // 同步生成器按体量分型自动编译（生成器二榨轮）：大体量生成器
+  // （模板流水线形）每 yield 工作量足以摊薄恢复仪式，编译净正；
+  // 琐碎体（紧 yield 循环）维持解释（原判决面）。协程/异步生成器
+  // 位含协程语义，不在此列。
+  if ((code->co_flags & CO_GENERATOR) &&
+      !(code->co_flags & (CO_COROUTINE | CO_ASYNC_GENERATOR)) &&
+      !jit::getConfig().compile_sync_generators) {
+    size_t min_units = jit::getConfig().sync_gen_min_units;
+    if (min_units == 0 ||
+        static_cast<size_t>(Py_SIZE(code)) < min_units) {
+      return false;
+    }
   }
   if (code->co_filename == nullptr || !PyUnicode_Check(code->co_filename)) {
     return true;
