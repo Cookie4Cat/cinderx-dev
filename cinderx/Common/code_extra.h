@@ -93,6 +93,17 @@ typedef struct CodeExtra {
   // 每实例仅调用数次）的挂接税由此封顶，稳定小实例集（deepcopy 型）
   // 获得全额收益。
   uint32_t fresh_attach_count;
+  // kwnames 绑定缓存(sqla 三残项轮③):被调方侧记录"kwname 身份序列
+  // →槽位"映射,消 JITRT_BindKeywordArgs 的每 kwname×total_args 扫描
+  // (调用位点 kwnames 为 LOAD_CONST 元组,名字驻留,指针身份稳定)。
+  // 无所有权设计:kwbind_names 为借用指针、只比较不解引用,命中判据
+  // =逐索引与活元组条目身份相等——元组亡后地址复用(ABA)下,同名
+  // 驻留串同指针,比对通过即映射构造性正确;名字不同则比对失败落
+  // 慢路径。仅缓存快速指针比对全命中且无 varargs/varkw 的形态,
+  // 富比较回落形不缓存。last-wins 单条目。
+  uint16_t kwbind_nkw;
+  uint8_t kwbind_slots[10];
+  void* kwbind_names[10];
 } CodeExtra;
 
 #define CI_CODE_EXTRA_AUTO_JIT_DISABLED 1
