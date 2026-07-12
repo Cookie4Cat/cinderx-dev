@@ -201,6 +201,13 @@ struct Config {
   //（协程编译净效应 +13%，且 D6 本就禁编协程本体）。force_compile
   // 不受限。yield 点溅射瘦身落地后可重估。
   bool compile_sync_generators{false};
+  // 同步生成器按体量分型自动编译(生成器二榨轮):码元数(Py_SIZE)
+  // ≥阈值才入编译面——大体量生成器(模板流水线,genshi __call__ 形
+  // 288-945 码元)每 yield 工作量足以摊薄恢复仪式(实测 genshi
+  // −10%),琐碎体(紧 yield 循环,generators 基准 56 码元)编译净负
+  // +58% 维持解释。0=关闭体量门(回到全不编);compile_sync_generators
+  // =true 时无视阈值全编(研究口径)。
+  size_t sync_gen_min_units{128};
   // Enable OSR hot-loop detection. OSR is production-off by default and must
   // be explicitly enabled by -X osr-enabled or CINDERX_OSR_ENABLED.
   bool osr_enabled{false};
