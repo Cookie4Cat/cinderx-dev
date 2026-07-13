@@ -607,6 +607,7 @@ _is_init: bool = False
 
 _AUTOJIT_IMPORT_PROVIDER_MARKER = "_cinderx_autojit_import_provider"
 _AUTOJIT_SETUP_PROVIDER_MARKER = "_cinderx_autojit_setup_provider"
+_AUTOJIT_SETUP_THREAD_DEPTH_ATTR = "_cinderx_autojit_setup_depth"
 
 
 def _is_autojit_classification_value(value: object) -> bool:
@@ -658,14 +659,32 @@ def _autojit_setup_predicate_matches(
     return predicate(args[0])
 
 
+def _autojit_suppress_internal_wrapper(wrapper: object) -> object:
+    cinderjit = sys.modules.get("cinderjit")
+    suppress = getattr(cinderjit, "jit_suppress", None)
+    if suppress is not None:
+        try:
+            # pyre-ignore[29]: Optional runtime hook from cinderjit.
+            suppress(wrapper)
+        except Exception:
+            pass
+    return wrapper
+
+
 def _make_autojit_setup_wrapper(
     original: object, provider: str, predicate: object | None = None
 ) -> object:
     def wrapper(*args: object, **kwargs: object) -> object:
-        if not _autojit_setup_predicate_matches(predicate, args):
+        _autojit_setup_enter()
+        try:
+            matches = _autojit_setup_predicate_matches(predicate, args)
+        except BaseException:
+            _autojit_setup_leave()
+            raise
+        if not matches:
+            _autojit_setup_leave()
             # pyre-ignore[29]: The wrapped setup callable is dynamically chosen.
             return original(*args, **kwargs)
-        _autojit_setup_enter()
         try:
             # pyre-ignore[29]: The wrapped setup callable is dynamically chosen.
             return original(*args, **kwargs)
@@ -674,17 +693,23 @@ def _make_autojit_setup_wrapper(
 
     setattr(wrapper, _AUTOJIT_SETUP_PROVIDER_MARKER, provider)
     setattr(wrapper, "__wrapped__", original)
-    return wrapper
+    return _autojit_suppress_internal_wrapper(wrapper)
 
 
 def _make_autojit_setup_enter_wrapper(
     original: object, provider: str, predicate: object | None = None
 ) -> object:
     def wrapper(*args: object, **kwargs: object) -> object:
-        if not _autojit_setup_predicate_matches(predicate, args):
+        _autojit_setup_enter()
+        try:
+            matches = _autojit_setup_predicate_matches(predicate, args)
+        except BaseException:
+            _autojit_setup_leave()
+            raise
+        if not matches:
+            _autojit_setup_leave()
             # pyre-ignore[29]: The wrapped setup callable is dynamically chosen.
             return original(*args, **kwargs)
-        _autojit_setup_enter()
         try:
             # pyre-ignore[29]: The wrapped setup callable is dynamically chosen.
             return original(*args, **kwargs)
@@ -694,7 +719,7 @@ def _make_autojit_setup_enter_wrapper(
 
     setattr(wrapper, _AUTOJIT_SETUP_PROVIDER_MARKER, provider)
     setattr(wrapper, "__wrapped__", original)
-    return wrapper
+    return _autojit_suppress_internal_wrapper(wrapper)
 
 
 def _make_autojit_setup_leave_wrapper(
@@ -712,7 +737,7 @@ def _make_autojit_setup_leave_wrapper(
 
     setattr(wrapper, _AUTOJIT_SETUP_PROVIDER_MARKER, provider)
     setattr(wrapper, "__wrapped__", original)
-    return wrapper
+    return _autojit_suppress_internal_wrapper(wrapper)
 
 
 def _is_process_pool_instance(obj: object) -> bool:
@@ -739,7 +764,146 @@ def _wrap_autojit_setup_attr(
     setattr(target, attr, make_wrapper(current, provider, predicate))
 
 
+def _install_autojit_threading_setup_provider() -> None:
+    threading = sys.modules.get("threading")
+    if threading is None:
+        return
+    thread = getattr(threading, "Thread", None)
+    if thread is None:
+        return
+
+    def make_start_wrapper(
+        original: object, provider: str, predicate: object | None = None
+    ) -> object:
+        def wrapper(self: object, *args: object, **kwargs: object) -> object:
+            depth = _autojit_setup_depth()
+            if depth:
+                setattr(self, _AUTOJIT_SETUP_THREAD_DEPTH_ATTR, depth)
+            # pyre-ignore[29]: The wrapped threading method is dynamically chosen.
+            return original(self, *args, **kwargs)
+
+        setattr(wrapper, _AUTOJIT_SETUP_PROVIDER_MARKER, provider)
+        setattr(wrapper, "__wrapped__", original)
+        return _autojit_suppress_internal_wrapper(wrapper)
+
+    def make_bootstrap_wrapper(
+        original: object, provider: str, predicate: object | None = None
+    ) -> object:
+        def wrapper(self: object, *args: object, **kwargs: object) -> object:
+            depth = getattr(self, _AUTOJIT_SETUP_THREAD_DEPTH_ATTR, 0)
+            if not isinstance(depth, int) or depth <= 0:
+                # pyre-ignore[29]: The wrapped threading method is dynamically chosen.
+                return original(self, *args, **kwargs)
+            for _ in range(depth):
+                _autojit_setup_enter()
+            try:
+                # pyre-ignore[29]: The wrapped threading method is dynamically chosen.
+                return original(self, *args, **kwargs)
+            finally:
+                for _ in range(depth):
+                    _autojit_setup_leave()
+
+        setattr(wrapper, _AUTOJIT_SETUP_PROVIDER_MARKER, provider)
+        setattr(wrapper, "__wrapped__", original)
+        return _autojit_suppress_internal_wrapper(wrapper)
+
+    provider = "threading_setup"
+    _wrap_autojit_setup_attr(thread, "start", provider, make_start_wrapper)
+    _wrap_autojit_setup_attr(thread, "_bootstrap", provider, make_bootstrap_wrapper)
+
+
+def _install_autojit_multiprocessing_cleanup_provider() -> None:
+    util = sys.modules.get("multiprocessing.util")
+    if util is not None:
+        afterfork_registry = getattr(util, "_afterfork_registry", None)
+        remove = getattr(afterfork_registry, "_remove", None)
+        if remove is not None:
+            _autojit_suppress_internal_wrapper(remove)
+
+        finalize = getattr(util, "Finalize", None)
+        if finalize is not None:
+            _wrap_autojit_setup_attr(
+                finalize,
+                "__call__",
+                "multiprocessing_pool",
+                _make_autojit_setup_wrapper,
+            )
+        for attr in ("close_fds", "debug", "sub_debug"):
+            _wrap_autojit_setup_attr(
+                util,
+                attr,
+                "multiprocessing_pool",
+                _make_autojit_setup_wrapper,
+            )
+
+    connection = sys.modules.get("multiprocessing.connection")
+    if connection is not None:
+        base = getattr(connection, "_ConnectionBase", None)
+        if base is not None:
+            _wrap_autojit_setup_attr(
+                base,
+                "__del__",
+                "multiprocessing_pool",
+                _make_autojit_setup_wrapper,
+            )
+        conn = getattr(connection, "Connection", None)
+        if conn is not None:
+            _wrap_autojit_setup_attr(
+                conn,
+                "_close",
+                "multiprocessing_pool",
+                _make_autojit_setup_wrapper,
+            )
+
+    def make_weakref_init_wrapper(
+        original: object, provider: str, predicate: object | None = None
+    ) -> object:
+        def wrapper(self: object, *args: object, **kwargs: object) -> object:
+            # pyre-ignore[29]: The wrapped weakref initializer is dynamic.
+            result = original(self, *args, **kwargs)
+            if _autojit_setup_depth() > 0:
+                remove = getattr(self, "_remove", None)
+                if remove is not None:
+                    _autojit_suppress_internal_wrapper(remove)
+            return result
+
+        setattr(wrapper, _AUTOJIT_SETUP_PROVIDER_MARKER, provider)
+        setattr(wrapper, "__wrapped__", original)
+        return _autojit_suppress_internal_wrapper(wrapper)
+
+    weakref_mod = sys.modules.get("weakref")
+    if weakref_mod is not None:
+        weak_value_dict = getattr(weakref_mod, "WeakValueDictionary", None)
+        if weak_value_dict is not None:
+            _wrap_autojit_setup_attr(
+                weak_value_dict,
+                "__init__",
+                "multiprocessing_pool",
+                make_weakref_init_wrapper,
+            )
+
+    weakrefset_mod = sys.modules.get("_weakrefset")
+    if weakrefset_mod is not None:
+        weak_set = getattr(weakrefset_mod, "WeakSet", None)
+        if weak_set is not None:
+            _wrap_autojit_setup_attr(
+                weak_set,
+                "__init__",
+                "multiprocessing_pool",
+                make_weakref_init_wrapper,
+            )
+
+    threading = sys.modules.get("threading")
+    if threading is not None:
+        dangling = getattr(threading, "_dangling", None)
+        remove = getattr(dangling, "_remove", None)
+        if remove is not None:
+            _autojit_suppress_internal_wrapper(remove)
+
+
 def _install_autojit_multiprocessing_pool_provider(module: object) -> None:
+    _install_autojit_threading_setup_provider()
+    _install_autojit_multiprocessing_cleanup_provider()
     pool = getattr(module, "Pool", None)
     if pool is not None:
         _wrap_autojit_setup_attr(
@@ -780,6 +944,40 @@ def _install_autojit_multiprocessing_pool_provider(module: object) -> None:
             )
 
 
+def _install_autojit_subprocess_popen_provider(module: object) -> None:
+    popen = getattr(module, "Popen", None)
+    if popen is None:
+        return
+
+    provider = "subprocess_popen"
+    for attr in (
+        "__init__",
+        "__enter__",
+        "__exit__",
+        "__del__",
+        "wait",
+        "_wait",
+        "_try_wait",
+        "_internal_poll",
+        "_execute_child",
+        "_get_handles",
+        "_close_pipe_fds",
+    ):
+        _wrap_autojit_setup_attr(
+            popen,
+            attr,
+            provider,
+            _make_autojit_setup_wrapper,
+        )
+
+    _wrap_autojit_setup_attr(
+        module,
+        "_cleanup",
+        provider,
+        _make_autojit_setup_wrapper,
+    )
+
+
 def _maybe_install_autojit_setup_provider_for_module(
     fullname: str, provider: str | None = None
 ) -> None:
@@ -809,6 +1007,11 @@ def _maybe_install_autojit_setup_provider_for_module(
         module = sys.modules.get("multiprocessing.pool")
         if module is not None:
             _install_autojit_multiprocessing_pool_provider(module)
+
+    if "subprocess_popen" in providers and fullname == "subprocess":
+        module = sys.modules.get("subprocess")
+        if module is not None:
+            _install_autojit_subprocess_popen_provider(module)
 
 
 def _make_autojit_import_wrapper(original: object, provider: str) -> object:
@@ -871,6 +1074,7 @@ def init() -> None:
     _install_autojit_import_provider()
     _maybe_install_autojit_setup_provider_for_module("lib2to3.main")
     _maybe_install_autojit_setup_provider_for_module("multiprocessing.pool")
+    _maybe_install_autojit_setup_provider_for_module("subprocess")
 
     _is_init = True
 

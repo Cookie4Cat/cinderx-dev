@@ -660,6 +660,14 @@ PyObject* jitVectorcall(
   // limit is reached.
   if (auto limit = getConfig().compile_after_n_calls; limit.has_value()) {
     AutoJitGateState state = readAutoJitGateState(code);
+#if PY_VERSION_HEX < 0x030C0000
+    if (state.context.import_phase || state.context.setup_phase) {
+      incAutoJitGateStat(g_auto_jit_gate_stats.global_threshold_return);
+      auto entry = getInterpretedVectorcall(func);
+      setVectorcall(func, entry);
+      return entry(func_obj, stack, nargsf, kwnames);
+    }
+#endif
     if (state.calls < *limit) {
       incAutoJitGateStat(g_auto_jit_gate_stats.global_threshold_return);
       auto entry = getInterpretedVectorcall(func);
@@ -5632,6 +5640,9 @@ extern "C" void Ci_AutoJitCountFramePush311(
   // 全局结构直读,非成本中心。
   const std::optional<size_t> limit = jit::getConfig().compile_after_n_calls;
   if (!limit.has_value()) {
+    return;
+  }
+  if (jit::autoJitImportDepth() > 0 || jit::autoJitSetupDepth() > 0) {
     return;
   }
   PyFunctionObject* func = frame->f_func;
