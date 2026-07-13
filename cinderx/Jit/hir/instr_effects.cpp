@@ -69,6 +69,7 @@ MemoryEffects memoryEffects(const Instr& inst) {
     case Opcode::kUnicodeRepeat:
     case Opcode::kUnicodeSubscr:
     case Opcode::kUnreachable:
+    case Opcode::kUseObj:
     case Opcode::kUseType:
     case Opcode::kWaitHandleLoadCoroOrResult:
     case Opcode::kWaitHandleLoadWaiter:
@@ -478,6 +479,7 @@ bool hasArbitraryExecution(const Instr& inst) {
     case Opcode::kUnicodeSubscr:
     case Opcode::kUnreachable:
     case Opcode::kUpdatePrevInstr:
+    case Opcode::kUseObj:
     case Opcode::kUseType:
     case Opcode::kWaitHandleLoadCoroOrResult:
     case Opcode::kWaitHandleLoadWaiter:
