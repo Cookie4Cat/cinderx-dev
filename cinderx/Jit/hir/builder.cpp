@@ -3214,6 +3214,25 @@ void HIRBuilder::emitCompareOp(
         tc.emit<GuardType>(left, TUnicodeExact, left, tc.frame);
         tc.emit<GuardType>(right, TUnicodeExact, right, tc.frame);
         break;
+#if PY_VERSION_HEX < 0x030C0000
+      // 3.11 的比较特化名带 _JUMP 后缀(解释器把后随 POP_JUMP 融合
+      // 执行;字节码流中跳转仍是独立指令,builder 照常翻译,无需在此
+      // 复刻融合)。守卫语义:INT 形解释器要求双单 digit,GuardType
+      // TLongExact 更宽且对 LongCompare 正确性充分;STR 形解释器仅
+      // 特化 Eq/Ne,类型守卫对任意 op 无害(simplify 按 op 支持面
+      // 决定是否降级)。(COMPARE_OP 融合轮,普查最宽缺口——泛型
+      // RichCompare 在 B0 剖面 3-7%。)
+      case COMPARE_OP_FLOAT_JUMP:
+        tc.emit<GuardType>(left, TFloatExact, left, tc.frame);
+        tc.emit<GuardType>(right, TFloatExact, right, tc.frame);
+        break;
+      case COMPARE_OP_INT_JUMP:
+        if (specialize_int_guards) {
+          tc.emit<GuardType>(left, TLongExact, left, tc.frame);
+          tc.emit<GuardType>(right, TLongExact, right, tc.frame);
+        }
+        break;
+#endif
       default:
         break;
     }
