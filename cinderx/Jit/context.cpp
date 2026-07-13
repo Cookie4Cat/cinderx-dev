@@ -972,6 +972,15 @@ bool isRecursionGuardVectorcall(vectorcallfunc entry) {
 
 vectorcallfunc jitVectorcallEntryBase(BorrowedRef<PyFunctionObject> func) {
 #if PY_VERSION_HEX < 0x030C0000
+  // 转正后的编译函数 vectorcall 槽即裸生成代码入口（试用晋升时安装），
+  // kwargs/缺省补齐/静态直派等入口胶水据此免查编译表；仅试用期背
+  // 递归守卫包装的函数仍经上下文解析真实入口。守卫包装之外的槽值
+  // 与查表结果逐态一致：已编译转正即槽内裸入口，未编译查表亦落空
+  // 返回原槽值。
+  vectorcallfunc vc = func->vectorcall;
+  if (!isRecursionGuardVectorcall(vc)) {
+    return vc;
+  }
   if (Context* ctx = getContext()) {
     if (CompiledFunction* compiled = ctx->lookupFunc(func)) {
       return compiled->vectorcallEntry();
