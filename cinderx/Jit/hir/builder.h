@@ -316,6 +316,7 @@ class HIRBuilder {
       CFG& cfg,
       TranslationContext& tc,
       Register* container,
+      char expected,
       BasicBlock* slow_path);
   void emitInPlaceOp(
       TranslationContext& tc,

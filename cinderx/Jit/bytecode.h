@@ -44,6 +44,14 @@ class BytecodeInstruction {
   // variant for guard selection.
   int opcode() const;
   int specializedOpcode() const;
+  // True when this is a BINARY_SUBSCR/STORE_SUBSCR site whose adaptive
+  // specialization was attempted and failed (3.11: raw opcode still
+  // *_ADAPTIVE with the cache counter's backoff nibble past its initial
+  // value). Failure means the container matched none of the interpreter's
+  // specializable shapes (list/tuple/dict/__getitem__ class), which is
+  // discriminating evidence for containers like array.array that only the
+  // JIT fast path can serve. Always false on 3.12+.
+  bool isSubscrAdaptiveStuck() const;
   int oparg() const;
   uint16_t cacheU16(int instruction_offset) const;
   uint32_t cacheU32(int instruction_offset) const;

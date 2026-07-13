@@ -209,6 +209,11 @@ int BytecodeInstruction::specializedOpcode() const {
     // STR_JUMP 不放行:simplify 无 Unicode 比较降级,守卫纯付风险
     // 零回报——v26 实测字符串比较密集族回归(tomli_loads −14%/
     // django_template −5%),INT/FLOAT 数值族净正(float +3.8%)。
+    // 下标写侧特化形(异常带轮):读侧 BINARY_SUBSCR_LIST_INT 早已
+    // 放行且 simplify 有完整定型下沉,写侧此前缺席——list 元素写
+    // 一律走泛型 helper。放行后 builder 发类型守卫,simplify 落成
+    // 行内存储(收养旧值+锚定后置 decref,见 simplifyStoreSubscr)。
+    case STORE_SUBSCR_LIST_INT:
 #endif
 #if PY_VERSION_HEX >= 0x030C0000
 #endif
@@ -237,6 +242,25 @@ int BytecodeInstruction::specializedOpcode() const {
     default:
       return unspecialize(opcode);
   }
+}
+
+bool BytecodeInstruction::isSubscrAdaptiveStuck() const {
+#if PY_VERSION_HEX < 0x030C0000
+  int raw = _Py_OPCODE(codeUnit(code_)[opcodeIndex().value()]);
+  if (raw != BINARY_SUBSCR_ADAPTIVE && raw != STORE_SUBSCR_ADAPTIVE) {
+    return false;
+  }
+  // 计数器低 4 位是 backoff 档。3.11 的 _PyCode_Quicken 将计数器
+  // 清零("Make sure the adaptive counter is zero"),首次执行即尝试
+  // 特化:成功则替换 opcode(不再是 ADAPTIVE 形),失败则
+  // adaptive_counter_backoff 置 backoff≥1。故仍为 ADAPTIVE 形且
+  // backoff 非零 ⇔ 至少尝试过一次且失败(或特化后因 miss 回退),
+  // backoff 为零 ⇔ 自 quicken 起从未执行——排除冷位点假阳性。
+  uint16_t counter = cacheU16(kInlineCacheStartInstructionOffset);
+  return (counter & ((1 << ADAPTIVE_BACKOFF_BITS) - 1)) != 0;
+#else
+  return false;
+#endif
 }
 
 int BytecodeInstruction::oparg() const {

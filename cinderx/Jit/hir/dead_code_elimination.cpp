@@ -9,7 +9,10 @@ namespace jit::hir {
 namespace {
 
 bool isUseful(Instr& instr) {
-  return instr.IsTerminator() || instr.IsSnapshot() ||
+  // UseObj is a pure liveness anchor: it has no output and no store
+  // effects, so it must be kept explicitly or the refcount pass would
+  // release its operand too early.
+  return instr.IsTerminator() || instr.IsSnapshot() || instr.IsUseObj() ||
       (instr.asDeoptBase() != nullptr && !instr.IsPrimitiveBox()) ||
       (!instr.IsPhi() && memoryEffects(instr).may_store != AEmpty);
 }
