@@ -141,13 +141,15 @@ ENABLE_DISASSEMBLER 构建）。
 ```bash
 # 冒烟四件（docs/dryrun/smoke/，拷入容器后 PYTHONJITAUTO=0 逐个跑）
 smoke_laggards.py  smoke_ic_round.py  smoke_frame_inline.py  smoke_entry_guard.py
-# 差分门禁（分钟级）
-cd /src/scratch/m4-diffgate && python3.11 run_diffgate.py --corpus corpus \
-  --out out/report.json --baseline /src/docs/dryrun/m8-diffgate-baseline.json
+# 差分门禁（分钟级；工具与语料已收编 git 于 docs/dryrun/gates/，
+# scratch/ 副本仅预演机残留，迁移后以 gates/ 为准）
+cd /src/docs/dryrun/gates && python3.11 run_diffgate.py --corpus corpus \
+  --out /tmp/dg.json --baseline /src/docs/dryrun/m8-diffgate-baseline.json
 # refcount 矩阵（六组，interp/jit 两模式对比）
-python3.11 /src/docs/dryrun/refcount_matrix.py corpus <组名> <interp|jit> out.json
+python3.11 /src/docs/dryrun/refcount_matrix.py \
+  /src/docs/dryrun/gates/corpus corpus_<组名> <interp|jit> out.json
 # 基础 libtest 差分（基线内已知项：test_builtin 微漂移、test_scope 追踪中）
-cd /src/scratch/m2-libtest && python3.11 run_libtest_diff.py --out /tmp/lt.json \
+cd /src/docs/dryrun/gates && python3.11 run_libtest_diff.py --out /tmp/lt.json \
   --baseline baseline-m2-cp31113-microdrift.json
 # 3.14 反向编译（dryrun-m314 容器：cd /tmp/b314 && ninja _cinderx + 两个 smoke314）
 ```
