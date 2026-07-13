@@ -1,0 +1,28 @@
+# 基础 Lib/test 差分模块清单（M0 层：语言核心语义，快速、确定性、不依赖网络/进程）
+# 选择标准：测的是解释器而不是库。扩张随里程碑（M3 加 pdb/bdb，M7 加 pickle/copy）。
+test_grammar
+test_builtin
+test_types
+test_dict
+test_set
+test_list
+test_tuple
+test_slice
+test_int
+test_float
+test_exceptions
+test_raise
+test_call
+test_scope
+test_generators
+test_genexps
+test_listcomps
+test_dictcomps
+test_super
+test_property
+test_augassign
+test_with
+test_contextlib
+test_keywordonlyarg
+test_unpack
+test_unpack_ex
