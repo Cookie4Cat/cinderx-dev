@@ -2613,7 +2613,11 @@ LIRGenerator::TranslatedBlock LIRGenerator::TranslateOneBasicBlock(
 
         // Set to -1 in the error case.
         bbb.appendInstr(Instruction::kDec, instr->output());
-        bbb.switchBlock(done);
+        // appendBlock, not switchBlock: set_err needs an explicit CFG edge
+        // to done. Relying on layout-adjacency fallthrough leaves set_err
+        // with zero successors, and block reordering can then place it
+        // anywhere — control falls off its end into an unrelated block.
+        bbb.appendBlock(done);
         break;
       }
 

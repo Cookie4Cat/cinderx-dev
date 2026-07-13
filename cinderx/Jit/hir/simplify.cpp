@@ -255,6 +255,61 @@ Register* simplifyCheck(const CheckBase* instr) {
   return nullptr;
 }
 
+// Inline the index normalization and bounds test for sequences whose length
+// lives in the ob_size slot, keeping the raising helper on the out-of-bounds
+// slow arm only. PyUnicode qualifies by layout: PyASCIIObject::length
+// occupies the ob_size slot, which is also what the generic helper reads via
+// Py_SIZE.
+Register* trySimplifySequenceBoundsInline(
+    Env& env,
+    const CheckSequenceBounds* instr) {
+  Register* sequence = instr->GetOperand(0);
+  Register* idx = instr->GetOperand(1);
+  if (!(sequence->isA(TListExact) || sequence->isA(TTupleExact) ||
+        sequence->isA(TUnicodeExact)) ||
+      !idx->isA(TCInt64)) {
+    return nullptr;
+  }
+  const FrameState& frame = *instr->frameState();
+
+  Register* size = env.emit<LoadVarObjectSize>(sequence);
+  Register* zero = env.emit<LoadConst>(Type::fromCInt(0, TCInt64));
+  Register* is_neg =
+      env.emit<PrimitiveCompare>(PrimitiveCompareOp::kLessThan, idx, zero);
+  // adjusted = idx < 0 ? idx + size : idx
+  Register* adjusted = env.emitCond(
+      [&](BasicBlock* neg_bb, BasicBlock* pos_bb) {
+        env.emit<CondBranch>(is_neg, neg_bb, pos_bb);
+      },
+      [&] { return env.emit<IntBinaryOp>(BinaryOpKind::kAdd, idx, size); },
+      [&] { return idx; });
+  // The unsigned compare folds both range tests: a still-negative adjusted
+  // index wraps past every valid size.
+  Register* in_bounds = env.emit<PrimitiveCompare>(
+      PrimitiveCompareOp::kLessThanUnsigned, adjusted, size);
+  return env.emitCond(
+      [&](BasicBlock* fast_bb, BasicBlock* slow_bb) {
+        env.emit<CondBranch>(in_bounds, fast_bb, slow_bb);
+      },
+      [&] { return adjusted; },
+      [&] {
+        // Out of bounds: the helper re-derives the adjustment from the
+        // original index and raises exactly like the generic path. Calling
+        // it directly instead of re-emitting CheckSequenceBounds keeps this
+        // rewrite from re-simplifying its own slow arm.
+        Register* out = env.func.env.AllocateRegister();
+        env.emitRawInstr<CallStatic>(
+            2,
+            out,
+            reinterpret_cast<void*>(JITRT_CheckSequenceBounds),
+            TCInt64,
+            sequence,
+            idx);
+        env.emit<IsNegativeAndErrOccurred>(out, frame);
+        return out;
+      });
+}
+
 Register* simplifyCheckSequenceBounds(
     Env& env,
     const CheckSequenceBounds* instr) {
@@ -279,7 +334,42 @@ Register* simplifyCheckSequenceBounds(
       }
     }
   }
-  return nullptr;
+  return trySimplifySequenceBoundsInline(env, instr);
+}
+
+// Unbox a proven-exact-long index inline when it is compact (single 30-bit
+// digit), keeping the PyNumber_AsSsize_t helper on the slow arm for
+// multi-digit values so overflow raises the instruction's exception type
+// with the stock message. Downstream IsNegativeAndErrOccurred checks are
+// unaffected: the fast arm can produce legitimate negative indexes but
+// never sets an error.
+Register* simplifyIndexUnbox(Env& env, const IndexUnbox* instr) {
+  Register* value = instr->GetOperand(0);
+  if (!value->isA(TLongExact)) {
+    return nullptr;
+  }
+  Register* is_compact = env.emit<IsCompactLong>(value);
+  return env.emitCond(
+      [&](BasicBlock* fast_bb, BasicBlock* slow_bb) {
+        env.emit<CondBranch>(is_compact, fast_bb, slow_bb);
+      },
+      [&] { return env.emit<CompactLongUnbox>(value); },
+      [&] {
+        // Call the helper directly instead of re-emitting IndexUnbox so this
+        // rewrite does not re-simplify its own slow arm. Mirrors the LIR
+        // lowering: PyNumber_AsSsize_t(value, exception_type).
+        Register* exc = env.emit<LoadConst>(
+            Type::fromObject(BorrowedRef<>{instr->exception()}));
+        Register* out = env.func.env.AllocateRegister();
+        env.emitRawInstr<CallStatic>(
+            2,
+            out,
+            reinterpret_cast<void*>(PyNumber_AsSsize_t),
+            TCInt64,
+            value,
+            exc);
+        return out;
+      });
 }
 
 Register* simplifyGuardType(Env& env, const GuardType* instr) {
@@ -2815,7 +2905,12 @@ Register* simplifyInstr(Env& env, const Instr* instr) {
     case Opcode::kPrimitiveBoxBool:
       return simplifyPrimitiveBoxBool(
           env, static_cast<const PrimitiveBoxBool*>(instr));
-    case Opcode::kIndexUnbox:
+    case Opcode::kIndexUnbox: {
+      if (Register* result = simplifyUnbox(env, instr)) {
+        return result;
+      }
+      return simplifyIndexUnbox(env, static_cast<const IndexUnbox*>(instr));
+    }
     case Opcode::kPrimitiveUnbox:
       return simplifyUnbox(env, instr);
 
