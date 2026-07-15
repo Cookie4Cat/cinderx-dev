@@ -75,6 +75,7 @@ using namespace jit;
 extern "C" void* Ci_StockEntry311;
 // vendored 循环 [P6] 的 warmup 步进；定义见本文件尾。
 extern "C" int Ci_QuickenWarmupStep_311;
+extern "C" int Ci_SpecializeOwnEvalFrame311;
 #endif
 
 namespace {
@@ -1370,6 +1371,14 @@ FlagProcessor initFlagProcessor() {
       getMutableConfig().early_quicken,
       "Quicken bytecode on the second warmup event (3.11) so low-threshold "
       "auto-JIT compiles from specialized bytecode.");
+
+  flag_processor.addOption(
+      "jit-pep523-specialization",
+      "PYTHONJITPEP523SPECIALIZATION",
+      getMutableConfig().pep523_specialization,
+      "Allow interpreter CALL/BINARY_SUBSCR_GETITEM specialization while the "
+      "CinderX evaluator is the sole PEP 523 tenant (3.11). Off by default; "
+      "intended for JIT-off compatibility runs.");
 
   flag_processor.addOption(
       "jit-adaptive-despec",
@@ -4854,6 +4863,10 @@ int initialize() {
   // 特化调用与行内门永久 DEOPT 到通用路径（历史"auto=0 解释态偏慢"
   // 的归因之一）。
   Ci_StockEntry311 = reinterpret_cast<void*>(Ci_PyFunction_Vectorcall);
+
+  // PEP 523 条件放行开关同样置于 auto 分支之外:其目标形态正是
+  // JIT 关闭(auto=0)的兼容性口径。
+  Ci_SpecializeOwnEvalFrame311 = getConfig().pep523_specialization ? 1 : 0;
 #endif
 
   mod_state->jit_list = std::move(jit_list);
@@ -5611,6 +5624,12 @@ extern "C" void* Ci_StockEntry311 = nullptr;
 // cinderx_ceval.c 台账）。缺省 1 与 stock 逐字等价；initialize() 按
 // jit-early-quicken 旗标置 4。
 extern "C" int Ci_QuickenWarmupStep_311 = 1;
+
+// PEP 523 条件放行开关(vendored specialize.c 消费):非零时,若
+// interp->eval_frame 恰为自家 Ci_EvalFrame,则放行 CALL 与
+// BINARY_SUBSCR_GETITEM 特化;第三方钩子在位时维持 stock 拒绝语义。
+// 缺省 0 与 stock 逐字等价。
+extern "C" int Ci_SpecializeOwnEvalFrame311 = 0;
 
 // [P3] 帧压栈计数钩子（vendored 循环 start_frame 处调用）：计数式
 // auto-JIT 的 3.11 实现。CodeExtra 由 codeExtra() 按需分配（3.14 经

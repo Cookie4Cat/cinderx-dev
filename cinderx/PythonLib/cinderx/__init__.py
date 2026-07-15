@@ -161,7 +161,12 @@ except ImportError as e:
     def is_lightweight_frames_enabled() -> bool:
         return False
 
-    from asyncio import AbstractEventLoop, Future
+    # AbstractEventLoop 与 Future 仅出现于注解位（本模块启用
+    # from __future__ import annotations,注解为字符串,无运行期依赖),
+    # 不做模块级导入:兜底分支在子解释器中执行,asyncio 传递闭包
+    # (concurrent.futures → logging → threading)会把 threading 带入
+    # 子解释器,叠加跨线程销毁触发 CPython 3.11 的
+    # Py_EndInterpreter/threading._shutdown 等锁挂死。
     from typing import (
         Awaitable,
         Callable,
@@ -236,8 +241,8 @@ except ImportError as e:
     _T = TypeVar("_T", covariant=True)
     _TParams = TypeVar("_TParams")
 
-    # noqa: F401
-    import asyncio
+    # asyncio 惰性导入,理由同上(threading 传递闭包)。首个
+    # _AsyncLazyValue 实例化时经 global 绑定,后续方法按模块全局访问。
 
     class _AsyncLazyValue(Awaitable[_T]):
         """
@@ -286,6 +291,7 @@ except ImportError as e:
             **kwargs: _TParams.kwargs,
         ) -> None:
             global asyncio
+            import asyncio
             # pyre-fixme[31]: Expression `typing.Optional[typing.Callable[(_TParams,
             #  typing.Awaitable[_T])]]` is not a valid type.
             self.coro_func: Optional[Callable[_TParams, Awaitable[_T]]] = coro_func

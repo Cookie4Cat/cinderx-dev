@@ -184,6 +184,13 @@ struct Config {
   // 事件即特化，使低阈值 auto-JIT 编译读到成熟字节码（早产编译对策，
   // spectral 验尸轮）。
   bool early_quicken{true};
+
+  // 3.11:在自家求值器(Ci_EvalFrame)为唯一 PEP 523 租户时放行
+  // CALL/BINARY_SUBSCR_GETITEM 解释器特化(stock 见钩子即拒)。
+  // 默认关:CALL_PY_EXACT_ARGS 的行内帧压栈绕过函数 vectorcall
+  // 入口,与 JIT 的入口计数/挂接机器交互未审,仅供 JIT 关闭的
+  // 兼容性口径使用。
+  bool pep523_specialization{false};
   // 守卫自适应去特化（3.11）：kGuardFailure 深度 deopt 按 code 计数，
   // 越限即卸载并以去特化输入重编（粘滞一次性）。为单次观测型特化
   // 守卫提供止损线：单态受者放胆投机，多态受者的 deopt 风暴被封顶
