@@ -4246,13 +4246,7 @@ int initialize() {
       PyErr_SetString(PyExc_RuntimeError, "Failed to allocate JIT list");
       return -1;
     }
-
-    try {
-      jit_list->parseFile(getConfig().jit_list.filename.c_str());
-    } catch (const std::exception& exn) {
-      PyErr_SetString(PyExc_RuntimeError, exn.what());
-      return -1;
-    }
+    jit_list->parseFile(getConfig().jit_list.filename.c_str());
   }
 
   jit::init_jit_genobject_type();
@@ -4273,13 +4267,7 @@ int initialize() {
 
   // Initialize the main compiler object and its context.  This will throw if
   // asmjit cannot initialize.
-  try {
-    cinderx::getModuleState()->jit_context.reset(
-        new CompilerContext<Compiler>());
-  } catch (const std::exception& exn) {
-    PyErr_SetString(PyExc_RuntimeError, exn.what());
-    return -1;
-  }
+  cinderx::getModuleState()->jit_context.reset(new CompilerContext<Compiler>());
 
   PyObject* mod = _Ci_CreateBuiltinModule(&jit_module, "cinderjit");
   if (mod == nullptr) {
