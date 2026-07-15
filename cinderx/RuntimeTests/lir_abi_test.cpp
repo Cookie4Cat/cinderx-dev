@@ -1322,6 +1322,14 @@ TEST_F(LIRABITest, TestkBranchBitNotSet_PhyReg_Imm_Label) {
   translateInstr(Instruction::kBranchBitNotSet, makePhyReg(0), Imm{63});
 }
 
+#if defined(CINDER_AARCH64)
+TEST_F(LIRABITest, TestTreeIterInt32Loads_NoneOutput) {
+  translateInstr(Instruction::kLoadPhase);
+  translateInstr(Instruction::kLoadPoppedPhase);
+  translateInstr(Instruction::kLoadStackTop);
+}
+#endif
+
 // kYieldInitial ANY
 TEST_F(LIRABITest, TestkYieldInitial) {
   PyCodeObject code;

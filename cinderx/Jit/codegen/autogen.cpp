@@ -1686,6 +1686,100 @@ static void emitTreeIterCallTwoInputs(
 #endif
 }
 
+static void storeTreeIterInt32Output(
+    arch::Builder* as,
+    const Instruction* instr,
+    asmjit::a64::Gp value) {
+#if defined(CINDER_AARCH64)
+  const OperandBase* out = instr->output();
+  // Regalloc preserves TreeIter helper loads with dead outputs and marks the
+  // output as None.  Match moveReturnToOutput() by discarding that result.
+  if (out->isNone()) {
+    return;
+  }
+  if (out->isReg()) {
+    auto dst = AutoTranslator::getGpOutput(out);
+    if (dst.id() != value.id()) {
+      as->mov(dst, value);
+    }
+  } else {
+    JIT_CHECK(
+        out->isStack(), "Unsupported TreeIter int32 output: {}", out->type());
+    as->str(
+        value,
+        arch::ptr_resolve(
+            as,
+            arch::fp,
+            out->getStackSlot().loc,
+            arch::reg_scratch_0,
+            arch::AccessSize::k32));
+  }
+#else
+  JIT_ABORT("storeTreeIterInt32Output is AArch64-only");
+#endif
+}
+
+static void emitLoadTreeIterInt32Field(
+    arch::Builder* as,
+    const Instruction* instr,
+    int32_t field_offset) {
+#if defined(CINDER_AARCH64)
+  auto done = as->newLabel();
+  auto out = arch::reg_scratch_1.w();
+  as->ldr(
+      arch::reg_scratch_0,
+      a64::ptr(arch::fp, offsetof(GenDataFooter, tree_iter_state)));
+  as->mov(out, 0);
+  as->cbz(arch::reg_scratch_0, done);
+  as->ldr(
+      out,
+      arch::ptr_offset(
+          arch::reg_scratch_0, field_offset, arch::AccessSize::k32));
+  as->bind(done);
+  storeTreeIterInt32Output(as, instr, out);
+#else
+  JIT_ABORT("emitLoadTreeIterInt32Field is AArch64-only");
+#endif
+}
+
+static void emitSaveTreeIterPhase(
+    arch::Builder* as,
+    const Instruction* instr) {
+#if defined(CINDER_AARCH64)
+  const OperandBase* in0 = instr->getInput(0);
+  a64::Gp phase;
+  if (in0->isReg()) {
+    phase = a64::w(in0->getPhyRegister().loc);
+  } else if (in0->isImm()) {
+    phase = arch::reg_scratch_1.w();
+    as->mov(phase, in0->getConstant());
+  } else {
+    JIT_CHECK(
+        in0->isStack(), "Unsupported TreeIter phase input: {}", in0->type());
+    phase = arch::reg_scratch_1.w();
+    as->ldr(
+        phase,
+        arch::ptr_resolve(
+            as,
+            arch::fp,
+            in0->getStackSlot().loc,
+            arch::reg_scratch_0,
+            arch::AccessSize::k32));
+  }
+  as->ldr(
+      arch::reg_scratch_0,
+      a64::ptr(arch::fp, offsetof(GenDataFooter, tree_iter_state)));
+  as->str(
+      phase,
+      arch::ptr_offset(
+          arch::reg_scratch_0,
+          offsetof(TreeIterState, tree_iter_current_phase),
+          arch::AccessSize::k32));
+#else
+  JIT_ABORT("emitSaveTreeIterPhase is AArch64-only");
+#endif
+}
+
 // Move the return value (int/ptr in return register) to the LIR output.
 static void moveReturnToOutput(
     arch::Builder* as,
@@ -1744,11 +1838,20 @@ void translateTreeIterOp(Environ* env, const Instruction* instr) {
       moveReturnToOutput(as, instr);
       break;
     case Instruction::kSavePhase:
+#if defined(CINDER_AARCH64)
+      emitSaveTreeIterPhase(as, instr);
+#else
       emitTreeIterCallOneInput(as, instr, reinterpret_cast<const void*>(JITRT_SavePhase));
+#endif
       break;
     case Instruction::kLoadPhase:
+#if defined(CINDER_AARCH64)
+      emitLoadTreeIterInt32Field(
+          as, instr, offsetof(TreeIterState, tree_iter_current_phase));
+#else
       emitTreeIterCallNoInputs(as, reinterpret_cast<const void*>(JITRT_LoadPhase));
       moveReturnToOutput(as, instr);
+#endif
       break;
     case Instruction::kStateStackPush:
       emitTreeIterCallTwoInputs(as, instr, reinterpret_cast<const void*>(JITRT_StateStackPush));
@@ -1759,12 +1862,22 @@ void translateTreeIterOp(Environ* env, const Instruction* instr) {
       moveReturnToOutput(as, instr);
       break;
     case Instruction::kLoadPoppedPhase:
+#if defined(CINDER_AARCH64)
+      emitLoadTreeIterInt32Field(
+          as, instr, offsetof(TreeIterState, tree_iter_popped_phase));
+#else
       emitTreeIterCallNoInputs(as, reinterpret_cast<const void*>(JITRT_LoadPoppedPhase));
       moveReturnToOutput(as, instr);
+#endif
       break;
     case Instruction::kLoadStackTop:
+#if defined(CINDER_AARCH64)
+      emitLoadTreeIterInt32Field(
+          as, instr, offsetof(TreeIterState, tree_iter_stack_top));
+#else
       emitTreeIterCallNoInputs(as, reinterpret_cast<const void*>(JITRT_LoadStackTop));
       moveReturnToOutput(as, instr);
+#endif
       break;
     case Instruction::kCheckTreeIterChildEntry:
       emitTreeIterCallOneInput(as, instr, reinterpret_cast<const void*>(JITRT_CheckTreeIterChildEntry));
