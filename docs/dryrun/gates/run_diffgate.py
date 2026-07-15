@@ -129,7 +129,7 @@ def main():
     ap.add_argument("--out", required=True)
     ap.add_argument("--baseline")
     ap.add_argument("--update-baseline")
-    ap.add_argument("--modes", default="jit,jit_deopt")
+    ap.add_argument("--modes", default="jit,jit_deopt,jit_warm")
     ap.add_argument("--timeout", type=int, default=600)
     args = ap.parse_args()
 

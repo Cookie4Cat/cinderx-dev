@@ -9,6 +9,15 @@ Modes:
               current case's functions mid-execution (entrypoint swap; frames
               already on stack / suspended generators exercise the deopt path
               on their next resume).
+  jit_warm  - warm each case 12x in the interpreter BEFORE force-compiling,
+              so quickening (8 warmup events at stock pace, 2 with
+              early-quicken) and the first specialization attempts land in
+              the adaptive stream; the subsequent compile then consumes
+              specialized-form feedback (guards, IC caches). Covers the
+              feedback-driven translation universe that cold force_compile
+              (mode jit) never reaches. Warm-run outcomes are discarded;
+              corpus cases are re-entrant by contract (refcount_matrix runs
+              the same corpus N=200).
 
 Output protocol (stdout), one line per case:
   CASE <name> OK <repr(value)>
@@ -56,7 +65,7 @@ def main():
     sys.modules["diffgate_rt"] = rt
 
     jit = None
-    if mode in ("jit", "jit_deopt"):
+    if mode in ("jit", "jit_deopt", "jit_warm"):
         import cinderx
 
         cinderx.init()
@@ -74,6 +83,12 @@ def main():
     for name, fn in cases:
         fns = [fn] + list(getattr(fn, "helpers", ()))
         if jit is not None:
+            if mode == "jit_warm":
+                for _ in range(12):
+                    try:
+                        fn()
+                    except BaseException:
+                        pass
             for f in fns:
                 try:
                     jit.force_compile(f)
