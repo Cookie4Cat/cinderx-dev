@@ -1737,6 +1737,9 @@ void HIRBuilder::translate(
           // Pop the value and iterator off the stack and then push back the
           // value.
           Register* value = tc.frame.stack.pop();
+          if constexpr (PY_VERSION_HEX >= 0x030F0000) {
+            tc.frame.stack.pop();
+          }
           tc.frame.stack.pop();
           tc.frame.stack.push(value);
           break;
@@ -5631,7 +5634,12 @@ void HIRBuilder::emitSend(
     const BytecodeInstruction& bc_instr) {
   OperandStack& stack = tc.frame.stack;
   Register* value_out = stack.pop();
-  Register* iter = stack.top();
+  Register* iter;
+  if constexpr (PY_VERSION_HEX >= 0x030F0000) {
+    iter = stack.top(1);
+  } else {
+    iter = stack.top();
+  }
   Register* value_in = temps_.AllocateStack();
   tc.emit<Send>(iter, value_out, value_in, tc.frame);
   Register* is_done = temps_.AllocateNonStack();
