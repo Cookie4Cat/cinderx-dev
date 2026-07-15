@@ -236,7 +236,7 @@ class InterpreterFrameHolder {
       setCurrentFrame(tstate_, frame_->previous);
     }
     jit::jitFrameClearExceptCode(frame_);
-    Cix_PyThreadState_PopFrame(tstate_, frame_);
+    _PyThreadState_PopFrame(tstate_, frame_);
   }
 
   _PyInterpreterFrame* get() const {
@@ -399,7 +399,7 @@ def test():
   EXPECT_EQ(state.osr_meta, &meta);
 
   // Cleanup: pop the manually-pushed frame.
-  Cix_PyThreadState_PopFrame(tstate, frame);
+  _PyThreadState_PopFrame(tstate, frame);
 }
 
 // TC-A02 (SR-OSR-009): OSRLiveIn default values.

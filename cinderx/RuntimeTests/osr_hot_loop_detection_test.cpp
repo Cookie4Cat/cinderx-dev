@@ -222,7 +222,7 @@ class InterpreterFrameHolder {
       return;
     }
     jit::jitFrameClearExceptCode(frame_);
-    Cix_PyThreadState_PopFrame(tstate_, frame_);
+    _PyThreadState_PopFrame(tstate_, frame_);
   }
 
   _PyInterpreterFrame* get() const {
