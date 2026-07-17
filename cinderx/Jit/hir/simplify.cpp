@@ -1284,31 +1284,129 @@ Register* simplifyFloatBinaryOp(Env& env, const FloatBinaryOp* instr) {
     return env.emit<PrimitiveBox>(result, TCDouble, *instr->frameState());
   }
 
-  // `x ** 0.5`, convert to the unboxed path.  The LIR generator can lower this
-  // into a call to sqrt().
+  // Constant-exponent strength reduction for `x ** const_float`.
+  //
+  // For the common numerical exponents used in scientific Python
+  // rewrite to an unboxed sqrt / mul / div chain instead of calling
+  // PyFloat.__pow__ -> float_pow -> libm pow.
   if (op == BinaryOpKind::kPower) {
     Type right_type = instr->right()->type();
-    if (right_type.hasObjectSpec() && PyFloat_Check(right_type.objectSpec())) {
+    // Skip strength reduction when the base is itself a compile-time float
+    // constant: the constant-folding path at the end of this function will
+    // evaluate `c1 ** c2` to a single LoadConst.
+    Type left_type_for_pow = instr->left()->type();
+    if (!left_type_for_pow.hasObjectSpec() &&
+        right_type.hasObjectSpec() && PyFloat_Check(right_type.objectSpec())) {
       double val = PyFloat_AS_DOUBLE(right_type.objectSpec());
+
+      auto unbox_x = [&]() {
+        return env.emit<PrimitiveUnbox>(instr->left(), TCDouble);
+      };
+      auto load = [&](double d) {
+        return env.emit<LoadConst>(Type::fromCDouble(d));
+      };
+      auto sqrt_of = [&](Register* r) {
+        // LIR lowering (generator.cpp) rewrites Power-by-0.5 into sqrt().
+        return env.emit<DoubleBinaryOp>(BinaryOpKind::kPower, r, load(0.5));
+      };
+      auto mul = [&](Register* a, Register* b) {
+        return env.emit<DoubleBinaryOp>(BinaryOpKind::kMultiply, a, b);
+      };
+      auto rdiv1 = [&](Register* r) {
+        return env.emit<DoubleBinaryOp>(BinaryOpKind::kTrueDivide, load(1.0), r);
+      };
+      auto guard_cmp = [&](PrimitiveCompareOp cmp_op, Register* r, double d) {
+        Register* ok = env.emit<PrimitiveCompare>(cmp_op, r, load(d));
+        env.emitInstr<Guard>(ok);
+      };
+      auto guard_finite = [&](Register* r) {
+        guard_cmp(PrimitiveCompareOp::kGreaterThan, r, -DBL_MAX);
+        guard_cmp(PrimitiveCompareOp::kLessThan, r, DBL_MAX);
+      };
+      // Single-sided upper-bound guard for results that are provably
+      // non-negative in IEEE-754 (e.g. x*x, 1/(x*x)). No `-inf` overflow is
+      // possible, so `-DBL_MAX < r` is redundant.
+      auto guard_finite_nonneg = [&](Register* r) {
+        guard_cmp(PrimitiveCompareOp::kLessThan, r, DBL_MAX);
+      };
+      auto box = [&](Register* r) {
+        return env.emit<PrimitiveBox>(r, TCDouble, *instr->frameState());
+      };
+
+      // x ** 0.5 = sqrt(x). Guard x > 0 so negative inputs deopt to
+      // Python's complex-result path and both signed zeros deopt to the
+      // interpreter, which returns +0.0 for ** 0.5.
       if (val == 0.5) {
-        Register* unbox_left =
-            env.emit<PrimitiveUnbox>(instr->left(), TCDouble);
-        Register* half = env.emit<LoadConst>(Type::fromCDouble(0.5));
-        Register* result =
-            env.emit<DoubleBinaryOp>(BinaryOpKind::kPower, unbox_left, half);
-        return env.emit<PrimitiveBox>(result, TCDouble, *instr->frameState());
+        Register* x = unbox_x();
+        guard_cmp(PrimitiveCompareOp::kGreaterThan, x, 0.0);
+        return box(sqrt_of(x));
       }
+      // x ** 1.0 = x. Identity; PrimitiveBox produces a fresh PyFloat, so
+      // Python's "float ** float returns a new object" contract holds.
+      if (val == 1.0) {
+        return box(unbox_x());
+      }
+      // x ** 1.5 = x * sqrt(x). Guard x >= 0 so a negative base deopts to
+      // Python's complex-result path; guard finite because huge x overflows
+      // through the multiply.
+      if (val == 1.5) {
+        Register* x = unbox_x();
+        guard_cmp(PrimitiveCompareOp::kGreaterThanEqual, x, 0.0);
+        Register* result = mul(x, sqrt_of(x));
+        guard_finite(result);
+        return box(result);
+      }
+      // x ** 2.0 = x * x. `x*x` is non-negative, so `-inf` overflow is
+      // impossible and only the upper-bound finite guard is needed.
       if (val == 2.0) {
-        Register* unbox_left =
-            env.emit<PrimitiveUnbox>(instr->left(), TCDouble);
-        Register* result = env.emit<DoubleBinaryOp>(
-            BinaryOpKind::kMultiply, unbox_left, unbox_left);
-        Register* max_double =
-            env.emit<LoadConst>(Type::fromCDouble(DBL_MAX));
-        Register* is_finite = env.emit<PrimitiveCompare>(
-            PrimitiveCompareOp::kLessThan, result, max_double);
-        env.emitInstr<Guard>(is_finite);
-        return env.emit<PrimitiveBox>(result, TCDouble, *instr->frameState());
+        Register* x = unbox_x();
+        Register* result = mul(x, x);
+        guard_finite_nonneg(result);
+        return box(result);
+      }
+      // x ** 3.0 = x * x * x. Odd exponent preserves sign so no base guard.
+      // Guard finite (large |x| overflows).
+      if (val == 3.0) {
+        Register* x = unbox_x();
+        Register* result = mul(mul(x, x), x);
+        guard_finite(result);
+        return box(result);
+      }
+      // x ** -0.5 = 1.0 / sqrt(x). Guard x > 0 so a negative base deopts to
+      // Python's complex-result path and zero deopts to ZeroDivisionError.
+      if (val == -0.5) {
+        Register* x = unbox_x();
+        guard_cmp(PrimitiveCompareOp::kGreaterThan, x, 0.0);
+        Register* result = rdiv1(sqrt_of(x));
+        guard_finite(result);
+        return box(result);
+      }
+      // x ** -1.0 = 1.0 / x. Guard x != 0 (ZeroDivisionError); negative x
+      // is fine (returns negative reciprocal per Python).
+      if (val == -1.0) {
+        Register* x = unbox_x();
+        guard_cmp(PrimitiveCompareOp::kNotEqual, x, 0.0);
+        Register* result = rdiv1(x);
+        guard_finite(result);
+        return box(result);
+      }
+      // x ** -1.5 = 1.0 / (x * sqrt(x)). Guard the intermediate
+      // t = x * sqrt(x) into the normal range [DBL_MIN, DBL_MAX)
+      if (val == -1.5) {
+        Register* x = unbox_x();
+        Register* t = mul(x, sqrt_of(x));
+        guard_cmp(PrimitiveCompareOp::kGreaterThanEqual, t, DBL_MIN);
+        guard_cmp(PrimitiveCompareOp::kLessThan, t, DBL_MAX);
+        return box(rdiv1(t));
+      }
+      // x ** -2.0 = 1.0 / (x * x). Even exponent -> negative base is fine
+      // (result is positive). Guard x*x between [DBL_MIN, DBL_MAX)
+      if (val == -2.0) {
+        Register* x = unbox_x();
+        Register* t = mul(x, x);
+        guard_cmp(PrimitiveCompareOp::kGreaterThanEqual, t, DBL_MIN);
+        guard_cmp(PrimitiveCompareOp::kLessThan, t, DBL_MAX);
+        return box(rdiv1(t));
       }
     }
   }
