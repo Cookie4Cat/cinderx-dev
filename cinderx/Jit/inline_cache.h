@@ -24,7 +24,6 @@ struct SplitMutator {
   PyObject* getAttr(PyObject* obj, PyObject* name);
   int setAttr(PyObject* obj, PyObject* name, PyObject* value);
 #if PY_VERSION_HEX >= 0x030E0000
-  PyObject* getAttrKnownOffset(PyObject* obj, PyObject* name);
   int setAttrKnownOffset(PyObject* obj, PyObject* name, PyObject* value);
   PyObject* getAttrInline(PyObject* obj, PyObject* name);
   PyObject* getAttrSlowPath(
@@ -36,18 +35,29 @@ struct SplitMutator {
   int setAttrInlineKnownOffset(PyObject* obj, PyObject* name, PyObject* value);
 #endif
   bool canInsertToSplitDict(BorrowedRef<PyDictObject> dict, BorrowedRef<> name);
-  bool ensureValueOffset(BorrowedRef<> name);
 
   Py_ssize_t val_offset;
   PyDictKeysObject* keys; // Borrowed
 };
 
 // Mutator for an instance attribute that is stored in a combined dictionary
+// (non-managed-dict types with tp_dictoffset).
 struct CombinedMutator {
   PyObject* getAttr(PyObject* obj, PyObject* name);
   int setAttr(PyObject* obj, PyObject* name, PyObject* value);
 
   Py_ssize_t dict_offset;
+  BorrowedRef<> getattr_method;
+};
+
+// Mutator for an instance attribute on a managed-dict type where the attribute
+// is not in the shared keys (e.g. shared keys are full). Uses the managed dict
+// APIs directly rather than a stored dict_offset.
+struct DictMutator {
+  PyObject* getAttr(PyObject* obj, PyObject* name);
+  int setAttr(PyObject* obj, PyObject* name, PyObject* value);
+
+  BorrowedRef<> getattr_method;
 };
 
 // Mutator for a data descriptor
@@ -65,6 +75,7 @@ struct MemberDescrMutator {
   int setAttr(PyObject* obj, PyObject* value);
 
   PyMemberDef* memberdef;
+  BorrowedRef<> getattr_method; // Cached __getattr__ if the type has one
 };
 
 // Attribute corresponds to a non-data descriptor or a class variable
@@ -76,6 +87,16 @@ struct DescrOrClassVarMutator {
   uint32_t keys_version;
 };
 
+// Mutator for attribute lookups on types that define __getattr__.
+// Used when a particular attribute name is absent from both the type's MRO
+// and the instance dict, causing __getattr__ to be invoked.
+struct GetAttrMutator {
+  PyObject* getAttr(PyObject* obj, PyObject* name);
+
+  BorrowedRef<> getattr_method;
+  uint32_t keys_version;
+};
+
 // An instance of AttributeMutator is specialized to more efficiently perform a
 // get/set of a particular kind of attribute.
 class AttributeMutator {
@@ -84,13 +105,13 @@ class AttributeMutator {
   // the type_ pointer
   enum class Kind : uint8_t {
     kSplit,
-    kSplitKnownOffset,
     kSplitInline,
-    kSplitInlineKnownOffset,
     kCombined,
     kDataDescr,
     kMemberDescr,
     kDescrOrClassVar,
+    kGetAttr,
+    kDict,
     kMaxValue,
   };
   static_assert(
@@ -107,6 +128,7 @@ class AttributeMutator {
     return type_ == 0;
   }
   void set_combined(PyTypeObject* type);
+  void set_dict(PyTypeObject* type);
   void set_data_descr(PyTypeObject* type, PyObject* descr);
   void set_member_descr(PyTypeObject* type, PyObject* descr);
   void set_descr_or_classvar(
@@ -118,6 +140,10 @@ class AttributeMutator {
       Py_ssize_t val_offset,
       PyDictKeysObject* keys,
       bool values_inline);
+  void set_getattr(
+      PyTypeObject* type,
+      PyObject* getattr_method,
+      uint32_t keys_version);
   BorrowedRef<PyTypeObject> watchedDescrType() const;
 
   PyObject* getAttr(PyObject* obj, PyObject* name);
@@ -128,7 +154,9 @@ class AttributeMutator {
     return 0x07;
   }
   static constexpr uintptr_t splitInlineKnownOffsetKind() {
-    return static_cast<uintptr_t>(Kind::kSplitInlineKnownOffset);
+    // e3f93f10 makes kSplitInline entries store a resolved val_offset at fill
+    // time, so the old codegen "known offset" check maps to kSplitInline.
+    return static_cast<uintptr_t>(Kind::kSplitInline);
   }
   static constexpr size_t typeOffset() {
     return offsetof(AttributeMutator, type_);
@@ -136,6 +164,12 @@ class AttributeMutator {
   static constexpr size_t splitValOffsetOffset() {
     return offsetof(AttributeMutator, split_) +
         offsetof(SplitMutator, val_offset);
+  }
+  template <typename T>
+  static AttributeMutator* from(T* mutator) {
+    return reinterpret_cast<AttributeMutator*>(
+        reinterpret_cast<uintptr_t>(mutator) -
+        offsetof(AttributeMutator, split_));
   }
 
  private:
@@ -150,9 +184,11 @@ class AttributeMutator {
   union {
     SplitMutator split_;
     CombinedMutator combined_;
+    DictMutator dict_;
     DataDescrMutator data_descr_;
     MemberDescrMutator member_descr_;
     DescrOrClassVarMutator descr_or_cvar_;
+    GetAttrMutator getattr_;
   };
 };
 
@@ -174,10 +210,10 @@ class AttributeCache {
 
   AttributeMutator* findEmptyEntry();
 
-  void fill(BorrowedRef<PyTypeObject> type, BorrowedRef<> name);
+  void fill(BorrowedRef<> obj, BorrowedRef<> name, bool is_set);
 
   void
-  fill(BorrowedRef<PyTypeObject> type, BorrowedRef<> name, BorrowedRef<> descr);
+  fill(BorrowedRef<> obj, BorrowedRef<> name, BorrowedRef<> descr, bool is_set);
 
   AttributeMutator entries_[0];
 };
