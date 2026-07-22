@@ -808,9 +808,24 @@ IC-off、解释器 quickening/specialization 开关、JIT specialized-opcode 消
 
 具体用例维度和覆盖矩阵在测试清单与 CI 配置中维护；每个功能域都必须具有正常执行、异常或拒编、失效/恢复以及生命周期证据，不能以“未覆盖”作为评审结论。
 
-语料遵循 diffgate 现行确定性约定：固定 `PYTHONHASHSEED`，不依赖随机、时间、网络和不可控进程顺序，全局状态变异在 `finally` 中恢复。标准库范围暂按 basic 26 + expanded 46，共 72 个互不重叠模块设计，最终以需求评审确认的清单为准。
+语料遵循 diffgate 现行确定性约定：固定 `PYTHONHASHSEED`，不依赖随机、时间、网络和不可控进程顺序，全局状态变异在 `finally` 中恢复。标准库范围暂按 basic 26 + expanded 46，共 72 个互不重叠模块设计，最终以需求评审确认的清单为准。标准库模块按功能域聚合的完整清单见附录 B。
 
-#### 3.3.8.4 强制去优化测试能力
+#### 3.3.8.4 高风险专项测试
+
+差分门禁保证面上的等价；以下六个专项针对**自然触发稀疏、错误无症状潜伏、组合空间大**的高风险面做定向深挖。每个专项给出风险来源、测试范围与测试方向，判定统一以 stock 双模一致为准，另列专项断言。
+
+| 专项 | 风险来源 | 测试范围 | 测试方向 |
+|---|---|---|---|
+| 帧级去优化现场重建 | 现场错一个槽即静默数据损坏；自然触发稀疏 | 全部帧级 site；指令前重执行/指令后继续两类恢复；调用窗口 method/非 method 形态；预压 NULL 指令；死值恢复；带异常恢复 | 小型语料全 site 枚举扫描；热循环 site 定向 + `at-or-after` 抽样；恢复后继续执行至函数结束的结果比对 |
+| 引用计数与对象生命周期 | 3.11 无 function watcher；清理责任跨 JIT/解释器边界；错误长期无症状 | 对象类别（参数/临时容器/入口 Frame/Generator 双强引用/缓存 owner）× 退出路径（正常/绑定失败/被调异常/帧级 deopt/uncompile/析构/关机） | 引用计数矩阵逐格断言；生命周期搅动（量产→编译→弃引→GC→退出）；关机路径专测；ASAN/`PYTHONMALLOC=debug`/refleak |
+| Frame 自省与调试联动 | 推式同步漏一个边界即错误快照，仅运行中观察可暴露 | JIT 函数内 `sys._getframe()`；用户 hook 内读调用方 Frame；异常构建 traceback；GC/析构重入读帧；跨线程 `sys._current_frames()`；tracing/profile 开关全时序 | 运行中观察用例（非静态快照）；settrace/setprofile 事件流基线比对（豁免差异钉住）；deopt 后 `f_trace` 补挂验证 |
+| 内联缓存变异与形态 | 无 watcher，失效全靠命中校验；漏一类变异即读旧值或悬垂引用 | 变异类型（类属性/基类/`__class__` 重绑定/descriptor 重分类/global 删除与 builtins 遮蔽/keys 成长与 values 迁移）× 时机（命中间隙/hook 重入中）；形态无副作用；发号器压力（如走影子分支） | 变异矩阵语料 + 重入变异用例；IC 探测前后形态计数断言；大字典/hash 冲突/非驻留字符串边界；IC-off 对照定位 |
+| 异步事件送达 | 检查点被编译消除后平时零症状，仅事件到达热循环时暴露 | 紧循环中 signal/KeyboardInterrupt；pending call；多线程 GIL 切换；周期任务失败的帧级恢复 | 定时注入信号的紧循环用例；多线程饥饿检测；送达位置为字节码边界的断言 |
+| Generator 状态机与挂起恢复 | 对象行为逐项镜像 stock，等价面宽；挂起态与 GC/uncompile/tracing 交叉 | 状态 × 操作全矩阵（含未启动 close/throw、`send(非 None)`、重入）；挂起期间 GC/weakref/自省；挂起点强制 deopt 后 resume；uncompile 后 resume；PEP 479；多实例交错；析构与关机 | 状态机穷举语料；挂起态搅动（大量挂起对象 + GC 循环）；镜像完整性清单逐项比对 |
+
+专项用例纳入 3.3.8.6 门禁分层执行：矩阵与搅动类进 Daily，最小回归集进 PR。
+
+#### 3.3.8.5 强制去优化测试能力
 
 site-deopt 是需要编译器和运行时共同支持的测试能力，不能以函数级 `force_uncompile` 代替。正式实现要求：
 
@@ -823,7 +838,7 @@ site-deopt 是需要编译器和运行时共同支持的测试能力，不能以
 
 该 site 基建为后续异常路径完善预留稳定扩展接口；新增动作不得改变 site 标识、恢复协议和报告格式，也不作为当前交付与验收项。
 
-#### 3.3.8.5 门禁与验收
+#### 3.3.8.6 门禁与验收
 
 PR 门禁覆盖：
 
@@ -1007,3 +1022,18 @@ CPython 3.11 适配主要调整内部字节码翻译、运行时语义和能力�
 | 拉式校验 | cache 命中时读取并验证当前类型/字典版本证据，而非依赖 watcher 回调 |
 | 可观察边界 | Python/调试器/GC/其他线程可能读取 Frame 状态之前的同步边界 |
 | Frame owner | 负责 Frame 生命周期和清理的 thread、Generator 或 FrameObject |
+
+## B. 标准库差分模块清单（72 个，按功能域聚合）
+
+| 分类 | 对应功能域 | 模块 | 数量 |
+|---|---|---|---|
+| 语言核心与字节码语义 | 3.3.2 | test_grammar、test_types、test_scope、test_augassign、test_unpack、test_unpack_ex、test_listcomps、test_dictcomps、test_fstring、test_format、test_with、test_contextlib、test_code、test_dis | 14 |
+| 数据类型与运算协议 | 3.3.2 / 3.3.5 | test_int、test_long、test_float、test_complex、test_bool、test_bytes、test_dict、test_set、test_list、test_tuple、test_slice、test_index、test_binop、test_richcmp、test_range、test_enumerate、test_iter、test_itertools、test_sort | 19 |
+| 调用与参数绑定 | 3.3.3 | test_call、test_extcall、test_builtin、test_keywordonlyarg、test_positional_only_arg、test_functools | 6 |
+| 对象模型与属性协议 | 3.3.5 | test_descr、test_property、test_super、test_class、test_subclassinit、test_metaclass、test_abc、test_isinstance、test_enum、test_dataclasses、test_funcattrs | 11 |
+| 异常与 traceback | 3.3.2 / 3.3.6 | test_exceptions、test_raise、test_except_star、test_exception_group、test_traceback | 5 |
+| Frame 自省与调试联动 | 3.3.4 | test_frame、test_inspect、test_sys_settrace、test_sys_setprofile、test_cprofile | 5 |
+| Generator 与异步回退 | 3.3.7 | test_generators、test_genexps、test_yield_from、test_asyncgen、test_coroutines、test_contextlib_async | 6 |
+| 生命周期、GC 与导入 | 3.3.4 / 3.3.5 / 3.3.6 跨域 | test_gc、test_weakref、test_finalization、test_copy、test_pickle、test_import | 6 |
+
+合计 72 个模块，互不重叠（basic 26 + expanded 46）。最终清单以需求评审确认为准；模块失败后不得移出清单，只能修复或走豁免评审。
