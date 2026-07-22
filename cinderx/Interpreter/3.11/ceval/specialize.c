@@ -333,6 +333,32 @@ miss_counter_start(void) {
 
 /* Common */
 
+
+/* CinderX:PEP 523 条件放行(定义见 pyjit.cpp)。非零且
+ * interp->eval_frame 恰为自家 Ci_EvalFrame 时,放行 CALL 与
+ * BINARY_SUBSCR_GETITEM 特化;第三方钩子维持 stock 拒绝语义。 */
+extern int Ci_SpecializeOwnEvalFrame311;
+extern PyObject *Ci_EvalFrame(PyThreadState *tstate,
+                              struct _PyInterpreterFrame *f,
+                              int throwflag);
+
+/* CinderX:PEP 523 拒绝判据(CALL 特化用;BINARY_SUBSCR_GETITEM 因
+ * handler 侧运行期 DEOPT 不在此放行,见 specialize_binary_subscr)。 */
+static int
+eval_frame_blocks_specialization(void)
+{
+    _PyFrameEvalFunction eval_frame =
+        _PyInterpreterState_GET()->eval_frame;
+    if (eval_frame == NULL) {
+        return 0;
+    }
+    if (Ci_SpecializeOwnEvalFrame311 &&
+        eval_frame == (_PyFrameEvalFunction)Ci_EvalFrame) {
+        return 0;
+    }
+    return 1;
+}
+
 #define SPEC_FAIL_OTHER 0
 #define SPEC_FAIL_NO_DICT 1
 #define SPEC_FAIL_OVERRIDDEN 2
@@ -671,6 +697,15 @@ _Py_Specialize_LoadAttr(PyObject *owner, _Py_CODEUNIT *instr, PyObject *name)
             return -1;
         }
     }
+    if (type->tp_version_tag == 0) {
+        /* CinderX 回迁:零版本号(未赋出或已耗尽)无法被特化守卫
+         * 校验——类型再变更版本号仍为零,缓存命中即陈旧。上游
+         * 3.11 后续修复拒绝此态,此处对齐(test_type_cache 的
+         * *_specialization_user_type 系列即验证该契约)。 */
+        SPECIALIZATION_FAIL(LOAD_ATTR, SPEC_FAIL_OUT_OF_VERSIONS);
+        goto fail;
+    }
+
     PyObject *descr;
     DescriptorClassification kind = analyze_descriptor(type, name, &descr, 0);
     switch(kind) {
@@ -764,6 +799,15 @@ _Py_Specialize_StoreAttr(PyObject *owner, _Py_CODEUNIT *instr, PyObject *name)
         SPECIALIZATION_FAIL(STORE_ATTR, SPEC_FAIL_OVERRIDDEN);
         goto fail;
     }
+    if (type->tp_version_tag == 0) {
+        /* CinderX 回迁:零版本号(未赋出或已耗尽)无法被特化守卫
+         * 校验——类型再变更版本号仍为零,缓存命中即陈旧。上游
+         * 3.11 后续修复拒绝此态,此处对齐(test_type_cache 的
+         * *_specialization_user_type 系列即验证该契约)。 */
+        SPECIALIZATION_FAIL(STORE_ATTR, SPEC_FAIL_OUT_OF_VERSIONS);
+        goto fail;
+    }
+
     PyObject *descr;
     DescriptorClassification kind = analyze_descriptor(type, name, &descr, 1);
     switch(kind) {
@@ -939,6 +983,15 @@ _Py_Specialize_LoadMethod(PyObject *owner, _Py_CODEUNIT *instr, PyObject *name)
             return -1;
         }
     }
+    if (owner_cls->tp_version_tag == 0) {
+        /* CinderX 回迁:零版本号(未赋出或已耗尽)无法被特化守卫
+         * 校验——类型再变更版本号仍为零,缓存命中即陈旧。上游
+         * 3.11 后续修复拒绝此态,此处对齐(test_type_cache 的
+         * *_specialization_user_type 系列即验证该契约)。 */
+        SPECIALIZATION_FAIL(LOAD_METHOD, SPEC_FAIL_OUT_OF_VERSIONS);
+        goto fail;
+    }
+
     if (PyType_Check(owner)) {
         int err = specialize_class_load_method(owner, instr, name);
         if (err) {
@@ -1238,6 +1291,12 @@ _Py_Specialize_BinarySubscr(
             SPECIALIZATION_FAIL(BINARY_SUBSCR, SPEC_FAIL_OUT_OF_VERSIONS);
             goto fail;
         }
+        /* PEP 523 在位则不特化。CinderX:此处不做条件放行——
+         * BINARY_SUBSCR_GETITEM 的 handler(ceval.c)带运行期
+         * DEOPT_IF(eval_frame),放行 specialize 也会被执行期立即
+         * 打回;真正启用需同步条件化 handler 的 DEOPT_IF(改动执行
+         * 语义:__getitem__ 内联进本循环),属独立性能轮(需 RCM+
+         * A/B),不在兼容轮范围。 */
         if (_PyInterpreterState_GET()->eval_frame) {
             SPECIALIZATION_FAIL(BINARY_SUBSCR, SPEC_FAIL_OTHER);
             goto fail;
@@ -1485,8 +1544,10 @@ specialize_py_call(PyFunctionObject *func, _Py_CODEUNIT *instr, int nargs,
     assert(_Py_OPCODE(*instr) == CALL_ADAPTIVE);
     PyCodeObject *code = (PyCodeObject *)func->func_code;
     int kind = function_kind(code);
-    /* Don't specialize if PEP 523 is active */
-    if (_PyInterpreterState_GET()->eval_frame) {
+    /* Don't specialize if PEP 523 is active.
+     * CinderX:自家求值器为唯一租户且放行开关打开时不构成阻断
+     * (行内化的特化 handler 即在自家循环内,语义等价)。 */
+    if (eval_frame_blocks_specialization()) {
         SPECIALIZATION_FAIL(CALL, SPEC_FAIL_CALL_PEP_523);
         return -1;
     }
