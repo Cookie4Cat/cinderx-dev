@@ -590,6 +590,13 @@ class HIRBuilder {
 
   bool code_has_backedge_{false};
 
+  // True for small no-loop helpers that contain at least two specialized
+  // numeric binary operations. These are often inlined into loop-heavy
+  // callers, where keeping int specialized opcodes is profitable without
+  // exposing single-op, comparison-only, or non-numeric leaf helpers to the
+  // old unconditional guard behavior.
+  bool code_is_simple_numeric_leaf_{false};
+
   OperandStack static_method_stack_;
 
   // True if the function's bytecode contains only opcodes that cannot invoke
@@ -600,6 +607,7 @@ class HIRBuilder {
   bool is_simple_leaf_function_{false};
 
   static bool isSimpleLeafFunction(BorrowedRef<PyCodeObject> code);
+  static bool isSimpleNumericLeafFunction(BorrowedRef<PyCodeObject> code);
 };
 
 } // namespace jit::hir

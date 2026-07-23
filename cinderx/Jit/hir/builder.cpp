@@ -772,6 +772,61 @@ bool HIRBuilder::isSimpleLeafFunction(BorrowedRef<PyCodeObject> code) {
   return true;
 }
 
+bool HIRBuilder::isSimpleNumericLeafFunction(BorrowedRef<PyCodeObject> code) {
+  if (code->co_flags & kCoFlagsAnyGenerator) {
+    return false;
+  }
+
+  int numeric_binary_op_count = 0;
+  for (auto& instr : BytecodeInstructionBlock{code}) {
+    if (instr.isBackwardBranch()) {
+      return false;
+    }
+
+    switch (instr.opcode()) {
+      case BINARY_OP:
+        switch (instr.specializedOpcode()) {
+          case BINARY_OP_ADD_INT:
+          case BINARY_OP_MULTIPLY_INT:
+          case BINARY_OP_SUBTRACT_INT:
+          case BINARY_OP_ADD_FLOAT:
+          case BINARY_OP_MULTIPLY_FLOAT:
+          case BINARY_OP_SUBTRACT_FLOAT:
+            numeric_binary_op_count++;
+            break;
+          default:
+            break;
+        }
+        break;
+      case COMPARE_OP:
+      case COPY:
+      case LOAD_CONST:
+      case LOAD_FAST:
+      case LOAD_FAST_AND_CLEAR:
+      case LOAD_FAST_BORROW:
+      case LOAD_FAST_BORROW_LOAD_FAST_BORROW:
+      case LOAD_FAST_CHECK:
+      case LOAD_FAST_LOAD_FAST:
+      case LOAD_SMALL_INT:
+      case NOP:
+      case NOT_TAKEN:
+      case POP_TOP:
+      case PUSH_NULL:
+      case RESUME:
+      case RETURN_CONST:
+      case RETURN_VALUE:
+      case STORE_FAST:
+      case STORE_FAST_LOAD_FAST:
+      case STORE_FAST_STORE_FAST:
+      case SWAP:
+        break;
+      default:
+        return false;
+    }
+  }
+  return numeric_binary_op_count > 1;
+}
+
 std::unique_ptr<Function> buildHIR(const Preloader& preloader) {
   return HIRBuilder{preloader}.buildHIR();
 }
@@ -791,6 +846,7 @@ std::unique_ptr<Function> buildHIR(const Preloader& preloader) {
 std::unique_ptr<Function> HIRBuilder::buildHIR() {
   checkTranslate();
   code_has_backedge_ = codeHasBackedge(code_);
+  code_is_simple_numeric_leaf_ = isSimpleNumericLeafFunction(code_);
 
   is_simple_leaf_function_ = isSimpleLeafFunction(code_);
 
@@ -938,6 +994,7 @@ InlineResult HIRBuilder::inlineHIR(
     FrameState* caller_frame_state) {
   checkTranslate();
   code_has_backedge_ = codeHasBackedge(code_);
+  code_is_simple_numeric_leaf_ = isSimpleNumericLeafFunction(code_);
 
   BasicBlock* entry_block = buildHIRImpl(caller, caller_frame_state);
   // Make one block with a Return that merges the return branches from the
@@ -2281,10 +2338,12 @@ void HIRBuilder::emitBinaryOp(
   // Exact int guards on specialized numeric opcodes work well for loop-hot
   // functions, but can be actively harmful for tiny mixed-numeric leaf helpers
   // like raytrace's Vector.dot(). Keep the int guards only for code objects
-  // that actually contain a backedge. Preserve float exact guards so float-only
-  // leaf helpers can still lower to the existing unboxed fast paths.
+  // that actually contain a backedge, or simple numeric leaf helpers that are
+  // likely to be inlined into such loops. Preserve float exact guards so
+  // float-only leaf helpers can still lower to the existing unboxed fast paths.
   bool specialize_int_guards =
-      !getConfig().backedge_gated_int_guards || code_has_backedge_;
+      !getConfig().backedge_gated_int_guards || code_has_backedge_ ||
+      code_is_simple_numeric_leaf_;
   if (getConfig().specialized_opcodes) {
     switch (bc_instr.specializedOpcode()) {
       case BINARY_OP_ADD_INT:
@@ -2877,7 +2936,8 @@ void HIRBuilder::emitCompareOp(
   Register* result = temps_.AllocateStack();
   CompareOp op = static_cast<CompareOp>(compare_op);
   bool specialize_int_guards =
-      !getConfig().backedge_gated_int_guards || code_has_backedge_;
+      !getConfig().backedge_gated_int_guards || code_has_backedge_ ||
+      code_is_simple_numeric_leaf_;
   if (getConfig().specialized_opcodes) {
     switch (bc_instr.specializedOpcode()) {
       case COMPARE_OP_FLOAT:
