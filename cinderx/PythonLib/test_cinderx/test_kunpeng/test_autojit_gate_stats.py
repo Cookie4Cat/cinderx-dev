@@ -751,7 +751,7 @@ class AutoJitGateStatsDumpTests(unittest.TestCase):
         CP3140_AUTOJIT_DIRECT_CALL_GATE_UNSUPPORTED,
         CP3140_AUTOJIT_SKIP_REASON,
     )
-    def test_plugin_defers_logging_disabled_fast_path(self) -> None:
+    def test_plugin_compiles_self_contained_eafp_predicates(self) -> None:
         with tempfile.TemporaryDirectory() as temp:
             env = _plugin_env()
 
@@ -773,10 +773,7 @@ class AutoJitGateStatsDumpTests(unittest.TestCase):
                     "    assert not logger.isEnabledFor(logging.DEBUG)\n"
                     "\n"
                     "stats = cinderjit._autojit_gate_stats()\n"
-                    "assert stats['global_threshold_return'] >= 1, stats\n"
-                    "assert stats['classified_defer_freeze'] >= 1, stats\n"
-                    "assert stats['forced_compile'] == 0, stats\n"
-                    "assert not jit.is_jit_compiled(logging.Logger.isEnabledFor), (\n"
+                    "assert jit.is_jit_compiled(logging.Logger.isEnabledFor), (\n"
                     "    stats,\n"
                     "    jit.count_interpreted_calls(logging.Logger.isEnabledFor),\n"
                     ")\n",

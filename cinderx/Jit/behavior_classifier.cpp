@@ -13,6 +13,7 @@
 #include <array>
 #include <cctype>
 #include <cstring>
+#include <vector>
 #include <initializer_list>
 #include <limits>
 #include <string>
@@ -557,6 +558,7 @@ uint8_t StructureKey::activeDimCount() const {
 
 uint32_t StructureKey::pack() const {
   uint32_t payload = 0;
+  payload |= (is_eafp_benign ? 1u : 0u) << 24;
   payload |= (static_cast<uint32_t>(mixed_shape) & 0xFu) << 20;
   payload |= (static_cast<uint32_t>(family) & 0xFu) << 16;
   payload |= (static_cast<uint32_t>(loop_score) & 0x3u) << 14;
@@ -571,6 +573,7 @@ uint32_t StructureKey::pack() const {
 StructureKey StructureKey::unpack(uint32_t payload) {
   payload &= kSkeyPayloadMask;
   StructureKey key;
+  key.is_eafp_benign = ((payload >> 24) & 0x1u) != 0;
   key.mixed_shape = static_cast<MixedShape>((payload >> 20) & 0xFu);
   key.family = static_cast<Family>((payload >> 16) & 0xFu);
   key.loop_score = static_cast<uint8_t>((payload >> 14) & 0x3u);
@@ -961,6 +964,176 @@ bool shouldDeferSuspendableAutoJitWithoutStructureKey(
           (CO_GENERATOR | CO_COROUTINE | CO_ASYNC_GENERATOR)) != 0;
 }
 
+namespace {
+
+// ---- Self-contained EAFP whitelist ---------------------------------------
+//
+// A function qualifies when its try/except usage is limited to the cache /
+// probe idiom: every typed except handler matches a benign exception type
+// (KeyError/AttributeError/IndexError), every region guarded by such a
+// handler contains no calls (the exception source is a local subscript or
+// attribute access, never a callee), and the function contains no explicit
+// raise. These functions take the exception path only on cache misses, so
+// the static exception-control risk verdict misprices them. A mispredicted
+// whitelist entry is still bounded by the deopt-side ROI backoff.
+
+struct ExceptionTableEntry {
+  uint32_t start; // byte offsets into co_code
+  uint32_t end;
+  uint32_t target;
+};
+
+bool parseExceptionTable(
+    BorrowedRef<PyCodeObject> code,
+    std::vector<ExceptionTableEntry>& entries) {
+  PyObject* table = code->co_exceptiontable;
+  if (table == nullptr || !PyBytes_Check(table)) {
+    return false;
+  }
+  auto data = reinterpret_cast<const uint8_t*>(PyBytes_AS_STRING(table));
+  Py_ssize_t size = PyBytes_GET_SIZE(table);
+  Py_ssize_t pos = 0;
+  auto parse_varint = [&](uint32_t& value) -> bool {
+    if (pos >= size) {
+      return false;
+    }
+    uint8_t byte = data[pos++];
+    value = byte & 63;
+    while (byte & 64) {
+      if (pos >= size) {
+        return false;
+      }
+      byte = data[pos++];
+      value = (value << 6) | (byte & 63);
+    }
+    return true;
+  };
+  while (pos < size) {
+    uint32_t start = 0, length = 0, target = 0, depth_lasti = 0;
+    if (!parse_varint(start) || !parse_varint(length) ||
+        !parse_varint(target) || !parse_varint(depth_lasti)) {
+      return false;
+    }
+    entries.push_back(
+        ExceptionTableEntry{start * 2, (start + length) * 2, target * 2});
+  }
+  return true;
+}
+
+bool isBenignEafpExceptionName(PyObject* name) {
+  if (name == nullptr || !PyUnicode_Check(name)) {
+    return false;
+  }
+  return PyUnicode_EqualToUTF8(name, "KeyError") == 1 ||
+      PyUnicode_EqualToUTF8(name, "AttributeError") == 1 ||
+      PyUnicode_EqualToUTF8(name, "IndexError") == 1;
+}
+
+enum class EafpHandlerKind {
+  kNotTyped, // cleanup / finally-style entry: no exception type check
+  kBenign, // typed handler matching a whitelisted exception
+  kOther, // typed handler matching anything else
+};
+
+EafpHandlerKind classifyEafpHandler(
+    BorrowedRef<PyCodeObject> code,
+    BytecodeInstructionBlock& block,
+    uint32_t target) {
+  constexpr int kHandlerScanWindow = 5;
+  bool in_handler = false;
+  int remaining = kHandlerScanWindow;
+  PyObject* last_global_name = nullptr;
+  for (auto it = block.begin(); it != block.end(); ++it) {
+    BytecodeInstruction instr = *it;
+    uint32_t off = instr.baseIndex().value() * 2;
+    if (!in_handler) {
+      if (off != target) {
+        continue;
+      }
+      if (instr.opcode() != PUSH_EXC_INFO) {
+        return EafpHandlerKind::kNotTyped;
+      }
+      in_handler = true;
+      continue;
+    }
+    if (remaining-- <= 0) {
+      return EafpHandlerKind::kNotTyped;
+    }
+    switch (instr.opcode()) {
+      case LOAD_GLOBAL:
+        last_global_name = PyTuple_GetItem(
+            code->co_names, static_cast<Py_ssize_t>(instr.oparg() >> 1));
+        continue;
+      case CHECK_EXC_MATCH:
+        return isBenignEafpExceptionName(last_global_name)
+            ? EafpHandlerKind::kBenign
+            : EafpHandlerKind::kOther;
+      default:
+        continue;
+    }
+  }
+  return EafpHandlerKind::kNotTyped;
+}
+
+bool regionContainsCall(
+    BytecodeInstructionBlock& block,
+    uint32_t begin,
+    uint32_t end) {
+  for (auto it = block.begin(); it != block.end(); ++it) {
+    BytecodeInstruction instr = *it;
+    uint32_t off = instr.baseIndex().value() * 2;
+    if (off < begin || off >= end) {
+      continue;
+    }
+    switch (instr.opcode()) {
+      case CALL:
+      case CALL_FUNCTION_EX:
+      case CALL_INTRINSIC_1:
+      case CALL_INTRINSIC_2:
+      case CALL_KW:
+        return true;
+      default:
+        break;
+    }
+  }
+  return false;
+}
+
+bool isSelfContainedEafpCode(BorrowedRef<PyCodeObject> code) {
+  std::vector<ExceptionTableEntry> entries;
+  if (!parseExceptionTable(code, entries) || entries.empty()) {
+    return false;
+  }
+  BytecodeInstructionBlock block{code};
+  bool saw_benign_typed_handler = false;
+  for (const auto& entry : entries) {
+    switch (classifyEafpHandler(code, block, entry.target)) {
+      case EafpHandlerKind::kOther:
+        return false;
+      case EafpHandlerKind::kBenign:
+        if (regionContainsCall(block, entry.start, entry.end)) {
+          return false;
+        }
+        saw_benign_typed_handler = true;
+        break;
+      case EafpHandlerKind::kNotTyped:
+        // Cleanup entry (with/finally); calls on the slow path are fine.
+        break;
+    }
+  }
+  if (!saw_benign_typed_handler) {
+    return false;
+  }
+  for (auto it = block.begin(); it != block.end(); ++it) {
+    if ((*it).opcode() == RAISE_VARARGS) {
+      return false;
+    }
+  }
+  return true;
+}
+
+} // namespace
+
 std::optional<StructureKey> deriveStructureKey(BorrowedRef<PyCodeObject> code) {
   if (!isAutoJitClassifiable(code)) {
     return std::nullopt;
@@ -980,6 +1153,15 @@ std::optional<StructureKey> deriveStructureKey(BorrowedRef<PyCodeObject> code) {
           0 ||
       sig->counts[dimIndex(WorkDim::Suspend)] > 0;
   key.risk_reason = deriveRiskReason(*sig, buckets);
+  // Record self-contained EAFP cache idioms (the handler runs only on cache
+  // misses, so the static exception-risk verdict misprices them). The
+  // exception risk itself stays in the key; computeThresholdForCode waives
+  // it per gate check outside the startup phase, so bootstrap machinery
+  // classified while imports are in flight keeps the deferral.
+  if ((key.risk_reason & kRiskException) != 0 &&
+      isSelfContainedEafpCode(code)) {
+    key.is_eafp_benign = true;
+  }
   key.code_size_bucket = codeSizeBucket(sig->n_eff);
   key.active_dim_mask = activeDimMask(buckets);
 
@@ -1147,14 +1329,23 @@ ThresholdDecision computeThresholdForCode(
     const StructureKey& key,
     const GateContext& context,
     uint32_t global) {
-  auto decision = computeThreshold(key, context, global);
-  if (isStdlibAsyncioEventLoopFrameworkHelper(code, key, context)) {
+  // Outside the startup phase, waive the exception risk for self-contained
+  // EAFP cache idioms before computing the verdict. This is re-evaluated on
+  // every gate check, so the same code keeps the risk deferral while
+  // imports or setup are in flight.
+  StructureKey effective = key;
+  if (effective.is_eafp_benign && !context.startup_phase) {
+    effective.risk_reason &= static_cast<uint8_t>(~kRiskException);
+  }
+
+  auto decision = computeThreshold(effective, context, global);
+  if (isStdlibAsyncioEventLoopFrameworkHelper(code, effective, context)) {
     return {
         saturatingMul(global, kStartupDeferThresholdFactor),
         BranchReason::LowRoi};
   }
   if (decision.branch_reason != BranchReason::None &&
-      shouldAllowSteadyStatePlainGenerator(code, key, context)) {
+      shouldAllowSteadyStatePlainGenerator(code, effective, context)) {
     return {global, BranchReason::None};
   }
   return decision;

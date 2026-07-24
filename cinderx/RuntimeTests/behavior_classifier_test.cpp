@@ -61,6 +61,7 @@ TEST(BehaviorClassifierTest, StructureKeyPackRoundTripsAllFields) {
       3,
       true,
       true,
+      true,
       static_cast<uint8_t>(kRiskDynamic | kRiskException | kRiskHugeCode),
       2,
       static_cast<uint8_t>(
@@ -81,6 +82,7 @@ TEST(BehaviorClassifierTest, StructureKeyPackRoundTripsAllFields) {
   EXPECT_EQ(decoded.loop_score, 3);
   EXPECT_TRUE(decoded.is_suspendable);
   EXPECT_TRUE(decoded.is_static);
+  EXPECT_TRUE(decoded.is_eafp_benign);
   EXPECT_TRUE(decoded.highRisk());
   EXPECT_EQ(decoded.risk_reason, key.risk_reason);
   EXPECT_EQ(decoded.code_size_bucket, 2);
@@ -1212,6 +1214,113 @@ target = ns["BaseEventLoop"].call_soon
       computeThresholdForCode(codeFromFunc(func), user_helper, {}, 2);
   EXPECT_EQ(decision.limit, 2);
   EXPECT_EQ(decision.branch_reason, BranchReason::None);
+}
+
+TEST_F(
+    BehaviorClassifierRuntimeTest,
+    DeriveStructureKeyMarksSelfContainedEafpCacheIdiom) {
+  Ref<> benign = compileStockAndGet(
+      R"(
+def probe(cache, key):
+    try:
+        return cache[key]
+    except KeyError:
+        pass
+    try:
+        return cache.attr
+    except AttributeError:
+        return None
+target = probe
+)",
+      "target");
+  auto benign_key = deriveStructureKey(codeFromFunc(benign));
+  ASSERT_TRUE(benign_key.has_value());
+  EXPECT_TRUE(benign_key->is_eafp_benign);
+  EXPECT_NE(benign_key->risk_reason & kRiskException, 0);
+
+  Ref<> calls_in_region = compileStockAndGet(
+      R"(
+def probe(cache, key):
+    try:
+        return cache.fetch(key)
+    except KeyError:
+        return None
+target = probe
+)",
+      "target");
+  auto calls_key = deriveStructureKey(codeFromFunc(calls_in_region));
+  ASSERT_TRUE(calls_key.has_value());
+  EXPECT_FALSE(calls_key->is_eafp_benign);
+
+  Ref<> raising = compileStockAndGet(
+      R"(
+def probe(cache, key):
+    try:
+        return cache[key]
+    except KeyError:
+        raise ValueError(key)
+target = probe
+)",
+      "target");
+  auto raising_key = deriveStructureKey(codeFromFunc(raising));
+  ASSERT_TRUE(raising_key.has_value());
+  EXPECT_FALSE(raising_key->is_eafp_benign);
+
+  Ref<> other_type = compileStockAndGet(
+      R"(
+def probe(cache, key):
+    try:
+        return cache[key]
+    except ZeroDivisionError:
+        return None
+target = probe
+)",
+      "target");
+  auto other_key = deriveStructureKey(codeFromFunc(other_type));
+  ASSERT_TRUE(other_key.has_value());
+  EXPECT_FALSE(other_key->is_eafp_benign);
+}
+
+TEST_F(
+    BehaviorClassifierRuntimeTest,
+    EafpBenignWaivesExceptionRiskOutsideStartup) {
+  GateContext steady_state{false};
+  GateContext startup{true};
+
+  StructureKey risky_predicate{Family::ObjectManipulator};
+  risky_predicate.loop_score = 0;
+  risky_predicate.risk_reason = kRiskException;
+  risky_predicate.active_dim_mask =
+      activeDimMaskFor(WorkDim::Control) | activeDimMaskFor(WorkDim::Object);
+
+  auto deferred = computeThreshold(risky_predicate, steady_state, 2);
+  EXPECT_GE(deferred.limit, 65536);
+  EXPECT_EQ(deferred.branch_reason, BranchReason::RiskDefer);
+
+  StructureKey benign_predicate = risky_predicate;
+  benign_predicate.is_eafp_benign = true;
+  EXPECT_EQ(
+      StructureKey::unpack(benign_predicate.pack()).is_eafp_benign, true);
+
+  Ref<> func = compileStockAndGet(
+      R"(
+def probe(cache, key):
+    try:
+        return cache[key]
+    except KeyError:
+        return None
+target = probe
+)",
+      "target");
+  auto steady = computeThresholdForCode(
+      codeFromFunc(func), benign_predicate, steady_state, 2);
+  EXPECT_EQ(steady.limit, 2);
+  EXPECT_EQ(steady.branch_reason, BranchReason::None);
+
+  auto during_startup =
+      computeThresholdForCode(codeFromFunc(func), benign_predicate, startup, 2);
+  EXPECT_GE(during_startup.limit, 65536);
+  EXPECT_EQ(during_startup.branch_reason, BranchReason::RiskDefer);
 }
 
 TEST_F(
