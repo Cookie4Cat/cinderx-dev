@@ -34,7 +34,7 @@
 2. 正确处理 CPython 3.11 的字节码、参数绑定、递归、Frame 生命周期、自省、异常、对象协议、缓存失效和去优化现场重建。
 3. 对 coroutine、iterable coroutine、async Generator 及其他未支持能力执行明确、安全的拒编回退，不创建半成品 JIT 状态。
 4. 建立可复现的 Stock、JIT-off、JIT-on、强制编译、函数级失效和 site-deopt 测试链路，并形成 PR 与 Daily 分层门禁。
-5. 保持 CPython/CinderX 3.14 参考线行为不变，共享代码修改必须通过反向构建和回归。
+5. 保持 CinderX 的 CPython 3.14 适配主线行为不变，共享代码修改必须通过反向构建和回归。
 
 ### 1.3.2 非目标
 
@@ -68,7 +68,7 @@
 
 ### 3.1.1 设计基线
 
-本提案依赖前置设计“可构建运行与自定义解释器循环”提供的 CPython 3.11 构建、vendored 解释器、private API 兼容层和 PEP 523 接入能力。正式目标固定为 openEuler 24.03-LTS-SP3、CPython 3.11.6、AArch64，并以 CPython/CinderX 3.14 作为共享代码参考线，而不是 3.11 正确性的 oracle。
+本提案依赖前置设计“可构建运行与自定义解释器循环”提供的 CPython 3.11 构建、vendored 解释器、private API 兼容层和 PEP 523 接入能力。正式目标固定为 openEuler 24.03-LTS-SP3、CPython 3.11.6、AArch64，并以 CinderX 的 CPython 3.14 适配主线作为共享代码参考线，而不是 3.11 正确性的 oracle。
 
 ### 3.1.2 设计原则
 
@@ -985,7 +985,7 @@ CPython 3.11 适配主要调整内部字节码翻译、运行时语义和能力�
 
 | 技术/项目 | 借鉴内容 | 本提案的差异 |
 |---|---|---|
-| CinderX 3.14 参考线 | HIR/LIR、AArch64 codegen、调用、deopt 和内联缓存总体架构 | 仅作为共享实现和行为参考；3.11 字节码、Frame、缓存失效和对象布局独立适配 |
+| CinderX 的 CPython 3.14 适配主线 | HIR/LIR、AArch64 codegen、调用、deopt 和内联缓存总体架构 | 仅作为共享实现和行为参考；3.11 字节码、Frame、缓存失效和对象布局独立适配 |
 | CPython 3.11.6 | 字节码、adaptive specialization、exception table、Frame、Generator 和对象协议的语义真源 | 使用 vendored/锚定源码和同版本 stock 解释器作为正确性 oracle |
 | PEP 523 | Frame evaluator 接管机制 | 只在明确所有权和固定主解释器环境下安装，不覆盖第三方 evaluator |
 | PEP 659 | CPython 3.11 adaptive/specialized bytecode | 使用 3.11 生成表为封闭真源，JIT 仅消费已审计证据 |
