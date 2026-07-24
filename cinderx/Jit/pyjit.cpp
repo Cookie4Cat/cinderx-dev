@@ -291,7 +291,6 @@ void writeAutoJitCompileEvent(
         << ",\"loop_score\":" << static_cast<int>(key->loop_score)
         << ",\"is_suspendable\":" << (key->is_suspendable ? "true" : "false")
         << ",\"is_static\":" << (key->is_static ? "true" : "false")
-        << ",\"is_synthetic\":" << (key->is_synthetic ? "true" : "false")
         << ",\"risk_reason\":" << static_cast<int>(key->risk_reason)
         << ",\"code_size_bucket\":" << static_cast<int>(key->code_size_bucket)
         << ",\"active_dim_mask\":" << static_cast<int>(key->active_dim_mask)

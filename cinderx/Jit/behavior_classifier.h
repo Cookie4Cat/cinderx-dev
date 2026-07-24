@@ -71,7 +71,6 @@ struct StructureKey {
   uint8_t loop_score{0};
   bool is_suspendable{false};
   bool is_static{false};
-  bool is_synthetic{false};
   uint8_t risk_reason{kRiskNone};
   uint8_t code_size_bucket{0};
   uint8_t active_dim_mask{0};

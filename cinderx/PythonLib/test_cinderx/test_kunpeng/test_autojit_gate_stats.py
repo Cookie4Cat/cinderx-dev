@@ -650,7 +650,7 @@ class AutoJitGateStatsDumpTests(unittest.TestCase):
         CP3140_AUTOJIT_DIRECT_CALL_GATE_UNSUPPORTED,
         CP3140_AUTOJIT_SKIP_REASON,
     )
-    def test_plugin_freezes_low_roi_functions(self) -> None:
+    def test_plugin_compiles_low_roi_functions_at_base(self) -> None:
         with tempfile.TemporaryDirectory() as temp:
             env = _plugin_env()
 
@@ -670,12 +670,8 @@ class AutoJitGateStatsDumpTests(unittest.TestCase):
                     "    trivial(value)\n"
                     "\n"
                     "trivial_stats = cinderjit._autojit_gate_stats()\n"
-                    "assert trivial_stats['global_threshold_return'] >= 1, trivial_stats\n"
-                    "assert trivial_stats['classified_defer_freeze'] >= 1, trivial_stats\n"
-                    "assert trivial_stats['classified_warmup_return'] == 0, trivial_stats\n"
-                    "assert trivial_stats['forced_compile'] == 0, trivial_stats\n"
-                    "assert jit.count_interpreted_calls(trivial) <= 2\n"
-                    "assert not jit.is_jit_compiled(trivial)\n"
+                    "assert trivial_stats['classified_defer_freeze'] == 0, trivial_stats\n"
+                    "assert jit.is_jit_compiled(trivial), trivial_stats\n"
                     "\n"
                     "cinderjit._clear_autojit_gate_stats()\n"
                     "\n"
@@ -689,12 +685,8 @@ class AutoJitGateStatsDumpTests(unittest.TestCase):
                     "    dispatch(identity, value)\n"
                     "\n"
                     "dispatch_stats = cinderjit._autojit_gate_stats()\n"
-                    "assert dispatch_stats['global_threshold_return'] >= 1, dispatch_stats\n"
-                    "assert dispatch_stats['classified_defer_freeze'] >= 1, dispatch_stats\n"
-                    "assert dispatch_stats['classified_warmup_return'] == 0, dispatch_stats\n"
-                    "assert dispatch_stats['forced_compile'] == 0, dispatch_stats\n"
-                    "assert jit.count_interpreted_calls(dispatch) <= 2\n"
-                    "assert not jit.is_jit_compiled(dispatch)\n",
+                    "assert dispatch_stats['classified_defer_freeze'] == 0, dispatch_stats\n"
+                    "assert jit.is_jit_compiled(dispatch), dispatch_stats\n",
                 ],
                 cwd=temp,
                 env=env,
@@ -713,7 +705,7 @@ class AutoJitGateStatsDumpTests(unittest.TestCase):
         CP3140_AUTOJIT_DIRECT_CALL_GATE_UNSUPPORTED,
         CP3140_AUTOJIT_SKIP_REASON,
     )
-    def test_plugin_freezes_low_loop_object_manipulators(self) -> None:
+    def test_plugin_compiles_low_loop_object_manipulators_at_base(self) -> None:
         with tempfile.TemporaryDirectory() as temp:
             env = _plugin_env()
 
@@ -739,12 +731,8 @@ class AutoJitGateStatsDumpTests(unittest.TestCase):
                     "    write_value(payload, value)\n"
                     "\n"
                     "stats = cinderjit._autojit_gate_stats()\n"
-                    "assert stats['global_threshold_return'] >= 1, stats\n"
-                    "assert stats['classified_defer_freeze'] >= 1, stats\n"
-                    "assert stats['classified_warmup_return'] == 0, stats\n"
-                    "assert stats['forced_compile'] == 0, stats\n"
-                    "assert jit.count_interpreted_calls(write_value) <= 2\n"
-                    "assert not jit.is_jit_compiled(write_value)\n",
+                    "assert stats['classified_defer_freeze'] == 0, stats\n"
+                    "assert jit.is_jit_compiled(write_value), stats\n",
                 ],
                 cwd=temp,
                 env=env,

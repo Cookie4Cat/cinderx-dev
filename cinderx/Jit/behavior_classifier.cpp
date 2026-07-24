@@ -33,11 +33,8 @@ constexpr uint8_t kRiskSuspendBucket = 2;
 constexpr uint8_t kRiskDynamicBucket = 2;
 constexpr uint32_t kRiskExceptionFloor = 2;
 constexpr uint32_t kRiskEffectiveInstructionFloor = 200;
-constexpr uint32_t kLowRoiThresholdFactor = 2;
 constexpr uint32_t kStartupDeferThresholdFactor = 1u << 20;
 constexpr uint32_t kSteadyNonnumericWarmupThreshold = 1000;
-constexpr uint32_t kProtocolDispatchMaxDynamicLoads = 4;
-constexpr uint32_t kProtocolDispatchMaxCalls = 8;
 constexpr uint8_t kWorkDimCount = static_cast<uint8_t>(WorkDim::kCount);
 
 struct Signature {
@@ -89,15 +86,6 @@ const char* unicodeUtf8OrNull(BorrowedRef<PyObject> obj) {
   return utf8;
 }
 
-std::string lowerAscii(std::string_view value) {
-  std::string lowered;
-  lowered.reserve(value.size());
-  for (unsigned char ch : value) {
-    lowered.push_back(static_cast<char>(std::tolower(ch)));
-  }
-  return lowered;
-}
-
 bool contains(std::string_view haystack, std::string_view needle) {
   return haystack.find(needle) != std::string_view::npos;
 }
@@ -121,26 +109,6 @@ bool isStdlibAsyncioEventLoopFrameworkFilename(std::string_view filename) {
       endsWith(filename, "/asyncio/tasks.py") ||
       endsWith(filename, "/asyncio/unix_events.py") ||
       endsWith(filename, "/selectors.py");
-}
-
-bool isSyntheticFilename(BorrowedRef<PyCodeObject> code) {
-  BorrowedRef<> filename{code->co_filename};
-  if (filename == nullptr || !PyUnicode_Check(filename)) {
-    return false;
-  }
-  const char* utf8 = PyUnicode_AsUTF8(filename);
-  if (utf8 == nullptr) {
-    PyErr_Clear();
-    return false;
-  }
-  std::string_view filename_view{utf8};
-  if (!filename_view.empty() && filename_view.front() == '<') {
-    return true;
-  }
-  std::string lowered = lowerAscii(filename_view);
-  return contains(lowered, "generated") || contains(lowered, "/_generated") ||
-      contains(lowered, "/genshi/") || contains(lowered, "/mako/") ||
-      contains(lowered, "/jinja") || contains(lowered, "/django/template/");
 }
 
 uint8_t bucketDim(uint32_t count, uint32_t n_eff) {
@@ -509,257 +477,6 @@ bool isReturnOpcode(int opcode) {
       opcode == RETURN_CONST || opcode == RETURN_PRIMITIVE;
 }
 
-bool isBooleanPredicateControlOpcode(
-    const BytecodeInstruction& instr,
-    int opcode) {
-  if (instr.isBranch()) {
-    return true;
-  }
-  switch (opcode) {
-    case NOT_TAKEN:
-    case TO_BOOL:
-    case TO_BOOL_ALWAYS_TRUE:
-    case TO_BOOL_BOOL:
-    case TO_BOOL_INT:
-    case TO_BOOL_LIST:
-    case TO_BOOL_NONE:
-    case TO_BOOL_STR:
-      return true;
-    default:
-      return false;
-  }
-}
-
-bool isAllowedProtocolDynamicOpcode(int opcode) {
-  switch (opcode) {
-    case LOAD_GLOBAL:
-    case LOAD_GLOBAL_BUILTIN:
-    case LOAD_GLOBAL_MODULE:
-      return true;
-    default:
-      return false;
-  }
-}
-
-bool isAllowedProtocolControlOpcode(
-    const BytecodeInstruction& instr,
-    int opcode) {
-  if (instr.isBranch()) {
-    return true;
-  }
-  switch (opcode) {
-    case JUMP:
-    case JUMP_FORWARD:
-    case NOT_TAKEN:
-    case NOP:
-    case RAISE_VARARGS:
-    case TO_BOOL:
-    case TO_BOOL_ALWAYS_TRUE:
-    case TO_BOOL_BOOL:
-    case TO_BOOL_INT:
-    case TO_BOOL_LIST:
-    case TO_BOOL_NONE:
-    case TO_BOOL_STR:
-      return true;
-    default:
-      return false;
-  }
-}
-
-bool isSteadyLowRiskUserMethodShape(
-    BorrowedRef<PyCodeObject> code,
-    const StructureKey& key,
-    const GateContext& context) {
-  return !context.startup_phase && code != nullptr && code->co_argcount > 0 &&
-      !nameEquals(code->co_name, "__init__") && !key.is_static &&
-      !key.is_suspendable && !key.highRisk() && key.loop_score == 0 &&
-      !key.is_synthetic;
-}
-
-bool shouldAllowSteadyStateTrivialStateHelper(
-    BorrowedRef<PyCodeObject> code,
-    const StructureKey& key,
-    const GateContext& context) {
-  if (!isSteadyLowRiskUserMethodShape(code, key, context) ||
-      key.family != Family::Trivial || key.code_size_bucket != 0 ||
-      key.active_dim_mask != 0) {
-    return false;
-  }
-
-  uint32_t load_attr_count = 0;
-  uint32_t store_attr_count = 0;
-  uint32_t return_count = 0;
-  BytecodeInstructionBlock block{code};
-  for (auto it = block.begin(); it != block.end(); ++it) {
-    int opcode = (*it).opcode();
-    OpcodeClass cls = opcodeClassOf(opcode);
-    if (cls == OpcodeClass::Invalid || cls == OpcodeClass::Dispatch ||
-        cls == OpcodeClass::Dynamic || cls == OpcodeClass::Suspend ||
-        isExceptionControlOpcode(opcode)) {
-      return false;
-    }
-    if (cls == OpcodeClass::Ignored || cls == OpcodeClass::Neutral) {
-      continue;
-    }
-    if (isLoadAttrOpcode(opcode)) {
-      load_attr_count++;
-      continue;
-    }
-    if (isStoreAttrOpcode(opcode)) {
-      store_attr_count++;
-      continue;
-    }
-    if (isReturnOpcode(opcode)) {
-      return_count++;
-      continue;
-    }
-    return false;
-  }
-
-  bool state_predicate = load_attr_count > 0 && store_attr_count == 0;
-  bool state_mutator = store_attr_count > 0 && load_attr_count == 0;
-  return return_count == 1 && (state_predicate || state_mutator);
-}
-
-bool shouldAllowSteadyStateCompositeStatePredicate(
-    BorrowedRef<PyCodeObject> code,
-    const StructureKey& key,
-    const GateContext& context) {
-  const uint8_t kAllowedDims =
-      activeDimMaskFor(WorkDim::Control) | activeDimMaskFor(WorkDim::Object);
-  if (!isSteadyLowRiskUserMethodShape(code, key, context) ||
-      key.family != Family::BranchFSM || key.code_size_bucket != 0 ||
-      (key.active_dim_mask & ~kAllowedDims) != 0) {
-    return false;
-  }
-
-  uint32_t load_attr_count = 0;
-  uint32_t return_count = 0;
-  BytecodeInstructionBlock block{code};
-  for (auto it = block.begin(); it != block.end(); ++it) {
-    BytecodeInstruction instr = *it;
-    int opcode = instr.opcode();
-    if (isReturnOpcode(opcode)) {
-      return_count++;
-      continue;
-    }
-    OpcodeClass cls = opcodeClassOf(opcode);
-    if (cls == OpcodeClass::Invalid || cls == OpcodeClass::Dispatch ||
-        cls == OpcodeClass::Dynamic || cls == OpcodeClass::Suspend ||
-        isExceptionControlOpcode(opcode)) {
-      return false;
-    }
-    if (cls == OpcodeClass::Ignored || cls == OpcodeClass::Neutral) {
-      continue;
-    }
-    if (isLoadAttrOpcode(opcode)) {
-      load_attr_count++;
-      continue;
-    }
-    if (isStoreAttrOpcode(opcode)) {
-      return false;
-    }
-    if (opcode == UNARY_NOT) {
-      continue;
-    }
-    if (cls == OpcodeClass::Control &&
-        isBooleanPredicateControlOpcode(instr, opcode)) {
-      continue;
-    }
-    return false;
-  }
-
-  return load_attr_count >= 2 && return_count == 1;
-}
-
-bool shouldAllowSteadyStateProtocolDispatchCore(
-    BorrowedRef<PyCodeObject> code,
-    const StructureKey& key,
-    const GateContext& context) {
-  if (!isSteadyLowRiskUserMethodShape(code, key, context) ||
-      code->co_argcount < 2 || key.code_size_bucket > 1) {
-    return false;
-  }
-  if (key.family != Family::BranchFSM && key.family != Family::Mixed &&
-      key.family != Family::ObjectManipulator &&
-      key.family != Family::CallDispatcher) {
-    return false;
-  }
-
-  uint32_t object_access_count = 0;
-  uint32_t store_attr_count = 0;
-  uint32_t control_count = 0;
-  uint32_t call_count = 0;
-  uint32_t dynamic_count = 0;
-  uint32_t return_count = 0;
-  uint32_t raise_count = 0;
-  BytecodeInstructionBlock block{code};
-  for (auto it = block.begin(); it != block.end(); ++it) {
-    BytecodeInstruction instr = *it;
-    int opcode = instr.opcode();
-    if (isReturnOpcode(opcode)) {
-      return_count++;
-      continue;
-    }
-    OpcodeClass cls = opcodeClassOf(opcode);
-    if (cls == OpcodeClass::Invalid || cls == OpcodeClass::Suspend ||
-        isExceptionControlOpcode(opcode)) {
-      return false;
-    }
-    if (cls == OpcodeClass::Ignored || cls == OpcodeClass::Neutral) {
-      continue;
-    }
-    if (cls == OpcodeClass::Dynamic) {
-      if (!isAllowedProtocolDynamicOpcode(opcode)) {
-        return false;
-      }
-      dynamic_count++;
-      if (dynamic_count > kProtocolDispatchMaxDynamicLoads) {
-        return false;
-      }
-      continue;
-    }
-    if (cls == OpcodeClass::Dispatch) {
-      call_count++;
-      continue;
-    }
-    if (isStoreAttrOpcode(opcode)) {
-      object_access_count++;
-      store_attr_count++;
-      continue;
-    }
-    if (isLoadAttrOpcode(opcode)) {
-      object_access_count++;
-      continue;
-    }
-    if (cls == OpcodeClass::Object) {
-      object_access_count++;
-      continue;
-    }
-    if (cls == OpcodeClass::Compute) {
-      continue;
-    }
-    if (cls == OpcodeClass::Control &&
-        isAllowedProtocolControlOpcode(instr, opcode)) {
-      control_count++;
-      if (opcode == RAISE_VARARGS) {
-        raise_count++;
-        if (raise_count > 1) {
-          return false;
-        }
-      }
-      continue;
-    }
-    return false;
-  }
-
-  // This keeps state-machine cores while rejecting call-only wrappers that
-  // looked similar in pickle_pure_python's setup path.
-  return object_access_count > 0 && control_count > 0 && return_count > 0 &&
-      call_count <= kProtocolDispatchMaxCalls &&
-      (store_attr_count > 0 || raise_count > 0);
-}
-
 bool shouldDeferSteadyStateCallOnlyDispatchLoop(
     const StructureKey& key,
     const GateContext& context) {
@@ -845,7 +562,6 @@ uint32_t StructureKey::pack() const {
   payload |= (static_cast<uint32_t>(loop_score) & 0x3u) << 14;
   payload |= (is_suspendable ? 1u : 0u) << 13;
   payload |= (is_static ? 1u : 0u) << 12;
-  payload |= (is_synthetic ? 1u : 0u) << 11;
   payload |= (static_cast<uint32_t>(risk_reason) & 0xFu) << 7;
   payload |= (static_cast<uint32_t>(code_size_bucket) & 0x3u) << 5;
   payload |= static_cast<uint32_t>(active_dim_mask) & 0x1Fu;
@@ -860,7 +576,6 @@ StructureKey StructureKey::unpack(uint32_t payload) {
   key.loop_score = static_cast<uint8_t>((payload >> 14) & 0x3u);
   key.is_suspendable = ((payload >> 13) & 0x1u) != 0;
   key.is_static = ((payload >> 12) & 0x1u) != 0;
-  key.is_synthetic = ((payload >> 11) & 0x1u) != 0;
   key.risk_reason = static_cast<uint8_t>((payload >> 7) & 0xFu);
   key.code_size_bucket = static_cast<uint8_t>((payload >> 5) & 0x3u);
   key.active_dim_mask = static_cast<uint8_t>(payload & 0x1Fu);
@@ -1264,7 +979,6 @@ std::optional<StructureKey> deriveStructureKey(BorrowedRef<PyCodeObject> code) {
       (code->co_flags & (CO_GENERATOR | CO_COROUTINE | CO_ASYNC_GENERATOR)) !=
           0 ||
       sig->counts[dimIndex(WorkDim::Suspend)] > 0;
-  key.is_synthetic = isSyntheticFilename(code);
   key.risk_reason = deriveRiskReason(*sig, buckets);
   key.code_size_bucket = codeSizeBucket(sig->n_eff);
   key.active_dim_mask = activeDimMask(buckets);
@@ -1365,6 +1079,13 @@ ThresholdDecision computeThreshold(
         BranchReason::RiskDefer};
   }
 
+  // Generalized steady-state LowRoi deferral is removed: pyperformance A/B
+  // showed the blanket verdicts (multidim object graphs, non-risky warmup
+  // holds, Trivial/synthetic freezes) mostly suppressed profitable compiles.
+  // What remains deferred below is evidence-backed or risk-gated: high-risk
+  // shapes keep their prior verdicts, the call-only dispatch loop verdict
+  // stays (logging_silent, negative ROI when compiled), and the asyncio
+  // helper naming in computeThresholdForCode() is untouched.
   bool steady_multidim_nonnumeric_object_graph_candidate =
       !context.startup_phase && !key.is_static && !key.is_suspendable &&
       !key.computeHint() && key.activeDimCount() >= 3 &&
@@ -1375,7 +1096,7 @@ ThresholdDecision computeThreshold(
        (key.family == Family::Mixed &&
         (key.hasActiveDim(WorkDim::Dispatch) ||
          key.hasActiveDim(WorkDim::Dynamic))));
-  if (steady_multidim_nonnumeric_object_graph_candidate) {
+  if (steady_multidim_nonnumeric_object_graph_candidate && key.highRisk()) {
     return {
         saturatingMul(global, kStartupDeferThresholdFactor),
         BranchReason::LowRoi};
@@ -1390,11 +1111,20 @@ ThresholdDecision computeThreshold(
   bool steady_nonnumeric_warmup_candidate = !key.is_static &&
       key.loop_score == 0 &&
       (key.is_suspendable || startup_like_family || startup_like_mixed);
-  if (steady_nonnumeric_warmup_candidate) {
-    if (key.highRisk() || key.code_size_bucket > 0) {
+  if (steady_nonnumeric_warmup_candidate && key.highRisk()) {
+    return {
+        saturatingMul(global, kStartupDeferThresholdFactor),
+        BranchReason::RiskDefer};
+  }
+  // Suspendable shapes keep their prior deferral: widening the compiled
+  // generator surface is deliberately out of scope for this change and
+  // needs its own correctness pass. The plain-generator allowance in
+  // computeThresholdForCode() stays the only entry.
+  if (steady_nonnumeric_warmup_candidate && key.is_suspendable) {
+    if (key.code_size_bucket > 0) {
       return {
           saturatingMul(global, kStartupDeferThresholdFactor),
-          key.highRisk() ? BranchReason::RiskDefer : BranchReason::LowRoi};
+          BranchReason::LowRoi};
     }
     return {
         std::max(global, kSteadyNonnumericWarmupThreshold),
@@ -1402,24 +1132,13 @@ ThresholdDecision computeThreshold(
   }
 
   bool large_branch_warmup_candidate = !key.is_static && key.loop_score > 0 &&
-      key.family == Family::BranchFSM &&
-      (key.highRisk() || key.code_size_bucket >= 2);
+      key.family == Family::BranchFSM && key.highRisk();
   if (large_branch_warmup_candidate) {
     return {
         std::max(global, kSteadyNonnumericWarmupThreshold),
         BranchReason::LowRoi};
   }
 
-  bool low_roi_base = key.loop_score == 0 && !key.is_static &&
-      !key.is_suspendable && !key.highRisk();
-  bool trivial_low_roi_candidate =
-      low_roi_base && key.family == Family::Trivial;
-  bool synthetic_low_roi_candidate = key.is_synthetic && low_roi_base &&
-      (key.family == Family::ReflectionMeta || key.family == Family::Trivial);
-  if (trivial_low_roi_candidate || synthetic_low_roi_candidate) {
-    return {
-        saturatingMul(global, kLowRoiThresholdFactor), BranchReason::LowRoi};
-  }
   return {global, BranchReason::None};
 }
 
@@ -1436,15 +1155,6 @@ ThresholdDecision computeThresholdForCode(
   }
   if (decision.branch_reason != BranchReason::None &&
       shouldAllowSteadyStatePlainGenerator(code, key, context)) {
-    return {global, BranchReason::None};
-  }
-  if (decision.branch_reason == BranchReason::LowRoi &&
-      shouldAllowSteadyStateTrivialStateHelper(code, key, context)) {
-    return {global, BranchReason::None};
-  }
-  if (decision.branch_reason == BranchReason::LowRoi &&
-      (shouldAllowSteadyStateCompositeStatePredicate(code, key, context) ||
-       shouldAllowSteadyStateProtocolDispatchCore(code, key, context))) {
     return {global, BranchReason::None};
   }
   return decision;

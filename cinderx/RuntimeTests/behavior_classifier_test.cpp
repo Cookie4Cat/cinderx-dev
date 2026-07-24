@@ -61,7 +61,6 @@ TEST(BehaviorClassifierTest, StructureKeyPackRoundTripsAllFields) {
       3,
       true,
       true,
-      true,
       static_cast<uint8_t>(kRiskDynamic | kRiskException | kRiskHugeCode),
       2,
       static_cast<uint8_t>(
@@ -82,7 +81,6 @@ TEST(BehaviorClassifierTest, StructureKeyPackRoundTripsAllFields) {
   EXPECT_EQ(decoded.loop_score, 3);
   EXPECT_TRUE(decoded.is_suspendable);
   EXPECT_TRUE(decoded.is_static);
-  EXPECT_TRUE(decoded.is_synthetic);
   EXPECT_TRUE(decoded.highRisk());
   EXPECT_EQ(decoded.risk_reason, key.risk_reason);
   EXPECT_EQ(decoded.code_size_bucket, 2);
@@ -107,13 +105,13 @@ TEST(BehaviorClassifierTest, OpcodeClassGoldenExamples) {
 
 TEST(
     BehaviorClassifierTest,
-    ComputeThresholdWarmsUpSteadyStateStartupLikeWork) {
+    ComputeThresholdCompilesSteadyStateStartupLikeWork) {
   GateContext ctx{false};
 
   StructureKey trivial{Family::Trivial};
   auto trivial_decision = computeThreshold(trivial, ctx, 2);
-  EXPECT_EQ(trivial_decision.limit, 4);
-  EXPECT_EQ(trivial_decision.branch_reason, BranchReason::LowRoi);
+  EXPECT_EQ(trivial_decision.limit, 2);
+  EXPECT_EQ(trivial_decision.branch_reason, BranchReason::None);
 
   StructureKey static_trivial{Family::Trivial};
   static_trivial.is_static = true;
@@ -179,8 +177,8 @@ TEST(BehaviorClassifierTest, StartupContextDefersImportLikeWork) {
 
   GateContext steady_state{false};
   auto steady_state_decision = computeThreshold(dispatcher, steady_state, 2);
-  EXPECT_EQ(steady_state_decision.limit, 1000);
-  EXPECT_EQ(steady_state_decision.branch_reason, BranchReason::LowRoi);
+  EXPECT_EQ(steady_state_decision.limit, 2);
+  EXPECT_EQ(steady_state_decision.branch_reason, BranchReason::None);
 
   StructureKey loop{Family::NumericLoop};
   loop.loop_score = 2;
@@ -241,8 +239,8 @@ TEST(BehaviorClassifierTest, ImportWindowDefersHighCostNonnumericWork) {
   EXPECT_EQ(large_branch_decision.branch_reason, BranchReason::StartupInit);
 
   auto steady_state_decision = computeThreshold(large_branch, steady_state, 2);
-  EXPECT_EQ(steady_state_decision.limit, 1000);
-  EXPECT_EQ(steady_state_decision.branch_reason, BranchReason::LowRoi);
+  EXPECT_EQ(steady_state_decision.limit, 2);
+  EXPECT_EQ(steady_state_decision.branch_reason, BranchReason::None);
 
   StructureKey medium_branch{Family::BranchFSM};
   medium_branch.loop_score = 1;
@@ -278,9 +276,9 @@ TEST(BehaviorClassifierTest, ImportWindowDefersHighCostNonnumericWork) {
 
   auto post_import_low_cost_dispatcher =
       computeThreshold(low_cost_dispatcher, steady_state, 2);
-  EXPECT_EQ(post_import_low_cost_dispatcher.limit, 1000);
+  EXPECT_EQ(post_import_low_cost_dispatcher.limit, 2);
   EXPECT_EQ(
-      post_import_low_cost_dispatcher.branch_reason, BranchReason::LowRoi);
+      post_import_low_cost_dispatcher.branch_reason, BranchReason::None);
 
   StructureKey numeric_loop{Family::NumericLoop};
   numeric_loop.loop_score = 2;
@@ -392,8 +390,8 @@ TEST(BehaviorClassifierTest, SteadyStateWarmsUpLargeBranchStateMachines) {
   large_low_risk_branch_loop.code_size_bucket = 2;
   auto large_low_risk_branch_decision =
       computeThreshold(large_low_risk_branch_loop, steady_state, 2);
-  EXPECT_EQ(large_low_risk_branch_decision.limit, 1000);
-  EXPECT_EQ(large_low_risk_branch_decision.branch_reason, BranchReason::LowRoi);
+  EXPECT_EQ(large_low_risk_branch_decision.limit, 2);
+  EXPECT_EQ(large_low_risk_branch_decision.branch_reason, BranchReason::None);
 
   StructureKey numeric_loop{Family::NumericLoop};
   numeric_loop.loop_score = 3;
@@ -492,7 +490,7 @@ TEST(BehaviorClassifierTest, SteadyStateRiskDefersExpectedExceptionLoopShape) {
       dispatching_exception_loop_decision.branch_reason, BranchReason::LowRoi);
 }
 
-TEST(BehaviorClassifierTest, SteadyStateDefersMultidimNonnumericObjectGraphs) {
+TEST(BehaviorClassifierTest, SteadyStateCompilesMultidimNonnumericObjectGraphs) {
   GateContext steady_state{false};
 
   StructureKey reflection_object_graph{Family::ReflectionMeta};
@@ -502,8 +500,8 @@ TEST(BehaviorClassifierTest, SteadyStateDefersMultidimNonnumericObjectGraphs) {
       activeDimMaskFor(WorkDim::Dispatch) | activeDimMaskFor(WorkDim::Dynamic);
   auto reflection_decision =
       computeThreshold(reflection_object_graph, steady_state, 2);
-  EXPECT_GE(reflection_decision.limit, 65536);
-  EXPECT_EQ(reflection_decision.branch_reason, BranchReason::LowRoi);
+  EXPECT_EQ(reflection_decision.limit, 2);
+  EXPECT_EQ(reflection_decision.branch_reason, BranchReason::None);
 
   StructureKey call_dispatch_graph{Family::CallDispatcher};
   call_dispatch_graph.loop_score = 1;
@@ -511,8 +509,8 @@ TEST(BehaviorClassifierTest, SteadyStateDefersMultidimNonnumericObjectGraphs) {
       activeDimMaskFor(WorkDim::Object) | activeDimMaskFor(WorkDim::Dispatch);
   auto call_dispatch_decision =
       computeThreshold(call_dispatch_graph, steady_state, 2);
-  EXPECT_GE(call_dispatch_decision.limit, 65536);
-  EXPECT_EQ(call_dispatch_decision.branch_reason, BranchReason::LowRoi);
+  EXPECT_EQ(call_dispatch_decision.limit, 2);
+  EXPECT_EQ(call_dispatch_decision.branch_reason, BranchReason::None);
 
   StructureKey branch_scheduler{Family::BranchFSM};
   branch_scheduler.loop_score = 2;
@@ -534,30 +532,30 @@ TEST(BehaviorClassifierTest, SteadyStateDefersMultidimNonnumericObjectGraphs) {
   EXPECT_EQ(compute_decision.branch_reason, BranchReason::None);
 }
 
-TEST(BehaviorClassifierTest, SteadyStateWarmsUpTinyStartupLikeWork) {
+TEST(BehaviorClassifierTest, SteadyStateCompilesTinyStartupLikeWork) {
   GateContext steady_state{false};
 
   StructureKey tiny_branch{Family::BranchFSM};
   tiny_branch.loop_score = 0;
   tiny_branch.code_size_bucket = 0;
   auto tiny_branch_decision = computeThreshold(tiny_branch, steady_state, 2);
-  EXPECT_EQ(tiny_branch_decision.limit, 1000);
-  EXPECT_EQ(tiny_branch_decision.branch_reason, BranchReason::LowRoi);
+  EXPECT_EQ(tiny_branch_decision.limit, 2);
+  EXPECT_EQ(tiny_branch_decision.branch_reason, BranchReason::None);
 
   StructureKey tiny_object{Family::ObjectManipulator};
   tiny_object.loop_score = 0;
   tiny_object.code_size_bucket = 0;
   auto tiny_object_decision = computeThreshold(tiny_object, steady_state, 2);
-  EXPECT_EQ(tiny_object_decision.limit, 1000);
-  EXPECT_EQ(tiny_object_decision.branch_reason, BranchReason::LowRoi);
+  EXPECT_EQ(tiny_object_decision.limit, 2);
+  EXPECT_EQ(tiny_object_decision.branch_reason, BranchReason::None);
 
   StructureKey medium_object{Family::ObjectManipulator};
   medium_object.loop_score = 0;
   medium_object.code_size_bucket = 1;
   auto medium_object_decision =
       computeThreshold(medium_object, steady_state, 2);
-  EXPECT_GE(medium_object_decision.limit, 65536);
-  EXPECT_EQ(medium_object_decision.branch_reason, BranchReason::LowRoi);
+  EXPECT_EQ(medium_object_decision.limit, 2);
+  EXPECT_EQ(medium_object_decision.branch_reason, BranchReason::None);
 
   StructureKey tiny_numeric{Family::NumericLoop};
   tiny_numeric.loop_score = 0;
@@ -571,7 +569,7 @@ class BehaviorClassifierRuntimeTest : public RuntimeTest {};
 
 TEST_F(
     BehaviorClassifierRuntimeTest,
-    AutoClassifyDefersTinyObjectHelpersOnPythonCallPath) {
+    AutoClassifyCompilesTinyObjectHelpersOnPythonCallPath) {
   ScopedAutoJitConfig config_guard;
   getMutableConfig().compile_after_n_calls = 2;
   getMutableConfig().auto_classify = true;
@@ -596,7 +594,7 @@ grid = Grid()
 for _ in range(16):
     Grid.__getitem__(grid, (0, 0))
 
-assert not jit.is_jit_compiled(Grid.__getitem__)
+assert jit.is_jit_compiled(Grid.__getitem__)
 assert jit.count_interpreted_calls(Grid.__getitem__) <= 2
 )");
 }
@@ -835,7 +833,9 @@ target = Task.fn
   }
 }
 
-TEST_F(BehaviorClassifierRuntimeTest, DefersGlobalHeavyProtocolLikeWork) {
+TEST_F(
+    BehaviorClassifierRuntimeTest,
+    SteadyStateCompilesGlobalHeavyProtocolLikeWork) {
   Ref<> global_heavy = compileStockAndGet(
       R"(
 G1 = True
@@ -869,10 +869,13 @@ target = Helper.globalHeavy
 
   auto decision =
       computeThresholdForCode(codeFromFunc(global_heavy), *key, {}, 2);
-  EXPECT_NE(decision.branch_reason, BranchReason::None);
+  EXPECT_EQ(decision.limit, 2);
+  EXPECT_EQ(decision.branch_reason, BranchReason::None);
 }
 
-TEST_F(BehaviorClassifierRuntimeTest, DefersCallOnlyProtocolLikeWrappers) {
+TEST_F(
+    BehaviorClassifierRuntimeTest,
+    SteadyStateCompilesCallOnlyProtocolLikeWrappers) {
   Ref<> call_only = compileStockAndGet(
       R"(
 class Wrapper:
@@ -897,7 +900,8 @@ target = Wrapper.callOnly
   EXPECT_FALSE(key->highRisk());
 
   auto decision = computeThresholdForCode(codeFromFunc(call_only), *key, {}, 2);
-  EXPECT_NE(decision.branch_reason, BranchReason::None);
+  EXPECT_EQ(decision.limit, 2);
+  EXPECT_EQ(decision.branch_reason, BranchReason::None);
 }
 
 TEST_F(
@@ -988,37 +992,6 @@ def thin(x):
   EXPECT_EQ(second->pack(), first->pack());
 }
 
-TEST_F(BehaviorClassifierRuntimeTest, AutoClassifyFreezesThinFunctions) {
-  ScopedAutoJitConfig config_guard;
-  getMutableConfig().compile_after_n_calls = 2;
-  getMutableConfig().auto_classify = true;
-  getMutableConfig().enable_startup_init_policy = false;
-
-  runStockCode(R"(
-import cinderx.jit as jit
-
-def thin(x):
-    return x
-
-assert not jit.is_jit_compiled(thin)
-thin(1)
-thin(2)
-assert not jit.is_jit_compiled(thin)
-
-thin(3)
-thin(4)
-assert not jit.is_jit_compiled(thin)
-
-frozen_calls = jit.count_interpreted_calls(thin)
-for value in range(5, 33):
-    thin(value)
-    assert not jit.is_jit_compiled(thin)
-
-assert jit.count_interpreted_calls(thin) == frozen_calls
-assert not jit.is_jit_compiled(thin)
-)");
-}
-
 TEST_F(
     BehaviorClassifierRuntimeTest,
     AutoClassifySkipsGateForNewFunctionsWithSteadyColdCode) {
@@ -1029,15 +1002,26 @@ TEST_F(
 
   runStockCode(R"(
 import cinderjit
+import cinderx.jit as jit
 
 def make_inner():
-    def inner(value):
-        return value
+    def inner(cache, key):
+        try:
+            return cache.fetch(key)
+        except KeyError:
+            return None
     return inner
 
+class Cache:
+    def fetch(self, key):
+        return key
+
+cache = Cache()
 first = make_inner()
 for value in range(4):
-    first(value)
+    first(cache, value)
+
+assert not jit.is_jit_compiled(first)
 
 for _ in range(4):
     make_inner()
@@ -1045,7 +1029,7 @@ for _ in range(4):
 cinderjit._clear_autojit_gate_stats()
 
 for value in range(32):
-    make_inner()(value)
+    make_inner()(cache, value)
 
 stats = cinderjit._autojit_gate_stats()
 assert stats["classified_schedule_cold_skip"] >= 32, stats
@@ -1226,8 +1210,8 @@ target = ns["BaseEventLoop"].call_soon
 
   auto decision =
       computeThresholdForCode(codeFromFunc(func), user_helper, {}, 2);
-  EXPECT_EQ(decision.limit, 1000);
-  EXPECT_EQ(decision.branch_reason, BranchReason::LowRoi);
+  EXPECT_EQ(decision.limit, 2);
+  EXPECT_EQ(decision.branch_reason, BranchReason::None);
 }
 
 TEST_F(
@@ -1378,7 +1362,7 @@ assert after_calls == before_calls, (before_calls, after_calls)
 )");
 }
 
-TEST_F(BehaviorClassifierRuntimeTest, AutoClassifyFreezesTrivialLowRoiWork) {
+TEST_F(BehaviorClassifierRuntimeTest, AutoClassifyCompilesTrivialWorkAtBase) {
   ScopedAutoJitConfig config_guard;
   getMutableConfig().compile_after_n_calls = 2;
   getMutableConfig().auto_classify = true;
@@ -1397,16 +1381,13 @@ for value in range(20):
     trivial(value)
 
 stats = cinderjit._autojit_gate_stats()
-assert stats["global_threshold_return"] >= 1, stats
-assert stats["classified_defer_freeze"] >= 1, stats
-assert stats["classified_warmup_return"] == 0, stats
-assert stats["forced_compile"] == 0, stats
-assert jit.count_interpreted_calls(trivial) <= 2
-assert not jit.is_jit_compiled(trivial)
+assert stats["classified_defer_freeze"] == 0, stats
+assert stats["forced_compile"] >= 1, stats
+assert jit.is_jit_compiled(trivial), stats
 )");
 }
 
-TEST_F(BehaviorClassifierRuntimeTest, AutoClassifyFreezesLongLowRoiWork) {
+TEST_F(BehaviorClassifierRuntimeTest, AutoClassifyCompilesCallDispatchAtBase) {
   ScopedAutoJitConfig config_guard;
   getMutableConfig().compile_after_n_calls = 2;
   getMutableConfig().auto_classify = true;
@@ -1428,12 +1409,9 @@ for value in range(2000):
     dispatch(identity, value)
 
 stats = cinderjit._autojit_gate_stats()
-assert stats["global_threshold_return"] >= 1, stats
-assert stats["classified_defer_freeze"] >= 1, stats
-assert stats["classified_warmup_return"] == 0, stats
-assert stats["forced_compile"] == 0, stats
-assert jit.count_interpreted_calls(dispatch) <= 2
-assert not jit.is_jit_compiled(dispatch)
+assert stats["classified_defer_freeze"] == 0, stats
+assert stats["forced_compile"] >= 1, stats
+assert jit.is_jit_compiled(dispatch), stats
 )");
 }
 

@@ -161,7 +161,7 @@ assert jit.is_jit_compiled(target)
 )");
 }
 
-void assertNewFunctionCountsAndDefersTrivialWork(RuntimeTest& test) {
+void assertNewFunctionCountsWithoutFrameEvaluator(RuntimeTest& test) {
   test.runStockCode(R"(
 import cinderx
 import cinderx.jit as jit
@@ -179,7 +179,7 @@ assert jit.count_interpreted_calls(target) == 2
 target(3)
 target(4)
 target(5)
-assert not jit.is_jit_compiled(target)
+assert jit.is_jit_compiled(target)
 assert jit.count_interpreted_calls(target) == 2
 )");
 }
@@ -560,7 +560,7 @@ TEST_F(CmdLineTest, JITAutoEnvAutoModeCountsWithoutFrameEvaluator) {
   EXPECT_TRUE(getConfig().auto_classify);
   EXPECT_TRUE(getConfig().enable_startup_init_policy);
 
-  assertNewFunctionCountsAndDefersTrivialWork(*this);
+  assertNewFunctionCountsWithoutFrameEvaluator(*this);
 
   jit::finalize();
   jit::shutdown_jit_genobject_type();
@@ -599,7 +599,7 @@ TEST_F(CmdLineTest, JITAutoXOptionAutoModeCountsWithoutFrameEvaluator) {
   EXPECT_TRUE(getConfig().auto_classify);
   EXPECT_TRUE(getConfig().enable_startup_init_policy);
 
-  assertNewFunctionCountsAndDefersTrivialWork(*this);
+  assertNewFunctionCountsWithoutFrameEvaluator(*this);
 
   jit::finalize();
   jit::shutdown_jit_genobject_type();
