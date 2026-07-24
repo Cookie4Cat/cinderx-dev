@@ -128,12 +128,10 @@ class Preloader {
     return preloader;
   }
 
-  Type type(BorrowedRef<> descr) const;
-  int primitiveTypecode(BorrowedRef<> descr) const;
-  BorrowedRef<PyTypeObject> pyType(BorrowedRef<> descr) const;
-  const OwnedType& preloadedType(BorrowedRef<> descr) const;
+  // Fetch the type represented by a type descr tuple.
+  const OwnedType* preloadedType(BorrowedRef<> descr) const;
 
-  const FieldInfo& fieldInfo(BorrowedRef<> descr) const;
+  const FieldInfo* fieldInfo(BorrowedRef<> descr) const;
 
   const InvokeTarget& invokeFunctionTarget(BorrowedRef<> descr) const;
   const InvokeTarget& invokeMethodTarget(BorrowedRef<> descr) const;

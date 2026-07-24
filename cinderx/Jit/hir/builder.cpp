@@ -3405,10 +3405,18 @@ void HIRBuilder::emitLoadAssertionError(
 void HIRBuilder::emitLoadClass(
     TranslationContext& tc,
     const jit::BytecodeInstruction& bc_instr) {
+  BorrowedRef<> descr = constArg(bc_instr);
+  const OwnedType* type = preloader_.preloadedType(descr);
+  if (type == nullptr) {
+    BUILDER_THROW(
+        "LOAD_CLASS: Cannot find type for type descr {}", repr(descr));
+  }
+  if (type->optional) {
+    BUILDER_THROW("Cannot load optional class type {}", type->type->tp_name);
+  }
+
   Register* tmp = temps_.AllocateStack();
-  auto pytype = preloader_.pyType(constArg(bc_instr));
-  auto pytype_as_pyobj = BorrowedRef(pytype);
-  tc.emit<LoadConst>(tmp, Type::fromObject(pytype_as_pyobj));
+  tc.emit<LoadConst>(tmp, Type::fromObject(type->type));
   tc.frame.stack.push(tmp);
 }
 
@@ -3872,9 +3880,15 @@ void HIRBuilder::emitFastLen(
 void HIRBuilder::emitRefineType(
     TranslationContext& tc,
     const jit::BytecodeInstruction& bc_instr) {
-  Type type = preloader_.type(constArg(bc_instr));
+  BorrowedRef<> descr = constArg(bc_instr);
+  const OwnedType* type = preloader_.preloadedType(descr);
+  if (type == nullptr) {
+    BUILDER_THROW(
+        "REFINE_TYPE: Can't find type for type descr {}", repr(descr));
+  }
+
   Register* dst = tc.frame.stack.top();
-  tc.emit<RefineType>(dst, type, dst);
+  tc.emit<RefineType>(dst, type->toHir(), dst);
 }
 
 void HIRBuilder::emitSequenceGet(
@@ -4092,13 +4106,17 @@ void HIRBuilder::emitBuildCheckedList(
   BorrowedRef<> descr = PyTuple_GET_ITEM(arg.get(), 0);
   Py_ssize_t list_size = PyLong_AsLong(PyTuple_GET_ITEM(arg.get(), 1));
 
-  Type type = preloader_.type(descr);
-  JIT_CHECK(
-      Ci_CheckedList_TypeCheck(type.uniquePyType()),
-      "expected CheckedList type");
+  const OwnedType* type = preloader_.preloadedType(descr);
+  if (type == nullptr) {
+    BUILDER_THROW(
+        "BUILD_CHECKED_LIST: Can't find type for type descr {}", repr(descr));
+  }
+  if (!Ci_CheckedList_TypeCheck(type->type)) {
+    BUILDER_THROW("Expected CheckedList type, got {}", type->toHir());
+  }
 
   Register* list = temps_.AllocateStack();
-  tc.emit<MakeCheckedList>(list, list_size, type, tc.frame);
+  tc.emit<MakeCheckedList>(list, list_size, type->toHir(), tc.frame);
   if (list_size > 0) {
     auto fill = tc.emit<InitListElements>(list_size + 1);
     fill->SetOperand(0, list);
@@ -4117,13 +4135,17 @@ void HIRBuilder::emitBuildCheckedMap(
   BorrowedRef<> descr = PyTuple_GET_ITEM(arg.get(), 0);
   Py_ssize_t dict_size = PyLong_AsLong(PyTuple_GET_ITEM(arg.get(), 1));
 
-  Type type = preloader_.type(descr);
-  JIT_CHECK(
-      Ci_CheckedDict_TypeCheck(type.uniquePyType()),
-      "expected CheckedDict type");
+  const OwnedType* type = preloader_.preloadedType(descr);
+  if (type == nullptr) {
+    BUILDER_THROW(
+        "BUILD_CHECKED_MAP: Can't find type for type descr {}", repr(descr));
+  }
+  if (!Ci_CheckedDict_TypeCheck(type->type)) {
+    BUILDER_THROW("Expected CheckedDict type, got {}", type->toHir());
+  }
 
   Register* dict = temps_.AllocateStack();
-  tc.emit<MakeCheckedDict>(dict, dict_size, type, tc.frame);
+  tc.emit<MakeCheckedDict>(dict, dict_size, type->toHir(), tc.frame);
   // Fill dict
   auto& stack = tc.frame.stack;
   for (auto i = stack.size() - dict_size * 2, end = stack.size(); i < end;
@@ -5085,7 +5107,12 @@ void HIRBuilder::emitSetupWith(
 void HIRBuilder::emitLoadField(
     TranslationContext& tc,
     const jit::BytecodeInstruction& bc_instr) {
-  auto& [offset, type, name] = preloader_.fieldInfo(constArg(bc_instr));
+  BorrowedRef<> descr = constArg(bc_instr);
+  const FieldInfo* field = preloader_.fieldInfo(descr);
+  if (field == nullptr) {
+    BUILDER_THROW("LOAD_FIELD: Can't find field for descr {}", repr(descr));
+  }
+  auto& [offset, type, name] = *field;
 
   Register* receiver = tc.frame.stack.pop();
   Register* result = temps_.AllocateStack();
@@ -5105,7 +5132,12 @@ void HIRBuilder::emitLoadField(
 void HIRBuilder::emitStoreField(
     TranslationContext& tc,
     const jit::BytecodeInstruction& bc_instr) {
-  auto& [offset, type, name] = preloader_.fieldInfo(constArg(bc_instr));
+  BorrowedRef<> descr = constArg(bc_instr);
+  const FieldInfo* field = preloader_.fieldInfo(descr);
+  if (field == nullptr) {
+    BUILDER_THROW("STORE_FIELD: Can't find field for descr {}", repr(descr));
+  }
+  auto& [offset, type, name] = *field;
   const char* field_name = PyUnicode_AsUTF8(name);
   if (field_name == nullptr) {
     PyErr_Clear();
@@ -5129,15 +5161,20 @@ void HIRBuilder::emitStoreField(
 void HIRBuilder::emitCast(
     TranslationContext& tc,
     const jit::BytecodeInstruction& bc_instr) {
-  auto const& preloaded_type = preloader_.preloadedType(constArg(bc_instr));
+  BorrowedRef<> descr = constArg(bc_instr);
+  const OwnedType* preloaded_type = preloader_.preloadedType(descr);
+  if (preloaded_type == nullptr) {
+    BUILDER_THROW("CAST: Can't find type for type descr {}", repr(descr));
+  }
+
   Register* value = tc.frame.stack.pop();
   Register* result = temps_.AllocateStack();
   tc.emit<Cast>(
       result,
       value,
-      preloaded_type.type,
-      preloaded_type.optional,
-      preloaded_type.exact,
+      preloaded_type->type,
+      preloaded_type->optional,
+      preloaded_type->exact,
       tc.frame);
   tc.frame.stack.push(result);
 }
@@ -5145,10 +5182,18 @@ void HIRBuilder::emitCast(
 void HIRBuilder::emitTpAlloc(
     TranslationContext& tc,
     const jit::BytecodeInstruction& bc_instr) {
-  auto pytype = preloader_.pyType(constArg(bc_instr));
+  BorrowedRef<> descr = constArg(bc_instr);
+  const OwnedType* type = preloader_.preloadedType(descr);
+  if (type == nullptr) {
+    BUILDER_THROW("TP_ALLOC: Cannot find type for descr {}", repr(descr));
+  }
+  if (type->optional) {
+    BUILDER_THROW(
+        "Cannot use optional {} type for TP_ALLOC", type->type->tp_name);
+  }
 
   Register* result = temps_.AllocateStack();
-  tc.emit<TpAlloc>(result, pytype, tc.frame);
+  tc.emit<TpAlloc>(result, type->type, tc.frame);
   tc.frame.stack.push(result);
 }
 
