@@ -381,12 +381,18 @@ const InvokeTarget& Preloader::invokeMethodTarget(BorrowedRef<> descr) const {
   return *(map_get(meth_targets_, descr));
 }
 
+const DescrMap<std::unique_ptr<InvokeTarget>>&
+Preloader::invokeFunctionTargets() const {
+  return func_targets_;
+}
+
 const NativeTarget& Preloader::invokeNativeTarget(BorrowedRef<> target) const {
   return *(map_get(native_targets_, target));
 }
 
-Type Preloader::checkArgType(long local_idx) const {
-  return map_get(check_arg_types_, local_idx, TObject);
+Type Preloader::checkArgType(int local_idx) const {
+  auto it = check_arg_types_.find(local_idx);
+  return it != check_arg_types_.end() ? it->second.toHir() : TObject;
 }
 
 std::optional<Type> Preloader::inferredSelfType() const {
@@ -430,7 +436,7 @@ std::unique_ptr<Function> Preloader::makeFunction() const {
   irfunc->return_type = return_type_;
   irfunc->has_primitive_args = has_primitive_args_;
   irfunc->has_primitive_first_arg = has_primitive_first_arg_;
-  for (auto& [local, preloaded_type] : check_arg_pytypes_) {
+  for (auto& [local, preloaded_type] : check_arg_types_) {
     irfunc->typed_args.emplace_back(
         local,
         preloaded_type.type,
@@ -603,11 +609,12 @@ bool Preloader::preloadStatic() {
   BorrowedRef<PyTupleObject> checks = reinterpret_cast<PyTupleObject*>(
       _PyClassLoader_GetCodeArgumentTypeDescrs(code_));
 
+  constexpr Py_ssize_t kMaxLocals = 16384;
   for (int i = 0; i < PyTuple_GET_SIZE(checks); i += 2) {
-    long local = PyLong_AsLong(PyTuple_GET_ITEM(checks, i));
-    if (local < 0) {
-      JIT_ABORT(
-          "In Static Python function {}, hit negative local {} at index {}, "
+    Py_ssize_t local = PyLong_AsSsize_t(PyTuple_GET_ITEM(checks, i));
+    if (local < 0 || local >= kMaxLocals) {
+      JIT_THROW(
+          "In Static Python function {}, hit bad local {} at index {}, "
           "arguments checks tuple is {}",
           fullname(),
           local,
@@ -627,8 +634,7 @@ bool Preloader::preloadStatic() {
         preloaded_type.type != reinterpret_cast<PyTypeObject*>(&PyObject_Type),
         "shouldn't generate type checks for object");
     Type type = preloaded_type.toHir();
-    check_arg_types_.emplace(local, type);
-    check_arg_pytypes_.emplace(local, std::move(preloaded_type));
+    check_arg_types_.emplace(local, std::move(preloaded_type));
     if (type <= TPrimitive) {
       has_primitive_args_ = true;
       if (local == 0) {
