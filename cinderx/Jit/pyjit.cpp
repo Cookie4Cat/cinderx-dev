@@ -4601,8 +4601,10 @@ Result compileFunctionWithOSR(BorrowedRef<PyFunctionObject> func) {
 std::vector<BorrowedRef<PyFunctionObject>> preloadFuncAndDeps(
     BorrowedRef<PyFunctionObject> func,
     bool forcePreload) {
-  // Add one for the original function itself.
-  size_t limit = getConfig().preload_dependent_limit + 1;
+  // Add one for the original function itself.  When forcePreload is set the
+  // caller wants all dependents regardless of the configured limit.
+  size_t limit = forcePreload ? std::numeric_limits<size_t>::max()
+                              : getConfig().preload_dependent_limit + 1;
 
   std::deque<BorrowedRef<PyFunctionObject>> worklist;
   std::vector<BorrowedRef<PyFunctionObject>> result;
