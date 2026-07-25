@@ -1406,6 +1406,51 @@ void NativeGenerator::emitAarch64LoadAttrInvokeStub(
 #endif
 }
 
+void NativeGenerator::emitAarch64ExactLongAddSubStubs(
+    const asmjit::CodeHolder& code) {
+#if defined(CINDER_AARCH64) && PY_VERSION_HEX >= 0x030E0000 && \
+    PY_VERSION_HEX < 0x030F0000 && \
+    !defined(Py_GIL_DISABLED) && !defined(Py_REF_DEBUG) && \
+    !defined(Py_STATS)
+  if (env_.exact_long_add_sub_stubs.empty()) {
+    return;
+  }
+
+  CodeSectionOverride hot_override{as_, &code, &metadata_, CodeSection::kHot};
+  constexpr int kObTypeOffset = offsetof(PyObject, ob_type);
+  const uint64_t exact_long_type =
+      reinterpret_cast<uint64_t>(&PyLong_Type);
+
+  for (const auto& stub : env_.exact_long_add_sub_stubs) {
+    Label generic_path = as_->newLabel();
+
+    ASM_CHECK(as_->align(AlignMode::kCode, 8), GetFunction()->fullname);
+    as_->bind(stub.entry);
+
+    // x0=left, x1=right. Exact checks exclude bool and int subclasses, whose
+    // reflected methods remain observable through PyNumber_Add/Subtract.
+    as_->ldr(a64::x9, arch::ptr_offset(a64::x0, kObTypeOffset));
+    as_->mov(a64::x10, exact_long_type);
+    as_->cmp(a64::x9, a64::x10);
+    as_->b_ne(generic_path);
+    as_->ldr(a64::x9, arch::ptr_offset(a64::x1, kObTypeOffset));
+    as_->cmp(a64::x9, a64::x10);
+    as_->b_ne(generic_path);
+
+    // BR preserves the LR set by the JIT's BL to this stub, so either helper
+    // returns directly to the original post-call guard/callsite.
+    as_->mov(arch::reg_scratch_br, stub.exact_target);
+    as_->br(arch::reg_scratch_br);
+
+    as_->bind(generic_path);
+    as_->mov(arch::reg_scratch_br, stub.generic_target);
+    as_->br(arch::reg_scratch_br);
+  }
+#else
+  (void)code;
+#endif
+}
+
 void NativeGenerator::linkDeoptPatchers(const asmjit::CodeHolder& code) {
   JIT_CHECK(code.hasBaseAddress(), "code not generated!");
   uint64_t base = code.baseAddress();
@@ -1739,6 +1784,7 @@ void NativeGenerator::generateCode(
 
   generateDeoptExits(codeholder);
   emitAarch64LoadAttrInvokeStub(codeholder);
+  emitAarch64ExactLongAddSubStubs(codeholder);
 
   for (auto& [osr_idx, block] : env_.osr_entry_blocks) {
     Label stub_label = as_->newLabel();

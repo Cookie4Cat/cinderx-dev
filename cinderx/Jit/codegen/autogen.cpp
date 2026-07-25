@@ -2,6 +2,7 @@
 
 #include "cinderx/Jit/codegen/autogen.h"
 
+#include "internal/pycore_long.h"
 #include "internal/pycore_pystate.h"
 
 #include "cinderx/Common/util.h"
@@ -46,6 +47,24 @@ void checkMoveRelaxedOperandShape(const Instruction* instr) {
       output->type(),
       input->type());
 }
+
+#if defined(CINDER_AARCH64) && PY_VERSION_HEX >= 0x030E0000 && \
+    PY_VERSION_HEX < 0x030F0000 && \
+    !defined(Py_GIL_DISABLED) && !defined(Py_REF_DEBUG) && \
+    !defined(Py_STATS)
+uint64_t exactLongAddSubTarget(uint64_t generic_target) {
+  auto matches = [generic_target](binaryfunc helper) {
+    return generic_target == reinterpret_cast<uint64_t>(helper);
+  };
+  if (matches(PyNumber_Add)) {
+    return reinterpret_cast<uint64_t>(_PyLong_Add);
+  }
+  if (matches(PyNumber_Subtract)) {
+    return reinterpret_cast<uint64_t>(_PyLong_Subtract);
+  }
+  return 0;
+}
+#endif
 
 } // namespace
 
@@ -2219,6 +2238,59 @@ void translateLoadAttrCachedFastPath(Environ* env, const Instruction* instr) {
 #endif
 }
 
+void translateBinaryOpExactLongAddSubFastPath(
+    Environ* env,
+    const Instruction* instr) {
+#if defined(CINDER_AARCH64) && PY_VERSION_HEX >= 0x030E0000 && \
+    PY_VERSION_HEX < 0x030F0000 && \
+    !defined(Py_GIL_DISABLED) && !defined(Py_REF_DEBUG) && \
+    !defined(Py_STATS)
+  JIT_CHECK(
+      instr->getNumInputs() == 1 && instr->getInput(0)->isImm(),
+      "BinaryOpExactLongAddSubFastPath expects one immediate helper target");
+
+  auto output = instr->output();
+  auto as = env->as;
+  uint64_t generic_target = instr->getInput(0)->getConstant();
+  uint64_t exact_target = exactLongAddSubTarget(generic_target);
+  JIT_CHECK(
+      exact_target != 0,
+      "unsupported exact-long add/sub helper target {:#x}",
+      generic_target);
+
+  Label entry;
+  for (const auto& stub : env->exact_long_add_sub_stubs) {
+    if (stub.generic_target == generic_target) {
+      JIT_DCHECK(
+          stub.exact_target == exact_target,
+          "exact-long add/sub target changed for helper");
+      entry = stub.entry;
+      break;
+    }
+  }
+  if (!entry.isValid()) {
+    entry = as->newLabel();
+    env->exact_long_add_sub_stubs.push_back(
+        {entry, generic_target, exact_target});
+  }
+
+  // The local stub tail-branches to either target so the helper returns to the
+  // address recorded here, preserving normal callsite/deopt bookkeeping.
+  emitCall(*env, entry, instr);
+
+  if (output->type() != OperandBase::kNone) {
+    auto out_reg = AT::getGpOutput(output);
+    if (out_reg.isGpW()) {
+      as->mov(out_reg, a64::w0);
+    } else {
+      as->mov(out_reg, a64::x0);
+    }
+  }
+#else
+  translateCall(env, instr);
+#endif
+}
+
 // Our move instruction encapsulates moving a value between registers, setting
 // the value of a register, loading a value from memory, and storing a value to
 // memory. The operation that will be performed is determined by the
@@ -3851,6 +3923,9 @@ void AutoTranslator::translateInstr(Environ* env, const Instruction* instr)
       return;
     case Instruction::kLoadAttrCachedFastPath:
       translateLoadAttrCachedFastPath(env, instr);
+      return;
+    case Instruction::kBinaryOpExactLongAddSubFastPath:
+      translateBinaryOpExactLongAddSubFastPath(env, instr);
       return;
     case Instruction::kMove:
       translateMove(env, instr);

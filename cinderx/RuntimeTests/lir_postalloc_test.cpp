@@ -775,6 +775,54 @@ TEST_F(LIRPostAllocRewriteTest, LoadAttrCachedFastPathKeepsOpcode) {
   EXPECT_EQ(fast_path->getNumInputs(), 1);
 }
 
+TEST_F(
+    LIRPostAllocRewriteTest,
+    BinaryOpExactLongAddSubFastPathKeepsOpcodeAndABI) {
+#if defined(CINDER_AARCH64) && PY_VERSION_HEX >= 0x030E0000 && \
+    PY_VERSION_HEX < 0x030F0000 && \
+    !defined(Py_GIL_DISABLED) && !defined(Py_REF_DEBUG) && \
+    !defined(Py_STATS)
+  Function func;
+  auto* bb = func.allocateBasicBlock();
+  constexpr uint64_t kGenericHelper = 0x12345678;
+  bb->allocateInstr(
+      Instruction::kBinaryOpExactLongAddSubFastPath,
+      nullptr,
+      OutPhyReg{X4, DataType::kObject},
+      Imm{kGenericHelper, DataType::k64bit},
+      PhyReg{X2, DataType::kObject},
+      PhyReg{X3, DataType::kObject});
+
+  jit::codegen::Environ env;
+  PostRegAllocRewrite rewrite(&func, &env);
+  rewrite.run();
+
+  auto instrs = collectInstrs(*bb);
+  ASSERT_EQ(instrs.size(), 4);
+  ASSERT_TRUE(instrs[0]->isMove());
+  EXPECT_EQ(instrs[0]->output()->getPhyRegister(), X0);
+  EXPECT_EQ(instrs[0]->getInput(0)->getPhyRegister(), X2);
+  ASSERT_TRUE(instrs[1]->isMove());
+  EXPECT_EQ(instrs[1]->output()->getPhyRegister(), X1);
+  EXPECT_EQ(instrs[1]->getInput(0)->getPhyRegister(), X3);
+
+  auto* fast_path = instrs[2];
+  ASSERT_TRUE(fast_path->isBinaryOpExactLongAddSubFastPath());
+  ASSERT_FALSE(fast_path->isCall());
+  EXPECT_TRUE(fast_path->output()->isNone());
+  ASSERT_EQ(fast_path->getNumInputs(), 1);
+  ASSERT_TRUE(fast_path->getInput(0)->isImm());
+  EXPECT_EQ(fast_path->getInput(0)->getConstant(), kGenericHelper);
+
+  ASSERT_TRUE(instrs[3]->isMove());
+  EXPECT_EQ(instrs[3]->output()->getPhyRegister(), X4);
+  EXPECT_EQ(instrs[3]->getInput(0)->getPhyRegister(), X0);
+  ASSERT_TRUE(verifyPostRegAllocInvariants(&func, std::cout));
+#else
+  GTEST_SKIP() << "AArch64 CPython 3.14 GIL-only fast path";
+#endif
+}
+
 // kAdd with one register input and one stack input should insert a Move from
 // stack to GP scratch register before the Add, then rewrite the Add's stack
 // input to use the scratch register.

@@ -387,12 +387,14 @@ RewriteResult rewriteCallInstrs(instr_iter_t instr_iter, Environ* env) {
     return kChanged;
   } else if (
       !instr->isCall() && !instr->isVectorCallTstate() &&
-      !instr->isLoadAttrCachedFastPath()) {
+      !instr->isLoadAttrCachedFastPath() &&
+      !instr->isBinaryOpExactLongAddSubFastPath()) {
     return kUnchanged;
   }
 
   auto output = instr->output();
-  if ((instr->isCall() || instr->isLoadAttrCachedFastPath()) &&
+  if ((instr->isCall() || instr->isLoadAttrCachedFastPath() ||
+       instr->isBinaryOpExactLongAddSubFastPath()) &&
       instr->getNumInputs() == 1 && output->isNone()) {
     return kUnchanged;
   }
@@ -407,7 +409,8 @@ RewriteResult rewriteCallInstrs(instr_iter_t instr_iter, Environ* env) {
   }
 
   instr->setNumInputs(1); // leave function self operand only
-  if (!instr->isLoadAttrCachedFastPath()) {
+  if (!instr->isLoadAttrCachedFastPath() &&
+      !instr->isBinaryOpExactLongAddSubFastPath()) {
     instr->setOpcode(Instruction::kCall);
   }
 
@@ -1011,6 +1014,7 @@ RewriteResult rewriteMemoryInputsToReg(instr_iter_t instr_iter) {
     case Instruction::kNop:
     case Instruction::kUnreachable:
     case Instruction::kCall:
+    case Instruction::kBinaryOpExactLongAddSubFastPath:
     case Instruction::kVectorCallTstate:
     case Instruction::kVarArgCall:
     case Instruction::kA64GuardCC:

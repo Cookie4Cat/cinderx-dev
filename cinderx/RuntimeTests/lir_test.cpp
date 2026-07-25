@@ -21,6 +21,7 @@
 #include <ostream>
 #include <regex>
 #include <string>
+#include <string_view>
 #include <utility>
 
 using namespace asmjit;
@@ -170,6 +171,127 @@ def f(obj):
     auto lir_str = getLIRString(pyfunc.get());
     ASSERT_FALSE(lir_str.empty());
   }
+}
+
+TEST_F(LIRGeneratorTest, Aarch64ExactLongAddSubFastPathSelection) {
+#if defined(CINDER_AARCH64) && PY_VERSION_HEX >= 0x030E0000 && \
+    PY_VERSION_HEX < 0x030F0000 && \
+    !defined(Py_GIL_DISABLED) && !defined(Py_REF_DEBUG) && \
+    !defined(Py_STATS)
+  auto count_opcode = [](const std::string& lir, std::string_view opcode) {
+    size_t count = 0;
+    size_t pos = 0;
+    while ((pos = lir.find(opcode, pos)) != std::string::npos) {
+      ++count;
+      pos += opcode.size();
+    }
+    return count;
+  };
+
+  Ref<PyObject> binary_func(compileAndGet(
+      R"(
+def binary_func(a, b):
+  return (a + b, a - b)
+)",
+      "binary_func"));
+  ASSERT_NE(binary_func.get(), nullptr);
+  auto binary_lir = getLIRString(binary_func.get());
+  EXPECT_EQ(
+      count_opcode(
+          binary_lir, "BinaryOpExactLongAddSubFastPath"),
+      2)
+      << binary_lir;
+
+  Ref<PyObject> other_binary_func(compileAndGet(
+      R"(
+def other_binary_func(a, b):
+  return (
+      a & b,
+      a // b,
+      a << b,
+      a % b,
+      a * b,
+      a | b,
+      a >> b,
+      a / b,
+      a ^ b,
+      a ** b,
+      a @ b,
+      a[b],
+  )
+)",
+      "other_binary_func"));
+  ASSERT_NE(other_binary_func.get(), nullptr);
+  auto other_binary_lir = getLIRString(other_binary_func.get());
+  EXPECT_EQ(
+      count_opcode(
+          other_binary_lir, "BinaryOpExactLongAddSubFastPath"),
+      0)
+      << other_binary_lir;
+  EXPECT_NE(other_binary_lir.find(":Object = Call"), std::string::npos)
+      << other_binary_lir;
+
+  Ref<PyObject> inplace_func(compileAndGet(
+      R"(
+def inplace_func(a, b):
+  a += b
+  a -= b
+  return a
+)",
+      "inplace_func"));
+  ASSERT_NE(inplace_func.get(), nullptr);
+  auto inplace_lir = getLIRString(inplace_func.get());
+  EXPECT_EQ(
+      count_opcode(
+          inplace_lir, "BinaryOpExactLongAddSubFastPath"),
+      0)
+      << inplace_lir;
+  EXPECT_NE(inplace_lir.find(":Object = Call"), std::string::npos)
+      << inplace_lir;
+
+  const char* known_exact_hir = R"(
+fun known_exact {
+  bb 0 {
+    v1 = LoadArg<0>
+    v2 = LoadArg<1>
+    v3 = RefineType<LongExact> v1
+    v4 = RefineType<LongExact> v2
+    v5 = BinaryOp<Add> v3 v4
+    v6 = BinaryOp<Subtract> v5 v4
+    Return v6
+  }
+}
+)";
+  auto irfunc = hir::HIRParser{}.ParseHIR(known_exact_hir);
+  ASSERT_NE(irfunc, nullptr);
+  Compiler::runPasses(
+      *irfunc,
+      static_cast<PassConfig>(
+          PassConfig::kAllExceptInliner &
+          ~PassConfig::kInsertUpdatePrevInstr));
+  jit::codegen::Environ env;
+  jit::CodeRuntime code_runtime{
+      irfunc->code, irfunc->builtins, irfunc->globals};
+  env.ctx = getContext();
+  env.code_rt = &code_runtime;
+  LIRGenerator lir_gen(irfunc.get(), &env);
+  auto lir_func = lir_gen.TranslateFunction();
+  std::stringstream exact_stream;
+  lir_func->sortBasicBlocks();
+  exact_stream << *lir_func << '\n';
+  auto exact_lir = exact_stream.str();
+  EXPECT_NE(exact_lir.find("LongBinaryOp<Add>"), std::string::npos)
+      << exact_lir;
+  EXPECT_NE(exact_lir.find("LongBinaryOp<Subtract>"), std::string::npos)
+      << exact_lir;
+  EXPECT_EQ(
+      count_opcode(
+          exact_lir, "BinaryOpExactLongAddSubFastPath"),
+      0)
+      << exact_lir;
+#else
+  GTEST_SKIP() << "AArch64 CPython 3.14 GIL-only fast path";
+#endif
 }
 
 TEST_F(LIRGeneratorTest, BroadStaticTranslationCoverage) {
