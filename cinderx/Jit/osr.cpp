@@ -100,7 +100,7 @@ void popCurrentFrameForTestHook(
   tstate->current_frame = frame->previous;
   jit::jitFrameClearExceptCode(frame);
   PyStackRef_CLEAR(frame->f_executable);
-  Cix_PyThreadState_PopFrame(tstate, frame);
+  _PyThreadState_PopFrame(tstate, frame);
 }
 
 // ---------------------------------------------------------------------------
