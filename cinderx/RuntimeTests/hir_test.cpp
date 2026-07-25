@@ -763,18 +763,28 @@ class HIRBuildTest : public RuntimeTest {
 
   std::unique_ptr<Function> build_specialized_source(
       const char* src,
-      int specialized_opcode,
+      std::initializer_list<int> specialized_opcodes,
       int backedge_opcode = 0) {
     Ref<PyFunctionObject> func(compileAndGet(src, "test"));
     PyCodeObject* code = reinterpret_cast<PyCodeObject*>(func->func_code);
 
-    replaceFirstOpcode(
-        code, unspecialize(specialized_opcode), specialized_opcode);
+    for (int specialized_opcode : specialized_opcodes) {
+      replaceFirstOpcode(
+          code, unspecialize(specialized_opcode), specialized_opcode);
+    }
     if (backedge_opcode != 0) {
       replaceFirstOpcode(code, JUMP_BACKWARD, backedge_opcode);
     }
 
     return buildHIR(func);
+  }
+
+  std::unique_ptr<Function> build_specialized_source(
+      const char* src,
+      int specialized_opcode,
+      int backedge_opcode = 0) {
+    return build_specialized_source(
+        src, {specialized_opcode}, backedge_opcode);
   }
 
  private:
@@ -2394,10 +2404,38 @@ def replace_descriptor():
 #endif
 
 #if PY_VERSION_HEX >= 0x030C0000
-TEST_F(HIRBuildTest, NoBackedgeSpecializedIntBinaryOpSkipsLongExactGuards) {
+TEST_F(
+    HIRBuildTest,
+    SingleOpNumericLeafSpecializedIntBinaryOpSkipsLongExactGuards) {
   std::unique_ptr<Function> irfunc = build_specialized_source(
       "def test(a, b):\n"
       "    return a + b\n",
+      BINARY_OP_ADD_INT);
+
+  std::string hir = fullPrinter().ToString(*irfunc);
+  EXPECT_EQ(countSubstring(hir, "GuardType<LongExact>"), 0);
+}
+
+TEST_F(
+    HIRBuildTest,
+    MultiOpNumericLeafSpecializedIntBinaryOpKeepsLongExactGuards) {
+  std::unique_ptr<Function> irfunc = build_specialized_source(
+      "def test(a, b):\n"
+      "    return (a + b) * (a - b)\n",
+      {BINARY_OP_ADD_INT,
+       BINARY_OP_MULTIPLY_FLOAT,
+       BINARY_OP_SUBTRACT_FLOAT});
+
+  std::string hir = fullPrinter().ToString(*irfunc);
+  EXPECT_EQ(countSubstring(hir, "GuardType<LongExact>"), 2);
+}
+
+TEST_F(
+    HIRBuildTest,
+    NoBackedgeAttributeSpecializedIntBinaryOpSkipsLongExactGuards) {
+  std::unique_ptr<Function> irfunc = build_specialized_source(
+      "def test(a, b):\n"
+      "    return a.x + b.x\n",
       BINARY_OP_ADD_INT);
 
   std::string hir = fullPrinter().ToString(*irfunc);
@@ -2423,6 +2461,18 @@ TEST_F(HIRBuildTest, NoBackedgeSpecializedIntCompareSkipsLongExactGuards) {
 
   std::string hir = fullPrinter().ToString(*irfunc);
   EXPECT_EQ(countSubstring(hir, "GuardType<LongExact>"), 0);
+}
+
+TEST_F(
+    HIRBuildTest,
+    MultiOpNumericLeafSpecializedIntCompareKeepsLongExactGuards) {
+  std::unique_ptr<Function> irfunc = build_specialized_source(
+      "def test(a, b, c, d):\n"
+      "    return (a + b) < (c + d)\n",
+      {BINARY_OP_ADD_FLOAT, BINARY_OP_ADD_FLOAT, COMPARE_OP_INT});
+
+  std::string hir = fullPrinter().ToString(*irfunc);
+  EXPECT_EQ(countSubstring(hir, "GuardType<LongExact>"), 2);
 }
 
 TEST_F(HIRBuildTest, BackedgeSpecializedIntCompareKeepsLongExactGuards) {
