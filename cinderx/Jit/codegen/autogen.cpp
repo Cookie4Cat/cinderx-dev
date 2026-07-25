@@ -1665,22 +1665,35 @@ static void emitTreeIterCallTwoInputs(
         arch::ptr_resolve(
             as, arch::fp, in0->getStackSlot().loc, arch::reg_scratch_1));
   }
-  a64::Gp src1;
-  if (in1->isReg()) {
-    // int32 phase: use 64-bit reg; the helper accepts int32_t through x reg.
-    src1 = a64::x(in1->getPhyRegister().loc);
-  } else if (in1->isImm()) {
-    src1 = arch::reg_scratch_1;
-    as->mov(src1, in1->getConstant());
-  } else {
-    JIT_CHECK(
-        in1->isStack(), "Unsupported TreeIter helper input: {}", in1->type());
-    src1 = arch::reg_scratch_1;
-    as->ldr(
-        src1,
-        arch::ptr_resolve(
-            as, arch::fp, in1->getStackSlot().loc, arch::reg_scratch_0));
+
+  if (in1->isImm() || in1->isStack()) {
+    // Set up the phase argument directly in x2.  Loading it through a scratch
+    // register adds a move to every TreeIter state-stack push.
+    if (src0.id() == a64::x0.id()) {
+      as->mov(arch::reg_scratch_0, src0);
+      src0 = arch::reg_scratch_0;
+    }
+
+    as->mov(a64::x0, arch::fp);
+    if (src0.id() != a64::x1.id()) {
+      as->mov(a64::x1, src0);
+    }
+    if (in1->isImm()) {
+      as->mov(a64::x2, in1->getConstant());
+    } else {
+      as->ldr(
+          a64::x2,
+          arch::ptr_resolve(
+              as, arch::fp, in1->getStackSlot().loc, arch::reg_scratch_0));
+    }
+    as->bl(reinterpret_cast<uint64_t>(helper));
+    return;
   }
+
+  JIT_CHECK(
+      in1->isReg(), "Unsupported TreeIter helper input: {}", in1->type());
+  // int32 phase: use 64-bit reg; the helper accepts int32_t through x reg.
+  a64::Gp src1 = a64::x(in1->getPhyRegister().loc);
   // Avoid clobber: if src0 or src1 collide with x0/x1/x2 (arg regs), save
   // them to scratch regs.
   if (src0.id() == a64::x0.id() || src0.id() == a64::x1.id()) {
@@ -3050,6 +3063,24 @@ void translateSelect(Environ* env, const Instruction* instr) {
 void AutoTranslator::translateInstr(Environ* env, const Instruction* instr)
     const {
   auto opcode = instr->opcode();
+#if defined(CINDER_AARCH64)
+  const hir::Instr* origin = instr->origin();
+  if (origin != nullptr && origin->IsCondBranch()) {
+    const auto& branch = static_cast<const hir::CondBranch&>(*origin);
+    if (JumpPatcher* patcher = branch.falseBranchPatcher()) {
+      JIT_CHECK(
+          instr->isBranchCC() || instr->isCmpBranch(),
+          "patchable CondBranch lowered to unexpected opcode {}",
+          instr->opname());
+      auto patchpoint_label = env->as->newLabel();
+      env->as->bind(patchpoint_label);
+      auto fallback_label = map_get(
+          env->block_label_map, instr->basicblock()->getFalseSuccessor());
+      env->pending_deopt_patchers.emplace_back(
+          patcher, patchpoint_label, fallback_label);
+    }
+  }
+#endif
   switch (opcode) {
     case Instruction::kBind:
       return;

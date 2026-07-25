@@ -1598,7 +1598,16 @@ JITRT_GenSendRes JITRT_GenSend(
   }
 #endif
 
-  auto gen_status = PyIter_Send(gen, v, &retval);
+  PySendResult gen_status;
+  PyAsyncMethods* async_methods = Py_TYPE(gen)->tp_as_async;
+  if (async_methods != nullptr && async_methods->am_send != nullptr) {
+    // Inline PyIter_Send's first branch while honoring the current slot, which
+    // may be replaced by the instrumentation deopt wrapper.
+    gen_status = async_methods->am_send(gen, v, &retval);
+    assert(_Py_CheckSlotResult(gen, "am_send", gen_status != PYGEN_ERROR));
+  } else {
+    gen_status = PyIter_Send(gen, v, &retval);
+  }
 
   if (gen_status == PYGEN_RETURN) {
     return {retval, 1};
