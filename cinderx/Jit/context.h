@@ -198,6 +198,47 @@ class Context : public IJitContext, public CompiledFunctionOwner {
       BorrowedRef<CompiledFunction> compiled);
 
   /*
+   * Content-keyed reuse of compiled code for provably namespace-free code
+   * objects that the process keeps recreating. Donors are promoted by
+   * behavioral evidence -- the second compilation of identical content (see
+   * noteCodeCompiled) or the death of a compiled instance while the
+   * interpreter keeps running (see noteCompiledFuncDestroyed); if a
+   * function's code is value-identical to a same-origin donor, the function is
+   * canonicalized onto the donor code object and attached to the pinned
+   * artifact. Returns true when the function was attached and needs no
+   * compilation.
+   */
+  bool reuseDedupedCompiled(BorrowedRef<PyFunctionObject> func);
+
+  /*
+   * Record a completed compilation's content; the second compilation of
+   * identical content promotes it to a reuse donor with a pinned artifact.
+   */
+  void noteCodeCompiled(
+      const CompilationKey& key,
+      BorrowedRef<CompiledFunction> compiled);
+
+  /*
+   * Rescue the artifact of a dying compiled function whose content is
+   * recorded but not yet promoted; called from funcDestroyed while the
+   * artifact is alive.
+   */
+  void noteCompiledFuncDestroyed(
+      BorrowedRef<PyFunctionObject> func,
+      BorrowedRef<CompiledFunction> compiled);
+
+  /*
+   * Demote any donor entry holding this artifact back to a recurrence
+   * candidate. Called before CompiledFunction::clear() guts the artifact
+   * (force_uncompile, ROI backoff): the entry's strong reference would
+   * otherwise keep serving a cleared artifact to future twins. Identical
+   * content seen later recompiles normally and can be re-promoted.
+   */
+  void dropDedupArtifact(
+      BorrowedRef<PyCodeObject> code,
+      BorrowedRef<CompiledFunction> compiled);
+
+  /*
    * Removes a function from the set of functions that are known to be compiled.
    * This happens if a function is deopted.
    *
@@ -499,6 +540,18 @@ class Context : public IJitContext, public CompiledFunctionOwner {
   bool deoptFuncImpl(BorrowedRef<PyFunctionObject> func);
 
   /*
+   * One content class of namespace-free compiled code. A first compilation
+   * records the content only; a second compilation of identical content (or
+   * the death of a compiled instance) promotes the entry to a donor, whose
+   * strong references keep the canonical code object and its artifact alive
+   * across the death of short-lived producer functions.
+   */
+  struct CodeDedupEntry {
+    Ref<PyCodeObject> code;
+    Ref<CompiledFunction> compiled;
+  };
+
+  /*
    * Map of all compiled code objects, keyed by their address and also their
    * builtins and globals objects.
    */
@@ -543,6 +596,14 @@ class Context : public IJitContext, public CompiledFunctionOwner {
    * multithreaded_compile_test.
    */
   std::vector<Ref<CompiledFunction>> orphaned_compiled_codes_;
+
+  /*
+   * Donor index for reuseDedupedCompiled, keyed by a structural fingerprint
+   * over immutable code-object fields; each bucket holds the entries sharing
+   * that fingerprint, disambiguated by code-object value equality.
+   */
+  UnorderedMap<uint64_t, std::vector<CodeDedupEntry>> code_dedup_cache_;
+  size_t code_dedup_size_{0};
 
   Ref<> cinderjit_module_;
 

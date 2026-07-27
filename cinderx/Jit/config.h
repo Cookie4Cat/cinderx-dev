@@ -227,6 +227,12 @@ struct Config {
   // repeatedly deopts. Enabled by default; disable with
   // CINDERX_AUTOJIT_ROI_BACKOFF=0 when isolating A/B or rolling back.
   bool roi_backoff_enabled{true};
+  // Canonicalize exec-generated namespace-free content-twin code objects
+  // (factory helpers recreated per instantiation) onto the first-seen
+  // identity at compile time, so twins attach to the existing compiled
+  // artifact instead of recompiling. Disable with
+  // CINDERX_AUTOJIT_CODE_DEDUP=0 when isolating A/B.
+  bool auto_code_twin_dedup{true};
   size_t roi_deopt_budget_base{32};
   size_t roi_backoff_max_rounds{1};
   size_t roi_rewarm_factor{64};

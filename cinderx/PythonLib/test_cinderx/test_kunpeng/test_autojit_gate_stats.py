@@ -791,6 +791,35 @@ class AutoJitGateStatsDumpTests(unittest.TestCase):
                 f"stdout:\n{completed.stdout}\nstderr:\n{completed.stderr}",
             )
 
+    @unittest.skipIf(
+        CP3140_AUTOJIT_DIRECT_CALL_GATE_UNSUPPORTED,
+        CP3140_AUTOJIT_SKIP_REASON,
+    )
+    def test_plugin_dedup_uncompile_demotes_donor(self) -> None:
+        # Lifecycle: promote a donor, gut its artifact via force_uncompile
+        # (the same path ROI backoff takes), then verify a fresh twin does
+        # not get the cleared artifact re-installed -- it recompiles cleanly
+        # and the entry can be promoted again.
+        script = Path(__file__).with_name("dedup_uncompile_helper.py")
+        with tempfile.TemporaryDirectory() as temp:
+            env = _plugin_env()
+            env["CINDERX_AUTOJIT_CODE_DEDUP"] = "1"
+
+            completed = subprocess.run(
+                [sys.executable, str(script)],
+                cwd=temp,
+                env=env,
+                capture_output=True,
+                text=True,
+                timeout=60,
+            )
+
+            self.assertEqual(
+                completed.returncode,
+                0,
+                f"stdout:\n{completed.stdout}\nstderr:\n{completed.stderr}",
+            )
+
     def test_plugin_defers_call_only_dispatch_loop(self) -> None:
         with tempfile.TemporaryDirectory() as temp:
             env = _plugin_env()
