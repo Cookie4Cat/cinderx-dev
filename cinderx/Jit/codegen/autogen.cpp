@@ -2902,16 +2902,15 @@ void translateBranchBit(Environ* env, const Instruction* instr, bool is_set) {
   auto bit_pos = instr->getInput(1)->getConstant();
   auto label = getLabel(env, instr->getInput(2));
 
-  uint64_t mask = 1ULL << bit_pos;
   JIT_CHECK(
-      arm::Utils::isLogicalImm(mask, 64),
-      "All single bits should be able to be tested");
+      bit_pos < 64,
+      "AArch64 bit branch position must be in [0, 63], got {}",
+      bit_pos);
 
-  as->tst(test_reg, mask);
   if (is_set) {
-    as->b_ne(label);
+    as->tbnz(test_reg, bit_pos, label);
   } else {
-    as->b_eq(label);
+    as->tbz(test_reg, bit_pos, label);
   }
 }
 

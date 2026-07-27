@@ -2,6 +2,7 @@
 
 #pragma once
 
+#include "cinderx/Jit/codegen/arch/detection.h"
 #include "cinderx/Jit/lir/operand.h"
 
 #include <memory>
@@ -32,6 +33,12 @@ enum class FlagEffects {
   /* The instruction clobbers flags (e.g., a call instruction). */
   kInvalidate,
 };
+
+#if defined(CINDER_AARCH64)
+constexpr FlagEffects kBranchBitFlagEffects = FlagEffects::kNone;
+#else
+constexpr FlagEffects kBranchBitFlagEffects = FlagEffects::kSet;
+#endif
 
 /* OperandSizeType describes how an LIR instruction's operand sizes are
  * determined. */
@@ -167,8 +174,8 @@ enum OperandSizeType {
   X(BranchNS)                                                                 \
   X(BranchE)                                                                  \
   X(BranchNE)                                                                 \
-  X(BranchBitSet, false, FlagEffects::kSet, kDefault, 0, {1}, 1)              \
-  X(BranchBitNotSet, false, FlagEffects::kSet, kDefault, 0, {1}, 1)           \
+  X(BranchBitSet, false, kBranchBitFlagEffects, kDefault, 0, {1}, 1)          \
+  X(BranchBitNotSet, false, kBranchBitFlagEffects, kDefault, 0, {1}, 1)       \
   X(Inc, false, FlagEffects::kSet)                                            \
   X(Dec, false, FlagEffects::kSet)                                            \
   X(CondBranch, false, FlagEffects::kInvalidate, kDefault, 0, {1})            \
