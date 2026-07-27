@@ -11,8 +11,12 @@
 
 #include <algorithm>
 #include <array>
+#include <atomic>
 #include <cctype>
 #include <cstring>
+#ifndef _WIN32
+#include <pthread.h>
+#endif
 #include <vector>
 #include <initializer_list>
 #include <limits>
@@ -34,6 +38,16 @@ constexpr uint8_t kRiskSuspendBucket = 2;
 constexpr uint8_t kRiskDynamicBucket = 2;
 constexpr uint32_t kRiskExceptionFloor = 2;
 constexpr uint32_t kRiskEffectiveInstructionFloor = 200;
+// Threshold the released shapes are held at while the process is still
+// proving itself. It sits below the interpret-only freeze line and carries
+// no LowRoi reason, so the code keeps counting calls without being frozen:
+// whatever accumulated during the hold converts into a compile on the first
+// gate check after the release, and long-lived workloads lose nothing.
+// This is deliberately a second gate, not a freeze: a single shape whose
+// own call count reaches the hold threshold compiles on that evidence even
+// if the process-wide budget never releases -- 65535 interpreted calls of
+// one function are overwhelming proof of profitability on their own.
+constexpr uint32_t kLowRoiWarmHoldThreshold = 65535;
 constexpr uint32_t kStartupDeferThresholdFactor = 1u << 20;
 constexpr uint32_t kSteadyNonnumericWarmupThreshold = 1000;
 constexpr uint8_t kWorkDimCount = static_cast<uint8_t>(WorkDim::kCount);
@@ -1205,6 +1219,65 @@ std::optional<StructureKey> getOrComputeStructureKey(
   return key;
 }
 
+namespace {
+
+// Process-wide evidence that speculative compilation can amortize. Every
+// increment is one interpreted execution of code this series would otherwise
+// have compiled, so the budget measures forgone opportunity directly rather
+// than elapsed time: call counts are properties of the program, independent
+// of machine speed, architecture, and where an integration loader hooks into
+// the interpreter lifecycle. A python_startup_no_site-shaped process makes a
+// few hundred such calls in total and never reaches the budget; benchmark
+// and application workloads reach it during their first warmup moments.
+std::atomic<uint64_t> g_low_roi_held_calls{0};
+std::atomic<bool> g_low_roi_release_active{false};
+
+bool lowRoiReleaseActiveOrNote() {
+  if (g_low_roi_release_active.load(std::memory_order_relaxed)) {
+    return true;
+  }
+  size_t budget = getConfig().auto_classify_low_roi_warm_calls;
+  if (budget == 0 ||
+      g_low_roi_held_calls.fetch_add(1, std::memory_order_relaxed) + 1 >=
+          budget) {
+    g_low_roi_release_active.store(true, std::memory_order_relaxed);
+    return true;
+  }
+  return false;
+}
+
+} // namespace
+
+void resetLowRoiReleaseState() {
+  g_low_roi_held_calls.store(0, std::memory_order_relaxed);
+  g_low_roi_release_active.store(false, std::memory_order_relaxed);
+}
+
+#ifndef _WIN32
+namespace {
+
+// The budget's evidence is per-process execution, and a forked child has
+// not executed anything: letting it inherit the parent's counter and sticky
+// release hands it unearned proof. Disposable fork children (multiprocessing
+// pool workers) then compile eagerly and pay bursts they can never amortize
+// -- concurrent_imap measures 75ms with an inherited release versus 42ms
+// held, against 51ms for the pre-series baseline. Already-compiled code is
+// inherited as-is; only future release decisions start over. Registered at
+// shared-object load so it also covers forks taken before the JIT
+// initializes; resetting two relaxed atomics is async-signal-safe. If
+// registration ever fails (ENOMEM), children simply skip the reset and
+// inherit the parent's release state -- the pre-budget behavior, safe but
+// less frugal -- so the return value is deliberately not checked.
+struct LowRoiForkReset {
+  LowRoiForkReset() {
+    pthread_atfork(nullptr, nullptr, [] { resetLowRoiReleaseState(); });
+  }
+};
+LowRoiForkReset s_low_roi_fork_reset;
+
+} // namespace
+#endif
+
 ThresholdDecision computeThreshold(
     const StructureKey& key,
     const GateContext& context,
@@ -1319,6 +1392,33 @@ ThresholdDecision computeThreshold(
     return {
         std::max(global, kSteadyNonnumericWarmupThreshold),
         BranchReason::LowRoi};
+  }
+
+  bool low_roi_base = key.loop_score == 0 && !key.is_static &&
+      !key.is_suspendable && !key.highRisk();
+  bool trivial_low_roi_candidate =
+      low_roi_base && key.family == Family::Trivial;
+
+  // Everything above this point is the classifier's verdict. What follows is
+  // policy: the shapes released by this series compile at the base threshold
+  // only once the process has shown that speculative compilation can pay for
+  // itself. Until then they are held (see kLowRoiWarmHoldThreshold), which is
+  // what keeps short-lived interpreter invocations as cheap as they were
+  // before the release. The hold applies in every phase, so a cold process
+  // stays cheap during its imports as well.
+  // Loop-bearing shapes are never held. The gate counts calls, not loop
+  // iterations, and there is no on-stack replacement, so holding a function
+  // whose work sits inside a loop strands that work in the interpreter for
+  // as long as the hold lasts -- and a process-wide budget can outlast a
+  // whole measurement window.
+  bool released_low_roi_shape = key.loop_score == 0 &&
+      (steady_multidim_nonnumeric_object_graph_candidate ||
+       steady_nonnumeric_warmup_candidate || trivial_low_roi_candidate);
+  // lowRoiReleaseActiveOrNote() has a side effect, so it is evaluated last:
+  // the counter must measure forgone opportunity, i.e. only calls that the
+  // release would actually have compiled.
+  if (released_low_roi_shape && !lowRoiReleaseActiveOrNote()) {
+    return {kLowRoiWarmHoldThreshold, BranchReason::None};
   }
 
   return {global, BranchReason::None};

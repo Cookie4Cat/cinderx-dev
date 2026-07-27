@@ -138,4 +138,10 @@ ThresholdDecision computeThresholdForCode(
     const GateContext& context,
     uint32_t global);
 
+// Clears the process-wide held-call budget that gates the steady-state
+// LowRoi release. Runs in the child side of every fork (the budget's
+// evidence is per-process execution, and a fresh child has not executed
+// anything), and in tests that need to start from an unwarmed process.
+void resetLowRoiReleaseState();
+
 } // namespace jit

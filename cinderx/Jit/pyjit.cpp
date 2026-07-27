@@ -812,6 +812,13 @@ FlagProcessor initFlagProcessor() {
       "A/B");
 
   flag_processor.addOption(
+      "jit-auto-lowroi-warm-calls",
+      "CINDERX_AUTOJIT_LOWROI_WARM_CALLS",
+      getMutableConfig().auto_classify_low_roi_warm_calls,
+      "Held calls a process must accumulate before steady-state LowRoi "
+      "shapes stop being deferred; 0 releases them immediately");
+
+  flag_processor.addOption(
       "jit-debug",
       "PYTHONJITDEBUG",
       getMutableConfig().log.debug,

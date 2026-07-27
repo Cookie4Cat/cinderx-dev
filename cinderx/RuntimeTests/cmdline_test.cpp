@@ -2,6 +2,7 @@
 
 #include <gtest/gtest.h>
 
+#include "cinderx/Jit/behavior_classifier.h"
 #include "cinderx/Jit/generators_rt.h"
 #include "cinderx/Jit/osr_capi.h"
 #include "cinderx/Jit/perf_jitdump.h"
@@ -162,6 +163,9 @@ assert jit.is_jit_compiled(target)
 }
 
 void assertNewFunctionCountsWithoutFrameEvaluator(RuntimeTest& test) {
+  // Start from an unwarmed process so the trivial target sits in the
+  // held-call regime deterministically, regardless of test order.
+  jit::resetLowRoiReleaseState();
   test.runStockCode(R"(
 import cinderx
 import cinderx.jit as jit
@@ -179,9 +183,10 @@ assert jit.count_interpreted_calls(target) == 2
 target(3)
 target(4)
 target(5)
-assert jit.is_jit_compiled(target)
-assert jit.count_interpreted_calls(target) == 2
+assert not jit.is_jit_compiled(target)
+assert jit.count_interpreted_calls(target) == 5
 )");
+  jit::resetLowRoiReleaseState();
 }
 
 } // namespace

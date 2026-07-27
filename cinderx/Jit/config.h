@@ -233,6 +233,16 @@ struct Config {
   // artifact instead of recompiling. Disable with
   // CINDERX_AUTOJIT_CODE_DEDUP=0 when isolating A/B.
   bool auto_code_twin_dedup{true};
+  // Number of held calls a process must accumulate before steady-state
+  // LowRoi shapes stop being deferred. The counter measures the interpreted
+  // executions that the release would have compiled, so reaching the budget
+  // demonstrates that speculative compilation can amortize. Short-lived
+  // interpreter invocations make a few hundred such calls in total and never
+  // reach it; workloads reach it within their first warmup moments. Call
+  // counts are properties of the program, independent of machine speed,
+  // architecture and integration topology. 0 releases immediately. Override
+  // with CINDERX_AUTOJIT_LOWROI_WARM_CALLS.
+  size_t auto_classify_low_roi_warm_calls{4096};
   size_t roi_deopt_budget_base{32};
   size_t roi_backoff_max_rounds{1};
   size_t roi_rewarm_factor{64};

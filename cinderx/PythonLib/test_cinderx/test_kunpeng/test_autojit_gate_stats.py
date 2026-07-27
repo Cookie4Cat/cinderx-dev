@@ -308,6 +308,10 @@ def _plugin_env() -> dict[str, str]:
 
     env["CINDERX_PLUGIN_ENABLE"] = "1"
     env["PYTHONJITAUTO"] = "auto:2"
+    # These cases are about classification verdicts, so they run with the
+    # held-call budget released: a test process is short-lived by nature and
+    # would otherwise never warm up. The budget itself has its own case.
+    env["CINDERX_AUTOJIT_LOWROI_WARM_CALLS"] = "0"
     env.pop("PYTHONJITALL", None)
     env.pop("CINDERX_AUTOJIT_IMPORT_PROVIDER", None)
     env.pop("CINDERX_AUTOJIT_SETUP_PROVIDER", None)
@@ -778,6 +782,76 @@ class AutoJitGateStatsDumpTests(unittest.TestCase):
                     "    jit.count_interpreted_calls(logging.Logger.isEnabledFor),\n"
                     ")\n",
                 ],
+                cwd=temp,
+                env=env,
+                capture_output=True,
+                text=True,
+                timeout=60,
+            )
+
+            self.assertEqual(
+                completed.returncode,
+                0,
+                f"stdout:\n{completed.stdout}\nstderr:\n{completed.stderr}",
+            )
+
+    @unittest.skipIf(
+        CP3140_AUTOJIT_DIRECT_CALL_GATE_UNSUPPORTED,
+        CP3140_AUTOJIT_SKIP_REASON,
+    )
+    def test_plugin_low_roi_release_waits_for_held_call_budget(self) -> None:
+        # A process that never accumulates the budget keeps the deferral, so
+        # short-lived interpreter invocations stay as cheap as before the
+        # release; one that does accumulate it compiles the same shape. The
+        # third case pins the second gate: a single shape that alone reaches
+        # the 65535 hold threshold compiles on its own evidence even when the
+        # process-level budget never releases.
+        script = Path(__file__).with_name("held_call_budget_helper.py")
+        with tempfile.TemporaryDirectory() as temp:
+            for calls, want, budget in (
+                (64, "interpreted", "1024"),
+                (5000, "compiled", "1024"),
+                (140000, "compiled", "1000000000"),
+            ):
+                env = _plugin_env()
+                env["CINDERX_AUTOJIT_LOWROI_WARM_CALLS"] = budget
+                env["CALLS"] = str(calls)
+                env["WANT"] = want
+
+                completed = subprocess.run(
+                    [sys.executable, str(script)],
+                    cwd=temp,
+                    env=env,
+                    capture_output=True,
+                    text=True,
+                    timeout=60,
+                )
+
+                self.assertEqual(
+                    completed.returncode,
+                    0,
+                    f"calls={calls} want={want} budget={budget}"
+                    f"\nstdout:\n{completed.stdout}"
+                    f"\nstderr:\n{completed.stderr}",
+                )
+
+    @unittest.skipIf(
+        CP3140_AUTOJIT_DIRECT_CALL_GATE_UNSUPPORTED,
+        CP3140_AUTOJIT_SKIP_REASON,
+    )
+    @unittest.skipUnless(hasattr(os, "fork"), "requires os.fork")
+    def test_plugin_forked_child_reproves_held_call_budget(self) -> None:
+        # The budget's evidence is per-process execution. A forked child has
+        # executed nothing, so it must not inherit the parent's release:
+        # disposable pool workers otherwise compile eagerly and pay bursts
+        # they can never amortize. Compiled code itself is inherited.
+        script = Path(__file__).with_name("fork_budget_helper.py")
+        with tempfile.TemporaryDirectory() as temp:
+            env = _plugin_env()
+            env["CINDERX_AUTOJIT_LOWROI_WARM_CALLS"] = "1024"
+
+            completed = subprocess.run(
+                [sys.executable, str(script)],
                 cwd=temp,
                 env=env,
                 capture_output=True,
