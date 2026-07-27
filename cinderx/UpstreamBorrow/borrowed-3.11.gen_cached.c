@@ -642,3 +642,990 @@ unicodekeys_lookup_unicode(PyDictKeysObject* dk, PyObject *key, Py_hash_t hash)
     }
     Py_UNREACHABLE();
 }
+static Py_ssize_t
+unicodekeys_lookup_generic(PyDictObject *mp, PyDictKeysObject* dk, PyObject *key, Py_hash_t hash)
+{
+    PyDictUnicodeEntry *ep0 = DK_UNICODE_ENTRIES(dk);
+    size_t mask = DK_MASK(dk);
+    size_t perturb = hash;
+    size_t i = (size_t)hash & mask;
+    Py_ssize_t ix;
+    for (;;) {
+        ix = dictkeys_get_index(dk, i);
+        if (ix >= 0) {
+            PyDictUnicodeEntry *ep = &ep0[ix];
+            assert(ep->me_key != NULL);
+            assert(PyUnicode_CheckExact(ep->me_key));
+            if (ep->me_key == key) {
+                return ix;
+            }
+            if (unicode_get_hash(ep->me_key) == hash) {
+                PyObject *startkey = ep->me_key;
+                Py_INCREF(startkey);
+                int cmp = PyObject_RichCompareBool(startkey, key, Py_EQ);
+                Py_DECREF(startkey);
+                if (cmp < 0) {
+                    return DKIX_ERROR;
+                }
+                if (dk == mp->ma_keys && ep->me_key == startkey) {
+                    if (cmp > 0) {
+                        return ix;
+                    }
+                }
+                else {
+                    /* The dict was mutated, restart */
+                    return DKIX_KEY_CHANGED;
+                }
+            }
+        }
+        else if (ix == DKIX_EMPTY) {
+            return DKIX_EMPTY;
+        }
+        perturb >>= PERTURB_SHIFT;
+        i = mask & (i*5 + perturb + 1);
+    }
+    Py_UNREACHABLE();
+}
+static Py_ssize_t
+dictkeys_generic_lookup(PyDictObject *mp, PyDictKeysObject* dk, PyObject *key, Py_hash_t hash)
+{
+    PyDictKeyEntry *ep0 = DK_ENTRIES(dk);
+    size_t mask = DK_MASK(dk);
+    size_t perturb = hash;
+    size_t i = (size_t)hash & mask;
+    Py_ssize_t ix;
+    for (;;) {
+        ix = dictkeys_get_index(dk, i);
+        if (ix >= 0) {
+            PyDictKeyEntry *ep = &ep0[ix];
+            assert(ep->me_key != NULL);
+            if (ep->me_key == key) {
+                return ix;
+            }
+            if (ep->me_hash == hash) {
+                PyObject *startkey = ep->me_key;
+                Py_INCREF(startkey);
+                int cmp = PyObject_RichCompareBool(startkey, key, Py_EQ);
+                Py_DECREF(startkey);
+                if (cmp < 0) {
+                    return DKIX_ERROR;
+                }
+                if (dk == mp->ma_keys && ep->me_key == startkey) {
+                    if (cmp > 0) {
+                        return ix;
+                    }
+                }
+                else {
+                    /* The dict was mutated, restart */
+                    return DKIX_KEY_CHANGED;
+                }
+            }
+        }
+        else if (ix == DKIX_EMPTY) {
+            return DKIX_EMPTY;
+        }
+        perturb >>= PERTURB_SHIFT;
+        i = mask & (i*5 + perturb + 1);
+    }
+    Py_UNREACHABLE();
+}
+#define _Py_dict_lookup Cix_dict_lookup
+Py_ssize_t
+_Py_dict_lookup(PyDictObject *mp, PyObject *key, Py_hash_t hash, PyObject **value_addr)
+{
+    PyDictKeysObject *dk;
+    DictKeysKind kind;
+    Py_ssize_t ix;
+
+start:
+    dk = mp->ma_keys;
+    kind = dk->dk_kind;
+
+    if (kind != DICT_KEYS_GENERAL) {
+        if (PyUnicode_CheckExact(key)) {
+            ix = unicodekeys_lookup_unicode(dk, key, hash);
+        }
+        else {
+            ix = unicodekeys_lookup_generic(mp, dk, key, hash);
+            if (ix == DKIX_KEY_CHANGED) {
+                goto start;
+            }
+        }
+
+        if (ix >= 0) {
+            if (kind == DICT_KEYS_SPLIT) {
+                *value_addr = mp->ma_values->values[ix];
+            }
+            else {
+                *value_addr = DK_UNICODE_ENTRIES(dk)[ix].me_value;
+            }
+        }
+        else {
+            *value_addr = NULL;
+        }
+    }
+    else {
+        ix = dictkeys_generic_lookup(mp, dk, key, hash);
+        if (ix == DKIX_KEY_CHANGED) {
+            goto start;
+        }
+        if (ix >= 0) {
+            *value_addr = DK_ENTRIES(dk)[ix].me_value;
+        }
+        else {
+            *value_addr = NULL;
+        }
+    }
+
+    return ix;
+}
+PyObject *
+_PyDict_LoadGlobal(PyDictObject *globals, PyDictObject *builtins, PyObject *key)
+{
+    Py_ssize_t ix;
+    Py_hash_t hash;
+    PyObject *value;
+
+    if (!PyUnicode_CheckExact(key) || (hash = unicode_get_hash(key)) == -1) {
+        hash = PyObject_Hash(key);
+        if (hash == -1)
+            return NULL;
+    }
+
+    /* namespace 1: globals */
+    ix = _Py_dict_lookup(globals, key, hash, &value);
+    if (ix == DKIX_ERROR)
+        return NULL;
+    if (ix != DKIX_EMPTY && value != NULL)
+        return value;
+
+    /* namespace 2: builtins */
+    ix = _Py_dict_lookup(builtins, key, hash, &value);
+    assert(ix >= 0 || value == NULL);
+    return value;
+}
+#undef _Py_dict_lookup
+
+// CPython 3.11 has no dict watcher callbacks.  This preserves the existing
+// compatibility contract; cache invalidation on 3.11 uses version guards.
+void Cix_PyDict_SendEvent(
+    int watcher_bits,
+    PyDict_WatchEvent event,
+    PyDictObject* mp,
+    PyObject* key,
+    PyObject* value) {
+  (void)watcher_bits;
+  (void)event;
+  (void)mp;
+  (void)key;
+  (void)value;
+}
+
+// AttributeError context is a static inline helper upstream.
+static inline int
+set_attribute_error_context(PyObject* v, PyObject* name)
+{
+    assert(PyErr_Occurred());
+    if (!PyErr_ExceptionMatches(PyExc_AttributeError)){
+        return 0;
+    }
+    // Intercept AttributeError exceptions and augment them to offer suggestions later.
+    PyObject *type, *value, *traceback;
+    PyErr_Fetch(&type, &value, &traceback);
+    PyErr_NormalizeException(&type, &value, &traceback);
+    // Check if the normalized exception is indeed an AttributeError
+    if (!PyErr_GivenExceptionMatches(value, PyExc_AttributeError)) {
+        goto restore;
+    }
+    PyAttributeErrorObject* the_exc = (PyAttributeErrorObject*) value;
+    // Check if this exception was already augmented
+    if (the_exc->name || the_exc->obj) {
+        goto restore;
+    }
+    // Augment the exception with the name and object
+    if (PyObject_SetAttr(value, &_Py_ID(name), name) ||
+        PyObject_SetAttr(value, &_Py_ID(obj), v)) {
+        return 1;
+    }
+restore:
+    PyErr_Restore(type, value, traceback);
+    return 0;
+}
+int Cix_set_attribute_error_context(PyObject* v, PyObject* name) {
+  return set_attribute_error_context(v, name);
+}
+
+// Tuple construction closure.
+#ifdef Py_DEBUG
+#endif
+#ifdef Py_DEBUG
+#else
+#endif
+#ifdef Py_DEBUG
+#endif
+#if SIZEOF_PY_UHASH_T > 4
+#define _PyHASH_XXPRIME_1 ((Py_uhash_t)11400714785074694791ULL)
+#define _PyHASH_XXPRIME_2 ((Py_uhash_t)14029467366897019727ULL)
+#define _PyHASH_XXPRIME_5 ((Py_uhash_t)2870177450012600261ULL)
+#define _PyHASH_XXROTATE(x) ((x << 31) | (x >> 33))  /* Rotate left 31 bits */
+#else
+#define _PyHASH_XXPRIME_1 ((Py_uhash_t)2654435761UL)
+#define _PyHASH_XXPRIME_2 ((Py_uhash_t)2246822519UL)
+#define _PyHASH_XXPRIME_5 ((Py_uhash_t)374761393UL)
+#define _PyHASH_XXROTATE(x) ((x << 13) | (x >> 19))  /* Rotate left 13 bits */
+#endif
+#ifdef Py_REF_DEBUG
+#endif
+#ifdef Py_REF_DEBUG
+#endif
+#ifdef Py_DEBUG
+#endif
+#ifdef Py_REF_DEBUG
+#endif
+#ifdef Py_TRACE_REFS
+#endif
+#define STATE (interp->tuple)
+#define FREELIST_FINALIZED (STATE.numfree[0] < 0)
+#if PyTuple_NFREELISTS > 0
+#ifdef Py_DEBUG
+#endif
+#ifdef Py_TRACE_REFS
+#endif
+#endif
+#if PyTuple_NFREELISTS > 0
+#ifdef Py_DEBUG
+#endif
+#endif
+#if PyTuple_NFREELISTS > 0
+#endif
+#if PyTuple_NFREELISTS > 0
+#endif
+#undef STATE
+#undef FREELIST_FINALIZED
+// tupleobject.c undefines these file-local freelist macros at EOF, so the
+// borrowed preprocessor stream has removed them before the functions below
+// are emitted.  Restore the exact 3.11 definitions around the closure.
+#define STATE (interp->tuple)
+#define FREELIST_FINALIZED (STATE.numfree[0] < 0)
+static inline PyTupleObject *
+maybe_freelist_pop(Py_ssize_t size)
+{
+#if PyTuple_NFREELISTS > 0
+    PyInterpreterState *interp = _PyInterpreterState_GET();
+#ifdef Py_DEBUG
+    /* maybe_freelist_pop() must not be called after maybe_freelist_fini(). */
+    assert(!FREELIST_FINALIZED);
+#endif
+    if (size == 0) {
+        return NULL;
+    }
+    assert(size > 0);
+    if (size < PyTuple_MAXSAVESIZE) {
+        Py_ssize_t index = size - 1;
+        PyTupleObject *op = STATE.free_list[index];
+        if (op != NULL) {
+            /* op is the head of a linked list, with the first item
+               pointing to the next node.  Here we pop off the old head. */
+            STATE.free_list[index] = (PyTupleObject *) op->ob_item[0];
+            STATE.numfree[index]--;
+            /* Inlined _PyObject_InitVar() without _PyType_HasFeature() test */
+#ifdef Py_TRACE_REFS
+            /* maybe_freelist_push() ensures these were already set. */
+            // XXX Can we drop these?  See commit 68055ce6fe01 (GvR, Dec 1998).
+            Py_SET_SIZE(op, size);
+            Py_SET_TYPE(op, &PyTuple_Type);
+#endif
+            _Py_NewReference((PyObject *)op);
+            /* END inlined _PyObject_InitVar() */
+            OBJECT_STAT_INC(from_freelist);
+            return op;
+        }
+    }
+#endif
+    return NULL;
+}
+static PyTupleObject *
+tuple_alloc(Py_ssize_t size)
+{
+    if (size < 0) {
+        PyErr_BadInternalCall();
+        return NULL;
+    }
+#ifdef Py_DEBUG
+    assert(size != 0);    // The empty tuple is statically allocated.
+#endif
+
+    PyTupleObject *op = maybe_freelist_pop(size);
+    if (op == NULL) {
+        /* Check for overflow */
+        if ((size_t)size > ((size_t)PY_SSIZE_T_MAX - (sizeof(PyTupleObject) -
+                    sizeof(PyObject *))) / sizeof(PyObject *)) {
+            return (PyTupleObject *)PyErr_NoMemory();
+        }
+        op = PyObject_GC_NewVar(PyTupleObject, &PyTuple_Type, size);
+        if (op == NULL)
+            return NULL;
+    }
+    return op;
+}
+static inline PyObject *
+tuple_get_empty(void)
+{
+    Py_INCREF(&_Py_SINGLETON(tuple_empty));
+    return (PyObject *)&_Py_SINGLETON(tuple_empty);
+}
+PyObject *
+_PyTuple_FromArray(PyObject *const *src, Py_ssize_t n)
+{
+    if (n == 0) {
+        return tuple_get_empty();
+    }
+
+    PyTupleObject *tuple = tuple_alloc(n);
+    if (tuple == NULL) {
+        return NULL;
+    }
+    PyObject **dst = tuple->ob_item;
+    for (Py_ssize_t i = 0; i < n; i++) {
+        PyObject *item = src[i];
+        Py_INCREF(item);
+        dst[i] = item;
+    }
+    _PyObject_GC_TRACK(tuple);
+    return (PyObject *)tuple;
+}
+#undef FREELIST_FINALIZED
+#undef STATE
+
+// 3.11 has no _PyFrame_ClearExceptCode.  Delegate to the verbatim vendored
+// _PyFrame_Clear while preserving the code reference owned by JIT cleanup.
+void _PyFrame_ClearExceptCode(_PyInterpreterFrame* frame) {
+  Py_INCREF(frame->f_code);
+  _PyFrame_Clear(frame);
+}
+
+// Line-table helpers.
+#define ASSERT_VALID_BOUNDS(bounds) ((void)0)
+void
+_PyLineTable_InitAddressRange(const char *linetable, Py_ssize_t length, int firstlineno, PyCodeAddressRange *range)
+{
+    range->opaque.lo_next = (const uint8_t *)linetable;
+    range->opaque.limit = range->opaque.lo_next + length;
+    range->ar_start = -1;
+    range->ar_end = 0;
+    range->opaque.computed_line = firstlineno;
+    range->ar_line = -1;
+}
+int
+_PyCode_InitAddressRange(PyCodeObject* co, PyCodeAddressRange *bounds)
+{
+    assert(co->co_linetable != NULL);
+    const char *linetable = PyBytes_AS_STRING(co->co_linetable);
+    Py_ssize_t length = PyBytes_GET_SIZE(co->co_linetable);
+    _PyLineTable_InitAddressRange(linetable, length, co->co_firstlineno, bounds);
+    return bounds->ar_line;
+}
+static int
+scan_varint(const uint8_t *ptr)
+{
+    unsigned int read = *ptr++;
+    unsigned int val = read & 63;
+    unsigned int shift = 0;
+    while (read & 64) {
+        read = *ptr++;
+        shift += 6;
+        val |= (read & 63) << shift;
+    }
+    return val;
+}
+static int
+scan_signed_varint(const uint8_t *ptr)
+{
+    unsigned int uval = scan_varint(ptr);
+    if (uval & 1) {
+        return -(int)(uval >> 1);
+    }
+    else {
+        return uval >> 1;
+    }
+}
+static int
+get_line_delta(const uint8_t *ptr)
+{
+    int code = ((*ptr) >> 3) & 15;
+    switch (code) {
+        case PY_CODE_LOCATION_INFO_NONE:
+            return 0;
+        case PY_CODE_LOCATION_INFO_NO_COLUMNS:
+        case PY_CODE_LOCATION_INFO_LONG:
+            return scan_signed_varint(ptr+1);
+        case PY_CODE_LOCATION_INFO_ONE_LINE0:
+            return 0;
+        case PY_CODE_LOCATION_INFO_ONE_LINE1:
+            return 1;
+        case PY_CODE_LOCATION_INFO_ONE_LINE2:
+            return 2;
+        default:
+            /* Same line */
+            return 0;
+    }
+}
+static int
+is_no_line_marker(uint8_t b)
+{
+    return (b >> 3) == 0x1f;
+}
+static int
+next_code_delta(PyCodeAddressRange *bounds)
+{
+    assert((*bounds->opaque.lo_next) & 128);
+    return (((*bounds->opaque.lo_next) & 7) + 1) * sizeof(_Py_CODEUNIT);
+}
+static inline int
+at_end(PyCodeAddressRange *bounds) {
+    return bounds->opaque.lo_next >= bounds->opaque.limit;
+}
+static void
+advance(PyCodeAddressRange *bounds)
+{
+    ASSERT_VALID_BOUNDS(bounds);
+    bounds->opaque.computed_line += get_line_delta(bounds->opaque.lo_next);
+    if (is_no_line_marker(*bounds->opaque.lo_next)) {
+        bounds->ar_line = -1;
+    }
+    else {
+        bounds->ar_line = bounds->opaque.computed_line;
+    }
+    bounds->ar_start = bounds->ar_end;
+    bounds->ar_end += next_code_delta(bounds);
+    do {
+        bounds->opaque.lo_next++;
+    } while (bounds->opaque.lo_next < bounds->opaque.limit &&
+        ((*bounds->opaque.lo_next) & 128) == 0);
+    ASSERT_VALID_BOUNDS(bounds);
+}
+int
+_PyLineTable_NextAddressRange(PyCodeAddressRange *range)
+{
+    if (at_end(range)) {
+        return 0;
+    }
+    advance(range);
+    assert(range->ar_end > range->ar_start);
+    return 1;
+}
+
+// Datastack helpers.  The source bodies are borrowed from pystate.c; allocator
+// access is routed through the public arena API because CPython's backing
+// _PyObject_Arena variable is file-static in 3.11.
+#define DATA_STACK_CHUNK_SIZE (16 * 1024)
+#define MINIMUM_OVERHEAD 1000
+
+static void* Cix_PyObject_VirtualAlloc(size_t size) {
+  PyObjectArenaAllocator arena;
+  PyObject_GetArenaAllocator(&arena);
+  return arena.alloc(arena.ctx, size);
+}
+
+static void Cix_PyObject_VirtualFree(void* ptr, size_t size) {
+  PyObjectArenaAllocator arena;
+  PyObject_GetArenaAllocator(&arena);
+  arena.free(arena.ctx, ptr, size);
+}
+
+#define _PyObject_VirtualAlloc Cix_PyObject_VirtualAlloc
+#define _PyObject_VirtualFree Cix_PyObject_VirtualFree
+static _PyStackChunk*
+allocate_chunk(int size_in_bytes, _PyStackChunk* previous)
+{
+    assert(size_in_bytes % sizeof(PyObject **) == 0);
+    _PyStackChunk *res = _PyObject_VirtualAlloc(size_in_bytes);
+    if (res == NULL) {
+        return NULL;
+    }
+    res->previous = previous;
+    res->size = size_in_bytes;
+    res->top = 0;
+    return res;
+}
+static PyObject **
+push_chunk(PyThreadState *tstate, int size)
+{
+    int allocate_size = DATA_STACK_CHUNK_SIZE;
+    while (allocate_size < (int)sizeof(PyObject*)*(size + MINIMUM_OVERHEAD)) {
+        allocate_size *= 2;
+    }
+    _PyStackChunk *new = allocate_chunk(allocate_size, tstate->datastack_chunk);
+    if (new == NULL) {
+        return NULL;
+    }
+    if (tstate->datastack_chunk) {
+        tstate->datastack_chunk->top = tstate->datastack_top -
+                                       &tstate->datastack_chunk->data[0];
+    }
+    tstate->datastack_chunk = new;
+    tstate->datastack_limit = (PyObject **)(((char *)new) + allocate_size);
+    // When new is the "root" chunk (i.e. new->previous == NULL), we can keep
+    // _PyThreadState_PopFrame from freeing it later by "skipping" over the
+    // first element:
+    PyObject **res = &new->data[new->previous == NULL];
+    tstate->datastack_top = res + size;
+    return res;
+}
+
+#define _PyThreadState_BumpFramePointerSlow Cix_PyThreadState_PushFrame
+_PyInterpreterFrame *
+_PyThreadState_BumpFramePointerSlow(PyThreadState *tstate, size_t size)
+{
+    if (_PyThreadState_HasStackSpace(tstate, size)) {
+        _PyInterpreterFrame *res = (_PyInterpreterFrame *)tstate->datastack_top;
+        tstate->datastack_top += size;
+        return res;
+    }
+    if (size > INT_MAX/2) {
+        PyErr_NoMemory();
+        return NULL;
+    }
+    return (_PyInterpreterFrame *)push_chunk(tstate, (int)size);
+}
+#undef _PyThreadState_BumpFramePointerSlow
+
+#define _PyThreadState_PopFrame Cix_PyThreadState_PopFrame
+void
+_PyThreadState_PopFrame(PyThreadState *tstate, _PyInterpreterFrame * frame)
+{
+    assert(tstate->datastack_chunk);
+    PyObject **base = (PyObject **)frame;
+    if (base == &tstate->datastack_chunk->data[0]) {
+        _PyStackChunk *chunk = tstate->datastack_chunk;
+        _PyStackChunk *previous = chunk->previous;
+        // push_chunk ensures that the root chunk is never popped:
+        assert(previous);
+        tstate->datastack_top = &previous->data[previous->top];
+        tstate->datastack_chunk = previous;
+        _PyObject_VirtualFree(chunk, chunk->size);
+        tstate->datastack_limit = (PyObject **)(((char *)previous) + previous->size);
+    }
+    else {
+        assert(tstate->datastack_top);
+        assert(tstate->datastack_top >= base);
+        tstate->datastack_top = base;
+    }
+}
+#undef _PyThreadState_PopFrame
+#undef _PyObject_VirtualFree
+#undef _PyObject_VirtualAlloc
+
+// Structural pattern matching and exception formatting.
+static PyObject*
+match_class_attr(PyThreadState *tstate, PyObject *subject, PyObject *type,
+                 PyObject *name, PyObject *seen)
+{
+    assert(PyUnicode_CheckExact(name));
+    assert(PySet_CheckExact(seen));
+    if (PySet_Contains(seen, name) || PySet_Add(seen, name)) {
+        if (!_PyErr_Occurred(tstate)) {
+            // Seen it before!
+            _PyErr_Format(tstate, PyExc_TypeError,
+                          "%s() got multiple sub-patterns for attribute %R",
+                          ((PyTypeObject*)type)->tp_name, name);
+        }
+        return NULL;
+    }
+    PyObject *attr = PyObject_GetAttr(subject, name);
+    if (attr == NULL && _PyErr_ExceptionMatches(tstate, PyExc_AttributeError)) {
+        _PyErr_Clear(tstate);
+    }
+    return attr;
+}
+static PyObject*
+match_class(PyThreadState *tstate, PyObject *subject, PyObject *type,
+            Py_ssize_t nargs, PyObject *kwargs)
+{
+    if (!PyType_Check(type)) {
+        const char *e = "called match pattern must be a type";
+        _PyErr_Format(tstate, PyExc_TypeError, e);
+        return NULL;
+    }
+    assert(PyTuple_CheckExact(kwargs));
+    // First, an isinstance check:
+    if (PyObject_IsInstance(subject, type) <= 0) {
+        return NULL;
+    }
+    // So far so good:
+    PyObject *seen = PySet_New(NULL);
+    if (seen == NULL) {
+        return NULL;
+    }
+    PyObject *attrs = PyList_New(0);
+    if (attrs == NULL) {
+        Py_DECREF(seen);
+        return NULL;
+    }
+    // NOTE: From this point on, goto fail on failure:
+    PyObject *match_args = NULL;
+    // First, the positional subpatterns:
+    if (nargs) {
+        int match_self = 0;
+        match_args = PyObject_GetAttrString(type, "__match_args__");
+        if (match_args) {
+            if (!PyTuple_CheckExact(match_args)) {
+                const char *e = "%s.__match_args__ must be a tuple (got %s)";
+                _PyErr_Format(tstate, PyExc_TypeError, e,
+                              ((PyTypeObject *)type)->tp_name,
+                              Py_TYPE(match_args)->tp_name);
+                goto fail;
+            }
+        }
+        else if (_PyErr_ExceptionMatches(tstate, PyExc_AttributeError)) {
+            _PyErr_Clear(tstate);
+            // _Py_TPFLAGS_MATCH_SELF is only acknowledged if the type does not
+            // define __match_args__. This is natural behavior for subclasses:
+            // it's as if __match_args__ is some "magic" value that is lost as
+            // soon as they redefine it.
+            match_args = PyTuple_New(0);
+            match_self = PyType_HasFeature((PyTypeObject*)type,
+                                            _Py_TPFLAGS_MATCH_SELF);
+        }
+        else {
+            goto fail;
+        }
+        assert(PyTuple_CheckExact(match_args));
+        Py_ssize_t allowed = match_self ? 1 : PyTuple_GET_SIZE(match_args);
+        if (allowed < nargs) {
+            const char *plural = (allowed == 1) ? "" : "s";
+            _PyErr_Format(tstate, PyExc_TypeError,
+                          "%s() accepts %d positional sub-pattern%s (%d given)",
+                          ((PyTypeObject*)type)->tp_name,
+                          allowed, plural, nargs);
+            goto fail;
+        }
+        if (match_self) {
+            // Easy. Copy the subject itself, and move on to kwargs.
+            PyList_Append(attrs, subject);
+        }
+        else {
+            for (Py_ssize_t i = 0; i < nargs; i++) {
+                PyObject *name = PyTuple_GET_ITEM(match_args, i);
+                if (!PyUnicode_CheckExact(name)) {
+                    _PyErr_Format(tstate, PyExc_TypeError,
+                                  "__match_args__ elements must be strings "
+                                  "(got %s)", Py_TYPE(name)->tp_name);
+                    goto fail;
+                }
+                PyObject *attr = match_class_attr(tstate, subject, type, name,
+                                                  seen);
+                if (attr == NULL) {
+                    goto fail;
+                }
+                PyList_Append(attrs, attr);
+                Py_DECREF(attr);
+            }
+        }
+        Py_CLEAR(match_args);
+    }
+    // Finally, the keyword subpatterns:
+    for (Py_ssize_t i = 0; i < PyTuple_GET_SIZE(kwargs); i++) {
+        PyObject *name = PyTuple_GET_ITEM(kwargs, i);
+        PyObject *attr = match_class_attr(tstate, subject, type, name, seen);
+        if (attr == NULL) {
+            goto fail;
+        }
+        PyList_Append(attrs, attr);
+        Py_DECREF(attr);
+    }
+    Py_SETREF(attrs, PyList_AsTuple(attrs));
+    Py_DECREF(seen);
+    return attrs;
+fail:
+    // We really don't care whether an error was raised or not... that's our
+    // caller's problem. All we know is that the match failed.
+    Py_XDECREF(match_args);
+    Py_DECREF(seen);
+    Py_DECREF(attrs);
+    return NULL;
+}
+PyObject* Cix_match_class(
+    PyThreadState* tstate,
+    PyObject* subject,
+    PyObject* type,
+    Py_ssize_t nargs,
+    PyObject* kwargs) {
+  return match_class(tstate, subject, type, nargs, kwargs);
+}
+
+static PyObject*
+match_keys(PyThreadState *tstate, PyObject *map, PyObject *keys)
+{
+    assert(PyTuple_CheckExact(keys));
+    Py_ssize_t nkeys = PyTuple_GET_SIZE(keys);
+    if (!nkeys) {
+        // No keys means no items.
+        return PyTuple_New(0);
+    }
+    PyObject *seen = NULL;
+    PyObject *dummy = NULL;
+    PyObject *values = NULL;
+    PyObject *get = NULL;
+    // We use the two argument form of map.get(key, default) for two reasons:
+    // - Atomically check for a key and get its value without error handling.
+    // - Don't cause key creation or resizing in dict subclasses like
+    //   collections.defaultdict that define __missing__ (or similar).
+    int meth_found = _PyObject_GetMethod(map, &_Py_ID(get), &get);
+    if (get == NULL) {
+        goto fail;
+    }
+    seen = PySet_New(NULL);
+    if (seen == NULL) {
+        goto fail;
+    }
+    // dummy = object()
+    dummy = _PyObject_CallNoArgs((PyObject *)&PyBaseObject_Type);
+    if (dummy == NULL) {
+        goto fail;
+    }
+    values = PyTuple_New(nkeys);
+    if (values == NULL) {
+        goto fail;
+    }
+    for (Py_ssize_t i = 0; i < nkeys; i++) {
+        PyObject *key = PyTuple_GET_ITEM(keys, i);
+        if (PySet_Contains(seen, key) || PySet_Add(seen, key)) {
+            if (!_PyErr_Occurred(tstate)) {
+                // Seen it before!
+                _PyErr_Format(tstate, PyExc_ValueError,
+                              "mapping pattern checks duplicate key (%R)", key);
+            }
+            goto fail;
+        }
+        PyObject *args[] = { map, key, dummy };
+        PyObject *value = NULL;
+        if (meth_found) {
+            value = PyObject_Vectorcall(get, args, 3, NULL);
+        }
+        else {
+            value = PyObject_Vectorcall(get, &args[1], 2, NULL);
+        }
+        if (value == NULL) {
+            goto fail;
+        }
+        if (value == dummy) {
+            // key not in map!
+            Py_DECREF(value);
+            Py_DECREF(values);
+            // Return None:
+            Py_INCREF(Py_None);
+            values = Py_None;
+            goto done;
+        }
+        PyTuple_SET_ITEM(values, i, value);
+    }
+    // Success:
+done:
+    Py_DECREF(get);
+    Py_DECREF(seen);
+    Py_DECREF(dummy);
+    return values;
+fail:
+    Py_XDECREF(get);
+    Py_XDECREF(seen);
+    Py_XDECREF(dummy);
+    Py_XDECREF(values);
+    return NULL;
+}
+PyObject* Cix_match_keys(PyThreadState* tstate, PyObject* map, PyObject* keys) {
+  return match_keys(tstate, map, keys);
+}
+
+static void
+format_kwargs_error(PyThreadState *tstate, PyObject *func, PyObject *kwargs)
+{
+    /* _PyDict_MergeEx raises attribute
+     * error (percolated from an attempt
+     * to get 'keys' attribute) instead of
+     * a type error if its second argument
+     * is not a mapping.
+     */
+    if (_PyErr_ExceptionMatches(tstate, PyExc_AttributeError)) {
+        _PyErr_Clear(tstate);
+        PyObject *funcstr = _PyObject_FunctionStr(func);
+        if (funcstr != NULL) {
+            _PyErr_Format(
+                tstate, PyExc_TypeError,
+                "%U argument after ** must be a mapping, not %.200s",
+                funcstr, Py_TYPE(kwargs)->tp_name);
+            Py_DECREF(funcstr);
+        }
+    }
+    else if (_PyErr_ExceptionMatches(tstate, PyExc_KeyError)) {
+        PyObject *exc, *val, *tb;
+        _PyErr_Fetch(tstate, &exc, &val, &tb);
+        if (val && PyTuple_Check(val) && PyTuple_GET_SIZE(val) == 1) {
+            _PyErr_Clear(tstate);
+            PyObject *funcstr = _PyObject_FunctionStr(func);
+            if (funcstr != NULL) {
+                PyObject *key = PyTuple_GET_ITEM(val, 0);
+                _PyErr_Format(
+                    tstate, PyExc_TypeError,
+                    "%U got multiple values for keyword argument '%S'",
+                    funcstr, key);
+                Py_DECREF(funcstr);
+            }
+            Py_XDECREF(exc);
+            Py_XDECREF(val);
+            Py_XDECREF(tb);
+        }
+        else {
+            _PyErr_Restore(tstate, exc, val, tb);
+        }
+    }
+}
+void Cix_format_kwargs_error(
+    PyThreadState* tstate,
+    PyObject* func,
+    PyObject* kwargs) {
+  format_kwargs_error(tstate, func, kwargs);
+}
+
+static void
+format_exc_check_arg(PyThreadState *tstate, PyObject *exc,
+                     const char *format_str, PyObject *obj)
+{
+    const char *obj_str;
+
+    if (!obj)
+        return;
+
+    obj_str = PyUnicode_AsUTF8(obj);
+    if (!obj_str)
+        return;
+
+    _PyErr_Format(tstate, exc, format_str, obj_str);
+
+    if (exc == PyExc_NameError) {
+        // Include the name in the NameError exceptions to offer suggestions later.
+        PyObject *type, *value, *traceback;
+        PyErr_Fetch(&type, &value, &traceback);
+        PyErr_NormalizeException(&type, &value, &traceback);
+        if (PyErr_GivenExceptionMatches(value, PyExc_NameError)) {
+            PyNameErrorObject* exc = (PyNameErrorObject*) value;
+            if (exc->name == NULL) {
+                // We do not care if this fails because we are going to restore the
+                // NameError anyway.
+                (void)PyObject_SetAttr(value, &_Py_ID(name), obj);
+            }
+        }
+        PyErr_Restore(type, value, traceback);
+    }
+}
+void Cix_format_exc_check_arg(
+    PyThreadState* tstate,
+    PyObject* exc,
+    const char* format_str,
+    PyObject* obj) {
+  format_exc_check_arg(tstate, exc, format_str, obj);
+}
+
+// Use the exact 3.11 next() implementation rather than maintaining another
+// hand-written copy.
+static PyObject *
+builtin_next(PyObject *self, PyObject *const *args, Py_ssize_t nargs)
+{
+    PyObject *it, *res;
+
+    if (!_PyArg_CheckPositional("next", nargs, 1, 2))
+        return NULL;
+
+    it = args[0];
+    if (!PyIter_Check(it)) {
+        PyErr_Format(PyExc_TypeError,
+            "'%.200s' object is not an iterator",
+            Py_TYPE(it)->tp_name);
+        return NULL;
+    }
+
+    res = (*Py_TYPE(it)->tp_iternext)(it);
+    if (res != NULL) {
+        return res;
+    } else if (nargs > 1) {
+        PyObject *def = args[1];
+        if (PyErr_Occurred()) {
+            if(!PyErr_ExceptionMatches(PyExc_StopIteration))
+                return NULL;
+            PyErr_Clear();
+        }
+        Py_INCREF(def);
+        return def;
+    } else if (PyErr_Occurred()) {
+        return NULL;
+    } else {
+        PyErr_SetNone(PyExc_StopIteration);
+        return NULL;
+    }
+}
+PyObject* Ci_Builtin_Next_Core(PyObject* it, PyObject* def) {
+  PyObject* args[] = {it, def};
+  return builtin_next(NULL, args, def == NULL ? 1 : 2);
+}
+
+// Static Python is stubbed on the 3.11 port, so retain this small exported
+// helper that is normally supplied by typed_method_def.c.
+PyObject* Ci_static_rand(PyObject* self) {
+  (void)self;
+  return PyLong_FromLong(rand());
+}
+
+int init_upstream_borrow(void) {
+  const char* code_str =
+      "class GetAttr:\n"
+      "    def __getattr__(self, name): pass\n";
+
+  PyObject* code = NULL;
+  PyObject* globals = NULL;
+  PyObject* empty_dict = NULL;
+  int result = -1;
+
+  empty_dict = PyDict_New();
+  if (empty_dict == NULL) {
+    goto error;
+  }
+  ci_dict_empty_keys = ((PyDictObject*)empty_dict)->ma_keys;
+
+  code = Py_CompileString(code_str, "cinderx_getattr_init.py", Py_file_input);
+  if (code == NULL) {
+    goto error;
+  }
+  globals = PyDict_New();
+  if (globals == NULL) {
+    goto error;
+  }
+
+  PyObject* eval_result = PyEval_EvalCode(code, globals, globals);
+  if (eval_result == NULL) {
+    goto error;
+  }
+  Py_DECREF(eval_result);
+
+  PyObject* getattr = PyDict_GetItemString(globals, "GetAttr");
+  if (getattr == NULL || Py_TYPE(getattr) != &PyType_Type) {
+    PyErr_SetString(
+        PyExc_RuntimeError, "failed to initialize GetAttr: class not defined");
+    goto error;
+  }
+
+  Ci_tp_getattr_hook = ((PyTypeObject*)getattr)->tp_getattro;
+  if (Ci_tp_getattr_hook == NULL) {
+    PyErr_SetString(
+        PyExc_RuntimeError,
+        "failed to initialize GetAttr: got NULL tp_getattro");
+    goto error;
+  }
+
+  result = 0;
+
+error:
+  Py_XDECREF(code);
+  Py_XDECREF(globals);
+  Py_XDECREF(empty_dict);
+  return result;
+}
