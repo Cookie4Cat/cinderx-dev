@@ -585,7 +585,87 @@ std::string disassembleAArch64Snippet(
   return out.str();
 }
 
+uint64_t runBranchBitAndReadNzcv(
+    Instruction::Opcode opcode,
+    uint64_t value,
+    uint64_t nzcv) {
+  JIT_CHECK(
+      opcode == Instruction::kBranchBitSet ||
+          opcode == Instruction::kBranchBitNotSet,
+      "expected a BranchBit opcode");
+
+  auto code_allocator = std::unique_ptr<ICodeAllocator>(CodeAllocator::make());
+  asmjit::CodeHolder code;
+  code.init(code_allocator->asmJitEnvironment());
+  arch::Builder as(&code);
+
+  Environ environ;
+  environ.as = &as;
+
+  Function function;
+  BasicBlock source(&function);
+  BasicBlock target(&function);
+  auto target_label = as.newLabel();
+  environ.block_label_map.emplace(&target, target_label);
+
+  auto* branch = source.allocateInstr(
+      opcode,
+      nullptr,
+      PhyReg{arch::reg_general_return_loc, DataType::k64bit},
+      Imm{31});
+  branch->addOperands(Lbl{&target});
+
+  auto done = as.newLabel();
+  as.msr(asmjit::a64::Predicate::SysReg::kNZCV, asmjit::a64::x1);
+  autogen::AutoTranslator::getInstance().translateInstr(&environ, branch);
+  as.mov(asmjit::a64::x2, 0);
+  as.b(done);
+  as.bind(target_label);
+  as.mov(asmjit::a64::x2, 1);
+  as.bind(done);
+  as.mrs(asmjit::a64::x0, asmjit::a64::Predicate::SysReg::kNZCV);
+  as.orr(asmjit::a64::x0, asmjit::a64::x0, asmjit::a64::x2);
+  as.ret(arch::lr);
+
+  JIT_CHECK(as.finalize() == asmjit::kErrorOk, "failed to finalize code");
+  AllocateResult result = code_allocator->addCode(&code);
+  JIT_CHECK(result.error == asmjit::kErrorOk, "failed to allocate code");
+
+  auto func =
+      reinterpret_cast<uint64_t (*)(uint64_t, uint64_t)>(result.addr);
+  return func(value, nzcv);
+}
+
 } // namespace
+
+TEST_F(BackendTest, BranchBitHasNoAArch64FlagEffects) {
+  EXPECT_EQ(
+      InstrProperty::getProperties(Instruction::kBranchBitSet).flag_effects,
+      FlagEffects::kNone);
+  EXPECT_EQ(
+      InstrProperty::getProperties(Instruction::kBranchBitNotSet).flag_effects,
+      FlagEffects::kNone);
+}
+
+TEST_F(BackendTest, BranchBitPreservesNzcv) {
+  constexpr uint64_t kNzcv = 0xa0000000;
+  constexpr uint64_t kBit31 = uint64_t{1} << 31;
+  constexpr uint64_t kTaken = 1;
+
+  EXPECT_EQ(
+      runBranchBitAndReadNzcv(
+          Instruction::kBranchBitSet, kBit31, kNzcv),
+      kNzcv | kTaken);
+  EXPECT_EQ(
+      runBranchBitAndReadNzcv(Instruction::kBranchBitSet, 0, kNzcv), kNzcv);
+  EXPECT_EQ(
+      runBranchBitAndReadNzcv(Instruction::kBranchBitNotSet, 0, kNzcv),
+      kNzcv | kTaken);
+  EXPECT_EQ(
+      runBranchBitAndReadNzcv(
+          Instruction::kBranchBitNotSet, kBit31, kNzcv),
+      kNzcv);
+}
 
 TEST_F(BackendTest, SplitAddSubImmediate) {
   constexpr uint64_t kSplitImm = 8193;

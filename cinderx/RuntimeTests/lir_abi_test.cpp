@@ -1313,12 +1313,14 @@ TEST_F(LIRABITest, TestkDec_Mem) {
 // kBranchBitSet r i l
 TEST_F(LIRABITest, TestkBranchBitSet_PhyReg_Imm_Label) {
   translateInstr(Instruction::kBranchBitSet, makePhyReg(0), Imm{0});
+  translateInstr(Instruction::kBranchBitSet, makePhyReg(0), Imm{31});
   translateInstr(Instruction::kBranchBitSet, makePhyReg(0), Imm{63});
 }
 
 // kBranchBitNotSet r i l
 TEST_F(LIRABITest, TestkBranchBitNotSet_PhyReg_Imm_Label) {
   translateInstr(Instruction::kBranchBitNotSet, makePhyReg(0), Imm{0});
+  translateInstr(Instruction::kBranchBitNotSet, makePhyReg(0), Imm{31});
   translateInstr(Instruction::kBranchBitNotSet, makePhyReg(0), Imm{63});
 }
 

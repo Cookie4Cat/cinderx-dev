@@ -108,6 +108,35 @@ TEST_F(BranchRelaxationTest, OutOfRangeTbzIsRelaxed) {
   EXPECT_EQ(func(3), 1u);
 }
 
+TEST_F(BranchRelaxationTest, OutOfRangeTbnzIsRelaxed) {
+  asmjit::CodeHolder code;
+  code.init(code_allocator_->asmJitEnvironment());
+  arch::Builder as(&code);
+
+  asmjit::Label target = as.newLabel();
+
+  as.tbnz(asmjit::a64::x0, 31, target);
+
+  for (int i = 0; i < 9000; i++) {
+    as.nop();
+  }
+
+  as.mov(asmjit::a64::x0, 1);
+  as.ret(asmjit::a64::x30);
+
+  as.bind(target);
+  as.mov(asmjit::a64::x0, 0);
+  as.ret(asmjit::a64::x30);
+
+  void* fn = compileBuilder(as, code);
+  ASSERT_NE(fn, nullptr);
+
+  auto func = reinterpret_cast<uint64_t (*)(uint64_t)>(fn);
+  EXPECT_EQ(func(0), 1u);
+  EXPECT_EQ(func(1ULL << 31), 0u);
+  EXPECT_EQ(func((1ULL << 31) - 1), 1u);
+}
+
 // cbz has a 19-bit signed immediate (+/-1MB).
 TEST_F(BranchRelaxationTest, OutOfRangeCbzIsRelaxed) {
   asmjit::CodeHolder code;

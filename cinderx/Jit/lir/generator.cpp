@@ -1773,8 +1773,8 @@ void LIRGenerator::makeDecrefFreeThreaded(
 
   // Check immortal via sign bit. Normal refcounts are well below 2^31,
   // so a set sign bit indicates an immortal sentinel.
-  bbb.appendInstr(Instruction::kTest32, ref_local, ref_local);
-  bbb.appendBranch(Instruction::kBranchS, end_decref);
+  bbb.appendBranch(
+      Instruction::kBranchBitSet, end_decref, ref_local, Imm{31});
 
   // Check thread ownership: ob_tid vs tstate->thread_id.
   BasicBlock* check_owner = bbb.allocateBlock();
@@ -1842,8 +1842,7 @@ void LIRGenerator::makeDecrefGILEnabled(
 
   if (possible_immortal) {
     auto mortal = bbb.allocateBlock();
-    bbb.appendInstr(Instruction::kTest32, r1, r1);
-    bbb.appendBranch(Instruction::kBranchS, end_decref);
+    bbb.appendBranch(Instruction::kBranchBitSet, end_decref, r1, Imm{31});
     bbb.appendBlock(mortal);
   }
 
