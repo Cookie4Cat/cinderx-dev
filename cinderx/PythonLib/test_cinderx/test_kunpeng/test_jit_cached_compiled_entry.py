@@ -1,85 +1,14 @@
 import os
 import subprocess
-import sys
+from pathlib import Path
 import types
 import unittest
 
 import cinderx.jit
+from cinderx.test_support import assert_python_child_ok, run_python_child
 
 
-_FAST_ATTACH_SCRIPT = r"""
-import cinderx.jit
-
-
-def make_inner():
-    def inner(x):
-        return x + 1
-
-    return inner
-
-
-first = make_inner()
-assert cinderx.jit.force_compile(first)
-assert cinderx.jit.is_jit_compiled(first)
-
-second = make_inner()
-assert cinderx.jit.is_jit_compiled(second)
-assert second(41) == 42
-"""
-
-
-_JIT_LIST_BAIL_SCRIPT = r"""
-import cinderx.jit
-
-
-def make_inner():
-    def inner(x):
-        return x + 1
-
-    return inner
-
-
-first = make_inner()
-assert cinderx.jit.force_compile(first)
-assert cinderx.jit.is_jit_compiled(first)
-
-cinderx.jit.append_jit_list("not_the_module:not_the_function")
-
-second = make_inner()
-assert not cinderx.jit.is_jit_compiled(second)
-assert second(41) == 42
-"""
-
-
-_INSTRUMENTATION_BAIL_SCRIPT = r"""
-import sys
-
-import cinderx.jit
-
-
-def make_inner():
-    def inner(x):
-        return x + 1
-
-    return inner
-
-
-def profiler(*args):
-    return None
-
-
-first = make_inner()
-assert cinderx.jit.force_compile(first)
-assert cinderx.jit.is_jit_compiled(first)
-
-sys.setprofile(profiler)
-try:
-    second = make_inner()
-    assert not cinderx.jit.is_jit_compiled(second)
-    assert second(41) == 42
-finally:
-    sys.setprofile(None)
-"""
+CHILD = Path(__file__).with_name("child_cases") / "jit_cached_compiled_entry.py"
 
 
 def _clean_jit_env() -> dict[str, str]:
@@ -98,37 +27,34 @@ def _clean_jit_env() -> dict[str, str]:
     return env
 
 
-def _run_clean_jit_subprocess(script: str) -> subprocess.CompletedProcess[str]:
-    return subprocess.run(
-        [sys.executable, "-c", script],
+def _run_clean_jit_subprocess(case: str) -> subprocess.CompletedProcess[str]:
+    return run_python_child(
+        CHILD,
+        case,
         env=_clean_jit_env(),
-        capture_output=True,
-        text=True,
         timeout=60,
     )
 
 
 @unittest.skipUnless(cinderx.jit.is_enabled(), "requires CinderX JIT")
 class CachedCompiledEntryTests(unittest.TestCase):
-    def assert_clean_jit_subprocess_succeeds(self, script: str) -> None:
-        completed = _run_clean_jit_subprocess(script)
-
-        self.assertEqual(
-            completed.returncode,
-            0,
-            f"stdout:\n{completed.stdout}\nstderr:\n{completed.stderr}",
+    def assert_clean_jit_subprocess_succeeds(self, case: str) -> None:
+        completed = _run_clean_jit_subprocess(case)
+        assert_python_child_ok(
+            completed,
+            context=f"cached compiled entry case {case}",
         )
 
     def test_recreated_function_attaches_cached_compiled_entry(self) -> None:
         # Other test_cinderx cases can leave a process-local JIT list installed.
         # The cached-entry fast path intentionally stays disabled in that state.
-        self.assert_clean_jit_subprocess_succeeds(_FAST_ATTACH_SCRIPT)
+        self.assert_clean_jit_subprocess_succeeds("fast-attach")
 
     def test_jit_list_disables_cached_compiled_entry_fast_path(self) -> None:
-        self.assert_clean_jit_subprocess_succeeds(_JIT_LIST_BAIL_SCRIPT)
+        self.assert_clean_jit_subprocess_succeeds("jit-list-bail")
 
     def test_instrumentation_disables_cached_compiled_entry_fast_path(self) -> None:
-        self.assert_clean_jit_subprocess_succeeds(_INSTRUMENTATION_BAIL_SCRIPT)
+        self.assert_clean_jit_subprocess_succeeds("instrumentation-bail")
 
     def test_cached_entry_does_not_cross_globals(self) -> None:
         globs = {

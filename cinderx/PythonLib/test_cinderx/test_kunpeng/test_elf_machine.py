@@ -6,15 +6,20 @@ from pathlib import Path
 import shutil
 import struct
 import subprocess
-import sys
 import tempfile
-import textwrap
 import unittest
 
-from cinderx.test_support import ENCODING, SUBPROCESS_TIMEOUT_SEC, subprocess_env
+from cinderx.test_support import (
+    ENCODING,
+    SUBPROCESS_TIMEOUT_SEC,
+    assert_python_child_ok,
+    run_python_child,
+    subprocess_env,
+)
 
 
 SKIP_PREFIX = "PYTEST_SKIP "
+CHILD = Path(__file__).with_name("child_cases") / "elf_machine.py"
 
 
 def _expected_elf_machine() -> int:
@@ -103,14 +108,18 @@ def _subprocess_env(**overrides: str) -> dict[str, str]:
     return env
 
 
-def _run_child(code: str, tmp_path: Path, env: dict[str, str]) -> str:
-    completed = subprocess.run(
-        [sys.executable, "-c", code],
+def _run_child(
+    case: str,
+    output_path: Path,
+    tmp_path: Path,
+    env: dict[str, str],
+) -> str:
+    completed = run_python_child(
+        CHILD,
+        case,
+        str(output_path),
         cwd=tmp_path,
         env=env,
-        capture_output=True,
-        encoding=ENCODING,
-        errors="replace",
         timeout=max(SUBPROCESS_TIMEOUT_SEC, 60),
     )
     output = (completed.stdout or "") + (completed.stderr or "")
@@ -118,10 +127,9 @@ def _run_child(code: str, tmp_path: Path, env: dict[str, str]) -> str:
         if line.startswith(SKIP_PREFIX):
             raise unittest.SkipTest(line[len(SKIP_PREFIX) :])
 
-    assert completed.returncode == 0, (
-        f"subprocess failed with {completed.returncode}\n"
-        f"stdout:\n{completed.stdout}\n"
-        f"stderr:\n{completed.stderr}"
+    assert_python_child_ok(
+        completed,
+        context=f"ELF machine child case {case}",
     )
     assert "Traceback" not in output
     return output
@@ -133,43 +141,12 @@ class ElfMachineTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as tmp_dir:
             tmp_path = Path(tmp_dir)
             elf_path = tmp_path / "jit_dump.elf"
-            code = textwrap.dedent(
-                f"""
-                from pathlib import Path
-
-                import cinderx
-                import cinderx.jit
-
-                try:
-                    import cinderjit
-                except ImportError as exc:
-                    print({SKIP_PREFIX!r} + f"cinderjit is not available: {{exc}}")
-                    raise SystemExit(0)
-
-                if not hasattr(cinderjit, "dump_elf"):
-                    print({SKIP_PREFIX!r} + "cinderjit.dump_elf is not available")
-                    raise SystemExit(0)
-
-                cinderx.init()
-                cinderx.jit.enable()
-                if not cinderx.jit.is_enabled():
-                    print({SKIP_PREFIX!r} + "CinderX JIT is not enabled")
-                    raise SystemExit(0)
-
-                def dump_elf_machine_target(value):
-                    return value + 1
-
-                if not cinderx.jit.force_compile(dump_elf_machine_target):
-                    print({SKIP_PREFIX!r} + "force_compile returned False")
-                    raise SystemExit(0)
-
-                assert dump_elf_machine_target(41) == 42
-                cinderjit.dump_elf({str(elf_path)!r})
-                assert Path({str(elf_path)!r}).is_file()
-                """
+            _run_child(
+                "dump-elf",
+                elf_path,
+                tmp_path,
+                _subprocess_env(),
             )
-
-            _run_child(code, tmp_path, _subprocess_env())
 
             self.assertEqual(_read_elf_machine(elf_path), expected_machine)
             _assert_external_tools_report_machine(self, elf_path)
@@ -179,47 +156,9 @@ class ElfMachineTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as tmp_dir:
             tmp_path = Path(tmp_dir)
             elf_path = tmp_path / "gdb_jit.elf"
-            code = textwrap.dedent(
-                f"""
-                from pathlib import Path
-                import shutil
-
-                import cinderx
-                import cinderx.jit
-
-                tmp_dir = Path("/tmp")
-                pattern = "cinder_PyFunctionObject_*_elf"
-                before = {{path.resolve() for path in tmp_dir.glob(pattern)}}
-
-                cinderx.init()
-                cinderx.jit.enable()
-                if not cinderx.jit.is_enabled():
-                    print({SKIP_PREFIX!r} + "CinderX JIT is not enabled")
-                    raise SystemExit(0)
-
-                def gdb_jit_elf_machine_target(value):
-                    return value * 3
-
-                if not cinderx.jit.force_compile(gdb_jit_elf_machine_target):
-                    print({SKIP_PREFIX!r} + "force_compile returned False")
-                    raise SystemExit(0)
-
-                assert gdb_jit_elf_machine_target(14) == 42
-                after = {{path.resolve() for path in tmp_dir.glob(pattern)}}
-                matches = sorted(
-                    after - before,
-                    key=lambda path: path.stat().st_mtime_ns,
-                )
-                assert matches, f"no GDB JIT ELF files matched {{pattern!r}}"
-
-                shutil.copyfile(matches[-1], {str(elf_path)!r})
-                for generated_path in matches:
-                    generated_path.unlink(missing_ok=True)
-                """
-            )
-
             _run_child(
-                code,
+                "gdb-jit-elf",
+                elf_path,
                 tmp_path,
                 _subprocess_env(PYTHONJITGDBWRITEELF="1"),
             )

@@ -9,6 +9,7 @@ import importlib
 import multiprocessing
 import os.path
 import platform
+import subprocess
 import sys
 import sysconfig
 import tempfile
@@ -16,7 +17,7 @@ import types
 import unittest
 from contextlib import contextmanager
 from pathlib import Path
-from typing import Callable, Coroutine, Generator, Sequence, TypeVar
+from typing import Callable, Coroutine, Generator, Mapping, Sequence, TypeVar
 
 import cinderx
 import cinderx.jit
@@ -314,6 +315,49 @@ def is_sanitizer_build() -> bool:
 SUBPROCESS_TIMEOUT_SEC = (
     100 if (is_sanitizer_build() or platform.processor() != platform.machine()) else 5
 )
+
+
+def run_python_child(
+    script: os.PathLike[str] | str,
+    *args: str,
+    python_options: Sequence[str] = (),
+    cwd: os.PathLike[str] | str | None = None,
+    env: Mapping[str, str] | None = None,
+    timeout: float | None = None,
+) -> subprocess.CompletedProcess[str]:
+    """Run a real Python child script with consistent capture and timeout."""
+    return subprocess.run(
+        [sys.executable, *python_options, os.fspath(script), *args],
+        cwd=cwd,
+        env=env,
+        capture_output=True,
+        encoding=ENCODING,
+        errors="replace",
+        timeout=max(SUBPROCESS_TIMEOUT_SEC, 60) if timeout is None else timeout,
+    )
+
+
+def assert_python_child_ok(
+    completed: subprocess.CompletedProcess[str],
+    *,
+    context: str,
+) -> str:
+    """Raise a diagnostic-rich assertion and return combined child output."""
+    stdout = completed.stdout or ""
+    stderr = completed.stderr or ""
+    if completed.returncode != 0:
+        if isinstance(completed.args, str):
+            command = completed.args
+        else:
+            command = " ".join(os.fspath(arg) for arg in completed.args)
+        raise AssertionError(
+            f"{context}: child process failed with {completed.returncode}\n"
+            f"command: {command}\n"
+            f"stdout:\n{stdout}\n"
+            f"stderr:\n{stderr}"
+        )
+    separator = "\n" if stdout and stderr else ""
+    return stdout + separator + stderr
 
 
 @contextmanager

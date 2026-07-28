@@ -1,7 +1,7 @@
 import os
 from pathlib import Path
-import subprocess
-import sys
+
+from cinderx.test_support import run_python_child
 
 HELPER = Path(__file__).with_name("startup_auto_jit_helper.py")
 
@@ -26,14 +26,12 @@ def _startup_provider_env(provider):
 
 
 def _run_startup_auto_jit_helper(tmp_path, env, failure_message):
-    completed = subprocess.run(
-        [sys.executable, str(HELPER)],
+    completed = run_python_child(
+        HELPER,
         # Keep the child away from the source tree so startup must use the
         # installed cinderx package rather than local imports.
         cwd=tmp_path,
         env=env,
-        capture_output=True,
-        text=True,
         timeout=60,
     )
     assert completed.returncode == 0, (
