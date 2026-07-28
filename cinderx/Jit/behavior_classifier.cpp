@@ -11,8 +11,13 @@
 
 #include <algorithm>
 #include <array>
+#include <atomic>
 #include <cctype>
 #include <cstring>
+#ifndef _WIN32
+#include <pthread.h>
+#endif
+#include <vector>
 #include <initializer_list>
 #include <limits>
 #include <string>
@@ -33,11 +38,18 @@ constexpr uint8_t kRiskSuspendBucket = 2;
 constexpr uint8_t kRiskDynamicBucket = 2;
 constexpr uint32_t kRiskExceptionFloor = 2;
 constexpr uint32_t kRiskEffectiveInstructionFloor = 200;
-constexpr uint32_t kLowRoiThresholdFactor = 2;
+// Threshold the released shapes are held at while the process is still
+// proving itself. It sits below the interpret-only freeze line and carries
+// no LowRoi reason, so the code keeps counting calls without being frozen:
+// whatever accumulated during the hold converts into a compile on the first
+// gate check after the release, and long-lived workloads lose nothing.
+// This is deliberately a second gate, not a freeze: a single shape whose
+// own call count reaches the hold threshold compiles on that evidence even
+// if the process-wide budget never releases -- 65535 interpreted calls of
+// one function are overwhelming proof of profitability on their own.
+constexpr uint32_t kLowRoiWarmHoldThreshold = 65535;
 constexpr uint32_t kStartupDeferThresholdFactor = 1u << 20;
 constexpr uint32_t kSteadyNonnumericWarmupThreshold = 1000;
-constexpr uint32_t kProtocolDispatchMaxDynamicLoads = 4;
-constexpr uint32_t kProtocolDispatchMaxCalls = 8;
 constexpr uint8_t kWorkDimCount = static_cast<uint8_t>(WorkDim::kCount);
 
 struct Signature {
@@ -89,15 +101,6 @@ const char* unicodeUtf8OrNull(BorrowedRef<PyObject> obj) {
   return utf8;
 }
 
-std::string lowerAscii(std::string_view value) {
-  std::string lowered;
-  lowered.reserve(value.size());
-  for (unsigned char ch : value) {
-    lowered.push_back(static_cast<char>(std::tolower(ch)));
-  }
-  return lowered;
-}
-
 bool contains(std::string_view haystack, std::string_view needle) {
   return haystack.find(needle) != std::string_view::npos;
 }
@@ -121,26 +124,6 @@ bool isStdlibAsyncioEventLoopFrameworkFilename(std::string_view filename) {
       endsWith(filename, "/asyncio/tasks.py") ||
       endsWith(filename, "/asyncio/unix_events.py") ||
       endsWith(filename, "/selectors.py");
-}
-
-bool isSyntheticFilename(BorrowedRef<PyCodeObject> code) {
-  BorrowedRef<> filename{code->co_filename};
-  if (filename == nullptr || !PyUnicode_Check(filename)) {
-    return false;
-  }
-  const char* utf8 = PyUnicode_AsUTF8(filename);
-  if (utf8 == nullptr) {
-    PyErr_Clear();
-    return false;
-  }
-  std::string_view filename_view{utf8};
-  if (!filename_view.empty() && filename_view.front() == '<') {
-    return true;
-  }
-  std::string lowered = lowerAscii(filename_view);
-  return contains(lowered, "generated") || contains(lowered, "/_generated") ||
-      contains(lowered, "/genshi/") || contains(lowered, "/mako/") ||
-      contains(lowered, "/jinja") || contains(lowered, "/django/template/");
 }
 
 uint8_t bucketDim(uint32_t count, uint32_t n_eff) {
@@ -509,257 +492,6 @@ bool isReturnOpcode(int opcode) {
       opcode == RETURN_CONST || opcode == RETURN_PRIMITIVE;
 }
 
-bool isBooleanPredicateControlOpcode(
-    const BytecodeInstruction& instr,
-    int opcode) {
-  if (instr.isBranch()) {
-    return true;
-  }
-  switch (opcode) {
-    case NOT_TAKEN:
-    case TO_BOOL:
-    case TO_BOOL_ALWAYS_TRUE:
-    case TO_BOOL_BOOL:
-    case TO_BOOL_INT:
-    case TO_BOOL_LIST:
-    case TO_BOOL_NONE:
-    case TO_BOOL_STR:
-      return true;
-    default:
-      return false;
-  }
-}
-
-bool isAllowedProtocolDynamicOpcode(int opcode) {
-  switch (opcode) {
-    case LOAD_GLOBAL:
-    case LOAD_GLOBAL_BUILTIN:
-    case LOAD_GLOBAL_MODULE:
-      return true;
-    default:
-      return false;
-  }
-}
-
-bool isAllowedProtocolControlOpcode(
-    const BytecodeInstruction& instr,
-    int opcode) {
-  if (instr.isBranch()) {
-    return true;
-  }
-  switch (opcode) {
-    case JUMP:
-    case JUMP_FORWARD:
-    case NOT_TAKEN:
-    case NOP:
-    case RAISE_VARARGS:
-    case TO_BOOL:
-    case TO_BOOL_ALWAYS_TRUE:
-    case TO_BOOL_BOOL:
-    case TO_BOOL_INT:
-    case TO_BOOL_LIST:
-    case TO_BOOL_NONE:
-    case TO_BOOL_STR:
-      return true;
-    default:
-      return false;
-  }
-}
-
-bool isSteadyLowRiskUserMethodShape(
-    BorrowedRef<PyCodeObject> code,
-    const StructureKey& key,
-    const GateContext& context) {
-  return !context.startup_phase && code != nullptr && code->co_argcount > 0 &&
-      !nameEquals(code->co_name, "__init__") && !key.is_static &&
-      !key.is_suspendable && !key.highRisk() && key.loop_score == 0 &&
-      !key.is_synthetic;
-}
-
-bool shouldAllowSteadyStateTrivialStateHelper(
-    BorrowedRef<PyCodeObject> code,
-    const StructureKey& key,
-    const GateContext& context) {
-  if (!isSteadyLowRiskUserMethodShape(code, key, context) ||
-      key.family != Family::Trivial || key.code_size_bucket != 0 ||
-      key.active_dim_mask != 0) {
-    return false;
-  }
-
-  uint32_t load_attr_count = 0;
-  uint32_t store_attr_count = 0;
-  uint32_t return_count = 0;
-  BytecodeInstructionBlock block{code};
-  for (auto it = block.begin(); it != block.end(); ++it) {
-    int opcode = (*it).opcode();
-    OpcodeClass cls = opcodeClassOf(opcode);
-    if (cls == OpcodeClass::Invalid || cls == OpcodeClass::Dispatch ||
-        cls == OpcodeClass::Dynamic || cls == OpcodeClass::Suspend ||
-        isExceptionControlOpcode(opcode)) {
-      return false;
-    }
-    if (cls == OpcodeClass::Ignored || cls == OpcodeClass::Neutral) {
-      continue;
-    }
-    if (isLoadAttrOpcode(opcode)) {
-      load_attr_count++;
-      continue;
-    }
-    if (isStoreAttrOpcode(opcode)) {
-      store_attr_count++;
-      continue;
-    }
-    if (isReturnOpcode(opcode)) {
-      return_count++;
-      continue;
-    }
-    return false;
-  }
-
-  bool state_predicate = load_attr_count > 0 && store_attr_count == 0;
-  bool state_mutator = store_attr_count > 0 && load_attr_count == 0;
-  return return_count == 1 && (state_predicate || state_mutator);
-}
-
-bool shouldAllowSteadyStateCompositeStatePredicate(
-    BorrowedRef<PyCodeObject> code,
-    const StructureKey& key,
-    const GateContext& context) {
-  const uint8_t kAllowedDims =
-      activeDimMaskFor(WorkDim::Control) | activeDimMaskFor(WorkDim::Object);
-  if (!isSteadyLowRiskUserMethodShape(code, key, context) ||
-      key.family != Family::BranchFSM || key.code_size_bucket != 0 ||
-      (key.active_dim_mask & ~kAllowedDims) != 0) {
-    return false;
-  }
-
-  uint32_t load_attr_count = 0;
-  uint32_t return_count = 0;
-  BytecodeInstructionBlock block{code};
-  for (auto it = block.begin(); it != block.end(); ++it) {
-    BytecodeInstruction instr = *it;
-    int opcode = instr.opcode();
-    if (isReturnOpcode(opcode)) {
-      return_count++;
-      continue;
-    }
-    OpcodeClass cls = opcodeClassOf(opcode);
-    if (cls == OpcodeClass::Invalid || cls == OpcodeClass::Dispatch ||
-        cls == OpcodeClass::Dynamic || cls == OpcodeClass::Suspend ||
-        isExceptionControlOpcode(opcode)) {
-      return false;
-    }
-    if (cls == OpcodeClass::Ignored || cls == OpcodeClass::Neutral) {
-      continue;
-    }
-    if (isLoadAttrOpcode(opcode)) {
-      load_attr_count++;
-      continue;
-    }
-    if (isStoreAttrOpcode(opcode)) {
-      return false;
-    }
-    if (opcode == UNARY_NOT) {
-      continue;
-    }
-    if (cls == OpcodeClass::Control &&
-        isBooleanPredicateControlOpcode(instr, opcode)) {
-      continue;
-    }
-    return false;
-  }
-
-  return load_attr_count >= 2 && return_count == 1;
-}
-
-bool shouldAllowSteadyStateProtocolDispatchCore(
-    BorrowedRef<PyCodeObject> code,
-    const StructureKey& key,
-    const GateContext& context) {
-  if (!isSteadyLowRiskUserMethodShape(code, key, context) ||
-      code->co_argcount < 2 || key.code_size_bucket > 1) {
-    return false;
-  }
-  if (key.family != Family::BranchFSM && key.family != Family::Mixed &&
-      key.family != Family::ObjectManipulator &&
-      key.family != Family::CallDispatcher) {
-    return false;
-  }
-
-  uint32_t object_access_count = 0;
-  uint32_t store_attr_count = 0;
-  uint32_t control_count = 0;
-  uint32_t call_count = 0;
-  uint32_t dynamic_count = 0;
-  uint32_t return_count = 0;
-  uint32_t raise_count = 0;
-  BytecodeInstructionBlock block{code};
-  for (auto it = block.begin(); it != block.end(); ++it) {
-    BytecodeInstruction instr = *it;
-    int opcode = instr.opcode();
-    if (isReturnOpcode(opcode)) {
-      return_count++;
-      continue;
-    }
-    OpcodeClass cls = opcodeClassOf(opcode);
-    if (cls == OpcodeClass::Invalid || cls == OpcodeClass::Suspend ||
-        isExceptionControlOpcode(opcode)) {
-      return false;
-    }
-    if (cls == OpcodeClass::Ignored || cls == OpcodeClass::Neutral) {
-      continue;
-    }
-    if (cls == OpcodeClass::Dynamic) {
-      if (!isAllowedProtocolDynamicOpcode(opcode)) {
-        return false;
-      }
-      dynamic_count++;
-      if (dynamic_count > kProtocolDispatchMaxDynamicLoads) {
-        return false;
-      }
-      continue;
-    }
-    if (cls == OpcodeClass::Dispatch) {
-      call_count++;
-      continue;
-    }
-    if (isStoreAttrOpcode(opcode)) {
-      object_access_count++;
-      store_attr_count++;
-      continue;
-    }
-    if (isLoadAttrOpcode(opcode)) {
-      object_access_count++;
-      continue;
-    }
-    if (cls == OpcodeClass::Object) {
-      object_access_count++;
-      continue;
-    }
-    if (cls == OpcodeClass::Compute) {
-      continue;
-    }
-    if (cls == OpcodeClass::Control &&
-        isAllowedProtocolControlOpcode(instr, opcode)) {
-      control_count++;
-      if (opcode == RAISE_VARARGS) {
-        raise_count++;
-        if (raise_count > 1) {
-          return false;
-        }
-      }
-      continue;
-    }
-    return false;
-  }
-
-  // This keeps state-machine cores while rejecting call-only wrappers that
-  // looked similar in pickle_pure_python's setup path.
-  return object_access_count > 0 && control_count > 0 && return_count > 0 &&
-      call_count <= kProtocolDispatchMaxCalls &&
-      (store_attr_count > 0 || raise_count > 0);
-}
-
 bool shouldDeferSteadyStateCallOnlyDispatchLoop(
     const StructureKey& key,
     const GateContext& context) {
@@ -840,12 +572,12 @@ uint8_t StructureKey::activeDimCount() const {
 
 uint32_t StructureKey::pack() const {
   uint32_t payload = 0;
+  payload |= (is_eafp_benign ? 1u : 0u) << 24;
   payload |= (static_cast<uint32_t>(mixed_shape) & 0xFu) << 20;
   payload |= (static_cast<uint32_t>(family) & 0xFu) << 16;
   payload |= (static_cast<uint32_t>(loop_score) & 0x3u) << 14;
   payload |= (is_suspendable ? 1u : 0u) << 13;
   payload |= (is_static ? 1u : 0u) << 12;
-  payload |= (is_synthetic ? 1u : 0u) << 11;
   payload |= (static_cast<uint32_t>(risk_reason) & 0xFu) << 7;
   payload |= (static_cast<uint32_t>(code_size_bucket) & 0x3u) << 5;
   payload |= static_cast<uint32_t>(active_dim_mask) & 0x1Fu;
@@ -855,12 +587,12 @@ uint32_t StructureKey::pack() const {
 StructureKey StructureKey::unpack(uint32_t payload) {
   payload &= kSkeyPayloadMask;
   StructureKey key;
+  key.is_eafp_benign = ((payload >> 24) & 0x1u) != 0;
   key.mixed_shape = static_cast<MixedShape>((payload >> 20) & 0xFu);
   key.family = static_cast<Family>((payload >> 16) & 0xFu);
   key.loop_score = static_cast<uint8_t>((payload >> 14) & 0x3u);
   key.is_suspendable = ((payload >> 13) & 0x1u) != 0;
   key.is_static = ((payload >> 12) & 0x1u) != 0;
-  key.is_synthetic = ((payload >> 11) & 0x1u) != 0;
   key.risk_reason = static_cast<uint8_t>((payload >> 7) & 0xFu);
   key.code_size_bucket = static_cast<uint8_t>((payload >> 5) & 0x3u);
   key.active_dim_mask = static_cast<uint8_t>(payload & 0x1Fu);
@@ -1246,6 +978,176 @@ bool shouldDeferSuspendableAutoJitWithoutStructureKey(
           (CO_GENERATOR | CO_COROUTINE | CO_ASYNC_GENERATOR)) != 0;
 }
 
+namespace {
+
+// ---- Self-contained EAFP whitelist ---------------------------------------
+//
+// A function qualifies when its try/except usage is limited to the cache /
+// probe idiom: every typed except handler matches a benign exception type
+// (KeyError/AttributeError/IndexError), every region guarded by such a
+// handler contains no calls (the exception source is a local subscript or
+// attribute access, never a callee), and the function contains no explicit
+// raise. These functions take the exception path only on cache misses, so
+// the static exception-control risk verdict misprices them. A mispredicted
+// whitelist entry is still bounded by the deopt-side ROI backoff.
+
+struct ExceptionTableEntry {
+  uint32_t start; // byte offsets into co_code
+  uint32_t end;
+  uint32_t target;
+};
+
+bool parseExceptionTable(
+    BorrowedRef<PyCodeObject> code,
+    std::vector<ExceptionTableEntry>& entries) {
+  PyObject* table = code->co_exceptiontable;
+  if (table == nullptr || !PyBytes_Check(table)) {
+    return false;
+  }
+  auto data = reinterpret_cast<const uint8_t*>(PyBytes_AS_STRING(table));
+  Py_ssize_t size = PyBytes_GET_SIZE(table);
+  Py_ssize_t pos = 0;
+  auto parse_varint = [&](uint32_t& value) -> bool {
+    if (pos >= size) {
+      return false;
+    }
+    uint8_t byte = data[pos++];
+    value = byte & 63;
+    while (byte & 64) {
+      if (pos >= size) {
+        return false;
+      }
+      byte = data[pos++];
+      value = (value << 6) | (byte & 63);
+    }
+    return true;
+  };
+  while (pos < size) {
+    uint32_t start = 0, length = 0, target = 0, depth_lasti = 0;
+    if (!parse_varint(start) || !parse_varint(length) ||
+        !parse_varint(target) || !parse_varint(depth_lasti)) {
+      return false;
+    }
+    entries.push_back(
+        ExceptionTableEntry{start * 2, (start + length) * 2, target * 2});
+  }
+  return true;
+}
+
+bool isBenignEafpExceptionName(PyObject* name) {
+  if (name == nullptr || !PyUnicode_Check(name)) {
+    return false;
+  }
+  return PyUnicode_EqualToUTF8(name, "KeyError") == 1 ||
+      PyUnicode_EqualToUTF8(name, "AttributeError") == 1 ||
+      PyUnicode_EqualToUTF8(name, "IndexError") == 1;
+}
+
+enum class EafpHandlerKind {
+  kNotTyped, // cleanup / finally-style entry: no exception type check
+  kBenign, // typed handler matching a whitelisted exception
+  kOther, // typed handler matching anything else
+};
+
+EafpHandlerKind classifyEafpHandler(
+    BorrowedRef<PyCodeObject> code,
+    BytecodeInstructionBlock& block,
+    uint32_t target) {
+  constexpr int kHandlerScanWindow = 5;
+  bool in_handler = false;
+  int remaining = kHandlerScanWindow;
+  PyObject* last_global_name = nullptr;
+  for (auto it = block.begin(); it != block.end(); ++it) {
+    BytecodeInstruction instr = *it;
+    uint32_t off = instr.baseIndex().value() * 2;
+    if (!in_handler) {
+      if (off != target) {
+        continue;
+      }
+      if (instr.opcode() != PUSH_EXC_INFO) {
+        return EafpHandlerKind::kNotTyped;
+      }
+      in_handler = true;
+      continue;
+    }
+    if (remaining-- <= 0) {
+      return EafpHandlerKind::kNotTyped;
+    }
+    switch (instr.opcode()) {
+      case LOAD_GLOBAL:
+        last_global_name = PyTuple_GetItem(
+            code->co_names, static_cast<Py_ssize_t>(instr.oparg() >> 1));
+        continue;
+      case CHECK_EXC_MATCH:
+        return isBenignEafpExceptionName(last_global_name)
+            ? EafpHandlerKind::kBenign
+            : EafpHandlerKind::kOther;
+      default:
+        continue;
+    }
+  }
+  return EafpHandlerKind::kNotTyped;
+}
+
+bool regionContainsCall(
+    BytecodeInstructionBlock& block,
+    uint32_t begin,
+    uint32_t end) {
+  for (auto it = block.begin(); it != block.end(); ++it) {
+    BytecodeInstruction instr = *it;
+    uint32_t off = instr.baseIndex().value() * 2;
+    if (off < begin || off >= end) {
+      continue;
+    }
+    switch (instr.opcode()) {
+      case CALL:
+      case CALL_FUNCTION_EX:
+      case CALL_INTRINSIC_1:
+      case CALL_INTRINSIC_2:
+      case CALL_KW:
+        return true;
+      default:
+        break;
+    }
+  }
+  return false;
+}
+
+bool isSelfContainedEafpCode(BorrowedRef<PyCodeObject> code) {
+  std::vector<ExceptionTableEntry> entries;
+  if (!parseExceptionTable(code, entries) || entries.empty()) {
+    return false;
+  }
+  BytecodeInstructionBlock block{code};
+  bool saw_benign_typed_handler = false;
+  for (const auto& entry : entries) {
+    switch (classifyEafpHandler(code, block, entry.target)) {
+      case EafpHandlerKind::kOther:
+        return false;
+      case EafpHandlerKind::kBenign:
+        if (regionContainsCall(block, entry.start, entry.end)) {
+          return false;
+        }
+        saw_benign_typed_handler = true;
+        break;
+      case EafpHandlerKind::kNotTyped:
+        // Cleanup entry (with/finally); calls on the slow path are fine.
+        break;
+    }
+  }
+  if (!saw_benign_typed_handler) {
+    return false;
+  }
+  for (auto it = block.begin(); it != block.end(); ++it) {
+    if ((*it).opcode() == RAISE_VARARGS) {
+      return false;
+    }
+  }
+  return true;
+}
+
+} // namespace
+
 std::optional<StructureKey> deriveStructureKey(BorrowedRef<PyCodeObject> code) {
   if (!isAutoJitClassifiable(code)) {
     return std::nullopt;
@@ -1264,8 +1166,16 @@ std::optional<StructureKey> deriveStructureKey(BorrowedRef<PyCodeObject> code) {
       (code->co_flags & (CO_GENERATOR | CO_COROUTINE | CO_ASYNC_GENERATOR)) !=
           0 ||
       sig->counts[dimIndex(WorkDim::Suspend)] > 0;
-  key.is_synthetic = isSyntheticFilename(code);
   key.risk_reason = deriveRiskReason(*sig, buckets);
+  // Record self-contained EAFP cache idioms (the handler runs only on cache
+  // misses, so the static exception-risk verdict misprices them). The
+  // exception risk itself stays in the key; computeThresholdForCode waives
+  // it per gate check outside the startup phase, so bootstrap machinery
+  // classified while imports are in flight keeps the deferral.
+  if ((key.risk_reason & kRiskException) != 0 &&
+      isSelfContainedEafpCode(code)) {
+    key.is_eafp_benign = true;
+  }
   key.code_size_bucket = codeSizeBucket(sig->n_eff);
   key.active_dim_mask = activeDimMask(buckets);
 
@@ -1308,6 +1218,65 @@ std::optional<StructureKey> getOrComputeStructureKey(
   Ci_code_extra_store_skey_release(extra, key->pack() | kSkeyValidBit);
   return key;
 }
+
+namespace {
+
+// Process-wide evidence that speculative compilation can amortize. Every
+// increment is one interpreted execution of code this series would otherwise
+// have compiled, so the budget measures forgone opportunity directly rather
+// than elapsed time: call counts are properties of the program, independent
+// of machine speed, architecture, and where an integration loader hooks into
+// the interpreter lifecycle. A python_startup_no_site-shaped process makes a
+// few hundred such calls in total and never reaches the budget; benchmark
+// and application workloads reach it during their first warmup moments.
+std::atomic<uint64_t> g_low_roi_held_calls{0};
+std::atomic<bool> g_low_roi_release_active{false};
+
+bool lowRoiReleaseActiveOrNote() {
+  if (g_low_roi_release_active.load(std::memory_order_relaxed)) {
+    return true;
+  }
+  size_t budget = getConfig().auto_classify_low_roi_warm_calls;
+  if (budget == 0 ||
+      g_low_roi_held_calls.fetch_add(1, std::memory_order_relaxed) + 1 >=
+          budget) {
+    g_low_roi_release_active.store(true, std::memory_order_relaxed);
+    return true;
+  }
+  return false;
+}
+
+} // namespace
+
+void resetLowRoiReleaseState() {
+  g_low_roi_held_calls.store(0, std::memory_order_relaxed);
+  g_low_roi_release_active.store(false, std::memory_order_relaxed);
+}
+
+#ifndef _WIN32
+namespace {
+
+// The budget's evidence is per-process execution, and a forked child has
+// not executed anything: letting it inherit the parent's counter and sticky
+// release hands it unearned proof. Disposable fork children (multiprocessing
+// pool workers) then compile eagerly and pay bursts they can never amortize
+// -- concurrent_imap measures 75ms with an inherited release versus 42ms
+// held, against 51ms for the pre-series baseline. Already-compiled code is
+// inherited as-is; only future release decisions start over. Registered at
+// shared-object load so it also covers forks taken before the JIT
+// initializes; resetting two relaxed atomics is async-signal-safe. If
+// registration ever fails (ENOMEM), children simply skip the reset and
+// inherit the parent's release state -- the pre-budget behavior, safe but
+// less frugal -- so the return value is deliberately not checked.
+struct LowRoiForkReset {
+  LowRoiForkReset() {
+    pthread_atfork(nullptr, nullptr, [] { resetLowRoiReleaseState(); });
+  }
+};
+LowRoiForkReset s_low_roi_fork_reset;
+
+} // namespace
+#endif
 
 ThresholdDecision computeThreshold(
     const StructureKey& key,
@@ -1365,6 +1334,13 @@ ThresholdDecision computeThreshold(
         BranchReason::RiskDefer};
   }
 
+  // Generalized steady-state LowRoi deferral is removed: pyperformance A/B
+  // showed the blanket verdicts (multidim object graphs, non-risky warmup
+  // holds, Trivial/synthetic freezes) mostly suppressed profitable compiles.
+  // What remains deferred below is evidence-backed or risk-gated: high-risk
+  // shapes keep their prior verdicts, the call-only dispatch loop verdict
+  // stays (logging_silent, negative ROI when compiled), and the asyncio
+  // helper naming in computeThresholdForCode() is untouched.
   bool steady_multidim_nonnumeric_object_graph_candidate =
       !context.startup_phase && !key.is_static && !key.is_suspendable &&
       !key.computeHint() && key.activeDimCount() >= 3 &&
@@ -1375,7 +1351,7 @@ ThresholdDecision computeThreshold(
        (key.family == Family::Mixed &&
         (key.hasActiveDim(WorkDim::Dispatch) ||
          key.hasActiveDim(WorkDim::Dynamic))));
-  if (steady_multidim_nonnumeric_object_graph_candidate) {
+  if (steady_multidim_nonnumeric_object_graph_candidate && key.highRisk()) {
     return {
         saturatingMul(global, kStartupDeferThresholdFactor),
         BranchReason::LowRoi};
@@ -1390,11 +1366,20 @@ ThresholdDecision computeThreshold(
   bool steady_nonnumeric_warmup_candidate = !key.is_static &&
       key.loop_score == 0 &&
       (key.is_suspendable || startup_like_family || startup_like_mixed);
-  if (steady_nonnumeric_warmup_candidate) {
-    if (key.highRisk() || key.code_size_bucket > 0) {
+  if (steady_nonnumeric_warmup_candidate && key.highRisk()) {
+    return {
+        saturatingMul(global, kStartupDeferThresholdFactor),
+        BranchReason::RiskDefer};
+  }
+  // Suspendable shapes keep their prior deferral: widening the compiled
+  // generator surface is deliberately out of scope for this change and
+  // needs its own correctness pass. The plain-generator allowance in
+  // computeThresholdForCode() stays the only entry.
+  if (steady_nonnumeric_warmup_candidate && key.is_suspendable) {
+    if (key.code_size_bucket > 0) {
       return {
           saturatingMul(global, kStartupDeferThresholdFactor),
-          key.highRisk() ? BranchReason::RiskDefer : BranchReason::LowRoi};
+          BranchReason::LowRoi};
     }
     return {
         std::max(global, kSteadyNonnumericWarmupThreshold),
@@ -1402,8 +1387,7 @@ ThresholdDecision computeThreshold(
   }
 
   bool large_branch_warmup_candidate = !key.is_static && key.loop_score > 0 &&
-      key.family == Family::BranchFSM &&
-      (key.highRisk() || key.code_size_bucket >= 2);
+      key.family == Family::BranchFSM && key.highRisk();
   if (large_branch_warmup_candidate) {
     return {
         std::max(global, kSteadyNonnumericWarmupThreshold),
@@ -1414,12 +1398,29 @@ ThresholdDecision computeThreshold(
       !key.is_suspendable && !key.highRisk();
   bool trivial_low_roi_candidate =
       low_roi_base && key.family == Family::Trivial;
-  bool synthetic_low_roi_candidate = key.is_synthetic && low_roi_base &&
-      (key.family == Family::ReflectionMeta || key.family == Family::Trivial);
-  if (trivial_low_roi_candidate || synthetic_low_roi_candidate) {
-    return {
-        saturatingMul(global, kLowRoiThresholdFactor), BranchReason::LowRoi};
+
+  // Everything above this point is the classifier's verdict. What follows is
+  // policy: the shapes released by this series compile at the base threshold
+  // only once the process has shown that speculative compilation can pay for
+  // itself. Until then they are held (see kLowRoiWarmHoldThreshold), which is
+  // what keeps short-lived interpreter invocations as cheap as they were
+  // before the release. The hold applies in every phase, so a cold process
+  // stays cheap during its imports as well.
+  // Loop-bearing shapes are never held. The gate counts calls, not loop
+  // iterations, and there is no on-stack replacement, so holding a function
+  // whose work sits inside a loop strands that work in the interpreter for
+  // as long as the hold lasts -- and a process-wide budget can outlast a
+  // whole measurement window.
+  bool released_low_roi_shape = key.loop_score == 0 &&
+      (steady_multidim_nonnumeric_object_graph_candidate ||
+       steady_nonnumeric_warmup_candidate || trivial_low_roi_candidate);
+  // lowRoiReleaseActiveOrNote() has a side effect, so it is evaluated last:
+  // the counter must measure forgone opportunity, i.e. only calls that the
+  // release would actually have compiled.
+  if (released_low_roi_shape && !lowRoiReleaseActiveOrNote()) {
+    return {kLowRoiWarmHoldThreshold, BranchReason::None};
   }
+
   return {global, BranchReason::None};
 }
 
@@ -1428,23 +1429,23 @@ ThresholdDecision computeThresholdForCode(
     const StructureKey& key,
     const GateContext& context,
     uint32_t global) {
-  auto decision = computeThreshold(key, context, global);
-  if (isStdlibAsyncioEventLoopFrameworkHelper(code, key, context)) {
+  // Outside the startup phase, waive the exception risk for self-contained
+  // EAFP cache idioms before computing the verdict. This is re-evaluated on
+  // every gate check, so the same code keeps the risk deferral while
+  // imports or setup are in flight.
+  StructureKey effective = key;
+  if (effective.is_eafp_benign && !context.startup_phase) {
+    effective.risk_reason &= static_cast<uint8_t>(~kRiskException);
+  }
+
+  auto decision = computeThreshold(effective, context, global);
+  if (isStdlibAsyncioEventLoopFrameworkHelper(code, effective, context)) {
     return {
         saturatingMul(global, kStartupDeferThresholdFactor),
         BranchReason::LowRoi};
   }
   if (decision.branch_reason != BranchReason::None &&
-      shouldAllowSteadyStatePlainGenerator(code, key, context)) {
-    return {global, BranchReason::None};
-  }
-  if (decision.branch_reason == BranchReason::LowRoi &&
-      shouldAllowSteadyStateTrivialStateHelper(code, key, context)) {
-    return {global, BranchReason::None};
-  }
-  if (decision.branch_reason == BranchReason::LowRoi &&
-      (shouldAllowSteadyStateCompositeStatePredicate(code, key, context) ||
-       shouldAllowSteadyStateProtocolDispatchCore(code, key, context))) {
+      shouldAllowSteadyStatePlainGenerator(code, effective, context)) {
     return {global, BranchReason::None};
   }
   return decision;

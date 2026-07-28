@@ -308,6 +308,10 @@ def _plugin_env() -> dict[str, str]:
 
     env["CINDERX_PLUGIN_ENABLE"] = "1"
     env["PYTHONJITAUTO"] = "auto:2"
+    # These cases are about classification verdicts, so they run with the
+    # held-call budget released: a test process is short-lived by nature and
+    # would otherwise never warm up. The budget itself has its own case.
+    env["CINDERX_AUTOJIT_LOWROI_WARM_CALLS"] = "0"
     env.pop("PYTHONJITALL", None)
     env.pop("CINDERX_AUTOJIT_IMPORT_PROVIDER", None)
     env.pop("CINDERX_AUTOJIT_SETUP_PROVIDER", None)
@@ -650,7 +654,7 @@ class AutoJitGateStatsDumpTests(unittest.TestCase):
         CP3140_AUTOJIT_DIRECT_CALL_GATE_UNSUPPORTED,
         CP3140_AUTOJIT_SKIP_REASON,
     )
-    def test_plugin_freezes_low_roi_functions(self) -> None:
+    def test_plugin_compiles_low_roi_functions_at_base(self) -> None:
         with tempfile.TemporaryDirectory() as temp:
             env = _plugin_env()
 
@@ -670,12 +674,8 @@ class AutoJitGateStatsDumpTests(unittest.TestCase):
                     "    trivial(value)\n"
                     "\n"
                     "trivial_stats = cinderjit._autojit_gate_stats()\n"
-                    "assert trivial_stats['global_threshold_return'] >= 1, trivial_stats\n"
-                    "assert trivial_stats['classified_defer_freeze'] >= 1, trivial_stats\n"
-                    "assert trivial_stats['classified_warmup_return'] == 0, trivial_stats\n"
-                    "assert trivial_stats['forced_compile'] == 0, trivial_stats\n"
-                    "assert jit.count_interpreted_calls(trivial) <= 2\n"
-                    "assert not jit.is_jit_compiled(trivial)\n"
+                    "assert trivial_stats['classified_defer_freeze'] == 0, trivial_stats\n"
+                    "assert jit.is_jit_compiled(trivial), trivial_stats\n"
                     "\n"
                     "cinderjit._clear_autojit_gate_stats()\n"
                     "\n"
@@ -689,12 +689,8 @@ class AutoJitGateStatsDumpTests(unittest.TestCase):
                     "    dispatch(identity, value)\n"
                     "\n"
                     "dispatch_stats = cinderjit._autojit_gate_stats()\n"
-                    "assert dispatch_stats['global_threshold_return'] >= 1, dispatch_stats\n"
-                    "assert dispatch_stats['classified_defer_freeze'] >= 1, dispatch_stats\n"
-                    "assert dispatch_stats['classified_warmup_return'] == 0, dispatch_stats\n"
-                    "assert dispatch_stats['forced_compile'] == 0, dispatch_stats\n"
-                    "assert jit.count_interpreted_calls(dispatch) <= 2\n"
-                    "assert not jit.is_jit_compiled(dispatch)\n",
+                    "assert dispatch_stats['classified_defer_freeze'] == 0, dispatch_stats\n"
+                    "assert jit.is_jit_compiled(dispatch), dispatch_stats\n",
                 ],
                 cwd=temp,
                 env=env,
@@ -713,7 +709,7 @@ class AutoJitGateStatsDumpTests(unittest.TestCase):
         CP3140_AUTOJIT_DIRECT_CALL_GATE_UNSUPPORTED,
         CP3140_AUTOJIT_SKIP_REASON,
     )
-    def test_plugin_freezes_low_loop_object_manipulators(self) -> None:
+    def test_plugin_compiles_low_loop_object_manipulators_at_base(self) -> None:
         with tempfile.TemporaryDirectory() as temp:
             env = _plugin_env()
 
@@ -739,12 +735,8 @@ class AutoJitGateStatsDumpTests(unittest.TestCase):
                     "    write_value(payload, value)\n"
                     "\n"
                     "stats = cinderjit._autojit_gate_stats()\n"
-                    "assert stats['global_threshold_return'] >= 1, stats\n"
-                    "assert stats['classified_defer_freeze'] >= 1, stats\n"
-                    "assert stats['classified_warmup_return'] == 0, stats\n"
-                    "assert stats['forced_compile'] == 0, stats\n"
-                    "assert jit.count_interpreted_calls(write_value) <= 2\n"
-                    "assert not jit.is_jit_compiled(write_value)\n",
+                    "assert stats['classified_defer_freeze'] == 0, stats\n"
+                    "assert jit.is_jit_compiled(write_value), stats\n",
                 ],
                 cwd=temp,
                 env=env,
@@ -763,7 +755,7 @@ class AutoJitGateStatsDumpTests(unittest.TestCase):
         CP3140_AUTOJIT_DIRECT_CALL_GATE_UNSUPPORTED,
         CP3140_AUTOJIT_SKIP_REASON,
     )
-    def test_plugin_defers_logging_disabled_fast_path(self) -> None:
+    def test_plugin_compiles_self_contained_eafp_predicates(self) -> None:
         with tempfile.TemporaryDirectory() as temp:
             env = _plugin_env()
 
@@ -785,14 +777,110 @@ class AutoJitGateStatsDumpTests(unittest.TestCase):
                     "    assert not logger.isEnabledFor(logging.DEBUG)\n"
                     "\n"
                     "stats = cinderjit._autojit_gate_stats()\n"
-                    "assert stats['global_threshold_return'] >= 1, stats\n"
-                    "assert stats['classified_defer_freeze'] >= 1, stats\n"
-                    "assert stats['forced_compile'] == 0, stats\n"
-                    "assert not jit.is_jit_compiled(logging.Logger.isEnabledFor), (\n"
+                    "assert jit.is_jit_compiled(logging.Logger.isEnabledFor), (\n"
                     "    stats,\n"
                     "    jit.count_interpreted_calls(logging.Logger.isEnabledFor),\n"
                     ")\n",
                 ],
+                cwd=temp,
+                env=env,
+                capture_output=True,
+                text=True,
+                timeout=60,
+            )
+
+            self.assertEqual(
+                completed.returncode,
+                0,
+                f"stdout:\n{completed.stdout}\nstderr:\n{completed.stderr}",
+            )
+
+    @unittest.skipIf(
+        CP3140_AUTOJIT_DIRECT_CALL_GATE_UNSUPPORTED,
+        CP3140_AUTOJIT_SKIP_REASON,
+    )
+    def test_plugin_low_roi_release_waits_for_held_call_budget(self) -> None:
+        # A process that never accumulates the budget keeps the deferral, so
+        # short-lived interpreter invocations stay as cheap as before the
+        # release; one that does accumulate it compiles the same shape. The
+        # third case pins the second gate: a single shape that alone reaches
+        # the 65535 hold threshold compiles on its own evidence even when the
+        # process-level budget never releases.
+        script = Path(__file__).with_name("held_call_budget_helper.py")
+        with tempfile.TemporaryDirectory() as temp:
+            for calls, want, budget in (
+                (64, "interpreted", "1024"),
+                (5000, "compiled", "1024"),
+                (140000, "compiled", "1000000000"),
+            ):
+                env = _plugin_env()
+                env["CINDERX_AUTOJIT_LOWROI_WARM_CALLS"] = budget
+                env["CALLS"] = str(calls)
+                env["WANT"] = want
+
+                completed = subprocess.run(
+                    [sys.executable, str(script)],
+                    cwd=temp,
+                    env=env,
+                    capture_output=True,
+                    text=True,
+                    timeout=60,
+                )
+
+                self.assertEqual(
+                    completed.returncode,
+                    0,
+                    f"calls={calls} want={want} budget={budget}"
+                    f"\nstdout:\n{completed.stdout}"
+                    f"\nstderr:\n{completed.stderr}",
+                )
+
+    @unittest.skipIf(
+        CP3140_AUTOJIT_DIRECT_CALL_GATE_UNSUPPORTED,
+        CP3140_AUTOJIT_SKIP_REASON,
+    )
+    @unittest.skipUnless(hasattr(os, "fork"), "requires os.fork")
+    def test_plugin_forked_child_reproves_held_call_budget(self) -> None:
+        # The budget's evidence is per-process execution. A forked child has
+        # executed nothing, so it must not inherit the parent's release:
+        # disposable pool workers otherwise compile eagerly and pay bursts
+        # they can never amortize. Compiled code itself is inherited.
+        script = Path(__file__).with_name("fork_budget_helper.py")
+        with tempfile.TemporaryDirectory() as temp:
+            env = _plugin_env()
+            env["CINDERX_AUTOJIT_LOWROI_WARM_CALLS"] = "1024"
+
+            completed = subprocess.run(
+                [sys.executable, str(script)],
+                cwd=temp,
+                env=env,
+                capture_output=True,
+                text=True,
+                timeout=60,
+            )
+
+            self.assertEqual(
+                completed.returncode,
+                0,
+                f"stdout:\n{completed.stdout}\nstderr:\n{completed.stderr}",
+            )
+
+    @unittest.skipIf(
+        CP3140_AUTOJIT_DIRECT_CALL_GATE_UNSUPPORTED,
+        CP3140_AUTOJIT_SKIP_REASON,
+    )
+    def test_plugin_dedup_uncompile_demotes_donor(self) -> None:
+        # Lifecycle: promote a donor, gut its artifact via force_uncompile
+        # (the same path ROI backoff takes), then verify a fresh twin does
+        # not get the cleared artifact re-installed -- it recompiles cleanly
+        # and the entry can be promoted again.
+        script = Path(__file__).with_name("dedup_uncompile_helper.py")
+        with tempfile.TemporaryDirectory() as temp:
+            env = _plugin_env()
+            env["CINDERX_AUTOJIT_CODE_DEDUP"] = "1"
+
+            completed = subprocess.run(
+                [sys.executable, str(script)],
                 cwd=temp,
                 env=env,
                 capture_output=True,

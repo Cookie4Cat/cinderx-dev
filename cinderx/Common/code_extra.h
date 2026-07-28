@@ -8,11 +8,12 @@
 //   bit 31: classification payload is valid.
 //   bit 30: steady-state policy decided the code object is cold enough to stop
 //           per-frame call counting.
-//   bits 0-23: packed StructureKey payload. The gap between bit 30 and bit 23
-//              is reserved for future flags so payload width can stay stable.
+//   bits 0-24: packed StructureKey payload (bit 24: self-contained EAFP
+//              idiom flag). The gap between bit 30 and bit 24 is reserved
+//              for future flags so payload width can stay stable.
 #define CI_CODE_EXTRA_SKEY_VALID_BIT 0x80000000u
 #define CI_CODE_EXTRA_SKEY_DECIDED_COLD_BIT 0x40000000u
-#define CI_CODE_EXTRA_SKEY_PAYLOAD_MASK 0x00FFFFFFu
+#define CI_CODE_EXTRA_SKEY_PAYLOAD_MASK 0x01FFFFFFu
 
 // roi_ctl bit layout for dynamic negative-ROI backoff:
 //   bit 31: code object is frozen for this process.
@@ -48,7 +49,8 @@ typedef struct CodeExtra {
   void* jit_globals;
   void* jit_builtins;
   // Cached AutoJIT behavior classification. bit31 is the valid bit; the low
-  // 24 bits are a StructureKey payload. Zero-initialized means unclassified.
+  // 25 bits (0-24) are a StructureKey payload. Zero-initialized means
+  // unclassified.
   uint32_t skey_word;
   // Per-code dynamic negative-ROI backoff state. These fields are runtime
   // feedback and intentionally do not participate in StructureKey identity.

@@ -291,7 +291,6 @@ void writeAutoJitCompileEvent(
         << ",\"loop_score\":" << static_cast<int>(key->loop_score)
         << ",\"is_suspendable\":" << (key->is_suspendable ? "true" : "false")
         << ",\"is_static\":" << (key->is_static ? "true" : "false")
-        << ",\"is_synthetic\":" << (key->is_synthetic ? "true" : "false")
         << ",\"risk_reason\":" << static_cast<int>(key->risk_reason)
         << ",\"code_size_bucket\":" << static_cast<int>(key->code_size_bucket)
         << ",\"active_dim_mask\":" << static_cast<int>(key->active_dim_mask)
@@ -803,6 +802,21 @@ FlagProcessor initFlagProcessor() {
       "CINDERX_AUTOJIT_ROI_REWARM_FACTOR",
       getMutableConfig().roi_rewarm_factor,
       "Multiplier for AutoJIT ROI backoff recompile floor");
+
+  flag_processor.addOption(
+      "jit-auto-code-dedup",
+      "CINDERX_AUTOJIT_CODE_DEDUP",
+      getMutableConfig().auto_code_twin_dedup,
+      "Canonicalize exec-generated namespace-free content-twin code objects "
+      "onto one identity at compile time; set to 0 to disable when isolating "
+      "A/B");
+
+  flag_processor.addOption(
+      "jit-auto-lowroi-warm-calls",
+      "CINDERX_AUTOJIT_LOWROI_WARM_CALLS",
+      getMutableConfig().auto_classify_low_roi_warm_calls,
+      "Held calls a process must accumulate before steady-state LowRoi "
+      "shapes stop being deferred; 0 releases them immediately");
 
   flag_processor.addOption(
       "jit-debug",
@@ -3811,6 +3825,14 @@ void trackEligibleCodeObjects(
 //
 // Failing to compile a dependent function is a soft failure, and is ignored.
 Result compile_func(BorrowedRef<PyFunctionObject> func) {
+  // Content-keyed reuse for exec-generated namespace-free code: if an
+  // identical code object was compiled before, attach this function to the
+  // existing artifact instead of compiling again.
+  if (getConfig().auto_code_twin_dedup && jitCtx() != nullptr &&
+      jitCtx()->reuseDedupedCompiled(func)) {
+    return Result::OK;
+  }
+
   // isolate preloaders state since batch preloading might trigger a call to a
   // jitable function, resulting in a single-function compile
   hir::IsolatedPreloaders ip;

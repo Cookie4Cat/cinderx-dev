@@ -71,7 +71,10 @@ struct StructureKey {
   uint8_t loop_score{0};
   bool is_suspendable{false};
   bool is_static{false};
-  bool is_synthetic{false};
+  // Exception risk was waived because the try/except usage is a
+  // self-contained EAFP cache idiom; such code warms up behind a deeper
+  // threshold floor instead of the full risk deferral.
+  bool is_eafp_benign{false};
   uint8_t risk_reason{kRiskNone};
   uint8_t code_size_bucket{0};
   uint8_t active_dim_mask{0};
@@ -134,5 +137,11 @@ ThresholdDecision computeThresholdForCode(
     const StructureKey& key,
     const GateContext& context,
     uint32_t global);
+
+// Clears the process-wide held-call budget that gates the steady-state
+// LowRoi release. Runs in the child side of every fork (the budget's
+// evidence is per-process execution, and a fresh child has not executed
+// anything), and in tests that need to start from an unwarmed process.
+void resetLowRoiReleaseState();
 
 } // namespace jit

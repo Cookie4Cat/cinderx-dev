@@ -9,13 +9,16 @@
 #include "cinderx/Common/code.h"
 #include "cinderx/Common/code_extra.h"
 #include "cinderx/Common/dict.h"
+#include "cinderx/Common/extra-py-flags.h"
 #include "cinderx/Common/log.h"
 #include "cinderx/Common/py-portability.h"
+#include "cinderx/Jit/bytecode.h"
 #include "cinderx/Jit/config.h"
 #include "cinderx/Jit/elf/reader.h"
 #include "cinderx/StaticPython/classloader.h"
 #include "cinderx/module_state.h"
 #include "cinderx/python_runtime.h"
+
 
 #ifndef WIN32
 #include <dlfcn.h>
@@ -474,6 +477,233 @@ bool Context::finalizeFunc(
   return associateFunctionWithCompiled(func, compiled, false /* is_nested */);
 }
 
+namespace {
+
+constexpr size_t kCodeDedupMaxEntries = 2048;
+
+// A code object is eligible for content-keyed compile reuse when it is
+// provably namespace-free: its bytecode never reads or writes globals,
+// builtins or module-level names, so the compiled artifact cannot reference
+// any globals-coupled cache and is valid under any (globals, builtins) pair.
+// Suspendable and Static Python code is excluded to keep per-code runtime
+// structures out of scope. These are semantic properties of the bytecode;
+// which code objects actually recur is decided by behavioral evidence (see
+// noteCompiledFuncDestroyed), not by name or origin heuristics.
+bool isDedupEligibleCode(BorrowedRef<PyCodeObject> code) {
+  if (code->co_flags &
+      (CO_GENERATOR | CO_COROUTINE | CO_ASYNC_GENERATOR |
+       CI_CO_STATICALLY_COMPILED)) {
+    return false;
+  }
+  BytecodeInstructionBlock block{code};
+  for (auto it = block.begin(); it != block.end(); ++it) {
+    switch ((*it).opcode()) {
+      case LOAD_GLOBAL:
+      case STORE_GLOBAL:
+      case DELETE_GLOBAL:
+      case LOAD_NAME:
+      case STORE_NAME:
+      case DELETE_NAME:
+      case LOAD_FROM_DICT_OR_GLOBALS:
+      case LOAD_BUILD_CLASS:
+      case IMPORT_NAME:
+      case IMPORT_FROM:
+        return false;
+      default:
+        break;
+    }
+  }
+  // Exclude code that creates nested functions: co_consts code objects would
+  // be shared through the canonical identity, and nested-function creation
+  // semantics under adopted identities are not worth reasoning about for
+  // this cohort (the exec-generated helpers this targets have flat bodies).
+  BorrowedRef<> consts{code->co_consts};
+  for (Py_ssize_t i = 0; i < PyTuple_GET_SIZE(consts.get()); ++i) {
+    if (PyCode_Check(PyTuple_GET_ITEM(consts.get(), i))) {
+      return false;
+    }
+  }
+  return true;
+}
+
+// Cheap structural fingerprint over immutable code-object fields, used to
+// prefilter registry probes so the common case (no registered donor with a
+// matching shape) costs a hash lookup instead of a marshal. Deliberately
+// excludes the bytecode buffer, which is mutated in place by the adaptive
+// interpreter. Collisions are resolved by full marshal comparison.
+uint64_t codeFingerprint(BorrowedRef<PyCodeObject> code) {
+  return combineHash(
+      static_cast<size_t>(Py_SIZE(code.get())),
+      static_cast<size_t>(code->co_argcount),
+      static_cast<size_t>(code->co_nlocalsplus),
+      static_cast<size_t>(code->co_stacksize),
+      static_cast<size_t>(code->co_flags),
+      static_cast<size_t>(PyTuple_GET_SIZE(code->co_consts)),
+      static_cast<size_t>(PyTuple_GET_SIZE(code->co_names)));
+}
+
+} // namespace
+
+namespace {
+
+// Same-origin gate for content reuse: CPython's code equality deliberately
+// ignores filename and line numbers, but sharing artifacts across source
+// locations would make tracebacks point at a different origin. Require the
+// same origin so a donor is only ever the same logical function.
+bool sameCodeOrigin(
+    BorrowedRef<PyCodeObject> a,
+    BorrowedRef<PyCodeObject> b) {
+  if (a->co_firstlineno != b->co_firstlineno) {
+    return false;
+  }
+  int eq = PyObject_RichCompareBool(a->co_filename, b->co_filename, Py_EQ);
+  if (eq < 0) {
+    PyErr_Clear();
+    return false;
+  }
+  return eq == 1;
+}
+
+// Value equality of code objects, as maintained by CPython itself: compares
+// bytecode (de-instrumented), constants, names and arities by value, and is
+// insensitive to string interning state, which makes it stable across
+// generations of recreated code (marshal output is not).
+bool sameCodeContent(
+    BorrowedRef<PyCodeObject> a,
+    BorrowedRef<PyCodeObject> b) {
+  int eq = PyObject_RichCompareBool(a.getObj(), b.getObj(), Py_EQ);
+  if (eq < 0) {
+    PyErr_Clear();
+    return false;
+  }
+  return eq == 1;
+}
+
+} // namespace
+
+bool Context::reuseDedupedCompiled(BorrowedRef<PyFunctionObject> func) {
+  BorrowedRef<PyCodeObject> code{func->func_code};
+  // Fingerprint prefilter: only code whose structural shape matches a
+  // recorded entry pays the eligibility scan and value comparison.
+  auto bucket_it = code_dedup_cache_.find(codeFingerprint(code));
+  if (bucket_it == code_dedup_cache_.end()) {
+    return false;
+  }
+  if (!isDedupEligibleCode(code)) {
+    return false;
+  }
+  for (CodeDedupEntry& entry : bucket_it->second) {
+    if (entry.compiled != nullptr && entry.compiled->runtime() == nullptr) {
+      // Defense in depth: the artifact was gutted by clear() without going
+      // through dropDedupArtifact(). Demote instead of re-installing a dead
+      // entrypoint; recompilation can re-promote the entry.
+      entry.compiled.reset();
+    }
+    if (entry.compiled == nullptr || entry.code.get() == code.get() ||
+        !sameCodeOrigin(code, entry.code) ||
+        !sameCodeContent(code, entry.code)) {
+      continue;
+    }
+    // Canonicalize onto the donor code object so all per-code machinery
+    // (compiled_codes_, the CodeExtra fast-attach, call counters) converges
+    // on a single identity. Assigning through the attribute keeps
+    // function-version and watcher bookkeeping correct.
+    if (PyObject_SetAttrString(func, "__code__", entry.code.getObj()) < 0) {
+      PyErr_Clear();
+      return false;
+    }
+    JIT_DLOG("dedup: attaching twin {}", funcFullname(func));
+    return finalizeFunc(func, entry.compiled);
+  }
+  return false;
+}
+
+void Context::noteCodeCompiled(
+    const CompilationKey& key,
+    BorrowedRef<CompiledFunction> compiled) {
+  if (!getConfig().auto_code_twin_dedup) {
+    return;
+  }
+  BorrowedRef<PyCodeObject> code{key.code};
+  if (!isDedupEligibleCode(code)) {
+    return;
+  }
+  uint64_t fingerprint = codeFingerprint(code);
+  auto bucket_it = code_dedup_cache_.find(fingerprint);
+  if (bucket_it != code_dedup_cache_.end()) {
+    for (CodeDedupEntry& entry : bucket_it->second) {
+      if (entry.code.get() == code.get()) {
+        return;
+      }
+      if (!sameCodeOrigin(code, entry.code) ||
+          !sameCodeContent(code, entry.code)) {
+        continue;
+      }
+      // Second compilation of identical content: that is the recurrence
+      // evidence this machinery exists for. This compilation becomes the
+      // canonical donor; content-identical code compiled later attaches to
+      // its pinned artifact instead of recompiling. Namespace-free code has
+      // no globals-coupled caches, so the artifact is valid under any
+      // (globals, builtins) pair.
+      if (entry.compiled == nullptr) {
+        JIT_DLOG("dedup: donor promoted for {}", codeQualname(code));
+        entry.code = Ref<PyCodeObject>::create(code);
+        entry.compiled = Ref<CompiledFunction>::create(compiled);
+      }
+      return;
+    }
+  }
+  // First sighting: record the code object so a later compilation of
+  // identical content can prove recurrence.
+  if (code_dedup_size_ < kCodeDedupMaxEntries) {
+    code_dedup_cache_[fingerprint].push_back(
+        CodeDedupEntry{Ref<PyCodeObject>::create(code), nullptr});
+    code_dedup_size_++;
+  }
+}
+
+void Context::dropDedupArtifact(
+    BorrowedRef<PyCodeObject> code,
+    BorrowedRef<CompiledFunction> compiled) {
+  if (code_dedup_cache_.empty()) {
+    return;
+  }
+  auto bucket_it = code_dedup_cache_.find(codeFingerprint(code));
+  if (bucket_it == code_dedup_cache_.end()) {
+    return;
+  }
+  for (CodeDedupEntry& entry : bucket_it->second) {
+    if (entry.compiled.get() == compiled.get()) {
+      JIT_DLOG("dedup: donor demoted for {}", codeQualname(entry.code));
+      entry.compiled.reset();
+    }
+  }
+}
+
+void Context::noteCompiledFuncDestroyed(
+    BorrowedRef<PyFunctionObject> func,
+    BorrowedRef<CompiledFunction> compiled) {
+  if (!getConfig().auto_code_twin_dedup || Py_IsFinalizing()) {
+    return;
+  }
+  BorrowedRef<PyCodeObject> code{func->func_code};
+  auto bucket_it = code_dedup_cache_.find(codeFingerprint(code));
+  if (bucket_it == code_dedup_cache_.end()) {
+    return;
+  }
+  for (CodeDedupEntry& entry : bucket_it->second) {
+    if (entry.code.get() == code.get()) {
+      // The dying function's code is itself the recorded entry; pin its
+      // artifact so a later recurrence can attach instead of recompiling.
+      if (entry.compiled == nullptr && isDedupEligibleCode(code)) {
+        JIT_DLOG("dedup: donor rescued from dying {}", funcFullname(func));
+        entry.compiled = Ref<CompiledFunction>::create(compiled);
+      }
+      return;
+    }
+  }
+}
+
 void Context::codeCompiled(
     BorrowedRef<PyFunctionObject> func,
     CompilationKey& key,
@@ -569,6 +799,7 @@ void Context::forgetCode(BorrowedRef<PyFunctionObject> func) {
   }
 
   clearCachedCompiledIfMatches(code, cf.get());
+  dropDedupArtifact(code, cf);
   it->second->clear();
   compiled_codes_.erase(CompilationKey{func});
 }
@@ -675,6 +906,7 @@ void Context::clearForMultithreadedCompileTest() {
 void Context::funcDestroyed(BorrowedRef<PyFunctionObject> func) {
   auto it = compiled_funcs_.find(func);
   if (it != compiled_funcs_.end()) {
+    noteCompiledFuncDestroyed(func, it->second);
     it->second->removeFunction(func);
     compiled_funcs_.erase(func);
   }
@@ -763,6 +995,7 @@ Ref<CompiledFunction> Context::makeCompiledFunction(
       "CompilationKey already present {}",
       PyUnicode_AsUTF8(reinterpret_cast<PyCodeObject*>(key.code)->co_qualname));
   cacheCompiledOnCode(key, compiled);
+  noteCodeCompiled(key, compiled);
   return compiled;
 }
 
