@@ -2,6 +2,9 @@
 
 #include <gtest/gtest.h>
 
+#include "cinderx/python.h"
+#include "internal/pycore_long.h"
+
 #include "cinderx/Jit/code_allocator.h"
 #include "cinderx/Jit/codegen/arch.h"
 #include "cinderx/Jit/codegen/autogen.h"
@@ -213,6 +216,77 @@ TEST_F(LIRABITest, TestkCall_Imm) {
 TEST_F(LIRABITest, TestkCall_PhyReg) {
   translateInstr(Instruction::kCall, makePhyReg());
 }
+
+#if defined(CINDER_AARCH64) && PY_VERSION_HEX >= 0x030E0000 && \
+    PY_VERSION_HEX < 0x030F0000 && \
+    !defined(Py_GIL_DISABLED) && !defined(Py_REF_DEBUG) && \
+    !defined(Py_STATS)
+TEST_F(
+    LIRABITest,
+    BinaryOpExactLongAddSubMapsHelpersAndRecordsCallsites) {
+  hir::Function hir_function;
+
+  Environ environ;
+  environ.ctx = getContext();
+  environ.code_rt = environ.ctx->allocateCodeRuntime(
+      hir_function.code.get(),
+      hir_function.builtins.get(),
+      hir_function.globals.get());
+
+  auto code_allocator =
+      std::unique_ptr<ICodeAllocator>(CodeAllocator::make());
+  CodeHolder code;
+  code.init(code_allocator->asmJitEnvironment());
+  arch::Builder as(&code);
+  environ.as = &as;
+
+  Function function;
+  BasicBlock bb(&function);
+  PyCodeObject code_obj;
+  hir::FrameState frame_state(
+      BorrowedRef<PyCodeObject>(&code_obj), nullptr, nullptr, nullptr);
+  hir::Register out(0);
+  auto origin = std::unique_ptr<hir::InitialYield>(
+      hir::InitialYield::create(&out, frame_state));
+
+  struct Mapping {
+    binaryfunc generic;
+    uint64_t exact;
+  };
+  const Mapping mappings[] = {
+      {PyNumber_Add, reinterpret_cast<uint64_t>(_PyLong_Add)},
+      {PyNumber_Subtract, reinterpret_cast<uint64_t>(_PyLong_Subtract)},
+  };
+  constexpr size_t kNumMappings = sizeof(mappings) / sizeof(mappings[0]);
+
+  auto translate_mapping = [&](const Mapping& mapping) {
+    auto* instr = bb.allocateInstr(
+        Instruction::kBinaryOpExactLongAddSubFastPath,
+        origin.get(),
+        makeOutPhyReg(2, DataType::kObject),
+        Imm{reinterpret_cast<uint64_t>(mapping.generic)});
+    autogen::AutoTranslator::getInstance().translateInstr(&environ, instr);
+  };
+  for (const auto& mapping : mappings) {
+    translate_mapping(mapping);
+  }
+  // Reusing Add should produce a second callsite but not a duplicate stub.
+  translate_mapping(mappings[0]);
+
+  ASSERT_EQ(environ.exact_long_add_sub_stubs.size(), kNumMappings);
+  for (size_t i = 0; i < kNumMappings; ++i) {
+    const auto& stub = environ.exact_long_add_sub_stubs[i];
+    EXPECT_TRUE(stub.entry.isValid());
+    EXPECT_EQ(
+        stub.generic_target,
+        reinterpret_cast<uint64_t>(mappings[i].generic));
+    EXPECT_EQ(
+        stub.exact_target,
+        mappings[i].exact);
+  }
+  EXPECT_EQ(environ.pending_debug_locs.size(), 3);
+}
+#endif
 
 // kCall m
 #if !defined(CINDER_AARCH64)

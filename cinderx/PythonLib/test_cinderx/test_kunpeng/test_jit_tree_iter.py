@@ -320,6 +320,20 @@ class TreeIterStateMachineTest(unittest.TestCase):
         # skip non-None falsy children instead of treating them as tree nodes.
         self.assertEqual(list(Node(2, 0, [])), [2])
 
+        class FalsyChild:
+            checks = 0
+
+            def __bool__(self):
+                type(self).checks += 1
+                return False
+
+            def __iter__(self):
+                raise AssertionError("falsy child must not be iterated")
+
+        child = FalsyChild()
+        self.assertEqual(list(Node(2, child, child)), [2])
+        self.assertEqual(FalsyChild.checks, 2)
+
     @cinder_support.skip_unless_jit("Requires CinderX JIT")
     def test_tree_iter_split_dict_truthiness_guard(self):
         """Pyperformance's ``generators`` Tree shape uses split-dict fields."""
@@ -387,6 +401,54 @@ class TreeIterStateMachineTest(unittest.TestCase):
 
         root = BoolNode(2, BoolNode(1), BoolNode(3))
         self.assertEqual(list(root), [1, 2, 3])
+
+    @cinder_support.skip_unless_jit("Requires CinderX JIT")
+    def test_tree_iter_mapping_length_not_optimized(self):
+        """A mapping-only length slot must keep the original truthiness guard."""
+
+        class MappingNode(dict):
+            def __init__(self, value, left=None, right=None):
+                super().__init__()
+                self.value = value
+                self.left = left
+                self.right = right
+
+            def __iter__(self):
+                if self.left:
+                    yield from self.left
+                yield self.value
+                if self.right:
+                    yield from self.right
+
+        self.assertTrue(cinderx.jit.force_compile(MappingNode.__iter__))
+        ops = cinderx.jit.get_function_hir_opcode_counts(MappingNode.__iter__)
+        self.assertEqual(
+            ops.get("EnsureTreeIterState", 0),
+            0,
+            "mapping mp_length must prevent the default-truthiness rewrite",
+        )
+
+        # The empty mapping child is falsy and must be skipped.
+        root = MappingNode(2, left=MappingNode(1))
+        self.assertEqual(list(root), [2])
+
+    @cinder_support.skip_unless_jit("Requires CinderX JIT")
+    def test_tree_iter_heap_type_truthiness_mutation(self):
+        """A suspended generator must observe heap-type truthiness changes."""
+
+        Node = _make_node_class_with_truthiness_guard()
+        self.assertTrue(cinderx.jit.force_compile(Node.__iter__))
+        if _tree_iter_state_machine_expected():
+            ops = cinderx.jit.get_function_hir_opcode_counts(Node.__iter__)
+            self.assertGreater(ops.get("EnsureTreeIterState", 0), 0)
+
+        root = Node(2, Node(1), Node(3))
+        gen = iter(root)
+        first = next(gen)
+        self.assertEqual(first, 1)
+
+        Node.__bool__ = lambda self: False
+        self.assertEqual([first, *gen], [1, 2])
 
     def test_tree_iter_state_machine_not_triggered_for_non_tree(self):
         """Plain generators without the left/right/value pattern are unaffected."""

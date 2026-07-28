@@ -84,6 +84,18 @@ uint64_t stackNullBits() {
   return bits;
 }
 
+bool useAarch64ExactLongAddSubFastPath(BinaryOpKind op) {
+#if defined(CINDER_AARCH64) && PY_VERSION_HEX >= 0x030E0000 && \
+    PY_VERSION_HEX < 0x030F0000 && \
+    !defined(Py_GIL_DISABLED) && !defined(Py_REF_DEBUG) && \
+    !defined(Py_STATS)
+  return op == BinaryOpKind::kAdd || op == BinaryOpKind::kSubtract;
+#else
+  (void)op;
+  return false;
+#endif
+}
+
 // These functions call their counterparts and convert its output from int (32
 // bits) to uint64_t (64 bits). This is solely because the code generator cannot
 // support an operand size other than 64 bits at this moment. A future diff will
@@ -2944,11 +2956,14 @@ LIRGenerator::TranslatedBlock LIRGenerator::TranslateOneBasicBlock(
         auto op_kind = static_cast<int>(bin_op->op());
 
         if (bin_op->op() != BinaryOpKind::kPower) {
-          bbb.appendCallInstruction(
+          auto* call = bbb.appendCallInstruction(
               bin_op->output(),
               helpers[op_kind],
               bin_op->left(),
               bin_op->right());
+          if (useAarch64ExactLongAddSubFastPath(bin_op->op())) {
+            call->setOpcode(Instruction::kBinaryOpExactLongAddSubFastPath);
+          }
         } else {
           bbb.appendCallInstruction(
               bin_op->output(),

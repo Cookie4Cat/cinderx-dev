@@ -2227,11 +2227,29 @@ class CondBranchBase : public Instr {
 };
 
 // Transfer control to `true_bb` if `reg` is nonzero, otherwise `false_bb`.
-DEFINE_SIMPLE_INSTR(
+class INSTR_CLASS(
     CondBranch,
     (Constraint::kOptObjectOrCIntOrCBool),
     Operands<1>,
-    CondBranchBase);
+    CondBranchBase) {
+ public:
+  CondBranch(
+      Register* condition,
+      BasicBlock* true_bb,
+      BasicBlock* false_bb)
+      : InstrT(condition, true_bb, false_bb) {}
+
+  void setFalseBranchPatcher(JumpPatcher* patcher) {
+    false_branch_patcher_ = patcher;
+  }
+
+  JumpPatcher* falseBranchPatcher() const {
+    return false_branch_patcher_;
+  }
+
+ private:
+  JumpPatcher* false_branch_patcher_{nullptr};
+};
 
 // Branch to `true_bb` if the operand is not the sentinel value that indicates
 // an iterator is exhausted, or `false_bb` otherwise.

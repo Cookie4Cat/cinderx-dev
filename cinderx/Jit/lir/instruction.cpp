@@ -310,6 +310,7 @@ bool Instruction::isCallLike() const {
   switch (opcode_) {
     case kCall:
     case kLoadAttrCachedFastPath:
+    case kBinaryOpExactLongAddSubFastPath:
     case kVarArgCall:
     case kVectorCallTstate:
       return true;

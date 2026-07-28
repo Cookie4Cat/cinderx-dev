@@ -94,7 +94,21 @@ for i in range(50):
     setattr(split_root, f"extra_{i}", i)
 assert list(split_root) == [1]
 assert list(SplitNode(0, 1, [])) == [1]
-del gen, root, split_root, Node, SplitNode, Other
+
+class FalsyChild:
+    checks = 0
+
+    def __bool__(self):
+        type(self).checks += 1
+        return False
+
+    def __iter__(self):
+        raise AssertionError("falsy child must not be iterated")
+
+child = FalsyChild()
+assert list(SplitNode(child, 1, child)) == [1]
+assert FalsyChild.checks == 2
+del gen, root, split_root, child, Node, SplitNode, Other, FalsyChild
 )");
 }
 

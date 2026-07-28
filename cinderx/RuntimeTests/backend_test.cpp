@@ -213,6 +213,60 @@ class BackendTest : public RuntimeTest {
   }
 
 #if defined(CINDER_AARCH64)
+  std::string DisassembleLIRFunction(Function* lir_func) {
+    Environ environ;
+    InitEnviron(environ);
+
+    PostGenerationRewrite post_gen(lir_func, &environ);
+    post_gen.run();
+
+    LinearScanAllocator lsalloc(lir_func);
+    lsalloc.run();
+
+    environ.shadow_frames_and_spill_size = lsalloc.getFrameSize();
+    environ.changed_regs = lsalloc.getChangedRegs();
+
+    PostRegAllocRewrite post_rewrite(lir_func, &environ);
+    post_rewrite.run();
+
+    auto code_allocator = std::unique_ptr<ICodeAllocator>(CodeAllocator::make());
+    asmjit::CodeHolder code;
+    code.init(code_allocator->asmJitEnvironment());
+
+    asmjit::a64::Builder as(&code);
+    environ.as = &as;
+
+    as.stp(arch::fp, arch::lr, asmjit::a64::ptr_pre(asmjit::a64::sp, -16));
+    as.mov(arch::fp, asmjit::a64::sp);
+
+    NativeGeneratorFactory factory;
+    auto gen = factory(nullptr);
+    gen->env_ = std::move(environ);
+    gen->lir_func_.reset(lir_func);
+    gen->generateAssemblyBody(code);
+    Function* caller_owned_lir_func = gen->lir_func_.release();
+    EXPECT_EQ(caller_owned_lir_func, lir_func);
+
+    as.mov(asmjit::a64::sp, arch::fp);
+    as.ldp(arch::fp, arch::lr, asmjit::a64::ptr_post(asmjit::a64::sp, 16));
+    as.ret(arch::lr);
+    as.finalize();
+
+    JIT_CHECK(code.flatten() == asmjit::kErrorOk, "failed to flatten code");
+    JIT_CHECK(
+        code.resolveUnresolvedLinks() == asmjit::kErrorOk,
+        "failed to resolve code links");
+
+    std::ostringstream out;
+    auto section = code.sectionById(0);
+    Disassembler dis{
+        reinterpret_cast<const char*>(section->data()), section->bufferSize()};
+    dis.setPrintAddr(false);
+    dis.setPrintInstBytes(false);
+    dis.disassembleAll(out);
+    return out.str();
+  }
+
   // Compile pre-allocated LIR (physical registers + stack slots) directly to
   // machine code, bypassing register allocation.  Used for tests that need
   // precise control over which registers and stack slots are used.
@@ -769,6 +823,26 @@ TEST_F(BackendTest, CmpImmediateAvoidsClobberingScratchInput) {
   EXPECT_NE(disasm.find("x14"), std::string::npos) << disasm;
   EXPECT_EQ(disasm.find("mov x13"), std::string::npos) << disasm;
   EXPECT_TRUE(std::regex_search(disasm, std::regex{"cmp\\s+x13, x14"}))
+      << disasm;
+}
+
+TEST_F(BackendTest, TreeIterTwoInputImmediateLoadsArgDirectly) {
+  Parser parser;
+  auto lirfunc = parser.parse(R"(Function:
+BB %0
+       %1:Object = Move 4096(0x1000):Object
+       %2:64bit = StateStackPush %1:Object, 1(0x1):32bit
+       %3:64bit = Move 0(0x0):64bit
+                   Return %3:64bit
+)");
+  auto epilogue = lirfunc->allocateBasicBlock();
+  lirfunc->basicblocks()[0]->addSuccessor(epilogue);
+
+  auto disasm = DisassembleLIRFunction(lirfunc.get());
+  EXPECT_TRUE(std::regex_search(disasm, std::regex{"mov\\s+x2, #1"}))
+      << disasm;
+  EXPECT_EQ(disasm.find("mov x14, #1"), std::string::npos) << disasm;
+  EXPECT_TRUE(std::regex_search(disasm, std::regex{"mov\\s+x0, x29"}))
       << disasm;
 }
 

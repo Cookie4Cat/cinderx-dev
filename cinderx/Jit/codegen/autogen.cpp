@@ -2,6 +2,7 @@
 
 #include "cinderx/Jit/codegen/autogen.h"
 
+#include "internal/pycore_long.h"
 #include "internal/pycore_pystate.h"
 
 #include "cinderx/Common/util.h"
@@ -46,6 +47,24 @@ void checkMoveRelaxedOperandShape(const Instruction* instr) {
       output->type(),
       input->type());
 }
+
+#if defined(CINDER_AARCH64) && PY_VERSION_HEX >= 0x030E0000 && \
+    PY_VERSION_HEX < 0x030F0000 && \
+    !defined(Py_GIL_DISABLED) && !defined(Py_REF_DEBUG) && \
+    !defined(Py_STATS)
+uint64_t exactLongAddSubTarget(uint64_t generic_target) {
+  auto matches = [generic_target](binaryfunc helper) {
+    return generic_target == reinterpret_cast<uint64_t>(helper);
+  };
+  if (matches(PyNumber_Add)) {
+    return reinterpret_cast<uint64_t>(_PyLong_Add);
+  }
+  if (matches(PyNumber_Subtract)) {
+    return reinterpret_cast<uint64_t>(_PyLong_Subtract);
+  }
+  return 0;
+}
+#endif
 
 } // namespace
 
@@ -1646,22 +1665,35 @@ static void emitTreeIterCallTwoInputs(
         arch::ptr_resolve(
             as, arch::fp, in0->getStackSlot().loc, arch::reg_scratch_1));
   }
-  a64::Gp src1;
-  if (in1->isReg()) {
-    // int32 phase: use 64-bit reg; the helper accepts int32_t through x reg.
-    src1 = a64::x(in1->getPhyRegister().loc);
-  } else if (in1->isImm()) {
-    src1 = arch::reg_scratch_1;
-    as->mov(src1, in1->getConstant());
-  } else {
-    JIT_CHECK(
-        in1->isStack(), "Unsupported TreeIter helper input: {}", in1->type());
-    src1 = arch::reg_scratch_1;
-    as->ldr(
-        src1,
-        arch::ptr_resolve(
-            as, arch::fp, in1->getStackSlot().loc, arch::reg_scratch_0));
+
+  if (in1->isImm() || in1->isStack()) {
+    // Set up the phase argument directly in x2.  Loading it through a scratch
+    // register adds a move to every TreeIter state-stack push.
+    if (src0.id() == a64::x0.id()) {
+      as->mov(arch::reg_scratch_0, src0);
+      src0 = arch::reg_scratch_0;
+    }
+
+    as->mov(a64::x0, arch::fp);
+    if (src0.id() != a64::x1.id()) {
+      as->mov(a64::x1, src0);
+    }
+    if (in1->isImm()) {
+      as->mov(a64::x2, in1->getConstant());
+    } else {
+      as->ldr(
+          a64::x2,
+          arch::ptr_resolve(
+              as, arch::fp, in1->getStackSlot().loc, arch::reg_scratch_0));
+    }
+    as->bl(reinterpret_cast<uint64_t>(helper));
+    return;
   }
+
+  JIT_CHECK(
+      in1->isReg(), "Unsupported TreeIter helper input: {}", in1->type());
+  // int32 phase: use 64-bit reg; the helper accepts int32_t through x reg.
+  a64::Gp src1 = a64::x(in1->getPhyRegister().loc);
   // Avoid clobber: if src0 or src1 collide with x0/x1/x2 (arg regs), save
   // them to scratch regs.
   if (src0.id() == a64::x0.id() || src0.id() == a64::x1.id()) {
@@ -2212,6 +2244,59 @@ void translateLoadAttrCachedFastPath(Environ* env, const Instruction* instr) {
       } else {
         as->mov(out_reg, a64::x0);
       }
+    }
+  }
+#else
+  translateCall(env, instr);
+#endif
+}
+
+void translateBinaryOpExactLongAddSubFastPath(
+    Environ* env,
+    const Instruction* instr) {
+#if defined(CINDER_AARCH64) && PY_VERSION_HEX >= 0x030E0000 && \
+    PY_VERSION_HEX < 0x030F0000 && \
+    !defined(Py_GIL_DISABLED) && !defined(Py_REF_DEBUG) && \
+    !defined(Py_STATS)
+  JIT_CHECK(
+      instr->getNumInputs() == 1 && instr->getInput(0)->isImm(),
+      "BinaryOpExactLongAddSubFastPath expects one immediate helper target");
+
+  auto output = instr->output();
+  auto as = env->as;
+  uint64_t generic_target = instr->getInput(0)->getConstant();
+  uint64_t exact_target = exactLongAddSubTarget(generic_target);
+  JIT_CHECK(
+      exact_target != 0,
+      "unsupported exact-long add/sub helper target {:#x}",
+      generic_target);
+
+  Label entry;
+  for (const auto& stub : env->exact_long_add_sub_stubs) {
+    if (stub.generic_target == generic_target) {
+      JIT_DCHECK(
+          stub.exact_target == exact_target,
+          "exact-long add/sub target changed for helper");
+      entry = stub.entry;
+      break;
+    }
+  }
+  if (!entry.isValid()) {
+    entry = as->newLabel();
+    env->exact_long_add_sub_stubs.push_back(
+        {entry, generic_target, exact_target});
+  }
+
+  // The local stub tail-branches to either target so the helper returns to the
+  // address recorded here, preserving normal callsite/deopt bookkeeping.
+  emitCall(*env, entry, instr);
+
+  if (output->type() != OperandBase::kNone) {
+    auto out_reg = AT::getGpOutput(output);
+    if (out_reg.isGpW()) {
+      as->mov(out_reg, a64::w0);
+    } else {
+      as->mov(out_reg, a64::x0);
     }
   }
 #else
@@ -2977,6 +3062,24 @@ void translateSelect(Environ* env, const Instruction* instr) {
 void AutoTranslator::translateInstr(Environ* env, const Instruction* instr)
     const {
   auto opcode = instr->opcode();
+#if defined(CINDER_AARCH64)
+  const hir::Instr* origin = instr->origin();
+  if (origin != nullptr && origin->IsCondBranch()) {
+    const auto& branch = static_cast<const hir::CondBranch&>(*origin);
+    if (JumpPatcher* patcher = branch.falseBranchPatcher()) {
+      JIT_CHECK(
+          instr->isBranchCC() || instr->isCmpBranch(),
+          "patchable CondBranch lowered to unexpected opcode {}",
+          instr->opname());
+      auto patchpoint_label = env->as->newLabel();
+      env->as->bind(patchpoint_label);
+      auto fallback_label = map_get(
+          env->block_label_map, instr->basicblock()->getFalseSuccessor());
+      env->pending_deopt_patchers.emplace_back(
+          patcher, patchpoint_label, fallback_label);
+    }
+  }
+#endif
   switch (opcode) {
     case Instruction::kBind:
       return;
@@ -3850,6 +3953,9 @@ void AutoTranslator::translateInstr(Environ* env, const Instruction* instr)
       return;
     case Instruction::kLoadAttrCachedFastPath:
       translateLoadAttrCachedFastPath(env, instr);
+      return;
+    case Instruction::kBinaryOpExactLongAddSubFastPath:
+      translateBinaryOpExactLongAddSubFastPath(env, instr);
       return;
     case Instruction::kMove:
       translateMove(env, instr);

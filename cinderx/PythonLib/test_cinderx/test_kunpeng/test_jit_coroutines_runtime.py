@@ -85,6 +85,23 @@ class JitCoroutineRuntimeTests(unittest.TestCase):
         self.assertIsNone(coro.cr_await)
 
     @cinder_support.skip_unless_jit("Requires CinderX JIT")
+    def test_coroutine_sends_value_to_non_jit_awaitable(self):
+        class PauseOnce:
+            def __await__(self):
+                received = yield "pause"
+                return received
+
+        async def coro():
+            return await PauseOnce()
+
+        self.assertTrue(cinderx.jit.force_compile(coro))
+        suspended = coro()
+        self.assertEqual(suspended.send(None), "pause")
+        with self.assertRaises(StopIteration) as caught:
+            suspended.send("resumed")
+        self.assertEqual(caught.exception.value, "resumed")
+
+    @cinder_support.skip_unless_jit("Requires CinderX JIT")
     def test_completed_coroutine_weakref_uses_generic_dealloc(self):
         events = []
 

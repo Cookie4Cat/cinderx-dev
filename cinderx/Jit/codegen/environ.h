@@ -106,6 +106,13 @@ struct Environ {
 
   asmjit::Label load_attr_invoke_stub;
 
+  struct Aarch64ExactLongAddSubStub {
+    asmjit::Label entry;
+    uint64_t generic_target;
+    uint64_t exact_target;
+  };
+  std::vector<Aarch64ExactLongAddSubStub> exact_long_add_sub_stubs;
+
   struct IndirectInfo {
     explicit IndirectInfo(void** indirect_ptr) : indirect(indirect_ptr) {}
 

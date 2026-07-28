@@ -2428,6 +2428,80 @@ Register* simplifyVectorCallStatic(Env& env, const VectorCall* instr) {
   return trySpecializeCCall(env, instr);
 }
 
+Register* simplifyBoundListInsert(Env& env, const VectorCall* instr) {
+#ifdef Py_GIL_DISABLED
+  return nullptr;
+#else
+  if ((instr->flags() & CallFlags::KwArgs) || instr->numArgs() != 2) {
+    return nullptr;
+  }
+
+  Instr* callee_def = instr->func()->instr();
+  if (callee_def == nullptr || !callee_def->IsLoadAttrCached()) {
+    return nullptr;
+  }
+
+  auto* load_attr = static_cast<const LoadAttrCached*>(callee_def);
+  if (PyUnicode_CompareWithASCIIString(load_attr->name(), "insert") != 0) {
+    return nullptr;
+  }
+
+  Register* receiver = load_attr->GetOperand(0);
+  Register* index = instr->arg(0);
+  Register* value = instr->arg(1);
+  if (!receiver->isA(TListExact) || !index->isA(TLongExact)) {
+    return nullptr;
+  }
+
+  env.emit<UseType>(receiver, TListExact);
+  Register* unboxed_index = nullptr;
+  Type index_type = index->type();
+  // Worker threads used by precompile_all() do not have a current Python
+  // thread state, so they must not call APIs that read or write PyErr.
+  if (index_type.hasObjectSpec() &&
+      !getThreadedCompileContext().compileRunning()) {
+    Py_ssize_t constant_index = PyLong_AsSsize_t(index_type.objectSpec());
+    if (constant_index == -1 && PyErr_Occurred()) {
+      // Keep overflowing constants on the runtime conversion path.  That path
+      // deopts and lets list.insert's normal slice-index conversion preserve
+      // its clipping semantics.
+      PyErr_Clear();
+    } else {
+      // The full specialized type is required here: using only TLongExact
+      // would lose the value dependency and make this constant invalid for a
+      // different exact int.
+      env.emit<UseType>(index, index_type);
+      unboxed_index =
+          env.emit<LoadConst>(Type::fromCInt(constant_index, TCInt64));
+    }
+  }
+
+  if (unboxed_index == nullptr) {
+    env.emit<UseType>(index, TLongExact);
+    unboxed_index = env.func.env.AllocateRegister();
+    env.emitRawInstr<CallStatic>(
+        1,
+        unboxed_index,
+        reinterpret_cast<void*>(PyLong_AsSsize_t),
+        TCInt64,
+        index);
+    env.emit<IsNegativeAndErrOccurred>(unboxed_index, *instr->frameState());
+  }
+
+  auto output = env.func.env.AllocateRegister();
+  env.emitRawInstr<CallStatic>(
+      3,
+      output,
+      reinterpret_cast<void*>(PyList_Insert),
+      TCInt32,
+      receiver,
+      unboxed_index,
+      value);
+  env.emit<CheckNeg>(output, *instr->frameState());
+  return env.emit<LoadConst>(TNoneType);
+#endif
+}
+
 // Special case here where we are testing `if isinstance`. In that case we do
 // not want to go through the boxing and then unboxing that we are about to do.
 // Instead, we want to directly provide the result of the unboxed comparison.
@@ -2520,6 +2594,9 @@ std::optional<std::pair<Instr*, std::vector<Instr*>>> isVectorCallIfIsInstance(
 
 Register* simplifyVectorCall(Env& env, const VectorCall* instr) {
   if (Register* result = simplifyVectorCallStatic(env, instr)) {
+    return result;
+  }
+  if (Register* result = simplifyBoundListInsert(env, instr)) {
     return result;
   }
   if (instr->flags() & CallFlags::KwArgs) {
