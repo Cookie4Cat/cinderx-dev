@@ -252,7 +252,7 @@ class ScopedModuleDeletionCallback {
 class ScopedPreloadTestCleanup {
  public:
   ~ScopedPreloadTestCleanup() {
-    hir::preloaderManager().clear();
+    jit::hir::preloaderManager().clear();
     cinderx::getModuleState()->registered_compilation_units.clear();
     PyErr_Clear();
   }
@@ -389,7 +389,7 @@ def test(value: int) -> int:
   // previously retained a stack-capturing lambda.
   int calls_before_destroy = deletion_calls;
   callback.ensureReplacementInstalled();
-  hir::preloaderManager().clear();
+  jit::hir::preloaderManager().clear();
   runStockCode("del test");
   func.reset();
   EXPECT_GT(deletion_calls, calls_before_destroy);
@@ -432,7 +432,7 @@ def test(value: int) -> int:
   }
 
   callback.ensureReplacementInstalled();
-  hir::preloaderManager().clear();
+  jit::hir::preloaderManager().clear();
   runStockCode("del test");
   func.reset();
   EXPECT_GT(deletion_calls, 0);
@@ -463,7 +463,8 @@ def test(value: int) -> int:
     ScopedStaticArgChecksReplacement replacement{
         func->func_code, bad_local};
     try {
-      result = callJitOneArg(jit_module, "force_compile", func);
+      result =
+          callJitOneArg(jit_module, "force_compile", func.getObj());
     } catch (const std::exception& exn) {
       cpp_exception_escaped = true;
       cpp_exception_message = exn.what();
@@ -498,7 +499,8 @@ def test(value: int) -> int:
   int deletion_calls = 0;
   ScopedModuleDeletionCallback callback{&deletion_calls};
 
-  Ref<> lazy_result = callJitOneArg(jit_module, "lazy_compile", func);
+  Ref<> lazy_result =
+      callJitOneArg(jit_module, "lazy_compile", func.getObj());
   ASSERT_NE(lazy_result, nullptr);
   ASSERT_EQ(lazy_result.get(), Py_True);
 
@@ -522,7 +524,7 @@ def test(value: int) -> int:
     ASSERT_NE(result, nullptr);
     EXPECT_EQ(PyLong_AsLong(result), 42);
     EXPECT_EQ(PyErr_Occurred(), nullptr);
-    EXPECT_FALSE(jit::isJitCompiled(func));
+    EXPECT_FALSE(isJitCompiled(func.get()));
     EXPECT_TRUE(callback.isReplacementInstalled());
   }
   callback.ensureReplacementInstalled();
@@ -546,7 +548,8 @@ def test(value: int) -> int:
   int deletion_calls = 0;
   ScopedModuleDeletionCallback callback{&deletion_calls};
 
-  Ref<> lazy_result = callJitOneArg(jit_module, "lazy_compile", func);
+  Ref<> lazy_result =
+      callJitOneArg(jit_module, "lazy_compile", func.getObj());
   ASSERT_NE(lazy_result, nullptr);
   ASSERT_EQ(lazy_result.get(), Py_True);
 
@@ -570,8 +573,8 @@ def test(value: int) -> int:
   EXPECT_EQ(PyErr_Occurred(), nullptr);
   EXPECT_GT(deletion_calls, 0);
   EXPECT_TRUE(callback.isReplacementInstalled());
-  EXPECT_TRUE(hir::preloaderManager().empty());
-  EXPECT_TRUE(jit::isJitCompiled(func));
+  EXPECT_TRUE(jit::hir::preloaderManager().empty());
+  EXPECT_TRUE(isJitCompiled(func.get()));
   callback.ensureReplacementInstalled();
 }
 
@@ -593,7 +596,8 @@ def test(value: int) -> int:
   int deletion_calls = 0;
   ScopedModuleDeletionCallback callback{&deletion_calls};
 
-  Ref<> lazy_result = callJitOneArg(jit_module, "lazy_compile", func);
+  Ref<> lazy_result =
+      callJitOneArg(jit_module, "lazy_compile", func.getObj());
   ASSERT_NE(lazy_result, nullptr);
   ASSERT_EQ(lazy_result.get(), Py_True);
 
@@ -616,9 +620,9 @@ def test(value: int) -> int:
     std::string python_message = takeRaisedExceptionMessage();
     EXPECT_NE(python_message.find("hit bad local"), std::string::npos)
         << python_message;
-    EXPECT_TRUE(hir::preloaderManager().empty());
+    EXPECT_TRUE(jit::hir::preloaderManager().empty());
     EXPECT_TRUE(callback.isReplacementInstalled());
-    EXPECT_FALSE(jit::isJitCompiled(func));
+    EXPECT_FALSE(isJitCompiled(func.get()));
   }
   callback.ensureReplacementInstalled();
 }
@@ -658,7 +662,7 @@ def test(value: int) -> int:
   EXPECT_FALSE(cpp_exception_escaped) << cpp_exception_message;
   EXPECT_EQ(result, jit::Result::UNKNOWN_ERROR);
   EXPECT_EQ(PyErr_Occurred(), nullptr);
-  EXPECT_TRUE(hir::preloaderManager().empty());
+  EXPECT_TRUE(jit::hir::preloaderManager().empty());
   Ref<> index_calls =
       Ref<>::steal(PyObject_GetAttrString(bad_local, "calls"));
   ASSERT_NE(index_calls, nullptr);
