@@ -2715,7 +2715,8 @@ PyObject* JITRT_CallWithKeywordArgsSimple(
   // stack allocate
   auto arg_space = (PyObject**)alloca(total_args * sizeof(PyObject*));
 
-  if (JITRT_BindKeywordArgsSimple(func, args, nargsf, kwnames, arg_space, total_args)) {
+  if (JITRT_BindKeywordArgsSimple(
+          func, args, nargsf, kwnames, arg_space, total_args)) {
     size_t new_nargsf = total_args;
     return JITRT_GET_REENTRY(func->vectorcall)(
         (PyObject*)func, arg_space, new_nargsf, nullptr);

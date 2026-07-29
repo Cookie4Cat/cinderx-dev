@@ -778,10 +778,9 @@ TEST_F(LIRPostAllocRewriteTest, LoadAttrCachedFastPathKeepsOpcode) {
 TEST_F(
     LIRPostAllocRewriteTest,
     BinaryOpExactLongAddSubFastPathKeepsOpcodeAndABI) {
-#if defined(CINDER_AARCH64) && PY_VERSION_HEX >= 0x030E0000 && \
-    PY_VERSION_HEX < 0x030F0000 && \
-    !defined(Py_GIL_DISABLED) && !defined(Py_REF_DEBUG) && \
-    !defined(Py_STATS)
+#if defined(CINDER_AARCH64) && PY_VERSION_HEX >= 0x030E0000 &&  \
+    PY_VERSION_HEX < 0x030F0000 && !defined(Py_GIL_DISABLED) && \
+    !defined(Py_REF_DEBUG) && !defined(Py_STATS)
   Function func;
   auto* bb = func.allocateBasicBlock();
   constexpr uint64_t kGenericHelper = 0x12345678;

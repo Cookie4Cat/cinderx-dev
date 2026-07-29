@@ -850,8 +850,7 @@ Register* unboxAndCheckListOrTupleIndex(
         env.emit<CondBranch>(is_negative, true_bb, false_bb);
       },
       [&] {
-        return env.emit<IntBinaryOp>(
-            BinaryOpKind::kAdd, unboxed_index, length);
+        return env.emit<IntBinaryOp>(BinaryOpKind::kAdd, unboxed_index, length);
       },
       [&] { return unboxed_index; });
 
@@ -1046,8 +1045,7 @@ Register* simplifySubscript(
 
       ThreadedCompileSerialize guard;
       Py_UCS4 c = PyUnicode_ReadChar(lhs_type.objectSpec(), idx);
-      PyObject* substr =
-          PyUnicode_FromKindAndData(PyUnicode_4BYTE_KIND, &c, 1);
+      PyObject* substr = PyUnicode_FromKindAndData(PyUnicode_4BYTE_KIND, &c, 1);
       if (substr == nullptr) {
         return nullptr;
       }
@@ -1064,8 +1062,8 @@ Register* simplifySubscript(
       env.emit<UseType>(rhs, TLongExact);
       Register* unboxed_idx = env.emit<IndexUnbox>(rhs);
       env.emit<IsNegativeAndErrOccurred>(unboxed_idx, *frame_state);
-      Register* adjusted_idx = env.emit<CheckSequenceBounds>(
-          lhs, unboxed_idx, *frame_state);
+      Register* adjusted_idx =
+          env.emit<CheckSequenceBounds>(lhs, unboxed_idx, *frame_state);
       return env.emit<UnicodeSubscr>(lhs, adjusted_idx, *frame_state);
     }
   }
@@ -1403,8 +1401,8 @@ Register* simplifyFloatBinaryOp(Env& env, const FloatBinaryOp* instr) {
     // constant: the constant-folding path at the end of this function will
     // evaluate `c1 ** c2` to a single LoadConst.
     Type left_type_for_pow = instr->left()->type();
-    if (!left_type_for_pow.hasObjectSpec() &&
-        right_type.hasObjectSpec() && PyFloat_Check(right_type.objectSpec())) {
+    if (!left_type_for_pow.hasObjectSpec() && right_type.hasObjectSpec() &&
+        PyFloat_Check(right_type.objectSpec())) {
       double val = PyFloat_AS_DOUBLE(right_type.objectSpec());
 
       auto unbox_x = [&]() {
@@ -1421,7 +1419,8 @@ Register* simplifyFloatBinaryOp(Env& env, const FloatBinaryOp* instr) {
         return env.emit<DoubleBinaryOp>(BinaryOpKind::kMultiply, a, b);
       };
       auto rdiv1 = [&](Register* r) {
-        return env.emit<DoubleBinaryOp>(BinaryOpKind::kTrueDivide, load(1.0), r);
+        return env.emit<DoubleBinaryOp>(
+            BinaryOpKind::kTrueDivide, load(1.0), r);
       };
       auto guard_cmp = [&](PrimitiveCompareOp cmp_op, Register* r, double d) {
         Register* ok = env.emit<PrimitiveCompare>(cmp_op, r, load(d));
@@ -2723,8 +2722,7 @@ Register* simplifyStoreSubscr(Env& env, const StoreSubscr* instr) {
 
   // C3/C4/C5: direct list[int] store with compact-index unboxing and inlined
   // negative-index normalization/bounds checking.
-  if (!kFreeThreadedBuild &&
-      instr->GetOperand(0)->isA(TListExact) &&
+  if (!kFreeThreadedBuild && instr->GetOperand(0)->isA(TListExact) &&
       instr->GetOperand(1)->isA(TLongExact)) {
     Register* container = instr->GetOperand(0);
     Register* index = instr->GetOperand(1);
@@ -2736,10 +2734,7 @@ Register* simplifyStoreSubscr(Env& env, const StoreSubscr* instr) {
     }
 
     Register* ob_item = env.emit<LoadField>(
-        container,
-        "ob_item",
-        offsetof(PyListObject, ob_item),
-        TCPtr);
+        container, "ob_item", offsetof(PyListObject, ob_item), TCPtr);
     // Transfer the slot's old owned reference into HIR, overwrite the slot,
     // then keep the old object alive until the write is complete. Refcount
     // insertion will place the old-value decref after UseObj.

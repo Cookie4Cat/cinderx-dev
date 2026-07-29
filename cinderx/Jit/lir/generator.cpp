@@ -85,10 +85,9 @@ uint64_t stackNullBits() {
 }
 
 bool useAarch64ExactLongAddSubFastPath(BinaryOpKind op) {
-#if defined(CINDER_AARCH64) && PY_VERSION_HEX >= 0x030E0000 && \
-    PY_VERSION_HEX < 0x030F0000 && \
-    !defined(Py_GIL_DISABLED) && !defined(Py_REF_DEBUG) && \
-    !defined(Py_STATS)
+#if defined(CINDER_AARCH64) && PY_VERSION_HEX >= 0x030E0000 &&  \
+    PY_VERSION_HEX < 0x030F0000 && !defined(Py_GIL_DISABLED) && \
+    !defined(Py_REF_DEBUG) && !defined(Py_STATS)
   return op == BinaryOpKind::kAdd || op == BinaryOpKind::kSubtract;
 #else
   (void)op;
@@ -1785,8 +1784,7 @@ void LIRGenerator::makeDecrefFreeThreaded(
 
   // Check immortal via sign bit. Normal refcounts are well below 2^31,
   // so a set sign bit indicates an immortal sentinel.
-  bbb.appendBranch(
-      Instruction::kBranchBitSet, end_decref, ref_local, Imm{31});
+  bbb.appendBranch(Instruction::kBranchBitSet, end_decref, ref_local, Imm{31});
 
   // Check thread ownership: ob_tid vs tstate->thread_id.
   BasicBlock* check_owner = bbb.allocateBlock();
@@ -4314,9 +4312,8 @@ LIRGenerator::TranslatedBlock LIRGenerator::TranslateOneBasicBlock(
         Instruction* caller_frame = bbb.appendInstr(
             OutVReg{DataType::k64bit},
             Instruction::kLea,
-            Stk{PhyLocation(
-                static_cast<int32_t>(
-                    frameOffsetBefore(instr) + kFrameHeaderOverhead))});
+            Stk{PhyLocation(static_cast<int32_t>(
+                frameOffsetBefore(instr) + kFrameHeaderOverhead))});
 
         // There is already an interpreter frame for the caller function.
         Instruction* callee_frame = getInlinedFrame(bbb, instr);
@@ -4404,11 +4401,10 @@ LIRGenerator::TranslatedBlock LIRGenerator::TranslateOneBasicBlock(
                   return bbb.appendInstr(
                       OutVReg{},
                       Instruction::kLea,
-                      Stk{PhyLocation(
-                          static_cast<int32_t>(
-                              frameOffsetOf(instr) +
-                              offsetof(_PyInterpreterFrame, localsplus) +
-                              code->co_nlocalsplus * sizeof(Ci_STACK_TYPE)))});
+                      Stk{PhyLocation(static_cast<int32_t>(
+                          frameOffsetOf(instr) +
+                          offsetof(_PyInterpreterFrame, localsplus) +
+                          code->co_nlocalsplus * sizeof(Ci_STACK_TYPE)))});
 #else
                   return bbb.appendInstr(
                       OutVReg{dt},
@@ -5387,12 +5383,10 @@ void LIRGenerator::emitLoadFrame(BasicBlockBuilder& bbb) {
               return bbb.appendInstr(
                   OutVReg{},
                   Instruction::kLea,
-                  Stk{PhyLocation(
-                      static_cast<int32_t>(
-                           -fh_size + jit::kFrameHeaderOverhead +
-                           offsetof(_PyInterpreterFrame, localsplus) +
-                           func_->code->co_nlocalsplus *
-                               sizeof(Ci_STACK_TYPE)))});
+                  Stk{PhyLocation(static_cast<int32_t>(
+                      -fh_size + jit::kFrameHeaderOverhead +
+                      offsetof(_PyInterpreterFrame, localsplus) +
+                      func_->code->co_nlocalsplus * sizeof(Ci_STACK_TYPE)))});
 #else
               return bbb.appendInstr(
                   OutVReg{dt},

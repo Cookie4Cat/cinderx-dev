@@ -167,9 +167,8 @@ DeoptResult prepareForDeopt(
       for (size_t i = 0; i < deopt_meta.inline_depth(); i++) {
         outer = outer->previous;
       }
-      is_instrumentation_deopt =
-          (jitFrameGetHeader(outer)->frame_status & JIT_FRAME_DEOPT_PATCHED) !=
-          0;
+      is_instrumentation_deopt = (jitFrameGetHeader(outer)->frame_status &
+                                  JIT_FRAME_DEOPT_PATCHED) != 0;
     }
   }
 #endif
@@ -1408,18 +1407,16 @@ void NativeGenerator::emitAarch64LoadAttrInvokeStub(
 
 void NativeGenerator::emitAarch64ExactLongAddSubStubs(
     const asmjit::CodeHolder& code) {
-#if defined(CINDER_AARCH64) && PY_VERSION_HEX >= 0x030E0000 && \
-    PY_VERSION_HEX < 0x030F0000 && \
-    !defined(Py_GIL_DISABLED) && !defined(Py_REF_DEBUG) && \
-    !defined(Py_STATS)
+#if defined(CINDER_AARCH64) && PY_VERSION_HEX >= 0x030E0000 &&  \
+    PY_VERSION_HEX < 0x030F0000 && !defined(Py_GIL_DISABLED) && \
+    !defined(Py_REF_DEBUG) && !defined(Py_STATS)
   if (env_.exact_long_add_sub_stubs.empty()) {
     return;
   }
 
   CodeSectionOverride hot_override{as_, &code, &metadata_, CodeSection::kHot};
   constexpr int kObTypeOffset = offsetof(PyObject, ob_type);
-  const uint64_t exact_long_type =
-      reinterpret_cast<uint64_t>(&PyLong_Type);
+  const uint64_t exact_long_type = reinterpret_cast<uint64_t>(&PyLong_Type);
 
   for (const auto& stub : env_.exact_long_add_sub_stubs) {
     Label generic_path = as_->newLabel();
@@ -1623,8 +1620,6 @@ void NativeGenerator::generatePrologueBlocks(lir::BasicBlock* frameSetupBlock) {
   std::rotate(blocks.begin(), blocks.begin() + body_end, blocks.end());
 }
 
-
-
 void NativeGenerator::generateCode(
     CodeHolder& codeholder,
     lir::BasicBlock* frameSetupBlock) {
@@ -1715,7 +1710,6 @@ void NativeGenerator::generateCode(
     env_.block_label_map[bb] = env_.gen_resume_entry_label;
     lir_func_->basicblocks().push_back(bb);
   }
-
 
   generateAssemblyBody(codeholder);
 

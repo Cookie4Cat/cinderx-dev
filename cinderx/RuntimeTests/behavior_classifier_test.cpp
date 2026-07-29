@@ -85,10 +85,9 @@ class LowRoiReleasedFixture : public Base {
 
 } // namespace
 
-class BehaviorClassifierTest : public LowRoiReleasedFixture<::testing::Test> {
-};
-class BehaviorClassifierRuntimeTest : public LowRoiReleasedFixture<RuntimeTest> {
-};
+class BehaviorClassifierTest : public LowRoiReleasedFixture<::testing::Test> {};
+class BehaviorClassifierRuntimeTest
+    : public LowRoiReleasedFixture<RuntimeTest> {};
 
 TEST_F(BehaviorClassifierTest, LowRoiReleaseWaitsForHeldCallBudget) {
   ScopedAutoJitConfig config_guard;
@@ -113,7 +112,6 @@ TEST_F(BehaviorClassifierTest, LowRoiReleaseWaitsForHeldCallBudget) {
   for (int i = 0; i < 4; ++i) {
     EXPECT_EQ(computeThreshold(trivial, steady_state, 2).limit, 2);
   }
-
 }
 
 TEST_F(BehaviorClassifierTest, LowRoiHeldCallsOnlyCountReleasedShapes) {
@@ -142,7 +140,6 @@ TEST_F(BehaviorClassifierTest, LowRoiHeldCallsOnlyCountReleasedShapes) {
 
   StructureKey trivial{Family::Trivial};
   EXPECT_EQ(computeThreshold(trivial, steady_state, 2).limit, 65535);
-
 }
 
 TEST_F(BehaviorClassifierTest, StructureKeyPackRoundTripsAllFields) {
@@ -370,8 +367,7 @@ TEST_F(BehaviorClassifierTest, ImportWindowDefersHighCostNonnumericWork) {
   auto post_import_low_cost_dispatcher =
       computeThreshold(low_cost_dispatcher, steady_state, 2);
   EXPECT_EQ(post_import_low_cost_dispatcher.limit, 2);
-  EXPECT_EQ(
-      post_import_low_cost_dispatcher.branch_reason, BranchReason::None);
+  EXPECT_EQ(post_import_low_cost_dispatcher.branch_reason, BranchReason::None);
 
   StructureKey numeric_loop{Family::NumericLoop};
   numeric_loop.loop_score = 2;
@@ -557,7 +553,9 @@ TEST_F(
   EXPECT_EQ(numeric_decision.branch_reason, BranchReason::None);
 }
 
-TEST_F(BehaviorClassifierTest, SteadyStateRiskDefersExpectedExceptionLoopShape) {
+TEST_F(
+    BehaviorClassifierTest,
+    SteadyStateRiskDefersExpectedExceptionLoopShape) {
   GateContext steady_state{false};
 
   StructureKey tuple_memo_miss{Family::BranchFSM};
@@ -583,7 +581,9 @@ TEST_F(BehaviorClassifierTest, SteadyStateRiskDefersExpectedExceptionLoopShape) 
       dispatching_exception_loop_decision.branch_reason, BranchReason::LowRoi);
 }
 
-TEST_F(BehaviorClassifierTest, SteadyStateCompilesMultidimNonnumericObjectGraphs) {
+TEST_F(
+    BehaviorClassifierTest,
+    SteadyStateCompilesMultidimNonnumericObjectGraphs) {
   GateContext steady_state{false};
 
   StructureKey reflection_object_graph{Family::ReflectionMeta};
@@ -657,7 +657,6 @@ TEST_F(BehaviorClassifierTest, SteadyStateCompilesTinyStartupLikeWork) {
   EXPECT_EQ(tiny_numeric_decision.limit, 2);
   EXPECT_EQ(tiny_numeric_decision.branch_reason, BranchReason::None);
 }
-
 
 TEST_F(
     BehaviorClassifierRuntimeTest,
@@ -1389,8 +1388,7 @@ TEST_F(
 
   StructureKey benign_predicate = risky_predicate;
   benign_predicate.is_eafp_benign = true;
-  EXPECT_EQ(
-      StructureKey::unpack(benign_predicate.pack()).is_eafp_benign, true);
+  EXPECT_EQ(StructureKey::unpack(benign_predicate.pack()).is_eafp_benign, true);
 
   Ref<> func = compileStockAndGet(
       R"(
@@ -1582,7 +1580,6 @@ assert jit.count_interpreted_calls(helper2) >= 5
 stats = cinderjit._autojit_gate_stats()
 assert stats["forced_compile"] == 0, stats
 )");
-
 }
 
 TEST_F(BehaviorClassifierRuntimeTest, AutoClassifyCompilesTrivialWorkAtBase) {

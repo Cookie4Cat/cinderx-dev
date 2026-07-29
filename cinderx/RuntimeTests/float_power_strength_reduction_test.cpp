@@ -74,11 +74,9 @@ ActualShape collectShape(const Function& func) {
       if (instr.IsPrimitiveUnbox()) {
         shape.unboxes.push_back(static_cast<const PrimitiveUnbox*>(&instr));
       } else if (instr.IsDoubleBinaryOp()) {
-        shape.binary_ops.push_back(
-            static_cast<const DoubleBinaryOp*>(&instr));
+        shape.binary_ops.push_back(static_cast<const DoubleBinaryOp*>(&instr));
       } else if (instr.IsPrimitiveCompare()) {
-        shape.compares.push_back(
-            static_cast<const PrimitiveCompare*>(&instr));
+        shape.compares.push_back(static_cast<const PrimitiveCompare*>(&instr));
       } else if (instr.IsGuard()) {
         shape.guards.push_back(static_cast<const Guard*>(&instr));
       } else if (instr.IsPrimitiveBox()) {

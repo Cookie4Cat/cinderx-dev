@@ -26,9 +26,7 @@ size_t countHIRCallsTo(const jit::hir::Function& func, void* target) {
   return count;
 }
 
-size_t countHIROpcode(
-    const jit::hir::Function& func,
-    jit::hir::Opcode opcode) {
+size_t countHIROpcode(const jit::hir::Function& func, jit::hir::Opcode opcode) {
   size_t count = 0;
   for (const auto& block : func.cfg.blocks) {
     for (const auto& instr : block) {
@@ -38,8 +36,9 @@ size_t countHIROpcode(
   return count;
 }
 
-const jit::hir::CallStatic*
-findHIRCallTo(const jit::hir::Function& func, void* target) {
+const jit::hir::CallStatic* findHIRCallTo(
+    const jit::hir::Function& func,
+    void* target) {
   for (const auto& block : func.cfg.blocks) {
     for (const auto& instr : block) {
       if (instr.IsCallStatic()) {
@@ -75,14 +74,11 @@ class ListInsertMethodTest : public RuntimeTest {
   std::unique_ptr<jit::hir::Function> optimizedHIR(
       BorrowedRef<PyFunctionObject> func) {
     auto irfunc = buildHIR(func);
-    jit::Compiler::runPasses(
-        *irfunc, jit::PassConfig::kAllExceptInliner);
+    jit::Compiler::runPasses(*irfunc, jit::PassConfig::kAllExceptInliner);
     return irfunc;
   }
 
-  size_t countLoweredCallsTo(
-      BorrowedRef<PyFunctionObject> func,
-      void* target) {
+  size_t countLoweredCallsTo(BorrowedRef<PyFunctionObject> func, void* target) {
     auto irfunc = optimizedHIR(func);
 
     jit::codegen::Environ env;
@@ -157,8 +153,7 @@ finally:
   auto constant_hir = optimizedHIR(constant_func);
   ASSERT_NE(constant_hir, nullptr);
   EXPECT_EQ(
-      countHIRCallsTo(
-          *constant_hir, reinterpret_cast<void*>(PyLong_AsSsize_t)),
+      countHIRCallsTo(*constant_hir, reinterpret_cast<void*>(PyLong_AsSsize_t)),
       0);
   EXPECT_EQ(
       countHIRCallsTo(*constant_hir, reinterpret_cast<void*>(PyList_Insert)),
@@ -179,22 +174,20 @@ finally:
 
   auto dynamic_hir = optimizedHIR(dynamic_func);
   ASSERT_NE(dynamic_hir, nullptr);
-  size_t dynamic_hir_conversion = countHIRCallsTo(
-      *dynamic_hir, reinterpret_cast<void*>(PyLong_AsSsize_t));
+  size_t dynamic_hir_conversion =
+      countHIRCallsTo(*dynamic_hir, reinterpret_cast<void*>(PyLong_AsSsize_t));
   size_t dynamic_hir_insert =
       countHIRCallsTo(*dynamic_hir, reinterpret_cast<void*>(PyList_Insert));
   EXPECT_EQ(dynamic_hir_conversion, dynamic_hir_insert);
   EXPECT_LE(dynamic_hir_insert, 1);
   if (dynamic_hir_insert == 0) {
-    EXPECT_GE(
-        countHIROpcode(*dynamic_hir, jit::hir::Opcode::kVectorCall), 1);
+    EXPECT_GE(countHIROpcode(*dynamic_hir, jit::hir::Opcode::kVectorCall), 1);
   }
 
   auto overflow_hir = optimizedHIR(overflow_func);
   ASSERT_NE(overflow_hir, nullptr);
   EXPECT_EQ(
-      countHIRCallsTo(
-          *overflow_hir, reinterpret_cast<void*>(PyLong_AsSsize_t)),
+      countHIRCallsTo(*overflow_hir, reinterpret_cast<void*>(PyLong_AsSsize_t)),
       1);
   EXPECT_EQ(
       countHIRCallsTo(*overflow_hir, reinterpret_cast<void*>(PyList_Insert)),

@@ -242,12 +242,10 @@ for _ in range(20000):
   EXPECT_EQ(PyFloat_AsDouble(float_result), 9.0);
   EXPECT_EQ(deopts, 0);
 
-  auto infinity = Ref<>::steal(
-      PyFloat_FromDouble(std::numeric_limits<double>::infinity()));
+  auto infinity =
+      Ref<>::steal(PyFloat_FromDouble(std::numeric_limits<double>::infinity()));
   auto overflow_result = Ref<>::steal(PyObject_CallFunctionObjArgs(
-      reinterpret_cast<PyObject*>(pyfunc.get()),
-      infinity.get(),
-      nullptr));
+      reinterpret_cast<PyObject*>(pyfunc.get()), infinity.get(), nullptr));
   ctx->clearGuardFailureCallback();
 
   ASSERT_NE(overflow_result, nullptr);

@@ -1326,7 +1326,8 @@ FlagProcessor initFlagProcessor() {
   //
   // This will reduce the chance that Static Python functions can natively call
   // each other though.
-  if (!force_disable_inliner_for_normal_frame && !getConfig().hir_opts.inliner &&
+  if (!force_disable_inliner_for_normal_frame &&
+      !getConfig().hir_opts.inliner &&
       !flag_processor.hasHandled("jit-preload-dependent-limit")) {
     getMutableConfig().preload_dependent_limit = 0;
   }

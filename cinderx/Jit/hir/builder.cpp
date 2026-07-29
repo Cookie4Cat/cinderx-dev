@@ -2351,9 +2351,8 @@ void HIRBuilder::emitBinaryOp(
   // that actually contain a backedge, or simple numeric leaf helpers that are
   // likely to be inlined into such loops. Preserve float exact guards so
   // float-only leaf helpers can still lower to the existing unboxed fast paths.
-  bool specialize_int_guards =
-      !getConfig().backedge_gated_int_guards || code_has_backedge_ ||
-      code_is_simple_numeric_leaf_;
+  bool specialize_int_guards = !getConfig().backedge_gated_int_guards ||
+      code_has_backedge_ || code_is_simple_numeric_leaf_;
   if (getConfig().specialized_opcodes) {
     switch (bc_instr.specializedOpcode()) {
       case BINARY_OP_ADD_INT:
@@ -2945,9 +2944,8 @@ void HIRBuilder::emitCompareOp(
   Register* left = stack.pop();
   Register* result = temps_.AllocateStack();
   CompareOp op = static_cast<CompareOp>(compare_op);
-  bool specialize_int_guards =
-      !getConfig().backedge_gated_int_guards || code_has_backedge_ ||
-      code_is_simple_numeric_leaf_;
+  bool specialize_int_guards = !getConfig().backedge_gated_int_guards ||
+      code_has_backedge_ || code_is_simple_numeric_leaf_;
   if (getConfig().specialized_opcodes) {
     switch (bc_instr.specializedOpcode()) {
       case COMPARE_OP_FLOAT:
@@ -4897,9 +4895,8 @@ void HIRBuilder::emitUnpackSequence(
   bool needs_slow_path =
       preferred != PreferredSequenceType::kTuple && !seq->isA(TTupleExact);
   if constexpr (!kFreeThreadedBuild) {
-    needs_slow_path =
-        needs_slow_path && preferred != PreferredSequenceType::kList &&
-        !seq->isA(TListExact);
+    needs_slow_path = needs_slow_path &&
+        preferred != PreferredSequenceType::kList && !seq->isA(TListExact);
   }
 
   TranslationContext deopt_path{cfg.AllocateBlock(), tc.frame};

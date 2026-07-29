@@ -19,7 +19,6 @@
 #include "cinderx/module_state.h"
 #include "cinderx/python_runtime.h"
 
-
 #ifndef WIN32
 #include <dlfcn.h>
 #include <sys/mman.h>
@@ -556,9 +555,7 @@ namespace {
 // ignores filename and line numbers, but sharing artifacts across source
 // locations would make tracebacks point at a different origin. Require the
 // same origin so a donor is only ever the same logical function.
-bool sameCodeOrigin(
-    BorrowedRef<PyCodeObject> a,
-    BorrowedRef<PyCodeObject> b) {
+bool sameCodeOrigin(BorrowedRef<PyCodeObject> a, BorrowedRef<PyCodeObject> b) {
   if (a->co_firstlineno != b->co_firstlineno) {
     return false;
   }
@@ -574,9 +571,7 @@ bool sameCodeOrigin(
 // bytecode (de-instrumented), constants, names and arities by value, and is
 // insensitive to string interning state, which makes it stable across
 // generations of recreated code (marshal output is not).
-bool sameCodeContent(
-    BorrowedRef<PyCodeObject> a,
-    BorrowedRef<PyCodeObject> b) {
+bool sameCodeContent(BorrowedRef<PyCodeObject> a, BorrowedRef<PyCodeObject> b) {
   int eq = PyObject_RichCompareBool(a.getObj(), b.getObj(), Py_EQ);
   if (eq < 0) {
     PyErr_Clear();

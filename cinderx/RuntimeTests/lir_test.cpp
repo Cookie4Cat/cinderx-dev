@@ -174,10 +174,9 @@ def f(obj):
 }
 
 TEST_F(LIRGeneratorTest, Aarch64ExactLongAddSubFastPathSelection) {
-#if defined(CINDER_AARCH64) && PY_VERSION_HEX >= 0x030E0000 && \
-    PY_VERSION_HEX < 0x030F0000 && \
-    !defined(Py_GIL_DISABLED) && !defined(Py_REF_DEBUG) && \
-    !defined(Py_STATS)
+#if defined(CINDER_AARCH64) && PY_VERSION_HEX >= 0x030E0000 &&  \
+    PY_VERSION_HEX < 0x030F0000 && !defined(Py_GIL_DISABLED) && \
+    !defined(Py_REF_DEBUG) && !defined(Py_STATS)
   auto count_opcode = [](const std::string& lir, std::string_view opcode) {
     size_t count = 0;
     size_t pos = 0;
@@ -196,10 +195,7 @@ def binary_func(a, b):
       "binary_func"));
   ASSERT_NE(binary_func.get(), nullptr);
   auto binary_lir = getLIRString(binary_func.get());
-  EXPECT_EQ(
-      count_opcode(
-          binary_lir, "BinaryOpExactLongAddSubFastPath"),
-      2)
+  EXPECT_EQ(count_opcode(binary_lir, "BinaryOpExactLongAddSubFastPath"), 2)
       << binary_lir;
 
   Ref<PyObject> other_binary_func(compileAndGet(
@@ -224,9 +220,7 @@ def other_binary_func(a, b):
   ASSERT_NE(other_binary_func.get(), nullptr);
   auto other_binary_lir = getLIRString(other_binary_func.get());
   EXPECT_EQ(
-      count_opcode(
-          other_binary_lir, "BinaryOpExactLongAddSubFastPath"),
-      0)
+      count_opcode(other_binary_lir, "BinaryOpExactLongAddSubFastPath"), 0)
       << other_binary_lir;
   EXPECT_NE(other_binary_lir.find(":Object = Call"), std::string::npos)
       << other_binary_lir;
@@ -241,10 +235,7 @@ def inplace_func(a, b):
       "inplace_func"));
   ASSERT_NE(inplace_func.get(), nullptr);
   auto inplace_lir = getLIRString(inplace_func.get());
-  EXPECT_EQ(
-      count_opcode(
-          inplace_lir, "BinaryOpExactLongAddSubFastPath"),
-      0)
+  EXPECT_EQ(count_opcode(inplace_lir, "BinaryOpExactLongAddSubFastPath"), 0)
       << inplace_lir;
   EXPECT_NE(inplace_lir.find(":Object = Call"), std::string::npos)
       << inplace_lir;
@@ -267,8 +258,7 @@ fun known_exact {
   Compiler::runPasses(
       *irfunc,
       static_cast<PassConfig>(
-          PassConfig::kAllExceptInliner &
-          ~PassConfig::kInsertUpdatePrevInstr));
+          PassConfig::kAllExceptInliner & ~PassConfig::kInsertUpdatePrevInstr));
   jit::codegen::Environ env;
   jit::CodeRuntime code_runtime{
       irfunc->code, irfunc->builtins, irfunc->globals};
@@ -284,10 +274,7 @@ fun known_exact {
       << exact_lir;
   EXPECT_NE(exact_lir.find("LongBinaryOp<Subtract>"), std::string::npos)
       << exact_lir;
-  EXPECT_EQ(
-      count_opcode(
-          exact_lir, "BinaryOpExactLongAddSubFastPath"),
-      0)
+  EXPECT_EQ(count_opcode(exact_lir, "BinaryOpExactLongAddSubFastPath"), 0)
       << exact_lir;
 #else
   GTEST_SKIP() << "AArch64 CPython 3.14 GIL-only fast path";
