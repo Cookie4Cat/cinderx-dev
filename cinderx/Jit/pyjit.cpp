@@ -1500,10 +1500,8 @@ hir::Preloader* preloadWithUnitDeletedCallback(
     BorrowedRef<> unit,
     UnitDeletedCallback current) {
   auto* state = cinderx::getModuleState();
-  UnitDeletedCallback previous =
-      std::move(state->unit_deleted_during_preload);
-  SCOPE_EXIT(
-      state->unit_deleted_during_preload = std::move(previous));
+  UnitDeletedCallback previous = std::move(state->unit_deleted_during_preload);
+  SCOPE_EXIT(state->unit_deleted_during_preload = std::move(previous));
 
   state->unit_deleted_during_preload = [&](BorrowedRef<> deleted_unit) {
     current(deleted_unit);
@@ -1669,7 +1667,8 @@ bool compile_all(size_t workers = 0) {
         deleted_units.size());
 
     if (workers > 1) {
-      multithread_compile_units_preloaded(std::move(compilation_units), workers);
+      multithread_compile_units_preloaded(
+          std::move(compilation_units), workers);
     } else {
       compile_units_preloaded(std::move(compilation_units));
     }
@@ -4681,8 +4680,8 @@ std::vector<BorrowedRef<PyFunctionObject>> preloadFuncAndDeps(
     BorrowedRef<PyFunctionObject> f = worklist.front();
     worklist.pop_front();
 
-    hir::Preloader* preloader = preloadWithUnitDeletedCallback(
-        f, [&](BorrowedRef<> deleted_unit) {
+    hir::Preloader* preloader =
+        preloadWithUnitDeletedCallback(f, [&](BorrowedRef<> deleted_unit) {
           deleted_units.emplace(deleted_unit);
         });
 
