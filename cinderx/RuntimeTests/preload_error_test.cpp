@@ -298,7 +298,7 @@ def test(value) -> int:
 
   Ref<PyFunctionObject> func(compileStaticAndGet(source, "test"));
   ASSERT_NE(func, nullptr);
-  auto preloader = jit::hir::Preloader::makePreloader(
+  auto preloader = jit::hir::Preloader::make(
       func, jit::makeFrameReifier(func->func_code));
   ASSERT_NE(preloader, nullptr);
 
@@ -323,7 +323,7 @@ def test(instance: C):
 
   Ref<PyFunctionObject> func(compileStaticAndGet(source, "test"));
   ASSERT_NE(func, nullptr);
-  auto preloader = jit::hir::Preloader::makePreloader(
+  auto preloader = jit::hir::Preloader::make(
       func, jit::makeFrameReifier(func->func_code));
   ASSERT_NE(preloader, nullptr);
 
