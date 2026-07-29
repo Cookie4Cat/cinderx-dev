@@ -1,9 +1,10 @@
 // Copyright (c) Meta Platforms, Inc. and affiliates.
 
-#include <gtest/gtest.h>
-
 #include "cinderx/python.h"
+
 #include "internal/pycore_long.h"
+
+#include <gtest/gtest.h>
 
 #include "cinderx/Jit/code_allocator.h"
 #include "cinderx/Jit/codegen/arch.h"
@@ -217,13 +218,10 @@ TEST_F(LIRABITest, TestkCall_PhyReg) {
   translateInstr(Instruction::kCall, makePhyReg());
 }
 
-#if defined(CINDER_AARCH64) && PY_VERSION_HEX >= 0x030E0000 && \
-    PY_VERSION_HEX < 0x030F0000 && \
-    !defined(Py_GIL_DISABLED) && !defined(Py_REF_DEBUG) && \
-    !defined(Py_STATS)
-TEST_F(
-    LIRABITest,
-    BinaryOpExactLongAddSubMapsHelpersAndRecordsCallsites) {
+#if defined(CINDER_AARCH64) && PY_VERSION_HEX >= 0x030E0000 &&  \
+    PY_VERSION_HEX < 0x030F0000 && !defined(Py_GIL_DISABLED) && \
+    !defined(Py_REF_DEBUG) && !defined(Py_STATS)
+TEST_F(LIRABITest, BinaryOpExactLongAddSubMapsHelpersAndRecordsCallsites) {
   hir::Function hir_function;
 
   Environ environ;
@@ -233,8 +231,7 @@ TEST_F(
       hir_function.builtins.get(),
       hir_function.globals.get());
 
-  auto code_allocator =
-      std::unique_ptr<ICodeAllocator>(CodeAllocator::make());
+  auto code_allocator = std::unique_ptr<ICodeAllocator>(CodeAllocator::make());
   CodeHolder code;
   code.init(code_allocator->asmJitEnvironment());
   arch::Builder as(&code);
@@ -278,11 +275,8 @@ TEST_F(
     const auto& stub = environ.exact_long_add_sub_stubs[i];
     EXPECT_TRUE(stub.entry.isValid());
     EXPECT_EQ(
-        stub.generic_target,
-        reinterpret_cast<uint64_t>(mappings[i].generic));
-    EXPECT_EQ(
-        stub.exact_target,
-        mappings[i].exact);
+        stub.generic_target, reinterpret_cast<uint64_t>(mappings[i].generic));
+    EXPECT_EQ(stub.exact_target, mappings[i].exact);
   }
   EXPECT_EQ(environ.pending_debug_locs.size(), 3);
 }

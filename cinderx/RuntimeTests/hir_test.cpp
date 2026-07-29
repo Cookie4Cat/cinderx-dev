@@ -3,11 +3,6 @@
 #include "cinderx/python.h"
 
 #include <gtest/gtest.h>
-#include <initializer_list>
-#include <string>
-#include <utility>
-
-#include <vector>
 
 #include "cinderx/Common/code.h"
 #include "cinderx/Common/ref.h"
@@ -27,6 +22,11 @@
 #include "cinderx/Jit/jit_rt.h"
 #include "cinderx/Jit/pyjit.h"
 #include "cinderx/RuntimeTests/fixtures.h"
+
+#include <initializer_list>
+#include <string>
+#include <utility>
+#include <vector>
 
 extern "C" {
 #if PY_VERSION_HEX >= 0x030C0000
@@ -783,8 +783,7 @@ class HIRBuildTest : public RuntimeTest {
       const char* src,
       int specialized_opcode,
       int backedge_opcode = 0) {
-    return build_specialized_source(
-        src, {specialized_opcode}, backedge_opcode);
+    return build_specialized_source(src, {specialized_opcode}, backedge_opcode);
   }
 
  private:
@@ -2422,9 +2421,7 @@ TEST_F(
   std::unique_ptr<Function> irfunc = build_specialized_source(
       "def test(a, b):\n"
       "    return (a + b) * (a - b)\n",
-      {BINARY_OP_ADD_INT,
-       BINARY_OP_MULTIPLY_FLOAT,
-       BINARY_OP_SUBTRACT_FLOAT});
+      {BINARY_OP_ADD_INT, BINARY_OP_MULTIPLY_FLOAT, BINARY_OP_SUBTRACT_FLOAT});
 
   std::string hir = fullPrinter().ToString(*irfunc);
   EXPECT_EQ(countSubstring(hir, "GuardType<LongExact>"), 2);

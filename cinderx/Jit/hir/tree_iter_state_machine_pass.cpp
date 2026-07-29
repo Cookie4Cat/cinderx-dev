@@ -852,8 +852,7 @@ static void emitDefaultTruthinessChildBranch(
 
   Register* is_truthy = env.AllocateRegister();
   fallback_truthiness->append<IsTruthy>(is_truthy, child, frame_state);
-  fallback_truthiness->append<CondBranch>(
-      is_truthy, has_child, no_child);
+  fallback_truthiness->append<CondBranch>(is_truthy, has_child, no_child);
 }
 
 static FrameState remapFrameStateRegister(

@@ -330,9 +330,7 @@ int rewriteVectorCallCommon(
   return rsp_sub;
 }
 
-int rewriteVectorCallTstateFunctions(
-    instr_iter_t instr_iter,
-    int base_offset) {
+int rewriteVectorCallTstateFunctions(instr_iter_t instr_iter, int base_offset) {
   auto instr = instr_iter->get();
 
   // For vector calls with tstate there are 5 fixed arguments:
@@ -345,14 +343,12 @@ int rewriteVectorCallTstateFunctions(
 
   // move tstate to first argument register
   auto block = instr->basicblock();
-  auto move_tstate =
-      block->allocateInstrBefore(instr_iter, Instruction::kMove);
+  auto move_tstate = block->allocateInstrBefore(instr_iter, Instruction::kMove);
   move_tstate->output()->setPhyRegister(ARGUMENT_REGS[0]);
   move_tstate->output()->setDataType(instr->getInput(2)->dataType());
   move_tstate->appendInput(instr->releaseInput(2)); // tstate
 
-  return rewriteVectorCallCommon(
-      instr_iter, base_offset, 1, 3, kFirstArg);
+  return rewriteVectorCallCommon(instr_iter, base_offset, 1, 3, kFirstArg);
 }
 
 int rewriteVarArgCall(instr_iter_t instr_iter, int base_offset) {

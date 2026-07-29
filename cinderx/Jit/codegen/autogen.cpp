@@ -48,10 +48,9 @@ void checkMoveRelaxedOperandShape(const Instruction* instr) {
       input->type());
 }
 
-#if defined(CINDER_AARCH64) && PY_VERSION_HEX >= 0x030E0000 && \
-    PY_VERSION_HEX < 0x030F0000 && \
-    !defined(Py_GIL_DISABLED) && !defined(Py_REF_DEBUG) && \
-    !defined(Py_STATS)
+#if defined(CINDER_AARCH64) && PY_VERSION_HEX >= 0x030E0000 &&  \
+    PY_VERSION_HEX < 0x030F0000 && !defined(Py_GIL_DISABLED) && \
+    !defined(Py_REF_DEBUG) && !defined(Py_STATS)
 uint64_t exactLongAddSubTarget(uint64_t generic_target) {
   auto matches = [generic_target](binaryfunc helper) {
     return generic_target == reinterpret_cast<uint64_t>(helper);
@@ -1690,8 +1689,7 @@ static void emitTreeIterCallTwoInputs(
     return;
   }
 
-  JIT_CHECK(
-      in1->isReg(), "Unsupported TreeIter helper input: {}", in1->type());
+  JIT_CHECK(in1->isReg(), "Unsupported TreeIter helper input: {}", in1->type());
   // int32 phase: use 64-bit reg; the helper accepts int32_t through x reg.
   a64::Gp src1 = a64::x(in1->getPhyRegister().loc);
   // Avoid clobber: if src0 or src1 collide with x0/x1/x2 (arg regs), save
@@ -1774,9 +1772,7 @@ static void emitLoadTreeIterInt32Field(
 #endif
 }
 
-static void emitSaveTreeIterPhase(
-    arch::Builder* as,
-    const Instruction* instr) {
+static void emitSaveTreeIterPhase(arch::Builder* as, const Instruction* instr) {
 #if defined(CINDER_AARCH64)
   const OperandBase* in0 = instr->getInput(0);
   a64::Gp phase;
@@ -1813,9 +1809,7 @@ static void emitSaveTreeIterPhase(
 }
 
 // Move the return value (int/ptr in return register) to the LIR output.
-static void moveReturnToOutput(
-    arch::Builder* as,
-    const Instruction* instr) {
+static void moveReturnToOutput(arch::Builder* as, const Instruction* instr) {
   const OperandBase* out = instr->output();
   if (out == nullptr) {
     return;
@@ -1881,7 +1875,8 @@ void translateTreeIterOp(Environ* env, const Instruction* instr) {
       emitLoadTreeIterInt32Field(
           as, instr, offsetof(TreeIterState, tree_iter_current_phase));
 #else
-      emitTreeIterCallNoInputs(as, reinterpret_cast<const void*>(JITRT_LoadPhase));
+      emitTreeIterCallNoInputs(
+          as, reinterpret_cast<const void*>(JITRT_LoadPhase));
       moveReturnToOutput(as, instr);
 #endif
       break;
@@ -1898,7 +1893,8 @@ void translateTreeIterOp(Environ* env, const Instruction* instr) {
       emitLoadTreeIterInt32Field(
           as, instr, offsetof(TreeIterState, tree_iter_popped_phase));
 #else
-      emitTreeIterCallNoInputs(as, reinterpret_cast<const void*>(JITRT_LoadPoppedPhase));
+      emitTreeIterCallNoInputs(
+          as, reinterpret_cast<const void*>(JITRT_LoadPoppedPhase));
       moveReturnToOutput(as, instr);
 #endif
       break;
@@ -1907,12 +1903,16 @@ void translateTreeIterOp(Environ* env, const Instruction* instr) {
       emitLoadTreeIterInt32Field(
           as, instr, offsetof(TreeIterState, tree_iter_stack_top));
 #else
-      emitTreeIterCallNoInputs(as, reinterpret_cast<const void*>(JITRT_LoadStackTop));
+      emitTreeIterCallNoInputs(
+          as, reinterpret_cast<const void*>(JITRT_LoadStackTop));
       moveReturnToOutput(as, instr);
 #endif
       break;
     case Instruction::kCheckTreeIterChildEntry:
-      emitTreeIterCallOneInput(as, instr, reinterpret_cast<const void*>(JITRT_CheckTreeIterChildEntry));
+      emitTreeIterCallOneInput(
+          as,
+          instr,
+          reinterpret_cast<const void*>(JITRT_CheckTreeIterChildEntry));
       moveReturnToOutput(as, instr);
       break;
     case Instruction::kTreeIterEnterChild:
@@ -2254,10 +2254,9 @@ void translateLoadAttrCachedFastPath(Environ* env, const Instruction* instr) {
 void translateBinaryOpExactLongAddSubFastPath(
     Environ* env,
     const Instruction* instr) {
-#if defined(CINDER_AARCH64) && PY_VERSION_HEX >= 0x030E0000 && \
-    PY_VERSION_HEX < 0x030F0000 && \
-    !defined(Py_GIL_DISABLED) && !defined(Py_REF_DEBUG) && \
-    !defined(Py_STATS)
+#if defined(CINDER_AARCH64) && PY_VERSION_HEX >= 0x030E0000 &&  \
+    PY_VERSION_HEX < 0x030F0000 && !defined(Py_GIL_DISABLED) && \
+    !defined(Py_REF_DEBUG) && !defined(Py_STATS)
   JIT_CHECK(
       instr->getNumInputs() == 1 && instr->getInput(0)->isImm(),
       "BinaryOpExactLongAddSubFastPath expects one immediate helper target");

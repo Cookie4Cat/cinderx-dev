@@ -45,8 +45,7 @@ bool verifyPostRegAllocInvariants(Function* func, std::ostream& err) {
             JIT_DCHECK(false, "Two-input branches are only valid on AArch64.");
 #endif
           } else {
-            JIT_DCHECK(
-                num_inputs == 1, "Branch must have one or two inputs.");
+            JIT_DCHECK(num_inputs == 1, "Branch must have one or two inputs.");
           }
           label_input_idx = num_inputs - 1;
         }

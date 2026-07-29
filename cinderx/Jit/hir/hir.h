@@ -2233,10 +2233,7 @@ class INSTR_CLASS(
     Operands<1>,
     CondBranchBase) {
  public:
-  CondBranch(
-      Register* condition,
-      BasicBlock* true_bb,
-      BasicBlock* false_bb)
+  CondBranch(Register* condition, BasicBlock* true_bb, BasicBlock* false_bb)
       : InstrT(condition, true_bb, false_bb) {}
 
   void setFalseBranchPatcher(JumpPatcher* patcher) {

@@ -229,7 +229,8 @@ class BackendTest : public RuntimeTest {
     PostRegAllocRewrite post_rewrite(lir_func, &environ);
     post_rewrite.run();
 
-    auto code_allocator = std::unique_ptr<ICodeAllocator>(CodeAllocator::make());
+    auto code_allocator =
+        std::unique_ptr<ICodeAllocator>(CodeAllocator::make());
     asmjit::CodeHolder code;
     code.init(code_allocator->asmJitEnvironment());
 
@@ -685,8 +686,7 @@ uint64_t runBranchBitAndReadNzcv(
   AllocateResult result = code_allocator->addCode(&code);
   JIT_CHECK(result.error == asmjit::kErrorOk, "failed to allocate code");
 
-  auto func =
-      reinterpret_cast<uint64_t (*)(uint64_t, uint64_t)>(result.addr);
+  auto func = reinterpret_cast<uint64_t (*)(uint64_t, uint64_t)>(result.addr);
   return func(value, nzcv);
 }
 
@@ -707,8 +707,7 @@ TEST_F(BackendTest, BranchBitPreservesNzcv) {
   constexpr uint64_t kTaken = 1;
 
   EXPECT_EQ(
-      runBranchBitAndReadNzcv(
-          Instruction::kBranchBitSet, kBit31, kNzcv),
+      runBranchBitAndReadNzcv(Instruction::kBranchBitSet, kBit31, kNzcv),
       kNzcv | kTaken);
   EXPECT_EQ(
       runBranchBitAndReadNzcv(Instruction::kBranchBitSet, 0, kNzcv), kNzcv);
@@ -716,8 +715,7 @@ TEST_F(BackendTest, BranchBitPreservesNzcv) {
       runBranchBitAndReadNzcv(Instruction::kBranchBitNotSet, 0, kNzcv),
       kNzcv | kTaken);
   EXPECT_EQ(
-      runBranchBitAndReadNzcv(
-          Instruction::kBranchBitNotSet, kBit31, kNzcv),
+      runBranchBitAndReadNzcv(Instruction::kBranchBitNotSet, kBit31, kNzcv),
       kNzcv);
 }
 
@@ -839,8 +837,7 @@ BB %0
   lirfunc->basicblocks()[0]->addSuccessor(epilogue);
 
   auto disasm = DisassembleLIRFunction(lirfunc.get());
-  EXPECT_TRUE(std::regex_search(disasm, std::regex{"mov\\s+x2, #1"}))
-      << disasm;
+  EXPECT_TRUE(std::regex_search(disasm, std::regex{"mov\\s+x2, #1"})) << disasm;
   EXPECT_EQ(disasm.find("mov x14, #1"), std::string::npos) << disasm;
   EXPECT_TRUE(std::regex_search(disasm, std::regex{"mov\\s+x0, x29"}))
       << disasm;
@@ -1668,7 +1665,7 @@ TEST_F(BackendTest, RegSwapPreserves64BitPointers) {
       OutPhyReg{arch::reg_general_return_loc, DataType::kObject},
       PhyReg{kReg_B, DataType::kObject});
 
-  auto func = (uint64_t (*)(uint64_t, uint64_t))CompilePreAllocated(
+  auto func = (uint64_t(*)(uint64_t, uint64_t))CompilePreAllocated(
       lirfunc.release(), 16);
   ASSERT_NE(func, nullptr);
 
@@ -1736,7 +1733,7 @@ TEST_F(BackendTest, RegSwapK32bitTruncates64BitValues) {
       OutPhyReg{arch::reg_general_return_loc, DataType::kObject},
       PhyReg{kReg_B, DataType::kObject});
 
-  auto func = (uint64_t (*)(uint64_t, uint64_t))CompilePreAllocated(
+  auto func = (uint64_t(*)(uint64_t, uint64_t))CompilePreAllocated(
       lirfunc.release(), 16);
   ASSERT_NE(func, nullptr);
 

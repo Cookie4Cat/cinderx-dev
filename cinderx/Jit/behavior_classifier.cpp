@@ -17,12 +17,12 @@
 #ifndef _WIN32
 #include <pthread.h>
 #endif
-#include <vector>
 #include <initializer_list>
 #include <limits>
 #include <string>
 #include <string_view>
 #include <utility>
+#include <vector>
 
 namespace jit {
 

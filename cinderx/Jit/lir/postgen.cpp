@@ -864,7 +864,8 @@ RewriteResult rewriteNonBinaryImmediateToVreg(instr_iter_t instr_iter) {
 // translateCall only needs blr(reg).
 RewriteResult rewriteCallInput(instr_iter_t instr_iter) {
   auto instr = instr_iter->get();
-  if (!instr->isCall() && !instr->isVarArgCall() && !instr->isVectorCallTstate()) {
+  if (!instr->isCall() && !instr->isVarArgCall() &&
+      !instr->isVectorCallTstate()) {
     return kUnchanged;
   }
 
