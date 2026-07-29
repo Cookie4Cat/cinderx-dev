@@ -6,7 +6,6 @@
 
 #include "cinderx/Common/ref.h"
 #include "cinderx/Jit/config.h"
-#include "cinderx/Jit/threaded_compile.h"
 
 #include <fmt/chrono.h>
 #include <fmt/format.h>
@@ -14,7 +13,25 @@
 #include <fmt/printf.h>
 
 #include <cstdio>
+#include <exception>
 #include <iterator>
+#include <string_view>
+
+#if defined(__has_cpp_attribute)
+#if __has_cpp_attribute(gnu::cold)
+#define JIT_COLD [[gnu::cold]]
+#endif
+#endif
+
+#if !defined(JIT_COLD) && defined(__has_attribute)
+#if __has_attribute(cold)
+#define JIT_COLD __attribute__((cold))
+#endif
+#endif
+
+#ifndef JIT_COLD
+#define JIT_COLD
+#endif
 
 namespace jit {
 
@@ -36,15 +53,74 @@ void printPythonException();
 // "<failed to get UTF8 from Python string>"
 std::string repr(BorrowedRef<> obj);
 
-#define JIT_LOG(...)                                           \
-  {                                                            \
-    FILE* _output = jit::getConfig().log.output_file;          \
-    jit::ThreadedCompileSerialize guard;                       \
-    fmt::print(_output, "JIT: {}:{} -- ", __FILE__, __LINE__); \
-    fmt::print(_output, __VA_ARGS__);                          \
-    fmt::print(_output, "\n");                                 \
-    std::fflush(_output);                                      \
-  }
+// Set a Python RuntimeError from a C++ exception.
+//
+// Will replace an existing Python exception if one exists, but will log it
+// first.
+void setRuntimeError(const std::exception& exn);
+
+// Outlined logging implementations to reduce code size on hot paths.
+JIT_COLD void logImplV(
+    std::string_view file,
+    int line,
+    fmt::string_view format,
+    fmt::format_args args);
+[[noreturn]] JIT_COLD void abortImplV(
+    std::string_view file,
+    int line,
+    fmt::string_view format,
+    fmt::format_args args);
+[[noreturn]] JIT_COLD void checkFailedImplV(
+    std::string_view file,
+    int line,
+    std::string_view cond_str,
+    fmt::string_view format,
+    fmt::format_args args);
+[[noreturn]] JIT_COLD void throwImplV(
+    std::string_view file,
+    int line,
+    fmt::string_view format,
+    fmt::format_args args);
+
+template <typename... Args>
+JIT_COLD void logImpl(
+    std::string_view file,
+    int line,
+    fmt::format_string<Args...> format,
+    Args&&... args) {
+  logImplV(file, line, format, fmt::make_format_args(args...));
+}
+
+template <typename... Args>
+[[noreturn]] JIT_COLD void abortImpl(
+    std::string_view file,
+    int line,
+    fmt::format_string<Args...> format,
+    Args&&... args) {
+  abortImplV(file, line, format, fmt::make_format_args(args...));
+}
+
+template <typename... Args>
+[[noreturn]] JIT_COLD void checkFailedImpl(
+    std::string_view file,
+    int line,
+    std::string_view cond_str,
+    fmt::format_string<Args...> format,
+    Args&&... args) {
+  checkFailedImplV(
+      file, line, cond_str, format, fmt::make_format_args(args...));
+}
+
+template <typename... Args>
+[[noreturn]] JIT_COLD void throwImpl(
+    std::string_view file,
+    int line,
+    fmt::format_string<Args...> format,
+    Args&&... args) {
+  throwImplV(file, line, format, fmt::make_format_args(args...));
+}
+
+#define JIT_LOG(...) jit::logImpl(__FILE__, __LINE__, __VA_ARGS__)
 
 #define JIT_LOGIF(PRED, ...) \
   if (PRED) {                \
@@ -53,17 +129,11 @@ std::string repr(BorrowedRef<> obj);
 
 #define JIT_DLOG(...) JIT_LOGIF(jit::getConfig().log.debug, __VA_ARGS__)
 
-#define JIT_CHECK(COND, ...)                      \
-  {                                               \
-    if (!(COND)) {                                \
-      fmt::print(                                 \
-          stderr,                                 \
-          "JIT: {}:{} -- Assertion failed: {}\n", \
-          __FILE__,                               \
-          __LINE__,                               \
-          #COND);                                 \
-      JIT_ABORT_IMPL(__VA_ARGS__);                \
-    }                                             \
+#define JIT_CHECK(COND, ...)                                        \
+  {                                                                 \
+    if (!(COND)) {                                                  \
+      jit::checkFailedImpl(__FILE__, __LINE__, #COND, __VA_ARGS__); \
+    }                                                               \
   }
 
 #define JIT_CHECK_ONCE(COND, ...)   \
@@ -75,20 +145,9 @@ std::string repr(BorrowedRef<> obj);
     }                               \
   }
 
-#define JIT_ABORT(...)                                               \
-  {                                                                  \
-    fmt::print(stderr, "JIT: {}:{} -- Abort\n", __FILE__, __LINE__); \
-    JIT_ABORT_IMPL(__VA_ARGS__);                                     \
-  }
+#define JIT_ABORT(...) jit::abortImpl(__FILE__, __LINE__, __VA_ARGS__)
 
-#define JIT_ABORT_IMPL(...)          \
-  {                                  \
-    fmt::print(stderr, __VA_ARGS__); \
-    fmt::print(stderr, "\n");        \
-    std::fflush(stderr);             \
-    jit::printPythonException();     \
-    std::abort();                    \
-  }
+#define JIT_THROW(...) jit::throwImpl(__FILE__, __LINE__, __VA_ARGS__)
 
 #ifdef Py_DEBUG
 #define JIT_DABORT(...) JIT_ABORT(__VA_ARGS__)

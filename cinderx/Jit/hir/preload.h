@@ -6,6 +6,7 @@
 
 #include "cinderx/Common/log.h"
 #include "cinderx/Common/ref.h"
+#include "cinderx/Common/sorted_vec_map.h"
 #include "cinderx/Jit/bytecode_offsets.h"
 #include "cinderx/Jit/hir/annotation_index.h"
 #include "cinderx/Jit/hir/function.h"
@@ -14,15 +15,20 @@
 #include "cinderx/Jit/osr.h"
 #include "cinderx/StaticPython/typed-args-info.h"
 
-#include <map>
 #include <optional>
 #include <unordered_map>
 #include <utility>
 
 namespace jit::hir {
 
-using ArgToType = std::map<long, Type>;
-using GlobalNamesMap = std::unordered_map<int, BorrowedRef<>>;
+// Maps keyed on local indices or name indices.  Keys are small dense integers,
+// so a sorted vector is cheaper than a hash table or tree.
+using ArgToType = SortedVecMap<int, Type>;
+using GlobalNamesMap = SortedVecMap<int, BorrowedRef<>>;
+
+// A map keyed by type descr tuples.
+template <class T>
+using DescrMap = std::unordered_map<BorrowedRef<>, T>;
 
 struct FieldInfo {
   Py_ssize_t offset;
@@ -61,9 +67,6 @@ struct InvokeTarget {
   // is a METH_TYPED builtin that returns integer error code
   bool builtin_returns_error_code{false};
 };
-
-using InvokeTargetMap =
-    std::unordered_map<PyObject*, std::unique_ptr<InvokeTarget>>;
 
 // The target of an INVOKE_NATIVE
 struct NativeTarget {
@@ -125,20 +128,16 @@ class Preloader {
     return preloader;
   }
 
-  Type type(BorrowedRef<> descr) const;
-  int primitiveTypecode(BorrowedRef<> descr) const;
-  BorrowedRef<PyTypeObject> pyType(BorrowedRef<> descr) const;
-  const OwnedType& preloadedType(BorrowedRef<> descr) const;
+  // Fetch the type represented by a type descr tuple.
+  const OwnedType* preloadedType(BorrowedRef<> descr) const;
 
-  const FieldInfo& fieldInfo(BorrowedRef<> descr) const;
+  const FieldInfo* fieldInfo(BorrowedRef<> descr) const;
 
   const InvokeTarget& invokeFunctionTarget(BorrowedRef<> descr) const;
   const InvokeTarget& invokeMethodTarget(BorrowedRef<> descr) const;
   const NativeTarget& invokeNativeTarget(BorrowedRef<> target) const;
 
-  const InvokeTargetMap& invokeFunctionTargets() const {
-    return func_targets_;
-  }
+  const DescrMap<std::unique_ptr<InvokeTarget>>& invokeFunctionTargets() const;
 
   const GlobalNamesMap& globalNames() const {
     return global_names_;
@@ -146,7 +145,7 @@ class Preloader {
 
   // get the type from argument check info for the given locals index, or
   // TObject
-  Type checkArgType(long local_idx) const;
+  Type checkArgType(int local_idx) const;
 
   // Candidate exact type for the first "self" argument of an inferred
   // instance method.
@@ -249,15 +248,13 @@ class Preloader {
   const std::string fullname_;
   Ref<> reifier_;
 
-  // keyed by type descr tuple identity (they are interned in code objects)
-  std::unordered_map<PyObject*, OwnedType> types_;
-  std::unordered_map<PyObject*, FieldInfo> fields_;
-  InvokeTargetMap func_targets_;
-  InvokeTargetMap meth_targets_;
-  std::unordered_map<PyObject*, std::unique_ptr<NativeTarget>> native_targets_;
-  // keyed by locals index
-  std::unordered_map<long, Type> check_arg_types_;
-  std::map<long, OwnedType> check_arg_pytypes_;
+  DescrMap<OwnedType> types_;
+  DescrMap<FieldInfo> fields_;
+  DescrMap<std::unique_ptr<InvokeTarget>> func_targets_;
+  DescrMap<std::unique_ptr<InvokeTarget>> meth_targets_;
+  DescrMap<std::unique_ptr<NativeTarget>> native_targets_;
+  // Keyed by locals index.
+  SortedVecMap<int, OwnedType> check_arg_types_;
   std::optional<OwnedType> inferred_self_type_;
   // keyed by name index, names borrowed from code object
   GlobalNamesMap global_names_;

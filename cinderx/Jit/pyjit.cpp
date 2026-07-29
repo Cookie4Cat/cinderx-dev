@@ -513,7 +513,17 @@ PyObject* forcedJitVectorcall(
   BorrowedRef<PyFunctionObject> func{func_obj};
   BorrowedRef<PyCodeObject> code{func->func_code};
 
-  auto result = compileFunction(func);
+  // Compile the function.
+  Result result;
+  try {
+    result = compileFunction(func);
+  } catch (const std::exception& exn) {
+    // Gently fall back to the interpreter when C++ exceptions happen.
+    JIT_DLOG("{}", exn.what());
+    PyErr_Clear();
+    result = Result::UNKNOWN_ERROR;
+  }
+
   if (result == Result::OK) {
     incAutoJitGateStat(g_auto_jit_gate_stats.forced_compile_ok);
     JIT_DCHECK(
@@ -1480,6 +1490,29 @@ hir::Preloader* preload(BorrowedRef<> unit) {
   return copy;
 }
 
+using UnitDeletedCallback = std::function<void(BorrowedRef<>)>;
+
+// Preloading can execute Python and re-enter the JIT. Preserve and chain the
+// callback so nested preloads report deletions to both scopes, then restore the
+// callback that was active on entry on every exit path.
+hir::Preloader* preloadWithUnitDeletedCallback(
+    BorrowedRef<> unit,
+    UnitDeletedCallback current) {
+  auto* state = cinderx::getModuleState();
+  UnitDeletedCallback previous =
+      std::move(state->unit_deleted_during_preload);
+  SCOPE_EXIT(
+      state->unit_deleted_during_preload = std::move(previous));
+
+  state->unit_deleted_during_preload = [&](BorrowedRef<> deleted_unit) {
+    current(deleted_unit);
+    if (previous) {
+      previous(deleted_unit);
+    }
+  };
+  return preload(unit);
+}
+
 // JIT compile func or code object, only if a preloader is available.
 //
 // Re-entrant compile that is safe to call from within compilation, because it
@@ -1584,67 +1617,65 @@ bool compile_all(size_t workers = 0) {
   FreeThreadedJITEntrypointGuard guard;
   JIT_CHECK(jitCtx(), "JIT not initialized");
 
-  if (workers == 0) {
-    workers = std::max<size_t>(getConfig().batch_compile_workers, 1);
-  }
+  try {
+    SCOPE_EXIT(hir::preloaderManager().clear());
 
-  std::vector<BorrowedRef<>> compilation_units;
-  // units that were deleted during preloading
-  std::unordered_set<BorrowedRef<>> deleted_units;
-
-  auto error_cleanup = [&]() {
-    hir::preloaderManager().clear();
-    cinderx::getModuleState()->unit_deleted_during_preload = nullptr;
-  };
-
-  auto& jit_reg_units = cinderx::getModuleState()->registered_compilation_units;
-  JIT_DLOG(
-      "Starting compile_all with {} workers for {} registered units",
-      workers,
-      jit_reg_units.size());
-
-  // First we have to preload everything we are going to compile.
-  while (jit_reg_units.size() > 0) {
-    auto preload_units = std::move(jit_reg_units);
-    jit_reg_units.clear();
-    JIT_DLOG(
-        "compile_all preloading a batch of {} units", preload_units.size());
-
-    for (auto unit : preload_units) {
-      if (deleted_units.contains(unit)) {
-        continue;
-      }
-      cinderx::getModuleState()->unit_deleted_during_preload =
-          [&](BorrowedRef<> deleted_unit) {
-            deleted_units.emplace(deleted_unit);
-          };
-      hir::Preloader* preloader = preload(unit);
-      if (!preloader) {
-        error_cleanup();
-        return false;
-      }
-      compilation_units.push_back(unit);
+    if (workers == 0) {
+      workers = std::max<size_t>(getConfig().batch_compile_workers, 1);
     }
+
+    std::vector<BorrowedRef<>> compilation_units;
+    // units that were deleted during preloading
+    std::unordered_set<BorrowedRef<>> deleted_units;
+
+    auto& jit_reg_units =
+        cinderx::getModuleState()->registered_compilation_units;
+    JIT_DLOG(
+        "Starting compile_all with {} workers for {} registered units",
+        workers,
+        jit_reg_units.size());
+
+    // First we have to preload everything we are going to compile.
+    while (jit_reg_units.size() > 0) {
+      auto preload_units = std::move(jit_reg_units);
+      jit_reg_units.clear();
+      JIT_DLOG(
+          "compile_all preloading a batch of {} units", preload_units.size());
+
+      for (auto unit : preload_units) {
+        if (deleted_units.contains(unit)) {
+          continue;
+        }
+        hir::Preloader* preloader = preloadWithUnitDeletedCallback(
+            unit, [&](BorrowedRef<> deleted_unit) {
+              deleted_units.emplace(deleted_unit);
+            });
+        if (!preloader) {
+          return false;
+        }
+        compilation_units.push_back(unit);
+      }
+    }
+
+    // Filter out any units that were deleted as a side effect of preloading.
+    std::erase_if(compilation_units, [&](BorrowedRef<> unit) {
+      return deleted_units.contains(unit);
+    });
+
+    JIT_DLOG(
+        "compile_all finished preloading {} units, {} were deleted",
+        compilation_units.size(),
+        deleted_units.size());
+
+    if (workers > 1) {
+      multithread_compile_units_preloaded(std::move(compilation_units), workers);
+    } else {
+      compile_units_preloaded(std::move(compilation_units));
+    }
+  } catch (const std::exception& exn) {
+    setRuntimeError(exn);
+    return false;
   }
-  cinderx::getModuleState()->unit_deleted_during_preload = nullptr;
-
-  // Filter out any units that were deleted as a side effect of preloading.
-  std::erase_if(compilation_units, [&](BorrowedRef<> unit) {
-    return deleted_units.contains(unit);
-  });
-
-  JIT_DLOG(
-      "compile_all finished preloading {} units, {} were deleted",
-      compilation_units.size(),
-      deleted_units.size());
-
-  if (workers > 1) {
-    multithread_compile_units_preloaded(std::move(compilation_units), workers);
-  } else {
-    compile_units_preloaded(std::move(compilation_units));
-  }
-
-  hir::preloaderManager().clear();
 
   return true;
 }
@@ -2242,7 +2273,16 @@ PyObject* force_compile(PyObject* /* self */, PyObject* arg) {
     return nullptr;
   }
 
-  auto result = compileFunction(func);
+  // Compile the function.
+  Result result;
+  try {
+    result = compileFunction(func);
+  } catch (const std::exception& exn) {
+    // Surface C++ exceptions to the caller immediately.
+    setRuntimeError(exn);
+    return nullptr;
+  }
+
   switch (result) {
     case Result::OK:
       Py_RETURN_TRUE;
@@ -4594,25 +4634,33 @@ Result compileFunctionWithOSR(BorrowedRef<PyFunctionObject> func) {
     return Result::CANNOT_SPECIALIZE;
   }
 
-  hir::IsolatedPreloaders isolated_preloaders;
-  hir::Preloader* preloader = preload(func);
-  if (preloader == nullptr || func->func_code != pinned_code) {
-    PyErr_Clear();
-    return Result::CANNOT_SPECIALIZE;
-  }
+  try {
+    hir::IsolatedPreloaders isolated_preloaders;
+    hir::Preloader* preloader = preload(func);
+    if (preloader == nullptr || func->func_code != pinned_code) {
+      PyErr_Clear();
+      return Result::CANNOT_SPECIALIZE;
+    }
 
-  Result result = compilePreloader(*preloader, func);
-  if (result != Result::OK && PyErr_Occurred()) {
+    Result result = compilePreloader(*preloader, func);
+    if (result != Result::OK && PyErr_Occurred()) {
+      PyErr_Clear();
+    }
+    return result;
+  } catch (const std::exception& exn) {
+    JIT_DLOG("{}", exn.what());
     PyErr_Clear();
+    return Result::UNKNOWN_ERROR;
   }
-  return result;
 }
 
 std::vector<BorrowedRef<PyFunctionObject>> preloadFuncAndDeps(
     BorrowedRef<PyFunctionObject> func,
     bool forcePreload) {
-  // Add one for the original function itself.
-  size_t limit = getConfig().preload_dependent_limit + 1;
+  // Add one for the original function itself.  When forcePreload is set the
+  // caller wants all dependents regardless of the configured limit.
+  size_t limit = forcePreload ? std::numeric_limits<size_t>::max()
+                              : getConfig().preload_dependent_limit + 1;
 
   std::deque<BorrowedRef<PyFunctionObject>> worklist;
   std::vector<BorrowedRef<PyFunctionObject>> result;
@@ -4632,15 +4680,10 @@ std::vector<BorrowedRef<PyFunctionObject>> preloadFuncAndDeps(
     BorrowedRef<PyFunctionObject> f = worklist.front();
     worklist.pop_front();
 
-    // This needs to be set every time before preload() is kicked off.
-    // Preloading can run arbitrary Python code, which means it can re-enter
-    // the JIT.
-    cinderx::getModuleState()->unit_deleted_during_preload =
-        [&](BorrowedRef<> deleted_unit) {
+    hir::Preloader* preloader = preloadWithUnitDeletedCallback(
+        f, [&](BorrowedRef<> deleted_unit) {
           deleted_units.emplace(deleted_unit);
-        };
-    hir::Preloader* preloader = preload(f);
-    cinderx::getModuleState()->unit_deleted_during_preload = nullptr;
+        });
 
     if (preloader == nullptr) {
       return {};

@@ -351,26 +351,14 @@ BorrowedRef<PyFunctionObject> InvokeTarget::func() const {
   return reinterpret_cast<PyFunctionObject*>(callable.get());
 }
 
-Type Preloader::type(BorrowedRef<> descr) const {
-  return preloadedType(descr).toHir();
+const OwnedType* Preloader::preloadedType(BorrowedRef<> descr) const {
+  auto it = types_.find(descr);
+  return it != types_.end() ? &it->second : nullptr;
 }
 
-int Preloader::primitiveTypecode(BorrowedRef<> descr) const {
-  return _PyClassLoader_GetTypeCode(pyType(descr));
-}
-
-BorrowedRef<PyTypeObject> Preloader::pyType(BorrowedRef<> descr) const {
-  auto const& preloader_type = preloadedType(descr);
-  JIT_CHECK(!preloader_type.optional, "unexpected optional type");
-  return preloader_type.type;
-}
-
-const OwnedType& Preloader::preloadedType(BorrowedRef<> descr) const {
-  return map_get(types_, descr);
-}
-
-const FieldInfo& Preloader::fieldInfo(BorrowedRef<> descr) const {
-  return map_get(fields_, descr);
+const FieldInfo* Preloader::fieldInfo(BorrowedRef<> descr) const {
+  auto it = fields_.find(descr);
+  return it != fields_.end() ? &it->second : nullptr;
 }
 
 const InvokeTarget& Preloader::invokeFunctionTarget(BorrowedRef<> descr) const {
@@ -381,12 +369,18 @@ const InvokeTarget& Preloader::invokeMethodTarget(BorrowedRef<> descr) const {
   return *(map_get(meth_targets_, descr));
 }
 
+const DescrMap<std::unique_ptr<InvokeTarget>>&
+Preloader::invokeFunctionTargets() const {
+  return func_targets_;
+}
+
 const NativeTarget& Preloader::invokeNativeTarget(BorrowedRef<> target) const {
   return *(map_get(native_targets_, target));
 }
 
-Type Preloader::checkArgType(long local_idx) const {
-  return map_get(check_arg_types_, local_idx, TObject);
+Type Preloader::checkArgType(int local_idx) const {
+  auto it = check_arg_types_.find(local_idx);
+  return it != check_arg_types_.end() ? it->second.toHir() : TObject;
 }
 
 std::optional<Type> Preloader::inferredSelfType() const {
@@ -430,7 +424,7 @@ std::unique_ptr<Function> Preloader::makeFunction() const {
   irfunc->return_type = return_type_;
   irfunc->has_primitive_args = has_primitive_args_;
   irfunc->has_primitive_first_arg = has_primitive_first_arg_;
-  for (auto& [local, preloaded_type] : check_arg_pytypes_) {
+  for (auto& [local, preloaded_type] : check_arg_types_) {
     irfunc->typed_args.emplace_back(
         local,
         preloaded_type.type,
@@ -478,13 +472,13 @@ bool Preloader::preload() {
         // the GlobalCache; otherwise GlobalCache initialization can
         // self-destroy due to side effects of PyDict_GetItem and cause a
         // use-after-free.
-        PyObject* global_value = PyDict_GetItem(globals_, name);
-        if (!global_value) {
+        PyObject* global_value = PyDict_GetItemWithError(globals_, name);
+        if (!global_value && !PyErr_Occurred()) {
           // It's extremely unlikely that builtins dict could ever contain a
           // lazy import that needs warming up, but since it is technically
           // possible, we may as well go ahead and warm that up too if the key
           // isn't in globals.
-          PyDict_GetItem(builtins_, name);
+          PyDict_GetItemWithError(builtins_, name);
         }
         if (PyErr_Occurred()) {
           return false;
@@ -603,11 +597,12 @@ bool Preloader::preloadStatic() {
   BorrowedRef<PyTupleObject> checks = reinterpret_cast<PyTupleObject*>(
       _PyClassLoader_GetCodeArgumentTypeDescrs(code_));
 
+  constexpr Py_ssize_t kMaxLocals = 16384;
   for (int i = 0; i < PyTuple_GET_SIZE(checks); i += 2) {
-    long local = PyLong_AsLong(PyTuple_GET_ITEM(checks, i));
-    if (local < 0) {
-      JIT_ABORT(
-          "In Static Python function {}, hit negative local {} at index {}, "
+    Py_ssize_t local = PyLong_AsSsize_t(PyTuple_GET_ITEM(checks, i));
+    if (local < 0 || local >= kMaxLocals) {
+      JIT_THROW(
+          "In Static Python function {}, hit bad local {} at index {}, "
           "arguments checks tuple is {}",
           fullname(),
           local,
@@ -627,8 +622,7 @@ bool Preloader::preloadStatic() {
         preloaded_type.type != reinterpret_cast<PyTypeObject*>(&PyObject_Type),
         "shouldn't generate type checks for object");
     Type type = preloaded_type.toHir();
-    check_arg_types_.emplace(local, type);
-    check_arg_pytypes_.emplace(local, std::move(preloaded_type));
+    check_arg_types_.emplace(local, std::move(preloaded_type));
     if (type <= TPrimitive) {
       has_primitive_args_ = true;
       if (local == 0) {
