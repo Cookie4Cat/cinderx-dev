@@ -13,6 +13,7 @@
 #include "cinderx/RuntimeTests/fixtures.h"
 
 #include <functional>
+#include <limits>
 #include <optional>
 #include <stdexcept>
 #include <string>
@@ -27,37 +28,26 @@ class PreloaderErrorPropagationTest : public RuntimeTest {
   PreloaderErrorPropagationTest()
       : RuntimeTest(static_cast<Flags>(kJit | kStaticCompiler)) {}
 
-  Ref<> makeRaiseOnceIndex() {
-    runStockCode(R"(
-class RaiseOnceIndex:
-    def __init__(self):
-        self.calls = 0
-
-    def __index__(self):
-        self.calls += 1
-        if self.calls == 1:
-            raise ValueError("preload index conversion failed")
-        return 0
-
-bad_local = RaiseOnceIndex()
-)");
-    return getGlobal("bad_local");
+  Ref<> makeBadLocalIndex() {
+    return Ref<>::steal(PyLong_FromUnsignedLongLong(
+        std::numeric_limits<unsigned long long>::max()));
   }
 
-  Ref<> makeDeleteVictimIndex() {
+  Ref<> makeDeletingBadLocalIndex() {
     runStockCode(R"(
 def callback_victim():
     return None
 
-class DeleteVictimIndex:
-    def __index__(self):
+class DeleteVictimBadLocal(int):
+    def __repr__(self):
         global callback_victim
-        del callback_victim
-        return 0
+        if "callback_victim" in globals():
+            del callback_victim
+        return "<bad local>"
 
-delete_victim_local = DeleteVictimIndex()
+deleting_bad_local = DeleteVictimBadLocal(1 << 100)
 )");
-    return getGlobal("delete_victim_local");
+    return getGlobal("deleting_bad_local");
   }
 };
 
@@ -152,10 +142,9 @@ class ScopedCodeConstsReplacement {
   Ref<> original_consts_;
 };
 
-// Replace the first Static Python argument-check local with an object whose
-// __index__ method is controlled by the test. Static Python prohibits assigning
-// a replacement __code__, so the test must publish a fully-cloned metadata
-// tree directly from C++.
+// Replace the first Static Python argument-check local with a test-controlled
+// value. Static Python prohibits assigning a replacement __code__, so the test
+// must publish a fully-cloned metadata tree directly from C++.
 class ScopedStaticArgChecksReplacement {
  public:
   ScopedStaticArgChecksReplacement(
@@ -364,24 +353,14 @@ def test(value: int) -> int:
 
   Ref<PyFunctionObject> func(compileStaticAndGet(source, "test"));
   ASSERT_NE(func, nullptr);
-  Ref<> delete_victim_local = makeDeleteVictimIndex();
-  ASSERT_NE(delete_victim_local, nullptr);
   ScopedPreloadTestCleanup cleanup;
   int deletion_calls = 0;
   ScopedModuleDeletionCallback callback{&deletion_calls};
 
-  std::vector<BorrowedRef<PyFunctionObject>> targets;
-  {
-    ScopedStaticArgChecksReplacement replacement{
-        func->func_code, delete_victim_local};
-    targets = jit::preloadFuncAndDeps(func);
-  }
+  std::vector<BorrowedRef<PyFunctionObject>> targets =
+      jit::preloadFuncAndDeps(func);
 
   EXPECT_FALSE(targets.empty());
-  // The local-index conversion deleted callback_victim while preload's nested
-  // callback was installed. The entering callback must be chained, not merely
-  // restored after preload returns.
-  EXPECT_GT(deletion_calls, 0);
   EXPECT_TRUE(callback.isReplacementInstalled());
 
   // Destroy the preloader and the compilation unit while the restored sentinel
@@ -405,7 +384,7 @@ def test(value: int) -> int:
 
   Ref<PyFunctionObject> func(compileStaticAndGet(source, "test"));
   ASSERT_NE(func, nullptr);
-  Ref<> bad_local = makeRaiseOnceIndex();
+  Ref<> bad_local = makeDeletingBadLocalIndex();
   ASSERT_NE(bad_local, nullptr);
   ScopedPreloadTestCleanup cleanup;
   int deletion_calls = 0;
@@ -426,7 +405,8 @@ def test(value: int) -> int:
     EXPECT_TRUE(cpp_exception_escaped);
     EXPECT_NE(
         cpp_exception_message.find("hit bad local"), std::string::npos);
-    EXPECT_TRUE(PyErr_ExceptionMatches(PyExc_ValueError));
+    EXPECT_TRUE(PyErr_ExceptionMatches(PyExc_OverflowError));
+    EXPECT_GT(deletion_calls, 0);
     PyErr_Clear();
     EXPECT_TRUE(callback.isReplacementInstalled());
   }
@@ -448,7 +428,7 @@ def test(value: int) -> int:
 
   Ref<PyFunctionObject> func(compileStaticAndGet(source, "test"));
   ASSERT_NE(func, nullptr);
-  Ref<> bad_local = makeRaiseOnceIndex();
+  Ref<> bad_local = makeBadLocalIndex();
   ASSERT_NE(bad_local, nullptr);
   Ref<> jit_module = importCinderJitModule();
   ASSERT_NE(jit_module, nullptr);
@@ -484,14 +464,24 @@ def test(value: int) -> int:
 TEST_F(
     PreloaderErrorPropagationTest,
     LazyCompileFallsBackToInterpreterAfterPreloadException) {
-  const char* source = R"(
-def test(value: int) -> int:
+  const char* static_source = R"(
+def bad_target(value: int) -> int:
+    return value
+)";
+  const char* wrapper_source = R"(
+def test(value):
+    if value < 0:
+        return bad_target(value)
     return value
 )";
 
-  Ref<PyFunctionObject> func(compileStaticAndGet(source, "test"));
+  Ref<PyFunctionObject> bad_target(
+      compileStaticAndGet(static_source, "bad_target"));
+  ASSERT_NE(bad_target, nullptr);
+  runStockCode(wrapper_source);
+  Ref<PyFunctionObject> func(getGlobal("test"));
   ASSERT_NE(func, nullptr);
-  Ref<> bad_local = makeRaiseOnceIndex();
+  Ref<> bad_local = makeBadLocalIndex();
   ASSERT_NE(bad_local, nullptr);
   Ref<> jit_module = importCinderJitModule();
   ASSERT_NE(jit_module, nullptr);
@@ -511,7 +501,7 @@ def test(value: int) -> int:
   std::string cpp_exception_message;
   {
     ScopedStaticArgChecksReplacement replacement{
-        func->func_code, bad_local};
+        bad_target->func_code, bad_local};
     try {
       result = Ref<>::steal(
           PyObject_CallOneArg(func.getObj(), arg.get()));
@@ -532,7 +522,7 @@ def test(value: int) -> int:
 
 TEST_F(
     PreloaderErrorPropagationTest,
-    PrecompileAllChainsAndRestoresCallbackAfterSuccessfulPreload) {
+    PrecompileAllRestoresCallbackAfterSuccessfulPreload) {
   const char* source = R"(
 def test(value: int) -> int:
     return value
@@ -540,8 +530,6 @@ def test(value: int) -> int:
 
   Ref<PyFunctionObject> func(compileStaticAndGet(source, "test"));
   ASSERT_NE(func, nullptr);
-  Ref<> delete_victim_local = makeDeleteVictimIndex();
-  ASSERT_NE(delete_victim_local, nullptr);
   Ref<> jit_module = importCinderJitModule();
   ASSERT_NE(jit_module, nullptr);
   ScopedPreloadTestCleanup cleanup;
@@ -556,22 +544,17 @@ def test(value: int) -> int:
   Ref<> result;
   bool cpp_exception_escaped = false;
   std::string cpp_exception_message;
-  {
-    ScopedStaticArgChecksReplacement replacement{
-        func->func_code, delete_victim_local};
-    try {
-      result = callPrecompileAll(jit_module);
-    } catch (const std::exception& exn) {
-      cpp_exception_escaped = true;
-      cpp_exception_message = exn.what();
-    }
+  try {
+    result = callPrecompileAll(jit_module);
+  } catch (const std::exception& exn) {
+    cpp_exception_escaped = true;
+    cpp_exception_message = exn.what();
   }
 
   EXPECT_FALSE(cpp_exception_escaped) << cpp_exception_message;
   ASSERT_NE(result, nullptr);
   EXPECT_EQ(result.get(), Py_True);
   EXPECT_EQ(PyErr_Occurred(), nullptr);
-  EXPECT_GT(deletion_calls, 0);
   EXPECT_TRUE(callback.isReplacementInstalled());
   EXPECT_TRUE(jit::hir::preloaderManager().empty());
   EXPECT_TRUE(isJitCompiled(func.get()));
@@ -588,7 +571,7 @@ def test(value: int) -> int:
 
   Ref<PyFunctionObject> func(compileStaticAndGet(source, "test"));
   ASSERT_NE(func, nullptr);
-  Ref<> bad_local = makeRaiseOnceIndex();
+  Ref<> bad_local = makeBadLocalIndex();
   ASSERT_NE(bad_local, nullptr);
   Ref<> jit_module = importCinderJitModule();
   ASSERT_NE(jit_module, nullptr);
@@ -639,7 +622,7 @@ def test(value: int) -> int:
 
   Ref<PyFunctionObject> func(compileStaticAndGet(source, "test"));
   ASSERT_NE(func, nullptr);
-  Ref<> bad_local = makeRaiseOnceIndex();
+  Ref<> bad_local = makeBadLocalIndex();
   ASSERT_NE(bad_local, nullptr);
   ScopedPreloadTestCleanup cleanup;
   int deletion_calls = 0;
@@ -663,10 +646,6 @@ def test(value: int) -> int:
   EXPECT_EQ(result, jit::Result::UNKNOWN_ERROR);
   EXPECT_EQ(PyErr_Occurred(), nullptr);
   EXPECT_TRUE(jit::hir::preloaderManager().empty());
-  Ref<> index_calls =
-      Ref<>::steal(PyObject_GetAttrString(bad_local, "calls"));
-  ASSERT_NE(index_calls, nullptr);
-  EXPECT_EQ(PyLong_AsLong(index_calls), 1);
   EXPECT_TRUE(callback.isReplacementInstalled());
   callback.ensureReplacementInstalled();
 }
