@@ -894,6 +894,10 @@ class AutoJitGateStatsDumpTests(unittest.TestCase):
                 f"stdout:\n{completed.stdout}\nstderr:\n{completed.stderr}",
             )
 
+    @unittest.skipIf(
+        CP3140_AUTOJIT_DIRECT_CALL_GATE_UNSUPPORTED,
+        CP3140_AUTOJIT_SKIP_REASON,
+    )
     def test_plugin_defers_call_only_dispatch_loop(self) -> None:
         with tempfile.TemporaryDirectory() as temp:
             env = _plugin_env()
