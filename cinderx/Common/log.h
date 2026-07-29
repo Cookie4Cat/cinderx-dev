@@ -13,6 +13,7 @@
 #include <fmt/printf.h>
 
 #include <cstdio>
+#include <exception>
 #include <iterator>
 #include <string_view>
 
@@ -51,6 +52,12 @@ void printPythonException();
 // but may return a description of an error in string e.g.
 // "<failed to get UTF8 from Python string>"
 std::string repr(BorrowedRef<> obj);
+
+// Set a Python RuntimeError from a C++ exception.
+//
+// Will replace an existing Python exception if one exists, but will log it
+// first.
+void setRuntimeError(const std::exception& exn);
 
 // Outlined logging implementations to reduce code size on hot paths.
 JIT_COLD void logImplV(

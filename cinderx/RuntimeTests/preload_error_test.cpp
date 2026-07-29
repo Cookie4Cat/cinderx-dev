@@ -8,13 +8,17 @@
 #include "cinderx/Jit/frame.h"
 #include "cinderx/Jit/hir/builder.h"
 #include "cinderx/Jit/hir/preload.h"
+#include "cinderx/Jit/osr.h"
 #include "cinderx/Jit/pyjit.h"
 #include "cinderx/RuntimeTests/fixtures.h"
 
+#include <functional>
 #include <optional>
 #include <stdexcept>
 #include <string>
 #include <string_view>
+#include <utility>
+#include <vector>
 
 namespace {
 
@@ -22,6 +26,39 @@ class PreloaderErrorPropagationTest : public RuntimeTest {
  public:
   PreloaderErrorPropagationTest()
       : RuntimeTest(static_cast<Flags>(kJit | kStaticCompiler)) {}
+
+  Ref<> makeRaiseOnceIndex() {
+    runStockCode(R"(
+class RaiseOnceIndex:
+    def __init__(self):
+        self.calls = 0
+
+    def __index__(self):
+        self.calls += 1
+        if self.calls == 1:
+            raise ValueError("preload index conversion failed")
+        return 0
+
+bad_local = RaiseOnceIndex()
+)");
+    return getGlobal("bad_local");
+  }
+
+  Ref<> makeDeleteVictimIndex() {
+    runStockCode(R"(
+def callback_victim():
+    return None
+
+class DeleteVictimIndex:
+    def __index__(self):
+        global callback_victim
+        del callback_victim
+        return 0
+
+delete_victim_local = DeleteVictimIndex()
+)");
+    return getGlobal("delete_victim_local");
+  }
 };
 
 std::optional<int> constIndexForOpcode(
@@ -52,6 +89,21 @@ Ref<> cloneTuple(BorrowedRef<> tuple) {
     PyTuple_SET_ITEM(clone.get(), i, item);
   }
   return clone;
+}
+
+void replaceTupleItem(
+    BorrowedRef<> tuple,
+    Py_ssize_t index,
+    BorrowedRef<> replacement) {
+  if (!PyTuple_Check(tuple) || index < 0 ||
+      index >= PyTuple_GET_SIZE(tuple.get())) {
+    throw std::runtime_error{"tuple replacement index is out of range"};
+  }
+
+  PyObject* old_item = PyTuple_GET_ITEM(tuple.get(), index);
+  Py_INCREF(replacement.get());
+  PyTuple_SET_ITEM(tuple.get(), index, replacement.get());
+  Py_DECREF(old_item);
 }
 
 // Publish a fresh co_consts tuple after the Preloader has populated its
@@ -99,6 +151,147 @@ class ScopedCodeConstsReplacement {
   PyCodeObject* code_;
   Ref<> original_consts_;
 };
+
+// Replace the first Static Python argument-check local with an object whose
+// __index__ method is controlled by the test. Static Python prohibits assigning
+// a replacement __code__, so the test must publish a fully-cloned metadata
+// tree directly from C++.
+class ScopedStaticArgChecksReplacement {
+ public:
+  ScopedStaticArgChecksReplacement(
+      BorrowedRef<PyCodeObject> code,
+      BorrowedRef<> replacement)
+      : code_(code.get()), original_consts_(Ref<>::create(code->co_consts)) {
+    Py_ssize_t consts_size = PyTuple_GET_SIZE(code->co_consts);
+    if (consts_size == 0) {
+      throw std::runtime_error{"Static Python code has no constants"};
+    }
+
+    Ref<> replacement_consts = cloneTuple(code->co_consts);
+    Ref<> static_type_info =
+        cloneTuple(PyTuple_GET_ITEM(code->co_consts, consts_size - 1));
+    if (PyTuple_GET_SIZE(static_type_info.get()) != 2) {
+      throw std::runtime_error{"unexpected Static Python type metadata"};
+    }
+
+    Ref<> checks =
+        cloneTuple(PyTuple_GET_ITEM(static_type_info.get(), 0));
+    if (PyTuple_GET_SIZE(checks.get()) < 2) {
+      throw std::runtime_error{"Static Python function has no argument checks"};
+    }
+
+    replaceTupleItem(checks, 0, replacement);
+    replaceTupleItem(static_type_info, 0, checks);
+    replaceTupleItem(replacement_consts, consts_size - 1, static_type_info);
+    Py_SETREF(code_->co_consts, replacement_consts.release());
+  }
+
+  ~ScopedStaticArgChecksReplacement() {
+    Py_SETREF(code_->co_consts, original_consts_.release());
+  }
+
+  ScopedStaticArgChecksReplacement(
+      const ScopedStaticArgChecksReplacement&) = delete;
+  ScopedStaticArgChecksReplacement& operator=(
+      const ScopedStaticArgChecksReplacement&) = delete;
+
+ private:
+  PyCodeObject* code_;
+  Ref<> original_consts_;
+};
+
+struct CountingDeletionCallback {
+  int* calls;
+
+  void operator()(BorrowedRef<>) const {
+    (*calls)++;
+  }
+};
+
+class ScopedModuleDeletionCallback {
+ public:
+  explicit ScopedModuleDeletionCallback(int* calls)
+      : state_(cinderx::getModuleState()),
+        previous_(state_->unit_deleted_during_preload),
+        replacement_(CountingDeletionCallback{calls}),
+        calls_(calls) {
+    state_->unit_deleted_during_preload = replacement_;
+  }
+
+  ~ScopedModuleDeletionCallback() {
+    state_->unit_deleted_during_preload = std::move(previous_);
+  }
+
+  bool isReplacementInstalled() const {
+    const auto* callback =
+        state_->unit_deleted_during_preload
+            .target<CountingDeletionCallback>();
+    return callback != nullptr && callback->calls == calls_;
+  }
+
+  // Old code can leave a callback that captures an unwound stack frame. Put
+  // the sentinel back before RED-test cleanup destroys a function or code
+  // object, so the regression test itself never dereferences the stale lambda.
+  void ensureReplacementInstalled() {
+    if (!isReplacementInstalled()) {
+      state_->unit_deleted_during_preload = replacement_;
+    }
+  }
+
+  ScopedModuleDeletionCallback(const ScopedModuleDeletionCallback&) = delete;
+  ScopedModuleDeletionCallback& operator=(
+      const ScopedModuleDeletionCallback&) = delete;
+
+ private:
+  cinderx::ModuleState* state_;
+  std::function<void(BorrowedRef<>)> previous_;
+  std::function<void(BorrowedRef<>)> replacement_;
+  int* calls_;
+};
+
+class ScopedPreloadTestCleanup {
+ public:
+  ~ScopedPreloadTestCleanup() {
+    hir::preloaderManager().clear();
+    cinderx::getModuleState()->registered_compilation_units.clear();
+    PyErr_Clear();
+  }
+};
+
+Ref<> importCinderJitModule() {
+  return Ref<>::steal(PyImport_ImportModule("cinderx.jit"));
+}
+
+Ref<> callJitOneArg(
+    BorrowedRef<> module,
+    const char* name,
+    BorrowedRef<> arg) {
+  return Ref<>::steal(
+      PyObject_CallMethod(module.get(), name, "O", arg.get()));
+}
+
+Ref<> callPrecompileAll(BorrowedRef<> module) {
+  return Ref<>::steal(
+      PyObject_CallMethod(module.get(), "precompile_all", "i", 1));
+}
+
+std::string takeRaisedExceptionMessage() {
+  Ref<> raised = Ref<>::steal(PyErr_GetRaisedException());
+  if (raised == nullptr) {
+    return "<no exception raised>";
+  }
+  Ref<> str = Ref<>::steal(PyObject_Str(raised));
+  if (str == nullptr) {
+    PyErr_Clear();
+    return "<failed to stringify exception>";
+  }
+  const char* message = PyUnicode_AsUTF8(str);
+  if (message == nullptr) {
+    PyErr_Clear();
+    return "<failed to decode exception message>";
+  }
+  return message;
+}
 
 void expectContextualBuilderError(
     jit::hir::Preloader& preloader,
@@ -159,6 +352,319 @@ def test(instance: C):
 
   expectContextualBuilderError(
       *preloader, "LOAD_FIELD: Can't find field for descr");
+}
+
+TEST_F(
+    PreloaderErrorPropagationTest,
+    RestoresUnitDeletionCallbackAfterSuccessfulPreload) {
+  const char* source = R"(
+def test(value: int) -> int:
+    return value
+)";
+
+  Ref<PyFunctionObject> func(compileStaticAndGet(source, "test"));
+  ASSERT_NE(func, nullptr);
+  Ref<> delete_victim_local = makeDeleteVictimIndex();
+  ASSERT_NE(delete_victim_local, nullptr);
+  ScopedPreloadTestCleanup cleanup;
+  int deletion_calls = 0;
+  ScopedModuleDeletionCallback callback{&deletion_calls};
+
+  std::vector<BorrowedRef<PyFunctionObject>> targets;
+  {
+    ScopedStaticArgChecksReplacement replacement{
+        func->func_code, delete_victim_local};
+    targets = jit::preloadFuncAndDeps(func);
+  }
+
+  EXPECT_FALSE(targets.empty());
+  // The local-index conversion deleted callback_victim while preload's nested
+  // callback was installed. The entering callback must be chained, not merely
+  // restored after preload returns.
+  EXPECT_GT(deletion_calls, 0);
+  EXPECT_TRUE(callback.isReplacementInstalled());
+
+  // Destroy the preloader and the compilation unit while the restored sentinel
+  // remains published. Under ASAN this also exercises the lifetime edge that
+  // previously retained a stack-capturing lambda.
+  int calls_before_destroy = deletion_calls;
+  callback.ensureReplacementInstalled();
+  hir::preloaderManager().clear();
+  runStockCode("del test");
+  func.reset();
+  EXPECT_GT(deletion_calls, calls_before_destroy);
+}
+
+TEST_F(
+    PreloaderErrorPropagationTest,
+    RestoresUnitDeletionCallbackAfterPreloadException) {
+  const char* source = R"(
+def test(value: int) -> int:
+    return value
+)";
+
+  Ref<PyFunctionObject> func(compileStaticAndGet(source, "test"));
+  ASSERT_NE(func, nullptr);
+  Ref<> bad_local = makeRaiseOnceIndex();
+  ASSERT_NE(bad_local, nullptr);
+  ScopedPreloadTestCleanup cleanup;
+  int deletion_calls = 0;
+  ScopedModuleDeletionCallback callback{&deletion_calls};
+
+  bool cpp_exception_escaped = false;
+  std::string cpp_exception_message;
+  {
+    ScopedStaticArgChecksReplacement replacement{
+        func->func_code, bad_local};
+    try {
+      (void)jit::preloadFuncAndDeps(func);
+    } catch (const std::runtime_error& exn) {
+      cpp_exception_escaped = true;
+      cpp_exception_message = exn.what();
+    }
+
+    EXPECT_TRUE(cpp_exception_escaped);
+    EXPECT_NE(
+        cpp_exception_message.find("hit bad local"), std::string::npos);
+    EXPECT_TRUE(PyErr_ExceptionMatches(PyExc_ValueError));
+    PyErr_Clear();
+    EXPECT_TRUE(callback.isReplacementInstalled());
+  }
+
+  callback.ensureReplacementInstalled();
+  hir::preloaderManager().clear();
+  runStockCode("del test");
+  func.reset();
+  EXPECT_GT(deletion_calls, 0);
+}
+
+TEST_F(
+    PreloaderErrorPropagationTest,
+    ForceCompileConvertsPreloadExceptionToRuntimeError) {
+  const char* source = R"(
+def test(value: int) -> int:
+    return value
+)";
+
+  Ref<PyFunctionObject> func(compileStaticAndGet(source, "test"));
+  ASSERT_NE(func, nullptr);
+  Ref<> bad_local = makeRaiseOnceIndex();
+  ASSERT_NE(bad_local, nullptr);
+  Ref<> jit_module = importCinderJitModule();
+  ASSERT_NE(jit_module, nullptr);
+  ScopedPreloadTestCleanup cleanup;
+  int deletion_calls = 0;
+  ScopedModuleDeletionCallback callback{&deletion_calls};
+
+  Ref<> result;
+  bool cpp_exception_escaped = false;
+  std::string cpp_exception_message;
+  {
+    ScopedStaticArgChecksReplacement replacement{
+        func->func_code, bad_local};
+    try {
+      result = callJitOneArg(jit_module, "force_compile", func);
+    } catch (const std::exception& exn) {
+      cpp_exception_escaped = true;
+      cpp_exception_message = exn.what();
+    }
+
+    EXPECT_FALSE(cpp_exception_escaped) << cpp_exception_message;
+    EXPECT_EQ(result, nullptr);
+    EXPECT_TRUE(PyErr_ExceptionMatches(PyExc_RuntimeError));
+    std::string python_message = takeRaisedExceptionMessage();
+    EXPECT_NE(python_message.find("hit bad local"), std::string::npos)
+        << python_message;
+    EXPECT_TRUE(callback.isReplacementInstalled());
+  }
+  callback.ensureReplacementInstalled();
+}
+
+TEST_F(
+    PreloaderErrorPropagationTest,
+    LazyCompileFallsBackToInterpreterAfterPreloadException) {
+  const char* source = R"(
+def test(value: int) -> int:
+    return value
+)";
+
+  Ref<PyFunctionObject> func(compileStaticAndGet(source, "test"));
+  ASSERT_NE(func, nullptr);
+  Ref<> bad_local = makeRaiseOnceIndex();
+  ASSERT_NE(bad_local, nullptr);
+  Ref<> jit_module = importCinderJitModule();
+  ASSERT_NE(jit_module, nullptr);
+  ScopedPreloadTestCleanup cleanup;
+  int deletion_calls = 0;
+  ScopedModuleDeletionCallback callback{&deletion_calls};
+
+  Ref<> lazy_result = callJitOneArg(jit_module, "lazy_compile", func);
+  ASSERT_NE(lazy_result, nullptr);
+  ASSERT_EQ(lazy_result.get(), Py_True);
+
+  Ref<> arg = Ref<>::steal(PyLong_FromLong(42));
+  ASSERT_NE(arg, nullptr);
+  Ref<> result;
+  bool cpp_exception_escaped = false;
+  std::string cpp_exception_message;
+  {
+    ScopedStaticArgChecksReplacement replacement{
+        func->func_code, bad_local};
+    try {
+      result = Ref<>::steal(
+          PyObject_CallOneArg(func.getObj(), arg.get()));
+    } catch (const std::exception& exn) {
+      cpp_exception_escaped = true;
+      cpp_exception_message = exn.what();
+    }
+
+    EXPECT_FALSE(cpp_exception_escaped) << cpp_exception_message;
+    ASSERT_NE(result, nullptr);
+    EXPECT_EQ(PyLong_AsLong(result), 42);
+    EXPECT_EQ(PyErr_Occurred(), nullptr);
+    EXPECT_FALSE(jit::isJitCompiled(func));
+    EXPECT_TRUE(callback.isReplacementInstalled());
+  }
+  callback.ensureReplacementInstalled();
+}
+
+TEST_F(
+    PreloaderErrorPropagationTest,
+    PrecompileAllChainsAndRestoresCallbackAfterSuccessfulPreload) {
+  const char* source = R"(
+def test(value: int) -> int:
+    return value
+)";
+
+  Ref<PyFunctionObject> func(compileStaticAndGet(source, "test"));
+  ASSERT_NE(func, nullptr);
+  Ref<> delete_victim_local = makeDeleteVictimIndex();
+  ASSERT_NE(delete_victim_local, nullptr);
+  Ref<> jit_module = importCinderJitModule();
+  ASSERT_NE(jit_module, nullptr);
+  ScopedPreloadTestCleanup cleanup;
+  int deletion_calls = 0;
+  ScopedModuleDeletionCallback callback{&deletion_calls};
+
+  Ref<> lazy_result = callJitOneArg(jit_module, "lazy_compile", func);
+  ASSERT_NE(lazy_result, nullptr);
+  ASSERT_EQ(lazy_result.get(), Py_True);
+
+  Ref<> result;
+  bool cpp_exception_escaped = false;
+  std::string cpp_exception_message;
+  {
+    ScopedStaticArgChecksReplacement replacement{
+        func->func_code, delete_victim_local};
+    try {
+      result = callPrecompileAll(jit_module);
+    } catch (const std::exception& exn) {
+      cpp_exception_escaped = true;
+      cpp_exception_message = exn.what();
+    }
+  }
+
+  EXPECT_FALSE(cpp_exception_escaped) << cpp_exception_message;
+  ASSERT_NE(result, nullptr);
+  EXPECT_EQ(result.get(), Py_True);
+  EXPECT_EQ(PyErr_Occurred(), nullptr);
+  EXPECT_GT(deletion_calls, 0);
+  EXPECT_TRUE(callback.isReplacementInstalled());
+  EXPECT_TRUE(hir::preloaderManager().empty());
+  EXPECT_TRUE(jit::isJitCompiled(func));
+  callback.ensureReplacementInstalled();
+}
+
+TEST_F(
+    PreloaderErrorPropagationTest,
+    PrecompileAllConvertsPreloadExceptionAndRestoresState) {
+  const char* source = R"(
+def test(value: int) -> int:
+    return value
+)";
+
+  Ref<PyFunctionObject> func(compileStaticAndGet(source, "test"));
+  ASSERT_NE(func, nullptr);
+  Ref<> bad_local = makeRaiseOnceIndex();
+  ASSERT_NE(bad_local, nullptr);
+  Ref<> jit_module = importCinderJitModule();
+  ASSERT_NE(jit_module, nullptr);
+  ScopedPreloadTestCleanup cleanup;
+  int deletion_calls = 0;
+  ScopedModuleDeletionCallback callback{&deletion_calls};
+
+  Ref<> lazy_result = callJitOneArg(jit_module, "lazy_compile", func);
+  ASSERT_NE(lazy_result, nullptr);
+  ASSERT_EQ(lazy_result.get(), Py_True);
+
+  Ref<> result;
+  bool cpp_exception_escaped = false;
+  std::string cpp_exception_message;
+  {
+    ScopedStaticArgChecksReplacement replacement{
+        func->func_code, bad_local};
+    try {
+      result = callPrecompileAll(jit_module);
+    } catch (const std::exception& exn) {
+      cpp_exception_escaped = true;
+      cpp_exception_message = exn.what();
+    }
+
+    EXPECT_FALSE(cpp_exception_escaped) << cpp_exception_message;
+    EXPECT_EQ(result, nullptr);
+    EXPECT_TRUE(PyErr_ExceptionMatches(PyExc_RuntimeError));
+    std::string python_message = takeRaisedExceptionMessage();
+    EXPECT_NE(python_message.find("hit bad local"), std::string::npos)
+        << python_message;
+    EXPECT_TRUE(hir::preloaderManager().empty());
+    EXPECT_TRUE(callback.isReplacementInstalled());
+    EXPECT_FALSE(jit::isJitCompiled(func));
+  }
+  callback.ensureReplacementInstalled();
+}
+
+TEST_F(
+    PreloaderErrorPropagationTest,
+    OSRCompileFallsBackAfterPreloadException) {
+  const char* source = R"(
+def test(value: int) -> int:
+    while value > 0:
+        value -= 1
+    return value
+)";
+
+  Ref<PyFunctionObject> func(compileStaticAndGet(source, "test"));
+  ASSERT_NE(func, nullptr);
+  Ref<> bad_local = makeRaiseOnceIndex();
+  ASSERT_NE(bad_local, nullptr);
+  ScopedPreloadTestCleanup cleanup;
+  int deletion_calls = 0;
+  ScopedModuleDeletionCallback callback{&deletion_calls};
+
+  jit::Result result = jit::Result::OK;
+  bool cpp_exception_escaped = false;
+  std::string cpp_exception_message;
+  {
+    ScopedStaticArgChecksReplacement replacement{
+        func->func_code, bad_local};
+    try {
+      result = jit::compileFunctionWithOSR(func);
+    } catch (const std::exception& exn) {
+      cpp_exception_escaped = true;
+      cpp_exception_message = exn.what();
+    }
+  }
+
+  EXPECT_FALSE(cpp_exception_escaped) << cpp_exception_message;
+  EXPECT_EQ(result, jit::Result::UNKNOWN_ERROR);
+  EXPECT_EQ(PyErr_Occurred(), nullptr);
+  EXPECT_TRUE(hir::preloaderManager().empty());
+  Ref<> index_calls =
+      Ref<>::steal(PyObject_GetAttrString(bad_local, "calls"));
+  ASSERT_NE(index_calls, nullptr);
+  EXPECT_EQ(PyLong_AsLong(index_calls), 1);
+  EXPECT_TRUE(callback.isReplacementInstalled());
+  callback.ensureReplacementInstalled();
 }
 
 } // namespace
