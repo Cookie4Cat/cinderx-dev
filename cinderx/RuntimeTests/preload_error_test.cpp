@@ -102,9 +102,7 @@ void replaceTupleItem(
 // the Preloader's borrowed map keys alive on every exit path.
 class ScopedCodeConstsReplacement {
  public:
-  ScopedCodeConstsReplacement(
-      BorrowedRef<PyCodeObject> code,
-      int const_index)
+  ScopedCodeConstsReplacement(BorrowedRef<PyCodeObject> code, int const_index)
       : code_(code.get()), original_consts_(Ref<>::create(code->co_consts)) {
     Py_ssize_t size = PyTuple_GET_SIZE(code->co_consts);
     if (const_index < 0 || const_index >= size) {
@@ -134,8 +132,8 @@ class ScopedCodeConstsReplacement {
   }
 
   ScopedCodeConstsReplacement(const ScopedCodeConstsReplacement&) = delete;
-  ScopedCodeConstsReplacement& operator=(
-      const ScopedCodeConstsReplacement&) = delete;
+  ScopedCodeConstsReplacement& operator=(const ScopedCodeConstsReplacement&) =
+      delete;
 
  private:
   PyCodeObject* code_;
@@ -163,8 +161,7 @@ class ScopedStaticArgChecksReplacement {
       throw std::runtime_error{"unexpected Static Python type metadata"};
     }
 
-    Ref<> checks =
-        cloneTuple(PyTuple_GET_ITEM(static_type_info.get(), 0));
+    Ref<> checks = cloneTuple(PyTuple_GET_ITEM(static_type_info.get(), 0));
     if (PyTuple_GET_SIZE(checks.get()) < 2) {
       throw std::runtime_error{"Static Python function has no argument checks"};
     }
@@ -179,8 +176,8 @@ class ScopedStaticArgChecksReplacement {
     Py_SETREF(code_->co_consts, original_consts_.release());
   }
 
-  ScopedStaticArgChecksReplacement(
-      const ScopedStaticArgChecksReplacement&) = delete;
+  ScopedStaticArgChecksReplacement(const ScopedStaticArgChecksReplacement&) =
+      delete;
   ScopedStaticArgChecksReplacement& operator=(
       const ScopedStaticArgChecksReplacement&) = delete;
 
@@ -213,8 +210,7 @@ class ScopedModuleDeletionCallback {
 
   bool isReplacementInstalled() const {
     const auto* callback =
-        state_->unit_deleted_during_preload
-            .target<CountingDeletionCallback>();
+        state_->unit_deleted_during_preload.target<CountingDeletionCallback>();
     return callback != nullptr && callback->calls == calls_;
   }
 
@@ -228,8 +224,8 @@ class ScopedModuleDeletionCallback {
   }
 
   ScopedModuleDeletionCallback(const ScopedModuleDeletionCallback&) = delete;
-  ScopedModuleDeletionCallback& operator=(
-      const ScopedModuleDeletionCallback&) = delete;
+  ScopedModuleDeletionCallback& operator=(const ScopedModuleDeletionCallback&) =
+      delete;
 
  private:
   cinderx::ModuleState* state_;
@@ -251,12 +247,8 @@ Ref<> importCinderJitModule() {
   return Ref<>::steal(PyImport_ImportModule("cinderx.jit"));
 }
 
-Ref<> callJitOneArg(
-    BorrowedRef<> module,
-    const char* name,
-    BorrowedRef<> arg) {
-  return Ref<>::steal(
-      PyObject_CallMethod(module.get(), name, "O", arg.get()));
+Ref<> callJitOneArg(BorrowedRef<> module, const char* name, BorrowedRef<> arg) {
+  return Ref<>::steal(PyObject_CallMethod(module.get(), name, "O", arg.get()));
 }
 
 Ref<> callPrecompileAll(BorrowedRef<> module) {
@@ -393,8 +385,7 @@ def test(value: int) -> int:
   bool cpp_exception_escaped = false;
   std::string cpp_exception_message;
   {
-    ScopedStaticArgChecksReplacement replacement{
-        func->func_code, bad_local};
+    ScopedStaticArgChecksReplacement replacement{func->func_code, bad_local};
     try {
       (void)jit::preloadFuncAndDeps(func);
     } catch (const std::runtime_error& exn) {
@@ -403,8 +394,7 @@ def test(value: int) -> int:
     }
 
     EXPECT_TRUE(cpp_exception_escaped);
-    EXPECT_NE(
-        cpp_exception_message.find("hit bad local"), std::string::npos);
+    EXPECT_NE(cpp_exception_message.find("hit bad local"), std::string::npos);
     EXPECT_TRUE(PyErr_ExceptionMatches(PyExc_OverflowError));
     EXPECT_GT(deletion_calls, 0);
     PyErr_Clear();
@@ -440,11 +430,9 @@ def test(value: int) -> int:
   bool cpp_exception_escaped = false;
   std::string cpp_exception_message;
   {
-    ScopedStaticArgChecksReplacement replacement{
-        func->func_code, bad_local};
+    ScopedStaticArgChecksReplacement replacement{func->func_code, bad_local};
     try {
-      result =
-          callJitOneArg(jit_module, "force_compile", func.getObj());
+      result = callJitOneArg(jit_module, "force_compile", func.getObj());
     } catch (const std::exception& exn) {
       cpp_exception_escaped = true;
       cpp_exception_message = exn.what();
@@ -489,8 +477,7 @@ def test(value):
   int deletion_calls = 0;
   ScopedModuleDeletionCallback callback{&deletion_calls};
 
-  Ref<> lazy_result =
-      callJitOneArg(jit_module, "lazy_compile", func.getObj());
+  Ref<> lazy_result = callJitOneArg(jit_module, "lazy_compile", func.getObj());
   ASSERT_NE(lazy_result, nullptr);
   ASSERT_EQ(lazy_result.get(), Py_True);
 
@@ -503,8 +490,7 @@ def test(value):
     ScopedStaticArgChecksReplacement replacement{
         bad_target->func_code, bad_local};
     try {
-      result = Ref<>::steal(
-          PyObject_CallOneArg(func.getObj(), arg.get()));
+      result = Ref<>::steal(PyObject_CallOneArg(func.getObj(), arg.get()));
     } catch (const std::exception& exn) {
       cpp_exception_escaped = true;
       cpp_exception_message = exn.what();
@@ -536,8 +522,7 @@ def test(value: int) -> int:
   int deletion_calls = 0;
   ScopedModuleDeletionCallback callback{&deletion_calls};
 
-  Ref<> lazy_result =
-      callJitOneArg(jit_module, "lazy_compile", func.getObj());
+  Ref<> lazy_result = callJitOneArg(jit_module, "lazy_compile", func.getObj());
   ASSERT_NE(lazy_result, nullptr);
   ASSERT_EQ(lazy_result.get(), Py_True);
 
@@ -579,8 +564,7 @@ def test(value: int) -> int:
   int deletion_calls = 0;
   ScopedModuleDeletionCallback callback{&deletion_calls};
 
-  Ref<> lazy_result =
-      callJitOneArg(jit_module, "lazy_compile", func.getObj());
+  Ref<> lazy_result = callJitOneArg(jit_module, "lazy_compile", func.getObj());
   ASSERT_NE(lazy_result, nullptr);
   ASSERT_EQ(lazy_result.get(), Py_True);
 
@@ -588,8 +572,7 @@ def test(value: int) -> int:
   bool cpp_exception_escaped = false;
   std::string cpp_exception_message;
   {
-    ScopedStaticArgChecksReplacement replacement{
-        func->func_code, bad_local};
+    ScopedStaticArgChecksReplacement replacement{func->func_code, bad_local};
     try {
       result = callPrecompileAll(jit_module);
     } catch (const std::exception& exn) {
@@ -632,8 +615,7 @@ def test(value: int) -> int:
   bool cpp_exception_escaped = false;
   std::string cpp_exception_message;
   {
-    ScopedStaticArgChecksReplacement replacement{
-        func->func_code, bad_local};
+    ScopedStaticArgChecksReplacement replacement{func->func_code, bad_local};
     try {
       result = jit::compileFunctionWithOSR(func);
     } catch (const std::exception& exn) {

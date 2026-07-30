@@ -60,6 +60,5 @@ TEST_F(SetRuntimeErrorTest, ReplacesExistingPythonException) {
   EXPECT_TRUE(PyErr_ExceptionMatches(PyExc_RuntimeError));
   EXPECT_EQ(takeRaisedExceptionMessage(), "the C++ error wins");
   EXPECT_NE(stderr_output.find("ValueError"), std::string::npos);
-  EXPECT_NE(
-      stderr_output.find("the original Python error"), std::string::npos);
+  EXPECT_NE(stderr_output.find("the original Python error"), std::string::npos);
 }
