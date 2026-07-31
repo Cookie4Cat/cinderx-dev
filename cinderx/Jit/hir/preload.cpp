@@ -64,6 +64,10 @@ void fill_primitive_arg_types_func(
   auto prim_args_info =
       Ref<_PyTypedArgsInfo>::steal(_PyClassLoader_GetTypedArgsInfo(
           reinterpret_cast<PyCodeObject*>(func->func_code), 1));
+  JIT_THROW_IF(
+      prim_args_info == nullptr,
+      "Failed to load primitive argument type information for function {}",
+      funcFullname(func));
   _fill_primitive_arg_types_helper(prim_args_info, map);
 }
 
@@ -73,6 +77,10 @@ void fill_primitive_arg_types_thunk(
     PyObject* container) {
   auto prim_args_info = Ref<_PyTypedArgsInfo>::steal(
       _PyClassLoader_GetTypedArgsInfoFromThunk(thunk, container, 1));
+  JIT_THROW_IF(
+      prim_args_info == nullptr,
+      "Failed to load primitive argument type information for thunk {}",
+      repr(thunk));
 
   _fill_primitive_arg_types_helper(prim_args_info, map);
 }

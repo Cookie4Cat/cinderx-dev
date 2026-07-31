@@ -366,6 +366,44 @@ def test(value: int) -> int:
 
 TEST_F(
     PreloaderErrorPropagationTest,
+    FailedPrimitiveTargetArgTypeLoadThrowsDuringPreload) {
+  const char* source = R"(
+from __static__ import int64
+
+def target(value: int64) -> int64:
+    return value
+
+def test(value: int64) -> int64:
+    return target(value)
+)";
+
+  Ref<PyFunctionObject> func(compileStaticAndGet(source, "test"));
+  ASSERT_NE(func, nullptr);
+  Ref<PyFunctionObject> target(getGlobal("target"));
+  ASSERT_NE(target, nullptr);
+  ScopedPreloadTestCleanup cleanup;
+  Ref<> invalid_descr = Ref<>::create(Py_None);
+  ScopedStaticArgChecksReplacement replacement{
+      target->func_code, invalid_descr, 1};
+
+  try {
+    (void)jit::hir::Preloader::make(
+        func, jit::makeFrameReifier(func->func_code));
+    FAIL() << "expected primitive argument type loading to fail";
+  } catch (const std::runtime_error& exn) {
+    std::string message{exn.what()};
+    EXPECT_NE(
+        message.find(
+            "Failed to load primitive argument type information for function"),
+        std::string::npos)
+        << message;
+    EXPECT_NE(message.find("jittestmodule:target"), std::string::npos)
+        << message;
+  }
+}
+
+TEST_F(
+    PreloaderErrorPropagationTest,
     RestoresUnitDeletionCallbackAfterSuccessfulPreload) {
   const char* source = R"(
 def test(value: int) -> int:
