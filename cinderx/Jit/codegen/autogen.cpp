@@ -1464,7 +1464,8 @@ void translateStorePair(Environ* env, const Instruction* instr) {
       x86::qword_ptr(base, offset + kPointerSize),
       x86::gpq(instr->getInput(3)->getPhyRegister().loc));
 #elif defined(CINDER_AARCH64)
-  auto base = a64::x(instr->getInput(1)->getPhyRegister().loc);
+  auto base_location = instr->getInput(1)->getPhyRegister();
+  auto base = base_location == SP ? a64::sp : a64::x(base_location.loc);
   // stp signed offset range is -512..504. Fall back to two str instructions
   // when the offset is out of range.
   if (Support::isInt7(offset >> 3)) {
@@ -1481,6 +1482,47 @@ void translateStorePair(Environ* env, const Instruction* instr) {
         a64::ptr(base, offset + kPointerSize));
   }
 #else
+  CINDER_UNSUPPORTED
+#endif
+}
+
+// Load consecutive pointer-width values into two GP registers. This opcode is
+// created only after register allocation, so inputs 2 and 3 are codegen-only
+// hidden definitions rather than ordinary LIR uses.
+void translateLoadPair(Environ* env, const Instruction* instr) {
+  JIT_DCHECK(
+      instr->getNumInputs() == 4,
+      "LoadPair expects exactly 4 inputs (offset, base, dst0, dst1)");
+
+#if defined(CINDER_AARCH64)
+  int32_t offset = static_cast<int32_t>(instr->getInput(0)->getConstant());
+  auto base_location = instr->getInput(1)->getPhyRegister();
+  auto dst0_location = instr->getInput(2)->getPhyRegister();
+  auto dst1_location = instr->getInput(3)->getPhyRegister();
+  JIT_CHECK(
+      base_location == SP ||
+          (base_location.is_gp_register() && base_location != XZR),
+      "LoadPair base is not a valid Xn/SP address register");
+  JIT_CHECK(
+      dst0_location.is_gp_register() && dst0_location != X29 &&
+          dst0_location != XZR && dst1_location.is_gp_register() &&
+          dst1_location != X29 && dst1_location != XZR &&
+          dst0_location != dst1_location && dst0_location != base_location &&
+          dst1_location != base_location,
+      "LoadPair destinations violate the post-RA hidden-definition contract");
+  auto base = base_location == SP ? a64::sp : a64::x(base_location.loc);
+  JIT_CHECK(
+      offset % kPointerSize == 0 && Support::isInt7(offset / kPointerSize),
+      "LoadPair offset is not encodable: {}",
+      offset);
+
+  env->as->ldp(
+      AutoTranslator::getGp(instr->getInput(2), dst0_location.loc),
+      AutoTranslator::getGp(instr->getInput(3), dst1_location.loc),
+      a64::ptr(base, offset));
+#else
+  (void)env;
+  (void)instr;
   CINDER_UNSUPPORTED
 #endif
 }
@@ -2460,6 +2502,28 @@ void translateMove(Environ* env, const Instruction* instr) {
             output->getMemoryIndirect(),
             output->dataType());
 
+        // Register encoding 31 is context-sensitive on AArch64.  Use the
+        // assembler's explicit zero-register operands here instead of routing
+        // XZR/WZR through the ordinary physical-register representation,
+        // where it may be interpreted as SP.
+        if (!input->isFp() && input->getConstant() == 0) {
+          switch (output->dataType()) {
+            case OperandBase::k8bit:
+              as->strb(a64::wzr, ptr);
+              break;
+            case OperandBase::k16bit:
+              as->strh(a64::wzr, ptr);
+              break;
+            case OperandBase::k32bit:
+              as->str(a64::wzr, ptr);
+              break;
+            default:
+              as->str(a64::xzr, ptr);
+              break;
+          }
+          break;
+        }
+
         // Use the output's data type to determine the store width.
         switch (output->dataType()) {
           case OperandBase::k8bit:
@@ -2810,6 +2874,39 @@ void translateMulAdd(Environ* env, const Instruction* instr) {
   // madd Rd, Rn, Rm, Ra  =>  Rd = Ra + Rn * Rm
   as->madd(
       AT::getGp(output), AT::getGp(opnd0), AT::getGp(opnd1), AT::getGp(opnd2));
+}
+
+void translateMulSub(Environ* env, const Instruction* instr) {
+  a64::Builder* as = env->as;
+
+  auto* output = instr->output();
+  auto* multiplier = instr->getInput(0);
+  auto* multiplicand = instr->getInput(1);
+  auto* accumulator = instr->getInput(2);
+
+  JIT_CHECK(output->isReg(), "Expected output to be a register");
+  JIT_CHECK(multiplier->isReg(), "Expected multiplier to be a register");
+  JIT_CHECK(multiplicand->isReg(), "Expected multiplicand to be a register");
+  JIT_CHECK(accumulator->isReg(), "Expected accumulator to be a register");
+
+  // msub Rd, Rn, Rm, Ra  =>  Rd = Ra - Rn * Rm
+  as->msub(
+      AT::getGp(output),
+      AT::getGp(multiplier),
+      AT::getGp(multiplicand),
+      AT::getGp(accumulator));
+}
+
+void translateA64SubSetFlags(Environ* env, const Instruction* instr) {
+  auto* output = instr->output();
+  auto* lhs = instr->getInput(0);
+  auto* rhs = instr->getInput(1);
+
+  JIT_CHECK(output->isReg(), "Expected output to be a register");
+  JIT_CHECK(lhs->isReg(), "Expected lhs to be a register");
+  JIT_CHECK(rhs->isReg(), "Expected rhs to be a register");
+
+  env->as->subs(AT::getGp(output), AT::getGp(lhs), AT::getGp(rhs));
 }
 
 template <typename EmitFn>
@@ -3681,6 +3778,9 @@ void AutoTranslator::translateInstr(Environ* env, const Instruction* instr)
     case Instruction::kSext:
     case Instruction::kZext:
     case Instruction::kMulAdd:
+    case Instruction::kMulSub:
+    case Instruction::kLoadPair:
+    case Instruction::kA64SubSetFlags:
     case Instruction::kLoadArg:
     case Instruction::kLoadSecondCallResult:
     case Instruction::kMovConstPool:
@@ -3965,6 +4065,12 @@ void AutoTranslator::translateInstr(Environ* env, const Instruction* instr)
     case Instruction::kMulAdd:
       translateMulAdd(env, instr);
       return;
+    case Instruction::kMulSub:
+      translateMulSub(env, instr);
+      return;
+    case Instruction::kA64SubSetFlags:
+      translateA64SubSetFlags(env, instr);
+      return;
     case Instruction::kReserveStack:
       translateReserveStack(env, instr);
       return;
@@ -3973,6 +4079,9 @@ void AutoTranslator::translateInstr(Environ* env, const Instruction* instr)
       return;
     case Instruction::kStorePair:
       translateStorePair(env, instr);
+      return;
+    case Instruction::kLoadPair:
+      translateLoadPair(env, instr);
       return;
     case Instruction::kLeave:
       translateLeave(env);

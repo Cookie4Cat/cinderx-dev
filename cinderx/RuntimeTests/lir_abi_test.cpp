@@ -776,6 +776,35 @@ TEST_F(LIRABITest, TestkMulAdd_OutPhyReg_PhyReg_PhyReg_PhyReg) {
       makePhyReg(2),
       makePhyReg(3));
 }
+
+// kMulSub R r r r
+TEST_F(LIRABITest, TestkMulSub_OutPhyReg_PhyReg_PhyReg_PhyReg) {
+  translateInstr(
+      Instruction::kMulSub,
+      makeOutPhyReg(0),
+      makePhyReg(1),
+      makePhyReg(2),
+      makePhyReg(3));
+}
+
+// kA64SubSetFlags R r r
+TEST_F(LIRABITest, TestkA64SubSetFlags_OutPhyReg_PhyReg_PhyReg) {
+  translateInstr(
+      Instruction::kA64SubSetFlags,
+      makeOutPhyReg(0),
+      makePhyReg(1),
+      makePhyReg(2));
+}
+
+// kLoadPair i r r r (the final two operands are post-RA hidden definitions)
+TEST_F(LIRABITest, TestkLoadPair_Imm_PhyReg_PhyReg_PhyReg) {
+  translateInstr(
+      Instruction::kLoadPair,
+      Imm{0},
+      makePhyReg(1),
+      makePhyReg(2),
+      makePhyReg(3));
+}
 #endif
 
 // kDiv r r r

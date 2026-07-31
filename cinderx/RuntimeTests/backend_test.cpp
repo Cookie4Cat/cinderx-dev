@@ -16,10 +16,16 @@
 #include "cinderx/Jit/lir/postalloc.h"
 #include "cinderx/Jit/lir/postgen.h"
 #include "cinderx/Jit/lir/regalloc.h"
+#include "cinderx/Jit/lir/target_select.h"
 #include "cinderx/RuntimeTests/fixtures.h"
 #include "cinderx/module_state.h"
 
+#include <array>
+#include <cmath>
+#include <cstring>
 #include <functional>
+#include <iterator>
+#include <limits>
 // NOLINTNEXTLINE(facebook-hte-BadInclude-regex)
 #include <regex>
 #include <sstream>
@@ -39,7 +45,10 @@ class BackendTest : public RuntimeTest {
   // the function is self-contained.
   // this function is used to test LIR, rewrite passes, register allocation,
   // and machine code generation.
-  void* SimpleCompile(Function* lir_func, int arg_buffer_size = 0) {
+  void* SimpleCompile(
+      Function* lir_func,
+      int arg_buffer_size = 0,
+      size_t* code_size = nullptr) {
     Environ environ;
     InitEnviron(environ);
     PostGenerationRewrite post_gen(lir_func, &environ);
@@ -197,6 +206,9 @@ class BackendTest : public RuntimeTest {
 
     as.finalize();
 
+    if (code_size != nullptr) {
+      *code_size = code.codeSize();
+    }
     AllocateResult result = code_allocator->addCode(&code);
     EXPECT_EQ(result.error, asmjit::kErrorOk);
     EXPECT_TRUE(code_allocator->contains(result.addr))
@@ -268,10 +280,23 @@ class BackendTest : public RuntimeTest {
     return out.str();
   }
 
+  // Exercise the complete pipeline used by the new pre-RA AArch64 rules.
+  // SimpleCompile intentionally starts after target selection because most
+  // backend tests construct already-selected LIR.
+  void* CompileAfterTargetSelect(
+      Function* lir_func,
+      size_t* code_size = nullptr) {
+    selectTargetOpcodes(lir_func);
+    return SimpleCompile(lir_func, 0, code_size);
+  }
+
   // Compile pre-allocated LIR (physical registers + stack slots) directly to
   // machine code, bypassing register allocation.  Used for tests that need
   // precise control over which registers and stack slots are used.
-  void* CompilePreAllocated(Function* lir_func, int spill_size) {
+  void* CompilePreAllocated(
+      Function* lir_func,
+      int spill_size,
+      size_t* code_size = nullptr) {
     Environ environ;
     InitEnviron(environ);
 
@@ -315,6 +340,9 @@ class BackendTest : public RuntimeTest {
 
     as.finalize();
 
+    if (code_size != nullptr) {
+      *code_size = code.codeSize();
+    }
     AllocateResult result = code_allocator->addCode(&code);
     EXPECT_EQ(result.error, asmjit::kErrorOk);
     Function* caller_owned_lir_func = gen->lir_func_.release();
@@ -954,6 +982,129 @@ TEST_F(BackendTest, ManyArguments) {
 
   ASSERT_DOUBLE_EQ(result, expected);
 }
+
+#if defined(CINDER_AARCH64)
+namespace {
+uint64_t tenIntegerArguments(
+    uint64_t a0,
+    uint64_t a1,
+    uint64_t a2,
+    uint64_t a3,
+    uint64_t a4,
+    uint64_t a5,
+    uint64_t a6,
+    uint64_t a7,
+    uint64_t a8,
+    uint64_t a9) {
+  return a0 + 2 * a1 + 3 * a2 + 4 * a3 + 5 * a4 + 6 * a5 + 7 * a6 + 8 * a7 +
+      9 * a8 + 10 * a9;
+}
+} // namespace
+
+TEST_F(BackendTest, AArch64StackArgumentImmediateStoresFallBackEndToEnd) {
+  constexpr uint64_t kArgs[] = {1, 2, 3, 4, 5, 6, 7, 8, 42, 42};
+
+  auto lirfunc = std::make_unique<Function>();
+  auto* block = lirfunc->allocateBasicBlock();
+  auto* call = block->allocateInstr(
+      Instruction::kCall,
+      nullptr,
+      OutVReg{DataType::k64bit},
+      Imm{reinterpret_cast<uint64_t>(tenIntegerArguments)});
+  for (uint64_t arg : kArgs) {
+    call->allocateImmediateInput(arg, DataType::k64bit);
+  }
+  block->allocateInstr(
+      Instruction::kMove,
+      nullptr,
+      OutPhyReg{arch::reg_general_return_loc, DataType::k64bit},
+      VReg{call});
+  block->allocateInstr(Instruction::kReturn, nullptr);
+  auto* epilogue = lirfunc->allocateBasicBlock();
+  block->addSuccessor(epilogue);
+
+  size_t code_size = 0;
+  auto* raw_func = SimpleCompile(lirfunc.get(), 16, &code_size);
+  auto func = reinterpret_cast<uint64_t (*)()>(raw_func);
+  ASSERT_NE(func, nullptr);
+  ASSERT_GT(code_size, 0);
+  EXPECT_EQ(
+      func(),
+      tenIntegerArguments(
+          kArgs[0],
+          kArgs[1],
+          kArgs[2],
+          kArgs[3],
+          kArgs[4],
+          kArgs[5],
+          kArgs[6],
+          kArgs[7],
+          kArgs[8],
+          kArgs[9]));
+
+  std::ostringstream out;
+  Disassembler dis{reinterpret_cast<const char*>(raw_func), code_size};
+  dis.setPrintAddr(false);
+  dis.setPrintInstBytes(false);
+  dis.disassembleAll(out);
+  const std::string disasm = out.str();
+  // rewriteRegularFunction keeps small immediate stack arguments as
+  // immediate-to-memory Moves.  They therefore do not satisfy the
+  // register-source StorePair guard.  Exercise that real ABI path and require
+  // the conservative scalar fallback; the direct SP-base StorePair test below
+  // separately verifies the eligible register-source lowering.
+  EXPECT_FALSE(std::regex_search(
+      disasm, std::regex{"stp\\s+(x[0-9]+),\\s*\\1,\\s*\\[sp(?:,|\\])"}))
+      << disasm;
+  EXPECT_TRUE(
+      std::regex_search(disasm, std::regex{"str\\s+x[0-9]+,\\s*\\[sp\\]"}))
+      << disasm;
+  EXPECT_TRUE(std::regex_search(
+      disasm, std::regex{"str\\s+x[0-9]+,\\s*\\[sp,\\s*#8\\]"}))
+      << disasm;
+}
+
+TEST_F(BackendTest, AArch64StackStorePairExecutesWithDistinctSources) {
+  auto lirfunc = std::make_unique<Function>();
+  auto* block = lirfunc->allocateBasicBlock();
+  auto* lower_store = block->allocateInstr(
+      Instruction::kMove,
+      nullptr,
+      OutInd{SP, 0, DataType::kObject},
+      PhyReg{ARGUMENT_REGS[0], DataType::k64bit});
+  lower_store->output()->setDataType(DataType::kObject);
+  auto* upper_store = block->allocateInstr(
+      Instruction::kMove,
+      nullptr,
+      OutInd{SP, 8, DataType::kObject},
+      PhyReg{ARGUMENT_REGS[1], DataType::k64bit});
+  upper_store->output()->setDataType(DataType::kObject);
+
+  size_t code_size = 0;
+  auto* raw_func = SimpleCompile(lirfunc.get(), 16, &code_size);
+  auto func = reinterpret_cast<void (*)(uint64_t, uint64_t)>(raw_func);
+  ASSERT_NE(func, nullptr);
+  ASSERT_GT(code_size, 0);
+
+  // Returning after the local stack write validates that the pair did not
+  // corrupt the frame record or stack restoration.
+  func(0x1122334455667788, 0x99aabbccddeeff00);
+
+  std::ostringstream out;
+  Disassembler dis{reinterpret_cast<const char*>(raw_func), code_size};
+  dis.setPrintAddr(false);
+  dis.setPrintInstBytes(false);
+  dis.disassembleAll(out);
+  const std::string disasm = out.str();
+  const std::regex pair{"stp\\s+x0,\\s*x1,\\s*\\[sp(?:,|\\])"};
+  EXPECT_EQ(
+      std::distance(
+          std::sregex_iterator(disasm.begin(), disasm.end(), pair),
+          std::sregex_iterator()),
+      1)
+      << disasm;
+}
+#endif
 
 namespace {
 static double add(double a, double b) {
@@ -1746,6 +1897,1426 @@ TEST_F(BackendTest, RegSwapK32bitTruncates64BitValues) {
       << "k32bit swap should NOT preserve full 64-bit value";
   EXPECT_EQ(result & 0xFFFFFFFF00000000ULL, 0ULL)
       << "k32bit swap should zero upper 32 bits, got 0x" << std::hex << result;
+}
+
+TEST_F(BackendTest, AArch64ZeroRegisterStoresPreserveCanaries) {
+  auto lirfunc = std::make_unique<Function>();
+  auto* block = lirfunc->allocateBasicBlock();
+
+  struct StoreCase {
+    int32_t offset;
+    DataType type;
+    size_t width;
+  };
+  constexpr StoreCase kStores[] = {
+      {1, DataType::k8bit, 1},
+      {4, DataType::k16bit, 2},
+      {8, DataType::k32bit, 4},
+      {16, DataType::k64bit, 8},
+      {32, DataType::kObject, 8},
+  };
+
+  for (const auto& store_case : kStores) {
+    auto* store = block->allocateInstr(
+        Instruction::kMove,
+        nullptr,
+        OutInd{ARGUMENT_REGS[0], store_case.offset, store_case.type},
+        Imm{0, store_case.type});
+    store->output()->setDataType(store_case.type);
+  }
+
+  size_t code_size = 0;
+  auto func = reinterpret_cast<void (*)(uint8_t*)>(
+      CompilePreAllocated(lirfunc.release(), 16, &code_size));
+  ASSERT_NE(func, nullptr);
+  ASSERT_GT(code_size, 0);
+
+  std::array<uint8_t, 48> bytes;
+  bytes.fill(0xA5);
+  func(bytes.data());
+
+  std::array<bool, 48> should_be_zero{};
+  for (const auto& store_case : kStores) {
+    for (size_t i = 0; i < store_case.width; i++) {
+      should_be_zero[store_case.offset + i] = true;
+    }
+  }
+  for (size_t i = 0; i < bytes.size(); i++) {
+    EXPECT_EQ(bytes[i], should_be_zero[i] ? 0 : 0xA5)
+        << "unexpected byte at offset " << i;
+  }
+
+  std::ostringstream out;
+  Disassembler dis{reinterpret_cast<const char*>(func), code_size};
+  dis.setPrintAddr(false);
+  dis.setPrintInstBytes(false);
+  dis.disassembleAll(out);
+  const std::string disasm = out.str();
+
+  EXPECT_TRUE(std::regex_search(disasm, std::regex{"stu?rb\\s+wzr"})) << disasm;
+  EXPECT_TRUE(std::regex_search(disasm, std::regex{"stu?rh\\s+wzr"})) << disasm;
+  EXPECT_TRUE(std::regex_search(disasm, std::regex{"stu?r\\s+wzr"})) << disasm;
+  const std::regex xzr_store{"stu?r\\s+xzr"};
+  const auto xzr_store_count = std::distance(
+      std::sregex_iterator(disasm.begin(), disasm.end(), xzr_store),
+      std::sregex_iterator());
+  EXPECT_GE(xzr_store_count, 2) << disasm;
+  EXPECT_FALSE(std::regex_search(disasm, std::regex{"stu?r(b|h)?\\s+(wsp|sp)"}))
+      << disasm;
+}
+
+TEST_F(BackendTest, AArch64ZeroRegisterStoresFoldMaterializationsEndToEnd) {
+  auto lirfunc = std::make_unique<Function>();
+  auto* block = lirfunc->allocateBasicBlock();
+
+  struct StoreCase {
+    PhyLocation temporary;
+    int32_t offset;
+    DataType type;
+    size_t width;
+  };
+  constexpr StoreCase kStores[] = {
+      {X8, 1, DataType::k8bit, 1},
+      {X9, 3, DataType::k16bit, 2},
+      {X10, 7, DataType::k32bit, 4},
+      {X11, 15, DataType::k64bit, 8},
+      {X12, 31, DataType::kObject, 8},
+  };
+
+  for (const auto& store_case : kStores) {
+    block->allocateInstr(
+        Instruction::kMove,
+        nullptr,
+        OutPhyReg{store_case.temporary, store_case.type},
+        Imm{0, store_case.type});
+    auto* store = block->allocateInstr(
+        Instruction::kMove,
+        nullptr,
+        OutInd{ARGUMENT_REGS[0], store_case.offset, store_case.type},
+        PhyReg{store_case.temporary, store_case.type});
+    store->output()->setDataType(store_case.type);
+    store->getInput(0)->setLastUse();
+  }
+
+  size_t code_size = 0;
+  auto func = reinterpret_cast<void (*)(uint8_t*)>(
+      CompilePreAllocated(lirfunc.release(), 16, &code_size));
+  ASSERT_NE(func, nullptr);
+  ASSERT_GT(code_size, 0);
+
+  std::array<uint8_t, 48> bytes;
+  bytes.fill(0xA5);
+  func(bytes.data());
+
+  std::array<bool, 48> should_be_zero{};
+  for (const auto& store_case : kStores) {
+    for (size_t i = 0; i < store_case.width; i++) {
+      should_be_zero[store_case.offset + i] = true;
+    }
+  }
+  for (size_t i = 0; i < bytes.size(); i++) {
+    EXPECT_EQ(bytes[i], should_be_zero[i] ? 0 : 0xA5)
+        << "unexpected byte at offset " << i;
+  }
+
+  std::ostringstream out;
+  Disassembler dis{reinterpret_cast<const char*>(func), code_size};
+  dis.setPrintAddr(false);
+  dis.setPrintInstBytes(false);
+  dis.disassembleAll(out);
+  const std::string disasm = out.str();
+
+  EXPECT_TRUE(std::regex_search(disasm, std::regex{"stu?rb\\s+wzr"})) << disasm;
+  EXPECT_TRUE(std::regex_search(disasm, std::regex{"stu?rh\\s+wzr"})) << disasm;
+  EXPECT_TRUE(std::regex_search(disasm, std::regex{"stu?r\\s+wzr"})) << disasm;
+  const std::regex xzr_store{"stu?r\\s+xzr"};
+  const auto xzr_store_count = std::distance(
+      std::sregex_iterator(disasm.begin(), disasm.end(), xzr_store),
+      std::sregex_iterator());
+  EXPECT_GE(xzr_store_count, 2) << disasm;
+  EXPECT_FALSE(std::regex_search(disasm, std::regex{"stu?r(b|h)?\\s+(wsp|sp)"}))
+      << disasm;
+}
+
+TEST_F(BackendTest, AArch64ZeroRegisterStoresMoveRelaxedLowersSafely) {
+  auto lirfunc = std::make_unique<Function>();
+  auto* block = lirfunc->allocateBasicBlock();
+
+  auto* store32 = block->allocateInstr(
+      Instruction::kMoveRelaxed,
+      nullptr,
+      OutInd{ARGUMENT_REGS[0], 7, DataType::k32bit},
+      Imm{0, DataType::k32bit});
+  store32->output()->setDataType(DataType::k32bit);
+  auto* store64 = block->allocateInstr(
+      Instruction::kMoveRelaxed,
+      nullptr,
+      OutInd{ARGUMENT_REGS[0], 19, DataType::k64bit},
+      Imm{0, DataType::k64bit});
+  store64->output()->setDataType(DataType::k64bit);
+
+  size_t code_size = 0;
+  auto func = reinterpret_cast<void (*)(uint8_t*)>(
+      CompilePreAllocated(lirfunc.release(), 16, &code_size));
+  ASSERT_NE(func, nullptr);
+  ASSERT_GT(code_size, 0);
+
+  std::array<uint8_t, 40> bytes;
+  bytes.fill(0xA5);
+  func(bytes.data());
+  for (size_t i = 0; i < bytes.size(); i++) {
+    const bool should_be_zero = (i >= 7 && i < 11) || (i >= 19 && i < 27);
+    EXPECT_EQ(bytes[i], should_be_zero ? 0 : 0xA5)
+        << "unexpected byte at offset " << i;
+  }
+
+  std::ostringstream out;
+  Disassembler dis{reinterpret_cast<const char*>(func), code_size};
+  dis.setPrintAddr(false);
+  dis.setPrintInstBytes(false);
+  dis.disassembleAll(out);
+  const std::string disasm = out.str();
+  EXPECT_TRUE(std::regex_search(disasm, std::regex{"stu?r\\s+wzr"})) << disasm;
+  EXPECT_TRUE(std::regex_search(disasm, std::regex{"stu?r\\s+xzr"})) << disasm;
+  EXPECT_FALSE(std::regex_search(disasm, std::regex{"stu?r(b|h)?\\s+(wsp|sp)"}))
+      << disasm;
+}
+
+TEST_F(BackendTest, AArch64ZeroRegisterStoresExecuteFallbackShapes) {
+  auto lirfunc = std::make_unique<Function>();
+  auto* block = lirfunc->allocateBasicBlock();
+
+  struct StoreCase {
+    PhyLocation temporary;
+    int32_t offset;
+    DataType materialization_type;
+    DataType stored_value_type;
+    DataType store_type;
+    uint64_t value;
+    size_t width;
+  };
+  constexpr StoreCase kStores[] = {
+      {X10, 1, DataType::k64bit, DataType::k8bit, DataType::k8bit, 0, 1},
+      {X10, 3, DataType::k64bit, DataType::k16bit, DataType::k16bit, 0, 2},
+      {X10, 5, DataType::k32bit, DataType::k32bit, DataType::k8bit, 0, 1},
+      {X10, 6, DataType::k32bit, DataType::k32bit, DataType::k16bit, 0, 2},
+      {X10, 8, DataType::k64bit, DataType::k32bit, DataType::k32bit, 0, 4},
+      {X11, 16, DataType::k32bit, DataType::k64bit, DataType::k64bit, 0, 8},
+      {X12, 32, DataType::k8bit, DataType::k8bit, DataType::k8bit, 0x7b, 1},
+      {X13,
+       34,
+       DataType::k16bit,
+       DataType::k16bit,
+       DataType::k16bit,
+       0xa1b2,
+       2},
+      {X14,
+       40,
+       DataType::k32bit,
+       DataType::k32bit,
+       DataType::k32bit,
+       0x11223344,
+       4},
+      {X15,
+       48,
+       DataType::k64bit,
+       DataType::k64bit,
+       DataType::k64bit,
+       0x1122334455667788,
+       8},
+  };
+
+  for (const auto& store_case : kStores) {
+    block->allocateInstr(
+        Instruction::kMove,
+        nullptr,
+        OutPhyReg{store_case.temporary, store_case.materialization_type},
+        Imm{store_case.value, store_case.materialization_type});
+    auto* store = block->allocateInstr(
+        Instruction::kMove,
+        nullptr,
+        OutInd{ARGUMENT_REGS[0], store_case.offset, store_case.store_type},
+        PhyReg{store_case.temporary, store_case.stored_value_type});
+    store->output()->setDataType(store_case.store_type);
+    store->getInput(0)->setLastUse();
+  }
+
+  size_t code_size = 0;
+  auto func = reinterpret_cast<void (*)(uint8_t*)>(
+      CompilePreAllocated(lirfunc.release(), 16, &code_size));
+  ASSERT_NE(func, nullptr);
+  ASSERT_GT(code_size, 0);
+
+  std::array<uint8_t, 64> bytes;
+  bytes.fill(0xA5);
+  func(bytes.data());
+
+  std::array<uint8_t, 64> expected;
+  expected.fill(0xA5);
+  for (const auto& store_case : kStores) {
+    for (size_t i = 0; i < store_case.width; i++) {
+      expected[store_case.offset + i] =
+          static_cast<uint8_t>(store_case.value >> (i * 8));
+    }
+  }
+  EXPECT_EQ(bytes, expected);
+
+  std::ostringstream out;
+  Disassembler dis{reinterpret_cast<const char*>(func), code_size};
+  dis.setPrintAddr(false);
+  dis.setPrintInstBytes(false);
+  dis.disassembleAll(out);
+  const std::string disasm = out.str();
+
+  // Every shape in this test is intentionally ineligible for the peephole:
+  // mismatched widths or a non-zero value.
+  EXPECT_FALSE(
+      std::regex_search(disasm, std::regex{"stu?r(b|h)?\\s+(wzr|xzr)"}))
+      << disasm;
+  EXPECT_FALSE(std::regex_search(disasm, std::regex{"stu?r(b|h)?\\s+(wsp|sp)"}))
+      << disasm;
+}
+
+TEST_F(BackendTest, AArch64FloatingPointZerosPreserveBitPatterns) {
+  auto lirfunc = std::make_unique<Function>();
+  auto* block = lirfunc->allocateBasicBlock();
+
+  constexpr double kPositiveZero = 0.0;
+  constexpr double kNegativeZero = -0.0;
+  auto* positive_store = block->allocateInstr(
+      Instruction::kMove,
+      nullptr,
+      OutInd{ARGUMENT_REGS[0], 8, DataType::kDouble},
+      PhyReg{FP_ARGUMENT_REGS[0], DataType::kDouble});
+  positive_store->output()->setDataType(DataType::kDouble);
+  auto* negative_store = block->allocateInstr(
+      Instruction::kMove,
+      nullptr,
+      OutInd{ARGUMENT_REGS[0], 24, DataType::kDouble},
+      PhyReg{FP_ARGUMENT_REGS[1], DataType::kDouble});
+  negative_store->output()->setDataType(DataType::kDouble);
+
+  size_t code_size = 0;
+  auto func = reinterpret_cast<void (*)(uint8_t*, double, double)>(
+      CompilePreAllocated(lirfunc.release(), 16, &code_size));
+  ASSERT_NE(func, nullptr);
+  ASSERT_GT(code_size, 0);
+
+  std::array<uint8_t, 40> bytes;
+  bytes.fill(0xa5);
+  func(bytes.data(), kPositiveZero, kNegativeZero);
+  std::array<uint8_t, 40> expected;
+  expected.fill(0xa5);
+  std::memcpy(expected.data() + 8, &kPositiveZero, sizeof(kPositiveZero));
+  std::memcpy(expected.data() + 24, &kNegativeZero, sizeof(kNegativeZero));
+  EXPECT_EQ(bytes, expected);
+
+  double stored_positive = 1.0;
+  double stored_negative = 1.0;
+  std::memcpy(&stored_positive, bytes.data() + 8, sizeof(stored_positive));
+  std::memcpy(&stored_negative, bytes.data() + 24, sizeof(stored_negative));
+  EXPECT_EQ(stored_positive, 0.0);
+  EXPECT_FALSE(std::signbit(stored_positive));
+  EXPECT_EQ(stored_negative, 0.0);
+  EXPECT_TRUE(std::signbit(stored_negative));
+
+  std::ostringstream out;
+  Disassembler dis{reinterpret_cast<const char*>(func), code_size};
+  dis.setPrintAddr(false);
+  dis.setPrintInstBytes(false);
+  dis.disassembleAll(out);
+  const std::string disasm = out.str();
+  EXPECT_FALSE(
+      std::regex_search(disasm, std::regex{"stu?r(b|h)?\\s+(wzr|xzr|wsp|sp)"}))
+      << disasm;
+}
+
+TEST_F(BackendTest, AArch64AdjacentStoresFoldToStorePairEndToEnd) {
+  auto lirfunc = std::make_unique<Function>();
+  auto* block = lirfunc->allocateBasicBlock();
+
+  auto* lower_store = block->allocateInstr(
+      Instruction::kMove,
+      nullptr,
+      OutInd{ARGUMENT_REGS[0], 0, DataType::kObject},
+      PhyReg{ARGUMENT_REGS[1], DataType::kObject});
+  lower_store->output()->setDataType(DataType::kObject);
+  auto* upper_store = block->allocateInstr(
+      Instruction::kMove,
+      nullptr,
+      OutInd{ARGUMENT_REGS[0], 8, DataType::kObject},
+      PhyReg{ARGUMENT_REGS[2], DataType::k64bit});
+  upper_store->output()->setDataType(DataType::kObject);
+
+  size_t code_size = 0;
+  auto func = reinterpret_cast<void (*)(uint64_t*, uint64_t, uint64_t)>(
+      CompilePreAllocated(lirfunc.release(), 16, &code_size));
+  ASSERT_NE(func, nullptr);
+  ASSERT_GT(code_size, 0);
+
+  constexpr uint64_t kFirst = 0x1122334455667788;
+  constexpr uint64_t kSecond = 0x99aabbccddeeff00;
+  std::array<uint64_t, 4> values = {
+      0xa5a5a5a5a5a5a5a5,
+      0xa5a5a5a5a5a5a5a5,
+      0xa5a5a5a5a5a5a5a5,
+      0xa5a5a5a5a5a5a5a5,
+  };
+  func(values.data(), kFirst, kSecond);
+
+  EXPECT_EQ(values[0], kFirst);
+  EXPECT_EQ(values[1], kSecond);
+  EXPECT_EQ(values[2], 0xa5a5a5a5a5a5a5a5);
+  EXPECT_EQ(values[3], 0xa5a5a5a5a5a5a5a5);
+
+  std::ostringstream out;
+  Disassembler dis{reinterpret_cast<const char*>(func), code_size};
+  dis.setPrintAddr(false);
+  dis.setPrintInstBytes(false);
+  dis.disassembleAll(out);
+  const std::string disasm = out.str();
+  EXPECT_TRUE(std::regex_search(disasm, std::regex{"stp\\s+x1,\\s*x2"}))
+      << disasm;
+}
+
+TEST_F(
+    BackendTest,
+    AArch64StorePairExecutesAtEightByteButNotSixteenByteAlignedBase) {
+  auto lirfunc = std::make_unique<Function>();
+  auto* block = lirfunc->allocateBasicBlock();
+  auto* lower_store = block->allocateInstr(
+      Instruction::kMove,
+      nullptr,
+      OutInd{ARGUMENT_REGS[0], 0, DataType::kObject},
+      PhyReg{ARGUMENT_REGS[1], DataType::k64bit});
+  lower_store->output()->setDataType(DataType::kObject);
+  auto* upper_store = block->allocateInstr(
+      Instruction::kMove,
+      nullptr,
+      OutInd{ARGUMENT_REGS[0], 8, DataType::kObject},
+      PhyReg{ARGUMENT_REGS[2], DataType::k64bit});
+  upper_store->output()->setDataType(DataType::kObject);
+
+  size_t code_size = 0;
+  auto func = reinterpret_cast<void (*)(uint8_t*, uint64_t, uint64_t)>(
+      CompilePreAllocated(lirfunc.release(), 16, &code_size));
+  ASSERT_NE(func, nullptr);
+  ASSERT_GT(code_size, 0);
+
+  alignas(16) std::array<uint8_t, 48> bytes;
+  bytes.fill(0xa5);
+  auto* base = bytes.data() + 8;
+  ASSERT_EQ(reinterpret_cast<uintptr_t>(base) % 8, 0);
+  ASSERT_EQ(reinterpret_cast<uintptr_t>(base) % 16, 8);
+  constexpr uint64_t kFirst = 0x1122334455667788;
+  constexpr uint64_t kSecond = 0x99aabbccddeeff00;
+  func(base, kFirst, kSecond);
+
+  std::array<uint8_t, 48> expected;
+  expected.fill(0xa5);
+  std::memcpy(expected.data() + 8, &kFirst, sizeof(kFirst));
+  std::memcpy(expected.data() + 16, &kSecond, sizeof(kSecond));
+  EXPECT_EQ(bytes, expected);
+
+  std::ostringstream out;
+  Disassembler dis{reinterpret_cast<const char*>(func), code_size};
+  dis.setPrintAddr(false);
+  dis.setPrintInstBytes(false);
+  dis.disassembleAll(out);
+  const std::string disasm = out.str();
+  const std::regex pair{"stp\\s+x1,\\s*x2"};
+  EXPECT_EQ(
+      std::distance(
+          std::sregex_iterator(disasm.begin(), disasm.end(), pair),
+          std::sregex_iterator()),
+      1)
+      << disasm;
+}
+
+TEST_F(BackendTest, AArch64AdjacentLoadsFoldToLoadPairEndToEnd) {
+  auto lirfunc = std::make_unique<Function>();
+  auto* block = lirfunc->allocateBasicBlock();
+
+  block->allocateInstr(
+      Instruction::kMove,
+      nullptr,
+      OutPhyReg{ARGUMENT_REGS[1], DataType::k64bit},
+      Ind{ARGUMENT_REGS[0], 0, DataType::k64bit});
+  block->allocateInstr(
+      Instruction::kMove,
+      nullptr,
+      OutPhyReg{ARGUMENT_REGS[2], DataType::k64bit},
+      Ind{ARGUMENT_REGS[0], 8, DataType::k64bit});
+  block->allocateInstr(
+      Instruction::kAdd,
+      nullptr,
+      OutPhyReg{ARGUMENT_REGS[0], DataType::k64bit},
+      PhyReg{ARGUMENT_REGS[1], DataType::k64bit},
+      PhyReg{ARGUMENT_REGS[2], DataType::k64bit});
+
+  size_t code_size = 0;
+  auto func = reinterpret_cast<uint64_t (*)(const uint64_t*)>(
+      CompilePreAllocated(lirfunc.release(), 16, &code_size));
+  ASSERT_NE(func, nullptr);
+  ASSERT_GT(code_size, 0);
+
+  constexpr std::array<uint64_t, 4> values = {
+      0x1122334455667788,
+      0x0102030405060708,
+      0xa5a5a5a5a5a5a5a5,
+      0xa5a5a5a5a5a5a5a5,
+  };
+  EXPECT_EQ(func(values.data()), values[0] + values[1]);
+
+  std::ostringstream out;
+  Disassembler dis{reinterpret_cast<const char*>(func), code_size};
+  dis.setPrintAddr(false);
+  dis.setPrintInstBytes(false);
+  dis.disassembleAll(out);
+  const std::string disasm = out.str();
+  const std::regex pair{"ldp\\s+x1,\\s*x2"};
+  EXPECT_EQ(
+      std::distance(
+          std::sregex_iterator(disasm.begin(), disasm.end(), pair),
+          std::sregex_iterator()),
+      1)
+      << disasm;
+}
+
+TEST_F(BackendTest, AArch64MulAddAndMulSubExecuteAtBothGpWidths) {
+  auto compile_op =
+      [this](
+          Instruction::Opcode opcode, DataType data_type, size_t* code_size) {
+        auto lirfunc = std::make_unique<Function>();
+        auto* block = lirfunc->allocateBasicBlock();
+        block->allocateInstr(
+            opcode,
+            nullptr,
+            OutPhyReg{ARGUMENT_REGS[0], data_type},
+            PhyReg{ARGUMENT_REGS[0], data_type},
+            PhyReg{ARGUMENT_REGS[1], data_type},
+            PhyReg{ARGUMENT_REGS[2], data_type});
+        return CompilePreAllocated(lirfunc.release(), 16, code_size);
+      };
+
+  size_t madd64_size = 0;
+  auto madd64 = reinterpret_cast<uint64_t (*)(uint64_t, uint64_t, uint64_t)>(
+      compile_op(Instruction::kMulAdd, DataType::k64bit, &madd64_size));
+  ASSERT_NE(madd64, nullptr);
+  EXPECT_EQ(madd64(7, 9, 11), 74);
+
+  size_t msub64_size = 0;
+  auto msub64 = reinterpret_cast<uint64_t (*)(uint64_t, uint64_t, uint64_t)>(
+      compile_op(Instruction::kMulSub, DataType::k64bit, &msub64_size));
+  ASSERT_NE(msub64, nullptr);
+  EXPECT_EQ(msub64(7, 9, 100), 37);
+
+  size_t madd32_size = 0;
+  auto madd32 = reinterpret_cast<uint32_t (*)(uint32_t, uint32_t, uint32_t)>(
+      compile_op(Instruction::kMulAdd, DataType::k32bit, &madd32_size));
+  ASSERT_NE(madd32, nullptr);
+  EXPECT_EQ(
+      madd32(0xfffffff0U, 3U, 0x31U),
+      static_cast<uint32_t>(0xfffffff0U * 3U + 0x31U));
+
+  size_t msub32_size = 0;
+  auto msub32 = reinterpret_cast<uint32_t (*)(uint32_t, uint32_t, uint32_t)>(
+      compile_op(Instruction::kMulSub, DataType::k32bit, &msub32_size));
+  ASSERT_NE(msub32, nullptr);
+  EXPECT_EQ(
+      msub32(0xfffffff0U, 3U, 0x31U),
+      static_cast<uint32_t>(0x31U - 0xfffffff0U * 3U));
+
+  auto disassemble = [](const void* func, size_t code_size) {
+    std::ostringstream out;
+    Disassembler dis{reinterpret_cast<const char*>(func), code_size};
+    dis.setPrintAddr(false);
+    dis.setPrintInstBytes(false);
+    dis.disassembleAll(out);
+    return out.str();
+  };
+  EXPECT_TRUE(std::regex_search(
+      disassemble(reinterpret_cast<const void*>(madd64), madd64_size),
+      std::regex{"madd\\s+x0,\\s*x0,\\s*x1,\\s*x2"}));
+  EXPECT_TRUE(std::regex_search(
+      disassemble(reinterpret_cast<const void*>(msub64), msub64_size),
+      std::regex{"msub\\s+x0,\\s*x0,\\s*x1,\\s*x2"}));
+  EXPECT_TRUE(std::regex_search(
+      disassemble(reinterpret_cast<const void*>(madd32), madd32_size),
+      std::regex{"madd\\s+w0,\\s*w0,\\s*w1,\\s*w2"}));
+  EXPECT_TRUE(std::regex_search(
+      disassemble(reinterpret_cast<const void*>(msub32), msub32_size),
+      std::regex{"msub\\s+w0,\\s*w0,\\s*w1,\\s*w2"}));
+}
+
+TEST_F(
+    BackendTest,
+    AArch64MulArithmeticFusesThroughFullPipelineAndPreservesFlags) {
+  struct CompiledOperation {
+    void* address;
+    size_t code_size;
+  };
+
+  auto compile_operation = [this](bool subtract) {
+    auto lirfunc = std::make_unique<Function>();
+    auto* entry = lirfunc->allocateBasicBlock();
+    auto* true_block = lirfunc->allocateBasicBlock();
+    auto* false_block = lirfunc->allocateBasicBlock();
+    auto* epilogue = lirfunc->allocateBasicBlock();
+
+    auto* lhs = entry->allocateInstr(
+        Instruction::kLoadArg, nullptr, OutVReg{DataType::k64bit}, Imm{0});
+    auto* rhs = entry->allocateInstr(
+        Instruction::kLoadArg, nullptr, OutVReg{DataType::k64bit}, Imm{1});
+    auto* accumulator = entry->allocateInstr(
+        Instruction::kLoadArg, nullptr, OutVReg{DataType::k64bit}, Imm{2});
+    auto* comparison = entry->allocateInstr(
+        Instruction::kLessThanUnsigned,
+        nullptr,
+        OutVReg{DataType::k8bit},
+        VReg{lhs},
+        VReg{rhs});
+    auto* product = entry->allocateInstr(
+        Instruction::kMul,
+        nullptr,
+        OutVReg{DataType::k64bit},
+        VReg{lhs},
+        VReg{rhs});
+    auto* result = entry->allocateInstr(
+        subtract ? Instruction::kSub : Instruction::kAdd,
+        nullptr,
+        OutVReg{DataType::k64bit},
+        subtract ? VReg{accumulator} : VReg{product},
+        subtract ? VReg{product} : VReg{accumulator});
+    entry->allocateInstr(Instruction::kCondBranch, nullptr, VReg{comparison});
+    entry->addSuccessor(true_block);
+    entry->addSuccessor(false_block);
+
+    true_block->allocateInstr(
+        Instruction::kMove,
+        nullptr,
+        OutPhyReg{arch::reg_general_return_loc, DataType::k64bit},
+        VReg{result});
+    true_block->allocateInstr(Instruction::kReturn, nullptr);
+    true_block->addSuccessor(epilogue);
+
+    false_block->allocateInstr(
+        Instruction::kMove,
+        nullptr,
+        OutPhyReg{arch::reg_general_return_loc, DataType::k64bit},
+        Imm{0, DataType::k64bit});
+    false_block->allocateInstr(Instruction::kReturn, nullptr);
+    false_block->addSuccessor(epilogue);
+
+    size_t code_size = 0;
+    void* address = CompileAfterTargetSelect(lirfunc.get(), &code_size);
+    return CompiledOperation{address, code_size};
+  };
+
+  CompiledOperation madd = compile_operation(false);
+  CompiledOperation msub = compile_operation(true);
+  ASSERT_NE(madd.address, nullptr);
+  ASSERT_NE(msub.address, nullptr);
+  ASSERT_GT(madd.code_size, 0);
+  ASSERT_GT(msub.code_size, 0);
+
+  auto madd_func = reinterpret_cast<uint64_t (*)(uint64_t, uint64_t, uint64_t)>(
+      madd.address);
+  auto msub_func = reinterpret_cast<uint64_t (*)(uint64_t, uint64_t, uint64_t)>(
+      msub.address);
+
+  // The compare is deliberately before the fused arithmetic.  Correct branch
+  // results therefore prove that MADD/MSUB did not clobber NZCV.
+  EXPECT_EQ(madd_func(2, 3, 5), 11);
+  EXPECT_EQ(madd_func(4, 3, 5), 0);
+  EXPECT_EQ(msub_func(2, 3, 20), 14);
+  EXPECT_EQ(msub_func(4, 3, 20), 0);
+
+  auto disassemble = [](const CompiledOperation& compiled) {
+    std::ostringstream out;
+    Disassembler dis{
+        reinterpret_cast<const char*>(compiled.address), compiled.code_size};
+    dis.setPrintAddr(false);
+    dis.setPrintInstBytes(false);
+    dis.disassembleAll(out);
+    return out.str();
+  };
+  const std::string madd_disasm = disassemble(madd);
+  const std::string msub_disasm = disassemble(msub);
+  EXPECT_TRUE(std::regex_search(
+      madd_disasm,
+      std::regex{"madd\\s+x[0-9]+,\\s*x[0-9]+,\\s*x[0-9]+,\\s*x[0-9]+"}))
+      << madd_disasm;
+  EXPECT_TRUE(std::regex_search(
+      msub_disasm,
+      std::regex{"msub\\s+x[0-9]+,\\s*x[0-9]+,\\s*x[0-9]+,\\s*x[0-9]+"}))
+      << msub_disasm;
+  EXPECT_EQ(madd_disasm.find("mul "), std::string::npos) << madd_disasm;
+  EXPECT_EQ(msub_disasm.find("mul "), std::string::npos) << msub_disasm;
+}
+
+TEST_F(BackendTest, AArch64SubSetFlagsPreservesSubtractionResult) {
+  auto lirfunc = std::make_unique<Function>();
+  auto* block = lirfunc->allocateBasicBlock();
+  block->allocateInstr(
+      Instruction::kA64SubSetFlags,
+      nullptr,
+      OutPhyReg{ARGUMENT_REGS[0], DataType::k64bit},
+      PhyReg{ARGUMENT_REGS[0], DataType::k64bit},
+      PhyReg{ARGUMENT_REGS[1], DataType::k64bit});
+
+  size_t code_size = 0;
+  auto func = reinterpret_cast<uint64_t (*)(uint64_t, uint64_t)>(
+      CompilePreAllocated(lirfunc.release(), 16, &code_size));
+  ASSERT_NE(func, nullptr);
+  EXPECT_EQ(func(3, 7), static_cast<uint64_t>(3 - 7));
+
+  std::ostringstream out;
+  Disassembler dis{reinterpret_cast<const char*>(func), code_size};
+  dis.setPrintAddr(false);
+  dis.setPrintInstBytes(false);
+  dis.disassembleAll(out);
+  EXPECT_TRUE(
+      std::regex_search(out.str(), std::regex{"subs\\s+x0,\\s*x0,\\s*x1"}))
+      << out.str();
+}
+
+TEST_F(
+    BackendTest,
+    AArch64PhysicalSubOutputFallsBackWhenItOverwritesComparedInput) {
+  auto lirfunc = std::make_unique<Function>();
+  auto* entry = lirfunc->allocateBasicBlock();
+  auto* true_block = lirfunc->allocateBasicBlock();
+  auto* false_block = lirfunc->allocateBasicBlock();
+  auto* epilogue = lirfunc->allocateBasicBlock();
+
+  entry->allocateInstr(
+      Instruction::kSub,
+      nullptr,
+      OutPhyReg{ARGUMENT_REGS[0], DataType::k64bit},
+      PhyReg{ARGUMENT_REGS[0], DataType::k64bit},
+      PhyReg{ARGUMENT_REGS[1], DataType::k64bit});
+  auto* comparison = entry->allocateInstr(
+      Instruction::kLessThanUnsigned,
+      nullptr,
+      OutVReg{DataType::k8bit},
+      PhyReg{ARGUMENT_REGS[0], DataType::k64bit},
+      PhyReg{ARGUMENT_REGS[1], DataType::k64bit});
+  entry->allocateInstr(Instruction::kCondBranch, nullptr, VReg{comparison});
+  entry->addSuccessor(true_block);
+  entry->addSuccessor(false_block);
+
+  true_block->allocateInstr(
+      Instruction::kMove,
+      nullptr,
+      OutPhyReg{arch::reg_general_return_loc, DataType::k64bit},
+      Imm{1, DataType::k64bit});
+  true_block->allocateInstr(Instruction::kReturn, nullptr);
+  true_block->addSuccessor(epilogue);
+
+  false_block->allocateInstr(
+      Instruction::kMove,
+      nullptr,
+      OutPhyReg{arch::reg_general_return_loc, DataType::k64bit},
+      Imm{0, DataType::k64bit});
+  false_block->allocateInstr(Instruction::kReturn, nullptr);
+  false_block->addSuccessor(epilogue);
+
+  size_t code_size = 0;
+  auto func = reinterpret_cast<uint64_t (*)(uint64_t, uint64_t)>(
+      CompileAfterTargetSelect(lirfunc.get(), &code_size));
+  ASSERT_NE(func, nullptr);
+  ASSERT_GT(code_size, 0);
+
+  // The compare must observe the already-written x0 value: 10 - 7 == 3.
+  // An unsafe SUBS fusion would instead branch on the flags for 10 - 7.
+  EXPECT_EQ(func(10, 7), 1);
+  EXPECT_EQ(func(20, 7), 0);
+
+  std::ostringstream out;
+  Disassembler dis{reinterpret_cast<const char*>(func), code_size};
+  dis.setPrintAddr(false);
+  dis.setPrintInstBytes(false);
+  dis.disassembleAll(out);
+  const std::string disasm = out.str();
+  EXPECT_TRUE(std::regex_search(disasm, std::regex{"sub\\s+x0,\\s*x0,\\s*x1"}))
+      << disasm;
+  EXPECT_TRUE(std::regex_search(disasm, std::regex{"cmp\\s+x0,\\s*x1"}))
+      << disasm;
+  EXPECT_FALSE(
+      std::regex_search(disasm, std::regex{"subs\\s+x0,\\s*x0,\\s*x1"}))
+      << disasm;
+}
+
+TEST_F(BackendTest, AArch64AddedAddressWithOffsetFallsBackAndExecutes) {
+  auto lirfunc = std::make_unique<Function>();
+  auto* block = lirfunc->allocateBasicBlock();
+  auto* epilogue = lirfunc->allocateBasicBlock();
+
+  auto* base = block->allocateInstr(
+      Instruction::kLoadArg, nullptr, OutVReg{DataType::kObject}, Imm{0});
+  auto* index = block->allocateInstr(
+      Instruction::kLoadArg, nullptr, OutVReg{DataType::k64bit}, Imm{1});
+  auto* value = block->allocateInstr(
+      Instruction::kLoadArg, nullptr, OutVReg{DataType::k64bit}, Imm{2});
+  auto* address = block->allocateInstr(
+      Instruction::kAdd,
+      nullptr,
+      OutVReg{DataType::kObject},
+      VReg{base},
+      VReg{index});
+  auto* store = block->allocateInstr(
+      Instruction::kMove,
+      nullptr,
+      OutInd{address, 8, DataType::k64bit},
+      VReg{value});
+  store->output()->setDataType(DataType::k64bit);
+  block->allocateInstr(
+      Instruction::kMove,
+      nullptr,
+      OutPhyReg{arch::reg_general_return_loc, DataType::k64bit},
+      VReg{value});
+  block->allocateInstr(Instruction::kReturn, nullptr);
+  block->addSuccessor(epilogue);
+
+  size_t code_size = 0;
+  auto func = reinterpret_cast<uint64_t (*)(uint8_t*, uint64_t, uint64_t)>(
+      CompileAfterTargetSelect(lirfunc.get(), &code_size));
+  ASSERT_NE(func, nullptr);
+  ASSERT_GT(code_size, 0);
+
+  // A non-zero offset deliberately keeps the Add outside the folded
+  // base-plus-index form.  Use a zero runtime index so this remains a short
+  // executable check of the ordinary-register fallback without constructing
+  // a physical XZR operand: XZR is not part of allocatable LIR and must only
+  // be covered structurally at target selection.
+  constexpr uint64_t kValue = 0x1122334455667788;
+  std::array<uint8_t, 32> bytes;
+  bytes.fill(0xa5);
+  std::array<uint8_t, 32> expected = bytes;
+  std::memcpy(expected.data() + 8, &kValue, sizeof(kValue));
+
+  EXPECT_EQ(func(bytes.data(), 0, kValue), kValue);
+  EXPECT_EQ(bytes, expected);
+
+  std::ostringstream out;
+  Disassembler dis{reinterpret_cast<const char*>(func), code_size};
+  dis.setPrintAddr(false);
+  dis.setPrintInstBytes(false);
+  dis.disassembleAll(out);
+  const std::string disasm = out.str();
+  EXPECT_TRUE(std::regex_search(
+      disasm, std::regex{"(^|\\n)\\s*add\\s+x[0-9]+,\\s*x[0-9]+,\\s*x[0-9]+"}))
+      << disasm;
+  EXPECT_TRUE(std::regex_search(
+      disasm, std::regex{"str\\s+x[0-9]+,\\s*\\[x[0-9]+,\\s*#8\\]"}))
+      << disasm;
+}
+
+TEST_F(BackendTest, AArch64AddedAddressesExecuteThroughFullPipeline) {
+  auto lirfunc = std::make_unique<Function>();
+  auto* block = lirfunc->allocateBasicBlock();
+  auto* epilogue = lirfunc->allocateBasicBlock();
+
+  auto* base = block->allocateInstr(
+      Instruction::kLoadArg, nullptr, OutVReg{DataType::kObject}, Imm{0});
+  auto* index = block->allocateInstr(
+      Instruction::kLoadArg, nullptr, OutVReg{DataType::k64bit}, Imm{1});
+  auto* value = block->allocateInstr(
+      Instruction::kLoadArg, nullptr, OutVReg{DataType::k64bit}, Imm{2});
+
+  auto* store_address = block->allocateInstr(
+      Instruction::kAdd,
+      nullptr,
+      OutVReg{DataType::kObject},
+      VReg{base},
+      VReg{index});
+  auto* store = block->allocateInstr(
+      Instruction::kMove,
+      nullptr,
+      OutInd{store_address, 0, DataType::k64bit},
+      VReg{value});
+  store->output()->setDataType(DataType::k64bit);
+
+  auto* load_address = block->allocateInstr(
+      Instruction::kAdd,
+      nullptr,
+      OutVReg{DataType::kObject},
+      VReg{base},
+      VReg{index});
+  auto* loaded = block->allocateInstr(
+      Instruction::kMove,
+      nullptr,
+      OutVReg{DataType::k64bit},
+      Ind{load_address, 0, DataType::k64bit});
+  static_cast<Operand*>(loaded->getInput(0))->setDataType(DataType::k64bit);
+  block->allocateInstr(
+      Instruction::kMove,
+      nullptr,
+      OutPhyReg{arch::reg_general_return_loc, DataType::k64bit},
+      VReg{loaded});
+  block->allocateInstr(Instruction::kReturn, nullptr);
+  block->addSuccessor(epilogue);
+
+  size_t code_size = 0;
+  auto func = reinterpret_cast<uint64_t (*)(uint8_t*, uint64_t, uint64_t)>(
+      CompileAfterTargetSelect(lirfunc.get(), &code_size));
+  ASSERT_NE(func, nullptr);
+  ASSERT_GT(code_size, 0);
+
+  constexpr size_t kOffset = 13;
+  constexpr uint64_t kValue = 0x1122334455667788;
+  std::array<uint8_t, 48> bytes;
+  bytes.fill(0xa5);
+  std::array<uint8_t, 48> expected = bytes;
+  std::memcpy(expected.data() + kOffset, &kValue, sizeof(kValue));
+
+  EXPECT_EQ(func(bytes.data(), kOffset, kValue), kValue);
+  EXPECT_EQ(bytes, expected);
+
+  std::ostringstream out;
+  Disassembler dis{reinterpret_cast<const char*>(func), code_size};
+  dis.setPrintAddr(false);
+  dis.setPrintInstBytes(false);
+  dis.disassembleAll(out);
+  const std::string disasm = out.str();
+  EXPECT_TRUE(std::regex_search(
+      disasm, std::regex{"str\\s+x[0-9]+,\\s*\\[x[0-9]+,\\s*x[0-9]+\\]"}))
+      << disasm;
+  EXPECT_TRUE(std::regex_search(
+      disasm, std::regex{"ldr\\s+x[0-9]+,\\s*\\[x[0-9]+,\\s*x[0-9]+\\]"}))
+      << disasm;
+  EXPECT_FALSE(std::regex_search(
+      disasm, std::regex{"(^|\\n)\\s*add\\s+x[0-9]+,\\s*x[0-9]+,\\s*x[0-9]+"}))
+      << disasm;
+}
+
+TEST_F(BackendTest, AArch64ShiftedIndexesExecuteThroughFullPipeline) {
+  auto lirfunc = std::make_unique<Function>();
+  auto* block = lirfunc->allocateBasicBlock();
+  auto* epilogue = lirfunc->allocateBasicBlock();
+
+  auto* base = block->allocateInstr(
+      Instruction::kLoadArg, nullptr, OutVReg{DataType::kObject}, Imm{0});
+  auto* index = block->allocateInstr(
+      Instruction::kLoadArg, nullptr, OutVReg{DataType::k64bit}, Imm{1});
+  auto* value = block->allocateInstr(
+      Instruction::kLoadArg, nullptr, OutVReg{DataType::k64bit}, Imm{2});
+
+  auto* store_index = block->allocateInstr(
+      Instruction::kLShift,
+      nullptr,
+      OutVReg{DataType::k64bit},
+      VReg{index},
+      Imm{3, DataType::k64bit});
+  auto* store = block->allocateInstr(
+      Instruction::kMove,
+      nullptr,
+      OutInd{base, store_index, DataType::k64bit},
+      VReg{value});
+  store->output()->setDataType(DataType::k64bit);
+
+  auto* load_index = block->allocateInstr(
+      Instruction::kLShift,
+      nullptr,
+      OutVReg{DataType::k64bit},
+      VReg{index},
+      Imm{3, DataType::k64bit});
+  auto* loaded = block->allocateInstr(
+      Instruction::kMove,
+      nullptr,
+      OutVReg{DataType::k64bit},
+      Ind{base, load_index, DataType::k64bit});
+  static_cast<Operand*>(loaded->getInput(0))->setDataType(DataType::k64bit);
+  block->allocateInstr(
+      Instruction::kMove,
+      nullptr,
+      OutPhyReg{arch::reg_general_return_loc, DataType::k64bit},
+      VReg{loaded});
+  block->allocateInstr(Instruction::kReturn, nullptr);
+  block->addSuccessor(epilogue);
+
+  size_t code_size = 0;
+  auto func = reinterpret_cast<uint64_t (*)(uint8_t*, uint64_t, uint64_t)>(
+      CompileAfterTargetSelect(lirfunc.get(), &code_size));
+  ASSERT_NE(func, nullptr);
+  ASSERT_GT(code_size, 0);
+
+  constexpr size_t kElement = 3;
+  constexpr size_t kOffset = kElement * sizeof(uint64_t);
+  constexpr uint64_t kValue = 0x8877665544332211;
+  std::array<uint8_t, 64> bytes;
+  bytes.fill(0xa5);
+  std::array<uint8_t, 64> expected = bytes;
+  std::memcpy(expected.data() + kOffset, &kValue, sizeof(kValue));
+
+  EXPECT_EQ(func(bytes.data(), kElement, kValue), kValue);
+  EXPECT_EQ(bytes, expected);
+
+  std::ostringstream out;
+  Disassembler dis{reinterpret_cast<const char*>(func), code_size};
+  dis.setPrintAddr(false);
+  dis.setPrintInstBytes(false);
+  dis.disassembleAll(out);
+  const std::string disasm = out.str();
+  EXPECT_TRUE(std::regex_search(
+      disasm,
+      std::regex{"str\\s+x[0-9]+,\\s*\\[x[0-9]+,\\s*x[0-9]+,\\s*lsl #3\\]"}))
+      << disasm;
+  EXPECT_TRUE(std::regex_search(
+      disasm,
+      std::regex{"ldr\\s+x[0-9]+,\\s*\\[x[0-9]+,\\s*x[0-9]+,\\s*lsl #3\\]"}))
+      << disasm;
+  EXPECT_FALSE(std::regex_search(
+      disasm, std::regex{"lsl\\s+x[0-9]+,\\s*x[0-9]+,\\s*#3"}))
+      << disasm;
+}
+
+TEST_F(BackendTest, AArch64SubSetFlagsBranchesAtSignedUnsignedBoundaries) {
+  struct CompiledComparison {
+    void* address;
+    size_t code_size;
+  };
+
+  auto compile_comparison = [this](
+                                Instruction::Opcode compare_opcode,
+                                DataType data_type) {
+    auto lirfunc = std::make_unique<Function>();
+    auto* entry = lirfunc->allocateBasicBlock();
+    auto* true_block = lirfunc->allocateBasicBlock();
+    auto* false_block = lirfunc->allocateBasicBlock();
+    auto* epilogue = lirfunc->allocateBasicBlock();
+
+    auto* lhs = entry->allocateInstr(
+        Instruction::kLoadArg, nullptr, OutVReg{data_type}, Imm{0});
+    auto* rhs = entry->allocateInstr(
+        Instruction::kLoadArg, nullptr, OutVReg{data_type}, Imm{1});
+    auto* difference = entry->allocateInstr(
+        Instruction::kSub, nullptr, OutVReg{data_type}, VReg{lhs}, VReg{rhs});
+    auto* comparison = entry->allocateInstr(
+        compare_opcode,
+        nullptr,
+        OutVReg{DataType::k8bit},
+        VReg{lhs},
+        VReg{rhs});
+    // Keep the subtraction result live without changing NZCV between the
+    // selected SUBS and its branch.
+    entry->allocateInstr(
+        Instruction::kMove,
+        nullptr,
+        OutPhyReg{ARGUMENT_REGS[3], data_type},
+        VReg{difference});
+    entry->allocateInstr(Instruction::kCondBranch, nullptr, VReg{comparison});
+    entry->addSuccessor(true_block);
+    entry->addSuccessor(false_block);
+
+    true_block->allocateInstr(
+        Instruction::kMove,
+        nullptr,
+        OutPhyReg{arch::reg_general_return_loc, DataType::k64bit},
+        Imm{1, DataType::k64bit});
+    true_block->allocateInstr(Instruction::kReturn, nullptr);
+    true_block->addSuccessor(epilogue);
+
+    false_block->allocateInstr(
+        Instruction::kMove,
+        nullptr,
+        OutPhyReg{arch::reg_general_return_loc, DataType::k64bit},
+        Imm{0, DataType::k64bit});
+    false_block->allocateInstr(Instruction::kReturn, nullptr);
+    false_block->addSuccessor(epilogue);
+
+    size_t code_size = 0;
+    void* address = CompileAfterTargetSelect(lirfunc.get(), &code_size);
+    return CompiledComparison{address, code_size};
+  };
+
+  auto signed32 =
+      compile_comparison(Instruction::kLessThanEqualSigned, DataType::k32bit);
+  auto unsigned32 =
+      compile_comparison(Instruction::kLessThanEqualUnsigned, DataType::k32bit);
+  auto signed64 =
+      compile_comparison(Instruction::kLessThanEqualSigned, DataType::k64bit);
+  auto unsigned64 =
+      compile_comparison(Instruction::kLessThanEqualUnsigned, DataType::k64bit);
+
+  ASSERT_NE(signed32.address, nullptr);
+  ASSERT_NE(unsigned32.address, nullptr);
+  ASSERT_NE(signed64.address, nullptr);
+  ASSERT_NE(unsigned64.address, nullptr);
+  ASSERT_GT(signed32.code_size, 0);
+  ASSERT_GT(unsigned32.code_size, 0);
+  ASSERT_GT(signed64.code_size, 0);
+  ASSERT_GT(unsigned64.code_size, 0);
+
+  auto signed32_func =
+      reinterpret_cast<uint64_t (*)(uint32_t, uint32_t)>(signed32.address);
+  auto unsigned32_func =
+      reinterpret_cast<uint64_t (*)(uint32_t, uint32_t)>(unsigned32.address);
+  auto signed64_func =
+      reinterpret_cast<uint64_t (*)(uint64_t, uint64_t)>(signed64.address);
+  auto unsigned64_func =
+      reinterpret_cast<uint64_t (*)(uint64_t, uint64_t)>(unsigned64.address);
+
+  // Signed cases exercise N xor V at the overflow boundaries and Z on equal.
+  EXPECT_EQ(signed32_func(0x80000000U, 0x7fffffffU), 1);
+  EXPECT_EQ(signed32_func(0x7fffffffU, 0x80000000U), 0);
+  EXPECT_EQ(signed32_func(0x80000000U, 0x80000000U), 1);
+  EXPECT_EQ(signed64_func(0x8000000000000000ULL, 0x7fffffffffffffffULL), 1);
+  EXPECT_EQ(signed64_func(0x7fffffffffffffffULL, 0x8000000000000000ULL), 0);
+  EXPECT_EQ(signed64_func(0x8000000000000000ULL, 0x8000000000000000ULL), 1);
+
+  // Unsigned cases exercise carry/borrow and Z at zero and the maximum value.
+  EXPECT_EQ(unsigned32_func(0, 0xffffffffU), 1);
+  EXPECT_EQ(unsigned32_func(0xffffffffU, 0), 0);
+  EXPECT_EQ(unsigned32_func(0xffffffffU, 0xffffffffU), 1);
+  EXPECT_EQ(unsigned64_func(0, 0xffffffffffffffffULL), 1);
+  EXPECT_EQ(unsigned64_func(0xffffffffffffffffULL, 0), 0);
+  EXPECT_EQ(unsigned64_func(0xffffffffffffffffULL, 0xffffffffffffffffULL), 1);
+
+  auto disassemble = [](const CompiledComparison& compiled) {
+    std::ostringstream out;
+    Disassembler dis{
+        reinterpret_cast<const char*>(compiled.address), compiled.code_size};
+    dis.setPrintAddr(false);
+    dis.setPrintInstBytes(false);
+    dis.disassembleAll(out);
+    return out.str();
+  };
+  for (const CompiledComparison* compiled : {&signed32, &unsigned32}) {
+    const std::string disasm = disassemble(*compiled);
+    EXPECT_TRUE(std::regex_search(disasm, std::regex{"subs\\s+w[0-9]+,"}))
+        << disasm;
+    EXPECT_EQ(disasm.find("cmp "), std::string::npos) << disasm;
+  }
+  for (const CompiledComparison* compiled : {&signed64, &unsigned64}) {
+    const std::string disasm = disassemble(*compiled);
+    EXPECT_TRUE(std::regex_search(disasm, std::regex{"subs\\s+x[0-9]+,"}))
+        << disasm;
+    EXPECT_EQ(disasm.find("cmp "), std::string::npos) << disasm;
+  }
+}
+
+TEST_F(BackendTest, AArch64ZeroRegisterStoresHandleDetailedAddressForms) {
+  auto lirfunc = std::make_unique<Function>();
+  auto* block = lirfunc->allocateBasicBlock();
+
+  constexpr size_t kBaseIndex = 6000;
+  constexpr size_t kIndexedOffset = 6001;
+  struct StoreCase {
+    int32_t offset;
+    DataType type;
+    size_t width;
+    size_t absolute_index;
+  };
+  // Cover an unscaled negative offset, negative and positive offsets that
+  // require address synthesis, and deliberately unaligned destinations.
+  // Canary checking verifies exact byte widths rather than relying on
+  // naturally aligned happy paths.
+  constexpr StoreCase kOffsetStores[] = {
+      {-4099, DataType::k8bit, 1, kBaseIndex - 4099},
+      {-257, DataType::k16bit, 2, kBaseIndex - 257},
+      {-55, DataType::k32bit, 4, kBaseIndex - 55},
+      {-47, DataType::k64bit, 8, kBaseIndex - 47},
+      {-31, DataType::kObject, 8, kBaseIndex - 31},
+      {4099, DataType::k64bit, 8, kBaseIndex + 4099},
+  };
+
+  for (const auto& store_case : kOffsetStores) {
+    auto* store = block->allocateInstr(
+        Instruction::kMove,
+        nullptr,
+        OutInd{ARGUMENT_REGS[0], store_case.offset, store_case.type},
+        Imm{0, store_case.type});
+    store->output()->setDataType(store_case.type);
+  }
+
+  auto* indexed_store = block->allocateInstr(
+      Instruction::kMove,
+      nullptr,
+      OutInd{
+          PhyLocation(ARGUMENT_REGS[0]),
+          PhyLocation(ARGUMENT_REGS[1]),
+          0,
+          DataType::k32bit},
+      Imm{0, DataType::k32bit});
+  indexed_store->output()->setDataType(DataType::k32bit);
+
+  // OutInd accepts the byte scale and converts it to the internal SIB-style
+  // log2 multiplier used by MemoryIndirect.  A value of 2 therefore means a
+  // 2-byte scale here and becomes multiplier 1 internally.
+  constexpr unsigned int kScaledIndexedNumBytes = 2;
+  constexpr int32_t kScaledIndexedExtraOffset = 257;
+  constexpr size_t kScaledIndexedAbsolute = kBaseIndex +
+      (kIndexedOffset * kScaledIndexedNumBytes) + kScaledIndexedExtraOffset;
+  auto* scaled_indexed_store = block->allocateInstr(
+      Instruction::kMove,
+      nullptr,
+      OutInd{
+          PhyLocation(ARGUMENT_REGS[0]),
+          PhyLocation(ARGUMENT_REGS[1]),
+          kScaledIndexedNumBytes,
+          kScaledIndexedExtraOffset,
+          DataType::kObject},
+      Imm{0, DataType::kObject});
+  scaled_indexed_store->output()->setDataType(DataType::kObject);
+
+  size_t code_size = 0;
+  auto func = reinterpret_cast<void (*)(uint8_t*, uint64_t)>(
+      CompilePreAllocated(lirfunc.release(), 16, &code_size));
+  ASSERT_NE(func, nullptr);
+  ASSERT_GT(code_size, 0);
+
+  std::array<uint8_t, 32768> bytes;
+  bytes.fill(0xA5);
+  func(bytes.data() + kBaseIndex, kIndexedOffset);
+
+  std::array<bool, 32768> should_be_zero{};
+  for (const auto& store_case : kOffsetStores) {
+    for (size_t i = 0; i < store_case.width; i++) {
+      should_be_zero[store_case.absolute_index + i] = true;
+    }
+  }
+  for (size_t i = 0; i < 4; i++) {
+    should_be_zero[kBaseIndex + kIndexedOffset + i] = true;
+  }
+  for (size_t i = 0; i < 8; i++) {
+    should_be_zero[kScaledIndexedAbsolute + i] = true;
+  }
+  for (size_t i = 0; i < bytes.size(); i++) {
+    EXPECT_EQ(bytes[i], should_be_zero[i] ? 0 : 0xA5)
+        << "unexpected byte at offset " << i;
+  }
+
+  std::ostringstream out;
+  Disassembler dis{reinterpret_cast<const char*>(func), code_size};
+  dis.setPrintAddr(false);
+  dis.setPrintInstBytes(false);
+  dis.disassembleAll(out);
+  const std::string disasm = out.str();
+
+  EXPECT_TRUE(std::regex_search(disasm, std::regex{"stu?rb\\s+wzr"})) << disasm;
+  EXPECT_TRUE(std::regex_search(disasm, std::regex{"stu?rh\\s+wzr"})) << disasm;
+  EXPECT_TRUE(std::regex_search(disasm, std::regex{"stu?r\\s+wzr"})) << disasm;
+  const std::regex xzr_store{"stu?r\\s+xzr"};
+  const auto xzr_store_count = std::distance(
+      std::sregex_iterator(disasm.begin(), disasm.end(), xzr_store),
+      std::sregex_iterator());
+  EXPECT_GE(xzr_store_count, 4) << disasm;
+  EXPECT_FALSE(std::regex_search(disasm, std::regex{"stu?r(b|h)?\\s+(wsp|sp)"}))
+      << disasm;
+}
+
+TEST_F(BackendTest, AArch64ConstantFillStorePairExecutesEndToEnd) {
+  auto lirfunc = std::make_unique<Function>();
+  auto* block = lirfunc->allocateBasicBlock();
+
+  constexpr uint64_t kFill = 0x1122334455667788;
+  block->allocateInstr(
+      Instruction::kMove,
+      nullptr,
+      OutPhyReg{X8, DataType::k64bit},
+      Imm{kFill, DataType::k64bit});
+  auto* lower_store = block->allocateInstr(
+      Instruction::kMove,
+      nullptr,
+      OutInd{ARGUMENT_REGS[0], 0, DataType::kObject},
+      PhyReg{X8, DataType::k64bit});
+  lower_store->output()->setDataType(DataType::kObject);
+  block->allocateInstr(
+      Instruction::kMove,
+      nullptr,
+      OutPhyReg{X8, DataType::k64bit},
+      Imm{kFill, DataType::k64bit});
+  auto* upper_store = block->allocateInstr(
+      Instruction::kMove,
+      nullptr,
+      OutInd{ARGUMENT_REGS[0], 8, DataType::kObject},
+      PhyReg{X8, DataType::k64bit});
+  upper_store->output()->setDataType(DataType::kObject);
+
+  size_t code_size = 0;
+  auto func = reinterpret_cast<void (*)(uint64_t*)>(
+      CompilePreAllocated(lirfunc.release(), 16, &code_size));
+  ASSERT_NE(func, nullptr);
+  ASSERT_GT(code_size, 0);
+
+  std::array<uint64_t, 4> values;
+  values.fill(0xa5a5a5a5a5a5a5a5);
+  func(values.data());
+  EXPECT_EQ(values[0], kFill);
+  EXPECT_EQ(values[1], kFill);
+  EXPECT_EQ(values[2], 0xa5a5a5a5a5a5a5a5);
+  EXPECT_EQ(values[3], 0xa5a5a5a5a5a5a5a5);
+
+  std::ostringstream out;
+  Disassembler dis{reinterpret_cast<const char*>(func), code_size};
+  dis.setPrintAddr(false);
+  dis.setPrintInstBytes(false);
+  dis.disassembleAll(out);
+  const std::string disasm = out.str();
+  const std::regex fill_pair{"stp\\s+x8,\\s*x8"};
+  EXPECT_EQ(
+      std::distance(
+          std::sregex_iterator(disasm.begin(), disasm.end(), fill_pair),
+          std::sregex_iterator()),
+      1)
+      << disasm;
+}
+
+TEST_F(BackendTest, AArch64ConstantFillBitPatternsPreserveCanaries) {
+  auto lirfunc = std::make_unique<Function>();
+  auto* block = lirfunc->allocateBasicBlock();
+
+  struct FillCase {
+    PhyLocation temporary;
+    int32_t lower_offset;
+    uint64_t value;
+    DataType type;
+  };
+  constexpr FillCase kFills[] = {
+      {X8, -16, 1, DataType::k64bit},
+      {X9, 0, std::numeric_limits<uint64_t>::max(), DataType::kObject},
+      {X10, 16, uint64_t{1} << 63, DataType::k64bit},
+  };
+  for (const auto& fill : kFills) {
+    block->allocateInstr(
+        Instruction::kMove,
+        nullptr,
+        OutPhyReg{fill.temporary, fill.type},
+        Imm{fill.value, fill.type});
+    auto* lower_store = block->allocateInstr(
+        Instruction::kMove,
+        nullptr,
+        OutInd{ARGUMENT_REGS[0], fill.lower_offset, fill.type},
+        PhyReg{fill.temporary, fill.type});
+    lower_store->output()->setDataType(fill.type);
+    block->allocateInstr(
+        Instruction::kMove,
+        nullptr,
+        OutPhyReg{fill.temporary, fill.type},
+        Imm{fill.value, fill.type});
+    auto* upper_store = block->allocateInstr(
+        Instruction::kMove,
+        nullptr,
+        OutInd{ARGUMENT_REGS[0], fill.lower_offset + 8, fill.type},
+        PhyReg{fill.temporary, fill.type});
+    upper_store->output()->setDataType(fill.type);
+  }
+
+  size_t code_size = 0;
+  auto func = reinterpret_cast<void (*)(uint64_t*)>(
+      CompilePreAllocated(lirfunc.release(), 16, &code_size));
+  ASSERT_NE(func, nullptr);
+  ASSERT_GT(code_size, 0);
+
+  std::array<uint64_t, 8> values;
+  values.fill(0xa5a5a5a5a5a5a5a5);
+  func(values.data() + 2);
+  for (size_t i = 0; i < std::size(kFills); i++) {
+    EXPECT_EQ(values[i * 2], kFills[i].value);
+    EXPECT_EQ(values[i * 2 + 1], kFills[i].value);
+  }
+  EXPECT_EQ(values[6], 0xa5a5a5a5a5a5a5a5);
+  EXPECT_EQ(values[7], 0xa5a5a5a5a5a5a5a5);
+
+  std::ostringstream out;
+  Disassembler dis{reinterpret_cast<const char*>(func), code_size};
+  dis.setPrintAddr(false);
+  dis.setPrintInstBytes(false);
+  dis.disassembleAll(out);
+  const std::string disasm = out.str();
+  for (const char* pattern : {
+           "stp\\s+x8,\\s*x8",
+           "stp\\s+x9,\\s*x9",
+           "stp\\s+x10,\\s*x10",
+       }) {
+    const std::regex pair{pattern};
+    EXPECT_EQ(
+        std::distance(
+            std::sregex_iterator(disasm.begin(), disasm.end(), pair),
+            std::sregex_iterator()),
+        1)
+        << disasm;
+  }
+}
+
+TEST_F(BackendTest, AArch64StorePairOffsetBoundariesPreserveCanaries) {
+  auto lirfunc = std::make_unique<Function>();
+  auto* block = lirfunc->allocateBasicBlock();
+
+  constexpr int32_t kLowerNegative = -512;
+  constexpr int32_t kUpperNegative = -504;
+  constexpr int32_t kLowerPositive = 496;
+  constexpr int32_t kUpperPositive = 504;
+  constexpr int32_t kRejectedLowerNegative = -528;
+  constexpr int32_t kRejectedUpperNegative = -520;
+  constexpr int32_t kRejectedLowerPositive = 512;
+  constexpr int32_t kRejectedUpperPositive = 520;
+  for (int32_t offset : {
+           kRejectedLowerNegative,
+           kRejectedUpperNegative,
+           kLowerNegative,
+           kUpperNegative,
+           kLowerPositive,
+           kUpperPositive,
+           kRejectedLowerPositive,
+           kRejectedUpperPositive,
+       }) {
+    const auto value_register =
+        (offset == kRejectedLowerNegative || offset == kLowerNegative ||
+         offset == kLowerPositive || offset == kRejectedLowerPositive)
+        ? ARGUMENT_REGS[1]
+        : ARGUMENT_REGS[2];
+    auto* store = block->allocateInstr(
+        Instruction::kMove,
+        nullptr,
+        OutInd{ARGUMENT_REGS[0], offset, DataType::kObject},
+        PhyReg{value_register, DataType::k64bit});
+    store->output()->setDataType(DataType::kObject);
+  }
+
+  size_t code_size = 0;
+  auto func = reinterpret_cast<void (*)(uint64_t*, uint64_t, uint64_t)>(
+      CompilePreAllocated(lirfunc.release(), 16, &code_size));
+  ASSERT_NE(func, nullptr);
+  ASSERT_GT(code_size, 0);
+
+  constexpr uint64_t kFirst = 0x0123456789abcdef;
+  constexpr uint64_t kSecond = 0xfedcba9876543210;
+  std::array<uint64_t, 192> values;
+  values.fill(0xa5a5a5a5a5a5a5a5);
+  constexpr size_t kBaseElement = 96;
+  func(values.data() + kBaseElement, kFirst, kSecond);
+
+  std::array<uint64_t, 192> expected;
+  expected.fill(0xa5a5a5a5a5a5a5a5);
+  const auto elementAtOffset = [=](int32_t offset) {
+    return static_cast<size_t>(static_cast<int64_t>(kBaseElement) + offset / 8);
+  };
+  expected[elementAtOffset(kLowerNegative)] = kFirst;
+  expected[elementAtOffset(kUpperNegative)] = kSecond;
+  expected[elementAtOffset(kLowerPositive)] = kFirst;
+  expected[elementAtOffset(kUpperPositive)] = kSecond;
+  expected[elementAtOffset(kRejectedLowerNegative)] = kFirst;
+  expected[elementAtOffset(kRejectedUpperNegative)] = kSecond;
+  expected[elementAtOffset(kRejectedLowerPositive)] = kFirst;
+  expected[elementAtOffset(kRejectedUpperPositive)] = kSecond;
+  EXPECT_EQ(values, expected);
+
+  std::ostringstream out;
+  Disassembler dis{reinterpret_cast<const char*>(func), code_size};
+  dis.setPrintAddr(false);
+  dis.setPrintInstBytes(false);
+  dis.disassembleAll(out);
+  const std::string disasm = out.str();
+  const std::regex pair{"stp\\s+x1,\\s*x2"};
+  EXPECT_EQ(
+      std::distance(
+          std::sregex_iterator(disasm.begin(), disasm.end(), pair),
+          std::sregex_iterator()),
+      2)
+      << disasm;
 }
 
 #endif // CINDER_AARCH64

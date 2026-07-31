@@ -1371,8 +1371,8 @@ void LinearScanAllocator::rewriteInstrOneIndirectOperand(
         ? map_get(mapping, index->getDefine())->allocated_loc
         : PhyLocation(index->getPhyRegister());
 
-    index_last_use = last_use_vregs != nullptr && base->isLinked() &&
-        last_use_vregs->count(static_cast<LinkedOperand*>(base));
+    index_last_use = last_use_vregs != nullptr && index->isLinked() &&
+        last_use_vregs->count(static_cast<LinkedOperand*>(index));
   }
   indirect->setMemoryIndirect(
       base_phy_reg,
