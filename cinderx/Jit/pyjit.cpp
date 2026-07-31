@@ -1437,8 +1437,7 @@ hir::Preloader* preload(BorrowedRef<> unit) {
   // assumptions are broken after this.
   std::unique_ptr<hir::Preloader> preloader;
   if (func != nullptr) {
-    preloader =
-        hir::Preloader::make(func, makeFrameReifier(func->func_code));
+    preloader = hir::Preloader::make(func, makeFrameReifier(func->func_code));
   } else {
     auto& jit_code_outer_funcs = jitCtx()->codeOuterFunctions();
     auto it = jit_code_outer_funcs.find(code);

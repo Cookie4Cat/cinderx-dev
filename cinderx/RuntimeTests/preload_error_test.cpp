@@ -299,8 +299,8 @@ def test(value) -> int:
 
   Ref<PyFunctionObject> func(compileStaticAndGet(source, "test"));
   ASSERT_NE(func, nullptr);
-  auto preloader = jit::hir::Preloader::make(
-      func, jit::makeFrameReifier(func->func_code));
+  auto preloader =
+      jit::hir::Preloader::make(func, jit::makeFrameReifier(func->func_code));
   ASSERT_NE(preloader, nullptr);
 
   auto const_index = constIndexForOpcode(func->func_code, CAST);
@@ -324,8 +324,8 @@ def test(instance: C):
 
   Ref<PyFunctionObject> func(compileStaticAndGet(source, "test"));
   ASSERT_NE(func, nullptr);
-  auto preloader = jit::hir::Preloader::make(
-      func, jit::makeFrameReifier(func->func_code));
+  auto preloader =
+      jit::hir::Preloader::make(func, jit::makeFrameReifier(func->func_code));
   ASSERT_NE(preloader, nullptr);
 
   auto const_index = constIndexForOpcode(func->func_code, LOAD_FIELD);
@@ -336,9 +336,7 @@ def test(instance: C):
       *preloader, "LOAD_FIELD: Can't find field for descr");
 }
 
-TEST_F(
-    PreloaderErrorPropagationTest,
-    UnknownStaticArgTypeThrowsDuringPreload) {
+TEST_F(PreloaderErrorPropagationTest, UnknownStaticArgTypeThrowsDuringPreload) {
   const char* source = R"(
 def test(value: int) -> int:
     return value
@@ -362,8 +360,7 @@ def test(value: int) -> int:
   }
 
   EXPECT_TRUE(cpp_exception_escaped);
-  EXPECT_NE(
-      cpp_exception_message.find("Unknown type descr"), std::string::npos)
+  EXPECT_NE(cpp_exception_message.find("Unknown type descr"), std::string::npos)
       << cpp_exception_message;
 }
 
