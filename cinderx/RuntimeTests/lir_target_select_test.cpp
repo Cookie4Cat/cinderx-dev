@@ -71,10 +71,8 @@ TEST(LIRTargetSelectOperandTest, ReleasesMemoryIndirectRegisterOperands) {
   MemoryIndirect memory(nullptr);
   memory.setMemoryIndirect(base.loc, index.loc, 2, 0x40);
 
-  std::unique_ptr<OperandBase> released_base =
-      memory.releaseBaseRegOperand();
-  std::unique_ptr<OperandBase> released_index =
-      memory.releaseIndexRegOperand();
+  std::unique_ptr<OperandBase> released_base = memory.releaseBaseRegOperand();
+  std::unique_ptr<OperandBase> released_index = memory.releaseIndexRegOperand();
 
   ASSERT_NE(released_base, nullptr);
   ASSERT_NE(released_index, nullptr);
@@ -124,14 +122,12 @@ TEST_F(LIRTargetSelectTest, LegalizesSelectStackInputs) {
 }
 
 TEST_F(LIRTargetSelectTest, LegalizesStackIncDecInputs) {
-  for (Instruction::Opcode opcode :
-       {Instruction::kInc, Instruction::kDec}) {
+  for (Instruction::Opcode opcode : {Instruction::kInc, Instruction::kDec}) {
     SCOPED_TRACE(static_cast<int>(opcode));
     Function func;
     BasicBlock* block = func.allocateBasicBlock();
     PhyLocation stack_loc{-24, 64};
-    block->allocateInstr(
-        opcode, nullptr, Stk{stack_loc, DataType::k64bit});
+    block->allocateInstr(opcode, nullptr, Stk{stack_loc, DataType::k64bit});
 
     selectTargetOpcodes(&func);
 
@@ -196,11 +192,7 @@ TEST_F(LIRTargetSelectTest, LegalizesSignedSubWordInputs) {
         OutVReg{DataType::k16bit},
         Imm{1, DataType::k16bit});
     Instruction* op = block->allocateInstr(
-        opcode,
-        nullptr,
-        OutVReg{DataType::k8bit},
-        VReg{lhs},
-        VReg{rhs});
+        opcode, nullptr, OutVReg{DataType::k8bit}, VReg{lhs}, VReg{rhs});
 
     selectTargetOpcodes(&func);
 
@@ -412,10 +404,9 @@ BB %0
 
   EXPECT_NE(lir_str.find(":64bit = Move %1:Double"), std::string::npos)
       << lir_str;
-  EXPECT_TRUE(
-      std::regex_search(
-          lir_str,
-          std::regex{R"(Guard 4\(0x4\):64bit, 0\(0x0\):64bit, %\d+:64bit)"}))
+  EXPECT_TRUE(std::regex_search(
+      lir_str,
+      std::regex{R"(Guard 4\(0x4\):64bit, 0\(0x0\):64bit, %\d+:64bit)"}))
       << lir_str;
   EXPECT_EQ(lir_str.find("A64GuardCC"), std::string::npos) << lir_str;
 }
