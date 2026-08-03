@@ -536,6 +536,7 @@ RewriteResult rewriteMoveAbsoluteAddress(instr_iter_t instr_iter) {
 //   - Call: late-created by PostRegAllocRewrite via setOpcode()
 //   - Negate/Invert: handled by AArch64 target selection
 //   - Inc/Dec: handled by AArch64 target selection
+//   - Select: handled by AArch64 target selection
 //   - EpilogueEnd: special return-value handling
 //   - Pop: stack output, not input
 bool lowerStackInputToVreg(instr_iter_t instr_iter, size_t idx) {
@@ -582,8 +583,6 @@ RewriteResult rewriteStackInputToVreg(instr_iter_t instr_iter) {
   switch (instr->opcode()) {
     case Instruction::kPush:
       return rewriteSingleStackInputToVreg(instr_iter, 0);
-    case Instruction::kSelect:
-      return rewriteAllStackInputsToVreg(instr_iter);
     default:
       return kUnchanged;
   }

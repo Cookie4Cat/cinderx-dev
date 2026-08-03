@@ -930,7 +930,7 @@ TEST_F(LIRPostAllocRewriteTest, MemoryInputRewriteFaddWithFPStackInput) {
 }
 
 // kLessThanSigned with a k8bit stack input should widen the load to k32bit to
-// preserve the sign-extended value stored by rewriteSignedSubWordOps.
+// preserve the sign-extended value produced during target selection.
 TEST_F(LIRPostAllocRewriteTest, MemoryInputRewriteSignedCmpWidensSubWordToK32) {
   Function func;
   auto* bb = func.allocateBasicBlock();

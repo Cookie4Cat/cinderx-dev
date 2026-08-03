@@ -99,6 +99,30 @@ static std::vector<Instruction*> collectTargetSelectInstrs(BasicBlock& block) {
   return result;
 }
 
+TEST_F(LIRTargetSelectTest, LegalizesSelectStackInputs) {
+  Function func;
+  BasicBlock* block = func.allocateBasicBlock();
+  Instruction* select = block->allocateInstr(
+      Instruction::kSelect,
+      nullptr,
+      OutVReg{DataType::k64bit},
+      Stk{PhyLocation{-8, 8}, DataType::k8bit},
+      Stk{PhyLocation{-16, 64}, DataType::k64bit},
+      Stk{PhyLocation{-24, 64}, DataType::k64bit});
+
+  selectTargetOpcodes(&func);
+
+  std::vector<Instruction*> instrs = collectTargetSelectInstrs(*block);
+  ASSERT_EQ(instrs.size(), 4);
+  for (size_t i = 0; i < 3; i++) {
+    ASSERT_TRUE(select->getInput(i)->isLinked());
+    Instruction* input =
+        static_cast<LinkedOperand*>(select->getInput(i))->getLinkedInstr();
+    EXPECT_TRUE(input->isMove());
+    EXPECT_TRUE(input->getInput(0)->isStack());
+  }
+}
+
 TEST_F(LIRTargetSelectTest, LegalizesStackIncDecInputs) {
   for (Instruction::Opcode opcode :
        {Instruction::kInc, Instruction::kDec}) {
