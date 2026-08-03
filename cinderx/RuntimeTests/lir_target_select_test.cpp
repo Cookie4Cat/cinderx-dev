@@ -62,6 +62,26 @@ class LIRTargetSelectTest : public RuntimeTest {
   }
 };
 
+TEST(LIRTargetSelectOperandTest, ReleasesMemoryIndirectRegisterOperands) {
+  auto base = codegen::ARGUMENT_REGS[3];
+  auto index = codegen::ARGUMENT_REGS[2];
+
+  MemoryIndirect memory(nullptr);
+  memory.setMemoryIndirect(base.loc, index.loc, 2, 0x40);
+
+  std::unique_ptr<OperandBase> released_base =
+      memory.releaseBaseRegOperand();
+  std::unique_ptr<OperandBase> released_index =
+      memory.releaseIndexRegOperand();
+
+  ASSERT_NE(released_base, nullptr);
+  ASSERT_NE(released_index, nullptr);
+  EXPECT_EQ(released_base->getPhyRegister(), base);
+  EXPECT_EQ(released_index->getPhyRegister(), index);
+  EXPECT_EQ(memory.getBaseRegOperand(), nullptr);
+  EXPECT_EQ(memory.getIndexRegOperand(), nullptr);
+}
+
 #if defined(CINDER_AARCH64)
 static std::string runTargetSelect(const char* lir_input_str) {
   std::unique_ptr<Function> func = Parser().parse(lir_input_str);

@@ -109,6 +109,11 @@ class MemoryIndirect {
   OperandBase* getBaseRegOperand() const;
   OperandBase* getIndexRegOperand() const;
 
+  // Release parts of the MemoryIndirect. This is used when transforming an Ind
+  // into some other kind of operand.
+  std::unique_ptr<OperandBase> releaseBaseRegOperand();
+  std::unique_ptr<OperandBase> releaseIndexRegOperand();
+
   uint8_t getMultipiler() const;
   int32_t getOffset() const;
 
