@@ -42,6 +42,10 @@ COUNT_KEY_ALIASES = {
 }
 COVERAGE_TOOLS = ("gcov", "lcov", "genhtml")
 
+# TODO(cp311-source-gate): Add a gate that compares
+# cinderx/Interpreter/3.11/upstream byte-for-byte with the rpmbuild output of
+# python3-3.11.6-34.oe2403sp3.src.rpm and validates its SHA256SUMS manifest.
+
 # Minimum coverage percentages enforced by --coverage after final lcov filters.
 # Tune these values when the accepted project baseline changes.
 COVERAGE_MIN_PERCENT = {
