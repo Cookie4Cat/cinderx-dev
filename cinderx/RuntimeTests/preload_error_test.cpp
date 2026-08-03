@@ -140,14 +140,15 @@ class ScopedCodeConstsReplacement {
   Ref<> original_consts_;
 };
 
-// Replace the first Static Python argument-check local with a test-controlled
-// value. Static Python prohibits assigning a replacement __code__, so the test
-// must publish a fully-cloned metadata tree directly from C++.
+// Replace one Static Python argument-check item with a test-controlled value.
+// Static Python prohibits assigning a replacement __code__, so the test must
+// publish a fully-cloned metadata tree directly from C++.
 class ScopedStaticArgChecksReplacement {
  public:
   ScopedStaticArgChecksReplacement(
       BorrowedRef<PyCodeObject> code,
-      BorrowedRef<> replacement)
+      BorrowedRef<> replacement,
+      Py_ssize_t check_index = 0)
       : code_(code.get()), original_consts_(Ref<>::create(code->co_consts)) {
     Py_ssize_t consts_size = PyTuple_GET_SIZE(code->co_consts);
     if (consts_size == 0) {
@@ -166,7 +167,7 @@ class ScopedStaticArgChecksReplacement {
       throw std::runtime_error{"Static Python function has no argument checks"};
     }
 
-    replaceTupleItem(checks, 0, replacement);
+    replaceTupleItem(checks, check_index, replacement);
     replaceTupleItem(static_type_info, 0, checks);
     replaceTupleItem(replacement_consts, consts_size - 1, static_type_info);
     Py_SETREF(code_->co_consts, replacement_consts.release());
@@ -298,8 +299,8 @@ def test(value) -> int:
 
   Ref<PyFunctionObject> func(compileStaticAndGet(source, "test"));
   ASSERT_NE(func, nullptr);
-  auto preloader = jit::hir::Preloader::makePreloader(
-      func, jit::makeFrameReifier(func->func_code));
+  auto preloader =
+      jit::hir::Preloader::make(func, jit::makeFrameReifier(func->func_code));
   ASSERT_NE(preloader, nullptr);
 
   auto const_index = constIndexForOpcode(func->func_code, CAST);
@@ -323,8 +324,8 @@ def test(instance: C):
 
   Ref<PyFunctionObject> func(compileStaticAndGet(source, "test"));
   ASSERT_NE(func, nullptr);
-  auto preloader = jit::hir::Preloader::makePreloader(
-      func, jit::makeFrameReifier(func->func_code));
+  auto preloader =
+      jit::hir::Preloader::make(func, jit::makeFrameReifier(func->func_code));
   ASSERT_NE(preloader, nullptr);
 
   auto const_index = constIndexForOpcode(func->func_code, LOAD_FIELD);
@@ -333,6 +334,72 @@ def test(instance: C):
 
   expectContextualBuilderError(
       *preloader, "LOAD_FIELD: Can't find field for descr");
+}
+
+TEST_F(PreloaderErrorPropagationTest, UnknownStaticArgTypeThrowsDuringPreload) {
+  const char* source = R"(
+def test(value: int) -> int:
+    return value
+)";
+
+  Ref<PyFunctionObject> func(compileStaticAndGet(source, "test"));
+  ASSERT_NE(func, nullptr);
+  ScopedPreloadTestCleanup cleanup;
+  Ref<> invalid_descr = Ref<>::create(Py_None);
+  ScopedStaticArgChecksReplacement replacement{
+      func->func_code, invalid_descr, 1};
+
+  bool cpp_exception_escaped = false;
+  std::string cpp_exception_message;
+  try {
+    (void)jit::hir::Preloader::make(
+        func, jit::makeFrameReifier(func->func_code));
+  } catch (const std::runtime_error& exn) {
+    cpp_exception_escaped = true;
+    cpp_exception_message = exn.what();
+  }
+
+  EXPECT_TRUE(cpp_exception_escaped);
+  EXPECT_NE(cpp_exception_message.find("Unknown type descr"), std::string::npos)
+      << cpp_exception_message;
+}
+
+TEST_F(
+    PreloaderErrorPropagationTest,
+    FailedPrimitiveTargetArgTypeLoadThrowsDuringPreload) {
+  const char* source = R"(
+from __static__ import int64
+
+def target(value: int64) -> int64:
+    return value
+
+def test(value: int64) -> int64:
+    return target(value)
+)";
+
+  Ref<PyFunctionObject> func(compileStaticAndGet(source, "test"));
+  ASSERT_NE(func, nullptr);
+  Ref<PyFunctionObject> target(getGlobal("target"));
+  ASSERT_NE(target, nullptr);
+  ScopedPreloadTestCleanup cleanup;
+  Ref<> invalid_descr = Ref<>::create(Py_None);
+  ScopedStaticArgChecksReplacement replacement{
+      target->func_code, invalid_descr, 1};
+
+  try {
+    (void)jit::hir::Preloader::make(
+        func, jit::makeFrameReifier(func->func_code));
+    FAIL() << "expected primitive argument type loading to fail";
+  } catch (const std::runtime_error& exn) {
+    std::string message{exn.what()};
+    EXPECT_NE(
+        message.find(
+            "Failed to load primitive argument type information for function"),
+        std::string::npos)
+        << message;
+    EXPECT_NE(message.find("jittestmodule:target"), std::string::npos)
+        << message;
+  }
 }
 
 TEST_F(

@@ -1437,8 +1437,7 @@ hir::Preloader* preload(BorrowedRef<> unit) {
   // assumptions are broken after this.
   std::unique_ptr<hir::Preloader> preloader;
   if (func != nullptr) {
-    preloader =
-        hir::Preloader::makePreloader(func, makeFrameReifier(func->func_code));
+    preloader = hir::Preloader::make(func, makeFrameReifier(func->func_code));
   } else {
     auto& jit_code_outer_funcs = jitCtx()->codeOuterFunctions();
     auto it = jit_code_outer_funcs.find(code);
@@ -1464,7 +1463,7 @@ hir::Preloader* preload(BorrowedRef<> unit) {
         "Unexpected type for globals ({}) on function {}",
         Py_TYPE(outer_func->func_globals)->tp_name,
         funcFullname(outer_func));
-    preloader = hir::Preloader::makePreloader(
+    preloader = hir::Preloader::make(
         code,
         outer_func->func_builtins,
         outer_func->func_globals,
@@ -4693,7 +4692,7 @@ std::vector<BorrowedRef<PyFunctionObject>> preloadFuncAndDeps(
     // Preload all invoked Static Python functions because then the JIT can
     // compile them and emit direct calls to them from the original function.
     for (const auto& [descr, target] : preloader->invokeFunctionTargets()) {
-      if (!target->is_function || !target->is_statically_typed) {
+      if (!target->isFunction() || !target->is_statically_typed) {
         continue;
       }
       BorrowedRef<PyFunctionObject> target_func = target->func();
