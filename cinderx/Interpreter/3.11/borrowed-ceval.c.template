@@ -1,0 +1,75 @@
+// -*- mode: c++ -*- vi: set ft=cpp:
+// Copyright (c) Meta Platforms, Inc. and affiliates.
+
+// Interpreter-local dependencies for the pristine CPython 3.11.6 evaluator.
+// Generate this file only with the standalone UpstreamBorrow mechanism and
+// python3-3.11.6-34.oe2403sp3.src.rpm's rpmbuild source tree.
+
+// clang-format off
+
+#define Py_BUILD_CORE
+
+#include "Python.h"
+#include "frameobject.h"
+#include "internal/pycore_ceval.h"
+#include "internal/pycore_code.h"
+#include "internal/pycore_dict.h"
+#include "internal/pycore_exceptions.h"
+#include "internal/pycore_frame.h"
+#include "internal/pycore_function.h"
+#include "internal/pycore_genobject.h"
+#include "internal/pycore_global_objects.h"
+#include "internal/pycore_list.h"
+#include "internal/pycore_moduleobject.h"
+#include "internal/pycore_object.h"
+#include "internal/pycore_opcode.h"
+#include "internal/pycore_pyerrors.h"
+#include "internal/pycore_pystate.h"
+#include "internal/pycore_tuple.h"
+
+#include <assert.h>
+
+// List and line-table helpers used directly by opcode implementations.
+// @Borrow function list_resize from Objects/listobject.c
+// @Borrow function _PyList_AppendTakeRefListResize from Objects/listobject.c
+// @Borrow function _PyCode_CreateLineArray from Objects/codeobject.c
+
+// Frame/local synchronization and function construction.
+// @Borrow function _PyFrame_OpAlreadyRan from Objects/frameobject.c
+// @Borrow function _PyFrame_FastToLocalsWithError from Objects/frameobject.c
+// @Borrow function _PyFrame_LocalsToFast from Objects/frameobject.c
+// @Borrow function _PyEval_BuiltinsFromGlobals from Objects/frameobject.c
+// @Borrow function _PyFunction_FromConstructor from Objects/funcobject.c
+
+// Complete the single vendored frame implementation. Python/frame.c calls this
+// Objects/frameobject.c helper, which libpython does not export.
+#define _PyFrame_New_NoTrack Ci_PyFrame_New_NoTrack_311
+// @Borrow function _PyFrame_New_NoTrack from Objects/frameobject.c
+#undef _PyFrame_New_NoTrack
+
+// Coroutine construction. _PyAsyncGenValueWrapperNew is already provided by
+// the common 3.11 Borrow cache and is macro-routed in ceval_wrapper.c.
+// @Borrow CPP directives from Objects/genobject.c
+// @Borrow function make_gen from Objects/genobject.c
+PyObject* Cix_compute_cr_origin(
+    int origin_depth,
+    _PyInterpreterFrame* current_frame);
+#define compute_cr_origin Cix_compute_cr_origin
+// @Borrow function _Py_MakeCoro from Objects/genobject.c
+#undef compute_cr_origin
+
+// ExceptionGroup reraising dependency closure.
+// @Borrow typedef _exceptiongroup_split_matcher_type from Objects/exceptions.c
+// @Borrow typedef _exceptiongroup_split_result from Objects/exceptions.c
+// @Borrow function _PyBaseExceptionGroupObject_cast from Objects/exceptions.c
+// @Borrow function is_same_exception_metadata from Objects/exceptions.c
+// @Borrow function exceptiongroup_split_check_match from Objects/exceptions.c
+// @Borrow function exceptiongroup_subset from Objects/exceptions.c
+// @Borrow function exceptiongroup_split_recursive from Objects/exceptions.c
+// @Borrow function collect_exception_group_leaf_ids from Objects/exceptions.c
+// @Borrow function exception_group_projection from Objects/exceptions.c
+// @Borrow function _PyExc_CreateExceptionGroup from Objects/exceptions.c
+// @Borrow function _PyExc_PrepReraiseStar from Objects/exceptions.c
+
+// GIL drop checks use the exact target runtime predicate.
+// @Borrow function _PyThreadState_MustExit from Python/pystate.c
