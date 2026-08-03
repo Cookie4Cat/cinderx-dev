@@ -37,6 +37,7 @@
 #endif
 
 #include <cmath>
+#include <cstdlib>
 #include <limits>
 
 // This is mostly taken from ceval.c _PyEval_EvalCodeWithName
@@ -288,7 +289,12 @@ JITRT_StaticCallFPReturn JITRT_CallWithIncorrectArgcountFPReturn(
       (PyObject*)defaulted_args);
 }
 
-JITRT_StaticCallReturn JITRT_CallWithIncorrectArgcount(
+#ifdef _WIN32
+PyObject*
+#else
+JITRT_StaticCallReturn
+#endif
+JITRT_CallWithIncorrectArgcount(
     PyFunctionObject* func,
     PyObject** args,
     size_t nargsf,
@@ -299,7 +305,11 @@ JITRT_StaticCallReturn JITRT_CallWithIncorrectArgcount(
     // Fallback to the default _PyFunction_Vectorcall implementation
     // to produce an appropriate exception.
     auto interpVectorcall = getInterpretedVectorcall(func);
+#ifdef _WIN32
+    return interpVectorcall((PyObject*)func, args, nargsf, nullptr);
+#else
     return {interpVectorcall((PyObject*)func, args, nargsf, nullptr), nullptr};
+#endif
   }
   Py_ssize_t defcount = PyTuple_GET_SIZE(defaults);
   Py_ssize_t nargs = PyVectorcall_NARGS(nargsf);
@@ -309,7 +319,11 @@ JITRT_StaticCallReturn JITRT_CallWithIncorrectArgcount(
   if (nargs + defcount < argcount || nargs > argcount) {
     // Not enough args with defaults, or too many args without defaults.
     auto interpVectorcall = getInterpretedVectorcall(func);
+#ifdef _WIN32
+    return interpVectorcall((PyObject*)func, args, nargsf, nullptr);
+#else
     return {interpVectorcall((PyObject*)func, args, nargsf, nullptr), nullptr};
+#endif
   }
 
   Py_ssize_t i;
@@ -325,6 +339,10 @@ JITRT_StaticCallReturn JITRT_CallWithIncorrectArgcount(
 
   size_t new_nargsf = argcount;
 
+#ifdef _WIN32
+  return JITRT_GET_REENTRY(func->vectorcall)(
+      (PyObject*)func, arg_space.get(), new_nargsf, (PyObject*)defaulted_args);
+#else
   return reinterpret_cast<staticvectorcallfunc>(
       JITRT_GET_REENTRY(func->vectorcall))(
       (PyObject*)func,
@@ -333,6 +351,7 @@ JITRT_StaticCallReturn JITRT_CallWithIncorrectArgcount(
       // We lie to C++ here, and smuggle in the number of defaulted args filled
       // in.
       (PyObject*)defaulted_args);
+#endif
 }
 
 bool JITRT_PackStaticArgs(
@@ -573,23 +592,14 @@ static void init_and_link_interpreter_frame(
   setCurrentFrame(tstate, frame);
 }
 
-static inline PyThreadState* allocate_and_link_interpreter_frame(
+static PyThreadState* allocate_and_link_interpreter_frame(
     PyFunctionObject* func,
     PyCodeObject* co) {
   PyThreadState* tstate = PyThreadState_GET();
   JIT_DCHECK(tstate != nullptr, "thread state cannot be null");
-  JIT_DCHECK(
-      PyCode_Check(func->func_code),
-      "Non-code object for JIT function: {}",
-      jit::repr(reinterpret_cast<PyObject*>(func)));
 
-  // Frame allocation failure is very unlikely - it can only happen if we run
-  // out of memory. If this happens we behave less gracefully than the
-  // interpreter as we don't have references to args to allow for proper
-  // clean-up. Maybe we'll want to change this in future if it limits
-  // us from getting something like a stack-trace on this kind of failure.
   _PyInterpreterFrame* frame =
-      Cix_PyThreadState_PushFrame(tstate, jit::jitFrameGetSize(co));
+      Cix_PyThreadState_PushFrame(tstate, co->co_framesize);
   JIT_CHECK(frame != nullptr, "Failed to allocate _PyInterpreterFrame");
 
   init_and_link_interpreter_frame(
@@ -601,16 +611,14 @@ static inline PyThreadState* allocate_and_link_interpreter_frame(
 PyThreadState* JITRT_AllocateAndLinkInterpreterFrame_Debug(
     PyFunctionObject* func,
     PyCodeObject* jit_code_object) {
-  PyCodeObject* co = (PyCodeObject*)func->func_code;
-  // Given this assertion we actually don't need to incref the code object as
-  // happens in _PyFrame_Initialize.
+  PyCodeObject* co = reinterpret_cast<PyCodeObject*>(func->func_code);
   JIT_DCHECK(co == jit_code_object, "Code object mismatch");
   return allocate_and_link_interpreter_frame(func, co);
 }
 
 PyThreadState* JITRT_AllocateAndLinkInterpreterFrame_Release(
     PyFunctionObject* func) {
-  PyCodeObject* co = (PyCodeObject*)func->func_code;
+  PyCodeObject* co = reinterpret_cast<PyCodeObject*>(func->func_code);
   return allocate_and_link_interpreter_frame(func, co);
 }
 
@@ -647,7 +655,7 @@ JITRT_AllocateAndLinkGenAndInterpreterFrame(
       "Non-code object for JIT function: {}",
       jit::repr(reinterpret_cast<PyObject*>(func)));
   BorrowedRef<PyCodeObject> co{func->func_code};
-  JIT_DCHECK(co == code_rt->frameState()->code(), "Code object mismatch");
+  JIT_DCHECK(co == code_rt->code(), "Code object mismatch");
 
   uint64_t spill_words = code_rt->spillWords();
   PyThreadState* tstate = PyThreadState_GET();
@@ -772,6 +780,47 @@ void JITRT_DecrefFrame(PyFrameObject* frame) {
   }
 }
 
+static void cleanupFrameExecutable(_PyInterpreterFrame* frame) {
+#if PY_VERSION_HEX >= 0x030E0000
+  // Can't use a plain decref as this needs to be symmetric with
+  // _PyFrame_Initialize() which uses PyStackRef_FromPyObjectNew() for
+  // f_executable.
+  PyStackRef_CLOSE(frame->f_executable);
+#else
+  Py_DECREF(frameExecutable(frame));
+#endif
+}
+
+// Non-generator frames don't incref f_funcobj during setup — the caller
+// keeps the function alive. Incref now to balance the decref that
+// jitFrameClearExceptCode will perform.
+static void increfFuncObjForNonGenerator(_PyInterpreterFrame* frame) {
+  if (jit::getConfig().frame_mode != jit::FrameMode::kLightweight) {
+    return;
+  }
+#if PY_VERSION_HEX >= 0x030E0000 && PY_VERSION_HEX < 0x030F0000
+  // The 3.14 port eagerly materializes CPython-visible frame fields and keeps
+  // the setup-time function reference, so clear paths do not need a top-up ref.
+  return;
+#endif
+  if (frameCode(frame)->co_flags & jit::kCoFlagsAnyGenerator) {
+    return;
+  }
+#if PY_VERSION_HEX >= 0x030E0000
+  Py_INCREF(PyStackRef_AsPyObjectBorrow(frame->f_funcobj));
+#elif defined(ENABLE_LIGHTWEIGHT_FRAMES)
+  // On 3.12+LW, f_funcobj holds the reifier, not the function. The
+  // function lives in FrameHeader.func. For inlined frames,
+  // jitFrameRemoveReifier already handles the incref via Py_NewRef,
+  // so only incref for non-inlined (top-level) frames here.
+  if (!jit::isInlinedFrame(frame)) {
+    Py_XINCREF(jit::jitFrameGetFunction(frame));
+  }
+#else
+  Py_INCREF(frame->f_funcobj);
+#endif
+}
+
 void JITRT_UnlinkFrame(PyThreadState* tstate) {
   /*
    * The reference for this is _PyEvalFrameClearAndPop in ceval.c.
@@ -782,27 +831,23 @@ void JITRT_UnlinkFrame(PyThreadState* tstate) {
 
   // This is needed particularly because it handles the work of copying
   // data to a PyFrameObject if one has escaped the function.
-  jit::jitFrameClearExceptCode(frame);
-#if PY_VERSION_HEX >= 0x030E0000
-  // Can't use a plain decref as this needs to be symmetric with
-  // _PyFrame_Initialize() which uses PyStackRef_FromPyObjectNew() for
-  // f_executable.
-  PyStackRef_CLOSE(frame->f_executable);
-#else
-  Py_DECREF(frameExecutable(frame));
+#if !(PY_VERSION_HEX >= 0x030E0000 && PY_VERSION_HEX < 0x030F0000)
+  if (jit::getConfig().frame_mode == jit::FrameMode::kLightweight) {
+    increfFuncObjForNonGenerator(frame);
+  }
 #endif
+  jit::jitFrameClearExceptCode(frame);
+  cleanupFrameExecutable(frame);
 
   if (jit::getConfig().frame_mode != jit::FrameMode::kLightweight) {
-    Cix_PyThreadState_PopFrame(tstate, frame);
+    _PyThreadState_PopFrame(tstate, frame);
   }
-
-  // JIT frames are stack allocated so there's nothing to pop.
 }
 
 PyObject*
 JITRT_LoadGlobal(PyObject* globals, PyObject* builtins, PyObject* name) {
-  PyObject* result = Cix_PyDict_LoadGlobal(
-      (PyDictObject*)globals, (PyDictObject*)builtins, name);
+  PyObject* result =
+      _PyDict_LoadGlobal((PyDictObject*)globals, (PyDictObject*)builtins, name);
   if ((result == nullptr) && !PyErr_Occurred()) {
     // name is converted to a `char*` by format_exc_check_arg
     _PyEval_FormatExcCheckArg(
@@ -821,13 +866,13 @@ JITRT_LoadGlobal(PyObject* globals, PyObject* builtins, PyObject* name) {
 PyObject* JITRT_LoadGlobalFromThreadState(
     PyThreadState* tstate,
     PyObject* name) {
-  jit::RuntimeFrameState rtfs = jit::runtimeFrameStateFromThreadState(tstate);
-  return JITRT_LoadGlobal(rtfs.globals(), rtfs.builtins(), name);
+  _PyInterpreterFrame* frame = currentFrame(tstate);
+  return JITRT_LoadGlobal(frame->f_globals, frame->f_builtins, name);
 }
 
 PyObject* JITRT_LoadGlobalsDict(PyThreadState* tstate) {
-  jit::RuntimeFrameState rtfs = jit::runtimeFrameStateFromThreadState(tstate);
-  return rtfs.globals();
+  _PyInterpreterFrame* frame = currentFrame(tstate);
+  return frame->f_globals;
 }
 
 static int listPrefixReverseAssignFallback(PyObject* list, PyObject* index) {
@@ -923,10 +968,7 @@ static bool handle_periodic_activities_on_call(
     PyThreadState* tstate,
     PyObject* res,
     PyObject* callable) {
-#ifdef Py_GIL_DISABLED
-  _Py_qsbr_quiescent_state(
-      (reinterpret_cast<_PyThreadStateImpl*>(tstate))->qsbr);
-#endif
+  JITRT_AtQuiescentState(tstate);
   return res != nullptr && !PyFunction_Check(callable) &&
       is_eval_breaker_set(tstate) && _Py_HandlePending(tstate) != 0;
 }
@@ -1001,6 +1043,7 @@ JITRT_CallFunctionEx(PyObject* func, PyObject* pargs, PyObject* kwargs) {
 }
 
 PyObject* JITRT_Call(
+    PyThreadState* tstate,
     PyObject* callable,
     PyObject* const* args,
     size_t nargsf,
@@ -1029,7 +1072,6 @@ PyObject* JITRT_Call(
     }
   }
 
-  PyThreadState* tstate = _PyThreadState_GET();
   PyObject* res =
       _PyObject_VectorcallTstate(tstate, callable, args, nargsf, kwnames);
   // In 3.12 calls to non-Python functions will check for the eval breaker
@@ -1042,12 +1084,12 @@ PyObject* JITRT_Call(
   return res;
 }
 
-PyObject* JITRT_Vectorcall(
+PyObject* JITRT_VectorcallTstate(
+    PyThreadState* tstate,
     PyObject* callable,
     PyObject* const* args,
     size_t nargsf,
     PyObject* kwnames) {
-  PyThreadState* tstate = _PyThreadState_GET();
   PyObject* res =
       _PyObject_VectorcallTstate(tstate, callable, args, nargsf, kwnames);
   // In 3.12 calls to non-Python functions will check for the eval breaker
@@ -1556,7 +1598,16 @@ JITRT_GenSendRes JITRT_GenSend(
   }
 #endif
 
-  auto gen_status = PyIter_Send(gen, v, &retval);
+  PySendResult gen_status;
+  PyAsyncMethods* async_methods = Py_TYPE(gen)->tp_as_async;
+  if (async_methods != nullptr && async_methods->am_send != nullptr) {
+    // Inline PyIter_Send's first branch while honoring the current slot, which
+    // may be replaced by the instrumentation deopt wrapper.
+    gen_status = async_methods->am_send(gen, v, &retval);
+    assert(_Py_CheckSlotResult(gen, "am_send", gen_status != PYGEN_ERROR));
+  } else {
+    gen_status = PyIter_Send(gen, v, &retval);
+  }
 
   if (gen_status == PYGEN_RETURN) {
     return {retval, 1};
@@ -1643,6 +1694,7 @@ PyObject* JITRT_FormatValue(
 }
 
 PyObject* JITRT_BuildString(
+    PyThreadState* /*tstate*/,
     void* /*unused*/,
     PyObject** args,
     size_t nargsf,
@@ -2208,8 +2260,8 @@ PyObject* JITRT_CopyDictWithoutKeys(PyObject* subject, PyObject* keys) {
 }
 
 PyObject* JITRT_LoadName(PyThreadState* tstate, int name_idx) {
-  jit::RuntimeFrameState rtfs = jit::runtimeFrameStateFromThreadState(tstate);
-  return PyTuple_GET_ITEM(rtfs.code()->co_names, name_idx);
+  _PyInterpreterFrame* frame = currentFrame(tstate);
+  return PyTuple_GET_ITEM(frameCode(frame)->co_names, name_idx);
 }
 
 void JITRT_FormatAwaitableError(
@@ -2289,12 +2341,12 @@ LoadMethodResult JITRT_LoadSpecial(
   JIT_ABORT("JITRT_LoadSpecial not valid with this version of Python");
 }
 
+void JITRT_AtQuiescentState([[maybe_unused]] PyThreadState* tstate) {
 #ifdef Py_GIL_DISABLED
-void JITRT_AtQuiescentState(PyThreadState* tstate) {
   _Py_qsbr_quiescent_state(
       (reinterpret_cast<_PyThreadStateImpl*>(tstate))->qsbr);
-}
 #endif
+}
 
 PyObject JITRT_IterDoneSentinel = {
     _PyObject_EXTRA_INIT
@@ -2549,4 +2601,126 @@ void JITRT_TreeIterLeaveCurrentNode(jit::GenDataFooter* footer) {
 
 void JITRT_ClearTreeIterState(jit::GenDataFooter* footer) {
   jit::clearTreeIterState(footer);
+}
+
+static int JITRT_BindKeywordArgsSimple(
+    PyFunctionObject* func,
+    PyObject** args,
+    size_t nargsf,
+    PyObject* kwnames,
+    PyObject** arg_space,
+    Py_ssize_t total_args) {
+  PyCodeObject* co = (PyCodeObject*)func->func_code;
+  Py_ssize_t argcount = PyVectorcall_NARGS(nargsf);
+  if (argcount > co->co_argcount) {
+    return 0;
+  }
+
+  for (int i = 0; i < total_args; i++) {
+    arg_space[i] = nullptr;
+  }
+
+  // Copy all positional arguments into local variables
+  Py_ssize_t n = std::min<Py_ssize_t>(argcount, co->co_argcount);
+  for (Py_ssize_t j = 0; j < n; j++) {
+    arg_space[j] = args[j];
+  }
+
+  // Handle keyword arguments
+  if (kwnames != nullptr) {
+    for (Py_ssize_t i = 0; i < PyTuple_Size(kwnames); i++) {
+      PyObject* keyword = PyTuple_GET_ITEM(kwnames, i);
+      PyObject* value = args[argcount + i];
+      Py_ssize_t j;
+
+      if (keyword == nullptr || !PyUnicode_Check(keyword)) {
+        return 0;
+      }
+
+      // Speed hack: do raw pointer compares.
+      for (j = co->co_posonlyargcount; j < total_args; j++) {
+        PyObject* name = jit::getVarname(co, j);
+        if (name == keyword) {
+          goto kw_found;
+        }
+      }
+
+      // Slow fallback
+      for (j = co->co_posonlyargcount; j < total_args; j++) {
+        PyObject* name = jit::getVarname(co, j);
+        int cmp = PyObject_RichCompareBool(keyword, name, Py_EQ);
+        if (cmp > 0) {
+          goto kw_found;
+        } else if (cmp < 0) {
+          return 0;
+        }
+      }
+
+      return 0;
+
+    kw_found:
+      if (arg_space[j] != nullptr) {
+        return 0;
+      }
+      arg_space[j] = value;
+    }
+  }
+
+  // Check number of positional arguments
+  if ((argcount > co->co_argcount) && kwnames == nullptr) {
+    return 0;
+  }
+
+  // Add missing positional arguments (copy default values from defs)
+  if (argcount < co->co_argcount) {
+    PyObject* defaults = func->func_defaults;
+    Py_ssize_t defcount = defaults == nullptr ? 0 : PyTuple_Size(defaults);
+    Py_ssize_t first_default_arg = co->co_argcount - defcount;
+
+    for (Py_ssize_t i = argcount; i < first_default_arg; i++) {
+      if (arg_space[i] == nullptr) {
+        return 0;
+      }
+    }
+
+    if (defaults != nullptr) {
+      PyObject* const* defs = &((PyTupleObject*)defaults)->ob_item[0];
+      Py_ssize_t arg_index = std::max(argcount, first_default_arg);
+      for (; arg_index < co->co_argcount; arg_index++) {
+        if (arg_space[arg_index] == nullptr) {
+          Py_ssize_t def_index = arg_index - first_default_arg;
+          arg_space[arg_index] = defs[def_index];
+        }
+      }
+    }
+  }
+
+  return 1;
+}
+
+PyObject* JITRT_CallWithKeywordArgsSimple(
+    PyFunctionObject* func,
+    PyObject** args,
+    size_t nargsf,
+    PyObject* kwnames) {
+  PyCodeObject* co = (PyCodeObject*)func->func_code;
+  JIT_DCHECK(
+      !(co->co_flags & (CO_VARARGS | CO_VARKEYWORDS)),
+      "JITRT_CallWithKeywordArgsSimple doesn't support varargs");
+  JIT_DCHECK(
+      !co->co_kwonlyargcount,
+      "JITRT_CallWithKeywordArgsSimple doesn't support kw only args");
+  const Py_ssize_t total_args = co->co_argcount;
+
+  // stack allocate
+  auto arg_space = (PyObject**)alloca(total_args * sizeof(PyObject*));
+
+  if (JITRT_BindKeywordArgsSimple(
+          func, args, nargsf, kwnames, arg_space, total_args)) {
+    size_t new_nargsf = total_args;
+    return JITRT_GET_REENTRY(func->vectorcall)(
+        (PyObject*)func, arg_space, new_nargsf, nullptr);
+  }
+
+  return Ci_PyFunction_Vectorcall((PyObject*)func, args, nargsf, kwnames);
 }

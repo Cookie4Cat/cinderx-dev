@@ -527,9 +527,15 @@ void LinearScanAllocator::calculateLiveIntervals() {
         visit_indirect(output_opnd);
       }
 
-      // inputs
-      for (size_t i = 0; i < instr->getNumInputs(); i++) {
-        const OperandBase* opnd = instr->getInput(i);
+      // Inputs are iterated in reverse so that when two operands reference
+      // the same vreg, lastUse lands on the last operand by index. After
+      // call rewriting splits operands into separate Move instructions, the
+      // last operand becomes the chronologically last Move, which is the
+      // correct one to carry lastUse for spill-deletion decisions.
+      size_t num_inputs = instr->getNumInputs();
+      for (size_t i = 0; i < num_inputs; ++i) {
+        size_t idx = num_inputs - i - 1;
+        const OperandBase* opnd = instr->getInput(idx);
         if (!opnd->isVreg() && !opnd->isInd()) {
           continue;
         }
@@ -539,7 +545,7 @@ void LinearScanAllocator::calculateLiveIntervals() {
           continue;
         }
 
-        register_input(opnd, instr->getInputPhyRegUse(i));
+        register_input(opnd, instr->getInputPhyRegUse(idx));
       }
 
       if (instr->isCallLike() || isTreeIterHelperCall(instr_opcode)) {
@@ -1483,10 +1489,20 @@ void LinearScanAllocator::resolveEdges() {
       bool is_exit = last_instr_opcode == Instruction::kReturn ||
           last_instr_opcode == Instruction::kBranchToYieldExit;
 
+      // Label-targeted branches are inserted by postalloc, so they should
+      // not exist yet. Indirect branches (MemoryIndirect operand) and
+      // direct-address branches (Imm operand) are created in the generator
+      // and are expected here.
       JIT_CHECK(
-          last_instr_opcode != Instruction::kBranch,
-          "Unconditional branch should not have been generated yet: {}",
-          *last_instr);
+          last_instr_opcode != Instruction::kBranch ||
+              (last_instr->getNumInputs() > 0 &&
+               (last_instr->getInput(0)->isInd() ||
+                last_instr->getInput(0)->isImm() ||
+                last_instr->getInput(0)->isReg())),
+          "Unconditional branch to label should not have been generated yet: "
+          "{} {}",
+          *last_instr,
+          last_instr->getInput(0)->type());
 
       rewriteLIREmitCopies(
           basic_block, basic_block->instructions().end(), std::move(copies));
@@ -1624,7 +1640,7 @@ void LinearScanAllocator::rewriteLIREmitCopies(
   for (auto op : copies->process()) {
     PhyLocation from = op.from;
     PhyLocation to = op.to;
-    auto orig_opnd_size = op.type;
+    [[maybe_unused]] auto orig_opnd_size = op.type;
 
     // All push and pop operations have to be 8-bytes in size as that's the size
     // of all stack slots.
@@ -1643,9 +1659,26 @@ void LinearScanAllocator::rewriteLIREmitCopies(
         } else if (to.is_register() || from.is_register()) {
           auto instr =
               block->allocateInstrBefore(instr_iter, Instruction::kMove);
-          instr->allocatePhyRegOrStackInput(from)->setDataType(orig_opnd_size);
+#if defined(CINDER_AARCH64)
+          // ARM64: always use 64-bit moves for edge-resolution copies
+          // involving GP registers.  During a register swap (cycle in the
+          // copy graph), two different virtual registers share the same
+          // physical register.  If one vreg is k32bit and the other is
+          // kObject/k64bit, using the k32bit width truncates the 64-bit
+          // value, zeroing the upper 32 bits.  A 64-bit move is always safe
+          // because ARM64 W-register operations zero-extend into X, so the
+          // upper half is already zero for true 32-bit values.
+          // FP registers must keep kDouble — using k64bit would route
+          // through getGp() instead of getVecD() and abort.
+          auto copy_dt = (from.is_fp_register() || to.is_fp_register())
+              ? orig_opnd_size
+              : DataType::k64bit;
+#else
+          auto copy_dt = orig_opnd_size;
+#endif
+          instr->allocatePhyRegOrStackInput(from)->setDataType(copy_dt);
           instr->output()->setPhyRegOrStackSlot(to);
-          instr->output()->setDataType(orig_opnd_size);
+          instr->output()->setDataType(copy_dt);
         } else {
 #if defined(CINDER_AARCH64)
           // ARM64: avoid push+pop for stack-to-stack copies. Use scratch x13
@@ -1684,9 +1717,20 @@ void LinearScanAllocator::rewriteLIREmitCopies(
             to);
         auto instr =
             block->allocateInstrBefore(instr_iter, Instruction::kExchange);
-        instr->allocatePhyRegisterInput(from)->setDataType(orig_opnd_size);
+#if defined(CINDER_AARCH64)
+        // ARM64: always use 64-bit for GP register exchanges (same
+        // reasoning as the kCopy case above — a narrower exchange
+        // truncates the wider value sharing the physical register).
+        // FP registers must keep kDouble.
+        auto xchg_dt = (from.is_fp_register() || to.is_fp_register())
+            ? orig_opnd_size
+            : DataType::k64bit;
+#else
+        auto xchg_dt = orig_opnd_size;
+#endif
+        instr->allocatePhyRegisterInput(from)->setDataType(xchg_dt);
         instr->output()->setPhyRegOrStackSlot(to);
-        instr->output()->setDataType(orig_opnd_size);
+        instr->output()->setDataType(xchg_dt);
         break;
       }
     }

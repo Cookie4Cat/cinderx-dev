@@ -232,14 +232,13 @@ int jitgen_traverse(PyObject* obj, visitproc visit, void* arg) {
       return r;
     }
 
-#if PY_VERSION_HEX < 0x030E0000
+#if PY_VERSION_HEX < 0x030E0000 && defined(ENABLE_LIGHTWEIGHT_FRAMES)
     // In lightweight frame mode, frame->f_funcobj is set to a reifier singleton
     // rather than the actual function. The real function is stored in the
     // FrameHeader and contains func_closure with closure cells that may
     // participate in reference cycles. We must visit it explicitly since
     // _PyFrame_Traverse won't see it.
-    if (getConfig().frame_mode == FrameMode::kLightweight &&
-        jit_gen->gi_frame_state < FRAME_CLEARED) {
+    if (jit_gen->gi_frame_state < FRAME_CLEARED) {
       _PyInterpreterFrame* frame = generatorFrame(jit_gen);
       BorrowedRef<PyFunctionObject> func = jitFrameGetFunction(frame);
       Py_VISIT(func.get());
@@ -920,19 +919,19 @@ void deopt_jit_gen_object_only(JitGenObject* gen) {
       : &PyCoro_Type;
   Py_DECREF(old_type);
   Py_SET_TYPE(reinterpret_cast<PyObject*>(gen), type);
-  if (getConfig().frame_mode == FrameMode::kLightweight) {
-    auto frame = generatorFrame(gen);
-    if (gen->gi_frame_state != FRAME_CLEARED) {
-      jitFrameRemoveReifier(frame);
-    } else if constexpr (PY_VERSION_HEX < 0x030E0000) {
-      // Normally we'll clear the function via jitFrameClearExceptCode. But
-      // a user can call clear on a reified frame object which transfers
-      // ownership of the _PyInterpreterFrame to the PyFrameObject and marks
-      // the generator frame as cleared. In that case we still need to decref
-      // the function which is stored before the _PyInterpreterFrame in 3.12.
-      Py_XDECREF(jitFrameGetFunction(frame));
-    }
+#ifdef ENABLE_LIGHTWEIGHT_FRAMES
+  auto frame = generatorFrame(gen);
+  if (gen->gi_frame_state != FRAME_CLEARED) {
+    jitFrameRemoveReifier(frame);
+  } else if constexpr (PY_VERSION_HEX < 0x030E0000) {
+    // Normally we'll clear the function via jitFrameClearExceptCode. But
+    // a user can call clear on a reified frame object which transfers
+    // ownership of the _PyInterpreterFrame to the PyFrameObject and marks
+    // the generator frame as cleared. In that case we still need to decref
+    // the function which is stored before the _PyInterpreterFrame in 3.12.
+    Py_XDECREF(jitFrameGetFunction(frame));
   }
+#endif
 }
 
 bool deopt_jit_gen_with_footer(
@@ -1085,12 +1084,12 @@ void init_jit_genobject_type() {
   copy_methods(PyGen_Type.tp_methods, gen_type->tp_methods);
   copy_methods(PyCoro_Type.tp_methods, coro_type->tp_methods);
 
-#ifdef Py_GIL_DISABLED
-  cinderx::getModuleState()->jit_gen_free_list.reset(
-      new JITGenFreeThreadedFreeList());
-#else
-  cinderx::getModuleState()->jit_gen_free_list.reset(new JitGenFreeList());
-#endif
+  if constexpr (kFreeThreadedBuild) {
+    cinderx::getModuleState()->jit_gen_free_list.reset(
+        new JITGenFreeThreadedFreeList());
+  } else {
+    cinderx::getModuleState()->jit_gen_free_list.reset(new JitGenFreeList());
+  }
 
   // Override dealloc so we can use a "free-list" for our objects.
   JIT_CHECK(

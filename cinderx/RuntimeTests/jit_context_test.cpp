@@ -51,8 +51,7 @@ foo = "hello"
 
   Ref<PyFunctionObject> func(compileAndGet(py_src, "func"));
   std::unique_ptr<jit::hir::Preloader> preloader(
-      jit::hir::Preloader::makePreloader(
-          func, jit::makeFrameReifier(func->func_code)));
+      jit::hir::Preloader::make(func, jit::makeFrameReifier(func->func_code)));
 
   auto comp_result =
       jit::compilePreloaderImpl(jit_ctx_.get(), *preloader, func);
@@ -189,8 +188,7 @@ def func(a: int) -> int:
   ASSERT_NE(func, nullptr);
 
   std::unique_ptr<jit::hir::Preloader> preloader(
-      jit::hir::Preloader::makePreloader(
-          func, jit::makeFrameReifier(func->func_code)));
+      jit::hir::Preloader::make(func, jit::makeFrameReifier(func->func_code)));
 
   auto comp_result =
       jit::compilePreloaderImpl(jit_ctx_.get(), *preloader, func);
@@ -218,18 +216,16 @@ def mul(a: int, b: int) -> int:
   ASSERT_NE(mul_func, nullptr);
 
   {
-    std::unique_ptr<jit::hir::Preloader> preloader(
-        jit::hir::Preloader::makePreloader(
-            add_func, jit::makeFrameReifier(add_func->func_code)));
+    std::unique_ptr<jit::hir::Preloader> preloader(jit::hir::Preloader::make(
+        add_func, jit::makeFrameReifier(add_func->func_code)));
     auto comp =
         jit::compilePreloaderImpl(jit_ctx_.get(), *preloader, add_func);
     ASSERT_EQ(comp, jit::Result::OK);
   }
 
   {
-    std::unique_ptr<jit::hir::Preloader> preloader(
-        jit::hir::Preloader::makePreloader(
-            mul_func, jit::makeFrameReifier(mul_func->func_code)));
+    std::unique_ptr<jit::hir::Preloader> preloader(jit::hir::Preloader::make(
+        mul_func, jit::makeFrameReifier(mul_func->func_code)));
     auto comp =
         jit::compilePreloaderImpl(jit_ctx_.get(), *preloader, mul_func);
     ASSERT_EQ(comp, jit::Result::OK);
@@ -249,8 +245,7 @@ def func() -> int:
   ASSERT_NE(func, nullptr);
 
   std::unique_ptr<jit::hir::Preloader> preloader(
-      jit::hir::Preloader::makePreloader(
-          func, jit::makeFrameReifier(func->func_code)));
+      jit::hir::Preloader::make(func, jit::makeFrameReifier(func->func_code)));
 
   auto comp_result =
       jit::compilePreloaderImpl(jit_ctx_.get(), *preloader, func);
@@ -273,8 +268,7 @@ def func() -> int:
   ASSERT_NE(func, nullptr);
 
   std::unique_ptr<jit::hir::Preloader> preloader(
-      jit::hir::Preloader::makePreloader(
-          func, jit::makeFrameReifier(func->func_code)));
+      jit::hir::Preloader::make(func, jit::makeFrameReifier(func->func_code)));
 
   auto comp_result =
       jit::compilePreloaderImpl(jit_ctx_.get(), *preloader, func);
@@ -299,8 +293,7 @@ def func() -> int:
   ASSERT_NE(func, nullptr);
 
   std::unique_ptr<jit::hir::Preloader> preloader(
-      jit::hir::Preloader::makePreloader(
-          func, jit::makeFrameReifier(func->func_code)));
+      jit::hir::Preloader::make(func, jit::makeFrameReifier(func->func_code)));
 
   auto comp_result =
       jit::compilePreloaderImpl(jit_ctx_.get(), *preloader, func);
@@ -358,8 +351,7 @@ def func():
   ASSERT_NE(func, nullptr);
 
   std::unique_ptr<jit::hir::Preloader> preloader(
-      jit::hir::Preloader::makePreloader(
-          func, jit::makeFrameReifier(func->func_code)));
+      jit::hir::Preloader::make(func, jit::makeFrameReifier(func->func_code)));
 
   auto comp_result =
       jit::compilePreloaderImpl(jit_ctx_.get(), *preloader, func);
@@ -383,8 +375,7 @@ def func():
   ASSERT_NE(func, nullptr);
 
   std::unique_ptr<jit::hir::Preloader> preloader(
-      jit::hir::Preloader::makePreloader(
-          func, jit::makeFrameReifier(func->func_code)));
+      jit::hir::Preloader::make(func, jit::makeFrameReifier(func->func_code)));
 
   auto comp_result =
       jit::compilePreloaderImpl(jit_ctx_.get(), *preloader, func);
@@ -403,8 +394,7 @@ def func():
   EXPECT_FALSE(jit_ctx_->didCompile(func));
 
   std::unique_ptr<jit::hir::Preloader> preloader(
-      jit::hir::Preloader::makePreloader(
-          func, jit::makeFrameReifier(func->func_code)));
+      jit::hir::Preloader::make(func, jit::makeFrameReifier(func->func_code)));
 
   auto comp_result =
       jit::compilePreloaderImpl(jit_ctx_.get(), *preloader, func);
@@ -436,8 +426,7 @@ def func(a: int, b: int) -> int:
   ASSERT_NE(func, nullptr);
 
   std::unique_ptr<jit::hir::Preloader> preloader(
-      jit::hir::Preloader::makePreloader(
-          func, jit::makeFrameReifier(func->func_code)));
+      jit::hir::Preloader::make(func, jit::makeFrameReifier(func->func_code)));
 
   auto comp_result =
       jit::compilePreloaderImpl(jit_ctx_.get(), *preloader, func);
@@ -460,8 +449,7 @@ def func():
   const auto before_size = jit_ctx_->compiledCodes().size();
 
   std::unique_ptr<jit::hir::Preloader> preloader(
-      jit::hir::Preloader::makePreloader(
-          func, jit::makeFrameReifier(func->func_code)));
+      jit::hir::Preloader::make(func, jit::makeFrameReifier(func->func_code)));
 
   auto comp_result =
       jit::compilePreloaderImpl(jit_ctx_.get(), *preloader, func);
@@ -511,8 +499,7 @@ def func(x):
   ASSERT_NE(func, nullptr);
 
   std::unique_ptr<jit::hir::Preloader> preloader(
-      jit::hir::Preloader::makePreloader(
-          func, jit::makeFrameReifier(func->func_code)));
+      jit::hir::Preloader::make(func, jit::makeFrameReifier(func->func_code)));
 
   auto comp_result =
       jit::compilePreloaderImpl(jit_ctx_.get(), *preloader, func);
@@ -524,11 +511,9 @@ def func(x):
   jit::CodeRuntime* rt = compiled->runtime();
   ASSERT_NE(rt, nullptr);
 
-  const auto* fs = rt->frameState();
-  ASSERT_NE(fs, nullptr);
-  EXPECT_EQ(fs->code(), func->func_code);
-  EXPECT_NE(fs->builtins(), nullptr);
-  EXPECT_NE(fs->globals(), nullptr);
+  EXPECT_EQ(rt->code(), func->func_code);
+  EXPECT_NE(rt->builtins(), nullptr);
+  EXPECT_NE(rt->globals(), nullptr);
 }
 
 TEST_F(JITFrameTest, CompileAndRunSimpleFunc) {
@@ -541,8 +526,7 @@ def func():
   ASSERT_NE(func, nullptr);
 
   std::unique_ptr<jit::hir::Preloader> preloader(
-      jit::hir::Preloader::makePreloader(
-          func, jit::makeFrameReifier(func->func_code)));
+      jit::hir::Preloader::make(func, jit::makeFrameReifier(func->func_code)));
 
   auto comp_result =
       jit::compilePreloaderImpl(jit_ctx_.get(), *preloader, func);
@@ -564,8 +548,7 @@ def add(a, b):
   ASSERT_NE(func, nullptr);
 
   std::unique_ptr<jit::hir::Preloader> preloader(
-      jit::hir::Preloader::makePreloader(
-          func, jit::makeFrameReifier(func->func_code)));
+      jit::hir::Preloader::make(func, jit::makeFrameReifier(func->func_code)));
 
   auto comp_result =
       jit::compilePreloaderImpl(jit_ctx_.get(), *preloader, func);
@@ -590,8 +573,7 @@ def gen():
   ASSERT_NE(func, nullptr);
 
   std::unique_ptr<jit::hir::Preloader> preloader(
-      jit::hir::Preloader::makePreloader(
-          func, jit::makeFrameReifier(func->func_code)));
+      jit::hir::Preloader::make(func, jit::makeFrameReifier(func->func_code)));
 
   auto comp_result =
       jit::compilePreloaderImpl(jit_ctx_.get(), *preloader, func);
@@ -627,18 +609,16 @@ def func_b():
   ASSERT_NE(func_b, nullptr);
 
   {
-    std::unique_ptr<jit::hir::Preloader> preloader(
-        jit::hir::Preloader::makePreloader(
-            func_a, jit::makeFrameReifier(func_a->func_code)));
+    std::unique_ptr<jit::hir::Preloader> preloader(jit::hir::Preloader::make(
+        func_a, jit::makeFrameReifier(func_a->func_code)));
     auto comp =
         jit::compilePreloaderImpl(jit_ctx_.get(), *preloader, func_a);
     ASSERT_EQ(comp, jit::Result::OK);
   }
 
   {
-    std::unique_ptr<jit::hir::Preloader> preloader(
-        jit::hir::Preloader::makePreloader(
-            func_b, jit::makeFrameReifier(func_b->func_code)));
+    std::unique_ptr<jit::hir::Preloader> preloader(jit::hir::Preloader::make(
+        func_b, jit::makeFrameReifier(func_b->func_code)));
     auto comp =
         jit::compilePreloaderImpl(jit_ctx_.get(), *preloader, func_b);
     ASSERT_EQ(comp, jit::Result::OK);
@@ -845,8 +825,7 @@ def func():
   ASSERT_NE(func, nullptr);
 
   std::unique_ptr<jit::hir::Preloader> preloader(
-      jit::hir::Preloader::makePreloader(
-          func, jit::makeFrameReifier(func->func_code)));
+      jit::hir::Preloader::make(func, jit::makeFrameReifier(func->func_code)));
 
   auto comp_result =
       jit::compilePreloaderImpl(jit_ctx_.get(), *preloader, func);
@@ -866,8 +845,7 @@ def func():
   ASSERT_NE(func, nullptr);
 
   std::unique_ptr<jit::hir::Preloader> preloader(
-      jit::hir::Preloader::makePreloader(
-          func, jit::makeFrameReifier(func->func_code)));
+      jit::hir::Preloader::make(func, jit::makeFrameReifier(func->func_code)));
 
   auto comp_result =
       jit::compilePreloaderImpl(jit_ctx_.get(), *preloader, func);
@@ -891,8 +869,7 @@ def func():
   ASSERT_NE(func, nullptr);
 
   std::unique_ptr<jit::hir::Preloader> preloader(
-      jit::hir::Preloader::makePreloader(
-          func, jit::makeFrameReifier(func->func_code)));
+      jit::hir::Preloader::make(func, jit::makeFrameReifier(func->func_code)));
 
   auto comp_result =
       jit::compilePreloaderImpl(jit_ctx_.get(), *preloader, func);
@@ -920,8 +897,7 @@ def func():
   ASSERT_NE(func, nullptr);
 
   std::unique_ptr<jit::hir::Preloader> preloader(
-      jit::hir::Preloader::makePreloader(
-          func, jit::makeFrameReifier(func->func_code)));
+      jit::hir::Preloader::make(func, jit::makeFrameReifier(func->func_code)));
 
   auto comp_result =
       jit::compilePreloaderImpl(jit_ctx_.get(), *preloader, func);
@@ -954,8 +930,7 @@ def func():
   ASSERT_NE(func, nullptr);
 
   std::unique_ptr<jit::hir::Preloader> preloader(
-      jit::hir::Preloader::makePreloader(
-          func, jit::makeFrameReifier(func->func_code)));
+      jit::hir::Preloader::make(func, jit::makeFrameReifier(func->func_code)));
 
   auto comp_result =
       jit::compilePreloaderImpl(jit_ctx_.get(), *preloader, func);
@@ -988,8 +963,7 @@ def func():
   ASSERT_NE(func, nullptr);
 
   std::unique_ptr<jit::hir::Preloader> preloader(
-      jit::hir::Preloader::makePreloader(
-          func, jit::makeFrameReifier(func->func_code)));
+      jit::hir::Preloader::make(func, jit::makeFrameReifier(func->func_code)));
 
   auto comp_result =
       jit::compilePreloaderImpl(jit_ctx_.get(), *preloader, func);
@@ -1032,8 +1006,7 @@ def func():
   ASSERT_NE(func, nullptr);
 
   std::unique_ptr<jit::hir::Preloader> preloader(
-      jit::hir::Preloader::makePreloader(
-          func, jit::makeFrameReifier(func->func_code)));
+      jit::hir::Preloader::make(func, jit::makeFrameReifier(func->func_code)));
 
   auto comp_result =
       jit::compilePreloaderImpl(jit_ctx_.get(), *preloader, func);
@@ -1162,8 +1135,7 @@ def gen():
   ASSERT_NE(func, nullptr);
 
   std::unique_ptr<jit::hir::Preloader> preloader(
-      jit::hir::Preloader::makePreloader(
-          func, jit::makeFrameReifier(func->func_code)));
+      jit::hir::Preloader::make(func, jit::makeFrameReifier(func->func_code)));
 
   auto comp_result =
       jit::compilePreloaderImpl(jit_ctx_.get(), *preloader, func);
@@ -1171,7 +1143,7 @@ def gen():
 
   jit::CodeRuntime* rt = jit_ctx_->lookupCodeRuntime(func);
   ASSERT_NE(rt, nullptr);
-  EXPECT_TRUE(rt->frameState()->isGen());
+  EXPECT_TRUE(rt->isGen());
 }
 
 class JITCodeRuntimeExtendedTest : public RuntimeTest {
@@ -1201,10 +1173,9 @@ def func():
 
   jit::CodeRuntime rt{func};
 
-  auto* inlined_fs = rt.allocateRuntimeFrameState(
-      func->func_code, func->func_builtins, func->func_globals);
-  ASSERT_NE(inlined_fs, nullptr);
-  EXPECT_EQ(inlined_fs->code(), func->func_code);
+  EXPECT_EQ(rt.code(), func->func_code);
+  EXPECT_NE(rt.builtins(), nullptr);
+  EXPECT_NE(rt.globals(), nullptr);
 }
 
 TEST_F(JITCodeRuntimeExtendedTest, MultipleDeoptMetadatas) {
@@ -1260,11 +1231,9 @@ def func():
 
   jit::CodeRuntime rt{func};
 
-  const auto* fs = rt.frameState();
-  ASSERT_NE(fs, nullptr);
-  EXPECT_EQ(fs->code(), func->func_code);
-  EXPECT_NE(fs->builtins(), nullptr);
-  EXPECT_NE(fs->globals(), nullptr);
+  EXPECT_EQ(rt.code(), func->func_code);
+  EXPECT_NE(rt.builtins(), nullptr);
+  EXPECT_NE(rt.globals(), nullptr);
 }
 
 TEST_F(JITCodeRuntimeExtendedTest, CompiledFunctionStackSizes) {
@@ -1277,8 +1246,7 @@ def func(a, b):
   ASSERT_NE(func, nullptr);
 
   std::unique_ptr<jit::hir::Preloader> preloader(
-      jit::hir::Preloader::makePreloader(
-          func, jit::makeFrameReifier(func->func_code)));
+      jit::hir::Preloader::make(func, jit::makeFrameReifier(func->func_code)));
 
   auto comp_result =
       jit::compilePreloaderImpl(jit_ctx_.get(), *preloader, func);
@@ -1301,8 +1269,7 @@ def func():
   ASSERT_NE(func, nullptr);
 
   std::unique_ptr<jit::hir::Preloader> preloader(
-      jit::hir::Preloader::makePreloader(
-          func, jit::makeFrameReifier(func->func_code)));
+      jit::hir::Preloader::make(func, jit::makeFrameReifier(func->func_code)));
 
   auto comp_result =
       jit::compilePreloaderImpl(jit_ctx_.get(), *preloader, func);
@@ -1325,8 +1292,7 @@ def func():
   ASSERT_NE(func, nullptr);
 
   std::unique_ptr<jit::hir::Preloader> preloader(
-      jit::hir::Preloader::makePreloader(
-          func, jit::makeFrameReifier(func->func_code)));
+      jit::hir::Preloader::make(func, jit::makeFrameReifier(func->func_code)));
 
   auto comp_result =
       jit::compilePreloaderImpl(jit_ctx_.get(), *preloader, func);
@@ -1403,12 +1369,12 @@ def gen():
 
   {
     jit::CodeRuntime rt{normal_func};
-    EXPECT_FALSE(rt.frameState()->isGen());
+    EXPECT_FALSE(rt.isGen());
   }
 
   {
     jit::CodeRuntime rt{gen_func};
-    EXPECT_TRUE(rt.frameState()->isGen());
+    EXPECT_TRUE(rt.isGen());
   }
 }
 
@@ -1548,8 +1514,7 @@ def func():
   ASSERT_NE(func, nullptr);
 
   std::unique_ptr<jit::hir::Preloader> preloader(
-      jit::hir::Preloader::makePreloader(
-          func, jit::makeFrameReifier(func->func_code)));
+      jit::hir::Preloader::make(func, jit::makeFrameReifier(func->func_code)));
 
   auto comp_result =
       jit::compilePreloaderImpl(jit_ctx_.get(), *preloader, func);
@@ -1563,11 +1528,9 @@ def func():
   EXPECT_GE(rt->frameSize(), 0);
   EXPECT_FALSE(rt->isCleared());
 
-  const auto* frame_state = rt->frameState();
-  ASSERT_NE(frame_state, nullptr);
-  ASSERT_NE(frame_state->code(), nullptr);
-  ASSERT_NE(frame_state->builtins(), nullptr);
-  ASSERT_NE(frame_state->globals(), nullptr);
+  ASSERT_NE(rt->code(), nullptr);
+  ASSERT_NE(rt->builtins(), nullptr);
+  ASSERT_NE(rt->globals(), nullptr);
 }
 
 class JITGeneratorTest : public RuntimeTest {
@@ -1598,8 +1561,7 @@ def gen():
   ASSERT_NE(func, nullptr);
 
   std::unique_ptr<jit::hir::Preloader> preloader(
-      jit::hir::Preloader::makePreloader(
-          func, jit::makeFrameReifier(func->func_code)));
+      jit::hir::Preloader::make(func, jit::makeFrameReifier(func->func_code)));
 
   auto comp_result =
       jit::compilePreloaderImpl(jit_ctx_.get(), *preloader, func);
@@ -1624,8 +1586,7 @@ def gen():
   EXPECT_FALSE(jit_ctx_->didCompile(func));
 
   std::unique_ptr<jit::hir::Preloader> preloader(
-      jit::hir::Preloader::makePreloader(
-          func, jit::makeFrameReifier(func->func_code)));
+      jit::hir::Preloader::make(func, jit::makeFrameReifier(func->func_code)));
 
   auto comp_result =
       jit::compilePreloaderImpl(jit_ctx_.get(), *preloader, func);
@@ -1645,8 +1606,7 @@ def gen():
   ASSERT_NE(func, nullptr);
 
   std::unique_ptr<jit::hir::Preloader> preloader(
-      jit::hir::Preloader::makePreloader(
-          func, jit::makeFrameReifier(func->func_code)));
+      jit::hir::Preloader::make(func, jit::makeFrameReifier(func->func_code)));
 
   auto comp_result =
       jit::compilePreloaderImpl(jit_ctx_.get(), *preloader, func);
@@ -1674,8 +1634,7 @@ def gen(n: int):
   ASSERT_NE(func, nullptr);
 
   std::unique_ptr<jit::hir::Preloader> preloader(
-      jit::hir::Preloader::makePreloader(
-          func, jit::makeFrameReifier(func->func_code)));
+      jit::hir::Preloader::make(func, jit::makeFrameReifier(func->func_code)));
 
   auto comp_result =
       jit::compilePreloaderImpl(jit_ctx_.get(), *preloader, func);
@@ -1711,8 +1670,7 @@ def gen():
   ASSERT_NE(func, nullptr);
 
   std::unique_ptr<jit::hir::Preloader> preloader(
-      jit::hir::Preloader::makePreloader(
-          func, jit::makeFrameReifier(func->func_code)));
+      jit::hir::Preloader::make(func, jit::makeFrameReifier(func->func_code)));
 
   auto comp_result =
       jit::compilePreloaderImpl(jit_ctx_.get(), *preloader, func);
@@ -1735,8 +1693,7 @@ def gen():
   ASSERT_NE(func, nullptr);
 
   std::unique_ptr<jit::hir::Preloader> preloader(
-      jit::hir::Preloader::makePreloader(
-          func, jit::makeFrameReifier(func->func_code)));
+      jit::hir::Preloader::make(func, jit::makeFrameReifier(func->func_code)));
 
   auto comp_result =
       jit::compilePreloaderImpl(jit_ctx_.get(), *preloader, func);
@@ -1770,8 +1727,7 @@ async def coro():
   ASSERT_NE(func, nullptr);
 
   std::unique_ptr<jit::hir::Preloader> preloader(
-      jit::hir::Preloader::makePreloader(
-          func, jit::makeFrameReifier(func->func_code)));
+      jit::hir::Preloader::make(func, jit::makeFrameReifier(func->func_code)));
 
   auto comp_result =
       jit::compilePreloaderImpl(jit_ctx_.get(), *preloader, func);
@@ -1817,8 +1773,7 @@ def gen():
   ASSERT_NE(func, nullptr);
 
   std::unique_ptr<jit::hir::Preloader> preloader(
-      jit::hir::Preloader::makePreloader(
-          func, jit::makeFrameReifier(func->func_code)));
+      jit::hir::Preloader::make(func, jit::makeFrameReifier(func->func_code)));
 
   auto comp_result =
       jit::compilePreloaderImpl(jit_ctx_.get(), *preloader, func);
@@ -1829,7 +1784,7 @@ def gen():
 
   jit::CodeRuntime* rt = compiled->runtime();
   ASSERT_NE(rt, nullptr);
-  EXPECT_TRUE(rt->frameState()->isGen());
+  EXPECT_TRUE(rt->isGen());
 }
 
 TEST_F(JITGeneratorTest, NormalFuncRuntimeIsNotGen) {
@@ -1842,8 +1797,7 @@ def func():
   ASSERT_NE(func, nullptr);
 
   std::unique_ptr<jit::hir::Preloader> preloader(
-      jit::hir::Preloader::makePreloader(
-          func, jit::makeFrameReifier(func->func_code)));
+      jit::hir::Preloader::make(func, jit::makeFrameReifier(func->func_code)));
 
   auto comp_result =
       jit::compilePreloaderImpl(jit_ctx_.get(), *preloader, func);
@@ -1854,7 +1808,7 @@ def func():
 
   jit::CodeRuntime* rt = compiled->runtime();
   ASSERT_NE(rt, nullptr);
-  EXPECT_FALSE(rt->frameState()->isGen());
+  EXPECT_FALSE(rt->isGen());
 }
 
 namespace {

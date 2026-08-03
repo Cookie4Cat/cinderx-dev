@@ -346,7 +346,7 @@ fun jittestmodule:test {
         Locals<3> v15 v16 v18
       }
     }
-    v25:Bool = PrimitiveBoxBool v24
+    v25:ImmortalBool = PrimitiveBoxBool v24
     Snapshot
     v26:ImmortalBool[True] = LoadConst<ImmortalBool[True]>
     CondBranch<1, 2> v24
@@ -792,7 +792,7 @@ fun jittestmodule:test {
     v14:Func = LoadCurrentFunc
     LoadFrame
     Snapshot
-    v15:OptNoneType = InitialYield {
+    v15:OptImmortalNoneType = InitialYield {
       FrameState {
         CurInstrOffset 0
       }
@@ -893,9 +893,9 @@ fun jittestmodule:test {
     v14:Func = LoadCurrentFunc
     LoadFrame
     Snapshot
-    v15:OptNoneType = InitialYield {
+    v15:OptImmortalNoneType = InitialYield {
       FrameState {
-        CurInstrOffset 2
+        CurInstrOffset 0
       }
     }
     Snapshot
@@ -980,7 +980,7 @@ fun jittestmodule:test {
     Snapshot
     v35:Object = YieldValue v32 {
       FrameState {
-        CurInstrOffset 46
+        CurInstrOffset 44
         Stack<1> v23
       }
     }
@@ -994,9 +994,9 @@ fun jittestmodule:test {
     v15:Func = LoadCurrentFunc
     LoadFrame
     Snapshot
-    v16:OptNoneType = InitialYield {
+    v16:OptImmortalNoneType = InitialYield {
       FrameState {
-        CurInstrOffset 2
+        CurInstrOffset 0
       }
     }
     Snapshot
@@ -1082,7 +1082,7 @@ fun jittestmodule:test {
     Snapshot
     v39:Object = YieldValue v36 {
       FrameState {
-        CurInstrOffset 50
+        CurInstrOffset 48
         Stack<2> v24 v28
       }
     }

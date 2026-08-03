@@ -23,6 +23,26 @@ namespace jit::lir {
 
 class BasicBlockBuilder;
 
+// On 3.12, tstate->current_frame lives behind an extra indirection through
+// tstate->cframe. This helper caches that cframe pointer so it's loaded at
+// most once when both load() and store() are called in the same scope.
+// On 3.13+ the field is directly on tstate and no caching is needed.
+struct CurrentFrameAccessor {
+  CurrentFrameAccessor(BasicBlockBuilder& bbb, Instruction* tstate)
+      : bbb_(bbb), tstate_(tstate) {}
+
+  Instruction* load();
+  void store(Instruction* frame);
+
+ private:
+  BasicBlockBuilder& bbb_;
+  Instruction* tstate_;
+#if PY_VERSION_HEX < 0x030D0000
+  Instruction* cframe_{nullptr};
+  Instruction* loadCFrame();
+#endif
+};
+
 class LIRGenerator {
  public:
   explicit LIRGenerator(
@@ -72,7 +92,8 @@ class LIRGenerator {
 
   // For generators: the shared epilogue block (unlink frame, FP restore,
   // return). Receives values from both exit_block_ (returns) and yield blocks.
-  // nullptr for non-generators.
+  // For non-generators: set when inline frame-unlink code creates additional
+  // blocks, so the block sorter uses the correct exit block.
   BasicBlock* exit_epilogue_{nullptr};
 
   // Phi instruction in exit_block_ for merging return values.
@@ -169,7 +190,7 @@ class LIRGenerator {
       const jit::hir::Instr& instr,
       bool xdecref);
 
-#ifdef Py_GIL_DISABLED
+  // Only used in free-threaded builds.
   void makeIncrefFreeThreaded(
       BasicBlockBuilder& bbb,
       lir::Instruction* instr,
@@ -178,7 +199,7 @@ class LIRGenerator {
       BasicBlockBuilder& bbb,
       lir::Instruction* instr,
       BasicBlock* end_decref);
-#else
+  // Only used in GIL builds.
   void makeIncrefGILEnabled(
       BasicBlockBuilder& bbb,
       lir::Instruction* instr,
@@ -190,7 +211,6 @@ class LIRGenerator {
       BasicBlock* end_decref,
       std::optional<destructor> destructor,
       bool possible_immortal);
-#endif
 #if defined(CINDER_AARCH64)
   void updateDeoptIndex(
       BasicBlockBuilder& bbb,
@@ -215,7 +235,31 @@ class LIRGenerator {
   void resolvePhiOperands(
       UnorderedMap<const hir::BasicBlock*, TranslatedBlock>& bb_map);
 
+  CurrentFrameAccessor makeCurrentFrameAccessor(BasicBlockBuilder& bbb);
+
   void emitLoadFrame(BasicBlockBuilder& bbb);
+  void emitUnlinkFrame(
+      BasicBlockBuilder& bbb,
+      bool has_freevars,
+      bool is_generator,
+      Instruction* func_reg,
+      PyObject* executable,
+      std::optional<destructor> exec_dtor,
+      Instruction* callee_frame = nullptr);
+  void emitInlineUnlinkLeafFrame(
+      BasicBlockBuilder& bbb,
+      bool is_generator,
+      Instruction* func_reg,
+      PyObject* executable,
+      std::optional<destructor> exec_dtor,
+      Instruction* callee_frame = nullptr);
+  void emitInlineUnlinkFastFrame(
+      BasicBlockBuilder& bbb,
+      bool is_generator,
+      Instruction* func_reg,
+      PyObject* executable,
+      std::optional<destructor> exec_dtor,
+      Instruction* callee_frame = nullptr);
 
   void emitExceptionCheck(
       const jit::hir::DeoptBase& i,
@@ -231,6 +275,67 @@ class LIRGenerator {
       const hir::BeginInlinedFunction* instr);
 
   Function* lir_func_{nullptr};
+
+  // Emit a call to a C++ function that returns a two-field struct...
+  template <typename Func, typename... Args>
+  void appendCall2RetValues(
+      BasicBlockBuilder& bbb,
+      hir::Register* dst,
+      Func func,
+      Args&&... args) {
+#if defined(CINDER_X86_64) && defined(_WIN32)
+    // Windows x64 hidden pointer ABI
+    Instruction* ret_struct = bbb.appendInstr(
+        OutVReg{},
+        Instruction::kLea,
+        Stk{PhyLocation(env_->win_struct_ret_offset)});
+    bbb.appendInstr(
+        OutVReg{},
+        Instruction::kCall,
+        func,
+        VReg{ret_struct},
+        std::forward<Args>(args)...);
+    bbb.appendInstr(dst, Instruction::kMove, Ind{ret_struct, 0});
+    bbb.appendInstr(
+        OutPhyReg{codegen::arch::reg_general_auxilary_return_loc},
+        Instruction::kMove,
+        Ind{ret_struct, 8});
+#else
+    bbb.appendInstr(dst, Instruction::kCall, func, std::forward<Args>(args)...);
+#endif
+  }
+
+  template <typename Func, typename... Args>
+  void appendCall2RetValues(
+      BasicBlockBuilder& bbb,
+      Instruction*& first_out,
+      Instruction*& second_out,
+      Func func,
+      Args&&... args) {
+#if defined(CINDER_X86_64) && defined(_WIN32)
+    Instruction* ret_struct = bbb.appendInstr(
+        OutVReg{},
+        Instruction::kLea,
+        Stk{PhyLocation(env_->win_struct_ret_offset)});
+    bbb.appendInstr(
+        OutVReg{},
+        Instruction::kCall,
+        func,
+        VReg{ret_struct},
+        std::forward<Args>(args)...);
+    first_out =
+        bbb.appendInstr(OutVReg{}, Instruction::kMove, Ind{ret_struct, 0});
+    second_out =
+        bbb.appendInstr(OutVReg{}, Instruction::kMove, Ind{ret_struct, 8});
+#else
+    first_out = bbb.appendInstr(
+        OutVReg{}, Instruction::kCall, func, std::forward<Args>(args)...);
+    second_out = bbb.appendInstr(
+        OutVReg{},
+        Instruction::kMove,
+        PhyReg{codegen::arch::reg_general_auxilary_return_loc});
+#endif
+  }
 
 #if defined(CINDER_AARCH64)
   // Address of the deopt_idx field in the FrameHeader, computed once per
@@ -259,13 +364,18 @@ struct UnresolvedJumpTable {
   void** table{nullptr};
   // Maps table index → LIR BasicBlock* target.
   std::vector<std::pair<int, BasicBlock*>> entries;
+  // The dispatch block that should receive the correct_arg_count label.
+  BasicBlock* dispatch_block{nullptr};
 };
 
 // Build post-regalloc LIR blocks for validating that arguments passed to a
 // Static Python function via the generic (vectorcall) entry point have the
 // correct types. Creates a dispatch block + per-argument check blocks (with
-// optional MRO walk blocks) and inserts them at the front of the LIR function's
-// block list so the prologue falls through to the dispatch block.
+// optional MRO walk blocks). The blocks are appended to the block list; the
+// caller is responsible for positioning them.
+//
+// entry_block is the branch target for successful type checks (typically the
+// entry block with arg loading).
 //
 // Returns an UnresolvedJumpTable whose entries must be resolved after code
 // generation (when block labels have been bound to addresses).
@@ -279,15 +389,15 @@ UnresolvedJumpTable GenerateStaticTypeCheckBlocks(
 
 // Build a post-regalloc LIR block for the function entry prologue
 // (push rbp; mov rbp, rsp on x86-64 / stp fp, lr; mov fp, sp on aarch64).
-// The block is inserted at the front of the LIR function's block list so the
-// vectorcall entry falls through to it.
+// The block is appended to the block list; the caller is responsible for
+// positioning it.
 void GenerateFunctionEntryBlock(Function* lir_func);
 
 // Build a post-regalloc LIR block for the primitive-args prologue.
 // Loads the _PyTypedArgsInfo pointer into the 5th argument register (R8/x4),
 // calls JITRT_CallStaticallyWithPrimitiveSignature[FP], then branches to
-// prologue_exit. The block is inserted at the front of the LIR function's
-// block list.
+// prologue_exit. The block is appended to the block list; the caller is
+// responsible for positioning it.
 void GeneratePrimitiveArgsPrologueBlock(
     Function* lir_func,
     PyObject* prim_args_info,
@@ -296,13 +406,13 @@ void GeneratePrimitiveArgsPrologueBlock(
 
 // Build post-regalloc LIR blocks for the vectorcall argcount check prologue.
 // Handles three paths: kwnames present (call keyword helper), wrong argcount
-// (call incorrect-argcount helper), correct argcount (fall through to
-// next_block). The created blocks are inserted at the front of the LIR
-// function's block list so the vectorcall entry falls through to them.
+// (call incorrect-argcount helper), correct argcount (branch to
+// correct_args_label). The blocks are appended to the block list; the caller
+// is responsible for positioning them.
 void GenerateArgcountCheckBlocks(
     Function* lir_func,
     const hir::Function* func,
-    BasicBlock* next_block,
+    asmjit::Label correct_args_label,
     asmjit::Label prologue_exit);
 
 // Build post-regalloc LIR blocks for the boxed-return wrapper that converts
@@ -310,8 +420,9 @@ void GenerateArgcountCheckBlocks(
 // sets up its own minimal frame, calls the inner function via generic_entry,
 // checks the success flag (EDX/W1 for integers, XMM1/D1 for doubles), boxes
 // the result by calling the appropriate JITRT_Box* helper, then branches to
-// wrapper_exit (which should be bound to a leave;ret sequence). The created
-// blocks are inserted at the front of the LIR function's block list.
+// wrapper_exit (which should be bound to a leave;ret sequence). The blocks
+// are appended to the block list; the caller is responsible for positioning
+// them.
 void GenerateBoxedReturnWrapperBlocks(
     Function* lir_func,
     hir::Type return_type,

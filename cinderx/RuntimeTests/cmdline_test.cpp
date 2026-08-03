@@ -2,6 +2,7 @@
 
 #include <gtest/gtest.h>
 
+#include "cinderx/Jit/behavior_classifier.h"
 #include "cinderx/Jit/generators_rt.h"
 #include "cinderx/Jit/osr_capi.h"
 #include "cinderx/Jit/perf_jitdump.h"
@@ -161,7 +162,10 @@ assert jit.is_jit_compiled(target)
 )");
 }
 
-void assertNewFunctionCountsAndDefersTrivialWork(RuntimeTest& test) {
+void assertNewFunctionCountsWithoutFrameEvaluator(RuntimeTest& test) {
+  // Start from an unwarmed process so the trivial target sits in the
+  // held-call regime deterministically, regardless of test order.
+  jit::resetLowRoiReleaseState();
   test.runStockCode(R"(
 import cinderx
 import cinderx.jit as jit
@@ -180,8 +184,9 @@ target(3)
 target(4)
 target(5)
 assert not jit.is_jit_compiled(target)
-assert jit.count_interpreted_calls(target) == 2
+assert jit.count_interpreted_calls(target) == 5
 )");
+  jit::resetLowRoiReleaseState();
 }
 
 } // namespace
@@ -560,7 +565,7 @@ TEST_F(CmdLineTest, JITAutoEnvAutoModeCountsWithoutFrameEvaluator) {
   EXPECT_TRUE(getConfig().auto_classify);
   EXPECT_TRUE(getConfig().enable_startup_init_policy);
 
-  assertNewFunctionCountsAndDefersTrivialWork(*this);
+  assertNewFunctionCountsWithoutFrameEvaluator(*this);
 
   jit::finalize();
   jit::shutdown_jit_genobject_type();
@@ -599,7 +604,7 @@ TEST_F(CmdLineTest, JITAutoXOptionAutoModeCountsWithoutFrameEvaluator) {
   EXPECT_TRUE(getConfig().auto_classify);
   EXPECT_TRUE(getConfig().enable_startup_init_policy);
 
-  assertNewFunctionCountsAndDefersTrivialWork(*this);
+  assertNewFunctionCountsWithoutFrameEvaluator(*this);
 
   jit::finalize();
   jit::shutdown_jit_genobject_type();

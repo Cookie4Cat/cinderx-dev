@@ -33,6 +33,7 @@
 #include "cinderx/Jit/lir/postgen.h"
 #include "cinderx/Jit/lir/printer.h"
 #include "cinderx/Jit/lir/regalloc.h"
+#include "cinderx/Jit/lir/target_select.h"
 #include "cinderx/Jit/lir/verify.h"
 #include "cinderx/Jit/perf_jitdump.h"
 #include "cinderx/Jit/pyjit.h"
@@ -166,8 +167,8 @@ DeoptResult prepareForDeopt(
       for (size_t i = 0; i < deopt_meta.inline_depth(); i++) {
         outer = outer->previous;
       }
-      is_instrumentation_deopt =
-          (jitFrameGetHeader(outer)->rtfs & JIT_FRAME_DEOPT_PATCHED) != 0;
+      is_instrumentation_deopt = (jitFrameGetHeader(outer)->frame_status &
+                                  JIT_FRAME_DEOPT_PATCHED) != 0;
     }
   }
 #endif
@@ -234,8 +235,9 @@ DeoptResult prepareForDeopt(
   if (_PyFrame_GetCode(frame)->co_flags & kCoFlagsAnyGenerator) {
     BorrowedRef<PyGenObject> base_gen = _PyGen_GetGeneratorFromFrame(frame);
     JitGenObject* gen = JitGenObject::cast(base_gen.get());
-    JIT_CHECK(gen != nullptr, "Not a JIT generator");
-    deopt_jit_gen_object_only(gen);
+    if (gen != nullptr) {
+      deopt_jit_gen_object_only(gen);
+    }
   }
   if (!PyErr_Occurred() && !is_instrumentation_deopt) {
     auto reason = deopt_meta.reason;
@@ -490,7 +492,9 @@ void emitLIRBlocks(
         annotation_cursor = cursor;
       }
 
+      env->suppress_annotations = !pending_annotation.empty();
       autogen::AutoTranslator::getInstance().translateInstr(env, instr.get());
+      env->suppress_annotations = false;
 
       if (!pending_annotation.empty()) {
         // Under an active annotation — don't emit per-instruction annotations.
@@ -600,23 +604,12 @@ class ThrowableErrorHandler : public ErrorHandler {
 
 } // namespace
 
-NativeGenerator::NativeGenerator(const hir::Function* func)
-    : NativeGenerator{
-          func,
-          generateDeoptTrampoline(false),
-          generateDeoptTrampoline(true),
-          generateFailedDeferredCompileTrampoline()} {}
-
 NativeGenerator::NativeGenerator(
     const hir::Function* func,
-    void* deopt_trampoline,
-    void* deopt_trampoline_generators,
-    void* failed_deferred_compile_trampoline)
+    NativeGeneratorFactory& factory)
     : func_{func},
-      deopt_trampoline_{deopt_trampoline},
-      deopt_trampoline_generators_{deopt_trampoline_generators},
-      failed_deferred_compile_trampoline_{failed_deferred_compile_trampoline},
-      inline_stack_size_{calcInlineStackSize(func)} {
+      inline_stack_size_{calcInlineStackSize(func)},
+      factory_(factory) {
   env_.has_inlined_functions = inline_stack_size_ > 0;
 }
 
@@ -728,6 +721,13 @@ void* NativeGenerator::getVectorcallEntry() {
   lir::LIRGenerator lirgen(GetFunction(), &env_);
   std::unique_ptr<lir::Function> lir_func;
 
+#if defined(CINDER_X86_64) && defined(_WIN32)
+  {
+    int fh_size = jit::frameHeaderSize(func_->code) + sizeof(void*);
+    env_.win_struct_ret_offset = -(fh_size + inline_stack_size_ + 16);
+  }
+#endif
+
   COMPILE_TIMER(
       GetFunction()->compilation_phase_timer,
       "Lowering into LIR",
@@ -756,11 +756,26 @@ void* NativeGenerator::getVectorcallEntry() {
       "DeadCodeElimination",
       eliminateDeadCode(lir_func.get()))
 
+  COMPILE_TIMER(
+      GetFunction()->compilation_phase_timer,
+      "Target Opcode Selection",
+      selectTargetOpcodes(lir_func.get()))
+
+  JIT_LOGIF(
+      getConfig().log.dump_lir,
+      "LIR for {} after target opcode selection:\n{}",
+      GetFunction()->fullname,
+      *lir_func);
+
   int frame_header_size = frameHeaderSize(func_->code);
   frame_header_size += sizeof(void*);
 
-  LinearScanAllocator lsalloc(
-      lir_func.get(), frame_header_size + inline_stack_size_);
+  int reserved_stack_space = frame_header_size + inline_stack_size_;
+#if defined(CINDER_X86_64) && defined(_WIN32)
+  reserved_stack_space += 16;
+#endif
+
+  LinearScanAllocator lsalloc(lir_func.get(), reserved_stack_space);
 
   COMPILE_TIMER(
       GetFunction()->compilation_phase_timer,
@@ -774,6 +789,7 @@ void* NativeGenerator::getVectorcallEntry() {
   if (GetFunction()->code->co_flags & kCoFlagsAnyGenerator) {
     env_.initial_yield_spill_size_ = lsalloc.initialYieldSpillSize();
   }
+  env_.can_deopt = GetFunction()->canDeopt();
 
   JIT_LOGIF(
       getConfig().log.dump_lir,
@@ -1100,23 +1116,6 @@ arch::Gp get_arg_location(int arg) {
   JIT_ABORT("should only be used with first six args");
 }
 
-void NativeGenerator::generateEpilogue(BaseNode* epilogue_cursor) {
-  as_->setCursor(epilogue_cursor);
-
-  // The main epilogue code (generator state, frame unlink, primitive return
-  // flag, callee-saved restore, leave/ret) is now emitted by LIR instructions
-  // in the exit block.
-
-  // Bind exit_label for annotation tracking.
-  as_->bind(env_.exit_label);
-
-#if defined(CINDER_X86_64)
-#elif defined(CINDER_AARCH64)
-#else
-  CINDER_UNSUPPORTED
-#endif
-}
-
 void NativeGenerator::generateDeoptExits(const asmjit::CodeHolder& code) {
   if (env_.deopt_exits.empty()) {
     return;
@@ -1198,8 +1197,8 @@ void NativeGenerator::generateDeoptExits(const asmjit::CodeHolder& code) {
   as_->mov(x86::ptr(x86::rsp, kPointerSize), deopt_scratch_reg);
 
   auto trampoline = GetFunction()->code->co_flags & kCoFlagsAnyGenerator
-      ? deopt_trampoline_generators_
-      : deopt_trampoline_;
+      ? factory_.deoptTrampolineGenerators()
+      : factory_.deoptTrampoline();
   as_->mov(deopt_scratch_reg, reinterpret_cast<uint64_t>(trampoline));
   as_->jmp(deopt_scratch_reg);
 
@@ -1287,8 +1286,8 @@ void NativeGenerator::generateDeoptExits(const asmjit::CodeHolder& code) {
       arch::ptr_resolve(as_, a64::sp, kPointerSize * 2, arch::reg_scratch_0));
 
   auto trampoline = GetFunction()->code->co_flags & kCoFlagsAnyGenerator
-      ? deopt_trampoline_generators_
-      : deopt_trampoline_;
+      ? factory_.deoptTrampolineGenerators()
+      : factory_.deoptTrampoline();
   as_->mov(deopt_scratch_reg, trampoline);
   as_->br(deopt_scratch_reg);
 
@@ -1406,6 +1405,49 @@ void NativeGenerator::emitAarch64LoadAttrInvokeStub(
 #endif
 }
 
+void NativeGenerator::emitAarch64ExactLongAddSubStubs(
+    const asmjit::CodeHolder& code) {
+#if defined(CINDER_AARCH64) && PY_VERSION_HEX >= 0x030E0000 &&  \
+    PY_VERSION_HEX < 0x030F0000 && !defined(Py_GIL_DISABLED) && \
+    !defined(Py_REF_DEBUG) && !defined(Py_STATS)
+  if (env_.exact_long_add_sub_stubs.empty()) {
+    return;
+  }
+
+  CodeSectionOverride hot_override{as_, &code, &metadata_, CodeSection::kHot};
+  constexpr int kObTypeOffset = offsetof(PyObject, ob_type);
+  const uint64_t exact_long_type = reinterpret_cast<uint64_t>(&PyLong_Type);
+
+  for (const auto& stub : env_.exact_long_add_sub_stubs) {
+    Label generic_path = as_->newLabel();
+
+    ASM_CHECK(as_->align(AlignMode::kCode, 8), GetFunction()->fullname);
+    as_->bind(stub.entry);
+
+    // x0=left, x1=right. Exact checks exclude bool and int subclasses, whose
+    // reflected methods remain observable through PyNumber_Add/Subtract.
+    as_->ldr(a64::x9, arch::ptr_offset(a64::x0, kObTypeOffset));
+    as_->mov(a64::x10, exact_long_type);
+    as_->cmp(a64::x9, a64::x10);
+    as_->b_ne(generic_path);
+    as_->ldr(a64::x9, arch::ptr_offset(a64::x1, kObTypeOffset));
+    as_->cmp(a64::x9, a64::x10);
+    as_->b_ne(generic_path);
+
+    // BR preserves the LR set by the JIT's BL to this stub, so either helper
+    // returns directly to the original post-call guard/callsite.
+    as_->mov(arch::reg_scratch_br, stub.exact_target);
+    as_->br(arch::reg_scratch_br);
+
+    as_->bind(generic_path);
+    as_->mov(arch::reg_scratch_br, stub.generic_target);
+    as_->br(arch::reg_scratch_br);
+  }
+#else
+  (void)code;
+#endif
+}
+
 void NativeGenerator::linkDeoptPatchers(const asmjit::CodeHolder& code) {
   JIT_CHECK(code.hasBaseAddress(), "code not generated!");
   uint64_t base = code.baseAddress();
@@ -1488,6 +1530,96 @@ bool NativeGenerator::hasStaticEntry() const {
   return (code->co_flags & CI_CO_STATICALLY_COMPILED);
 }
 
+void NativeGenerator::generatePrologueBlocks(lir::BasicBlock* frameSetupBlock) {
+  // Pre-assign finish_frame_setup to the frame setup block so
+  // generateAssemblyBody binds it at the block's start.
+  env_.block_label_map[frameSetupBlock] = env_.finish_frame_setup;
+
+  // Build pre-body LIR blocks in assembly order. Each Generate* call appends
+  // blocks to the end. The body blocks (from TranslateFunction) are already
+  // at the front.
+  //
+  // We pre-allocate the entry block (for arg loading), remove it from the
+  // list, generate all other prologue blocks (which append in the correct
+  // order), then push the entry block back at the end — right before the
+  // body blocks. A single rotate then moves the entire prologue prefix to
+  // the front.
+  //
+  // Final block order:
+  //   [wrapper?] [func_entry] [argcount/primitive] [typechecks?]
+  //   [entry(args)] [body...] [exit] [resume?] [deopt_exits]
+  auto& blocks = lir_func_->basicblocks();
+  size_t body_end = blocks.size();
+
+  auto* entry_block = lir_func_->allocateBasicBlock();
+  blocks.pop_back();
+  env_.block_label_map[entry_block] = env_.correct_arg_count;
+
+  // Boxed-return wrapper (if needed) — comes first so the vectorcall entry
+  // falls through to it.
+  Label generic_entry;
+  if (func_->returnsPrimitive()) {
+    generic_entry = as_->newLabel();
+    env_.wrapper_exit = as_->newLabel();
+    lir::GenerateBoxedReturnWrapperBlocks(
+        lir_func_.get(), func_->return_type, generic_entry, env_.wrapper_exit);
+  }
+
+  // Function entry prologue (push rbp / mov rbp, rsp).
+  lir::GenerateFunctionEntryBlock(lir_func_.get());
+  if (generic_entry.isValid()) {
+    env_.block_label_map[lir_func_->basicblocks().back()] = generic_entry;
+  }
+
+  // Argcount check or primitive-args prologue. The correct-args path
+  // branches to correct_arg_count, which is assigned below to either the
+  // typecheck dispatch block (if type checks exist) or the entry block.
+  env_.prologue_exit = as_->newLabel();
+  if (func_->has_primitive_args) {
+    BorrowedRef<_PyTypedArgsInfo> info = func_->prim_args_info;
+    env_.code_rt->addReference(info);
+
+    lir::GeneratePrimitiveArgsPrologueBlock(
+        lir_func_.get(),
+        reinterpret_cast<PyObject*>(info.get()),
+        func_->returnsPrimitiveDouble(),
+        env_.prologue_exit);
+  } else {
+    lir::GenerateArgcountCheckBlocks(
+        lir_func_.get(),
+        GetFunction(),
+        env_.correct_arg_count,
+        env_.prologue_exit);
+  }
+
+  // Static argument type checking (if applicable).
+  if (hasStaticEntry() && !func_->has_primitive_args &&
+      !GetFunction()->typed_args.empty()) {
+    env_.static_arg_typecheck_failed_label = as_->newLabel();
+    auto jt = lir::GenerateStaticTypeCheckBlocks(
+        lir_func_.get(),
+        entry_block,
+        GetFunction()->typed_args,
+        GetFunction()->numArgs(),
+        env_.code_rt,
+        env_.static_arg_typecheck_failed_label);
+    env_.static_typecheck_table = jt.table;
+    env_.static_typecheck_jt_entries = std::move(jt.entries);
+    // Reassign correct_arg_count from entry_block to the dispatch block so
+    // the argcount correct path and reentry go through type checks before
+    // entry(args). entry_block gets a fresh label from emitLIRBlocks.
+    env_.block_label_map.erase(entry_block);
+    env_.block_label_map[jt.dispatch_block] = env_.correct_arg_count;
+  }
+
+  // Push entry_block back and populate it with arg loading.
+  blocks.push_back(entry_block);
+  lir::PopulateEntryBlock(entry_block, env_.arg_locations);
+
+  // Move the prologue blocks from [body_end, end) to the front.
+  std::rotate(blocks.begin(), blocks.begin() + body_end, blocks.end());
+}
+
 void NativeGenerator::generateCode(
     CodeHolder& codeholder,
     lir::BasicBlock* frameSetupBlock) {
@@ -1511,9 +1643,61 @@ void NativeGenerator::generateCode(
     metadata.resume_saved_regs = env_.resume_saved_regs;
   }
 
-  // For generators, populate the resume entry block (allocated during LIR
-  // generation) with post-regalloc instructions. This block uses only physical
-  // registers and is translated by autogen alongside the rest of the LIR body.
+  // --- Emit code in final assembly order ---
+  //
+  // The layout is:
+  //   [static entry point]        (optional, at fixed negative offset)
+  //   [reentry with processed args] (at fixed negative offset)
+  //   [vectorcall entry label]
+  //   [LIR blocks: wrapper → func_entry → argcount → typechecks → entry(args)
+  //                → body → exit → resume → deopt_exits]
+  //   [exit label]
+  //   [typecheck failure stub]    (optional)
+  //   [prologue exit stub]        (optional)
+  //   [wrapper exit stub]         (optional)
+  //   [aarch64 constant pool]     (optional)
+
+  // Create labels used by both the raw-asm entry points and the LIR
+  // prologue blocks. finish_frame_setup is bound by generatePrologueBlocks
+  // to the frame setup block; correct_arg_count is bound to the entry block.
+  env_.finish_frame_setup = as_->newLabel();
+  env_.correct_arg_count = as_->newLabel();
+
+  Label static_jmp_location = as_->newLabel();
+  bool has_static_entry = hasStaticEntry();
+  if (has_static_entry) {
+    generateStaticEntryPoint(env_.finish_frame_setup, static_jmp_location);
+  }
+
+  // Reentry point: dispatched to from JITRT_CallWithIncorrectArgcount and
+  // JITRT_CallWithKeywordArgs after argument binding. Must be exactly
+  // JITRT_CALL_REENTRY_OFFSET bytes before the vectorcall entry.
+  auto arg_reentry_cursor = as_->cursor();
+  Label correct_args_entry = as_->newLabel();
+  as_->bind(correct_args_entry);
+  generateFunctionEntry();
+
+#if defined(CINDER_X86_64)
+  as_->short_().jmp(env_.correct_arg_count);
+#elif defined(CINDER_AARCH64)
+  as_->b(env_.correct_arg_count);
+#else
+  CINDER_UNSUPPORTED
+#endif
+
+  env_.addAnnotation("Reentry with processed args", arg_reentry_cursor);
+
+  // Generate prologue LIR blocks (wrapper, func_entry, argcount, typechecks,
+  // entry with arg loading) and prepend them to the body block list.
+  generatePrologueBlocks(frameSetupBlock);
+
+  // Vectorcall entry point. The prologue LIR blocks are first in the block
+  // list, so the vectorcall entry falls through to them.
+  Label vectorcall_entry_label = as_->newLabel();
+  as_->bind(vectorcall_entry_label);
+
+  // Append suffix blocks to the block list. These come after the body's exit
+  // block but before code emission.
   if (GetFunction()->code->co_flags & kCoFlagsAnyGenerator) {
     env_.gi_jit_data_offset = giJITDataOffset();
 
@@ -1523,150 +1707,13 @@ void NativeGenerator::generateCode(
         "Generator must have a resume entry block {}",
         lir_func_->hirFunc()->fullname);
     lir::PopulateResumeEntryBlock(bb, env_.gi_jit_data_offset);
-    // Pre-assign gen_resume_entry_label to this block so generateAssemblyBody
-    // binds it at the block's start.
     env_.block_label_map[bb] = env_.gen_resume_entry_label;
-
-    // The resume entry block was kept out of the block list during regalloc
-    // (it's a placeholder populated post-regalloc). Now that it has
-    // instructions, insert it into the block list for code generation.
-    // Append it at the end — the last block (exit_epilogue) ends with
-    // EpilogueEnd and has no fall-through, so appending is safe and avoids
-    // breaking fall-through relationships established during postalloc.
-    auto& blocks = lir_func_->basicblocks();
-    blocks.push_back(bb);
+    lir_func_->basicblocks().push_back(bb);
   }
 
-  // Pre-assign finish_frame_setup to the LIR entry block so
-  // generateAssemblyBody binds it at the block's start.
-  Label finish_frame_setup = as_->newLabel();
-  env_.block_label_map[frameSetupBlock] = finish_frame_setup;
-
-  // Populate the entry block with arg loading instructions (post-regalloc,
-  // using physical registers from arg_locations).
-  auto* entry_block = lir_func_->basicblocks().front();
-  lir::PopulateEntryBlock(entry_block, env_.arg_locations);
-
-  // Build post-regalloc LIR blocks for static argument type checking.
-  // These blocks are inserted at the front of the LIR function so the
-  // prologue falls through to the dispatch chain → checks → entry block.
-  // We skip primitive args because functions w/ primitive args are handled
-  // by a JIT helper in GeneratePrimitiveArgsPrologueBlock.
-  lir::UnresolvedJumpTable unresolved_jt;
-  if (hasStaticEntry() && !func_->has_primitive_args &&
-      !GetFunction()->typed_args.empty()) {
-    env_.static_arg_typecheck_failed_label = as_->newLabel();
-    unresolved_jt = lir::GenerateStaticTypeCheckBlocks(
-        lir_func_.get(),
-        entry_block,
-        GetFunction()->typed_args,
-        GetFunction()->numArgs(),
-        env_.code_rt,
-        env_.static_arg_typecheck_failed_label);
-  }
-
-  // Build post-regalloc LIR blocks for the vectorcall argcount check
-  // and/or primitive-args prologue. These are inserted at the very front
-  // (before any type check blocks) so the vectorcall entry falls through
-  // to them.
-  Label correct_arg_count = as_->newLabel();
-  asmjit::Label prologue_exit;
-  if (func_->has_primitive_args) {
-    // The block after the primitive prologue is whatever is currently
-    // at the front. The reentry point needs to jump here, past both
-    // the function entry (push rbp) and the primitive prologue (call helper).
-    auto* post_primitive_block = lir_func_->basicblocks().front();
-
-    BorrowedRef<_PyTypedArgsInfo> info = func_->prim_args_info;
-    env_.code_rt->addReference(info);
-
-    prologue_exit = as_->newLabel();
-    lir::GeneratePrimitiveArgsPrologueBlock(
-        lir_func_.get(),
-        reinterpret_cast<PyObject*>(info.get()),
-        func_->returnsPrimitiveDouble(),
-        prologue_exit);
-
-    // Pre-assign correct_arg_count so the reentry point jumps past
-    // the primitive prologue and function entry blocks.
-    env_.block_label_map[post_primitive_block] = correct_arg_count;
-  } else {
-    // The block after the argcount check blocks is whatever is currently
-    // at the front (type check dispatch, or entry block if no type checks).
-    auto* post_argcheck_block = lir_func_->basicblocks().front();
-
-    prologue_exit = as_->newLabel();
-    lir::GenerateArgcountCheckBlocks(
-        lir_func_.get(), GetFunction(), post_argcheck_block, prologue_exit);
-
-    // Pre-assign correct_arg_count to the post-argcheck block so the
-    // correct_args reentry point jumps past the argcount check.
-    env_.block_label_map[post_argcheck_block] = correct_arg_count;
-  }
-
-  // Build a post-regalloc LIR block for the function entry prologue
-  // (push rbp / mov rbp, rsp). Inserted at the very front (after the
-  // argcount/primitive blocks, so it ends up first) because the vectorcall
-  // entry falls through to it. The function entry must happen before the
-  // argcount check since the helpers expect a frame.
-  lir::GenerateFunctionEntryBlock(lir_func_.get());
-  auto* func_entry_block = lir_func_->basicblocks().front();
-
-  // For functions returning primitive types, generate a boxed-return wrapper
-  // as LIR blocks. The wrapper sets up its own frame, calls the inner
-  // function, boxes the primitive result, and returns. These blocks are
-  // inserted at the very front, before the function entry block.
-  Label wrapper_exit;
-  if (func_->returnsPrimitive()) {
-    Label generic_entry = as_->newLabel();
-    wrapper_exit = as_->newLabel();
-    lir::GenerateBoxedReturnWrapperBlocks(
-        lir_func_.get(), func_->return_type, generic_entry, wrapper_exit);
-    env_.block_label_map[func_entry_block] = generic_entry;
-  }
-
-  auto prologue_cursor = as_->cursor();
   generateAssemblyBody(codeholder);
 
-  auto epilogue_cursor = as_->cursor();
-
-  as_->setCursor(prologue_cursor);
-  Label static_jmp_location = as_->newLabel();
-
-  bool has_static_entry = hasStaticEntry();
-  if (has_static_entry) {
-    // Setup an entry point for direct static to static
-    // calls using the native calling convention
-    generateStaticEntryPoint(finish_frame_setup, static_jmp_location);
-  }
-
-  // Setup an entry for when we have the correct number of arguments
-  // This will be dispatched back to from JITRT_CallWithIncorrectArgcount and
-  // JITRT_CallWithKeywordArgs when we need to perform complicated
-  // argument binding.
-  auto arg_reentry_cursor = as_->cursor();
-  Label correct_args_entry = as_->newLabel();
-  as_->bind(correct_args_entry);
-  generateFunctionEntry();
-
-#if defined(CINDER_X86_64)
-  as_->short_().jmp(correct_arg_count);
-#elif defined(CINDER_AARCH64)
-  as_->b(correct_arg_count);
-#else
-  CINDER_UNSUPPORTED
-#endif
-
-  env_.addAnnotation("Reentry with processed args", arg_reentry_cursor);
-
-  // Setup the normal entry point that expects that implements the
-  // vectorcall convention
-  Label vectorcall_entry_label = as_->newLabel();
-  as_->bind(vectorcall_entry_label);
-  // The boxed-return wrapper (if any) and prologue are now LIR blocks
-  // emitted during generateAssemblyBody, so nothing more is needed here.
-
-  generateEpilogue(epilogue_cursor);
+  as_->bind(env_.exit_label);
 
   if (env_.static_arg_typecheck_failed_label.isValid()) {
     auto static_typecheck_cursor = as_->cursor();
@@ -1717,20 +1764,21 @@ void NativeGenerator::generateCode(
   // calling the keyword-args or incorrect-argcount helper. The helpers
   // return the result in the ABI return register; we just tear down the
   // minimal frame (push rbp / mov rbp, rsp) and return.
-  if (prologue_exit.isValid()) {
-    as_->bind(prologue_exit);
+  if (env_.prologue_exit.isValid()) {
+    as_->bind(env_.prologue_exit);
     generateFunctionExit();
   }
 
   // Boxed-return wrapper exit stub: the wrapper LIR blocks branch here
   // after boxing (or on error). Tears down the wrapper's own minimal frame.
-  if (wrapper_exit.isValid()) {
-    as_->bind(wrapper_exit);
+  if (env_.wrapper_exit.isValid()) {
+    as_->bind(env_.wrapper_exit);
     generateFunctionExit();
   }
 
   generateDeoptExits(codeholder);
   emitAarch64LoadAttrInvokeStub(codeholder);
+  emitAarch64ExactLongAddSubStubs(codeholder);
 
   for (auto& [osr_idx, block] : env_.osr_entry_blocks) {
     Label stub_label = as_->newLabel();
@@ -1796,14 +1844,6 @@ void NativeGenerator::generateCode(
     }
   }
 
-  for (auto& [osr_idx, label] : env_.osr_entry_stub_labels) {
-    OSRMetadata& metadata = env_.code_rt->getOSRMetadata(osr_idx);
-    metadata.entry_point_offset = codeholder.labelOffsetFromBase(label);
-    metadata.resume_frame_total_size = env_.resume_frame_total_size;
-    metadata.resume_header_and_spill_size = env_.resume_header_and_spill_size;
-    metadata.resume_saved_regs = env_.resume_saved_regs;
-  }
-
   vectorcall_entry_ = static_cast<char*>(code_start_) +
       codeholder.labelOffsetFromBase(vectorcall_entry_label);
 
@@ -1813,11 +1853,19 @@ void NativeGenerator::generateCode(
         codeholder.baseAddress());
   }
 
+  for (auto& [osr_idx, label] : env_.osr_entry_stub_labels) {
+    OSRMetadata& metadata = env_.code_rt->getOSRMetadata(osr_idx);
+    metadata.entry_point_offset = codeholder.labelOffsetFromBase(label);
+    metadata.resume_frame_total_size = env_.resume_frame_total_size;
+    metadata.resume_header_and_spill_size = env_.resume_header_and_spill_size;
+    metadata.resume_saved_regs = env_.resume_saved_regs;
+  }
+
   // Resolve the static type check jump table entries now that block labels
   // have been bound to code addresses.
-  for (auto& [index, block] : unresolved_jt.entries) {
+  for (auto& [index, block] : env_.static_typecheck_jt_entries) {
     auto label = map_get(env_.block_label_map, block);
-    unresolved_jt.table[index] = reinterpret_cast<void*>(
+    env_.static_typecheck_table[index] = reinterpret_cast<void*>(
         codeholder.baseAddress() + codeholder.labelOffsetFromBase(label));
   }
 
@@ -1835,27 +1883,21 @@ void NativeGenerator::generateCode(
       env_.annotations.disassemble(code_start_, codeholder));
   {
     ThreadedCompileSerialize guard;
+    void* failed_deferred_compile_trampoline =
+        factory_.failedDeferredCompileTrampoline();
     for (auto& x : env_.function_indirections) {
-      *x.second.indirect = failed_deferred_compile_trampoline_;
+      *x.second.indirect = failed_deferred_compile_trampoline;
     }
   }
 
   const hir::Function* func = GetFunction();
-  std::string_view prefix = [&] {
-    switch (func->frameMode) {
-      case FrameMode::kNormal:
-        [[fallthrough]];
-      case FrameMode::kLightweight:
-        return perf::kFuncSymbolPrefix;
-    }
-    JIT_ABORT("Invalid frame mode");
-  }();
   // For perf, we want only the size of the code, so we get that directly from
   // the text sections.
   std::vector<std::pair<void*, std::size_t>> code_sections;
   populateCodeSections(code_sections, codeholder, code_start_);
 #ifndef WIN32
-  perf::registerFunction(code_sections, func->fullname, prefix);
+  perf::registerFunction(
+      code_sections, func->fullname, perf::kFuncSymbolPrefix);
 #endif
 }
 
@@ -1894,19 +1936,33 @@ int NativeGenerator::calcInlineStackSize(const hir::Function* func) {
   return result;
 }
 
-NativeGeneratorFactory::NativeGeneratorFactory()
-    : deopt_trampoline_{generateDeoptTrampoline(false)},
-      deopt_trampoline_generators_{generateDeoptTrampoline(true)},
-      failed_deferred_compile_trampoline_{
-          generateFailedDeferredCompileTrampoline()} {}
+NativeGeneratorFactory::NativeGeneratorFactory() {}
+
+void* NativeGeneratorFactory::deoptTrampoline() {
+  if (deopt_trampoline_ == nullptr) {
+    deopt_trampoline_ = generateDeoptTrampoline(false);
+  }
+  return deopt_trampoline_;
+}
+
+void* NativeGeneratorFactory::deoptTrampolineGenerators() {
+  if (deopt_trampoline_generators_ == nullptr) {
+    deopt_trampoline_generators_ = generateDeoptTrampoline(true);
+  }
+  return deopt_trampoline_generators_;
+}
+
+void* NativeGeneratorFactory::failedDeferredCompileTrampoline() {
+  if (failed_deferred_compile_trampoline_ == nullptr) {
+    failed_deferred_compile_trampoline_ =
+        generateFailedDeferredCompileTrampoline();
+  }
+  return failed_deferred_compile_trampoline_;
+}
 
 std::unique_ptr<NativeGenerator> NativeGeneratorFactory::operator()(
-    const hir::Function* func) const {
-  return std::make_unique<NativeGenerator>(
-      func,
-      deopt_trampoline_,
-      deopt_trampoline_generators_,
-      failed_deferred_compile_trampoline_);
+    const hir::Function* func) {
+  return std::make_unique<NativeGenerator>(func, *this);
 }
 
 } // namespace jit::codegen

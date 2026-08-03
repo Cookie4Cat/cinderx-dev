@@ -291,7 +291,6 @@ void writeAutoJitCompileEvent(
         << ",\"loop_score\":" << static_cast<int>(key->loop_score)
         << ",\"is_suspendable\":" << (key->is_suspendable ? "true" : "false")
         << ",\"is_static\":" << (key->is_static ? "true" : "false")
-        << ",\"is_synthetic\":" << (key->is_synthetic ? "true" : "false")
         << ",\"risk_reason\":" << static_cast<int>(key->risk_reason)
         << ",\"code_size_bucket\":" << static_cast<int>(key->code_size_bucket)
         << ",\"active_dim_mask\":" << static_cast<int>(key->active_dim_mask)
@@ -333,11 +332,6 @@ int validateFrameModeConfig();
 constexpr int required_code_flags = CO_OPTIMIZED | CO_NEWLOCALS;
 bool hasRequiredFlags(BorrowedRef<PyCodeObject> code) {
   return (code->co_flags & required_code_flags) == required_code_flags;
-}
-
-uint64_t countCalls(PyCodeObject* code) {
-  auto extra = codeExtra(code);
-  return extra != nullptr ? Ci_code_extra_get_calls(extra) : 0;
 }
 
 GateContext readGateContext() {
@@ -519,7 +513,17 @@ PyObject* forcedJitVectorcall(
   BorrowedRef<PyFunctionObject> func{func_obj};
   BorrowedRef<PyCodeObject> code{func->func_code};
 
-  auto result = compileFunction(func);
+  // Compile the function.
+  Result result;
+  try {
+    result = compileFunction(func);
+  } catch (const std::exception& exn) {
+    // Gently fall back to the interpreter when C++ exceptions happen.
+    JIT_DLOG("{}", exn.what());
+    PyErr_Clear();
+    result = Result::UNKNOWN_ERROR;
+  }
+
   if (result == Result::OK) {
     incAutoJitGateStat(g_auto_jit_gate_stats.forced_compile_ok);
     JIT_DCHECK(
@@ -808,6 +812,21 @@ FlagProcessor initFlagProcessor() {
       "CINDERX_AUTOJIT_ROI_REWARM_FACTOR",
       getMutableConfig().roi_rewarm_factor,
       "Multiplier for AutoJIT ROI backoff recompile floor");
+
+  flag_processor.addOption(
+      "jit-auto-code-dedup",
+      "CINDERX_AUTOJIT_CODE_DEDUP",
+      getMutableConfig().auto_code_twin_dedup,
+      "Canonicalize exec-generated namespace-free content-twin code objects "
+      "onto one identity at compile time; set to 0 to disable when isolating "
+      "A/B");
+
+  flag_processor.addOption(
+      "jit-auto-lowroi-warm-calls",
+      "CINDERX_AUTOJIT_LOWROI_WARM_CALLS",
+      getMutableConfig().auto_classify_low_roi_warm_calls,
+      "Held calls a process must accumulate before steady-state LowRoi "
+      "shapes stop being deferred; 0 releases them immediately");
 
   flag_processor.addOption(
       "jit-debug",
@@ -1108,6 +1127,12 @@ FlagProcessor initFlagProcessor() {
       getMutableConfig().inliner_cost_limit,
       "Limit how much the inliner is able to inline. The number's definition "
       "is only relevant to the inliner itself.");
+  flag_processor.addOption(
+      "jit-hir-inliner-cold-call-threshold",
+      "PYTHONJITHIRINLINERCOLDCALLTHRESHOLD",
+      getMutableConfig().inliner_cold_call_threshold,
+      "Calls below this threshold are considered cold and will not be "
+      "inlined.  Setting to 0 disables the check.");
 
   flag_processor.addOption(
       "jit-lir-inliner",
@@ -1279,12 +1304,6 @@ FlagProcessor initFlagProcessor() {
       "objects that contain a loop backedge.");
 
   flag_processor.addOption(
-      "jit-compact-long-guards",
-      "PYTHONJITCOMPACTLONGGUARDS",
-      getMutableConfig().compact_long_guards,
-      "Guard on long objects being in compact form for arithmetic operations.");
-
-  flag_processor.addOption(
       "jit-support-instrumentation",
       "PYTHONJITSUPPORTINSTRUMENTATION",
       getMutableConfig().support_instrumentation,
@@ -1292,18 +1311,25 @@ FlagProcessor initFlagProcessor() {
 
   flag_processor.setFlags(PySys_GetXOptions());
 
-  // T198250666: Bit of a hack but this makes other things easier.  In 3.12 all
-  // functions need access to the runtime PyFunctionObject, which prevents
-  // inlining.  Our tests check `is_hir_inliner_enabled()` to see if the inliner
-  // is functional and make assumptions based on that.  This is only available
-  // when we have lightweight frames enabled as we need cooperation w/ the
-  // runtime to let us reify the frame.
-  //
-  // Inlining is only compatible w/ lightweight frames because we need our
-  // reifier to cooperate with restoring the frame object into something usable
-  // when CPython wants it.
-  if (getConfig().frame_mode != FrameMode::kLightweight) {
+  // Inlining relies on lightweight-frame reification support.  Keep the
+  // inliner disabled for normal-frame runs so tests and explicit normal-mode
+  // configurations do not build inline frames that cannot be safely unlinked.
+  bool force_disable_inliner_for_normal_frame =
+      getConfig().frame_mode != FrameMode::kLightweight;
+  if (force_disable_inliner_for_normal_frame) {
     getMutableConfig().hir_opts.inliner = false;
+  }
+
+  // If the inliner is off and the user hasn't explicitly set the preload
+  // dependent limit, set it to zero.  Nothing is going to be inlined so there's
+  // no need to aggressively preload.
+  //
+  // This will reduce the chance that Static Python functions can natively call
+  // each other though.
+  if (!force_disable_inliner_for_normal_frame &&
+      !getConfig().hir_opts.inliner &&
+      !flag_processor.hasHandled("jit-preload-dependent-limit")) {
+    getMutableConfig().preload_dependent_limit = 0;
   }
 
   return flag_processor;
@@ -1411,8 +1437,7 @@ hir::Preloader* preload(BorrowedRef<> unit) {
   // assumptions are broken after this.
   std::unique_ptr<hir::Preloader> preloader;
   if (func != nullptr) {
-    preloader =
-        hir::Preloader::makePreloader(func, makeFrameReifier(func->func_code));
+    preloader = hir::Preloader::make(func, makeFrameReifier(func->func_code));
   } else {
     auto& jit_code_outer_funcs = jitCtx()->codeOuterFunctions();
     auto it = jit_code_outer_funcs.find(code);
@@ -1438,7 +1463,7 @@ hir::Preloader* preload(BorrowedRef<> unit) {
         "Unexpected type for globals ({}) on function {}",
         Py_TYPE(outer_func->func_globals)->tp_name,
         funcFullname(outer_func));
-    preloader = hir::Preloader::makePreloader(
+    preloader = hir::Preloader::make(
         code,
         outer_func->func_builtins,
         outer_func->func_globals,
@@ -1463,6 +1488,27 @@ hir::Preloader* preload(BorrowedRef<> unit) {
   auto copy = preloader.get();
   hir::preloaderManager().add(code, std::move(preloader));
   return copy;
+}
+
+using UnitDeletedCallback = std::function<void(BorrowedRef<>)>;
+
+// Preloading can execute Python and re-enter the JIT. Preserve and chain the
+// callback so nested preloads report deletions to both scopes, then restore the
+// callback that was active on entry on every exit path.
+hir::Preloader* preloadWithUnitDeletedCallback(
+    BorrowedRef<> unit,
+    UnitDeletedCallback current) {
+  auto* state = cinderx::getModuleState();
+  UnitDeletedCallback previous = std::move(state->unit_deleted_during_preload);
+  SCOPE_EXIT(state->unit_deleted_during_preload = std::move(previous));
+
+  state->unit_deleted_during_preload = [&](BorrowedRef<> deleted_unit) {
+    current(deleted_unit);
+    if (previous) {
+      previous(deleted_unit);
+    }
+  };
+  return preload(unit);
 }
 
 // JIT compile func or code object, only if a preloader is available.
@@ -1569,67 +1615,66 @@ bool compile_all(size_t workers = 0) {
   FreeThreadedJITEntrypointGuard guard;
   JIT_CHECK(jitCtx(), "JIT not initialized");
 
-  if (workers == 0) {
-    workers = std::max<size_t>(getConfig().batch_compile_workers, 1);
-  }
+  try {
+    SCOPE_EXIT(hir::preloaderManager().clear());
 
-  std::vector<BorrowedRef<>> compilation_units;
-  // units that were deleted during preloading
-  std::unordered_set<BorrowedRef<>> deleted_units;
-
-  auto error_cleanup = [&]() {
-    hir::preloaderManager().clear();
-    cinderx::getModuleState()->unit_deleted_during_preload = nullptr;
-  };
-
-  auto& jit_reg_units = cinderx::getModuleState()->registered_compilation_units;
-  JIT_DLOG(
-      "Starting compile_all with {} workers for {} registered units",
-      workers,
-      jit_reg_units.size());
-
-  // First we have to preload everything we are going to compile.
-  while (jit_reg_units.size() > 0) {
-    auto preload_units = std::move(jit_reg_units);
-    jit_reg_units.clear();
-    JIT_DLOG(
-        "compile_all preloading a batch of {} units", preload_units.size());
-
-    for (auto unit : preload_units) {
-      if (deleted_units.contains(unit)) {
-        continue;
-      }
-      cinderx::getModuleState()->unit_deleted_during_preload =
-          [&](BorrowedRef<> deleted_unit) {
-            deleted_units.emplace(deleted_unit);
-          };
-      hir::Preloader* preloader = preload(unit);
-      if (!preloader) {
-        error_cleanup();
-        return false;
-      }
-      compilation_units.push_back(unit);
+    if (workers == 0) {
+      workers = std::max<size_t>(getConfig().batch_compile_workers, 1);
     }
+
+    std::vector<BorrowedRef<>> compilation_units;
+    // units that were deleted during preloading
+    std::unordered_set<BorrowedRef<>> deleted_units;
+
+    auto& jit_reg_units =
+        cinderx::getModuleState()->registered_compilation_units;
+    JIT_DLOG(
+        "Starting compile_all with {} workers for {} registered units",
+        workers,
+        jit_reg_units.size());
+
+    // First we have to preload everything we are going to compile.
+    while (jit_reg_units.size() > 0) {
+      auto preload_units = std::move(jit_reg_units);
+      jit_reg_units.clear();
+      JIT_DLOG(
+          "compile_all preloading a batch of {} units", preload_units.size());
+
+      for (auto unit : preload_units) {
+        if (deleted_units.contains(unit)) {
+          continue;
+        }
+        hir::Preloader* preloader = preloadWithUnitDeletedCallback(
+            unit, [&](BorrowedRef<> deleted_unit) {
+              deleted_units.emplace(deleted_unit);
+            });
+        if (!preloader) {
+          return false;
+        }
+        compilation_units.push_back(unit);
+      }
+    }
+
+    // Filter out any units that were deleted as a side effect of preloading.
+    std::erase_if(compilation_units, [&](BorrowedRef<> unit) {
+      return deleted_units.contains(unit);
+    });
+
+    JIT_DLOG(
+        "compile_all finished preloading {} units, {} were deleted",
+        compilation_units.size(),
+        deleted_units.size());
+
+    if (workers > 1) {
+      multithread_compile_units_preloaded(
+          std::move(compilation_units), workers);
+    } else {
+      compile_units_preloaded(std::move(compilation_units));
+    }
+  } catch (const std::exception& exn) {
+    setRuntimeError(exn);
+    return false;
   }
-  cinderx::getModuleState()->unit_deleted_during_preload = nullptr;
-
-  // Filter out any units that were deleted as a side effect of preloading.
-  std::erase_if(compilation_units, [&](BorrowedRef<> unit) {
-    return deleted_units.contains(unit);
-  });
-
-  JIT_DLOG(
-      "compile_all finished preloading {} units, {} were deleted",
-      compilation_units.size(),
-      deleted_units.size());
-
-  if (workers > 1) {
-    multithread_compile_units_preloaded(std::move(compilation_units), workers);
-  } else {
-    compile_units_preloaded(std::move(compilation_units));
-  }
-
-  hir::preloaderManager().clear();
 
   return true;
 }
@@ -2227,7 +2272,16 @@ PyObject* force_compile(PyObject* /* self */, PyObject* arg) {
     return nullptr;
   }
 
-  auto result = compileFunction(func);
+  // Compile the function.
+  Result result;
+  try {
+    result = compileFunction(func);
+  } catch (const std::exception& exn) {
+    // Surface C++ exceptions to the caller immediately.
+    setRuntimeError(exn);
+    return nullptr;
+  }
+
   switch (result) {
     case Result::OK:
       Py_RETURN_TRUE;
@@ -2422,7 +2476,7 @@ PyObject* count_interpreted_calls(PyObject* /* self */, PyObject* arg) {
     return nullptr;
   }
   BorrowedRef<PyCodeObject> code{func->func_code};
-  return PyLong_FromLong(static_cast<long>(countCalls(code)));
+  return PyLong_FromLong(static_cast<long>(codeCallCount(code)));
 }
 
 PyObject* is_jit_compiled(PyObject* /* self */, PyObject* arg) {
@@ -3810,6 +3864,14 @@ void trackEligibleCodeObjects(
 //
 // Failing to compile a dependent function is a soft failure, and is ignored.
 Result compile_func(BorrowedRef<PyFunctionObject> func) {
+  // Content-keyed reuse for exec-generated namespace-free code: if an
+  // identical code object was compiled before, attach this function to the
+  // existing artifact instead of compiling again.
+  if (getConfig().auto_code_twin_dedup && jitCtx() != nullptr &&
+      jitCtx()->reuseDedupedCompiled(func)) {
+    return Result::OK;
+  }
+
   // isolate preloaders state since batch preloading might trigger a call to a
   // jitable function, resulting in a single-function compile
   hir::IsolatedPreloaders ip;
@@ -4161,7 +4223,7 @@ void recordDeoptForRoiBackoff(
     return;
   }
 
-  BorrowedRef<PyCodeObject> code = code_runtime->frameState()->code();
+  BorrowedRef<PyCodeObject> code = code_runtime->code();
   CodeExtra* extra = codeExtra(code);
   if (extra == nullptr) {
     return;
@@ -4245,13 +4307,7 @@ int initialize() {
       PyErr_SetString(PyExc_RuntimeError, "Failed to allocate JIT list");
       return -1;
     }
-
-    try {
-      jit_list->parseFile(getConfig().jit_list.filename.c_str());
-    } catch (const std::exception& exn) {
-      PyErr_SetString(PyExc_RuntimeError, exn.what());
-      return -1;
-    }
+    jit_list->parseFile(getConfig().jit_list.filename.c_str());
   }
 
   jit::init_jit_genobject_type();
@@ -4272,13 +4328,7 @@ int initialize() {
 
   // Initialize the main compiler object and its context.  This will throw if
   // asmjit cannot initialize.
-  try {
-    cinderx::getModuleState()->jit_context.reset(
-        new CompilerContext<Compiler>());
-  } catch (const std::exception& exn) {
-    PyErr_SetString(PyExc_RuntimeError, exn.what());
-    return -1;
-  }
+  cinderx::getModuleState()->jit_context.reset(new CompilerContext<Compiler>());
 
   PyObject* mod = _Ci_CreateBuiltinModule(&jit_module, "cinderjit");
   if (mod == nullptr) {
@@ -4583,25 +4633,33 @@ Result compileFunctionWithOSR(BorrowedRef<PyFunctionObject> func) {
     return Result::CANNOT_SPECIALIZE;
   }
 
-  hir::IsolatedPreloaders isolated_preloaders;
-  hir::Preloader* preloader = preload(func);
-  if (preloader == nullptr || func->func_code != pinned_code) {
-    PyErr_Clear();
-    return Result::CANNOT_SPECIALIZE;
-  }
+  try {
+    hir::IsolatedPreloaders isolated_preloaders;
+    hir::Preloader* preloader = preload(func);
+    if (preloader == nullptr || func->func_code != pinned_code) {
+      PyErr_Clear();
+      return Result::CANNOT_SPECIALIZE;
+    }
 
-  Result result = compilePreloader(*preloader, func);
-  if (result != Result::OK && PyErr_Occurred()) {
+    Result result = compilePreloader(*preloader, func);
+    if (result != Result::OK && PyErr_Occurred()) {
+      PyErr_Clear();
+    }
+    return result;
+  } catch (const std::exception& exn) {
+    JIT_DLOG("{}", exn.what());
     PyErr_Clear();
+    return Result::UNKNOWN_ERROR;
   }
-  return result;
 }
 
 std::vector<BorrowedRef<PyFunctionObject>> preloadFuncAndDeps(
     BorrowedRef<PyFunctionObject> func,
     bool forcePreload) {
-  // Add one for the original function itself.
-  size_t limit = getConfig().preload_dependent_limit + 1;
+  // Add one for the original function itself.  When forcePreload is set the
+  // caller wants all dependents regardless of the configured limit.
+  size_t limit = forcePreload ? std::numeric_limits<size_t>::max()
+                              : getConfig().preload_dependent_limit + 1;
 
   std::deque<BorrowedRef<PyFunctionObject>> worklist;
   std::vector<BorrowedRef<PyFunctionObject>> result;
@@ -4621,15 +4679,10 @@ std::vector<BorrowedRef<PyFunctionObject>> preloadFuncAndDeps(
     BorrowedRef<PyFunctionObject> f = worklist.front();
     worklist.pop_front();
 
-    // This needs to be set every time before preload() is kicked off.
-    // Preloading can run arbitrary Python code, which means it can re-enter
-    // the JIT.
-    cinderx::getModuleState()->unit_deleted_during_preload =
-        [&](BorrowedRef<> deleted_unit) {
+    hir::Preloader* preloader =
+        preloadWithUnitDeletedCallback(f, [&](BorrowedRef<> deleted_unit) {
           deleted_units.emplace(deleted_unit);
-        };
-    hir::Preloader* preloader = preload(f);
-    cinderx::getModuleState()->unit_deleted_during_preload = nullptr;
+        });
 
     if (preloader == nullptr) {
       return {};
@@ -4639,7 +4692,7 @@ std::vector<BorrowedRef<PyFunctionObject>> preloadFuncAndDeps(
     // Preload all invoked Static Python functions because then the JIT can
     // compile them and emit direct calls to them from the original function.
     for (const auto& [descr, target] : preloader->invokeFunctionTargets()) {
-      if (!target->is_function || !target->is_statically_typed) {
+      if (!target->isFunction() || !target->is_statically_typed) {
         continue;
       }
       BorrowedRef<PyFunctionObject> target_func = target->func();

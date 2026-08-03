@@ -6,7 +6,7 @@ import dis
 import sys
 import unittest
 from types import ModuleType
-from typing import Callable, TypeVar
+from typing import Any, Callable, TypeVar
 
 import cinderx
 import cinderx.jit
@@ -157,6 +157,9 @@ class SpecializationTests(unittest.TestCase):
             self.assertNotIn("BINARY_SUBSCR", opnames(f))
             self.assertIn("BINARY_SUBSCR_LIST_INT", opnames(f))
         self.assertEqual(f(["c", "d"], 0), "c")
+        self.assertEqual(f(["c", "d"], -1), "d")
+        with self.assertRaises(IndexError):
+            f(["c", "d"], -3)
 
     def test_binary_subscr_tuple_int(self) -> None:
         def f(a: tuple[str, str], b: int) -> str:
@@ -171,6 +174,9 @@ class SpecializationTests(unittest.TestCase):
             self.assertNotIn("BINARY_SUBSCR", opnames(f))
             self.assertIn("BINARY_SUBSCR_TUPLE_INT", opnames(f))
         self.assertEqual(f(("c", "d"), 0), "c")
+        self.assertEqual(f(("c", "d"), -1), "d")
+        with self.assertRaises(IndexError):
+            f(("c", "d"), -3)
 
     def test_compare_op_float(self) -> None:
         def f(a: float, b: float) -> bool:
@@ -227,6 +233,84 @@ class SpecializationTests(unittest.TestCase):
         d = {"a": "b"}
         f(d, "a", "c")
         self.assertEqual(d, {"a": "c"})
+
+    def test_store_subscr_list_int_ownership_and_bounds(self) -> None:
+        def store(xs: list[Any], index: int, value: Any) -> None:
+            xs[index] = value
+
+        warmup: list[Any] = [None]
+        specialize(store, lambda: store(warmup, 0, None))
+
+        self.assertNotIn("STORE_SUBSCR", opnames(store))
+        self.assertIn("STORE_SUBSCR_LIST_INT", opnames(store))
+        counts = cinderx.jit.get_function_hir_opcode_counts(store)
+        self.assertIsNotNone(counts)
+        assert counts is not None
+        self.assertGreater(counts.get("LoadArrayItem", 0), 0)
+        self.assertGreater(counts.get("StoreArrayItem", 0), 0)
+        self.assertGreater(counts.get("UseObj", 0), 0)
+        self.assertEqual(counts.get("StoreSubscr", 0), 0)
+
+        old = object()
+        replacement = object()
+        values = [old]
+        old_refs = sys.getrefcount(old)
+        replacement_refs = sys.getrefcount(replacement)
+        store(values, 0, replacement)
+        self.assertIs(values[0], replacement)
+        self.assertEqual(sys.getrefcount(old), old_refs - 1)
+        self.assertEqual(sys.getrefcount(replacement), replacement_refs + 1)
+
+        same = object()
+        values = [same]
+        same_refs = sys.getrefcount(same)
+        store(values, 0, same)
+        self.assertIs(values[0], same)
+        self.assertEqual(sys.getrefcount(same), same_refs)
+
+        class Watched:
+            values: list[Any] = []
+            replacement: Any = None
+            seen: list[bool] = []
+
+            def __del__(self) -> None:
+                cls = type(self)
+                cls.seen.append(cls.values[0] is cls.replacement)
+
+        watched = Watched()
+        values = [watched]
+        replacement = object()
+        Watched.values = values
+        Watched.replacement = replacement
+        del watched
+        store(values, 0, replacement)
+        self.assertEqual(Watched.seen, [True])
+        Watched.values = []
+        Watched.replacement = None
+
+        values = [object(), object()]
+        replacement = object()
+        store(values, -1, replacement)
+        self.assertIs(values[-1], replacement)
+
+        def checked_store(xs: list[Any], index: int, value: Any) -> None:
+            xs[index] = value
+
+        for invalid_index in (-2, 1, 1 << 100):
+            specialize(
+                checked_store,
+                lambda: checked_store([None], 0, None),
+            )
+            old = object()
+            new = object()
+            values = [old]
+            old_refs = sys.getrefcount(old)
+            new_refs = sys.getrefcount(new)
+            with self.assertRaises(IndexError):
+                checked_store(values, invalid_index, new)
+            self.assertIs(values[0], old)
+            self.assertEqual(sys.getrefcount(old), old_refs)
+            self.assertEqual(sys.getrefcount(new), new_refs)
 
     def test_unpack_sequence_list(self) -> None:
         def f(li: list[str]) -> str:

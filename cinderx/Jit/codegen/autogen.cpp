@@ -2,6 +2,7 @@
 
 #include "cinderx/Jit/codegen/autogen.h"
 
+#include "internal/pycore_long.h"
 #include "internal/pycore_pystate.h"
 
 #include "cinderx/Common/util.h"
@@ -13,6 +14,7 @@
 #include "cinderx/Jit/hir/hir.h"
 #include "cinderx/Jit/jit_rt.h"
 #include "cinderx/Jit/lir/instruction.h"
+#include "cinderx/Jit/lir/printer.h"
 #include "cinderx/module_state.h"
 
 using namespace asmjit;
@@ -20,6 +22,50 @@ using namespace jit::lir;
 using namespace jit::codegen;
 
 namespace jit::codegen::autogen {
+
+namespace {
+
+bool isMemoryMoveOperand(const OperandBase* operand) {
+  return operand->isStack() || operand->isMem() || operand->isInd();
+}
+
+void checkMoveRelaxedOperandShape(const Instruction* instr) {
+  JIT_DCHECK(
+      instr->isMoveRelaxed(), "Expected kMoveRelaxed, got {}", instr->opname());
+
+  auto* output = instr->output();
+  auto* input = instr->getInput(0);
+
+  bool is_valid_load = output->isReg() && isMemoryMoveOperand(input);
+  bool is_valid_store =
+      isMemoryMoveOperand(output) && (input->isReg() || input->isImm());
+
+  JIT_CHECK(
+      is_valid_load || is_valid_store,
+      "kMoveRelaxed only supports memory->register loads and "
+      "register/immediate->memory stores, got {} <- {}",
+      output->type(),
+      input->type());
+}
+
+#if defined(CINDER_AARCH64) && PY_VERSION_HEX >= 0x030E0000 &&  \
+    PY_VERSION_HEX < 0x030F0000 && !defined(Py_GIL_DISABLED) && \
+    !defined(Py_REF_DEBUG) && !defined(Py_STATS)
+uint64_t exactLongAddSubTarget(uint64_t generic_target) {
+  auto matches = [generic_target](binaryfunc helper) {
+    return generic_target == reinterpret_cast<uint64_t>(helper);
+  };
+  if (matches(PyNumber_Add)) {
+    return reinterpret_cast<uint64_t>(_PyLong_Add);
+  }
+  if (matches(PyNumber_Subtract)) {
+    return reinterpret_cast<uint64_t>(_PyLong_Subtract);
+  }
+  return 0;
+}
+#endif
+
+} // namespace
 
 arch::Mem AsmIndirectOperandBuilder(const OperandBase* operand) {
   JIT_DCHECK(operand->isInd(), "operand should be an indirect reference");
@@ -72,7 +118,11 @@ int getOperandSize(const Instruction* instr, const OperandBase* operand) {
 // Returns the appropriately-sized Gp register for a given operand, respecting
 // the instruction's OperandSizeType property.
 arch::Gp getReg(const Instruction* instr, const OperandBase* operand) {
-  JIT_CHECK(operand->isReg(), "Expected a register for getReg");
+  JIT_CHECK(
+      operand->isReg(),
+      "Expected a register for getReg '{}' in '{}'",
+      *operand,
+      *instr);
   int size = getOperandSize(instr, operand);
   auto reg = operand->getPhyRegister().loc;
 #if defined(CINDER_X86_64)
@@ -152,8 +202,6 @@ void fillLiveValueLocations(
     const Instruction* instr,
     size_t begin_input,
     size_t end_input) {
-  ThreadedCompileSerialize guard;
-
   DeoptMetadata& deopt_meta = code_runtime->getDeoptMetadata(deopt_idx);
   for (size_t i = begin_input; i < end_input; i++) {
     auto loc = instr->getInput(i)->getPhyRegOrStackSlot();
@@ -178,8 +226,91 @@ void TranslateOSREntry(Environ* env, const Instruction* instr) {
   }
 }
 
+#if defined(CINDER_AARCH64)
+void translateBranchCC(
+    a64::Builder* as,
+    Instruction::Opcode opcode,
+    const asmjit::Label& label) {
+  switch (opcode) {
+    case Instruction::kBranchZ:
+    case Instruction::kBranchE:
+      as->b_eq(label);
+      break;
+    case Instruction::kBranchNZ:
+    case Instruction::kBranchNE:
+      as->b_ne(label);
+      break;
+    case Instruction::kBranchC:
+      as->b_cs(label);
+      break;
+    case Instruction::kBranchNC:
+      as->b_cc(label);
+      break;
+    case Instruction::kBranchO:
+      as->b_vs(label);
+      break;
+    case Instruction::kBranchNO:
+      as->b_vc(label);
+      break;
+    case Instruction::kBranchS:
+      as->b_mi(label);
+      break;
+    case Instruction::kBranchNS:
+      as->b_pl(label);
+      break;
+    case Instruction::kBranchA:
+      as->b_hi(label);
+      break;
+    case Instruction::kBranchB:
+      as->b_lo(label);
+      break;
+    case Instruction::kBranchAE:
+      as->b_hs(label);
+      break;
+    case Instruction::kBranchBE:
+      as->b_ls(label);
+      break;
+    case Instruction::kBranchG:
+      as->b_gt(label);
+      break;
+    case Instruction::kBranchL:
+      as->b_lt(label);
+      break;
+    case Instruction::kBranchGE:
+      as->b_ge(label);
+      break;
+    case Instruction::kBranchLE:
+      as->b_le(label);
+      break;
+    default:
+      JIT_ABORT(
+          "Unsupported AArch64 condition branch opcode {}",
+          static_cast<int>(opcode));
+  }
+}
+
+void translateA64GuardCC(Environ* env, const Instruction* instr) {
+  auto index = static_cast<size_t>(instr->getInput(1)->getConstant());
+  auto deopt_label = env->as->newLabel();
+  auto near_label = env->as->newLabel();
+  auto opcode =
+      static_cast<Instruction::Opcode>(instr->getInput(0)->getConstant());
+
+  env->aarch64_near_deopt_branches.emplace_back(near_label, deopt_label);
+  translateBranchCC(env->as, opcode, near_label);
+  fillLiveValueLocations(env->code_rt, index, instr, 2, instr->getNumInputs());
+  env->deopt_exits.emplace_back(index, deopt_label, instr);
+
+  if (!env->pending_debug_locs.empty() && instr->origin() != nullptr &&
+      env->pending_debug_locs.back().instr == instr->origin()) {
+    env->callsite_deopt_pending.emplace_back(
+        env->pending_debug_locs.back().label, deopt_label);
+  }
+}
+#endif
+
 // Translate GUARD instruction
-void TranslateGuard(Environ* env, const Instruction* instr) {
+void translateGuard(Environ* env, const Instruction* instr) {
 #if defined(CINDER_X86_64)
   auto as = env->as;
 
@@ -380,15 +511,15 @@ void TranslateDeoptPatchpoint(Environ* env, const Instruction* instr) {
   // Generate patchpoint by writing in an appropriately sized nop.  As a future
   // optimization, we may be able to avoid reserving space for the patchpoint if
   // we can prove that the following bytes are not the target of a jump.
-#if defined(CINDER_X86_64) && defined(Py_GIL_DISABLED)
   // On x86, align the patchpoint to 8 bytes so the patch-point doesn't straddle
   // a cache line boundary. This is enough to make updates appear atomic to
   // other cores.
   //
   // Not needed on Arm as fixed instructions are a fixed size and updates
   // naturally atomic.
-  as->align(AlignMode::kCode, 8);
-#endif
+  if constexpr (kFreeThreadedBuild && arch::kBuildArch == arch::Arch::kX86_64) {
+    as->align(AlignMode::kCode, 8);
+  }
   auto patchpoint_label = as->newLabel();
   as->bind(patchpoint_label);
 
@@ -1206,9 +1337,9 @@ void translateSetupFrame(Environ* env, const Instruction*) {
 #endif
 }
 
-// Emit an indirect jump through a memory location. The instruction's single
-// input is a MemoryIndirect operand specifying [base + offset].
-void translateIndirectJump(Environ* env, const Instruction* instr) {
+// Emit a branch through a memory-indirect operand [base + offset].
+// Used by kBranch when its input is a MemoryIndirect operand.
+void translateBranchIndirect(Environ* env, const Instruction* instr) {
   arch::Builder* as = env->as;
   const OperandBase* input = instr->getInput(0);
 
@@ -1224,7 +1355,8 @@ void translateIndirectJump(Environ* env, const Instruction* instr) {
   }
 
   JIT_CHECK(
-      input->isInd(), "IndirectJump input must be memory indirect or register");
+      input->isInd(),
+      "Branch indirect input must be memory indirect or register");
 
   const auto* mem = input->getMemoryIndirect();
   PhyLocation base = mem->getBaseRegOperand()->getPhyRegister();
@@ -1307,6 +1439,46 @@ void translateVariadicPush(Environ* env, const Instruction* instr) {
   }
   if (i < n) {
     str(i, a64::ptr(a64::sp, pair_idx * bytes_per_store));
+  }
+#else
+  CINDER_UNSUPPORTED
+#endif
+}
+
+// Store a pair of GP register values at consecutive pointer-sized slots.
+// Input 0: immediate offset. Input 1: base register.
+// Inputs 2, 3: values stored at [base+offset] and [base+offset+8].
+void translateStorePair(Environ* env, const Instruction* instr) {
+  arch::Builder* as = env->as;
+  JIT_DCHECK(
+      instr->getNumInputs() == 4,
+      "StorePair expects exactly 4 inputs (offset, base, val0, val1)");
+  int32_t offset = static_cast<int32_t>(instr->getInput(0)->getConstant());
+
+#if defined(CINDER_X86_64)
+  auto base = x86::gpq(instr->getInput(1)->getPhyRegister().loc);
+  as->mov(
+      x86::qword_ptr(base, offset),
+      x86::gpq(instr->getInput(2)->getPhyRegister().loc));
+  as->mov(
+      x86::qword_ptr(base, offset + kPointerSize),
+      x86::gpq(instr->getInput(3)->getPhyRegister().loc));
+#elif defined(CINDER_AARCH64)
+  auto base = a64::x(instr->getInput(1)->getPhyRegister().loc);
+  // stp signed offset range is -512..504. Fall back to two str instructions
+  // when the offset is out of range.
+  if (Support::isInt7(offset >> 3)) {
+    as->stp(
+        a64::x(instr->getInput(2)->getPhyRegister().loc),
+        a64::x(instr->getInput(3)->getPhyRegister().loc),
+        a64::ptr(base, offset));
+  } else {
+    as->str(
+        a64::x(instr->getInput(2)->getPhyRegister().loc),
+        a64::ptr(base, offset));
+    as->str(
+        a64::x(instr->getInput(3)->getPhyRegister().loc),
+        a64::ptr(base, offset + kPointerSize));
   }
 #else
   CINDER_UNSUPPORTED
@@ -1492,22 +1664,34 @@ static void emitTreeIterCallTwoInputs(
         arch::ptr_resolve(
             as, arch::fp, in0->getStackSlot().loc, arch::reg_scratch_1));
   }
-  a64::Gp src1;
-  if (in1->isReg()) {
-    // int32 phase: use 64-bit reg; the helper accepts int32_t through x reg.
-    src1 = a64::x(in1->getPhyRegister().loc);
-  } else if (in1->isImm()) {
-    src1 = arch::reg_scratch_1;
-    as->mov(src1, in1->getConstant());
-  } else {
-    JIT_CHECK(
-        in1->isStack(), "Unsupported TreeIter helper input: {}", in1->type());
-    src1 = arch::reg_scratch_1;
-    as->ldr(
-        src1,
-        arch::ptr_resolve(
-            as, arch::fp, in1->getStackSlot().loc, arch::reg_scratch_0));
+
+  if (in1->isImm() || in1->isStack()) {
+    // Set up the phase argument directly in x2.  Loading it through a scratch
+    // register adds a move to every TreeIter state-stack push.
+    if (src0.id() == a64::x0.id()) {
+      as->mov(arch::reg_scratch_0, src0);
+      src0 = arch::reg_scratch_0;
+    }
+
+    as->mov(a64::x0, arch::fp);
+    if (src0.id() != a64::x1.id()) {
+      as->mov(a64::x1, src0);
+    }
+    if (in1->isImm()) {
+      as->mov(a64::x2, in1->getConstant());
+    } else {
+      as->ldr(
+          a64::x2,
+          arch::ptr_resolve(
+              as, arch::fp, in1->getStackSlot().loc, arch::reg_scratch_0));
+    }
+    as->bl(reinterpret_cast<uint64_t>(helper));
+    return;
   }
+
+  JIT_CHECK(in1->isReg(), "Unsupported TreeIter helper input: {}", in1->type());
+  // int32 phase: use 64-bit reg; the helper accepts int32_t through x reg.
+  a64::Gp src1 = a64::x(in1->getPhyRegister().loc);
   // Avoid clobber: if src0 or src1 collide with x0/x1/x2 (arg regs), save
   // them to scratch regs.
   if (src0.id() == a64::x0.id() || src0.id() == a64::x1.id()) {
@@ -1532,10 +1716,100 @@ static void emitTreeIterCallTwoInputs(
 #endif
 }
 
-// Move the return value (int/ptr in return register) to the LIR output.
-static void moveReturnToOutput(
+static void storeTreeIterInt32Output(
     arch::Builder* as,
-    const Instruction* instr) {
+    const Instruction* instr,
+    asmjit::a64::Gp value) {
+#if defined(CINDER_AARCH64)
+  const OperandBase* out = instr->output();
+  // Regalloc preserves TreeIter helper loads with dead outputs and marks the
+  // output as None.  Match moveReturnToOutput() by discarding that result.
+  if (out->isNone()) {
+    return;
+  }
+  if (out->isReg()) {
+    auto dst = AutoTranslator::getGpOutput(out);
+    if (dst.id() != value.id()) {
+      as->mov(dst, value);
+    }
+  } else {
+    JIT_CHECK(
+        out->isStack(), "Unsupported TreeIter int32 output: {}", out->type());
+    as->str(
+        value,
+        arch::ptr_resolve(
+            as,
+            arch::fp,
+            out->getStackSlot().loc,
+            arch::reg_scratch_0,
+            arch::AccessSize::k32));
+  }
+#else
+  JIT_ABORT("storeTreeIterInt32Output is AArch64-only");
+#endif
+}
+
+static void emitLoadTreeIterInt32Field(
+    arch::Builder* as,
+    const Instruction* instr,
+    int32_t field_offset) {
+#if defined(CINDER_AARCH64)
+  auto done = as->newLabel();
+  auto out = arch::reg_scratch_1.w();
+  as->ldr(
+      arch::reg_scratch_0,
+      a64::ptr(arch::fp, offsetof(GenDataFooter, tree_iter_state)));
+  as->mov(out, 0);
+  as->cbz(arch::reg_scratch_0, done);
+  as->ldr(
+      out,
+      arch::ptr_offset(
+          arch::reg_scratch_0, field_offset, arch::AccessSize::k32));
+  as->bind(done);
+  storeTreeIterInt32Output(as, instr, out);
+#else
+  JIT_ABORT("emitLoadTreeIterInt32Field is AArch64-only");
+#endif
+}
+
+static void emitSaveTreeIterPhase(arch::Builder* as, const Instruction* instr) {
+#if defined(CINDER_AARCH64)
+  const OperandBase* in0 = instr->getInput(0);
+  a64::Gp phase;
+  if (in0->isReg()) {
+    phase = a64::w(in0->getPhyRegister().loc);
+  } else if (in0->isImm()) {
+    phase = arch::reg_scratch_1.w();
+    as->mov(phase, in0->getConstant());
+  } else {
+    JIT_CHECK(
+        in0->isStack(), "Unsupported TreeIter phase input: {}", in0->type());
+    phase = arch::reg_scratch_1.w();
+    as->ldr(
+        phase,
+        arch::ptr_resolve(
+            as,
+            arch::fp,
+            in0->getStackSlot().loc,
+            arch::reg_scratch_0,
+            arch::AccessSize::k32));
+  }
+  as->ldr(
+      arch::reg_scratch_0,
+      a64::ptr(arch::fp, offsetof(GenDataFooter, tree_iter_state)));
+  as->str(
+      phase,
+      arch::ptr_offset(
+          arch::reg_scratch_0,
+          offsetof(TreeIterState, tree_iter_current_phase),
+          arch::AccessSize::k32));
+#else
+  JIT_ABORT("emitSaveTreeIterPhase is AArch64-only");
+#endif
+}
+
+// Move the return value (int/ptr in return register) to the LIR output.
+static void moveReturnToOutput(arch::Builder* as, const Instruction* instr) {
   const OperandBase* out = instr->output();
   if (out == nullptr) {
     return;
@@ -1590,11 +1864,21 @@ void translateTreeIterOp(Environ* env, const Instruction* instr) {
       moveReturnToOutput(as, instr);
       break;
     case Instruction::kSavePhase:
+#if defined(CINDER_AARCH64)
+      emitSaveTreeIterPhase(as, instr);
+#else
       emitTreeIterCallOneInput(as, instr, reinterpret_cast<const void*>(JITRT_SavePhase));
+#endif
       break;
     case Instruction::kLoadPhase:
-      emitTreeIterCallNoInputs(as, reinterpret_cast<const void*>(JITRT_LoadPhase));
+#if defined(CINDER_AARCH64)
+      emitLoadTreeIterInt32Field(
+          as, instr, offsetof(TreeIterState, tree_iter_current_phase));
+#else
+      emitTreeIterCallNoInputs(
+          as, reinterpret_cast<const void*>(JITRT_LoadPhase));
       moveReturnToOutput(as, instr);
+#endif
       break;
     case Instruction::kStateStackPush:
       emitTreeIterCallTwoInputs(as, instr, reinterpret_cast<const void*>(JITRT_StateStackPush));
@@ -1605,15 +1889,30 @@ void translateTreeIterOp(Environ* env, const Instruction* instr) {
       moveReturnToOutput(as, instr);
       break;
     case Instruction::kLoadPoppedPhase:
-      emitTreeIterCallNoInputs(as, reinterpret_cast<const void*>(JITRT_LoadPoppedPhase));
+#if defined(CINDER_AARCH64)
+      emitLoadTreeIterInt32Field(
+          as, instr, offsetof(TreeIterState, tree_iter_popped_phase));
+#else
+      emitTreeIterCallNoInputs(
+          as, reinterpret_cast<const void*>(JITRT_LoadPoppedPhase));
       moveReturnToOutput(as, instr);
+#endif
       break;
     case Instruction::kLoadStackTop:
-      emitTreeIterCallNoInputs(as, reinterpret_cast<const void*>(JITRT_LoadStackTop));
+#if defined(CINDER_AARCH64)
+      emitLoadTreeIterInt32Field(
+          as, instr, offsetof(TreeIterState, tree_iter_stack_top));
+#else
+      emitTreeIterCallNoInputs(
+          as, reinterpret_cast<const void*>(JITRT_LoadStackTop));
       moveReturnToOutput(as, instr);
+#endif
       break;
     case Instruction::kCheckTreeIterChildEntry:
-      emitTreeIterCallOneInput(as, instr, reinterpret_cast<const void*>(JITRT_CheckTreeIterChildEntry));
+      emitTreeIterCallOneInput(
+          as,
+          instr,
+          reinterpret_cast<const void*>(JITRT_CheckTreeIterChildEntry));
       moveReturnToOutput(as, instr);
       break;
     case Instruction::kTreeIterEnterChild:
@@ -1628,6 +1927,69 @@ void translateTreeIterOp(Environ* env, const Instruction* instr) {
     default:
       JIT_ABORT("translateTreeIterOp: unexpected opcode {}", (int)op);
   }
+}
+
+void translateShift(Environ* env, const Instruction* instr) {
+  auto opcode = instr->opcode();
+  auto in0_reg = getReg(instr, instr->getInput(0));
+  auto in1 = instr->getInput(1);
+  auto out_reg =
+      (instr->getNumOutputs() > 0) ? getReg(instr, instr->output()) : in0_reg;
+  // Currently just a limitation of x86-64 register allocation.
+  JIT_CHECK(
+      arch::kBuildArch != arch::Arch::kX86_64 || in1->isImm(),
+      "Cannot emit non-immediate RHS for instruction '{}'",
+      *instr);
+
+  if (instr->getNumOutputs() > 0 && arch::kBuildArch != arch::Arch::kAarch64) {
+    env->as->mov(out_reg, in0_reg);
+  }
+
+#if defined(CINDER_X86_64)
+  asmjit::Imm shift = getImm(in1);
+  switch (opcode) {
+    case Instruction::kLShift:
+      env->as->shl(out_reg, shift);
+      return;
+    case Instruction::kRShift:
+      env->as->sar(out_reg, shift);
+      return;
+    case Instruction::kRShiftUn:
+      env->as->shr(out_reg, shift);
+      return;
+    default:
+      break;
+  }
+#elif defined(CINDER_AARCH64)
+  switch (opcode) {
+    case Instruction::kLShift:
+      if (in1->isReg()) {
+        env->as->lsl(out_reg, in0_reg, getReg(instr, in1));
+      } else {
+        env->as->lsl(out_reg, in0_reg, getImm(in1));
+      }
+      return;
+    case Instruction::kRShift:
+      if (in1->isReg()) {
+        env->as->asr(out_reg, in0_reg, getReg(instr, in1));
+      } else {
+        env->as->asr(out_reg, in0_reg, getImm(in1));
+      }
+      return;
+    case Instruction::kRShiftUn:
+      if (in1->isReg()) {
+        env->as->lsr(out_reg, in0_reg, getReg(instr, in1));
+      } else {
+        env->as->lsr(out_reg, in0_reg, getImm(in1));
+      }
+      return;
+    default:
+      break;
+  }
+#else
+  JIT_ABORT("Unrecognized architecture for emitting shift instruction");
+#endif
+  JIT_ABORT("Unrecognized shift opcode '{}'", instr->opname());
 }
 
 #if defined(CINDER_AARCH64)
@@ -1708,18 +2070,25 @@ arch::Mem ptrIndirect(
     arch::Builder* as,
     arch::Gp scratch0,
     arch::Gp scratch1,
-    const MemoryIndirect* indirect) {
+    const MemoryIndirect* indirect,
+    DataType data_type) {
   auto base = getGpOrSP(indirect->getBaseRegOperand());
   auto indexRegOperand = indirect->getIndexRegOperand();
   auto offset = indirect->getOffset();
 
   if (indexRegOperand != nullptr) {
-    leaIndex(
-        as,
-        scratch1,
-        base,
-        AT::getGp(indexRegOperand),
-        indirect->getMultipiler());
+    auto index = AT::getGp(indexRegOperand);
+    auto multiplier = indirect->getMultipiler();
+
+    if (offset == 0) {
+      if (multiplier == 0) {
+        return a64::ptr(base, index);
+      } else if (multiplier == byteShift(data_type)) {
+        return a64::ptr(base, index, a64::lsl(multiplier));
+      }
+    }
+
+    leaIndex(as, scratch1, base, index, multiplier);
 
     base = scratch1;
   }
@@ -1753,11 +2122,12 @@ void loadToReg(
 void storeFromReg(
     arch::Builder* as,
     const OperandBase* input,
+    const OperandBase* output_operand,
     const arch::Mem& output) {
   if (input->isVecD()) {
     as->str(AT::getVecD(input), output);
   } else {
-    switch (input->dataType()) {
+    switch (output_operand->dataType()) {
       case OperandBase::k8bit:
         as->strb(
             AT::getGp(DataType::k32bit, input->getPhyRegister().loc), output);
@@ -1767,7 +2137,9 @@ void storeFromReg(
             AT::getGp(DataType::k32bit, input->getPhyRegister().loc), output);
         break;
       default:
-        as->str(AT::getGp(input), output);
+        as->str(
+            AT::getGp(output_operand->dataType(), input->getPhyRegister().loc),
+            output);
         break;
     }
   }
@@ -1879,6 +2251,58 @@ void translateLoadAttrCachedFastPath(Environ* env, const Instruction* instr) {
 #endif
 }
 
+void translateBinaryOpExactLongAddSubFastPath(
+    Environ* env,
+    const Instruction* instr) {
+#if defined(CINDER_AARCH64) && PY_VERSION_HEX >= 0x030E0000 &&  \
+    PY_VERSION_HEX < 0x030F0000 && !defined(Py_GIL_DISABLED) && \
+    !defined(Py_REF_DEBUG) && !defined(Py_STATS)
+  JIT_CHECK(
+      instr->getNumInputs() == 1 && instr->getInput(0)->isImm(),
+      "BinaryOpExactLongAddSubFastPath expects one immediate helper target");
+
+  auto output = instr->output();
+  auto as = env->as;
+  uint64_t generic_target = instr->getInput(0)->getConstant();
+  uint64_t exact_target = exactLongAddSubTarget(generic_target);
+  JIT_CHECK(
+      exact_target != 0,
+      "unsupported exact-long add/sub helper target {:#x}",
+      generic_target);
+
+  Label entry;
+  for (const auto& stub : env->exact_long_add_sub_stubs) {
+    if (stub.generic_target == generic_target) {
+      JIT_DCHECK(
+          stub.exact_target == exact_target,
+          "exact-long add/sub target changed for helper");
+      entry = stub.entry;
+      break;
+    }
+  }
+  if (!entry.isValid()) {
+    entry = as->newLabel();
+    env->exact_long_add_sub_stubs.push_back(
+        {entry, generic_target, exact_target});
+  }
+
+  // The local stub tail-branches to either target so the helper returns to the
+  // address recorded here, preserving normal callsite/deopt bookkeeping.
+  emitCall(*env, entry, instr);
+
+  if (output->type() != OperandBase::kNone) {
+    auto out_reg = AT::getGpOutput(output);
+    if (out_reg.isGpW()) {
+      as->mov(out_reg, a64::w0);
+    } else {
+      as->mov(out_reg, a64::x0);
+    }
+  }
+#else
+  translateCall(env, instr);
+#endif
+}
+
 // Our move instruction encapsulates moving a value between registers, setting
 // the value of a register, loading a value from memory, and storing a value to
 // memory. The operation that will be performed is determined by the
@@ -1896,6 +2320,10 @@ void translateMove(Environ* env, const Instruction* instr) {
 
   const OperandBase* output = instr->output();
   const OperandBase* input = instr->getInput(0);
+
+  if (instr->isMoveRelaxed()) {
+    checkMoveRelaxedOperandShape(instr);
+  }
 
   switch (output->type()) {
     case lir::OperandType::kReg:
@@ -1944,7 +2372,8 @@ void translateMove(Environ* env, const Instruction* instr) {
               as,
               arch::reg_scratch_0,
               arch::reg_scratch_1,
-              input->getMemoryIndirect());
+              input->getMemoryIndirect(),
+              output->dataType());
 
           loadToReg(as, output, ptr);
           break;
@@ -1984,8 +2413,8 @@ void translateMove(Environ* env, const Instruction* instr) {
           as, arch::fp, output->getStackSlot().loc, arch::reg_scratch_0);
 
       if (input->isReg()) {
-        // Storing the value of a register to the stack.
-        storeFromReg(as, input, ptr);
+        // Storing the value of a register to the stack
+        storeFromReg(as, input, output, ptr);
       } else {
         JIT_ABORT("Unsupported operand type for Move: Stk + {}", input->type());
       }
@@ -2013,15 +2442,23 @@ void translateMove(Environ* env, const Instruction* instr) {
       if (input->isReg()) {
         // Storing the value of a register to an address relative to another
         // register.
-        auto ptr =
-            ptrIndirect(as, scratch0, scratch1, output->getMemoryIndirect());
+        auto ptr = ptrIndirect(
+            as,
+            scratch0,
+            scratch1,
+            output->getMemoryIndirect(),
+            output->dataType());
 
-        storeFromReg(as, input, ptr);
+        storeFromReg(as, input, output, ptr);
       } else if (input->isImm()) {
         // Storing a constant immediate to an address relative to another
         // register.
-        auto ptr =
-            ptrIndirect(as, scratch0, scratch1, output->getMemoryIndirect());
+        auto ptr = ptrIndirect(
+            as,
+            scratch0,
+            scratch1,
+            output->getMemoryIndirect(),
+            output->dataType());
 
         // Use the output's data type to determine the store width.
         switch (output->dataType()) {
@@ -2542,18 +2979,23 @@ void translateDec(Environ* env, const Instruction* instr) {
   });
 }
 
-void translateBitTest(Environ* env, const Instruction* instr) {
+void translateBranchBit(Environ* env, const Instruction* instr, bool is_set) {
   a64::Builder* as = env->as;
 
   auto test_reg = AT::getGpWiden(instr->getInput(0));
   auto bit_pos = instr->getInput(1)->getConstant();
+  auto label = getLabel(env, instr->getInput(2));
 
-  uint64_t mask = 1ULL << bit_pos;
   JIT_CHECK(
-      arm::Utils::isLogicalImm(mask, 64),
-      "All single bits should be able to be tested");
+      bit_pos < 64,
+      "AArch64 bit branch position must be in [0, 63], got {}",
+      bit_pos);
 
-  as->tst(test_reg, mask);
+  if (is_set) {
+    as->tbnz(test_reg, bit_pos, label);
+  } else {
+    as->tbz(test_reg, bit_pos, label);
+  }
 }
 
 void translateTst(Environ* env, const Instruction* instr) {
@@ -2619,6 +3061,24 @@ void translateSelect(Environ* env, const Instruction* instr) {
 void AutoTranslator::translateInstr(Environ* env, const Instruction* instr)
     const {
   auto opcode = instr->opcode();
+#if defined(CINDER_AARCH64)
+  const hir::Instr* origin = instr->origin();
+  if (origin != nullptr && origin->IsCondBranch()) {
+    const auto& branch = static_cast<const hir::CondBranch&>(*origin);
+    if (JumpPatcher* patcher = branch.falseBranchPatcher()) {
+      JIT_CHECK(
+          instr->isBranchCC() || instr->isCmpBranch(),
+          "patchable CondBranch lowered to unexpected opcode {}",
+          instr->opname());
+      auto patchpoint_label = env->as->newLabel();
+      env->as->bind(patchpoint_label);
+      auto fallback_label = map_get(
+          env->block_label_map, instr->basicblock()->getFalseSuccessor());
+      env->pending_deopt_patchers.emplace_back(
+          patcher, patchpoint_label, fallback_label);
+    }
+  }
+#endif
   switch (opcode) {
     case Instruction::kBind:
       return;
@@ -2635,6 +3095,8 @@ void AutoTranslator::translateInstr(Environ* env, const Instruction* instr)
       return;
     }
     case Instruction::kMoveRelaxed: {
+      checkMoveRelaxedOperandShape(instr);
+
       auto* output = instr->output();
       auto* input = instr->getInput(0);
 
@@ -2781,9 +3243,17 @@ void AutoTranslator::translateInstr(Environ* env, const Instruction* instr)
       env->as->test(getReg(instr, in0), getReg(instr, in1));
       return;
     }
-    case Instruction::kBranch:
-      env->as->jmp(getLabel(env, instr->getInput(0)));
+    case Instruction::kBranch: {
+      auto* input = instr->getInput(0);
+      if (input->isInd() || input->isReg()) {
+        translateBranchIndirect(env, instr);
+      } else if (input->isImm()) {
+        env->as->jmp(getImm(input));
+      } else {
+        env->as->jmp(getLabel(env, input));
+      }
       return;
+    }
     case Instruction::kBranchZ:
       env->as->jz(getLabel(env, instr->getInput(0)));
       return;
@@ -2839,7 +3309,7 @@ void AutoTranslator::translateInstr(Environ* env, const Instruction* instr)
       env->as->jne(getLabel(env, instr->getInput(0)));
       return;
     case Instruction::kGuard:
-      TranslateGuard(env, instr);
+      translateGuard(env, instr);
       return;
     case Instruction::kDeoptPatchpoint:
       TranslateDeoptPatchpoint(env, instr);
@@ -2877,9 +3347,6 @@ void AutoTranslator::translateInstr(Environ* env, const Instruction* instr)
     case Instruction::kSetupFrame:
       translateSetupFrame(env, instr);
       return;
-    case Instruction::kIndirectJump:
-      translateIndirectJump(env, instr);
-      return;
     case Instruction::kInc: {
       auto* input = instr->getInput(0);
 
@@ -2900,11 +3367,18 @@ void AutoTranslator::translateInstr(Environ* env, const Instruction* instr)
       }
       return;
     }
-    case Instruction::kBitTest: {
+    case Instruction::kBranchBitSet:
+    case Instruction::kBranchBitNotSet: {
       auto* in0 = instr->getInput(0);
       auto* in1 = instr->getInput(1);
+      auto label = getLabel(env, instr->getInput(2));
 
       env->as->bt(getReg(instr, in0), getImm(in1));
+      if (instr->isBranchBitSet()) {
+        env->as->jc(label);
+      } else {
+        env->as->jnc(label);
+      }
       return;
     }
     case Instruction::kSelect: {
@@ -3093,6 +3567,11 @@ void AutoTranslator::translateInstr(Environ* env, const Instruction* instr)
       }
       return;
     }
+    case Instruction::kLShift:
+    case Instruction::kRShift:
+    case Instruction::kRShiftUn:
+      translateShift(env, instr);
+      return;
     case Instruction::kTest32: {
       auto* in0 = instr->getInput(0);
       auto* in1 = instr->getInput(1);
@@ -3171,6 +3650,9 @@ void AutoTranslator::translateInstr(Environ* env, const Instruction* instr)
     case Instruction::kVariadicPush:
       translateVariadicPush(env, instr);
       return;
+    case Instruction::kStorePair:
+      translateStorePair(env, instr);
+      return;
     case Instruction::kLeave:
       translateLeave(env);
       return;
@@ -3194,17 +3676,16 @@ void AutoTranslator::translateInstr(Environ* env, const Instruction* instr)
       return;
     case Instruction::kNone:
     case Instruction::kNop:
-    case Instruction::kVectorCall:
+    case Instruction::kVectorCallTstate:
     case Instruction::kVarArgCall:
     case Instruction::kSext:
     case Instruction::kZext:
     case Instruction::kMulAdd:
-    case Instruction::kLShift:
-    case Instruction::kRShift:
-    case Instruction::kRShiftUn:
     case Instruction::kLoadArg:
     case Instruction::kLoadSecondCallResult:
     case Instruction::kMovConstPool:
+    case Instruction::kCmpBranchZero:
+    case Instruction::kCmpBranchNonZero:
     case Instruction::kCondBranch:
     case Instruction::kPhi:
     case Instruction::kReturn:
@@ -3250,9 +3731,17 @@ void AutoTranslator::translateInstr(Environ* env, const Instruction* instr)
     case Instruction::kTest:
       translateTst(env, instr);
       return;
-    case Instruction::kBranch:
-      env->as->b(getLabel(env, instr->getInput(0)));
+    case Instruction::kBranch: {
+      auto* input = instr->getInput(0);
+      if (input->isInd() || input->isReg()) {
+        translateBranchIndirect(env, instr);
+      } else if (input->isImm()) {
+        env->as->b(static_cast<uint64_t>(input->getConstant()));
+      } else {
+        env->as->b(getLabel(env, input));
+      }
       return;
+    }
     case Instruction::kBranchZ:
       if (instr->getNumInputs() == 2) {
         env->as->cbz(
@@ -3260,7 +3749,7 @@ void AutoTranslator::translateInstr(Environ* env, const Instruction* instr)
             getLabel(env, instr->getInput(1)));
         return;
       }
-      env->as->b_eq(getLabel(env, instr->getInput(0)));
+      translateBranchCC(env->as, opcode, getLabel(env, instr->getInput(0)));
       return;
     case Instruction::kBranchNZ:
       if (instr->getNumInputs() == 2) {
@@ -3269,58 +3758,39 @@ void AutoTranslator::translateInstr(Environ* env, const Instruction* instr)
             getLabel(env, instr->getInput(1)));
         return;
       }
-      env->as->b_ne(getLabel(env, instr->getInput(0)));
-      return;
-    case Instruction::kBranchA:
-      env->as->b_hi(getLabel(env, instr->getInput(0)));
-      return;
-    case Instruction::kBranchB:
-      env->as->b_lo(getLabel(env, instr->getInput(0)));
-      return;
-    case Instruction::kBranchAE:
-      env->as->b_hs(getLabel(env, instr->getInput(0)));
-      return;
-    case Instruction::kBranchBE:
-      env->as->b_ls(getLabel(env, instr->getInput(0)));
-      return;
-    case Instruction::kBranchG:
-      env->as->b_gt(getLabel(env, instr->getInput(0)));
-      return;
-    case Instruction::kBranchL:
-      env->as->b_lt(getLabel(env, instr->getInput(0)));
-      return;
-    case Instruction::kBranchGE:
-      env->as->b_ge(getLabel(env, instr->getInput(0)));
-      return;
-    case Instruction::kBranchLE:
-      env->as->b_le(getLabel(env, instr->getInput(0)));
+      translateBranchCC(env->as, opcode, getLabel(env, instr->getInput(0)));
       return;
     case Instruction::kBranchC:
-      env->as->b_cs(getLabel(env, instr->getInput(0)));
-      return;
     case Instruction::kBranchNC:
-      env->as->b_cc(getLabel(env, instr->getInput(0)));
-      return;
     case Instruction::kBranchO:
-      env->as->b_vs(getLabel(env, instr->getInput(0)));
-      return;
     case Instruction::kBranchNO:
-      env->as->b_vc(getLabel(env, instr->getInput(0)));
-      return;
     case Instruction::kBranchS:
-      env->as->b_mi(getLabel(env, instr->getInput(0)));
-      return;
     case Instruction::kBranchNS:
-      env->as->b_pl(getLabel(env, instr->getInput(0)));
-      return;
+    case Instruction::kBranchA:
+    case Instruction::kBranchB:
+    case Instruction::kBranchAE:
+    case Instruction::kBranchBE:
+    case Instruction::kBranchG:
+    case Instruction::kBranchL:
+    case Instruction::kBranchGE:
+    case Instruction::kBranchLE:
     case Instruction::kBranchE:
-      env->as->b_eq(getLabel(env, instr->getInput(0)));
-      return;
     case Instruction::kBranchNE:
-      env->as->b_ne(getLabel(env, instr->getInput(0)));
+      translateBranchCC(env->as, opcode, getLabel(env, instr->getInput(0)));
+      return;
+    case Instruction::kCmpBranchZero:
+      env->as->cbz(
+          getGpWiden(instr->getInput(0)), getLabel(env, instr->getInput(1)));
+      return;
+    case Instruction::kCmpBranchNonZero:
+      env->as->cbnz(
+          getGpWiden(instr->getInput(0)), getLabel(env, instr->getInput(1)));
+      return;
+    case Instruction::kA64GuardCC:
+      translateA64GuardCC(env, instr);
       return;
     case Instruction::kGuard:
-      TranslateGuard(env, instr);
+      translateGuard(env, instr);
       return;
     case Instruction::kDeoptPatchpoint:
       TranslateDeoptPatchpoint(env, instr);
@@ -3358,17 +3828,17 @@ void AutoTranslator::translateInstr(Environ* env, const Instruction* instr)
     case Instruction::kSetupFrame:
       translateSetupFrame(env, instr);
       return;
-    case Instruction::kIndirectJump:
-      translateIndirectJump(env, instr);
-      return;
     case Instruction::kInc:
       translateInc(env, instr);
       return;
     case Instruction::kDec:
       translateDec(env, instr);
       return;
-    case Instruction::kBitTest:
-      translateBitTest(env, instr);
+    case Instruction::kBranchBitSet:
+      translateBranchBit(env, instr, true);
+      return;
+    case Instruction::kBranchBitNotSet:
+      translateBranchBit(env, instr, false);
       return;
     case Instruction::kSelect:
       translateSelect(env, instr);
@@ -3463,6 +3933,11 @@ void AutoTranslator::translateInstr(Environ* env, const Instruction* instr)
     case Instruction::kMul:
       translateMul(env, instr);
       return;
+    case Instruction::kLShift:
+    case Instruction::kRShift:
+    case Instruction::kRShiftUn:
+      translateShift(env, instr);
+      return;
     case Instruction::kTest32: {
       auto* in0 = instr->getInput(0);
       auto* in1 = instr->getInput(1);
@@ -3478,6 +3953,9 @@ void AutoTranslator::translateInstr(Environ* env, const Instruction* instr)
     case Instruction::kLoadAttrCachedFastPath:
       translateLoadAttrCachedFastPath(env, instr);
       return;
+    case Instruction::kBinaryOpExactLongAddSubFastPath:
+      translateBinaryOpExactLongAddSubFastPath(env, instr);
+      return;
     case Instruction::kMove:
       translateMove(env, instr);
       return;
@@ -3492,6 +3970,9 @@ void AutoTranslator::translateInstr(Environ* env, const Instruction* instr)
       return;
     case Instruction::kVariadicPush:
       translateVariadicPush(env, instr);
+      return;
+    case Instruction::kStorePair:
+      translateStorePair(env, instr);
       return;
     case Instruction::kLeave:
       translateLeave(env);
@@ -3516,16 +3997,13 @@ void AutoTranslator::translateInstr(Environ* env, const Instruction* instr)
       return;
     case Instruction::kNone:
     case Instruction::kNop:
-    case Instruction::kVectorCall:
+    case Instruction::kVectorCallTstate:
     case Instruction::kVarArgCall:
     case Instruction::kSext:
     case Instruction::kZext:
     case Instruction::kCdq:
     case Instruction::kCwd:
     case Instruction::kCqo:
-    case Instruction::kLShift:
-    case Instruction::kRShift:
-    case Instruction::kRShiftUn:
     case Instruction::kLoadArg:
     case Instruction::kLoadSecondCallResult:
     case Instruction::kCondBranch:

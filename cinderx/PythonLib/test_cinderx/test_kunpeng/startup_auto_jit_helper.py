@@ -41,11 +41,24 @@ if os.environ.get("CINDERX_PLUGIN_ENABLE", "0") == "1":
         threshold = cinderjit.get_compile_after_n_calls()
         assert threshold is not None, "AutoJIT threshold was not configured"
         assert interpreted_calls > 0, "auto_jit_target was never observed"
-        assert interpreted_calls <= min(call_count, threshold), (
-            interpreted_calls,
-            call_count,
-            threshold,
-        )
+        if sys.version_info[:3] == (3, 14, 0):
+            # CPython 3.14.0 direct calls bypass the AutoJIT classification
+            # gate, so the held-call tally never accumulates: keep the
+            # pre-budget upper bound instead.
+            assert interpreted_calls <= min(call_count, threshold), (
+                interpreted_calls,
+                call_count,
+                threshold,
+            )
+        else:
+            # Held shapes keep counting past the threshold: the budget
+            # converts the tally into a compile only once the process proves
+            # steady work.
+            assert interpreted_calls >= call_count, (
+                interpreted_calls,
+                call_count,
+                threshold,
+            )
     else:
         assert cinderjit.is_jit_compiled(
             auto_jit_target

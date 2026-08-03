@@ -55,14 +55,14 @@ BB %4 - preds: %1 %2
   auto expected_lir_str = fmt::format(
       R"(Function:
 BB %0 - succs: %1 %2
-                   BranchNZ {}:Object, BB%1
+                   CmpBranchNonZero {}:Object, BB%1
 
 BB %2 - preds: %0 - succs: %3 %4
-                   BranchNZ {}:Object, BB%3
+                   CmpBranchNonZero {}:Object, BB%3
                    Branch BB%4
 
 BB %1 - preds: %0 - succs: %3 %4
-                   BranchZ {}:Object, BB%4
+                   CmpBranchZero {}:Object, BB%4
 
 BB %3 - preds: %1 %2
 {:>9}:Object = Move {}:Object
@@ -148,7 +148,7 @@ BB %2 - preds: %0
   auto expected_lir_str = fmt::format(
       R"(Function:
 BB %0 - succs: %1 %2
-                   BranchZ {}:Object, BB%2
+                   CmpBranchZero {}:Object, BB%2
                    Branch BB%1
 
 BB %1 - preds: %0 - section: .coldtext
@@ -724,6 +724,15 @@ static void checkSubWordCondBranchUsesTest(DataType data_type) {
   rewrite.run();
 
   auto instrs = collectInstrs(*entry);
+  if (codegen::arch::kBuildArch == codegen::arch::Arch::kAarch64) {
+    ASSERT_EQ(instrs.size(), 1);
+    EXPECT_TRUE(instrs[0]->isCmpBranch());
+    ASSERT_EQ(instrs[0]->getNumInputs(), 2);
+    EXPECT_EQ(instrs[0]->getInput(0)->dataType(), DataType::k32bit);
+    EXPECT_TRUE(instrs[0]->getInput(1)->isLabel());
+    return;
+  }
+
   ASSERT_GE(instrs.size(), 2);
   EXPECT_TRUE(instrs[0]->isTest());
   EXPECT_EQ(instrs[0]->getInput(0)->dataType(), data_type);
@@ -764,6 +773,53 @@ TEST_F(LIRPostAllocRewriteTest, LoadAttrCachedFastPathKeepsOpcode) {
   }
   ASSERT_NE(fast_path, nullptr);
   EXPECT_EQ(fast_path->getNumInputs(), 1);
+}
+
+TEST_F(
+    LIRPostAllocRewriteTest,
+    BinaryOpExactLongAddSubFastPathKeepsOpcodeAndABI) {
+#if defined(CINDER_AARCH64) && PY_VERSION_HEX >= 0x030E0000 &&  \
+    PY_VERSION_HEX < 0x030F0000 && !defined(Py_GIL_DISABLED) && \
+    !defined(Py_REF_DEBUG) && !defined(Py_STATS)
+  Function func;
+  auto* bb = func.allocateBasicBlock();
+  constexpr uint64_t kGenericHelper = 0x12345678;
+  bb->allocateInstr(
+      Instruction::kBinaryOpExactLongAddSubFastPath,
+      nullptr,
+      OutPhyReg{X4, DataType::kObject},
+      Imm{kGenericHelper, DataType::k64bit},
+      PhyReg{X2, DataType::kObject},
+      PhyReg{X3, DataType::kObject});
+
+  jit::codegen::Environ env;
+  PostRegAllocRewrite rewrite(&func, &env);
+  rewrite.run();
+
+  auto instrs = collectInstrs(*bb);
+  ASSERT_EQ(instrs.size(), 4);
+  ASSERT_TRUE(instrs[0]->isMove());
+  EXPECT_EQ(instrs[0]->output()->getPhyRegister(), X0);
+  EXPECT_EQ(instrs[0]->getInput(0)->getPhyRegister(), X2);
+  ASSERT_TRUE(instrs[1]->isMove());
+  EXPECT_EQ(instrs[1]->output()->getPhyRegister(), X1);
+  EXPECT_EQ(instrs[1]->getInput(0)->getPhyRegister(), X3);
+
+  auto* fast_path = instrs[2];
+  ASSERT_TRUE(fast_path->isBinaryOpExactLongAddSubFastPath());
+  ASSERT_FALSE(fast_path->isCall());
+  EXPECT_TRUE(fast_path->output()->isNone());
+  ASSERT_EQ(fast_path->getNumInputs(), 1);
+  ASSERT_TRUE(fast_path->getInput(0)->isImm());
+  EXPECT_EQ(fast_path->getInput(0)->getConstant(), kGenericHelper);
+
+  ASSERT_TRUE(instrs[3]->isMove());
+  EXPECT_EQ(instrs[3]->output()->getPhyRegister(), X4);
+  EXPECT_EQ(instrs[3]->getInput(0)->getPhyRegister(), X0);
+  ASSERT_TRUE(verifyPostRegAllocInvariants(&func, std::cout));
+#else
+  GTEST_SKIP() << "AArch64 CPython 3.14 GIL-only fast path";
+#endif
 }
 
 // kAdd with one register input and one stack input should insert a Move from

@@ -16,33 +16,57 @@ bool verifyPostRegAllocInvariants(Function* func, std::ostream& err) {
     BasicBlock* next_block = iter == blocks.end() ? nullptr : *iter;
     std::unordered_set<BasicBlock*> branched_blocks;
     for (auto& instr : block->instructions()) {
-      if (instr->isBranch() || instr->isBranchCC()) {
-        auto num_inputs = instr->getNumInputs();
-        JIT_DCHECK(num_inputs > 0, "Branch must have at least one input.");
-        if (num_inputs == 2) {
-#if defined(CINDER_AARCH64)
-          auto reg_input = instr->getInput(0);
-          auto reg_type = reg_input->dataType();
+      if (instr->isBranch() || instr->isBranchCC() || instr->isBranchBitSet() ||
+          instr->isBranchBitNotSet()) {
+        size_t label_input_idx = 0;
+        if (instr->isBranchBitSet() || instr->isBranchBitNotSet()) {
           JIT_DCHECK(
-              (instr->opcode() == Instruction::kBranchZ ||
-               instr->opcode() == Instruction::kBranchNZ) &&
-                  reg_input->isReg() &&
-                  (reg_type == OperandBase::k32bit ||
-                   reg_type == OperandBase::k64bit ||
-                   reg_type == OperandBase::kObject),
-              "Two-input branches must be AArch64 register-tested "
-              "BranchZ/BranchNZ.");
-#else
-          JIT_DCHECK(false, "Two-input branches are only valid on AArch64.");
-#endif
+              instr->getNumInputs() == 3,
+              "BranchBitSet/BranchBitNotSet must have value, bit, and label "
+              "inputs.");
+          label_input_idx = 2;
         } else {
-          JIT_DCHECK(
-              num_inputs == 1, "Branch must have one or two inputs.");
+          auto num_inputs = instr->getNumInputs();
+          JIT_DCHECK(num_inputs > 0, "Branch must have at least one input.");
+          if (num_inputs == 2) {
+#if defined(CINDER_AARCH64)
+            auto reg_input = instr->getInput(0);
+            auto reg_type = reg_input->dataType();
+            JIT_DCHECK(
+                (instr->opcode() == Instruction::kBranchZ ||
+                 instr->opcode() == Instruction::kBranchNZ) &&
+                    reg_input->isReg() &&
+                    (reg_type == OperandBase::k32bit ||
+                     reg_type == OperandBase::k64bit ||
+                     reg_type == OperandBase::kObject),
+                "Two-input branches must be AArch64 register-tested "
+                "BranchZ/BranchNZ.");
+#else
+            JIT_DCHECK(false, "Two-input branches are only valid on AArch64.");
+#endif
+          } else {
+            JIT_DCHECK(num_inputs == 1, "Branch must have one or two inputs.");
+          }
+          label_input_idx = num_inputs - 1;
         }
-        auto operand = instr->getInput(num_inputs - 1);
+        auto operand = instr->getInput(label_input_idx);
+        if (label_input_idx == 0 &&
+            (operand->isInd() || operand->isImm() || operand->isReg())) {
+          // Indirect or direct-address branch: no CFG successor to verify.
+          continue;
+        }
         JIT_DCHECK(
             operand->type() == OperandBase::kLabel,
             "Branch must jump to a label.");
+        branched_blocks.insert(operand->getBasicBlock());
+      } else if (instr->isCmpBranch()) {
+        JIT_DCHECK(
+            instr->getNumInputs() == 2,
+            "CmpBranch must have register and label inputs.");
+        auto operand = instr->getInput(1);
+        JIT_DCHECK(
+            operand->type() == OperandBase::kLabel,
+            "CmpBranch second input must be a label.");
         branched_blocks.insert(operand->getBasicBlock());
       }
     }

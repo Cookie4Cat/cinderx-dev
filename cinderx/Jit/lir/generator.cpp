@@ -3,6 +3,7 @@
 #include "cinderx/Jit/lir/generator.h"
 
 extern "C" {
+#include "internal/pycore_call.h"
 #include "internal/pycore_ceval.h"
 #include "internal/pycore_intrinsics.h"
 
@@ -29,6 +30,7 @@ extern "C" {
 #include "cinderx/Jit/config.h"
 #include "cinderx/Jit/containers.h"
 #include "cinderx/Jit/context.h"
+#include "cinderx/Jit/deopt.h"
 #include "cinderx/Jit/frame_header.h"
 #include "cinderx/Jit/generators_rt.h"
 #include "cinderx/Jit/hir/analysis.h"
@@ -36,6 +38,7 @@ extern "C" {
 #include "cinderx/Jit/inline_cache.h"
 #include "cinderx/Jit/jit_rt.h"
 #include "cinderx/Jit/lir/block_builder.h"
+#include "cinderx/Jit/lir/interpframe.h"
 #include "cinderx/Jit/threaded_compile.h"
 #include "cinderx/StaticPython/checked_dict.h"
 #include "cinderx/StaticPython/checked_list.h"
@@ -81,6 +84,17 @@ uint64_t stackNullBits() {
   return bits;
 }
 
+bool useAarch64ExactLongAddSubFastPath(BinaryOpKind op) {
+#if defined(CINDER_AARCH64) && PY_VERSION_HEX >= 0x030E0000 &&  \
+    PY_VERSION_HEX < 0x030F0000 && !defined(Py_GIL_DISABLED) && \
+    !defined(Py_REF_DEBUG) && !defined(Py_STATS)
+  return op == BinaryOpKind::kAdd || op == BinaryOpKind::kSubtract;
+#else
+  (void)op;
+  return false;
+#endif
+}
+
 // These functions call their counterparts and convert its output from int (32
 // bits) to uint64_t (64 bits). This is solely because the code generator cannot
 // support an operand size other than 64 bits at this moment. A future diff will
@@ -110,10 +124,16 @@ void finishYield(
     BasicBlockBuilder& bbb,
     Instruction* instr,
     const DeoptBase* hir_instr) {
+  DeoptLiveRegFilter live_reg_filter{*hir_instr};
+  size_t num_live_regs = 0;
   for (const RegState& rs : hir_instr->live_regs()) {
+    if (!live_reg_filter.isUsed(rs)) {
+      continue;
+    }
     instr->addOperands(VReg{bbb.getDefInstr(rs.reg)});
+    num_live_regs++;
   }
-  instr->addOperands(Imm{hir_instr->live_regs().size()});
+  instr->addOperands(Imm{num_live_regs});
   instr->addOperands(Imm{bbb.makeDeoptMetadata()});
 }
 
@@ -275,6 +295,201 @@ void emitAnnotation(BasicBlock* bb, std::string text) {
   bb->pending_annotation_ = std::move(text);
 }
 
+// Emit StorePair (and individual kMove for an odd remainder) to store
+// `count` consecutive pointer-sized values from `src_instr` operands
+// [src_start .. src_start+count) into [base + base_offset + i*8].
+void emitStorePairs(
+    BasicBlockBuilder& bbb,
+    Instruction* base,
+    int32_t base_offset,
+    const hir::Instr& src_instr,
+    size_t src_start,
+    size_t count) {
+  size_t i = 0;
+  while (i + 1 < count) {
+    Instruction* v0 = bbb.getDefInstr(src_instr.GetOperand(src_start + i));
+    Instruction* v1 = bbb.getDefInstr(src_instr.GetOperand(src_start + i + 1));
+    auto* sp = bbb.appendInstr(
+        Instruction::kStorePair,
+        Imm{static_cast<uint64_t>(
+            base_offset + static_cast<int32_t>(i * kPointerSize))});
+    sp->allocateLinkedInput(base);
+    sp->allocateLinkedInput(v0);
+    sp->allocateLinkedInput(v1);
+    i += 2;
+  }
+  if (i < count) {
+    Instruction* v = bbb.getDefInstr(src_instr.GetOperand(src_start + i));
+    bbb.appendInstr(
+        OutInd{base, base_offset + static_cast<int32_t>(i * kPointerSize)},
+        Instruction::kMove,
+        v);
+  }
+}
+
+// Describes a single frame field to be stored during initialization.
+struct FrameFieldEntry {
+  int32_t offset; // Relative to _PyInterpreterFrame pointer
+  DataType data_type; // Size of the store
+  Instruction* value; // VReg producing the value to store
+  const char* name; // Annotation label (for PYTHONJITDUMPASM)
+};
+
+// Unified frame initialization plan.  Walks kFrameInitTable (one shared
+// table of WHICH fields to init) and calls a caller-supplied value
+// provider to resolve WHERE each value comes from.  The plan sorts
+// fields by offset and groups consecutive pointer-sized stores for
+// StorePair emission.
+//
+// Usage:
+//   auto plan = FrameInitPlan::build([&](FrameFieldKind k, DataType dt) {
+//     switch (k) { ... return vreg; }
+//   });
+//   plan.emit(bbb, frame_base);
+class FrameInitPlan {
+ public:
+  static constexpr size_t kMaxFields = 20;
+
+  // Walk kFrameInitTable and call provider(kind, data_type) for each
+  // field to get the Instruction* value.  Sort and group for StorePair.
+  // When ENABLE_LIGHTWEIGHT_FRAMES is not defined, nlocalsplus controls
+  // how many localsplus slots to zero after the field stores.
+  template <typename Provider>
+  static FrameInitPlan build(
+      Provider&& provider,
+      [[maybe_unused]] int nlocalsplus = 0) {
+    FrameInitPlan plan;
+    constexpr auto& table = kFrameInitTable;
+    for (size_t i = 0; i < table.num_fields; i++) {
+      const auto& field = table.fields[i];
+      Instruction* val = provider(field.kind, field.data_type);
+      plan.fields_[plan.num_fields_++] = {
+          field.offset,
+          field.data_type,
+          val,
+          frameFieldKindName(field.kind).data()};
+    }
+    // Insertion sort by offset (small N, matches consteval table style).
+    for (size_t i = 1; i < plan.num_fields_; i++) {
+      auto key = plan.fields_[i];
+      size_t j = i;
+      while (j > 0 && plan.fields_[j - 1].offset > key.offset) {
+        plan.fields_[j] = plan.fields_[j - 1];
+        j--;
+      }
+      plan.fields_[j] = key;
+    }
+    // Build groups of consecutive pointer-sized stores for StorePair.
+    size_t i = 0;
+    while (i < plan.num_fields_) {
+      if (plan.fields_[i].data_type != DataType::kObject) {
+        plan.groups_[plan.num_groups_++] = {static_cast<uint8_t>(i), 1};
+        i++;
+        continue;
+      }
+      size_t start = i;
+      int32_t next_offset = plan.fields_[i].offset + kPointerSize;
+      i++;
+      while (i < plan.num_fields_ &&
+             plan.fields_[i].data_type == DataType::kObject &&
+             plan.fields_[i].offset == next_offset) {
+        next_offset += kPointerSize;
+        i++;
+      }
+      plan.groups_[plan.num_groups_++] = {
+          static_cast<uint8_t>(start), static_cast<uint8_t>(i - start)};
+    }
+#ifndef ENABLE_LIGHTWEIGHT_FRAMES
+    if (nlocalsplus > 0) {
+      plan.localsplus_zero_offset_ =
+          static_cast<int32_t>(offsetof(_PyInterpreterFrame, localsplus));
+      plan.localsplus_zero_count_ = nlocalsplus;
+    }
+#endif
+    return plan;
+  }
+
+  // Emit stores with StorePair grouping for consecutive pointer-sized fields,
+  // followed by localsplus zeroing if requested.
+  void emit(BasicBlockBuilder& bbb, Instruction* frame_base) const {
+    for (size_t gi = 0; gi < num_groups_; gi++) {
+      auto& group = groups_[gi];
+      if (group.count > 1) {
+        uint8_t j = 0;
+        while (j + 1 < group.count) {
+          auto& f0 = fields_[group.start + j];
+          auto& f1 = fields_[group.start + j + 1];
+          bbb.annotateNext(fmt::format("Store {}, {}", f0.name, f1.name));
+          bbb.appendInstr(
+              Instruction::kStorePair,
+              Imm{static_cast<uint64_t>(f0.offset)},
+              frame_base,
+              f0.value,
+              f1.value);
+          j += 2;
+        }
+        if (j < group.count) {
+          auto& f = fields_[group.start + j];
+          bbb.annotateNext(fmt::format("Store {}", f.name));
+          bbb.appendInstr(
+              OutInd{frame_base, f.offset, f.data_type},
+              Instruction::kMove,
+              f.value);
+        }
+      } else {
+        auto& f = fields_[group.start];
+        bbb.annotateNext(fmt::format("Store {}", f.name));
+        bbb.appendInstr(
+            OutInd{frame_base, f.offset, f.data_type},
+            Instruction::kMove,
+            f.value);
+      }
+    }
+
+    // Zero localsplus slots (non-LW frames need this so the GC doesn't
+    // see garbage pointers).
+    if (localsplus_zero_count_ > 0) {
+      Instruction* zero =
+          bbb.appendInstr(OutVReg{}, Instruction::kMove, Imm{0});
+      bbb.annotateNext("Zero localsplus");
+      int i = 0;
+      while (i + 1 < localsplus_zero_count_) {
+        bbb.appendInstr(
+            Instruction::kStorePair,
+            Imm{static_cast<uint64_t>(
+                localsplus_zero_offset_ +
+                static_cast<int32_t>(i * kPointerSize))},
+            frame_base,
+            zero,
+            zero);
+        i += 2;
+      }
+      if (i < localsplus_zero_count_) {
+        bbb.appendInstr(
+            OutInd{
+                frame_base,
+                localsplus_zero_offset_ +
+                    static_cast<int32_t>(i * kPointerSize)},
+            Instruction::kMove,
+            zero);
+      }
+    }
+  }
+
+ private:
+  struct StoreGroup {
+    uint8_t start;
+    uint8_t count;
+  };
+
+  std::array<FrameFieldEntry, kMaxFields> fields_{};
+  size_t num_fields_{0};
+  std::array<StoreGroup, kMaxFields> groups_{};
+  size_t num_groups_{0};
+  int32_t localsplus_zero_offset_{0};
+  int localsplus_zero_count_{0};
+};
+
 } // namespace
 
 void PopulateResumeEntryBlock(BasicBlock* bb, Py_ssize_t gi_jit_data_offset) {
@@ -348,7 +563,7 @@ void PopulateResumeEntryBlock(BasicBlock* bb, Py_ssize_t gi_jit_data_offset) {
       Instruction::kMove, nullptr, OutInd(fp_reg, yp_off, DT::kObject), Imm(0));
 
   // Jump to yieldPoint->resumeTarget
-  bb->allocateInstr(Instruction::kIndirectJump, nullptr, Ind(scratch, rt_off));
+  bb->allocateInstr(Instruction::kBranch, nullptr, Ind(scratch, rt_off));
 }
 
 void PopulateEntryBlock(
@@ -431,18 +646,21 @@ UnresolvedJumpTable GenerateStaticTypeCheckBlocks(
     code_rt->addReference(BorrowedRef(arg.pytype));
   }
 
-  // --- Build the mapping: defaulted_arg_count → check_block ---
-  // Allocate one check block per typed arg (last-to-first order).
+  // Allocate the dispatch block first so it is laid out before all type check
+  // blocks. The reentry short jump targets this block and must reach it within
+  // ±127 bytes.
+  auto* dispatch_block = lir_func->allocateBasicBlock();
+
+  // Allocate check blocks and their MRO blocks interleaved so each MRO loop
+  // block immediately follows its corresponding check block in the layout.
   // check_blocks[0] corresponds to typed_args[checks.size()-1] (the last arg).
   std::vector<BasicBlock*> check_blocks;
-  check_blocks.reserve(typed_args.size());
-  for (size_t i = 0; i < typed_args.size(); i++) {
-    check_blocks.push_back(lir_func->allocateBasicBlock());
-  }
-
-  // Allocate MRO loop blocks for checks that need them.
   std::vector<BasicBlock*> mro_blocks;
-  for (Py_ssize_t i = typed_args.size() - 1; i >= 0; i--) {
+  check_blocks.reserve(typed_args.size());
+  mro_blocks.reserve(typed_args.size());
+  for (size_t k = 0; k < typed_args.size(); k++) {
+    check_blocks.push_back(lir_func->allocateBasicBlock());
+    Py_ssize_t i = typed_args.size() - 1 - k;
     const auto& arg = typed_args[i];
     if (!arg.exact && (arg.threadSafeTpFlags() & Py_TPFLAGS_BASETYPE)) {
       mro_blocks.push_back(lir_func->allocateBasicBlock());
@@ -450,10 +668,6 @@ UnresolvedJumpTable GenerateStaticTypeCheckBlocks(
       mro_blocks.push_back(nullptr);
     }
   }
-
-  // Build the dispatch block.
-  size_t original_count = lir_func->basicblocks().size();
-  auto* dispatch_block = lir_func->allocateBasicBlock();
 
   // Build the dispatch mapping: for each defaulted_arg_count value, determine
   // which check block to jump to (same logic as the original jump table).
@@ -495,6 +709,7 @@ UnresolvedJumpTable GenerateStaticTypeCheckBlocks(
   // Build the unresolved jump table for post-codegen resolution.
   UnresolvedJumpTable result;
   result.table = jump_table;
+  result.dispatch_block = dispatch_block;
   for (const auto& [count, target] : dispatch_entries) {
     result.entries.emplace_back(count, target);
   }
@@ -512,8 +727,7 @@ UnresolvedJumpTable GenerateStaticTypeCheckBlocks(
       nullptr,
       OutPhyReg(tc_scratch),
       Ind(tc_scratch, defaulted_count_reg, 8, 0));
-  dispatch_block->allocateInstr(
-      Instruction::kIndirectJump, nullptr, Ind(tc_scratch));
+  dispatch_block->allocateInstr(Instruction::kBranch, nullptr, Ind(tc_scratch));
 
   // --- Emit check blocks ---
   // check_blocks[k] checks typed_args[typed_args.size()-1-k]
@@ -650,22 +864,13 @@ UnresolvedJumpTable GenerateStaticTypeCheckBlocks(
     }
   }
 
-  // --- Reorder blocks ---
-  // Move dispatch + check + mro blocks to the front of basicblocks(),
-  // before the entry_block. This ensures the prologue falls through to
-  // the dispatch block.
-  auto& blocks = lir_func->basicblocks();
-
-  // Rotate the new blocks from the end to the front.
-  std::rotate(blocks.begin(), blocks.begin() + original_count, blocks.end());
-
   return result;
 }
 
 void GenerateArgcountCheckBlocks(
     Function* lir_func,
     const hir::Function* func,
-    BasicBlock* next_block,
+    asmjit::Label correct_args_label,
     asmjit::Label prologue_exit) {
   bool returns_primitive_double = func->returnsPrimitiveDouble();
   BorrowedRef<PyCodeObject> code = func->code;
@@ -682,8 +887,6 @@ void GenerateArgcountCheckBlocks(
   auto kwnames_reg = codegen::ARGUMENT_REGS[3];
   auto nargsf_reg = codegen::ARGUMENT_REGS[2];
 
-  int num_new_blocks = 0;
-
   if (will_check_argcount) {
     // Two blocks:
     //   kw_dispatch: test kwnames → if null, branch to argcount_check;
@@ -693,7 +896,6 @@ void GenerateArgcountCheckBlocks(
     //                   helper → exit.
     auto* kw_dispatch = lir_func->allocateBasicBlock();
     auto* argcount_check = lir_func->allocateBasicBlock();
-    num_new_blocks = 2;
 
     // --- kw_dispatch ---
     emitAnnotation(kw_dispatch, "Keyword argument dispatch");
@@ -707,7 +909,11 @@ void GenerateArgcountCheckBlocks(
     kw_dispatch->allocateInstr(
         Instruction::kCall,
         nullptr,
-        Imm{reinterpret_cast<uint64_t>(JITRT_CallWithKeywordArgs)});
+        // Args are stack allocated in the simple version so only
+        // use if we have a reasonable number of arguments.
+        Imm{reinterpret_cast<uint64_t>(
+            num_args < 30 ? JITRT_CallWithKeywordArgsSimple
+                          : JITRT_CallWithKeywordArgs)});
     kw_dispatch->allocateInstr(
         Instruction::kBranch, nullptr, AsmLbl{prologue_exit});
 
@@ -731,8 +937,7 @@ void GenerateArgcountCheckBlocks(
         PhyReg{nargsf_reg, OperandBase::k32bit},
         PhyReg{kwnames_reg, OperandBase::k32bit});
     argcount_check->allocateInstr(
-        Instruction::kBranchE, nullptr, Lbl{next_block});
-    argcount_check->addSuccessor(next_block);
+        Instruction::kBranchE, nullptr, AsmLbl{correct_args_label});
 
     // Wrong argcount: kwnames_reg already holds numArgs for the 4th arg.
     auto helper = returns_primitive_double
@@ -746,7 +951,6 @@ void GenerateArgcountCheckBlocks(
     // have_varargs or kwonlyargcount > 0: always dispatch through the
     // keyword helper (it handles *args, **kwargs, keyword-only args, etc.).
     auto* kw_dispatch = lir_func->allocateBasicBlock();
-    num_new_blocks = 1;
 
     emitAnnotation(kw_dispatch, "Keyword argument dispatch (varargs/kwonly)");
 
@@ -757,13 +961,6 @@ void GenerateArgcountCheckBlocks(
     kw_dispatch->allocateInstr(
         Instruction::kBranch, nullptr, AsmLbl{prologue_exit});
   }
-
-  // Rotate the new blocks from the end to the front.
-  auto& blocks = lir_func->basicblocks();
-  std::rotate(
-      blocks.begin(),
-      blocks.end() - static_cast<std::ptrdiff_t>(num_new_blocks),
-      blocks.end());
 }
 
 void GenerateFunctionEntryBlock(Function* lir_func) {
@@ -771,10 +968,6 @@ void GenerateFunctionEntryBlock(Function* lir_func) {
 
   // No annotation needed — translatePrologue adds "Set up frame pointer".
   block->allocateInstr(Instruction::kPrologue, nullptr);
-
-  // Rotate the new block to the front.
-  auto& blocks = lir_func->basicblocks();
-  std::rotate(blocks.begin(), blocks.end() - 1, blocks.end());
 }
 
 void GeneratePrimitiveArgsPrologueBlock(
@@ -805,6 +998,7 @@ void GeneratePrimitiveArgsPrologueBlock(
   auto helper = returns_primitive_double
       ? reinterpret_cast<uint64_t>(JITRT_CallStaticallyWithPrimitiveSignatureFP)
       : reinterpret_cast<uint64_t>(JITRT_CallStaticallyWithPrimitiveSignature);
+
   block->allocateInstr(Instruction::kCall, nullptr, Imm{helper});
 
   // The helper either handled the call (result in return register) and we
@@ -812,10 +1006,6 @@ void GeneratePrimitiveArgsPrologueBlock(
   // Since the original code unconditionally calls generateFunctionExit()
   // after the call, we branch to prologue_exit.
   block->allocateInstr(Instruction::kBranch, nullptr, AsmLbl{prologue_exit});
-
-  // Rotate the new block to the front.
-  auto& blocks = lir_func->basicblocks();
-  std::rotate(blocks.begin(), blocks.end() - 1, blocks.end());
 }
 
 void GenerateBoxedReturnWrapperBlocks(
@@ -957,10 +1147,6 @@ void GenerateBoxedReturnWrapperBlocks(
 
   box_block->allocateInstr(Instruction::kCall, nullptr, Imm{box_func});
   box_block->allocateInstr(Instruction::kBranch, nullptr, AsmLbl{wrapper_exit});
-
-  // Rotate the two new blocks to the front.
-  auto& blocks = lir_func->basicblocks();
-  std::rotate(blocks.begin(), blocks.end() - 2, blocks.end());
 }
 
 void LIRGenerator::GenerateExitBlocks() {
@@ -976,18 +1162,37 @@ void LIRGenerator::GenerateExitBlocks() {
       return;
     }
 
+    BasicBlockBuilder bbb{env_, lir_func_};
+    bbb.switchBlock(block);
+
     auto ret_data_type = hirTypeToDataType(func_->return_type);
-    exit_phi_ = block->allocateInstr(
-        Instruction::kPhi, nullptr, OutVReg{ret_data_type});
+    exit_phi_ = bbb.appendInstr(OutVReg{ret_data_type}, Instruction::kPhi);
 
     // Unlink frame before epilogue. Non-generators always unlink.
-    block->allocateInstr(
-        Instruction::kCall,
-        nullptr,
-        Imm{reinterpret_cast<uint64_t>(JITRT_UnlinkFrame)},
-        VReg{env_->asm_tstate});
+    bool has_freevars = func_->code != nullptr && func_->code->co_nfreevars > 0;
+    if (func_->frameMode == FrameMode::kNormal) {
+      bbb.appendInvokeInstruction(JITRT_UnlinkFrame, env_->asm_tstate);
+    } else {
+      PyObject* executable;
+      std::optional<destructor> exec_dtor;
+#if PY_VERSION_HEX >= 0x030F0000 && defined(ENABLE_LIGHTWEIGHT_FRAMES)
+      executable = env_->code_rt->reifier().get();
+      exec_dtor = PyUnstable_JITExecutable_Type.tp_dealloc;
+#else
+      executable = reinterpret_cast<PyObject*>(func_->code.get());
+      exec_dtor = PyCode_Type.tp_dealloc;
+#endif
+      emitUnlinkFrame(
+          bbb, has_freevars, is_gen_, env_->asm_func, executable, exec_dtor);
+    }
 
-    block->allocateInstr(Instruction::kEpilogueEnd, nullptr, VReg{exit_phi_});
+    // EpilogueEnd goes on the builder's current block which may differ
+    // from exit_block_ when inline code created additional blocks.
+    BasicBlock* epilogue_block = bbb.curBlock();
+    bbb.appendInstr(Instruction::kEpilogueEnd, VReg{exit_phi_});
+    if (epilogue_block != exit_block_) {
+      exit_epilogue_ = epilogue_block;
+    }
     return;
   }
 
@@ -1083,7 +1288,7 @@ std::unique_ptr<jit::lir::Function> LIRGenerator::TranslateFunction() {
   // generate entry block and exit block
   entry_block_ = GenerateEntryBlock();
 
-#if defined(CINDER_AARCH64)
+#if defined(CINDER_AARCH64) && defined(ENABLE_LIGHTWEIGHT_FRAMES)
   // Compute the caller FrameState and active code object at each block's entry
   // by walking the CFG. Needed because blocks inside an inlined function may
   // not contain BeginInlinedFunction themselves (they're reached via branches).
@@ -1135,7 +1340,7 @@ std::unique_ptr<jit::lir::Function> LIRGenerator::TranslateFunction() {
   UnorderedMap<const hir::BasicBlock*, TranslatedBlock> bb_map;
   std::vector<const hir::BasicBlock*> translated;
   auto translate_block = [&](const hir::BasicBlock* hir_bb) {
-#if defined(CINDER_AARCH64)
+#if defined(CINDER_AARCH64) && defined(ENABLE_LIGHTWEIGHT_FRAMES)
     auto it = block_inline_ctx.find(hir_bb);
     const hir::FrameState* entry_fs =
         it != block_inline_ctx.end() ? it->second.caller_fs : nullptr;
@@ -1296,8 +1501,12 @@ void LIRGenerator::addLiveRegOperands(
     BasicBlockBuilder& bbb,
     Instruction* instr,
     const hir::DeoptBase& hir_instr) {
+  DeoptLiveRegFilter live_reg_filter{hir_instr};
   auto& regstates = hir_instr.live_regs();
   for (const auto& reg_state : regstates) {
+    if (!live_reg_filter.isUsed(reg_state)) {
+      continue;
+    }
     hir::Register* reg = reg_state.reg;
     instr->addOperands(VReg{bbb.getDefInstr(reg)});
   }
@@ -1404,11 +1613,11 @@ void LIRGenerator::makeIncref(
     bbb.appendBlock(cont);
   }
 
-#ifdef Py_GIL_DISABLED
-  makeIncrefFreeThreaded(bbb, instr, end_incref);
-#else
-  makeIncrefGILEnabled(bbb, instr, end_incref, possible_immortal);
-#endif
+  if constexpr (kFreeThreadedBuild) {
+    makeIncrefFreeThreaded(bbb, instr, end_incref);
+  } else {
+    makeIncrefGILEnabled(bbb, instr, end_incref, possible_immortal);
+  }
 
   bbb.appendBlock(end_incref);
 }
@@ -1419,14 +1628,15 @@ void LIRGenerator::makeIncrefFreeThreaded(
     lir::Instruction* instr,
     BasicBlock* end_incref) {
   // Inline the common-case incref for free-threading. Check thread ownership
-  // (ob_tid == tstate->thread_id) and use a non-atomic store for thread-owned
-  // objects. Fall back to Py_IncRef for objects owned by other threads.
+  // (ob_tid == tstate->thread_id) and use a relaxed atomic store for
+  // thread-owned objects. Fall back to Py_IncRef for objects owned by other
+  // threads.
   BasicBlock* slow_incref = bbb.allocateBlock();
 
-  // Load ob_ref_local (32-bit thread-local refcount).
+  // Load ob_ref_local (32-bit thread-local refcount) with relaxed semantics.
   Instruction* ref_local = bbb.appendInstr(
       OutVReg{OperandBase::k32bit},
-      Instruction::kMove,
+      Instruction::kMoveRelaxed,
       Ind{instr,
           static_cast<int>(offsetof(PyObject, ob_ref_local)),
           DataType::k32bit});
@@ -1440,18 +1650,19 @@ void LIRGenerator::makeIncrefFreeThreaded(
   BasicBlock* check_owner = bbb.allocateBlock();
   bbb.appendBlock(check_owner);
   Instruction* ob_tid = bbb.appendInstr(
-      OutVReg{},
+      OutVReg{DataType::k64bit},
       Instruction::kMove,
       Ind{instr, static_cast<int>(offsetof(PyObject, ob_tid))});
   Instruction* thread_id = bbb.appendInstr(
-      OutVReg{},
+      OutVReg{DataType::k64bit},
       Instruction::kMove,
       Ind{env_->asm_tstate,
           static_cast<int>(offsetof(PyThreadState, thread_id))});
   bbb.appendInstr(Instruction::kCmp, ob_tid, thread_id);
   bbb.appendBranch(Instruction::kBranchNE, slow_incref);
 
-  // Fast path: thread-owned, store incremented ob_ref_local non-atomically.
+  // Fast path: thread-owned, store incremented ob_ref_local with relaxed
+  // semantics.
   BasicBlock* fast_store = bbb.allocateBlock();
   bbb.appendBlock(fast_store);
   bbb.appendInstr(
@@ -1459,7 +1670,7 @@ void LIRGenerator::makeIncrefFreeThreaded(
           instr,
           static_cast<int>(offsetof(PyObject, ob_ref_local)),
           DataType::k32bit},
-      Instruction::kMove,
+      Instruction::kMoveRelaxed,
       ref_local);
   updateRefTotal(bbb, Instruction::kInc);
   // Jump past the slow path to end_incref.
@@ -1503,7 +1714,9 @@ void LIRGenerator::makeIncrefGILEnabled(
         r1);
   } else {
     Instruction* r1 = bbb.appendInstr(
-        OutVReg{}, Instruction::kMove, Ind{instr, kRefcountOffset});
+        OutVReg{DataType::k64bit},
+        Instruction::kMove,
+        Ind{instr, kRefcountOffset});
     bbb.appendInstr(Instruction::kInc, r1);
     bbb.appendInstr(OutInd{instr, kRefcountOffset}, Instruction::kMove, r1);
   }
@@ -1540,11 +1753,11 @@ void LIRGenerator::makeDecref(
     bbb.appendBlock(cont);
   }
 
-#ifdef Py_GIL_DISABLED
-  makeDecrefFreeThreaded(bbb, instr, end_decref);
-#else
-  makeDecrefGILEnabled(bbb, instr, end_decref, destructor, possible_immortal);
-#endif
+  if constexpr (kFreeThreadedBuild) {
+    makeDecrefFreeThreaded(bbb, instr, end_decref);
+  } else {
+    makeDecrefGILEnabled(bbb, instr, end_decref, destructor, possible_immortal);
+  }
 
   bbb.appendBlock(end_decref);
 }
@@ -1555,41 +1768,40 @@ void LIRGenerator::makeDecrefFreeThreaded(
     lir::Instruction* instr,
     BasicBlock* end_decref) {
   // Inline the common-case decref for free-threading. Check thread ownership
-  // and use a non-atomic decrement for thread-owned objects. When the local
+  // and use a relaxed atomic store for thread-owned objects. When the local
   // refcount reaches zero, call _Py_MergeZeroLocalRefcount to merge with the
   // shared refcount. Fall back to Py_DecRef for objects owned by other threads.
   BasicBlock* slow_decref = bbb.allocateBlock();
   BasicBlock* merge_refcount = bbb.allocateBlock();
 
-  // Load ob_ref_local (32-bit).
+  // Load ob_ref_local (32-bit) with relaxed semantics.
   Instruction* ref_local = bbb.appendInstr(
       OutVReg{OperandBase::k32bit},
-      Instruction::kMove,
+      Instruction::kMoveRelaxed,
       Ind{instr,
           static_cast<int>(offsetof(PyObject, ob_ref_local)),
           DataType::k32bit});
 
   // Check immortal via sign bit. Normal refcounts are well below 2^31,
   // so a set sign bit indicates an immortal sentinel.
-  bbb.appendInstr(Instruction::kTest32, ref_local, ref_local);
-  bbb.appendBranch(Instruction::kBranchS, end_decref);
+  bbb.appendBranch(Instruction::kBranchBitSet, end_decref, ref_local, Imm{31});
 
   // Check thread ownership: ob_tid vs tstate->thread_id.
   BasicBlock* check_owner = bbb.allocateBlock();
   bbb.appendBlock(check_owner);
   Instruction* ob_tid = bbb.appendInstr(
-      OutVReg{},
+      OutVReg{DataType::k64bit},
       Instruction::kMove,
       Ind{instr, static_cast<int>(offsetof(PyObject, ob_tid))});
   Instruction* thread_id = bbb.appendInstr(
-      OutVReg{},
+      OutVReg{DataType::k64bit},
       Instruction::kMove,
       Ind{env_->asm_tstate,
           static_cast<int>(offsetof(PyThreadState, thread_id))});
   bbb.appendInstr(Instruction::kCmp, ob_tid, thread_id);
   bbb.appendBranch(Instruction::kBranchNE, slow_decref);
 
-  // Fast path: thread-owned, decrement non-atomically.
+  // Fast path: thread-owned, decrement and store with relaxed semantics.
   BasicBlock* fast_dec = bbb.allocateBlock();
   bbb.appendBlock(fast_dec);
   updateRefTotal(bbb, Instruction::kDec);
@@ -1599,7 +1811,7 @@ void LIRGenerator::makeDecrefFreeThreaded(
           instr,
           static_cast<int>(offsetof(PyObject, ob_ref_local)),
           DataType::k32bit},
-      Instruction::kMove,
+      Instruction::kMoveRelaxed,
       ref_local);
   // Re-test zero flag after the store (the store may clobber flags).
   bbb.appendInstr(Instruction::kTest32, ref_local, ref_local);
@@ -1634,12 +1846,13 @@ void LIRGenerator::makeDecrefGILEnabled(
     std::optional<destructor> destructor,
     bool possible_immortal) {
   Instruction* r1 = bbb.appendInstr(
-      OutVReg{}, Instruction::kMove, Ind{instr, kRefcountOffset});
+      OutVReg{DataType::k64bit},
+      Instruction::kMove,
+      Ind{instr, kRefcountOffset});
 
   if (possible_immortal) {
     auto mortal = bbb.allocateBlock();
-    bbb.appendInstr(Instruction::kTest32, r1, r1);
-    bbb.appendBranch(Instruction::kBranchS, end_decref);
+    bbb.appendBranch(Instruction::kBranchBitSet, end_decref, r1, Imm{31});
     bbb.appendBlock(mortal);
   }
 
@@ -1784,10 +1997,17 @@ LIRGenerator::TranslatedBlock LIRGenerator::TranslateOneBasicBlock(
         // FT needs to call PyCell_GetRef for thread-safety. Switching the two
         // implementations changes whether the output is borrowed or new so
         // there is a corresponding switch in instr_effects.cpp.
-#ifdef Py_GIL_DISABLED
-        auto* instr = static_cast<const LoadCellItem*>(&i);
-        bbb.appendCallInstruction(
-            instr->output(), JITRT_LoadCellItem, instr->GetOperand(0));
+#if PY_VERSION_HEX >= 0x030D0000
+        if constexpr (kFreeThreadedBuild) {
+          auto* instr = static_cast<const LoadCellItem*>(&i);
+          bbb.appendCallInstruction(
+              instr->output(), JITRT_LoadCellItem, instr->GetOperand(0));
+        } else {
+          hir::Register* dest = i.output();
+          Instruction* src_base = bbb.getDefInstr(i.GetOperand(0));
+          constexpr int32_t kOffset = offsetof(PyCellObject, ob_ref);
+          bbb.appendInstr(dest, Instruction::kMove, Ind{src_base, kOffset});
+        }
 #else
         hir::Register* dest = i.output();
         Instruction* src_base = bbb.getDefInstr(i.GetOperand(0));
@@ -1900,7 +2120,16 @@ LIRGenerator::TranslatedBlock LIRGenerator::TranslateOneBasicBlock(
           case BinaryOpKind::kMultiply:
             op = Instruction::kMul;
             break;
-          case BinaryOpKind::kLShift:
+          case BinaryOpKind::kLShift: {
+            Register* rhs = instr->right();
+
+            // Left shifting by a constant avoids x86-64 register allocation
+            // concerns of putting the RHS in %cl.
+            if (rhs->type().hasIntSpec()) {
+              op = Instruction::kLShift;
+              break;
+            }
+
             switch (bytes_from_cint_type(instr->GetOperand(0)->type())) {
               case 1:
               case 2:
@@ -1914,7 +2143,17 @@ LIRGenerator::TranslatedBlock LIRGenerator::TranslateOneBasicBlock(
                 break;
             }
             break;
-          case BinaryOpKind::kRShift:
+          }
+          case BinaryOpKind::kRShift: {
+            Register* rhs = instr->right();
+
+            // Right shifting by a constant avoids x86-64 register allocation
+            // concerns of putting the RHS in %cl.
+            if (rhs->type().hasIntSpec()) {
+              op = Instruction::kRShift;
+              break;
+            }
+
             switch (bytes_from_cint_type(instr->GetOperand(0)->type())) {
               case 1:
               case 2:
@@ -1928,7 +2167,17 @@ LIRGenerator::TranslatedBlock LIRGenerator::TranslateOneBasicBlock(
                 break;
             }
             break;
-          case BinaryOpKind::kRShiftUnsigned:
+          }
+          case BinaryOpKind::kRShiftUnsigned: {
+            Register* rhs = instr->right();
+
+            // Right shifting by a constant avoids x86-64 register allocation
+            // concerns of putting the RHS in %cl.
+            if (rhs->type().hasIntSpec()) {
+              op = Instruction::kRShiftUn;
+              break;
+            }
+
             switch (bytes_from_cint_type(instr->GetOperand(0)->type())) {
               case 1:
               case 2:
@@ -1942,6 +2191,7 @@ LIRGenerator::TranslatedBlock LIRGenerator::TranslateOneBasicBlock(
                 break;
             }
             break;
+          }
           case BinaryOpKind::kFloorDivide:
             op = Instruction::kDiv;
             break;
@@ -2550,7 +2800,8 @@ LIRGenerator::TranslatedBlock LIRGenerator::TranslateOneBasicBlock(
               PyUnicode_AsUTF8(code->co_filename),
               PyUnicode_AsUTF8(code->co_name));
         }
-        bbb.appendCallInstruction(
+        appendCall2RetValues(
+            bbb,
             instr->output(),
             LoadTypeMethodCache::lookupHelper,
             cache_entry,
@@ -2578,7 +2829,8 @@ LIRGenerator::TranslatedBlock LIRGenerator::TranslateOneBasicBlock(
         auto instr = static_cast<const LoadTypeMethodCacheEntryValue*>(&i);
         LoadTypeMethodCache* cache =
             load_type_method_caches_.at(instr->cache_id());
-        bbb.appendCallInstruction(
+        appendCall2RetValues(
+            bbb,
             instr->output(),
             LoadTypeMethodCache::getValueHelper,
             cache,
@@ -2590,7 +2842,7 @@ LIRGenerator::TranslatedBlock LIRGenerator::TranslateOneBasicBlock(
         hir::Register* dst = instr->output();
         hir::Register* base = instr->receiver();
         Instruction* name = getNameFromIdx(bbb, instr);
-        bbb.appendCallInstruction(dst, JITRT_GetMethod, base, name);
+        appendCall2RetValues(bbb, dst, JITRT_GetMethod, base, name);
         break;
       }
       case Opcode::kLoadMethodCached: {
@@ -2608,8 +2860,8 @@ LIRGenerator::TranslatedBlock LIRGenerator::TranslateOneBasicBlock(
               PyUnicode_AsUTF8(code->co_filename),
               PyUnicode_AsUTF8(code->co_name));
         }
-        bbb.appendCallInstruction(
-            dst, LoadMethodCache::lookupHelper, cache, base, name);
+        appendCall2RetValues(
+            bbb, dst, LoadMethodCache::lookupHelper, cache, base, name);
         break;
       }
       case Opcode::kLoadModuleAttrCached: {
@@ -2634,7 +2886,8 @@ LIRGenerator::TranslatedBlock LIRGenerator::TranslateOneBasicBlock(
         auto instr = static_cast<const LoadModuleMethodCached*>(&i);
         Instruction* name = getNameFromIdx(bbb, instr);
         auto cache_entry = getContext()->allocateLoadModuleMethodCache();
-        bbb.appendCallInstruction(
+        appendCall2RetValues(
+            bbb,
             instr->output(),
             LoadModuleMethodCache::lookupHelper,
             cache_entry,
@@ -2650,7 +2903,8 @@ LIRGenerator::TranslatedBlock LIRGenerator::TranslateOneBasicBlock(
       case Opcode::kLoadMethodSuper: {
         auto instr = static_cast<const LoadMethodSuper*>(&i);
         Instruction* name = getNameFromIdx(bbb, instr);
-        bbb.appendCallInstruction(
+        appendCall2RetValues(
+            bbb,
             instr->output(),
             JITRT_GetMethodFromSuper,
             instr->global_super(),
@@ -2700,11 +2954,14 @@ LIRGenerator::TranslatedBlock LIRGenerator::TranslateOneBasicBlock(
         auto op_kind = static_cast<int>(bin_op->op());
 
         if (bin_op->op() != BinaryOpKind::kPower) {
-          bbb.appendCallInstruction(
+          auto* call = bbb.appendCallInstruction(
               bin_op->output(),
               helpers[op_kind],
               bin_op->left(),
               bin_op->right());
+          if (useAarch64ExactLongAddSubFastPath(bin_op->op())) {
+            call->setOpcode(Instruction::kBinaryOpExactLongAddSubFastPath);
+          }
         } else {
           bbb.appendCallInstruction(
               bin_op->output(),
@@ -3087,7 +3344,11 @@ LIRGenerator::TranslatedBlock LIRGenerator::TranslateOneBasicBlock(
             Instruction::kDeoptPatchpoint,
             MemImm{instr.patcher()},
             Imm{deopt_id});
+        DeoptLiveRegFilter live_reg_filter{instr};
         for (const auto& reg_state : regstates) {
+          if (!live_reg_filter.isUsed(reg_state)) {
+            continue;
+          }
           lir->addOperands(VReg{bbb.getDefInstr(reg_state.reg)});
         }
         break;
@@ -3243,19 +3504,20 @@ LIRGenerator::TranslatedBlock LIRGenerator::TranslateOneBasicBlock(
           break;
         }
         size_t flags = 0;
-        uint64_t func = reinterpret_cast<uint64_t>(_PyObject_Vectorcall);
+        uint64_t func = reinterpret_cast<uint64_t>(_PyObject_VectorcallTstate);
         if (!(hir_instr.func()->type() <= TFunc)) {
           // Calls to things which aren't simple Python functions will
           // need to check the eval breaker. We do this in a helper instead
           // of injecting it after every call.
-          func = reinterpret_cast<uint64_t>(JITRT_Vectorcall);
+          func = reinterpret_cast<uint64_t>(JITRT_VectorcallTstate);
         }
         Instruction* instr = bbb.appendInstr(
             hir_instr.output(),
-            Instruction::kVectorCall,
+            Instruction::kVectorCallTstate,
             // TASK(T140174965): This should be MemImm.
             Imm{func},
-            Imm{flags});
+            Imm{flags},
+            VReg{env_->asm_tstate});
         for (hir::Register* arg : hir_instr.GetOperands()) {
           instr->addOperands(VReg{bbb.getDefInstr(arg)});
         }
@@ -3369,10 +3631,11 @@ LIRGenerator::TranslatedBlock LIRGenerator::TranslateOneBasicBlock(
         size_t flags = 0;
         Instruction* instr = bbb.appendInstr(
             hir_instr.output(),
-            Instruction::kVectorCall,
+            Instruction::kVectorCallTstate,
             // TASK(T140174965): This should be MemImm.
             Imm{reinterpret_cast<uint64_t>(JITRT_Call)},
-            Imm{flags});
+            Imm{flags},
+            VReg{env_->asm_tstate});
         for (hir::Register* arg : hir_instr.GetOperands()) {
           instr->addOperands(VReg{bbb.getDefInstr(arg)});
         }
@@ -3535,41 +3798,40 @@ LIRGenerator::TranslatedBlock LIRGenerator::TranslateOneBasicBlock(
 
       case Opcode::kMakeList: {
         auto instr = static_cast<const MakeList*>(&i);
-        Instruction* call = bbb.appendCallInstruction(
+        bbb.appendCallInstruction(
             instr->output(),
             PyList_New,
             static_cast<Py_ssize_t>(instr->nvalues()));
-        if (instr->nvalues() > 0) {
-          // TODO(T174544781): need to check for nullptr before initializing,
-          // currently that check only happens after assigning these values.
-          Instruction* load = bbb.appendInstr(
-              Instruction::kMove,
-              OutVReg{OperandBase::k64bit},
-              Ind{call, offsetof(PyListObject, ob_item)});
-          for (size_t valueIdx = 0; valueIdx < instr->nvalues(); valueIdx++) {
-            bbb.appendInstr(
-                OutInd{load, static_cast<int32_t>(valueIdx * kPointerSize)},
-                Instruction::kMove,
-                instr->GetOperand(valueIdx));
-          }
-        }
         break;
       }
       case Opcode::kMakeTuple: {
         auto instr = static_cast<const MakeTuple*>(&i);
-        Instruction* tuple =
-            bbb.appendInstr(instr->output(), Instruction::kVarArgCall);
-        tuple->addOperands(
-            Imm{reinterpret_cast<uint64_t>(
-#if PY_VERSION_HEX >= 0x030F0000
-                PyTuple_FromArray
-#else
-                _PyTuple_FromArray
-#endif
-                )});
-        for (size_t ix = 0; ix < instr->NumOperands(); ix++) {
-          tuple->addOperands(VReg{bbb.getDefInstr(instr->GetOperand(ix))});
-        }
+        bbb.appendCallInstruction(
+            instr->output(),
+            PyTuple_New,
+            static_cast<Py_ssize_t>(instr->nvalues()));
+        break;
+      }
+      case Opcode::kInitListElements: {
+        auto instr = static_cast<const InitListElements*>(&i);
+        Instruction* ob_item = bbb.appendInstr(
+            Instruction::kMove,
+            OutVReg{OperandBase::k64bit},
+            Ind{bbb.getDefInstr(instr->list()),
+                offsetof(PyListObject, ob_item)});
+        emitStorePairs(bbb, ob_item, 0, *instr, 1, instr->nvalues());
+        break;
+      }
+      case Opcode::kInitTupleElements: {
+        auto instr = static_cast<const InitTupleElements*>(&i);
+        Instruction* tuple = bbb.getDefInstr(instr->tuple());
+        emitStorePairs(
+            bbb,
+            tuple,
+            static_cast<int32_t>(offsetof(PyTupleObject, ob_item)),
+            *instr,
+            1,
+            instr->nvalues());
         break;
       }
       case Opcode::kMatchClass: {
@@ -3609,7 +3871,9 @@ LIRGenerator::TranslatedBlock LIRGenerator::TranslateOneBasicBlock(
         if (type <= (TCInt8 | TCInt16 | TCInt32) ||
             type <= (TCUInt8 | TCUInt16 | TCUInt32)) {
           Instruction* lir = bbb.appendInstr(
-              Instruction::kSext, OutVReg{}, instr->GetOperand(1));
+              Instruction::kSext,
+              OutVReg{DataType::k64bit},
+              instr->GetOperand(1));
           bbb.appendCallInstruction(
               instr->output(),
               JITRT_CheckSequenceBounds,
@@ -3665,7 +3929,7 @@ LIRGenerator::TranslatedBlock LIRGenerator::TranslateOneBasicBlock(
         // split table, so it's safe to load and access ma_values with no
         // additional checks here.
         Instruction* ma_values = bbb.appendInstr(
-            OutVReg{},
+            OutVReg{DataType::k64bit},
             Instruction::kMove,
             Ind{bbb.getDefInstr(dict),
                 static_cast<int32_t>(offsetof(PyDictObject, ma_values))});
@@ -3678,25 +3942,11 @@ LIRGenerator::TranslatedBlock LIRGenerator::TranslateOneBasicBlock(
       }
       case Opcode::kMakeCheckedList: {
         auto instr = static_cast<const MakeCheckedList*>(&i);
-        auto capacity = instr->nvalues();
         bbb.appendCallInstruction(
             instr->output(),
             Ci_CheckedList_New,
             instr->type().typeSpec(),
-            static_cast<Py_ssize_t>(capacity));
-        if (instr->nvalues() > 0) {
-          Instruction* ob_item = bbb.appendInstr(
-              OutVReg{},
-              Instruction::kMove,
-              Ind{bbb.getDefInstr(instr->output()),
-                  static_cast<int32_t>(offsetof(PyListObject, ob_item))});
-          for (size_t valueIdx = 0; valueIdx < instr->nvalues(); valueIdx++) {
-            bbb.appendInstr(
-                OutInd{ob_item, static_cast<int32_t>(valueIdx * kPointerSize)},
-                Instruction::kMove,
-                instr->GetOperand(valueIdx));
-          }
-        }
+            static_cast<Py_ssize_t>(instr->nvalues()));
         break;
       }
       case Opcode::kMakeCheckedDict: {
@@ -3762,17 +4012,22 @@ LIRGenerator::TranslatedBlock LIRGenerator::TranslateOneBasicBlock(
       }
       case Opcode::kSetDictItem: {
         auto instr = static_cast<const SetDictItem*>(&i);
-        bbb.appendCallInstruction(
-            instr->output(),
-#ifdef Py_GIL_DISABLED
-            // TODO(T250369690): Need thread-safe checked collections
-            PyDict_SetItem,
-#else
-            Ci_DictOrChecked_SetItem,
-#endif
-            instr->GetOperand(0),
-            instr->GetOperand(1),
-            instr->GetOperand(2));
+        if constexpr (kFreeThreadedBuild) {
+          // TODO(T250369690): Need thread-safe checked collections
+          bbb.appendCallInstruction(
+              instr->output(),
+              PyDict_SetItem,
+              instr->GetOperand(0),
+              instr->GetOperand(1),
+              instr->GetOperand(2));
+        } else {
+          bbb.appendCallInstruction(
+              instr->output(),
+              Ci_DictOrChecked_SetItem,
+              instr->GetOperand(0),
+              instr->GetOperand(1),
+              instr->GetOperand(2));
+        }
         break;
       }
       case Opcode::kSetSetItem: {
@@ -3936,16 +4191,20 @@ LIRGenerator::TranslatedBlock LIRGenerator::TranslateOneBasicBlock(
       case Opcode::kListAppend: {
         auto instr = static_cast<const ListAppend*>(&i);
 
-        bbb.appendCallInstruction(
-            instr->output(),
-#ifdef Py_GIL_DISABLED
-            // TODO(T250369690): Need thread-safe checked collections
-            PyList_Append,
-#else
-            Ci_ListOrCheckedList_Append,
-#endif
-            instr->GetOperand(0),
-            instr->GetOperand(1));
+        if constexpr (kFreeThreadedBuild) {
+          // TODO(T250369690): Need thread-safe checked collections
+          bbb.appendCallInstruction(
+              instr->output(),
+              PyList_Append,
+              instr->GetOperand(0),
+              instr->GetOperand(1));
+        } else {
+          bbb.appendCallInstruction(
+              instr->output(),
+              Ci_ListOrCheckedList_Append,
+              instr->GetOperand(0),
+              instr->GetOperand(1));
+        }
         break;
       }
       case Opcode::kListExtend: {
@@ -4005,9 +4264,9 @@ LIRGenerator::TranslatedBlock LIRGenerator::TranslateOneBasicBlock(
         break;
       }
       case Opcode::kAtQuiescentState: {
-#ifdef Py_GIL_DISABLED
-        bbb.appendInvokeInstruction(JITRT_AtQuiescentState, env_->asm_tstate);
-#endif
+        if constexpr (kFreeThreadedBuild) {
+          bbb.appendInvokeInstruction(JITRT_AtQuiescentState, env_->asm_tstate);
+        }
         break;
       }
       case Opcode::kRunPeriodicTasks: {
@@ -4017,6 +4276,10 @@ LIRGenerator::TranslatedBlock LIRGenerator::TranslateOneBasicBlock(
       }
       case Opcode::kSnapshot: {
         // Snapshots are purely informative
+        break;
+      }
+      case Opcode::kUseObj: {
+        // UseObjs are purely informative.
         break;
       }
       case Opcode::kUseType: {
@@ -4031,9 +4294,11 @@ LIRGenerator::TranslatedBlock LIRGenerator::TranslateOneBasicBlock(
         JIT_DCHECK(
             getConfig().stable_frame,
             "Inlined code stores references to code objects");
-#if defined(ENABLE_LIGHTWEIGHT_FRAMES)
+        if (func_->frameMode == FrameMode::kNormal) {
+          break;
+        }
         auto instr = static_cast<const BeginInlinedFunction*>(&i);
-        // Set code object data
+        // Track references for code, globals, builtins, func.
         BorrowedRef<PyCodeObject> code = instr->code();
         env_->code_rt->addReference(code.getObj());
         PyObject* globals = instr->globals();
@@ -4042,24 +4307,19 @@ LIRGenerator::TranslatedBlock LIRGenerator::TranslateOneBasicBlock(
         env_->code_rt->addReference(builtins);
         PyObject* func = instr->func();
         env_->code_rt->addReference(func);
-        RuntimeFrameState* rtfs = env_->code_rt->allocateRuntimeFrameState(
-            code, builtins, globals, func);
-#endif
-#if defined(ENABLE_LIGHTWEIGHT_FRAMES)
-        // Load the address of our _PyInterpreterFrame and the previous
-        // _PyInterpreterFrame we skip past the FrameHeader for this.
+
+        // The caller frame for the previous field.
         Instruction* caller_frame = bbb.appendInstr(
-            OutVReg{},
+            OutVReg{DataType::k64bit},
             Instruction::kLea,
-            Stk{PhyLocation(
-                static_cast<int32_t>(
-                    frameOffsetBefore(instr) + sizeof(FrameHeader)))});
+            Stk{PhyLocation(static_cast<int32_t>(
+                frameOffsetBefore(instr) + kFrameHeaderOverhead))});
 
         // There is already an interpreter frame for the caller function.
         Instruction* callee_frame = getInlinedFrame(bbb, instr);
-        // Store code
-#if PY_VERSION_HEX >= 0x030E0000
-        // Store frame helper as f_executable
+
+        // Resolve executable and funcobj values based on version.
+#if PY_VERSION_HEX >= 0x030F0000 && defined(ENABLE_LIGHTWEIGHT_FRAMES)
         BorrowedRef<> frame_reifier;
         auto existing_reifier = inline_code_to_reifier_.find(code);
         if (existing_reifier == inline_code_to_reifier_.end()) {
@@ -4069,50 +4329,108 @@ LIRGenerator::TranslatedBlock LIRGenerator::TranslateOneBasicBlock(
         } else {
           frame_reifier = existing_reifier->second;
         }
-        Instruction* code_reg =
-            bbb.appendInstr(OutVReg{}, Instruction::kMove, frame_reifier.get());
+        PyObject* executable_obj = frame_reifier.get();
+        PyObject* funcobj_val = func;
+#elif PY_VERSION_HEX >= 0x030E0000
+        PyObject* executable_obj = code.getObj();
+        PyObject* funcobj_val = func;
+#elif defined(ENABLE_LIGHTWEIGHT_FRAMES)
+        PyObject* executable_obj = code.getObj();
+        PyObject* funcobj_val = cinderx::getModuleState()->frame_reifier;
 #else
-        Instruction* code_reg =
-            bbb.appendInstr(OutVReg{}, Instruction::kMove, code.get());
+        // Without LW frames: no reifier, store code and func directly.
+        PyObject* executable_obj = code.getObj();
+        PyObject* funcobj_val = func;
 #endif
-        bbb.appendInstr(
-            OutInd{callee_frame, FRAME_EXECUTABLE_OFFSET},
-            Instruction::kMove,
-            code_reg);
 
+        // Build frame init plan using the shared table with an inlined
+        // value provider.  The table defines WHICH fields to init; the
+        // lambda defines WHERE each value comes from.
+        Instruction* executable_reg = nullptr;
+        Instruction* funcobj_reg = nullptr;
+        static_assert(
+            FRAME_OWNED_BY_THREAD == 0, "FRAME_OWNED_BY_THREAD has changed");
+        Instruction* zero_reg = nullptr;
+        auto plan = FrameInitPlan::build(
+            [&](FrameFieldKind kind,
+                [[maybe_unused]] DataType dt) -> Instruction* {
+              switch (kind) {
+                case FrameFieldKind::kExecutable:
+                  executable_reg = bbb.appendInstr(
+                      OutVReg{}, Instruction::kMove, executable_obj);
+                  return executable_reg;
+                case FrameFieldKind::kFrameReifier:
+                  if constexpr (PY_VERSION_HEX >= 0x030F0000) {
+                    // f_executable field on 3.15+
+                    executable_reg = bbb.appendInstr(
+                        OutVReg{}, Instruction::kMove, executable_obj);
+                    return executable_reg;
+                  } else {
+                    funcobj_reg = bbb.appendInstr(
+                        OutVReg{}, Instruction::kMove, funcobj_val);
+                    return funcobj_reg;
+                  }
+                case FrameFieldKind::kFuncObj:
+                  funcobj_reg = bbb.appendInstr(
+                      OutVReg{}, Instruction::kMove, funcobj_val);
+                  return funcobj_reg;
+                case FrameFieldKind::kFrameHeaderFunc: {
+                  uintptr_t header;
+                  if constexpr (PY_VERSION_HEX >= 0x030E0000) {
+                    header = JIT_FRAME_INLINED;
+                  } else {
+                    header =
+                        reinterpret_cast<uintptr_t>(func) | JIT_FRAME_INLINED;
+                  }
+                  return bbb.appendInstr(OutVReg{}, Instruction::kMove, header);
+                }
+                case FrameFieldKind::kPrevFrame:
+                  return caller_frame;
+                case FrameFieldKind::kInstrPtr: {
+                  _Py_CODEUNIT* code_start;
+                  if constexpr (PY_VERSION_HEX >= 0x030E0000) {
+                    code_start = _PyCode_CODE(code.get());
+                  } else {
+                    code_start = _PyCode_CODE(code.get()) - 1;
+                  }
+                  return bbb.appendInstr(
+                      OutVReg{}, Instruction::kMove, code_start);
+                }
+                case FrameFieldKind::kStackPointer:
 #if PY_VERSION_HEX >= 0x030E0000
-        // Store function
-        PyObject* func_val = func;
+                  return bbb.appendInstr(
+                      OutVReg{},
+                      Instruction::kLea,
+                      Stk{PhyLocation(static_cast<int32_t>(
+                          frameOffsetOf(instr) +
+                          offsetof(_PyInterpreterFrame, localsplus) +
+                          code->co_nlocalsplus * sizeof(Ci_STACK_TYPE)))});
 #else
-        // Store frame helper as f_funcobj
-        PyObject* func_val = cinderx::getModuleState()->frame_reifier;
+                  return bbb.appendInstr(
+                      OutVReg{dt},
+                      Instruction::kMove,
+                      Imm{static_cast<uint64_t>(code->co_nlocalsplus), dt});
 #endif
-        Instruction* func_reg =
-            bbb.appendInstr(OutVReg{}, Instruction::kMove, func_val);
-        bbb.appendInstr(
-            OutInd{callee_frame, offsetof(_PyInterpreterFrame, f_funcobj)},
-            Instruction::kMove,
-            func_reg);
+                case FrameFieldKind::kBuiltins:
+                  return bbb.appendInstr(
+                      OutVReg{}, Instruction::kMove, builtins);
+                case FrameFieldKind::kGlobals:
+                  return bbb.appendInstr(
+                      OutVReg{}, Instruction::kMove, globals);
+                case FrameFieldKind::kZero:
+                case FrameFieldKind::kOwnerThread:
+                  if (zero_reg == nullptr) {
+                    zero_reg = bbb.appendInstr(
+                        OutVReg{dt}, Instruction::kMove, Imm{0, dt});
+                  }
+                  return zero_reg;
+              }
+              JIT_ABORT("Unexpected FrameFieldKind");
+            },
+            code->co_nlocalsplus);
+        plan.emit(bbb, callee_frame);
 
-        // Store RTFS in FrameHeader as a tag
-        Instruction* rtfs_reg = bbb.appendInstr(
-            OutVReg{},
-            Instruction::kMove,
-            reinterpret_cast<uintptr_t>(rtfs) | JIT_FRAME_RTFS);
-        bbb.appendInstr(
-            OutInd{
-                callee_frame,
-                (Py_ssize_t)offsetof(FrameHeader, func) -
-                    (Py_ssize_t)sizeof(FrameHeader)},
-            Instruction::kMove,
-            rtfs_reg);
-
-        bbb.appendInstr(
-            OutInd{callee_frame, offsetof(_PyInterpreterFrame, previous)},
-            Instruction::kMove,
-            caller_frame);
-
-#if PY_VERSION_HEX >= 0x030E0000
+#if PY_VERSION_HEX >= 0x030E0000 && defined(ENABLE_LIGHTWEIGHT_FRAMES)
         bbb.appendInstr(
             OutInd{callee_frame, offsetof(_PyInterpreterFrame, f_globals)},
             Instruction::kMove,
@@ -4133,24 +4451,6 @@ LIRGenerator::TranslatedBlock LIRGenerator::TranslateOneBasicBlock(
             Instruction::kMove,
             Imm{0, OperandBase::k16bit});
 
-        Instruction* localsplus = bbb.appendInstr(
-            OutVReg{},
-            Instruction::kLea,
-            Stk{PhyLocation(
-                static_cast<int32_t>(
-                    frameOffsetOf(instr) +
-                    offsetof(_PyInterpreterFrame, localsplus) +
-                    code->co_nlocalsplus * sizeof(Ci_STACK_TYPE)))});
-
-        bbb.appendInstr(
-            OutInd{callee_frame, offsetof(_PyInterpreterFrame, stackpointer)},
-            Instruction::kMove,
-            localsplus);
-
-        bbb.appendInstr(
-            OutInd{callee_frame, offsetof(_PyInterpreterFrame, f_locals)},
-            Instruction::kMove,
-            Imm{0});
         int free_offset = code->co_nlocalsplus - code->co_nfreevars;
         for (int local_idx = 0; local_idx < free_offset; local_idx++) {
           bbb.appendInstr(
@@ -4163,40 +4463,6 @@ LIRGenerator::TranslatedBlock LIRGenerator::TranslateOneBasicBlock(
               Imm{stackNullBits()});
         }
 
-        // Store prev_instr
-        _Py_CODEUNIT* frame_code = _PyCode_CODE(code.get());
-#else
-        // Store prev_instr
-        _Py_CODEUNIT* frame_code = _PyCode_CODE(code.get()) - 1;
-#endif
-
-        Instruction* codeunit_reg =
-            bbb.appendInstr(OutVReg{}, Instruction::kMove, frame_code);
-
-        bbb.appendInstr(
-            OutInd{callee_frame, FRAME_INSTR_OFFSET},
-            Instruction::kMove,
-            codeunit_reg);
-
-#ifdef Py_GIL_DISABLED
-        bbb.appendInstr(
-            OutInd{
-                callee_frame,
-                offsetof(_PyInterpreterFrame, tlbc_index),
-                OperandBase::k32bit},
-            Instruction::kMove,
-            Imm{0, OperandBase::k32bit});
-#endif
-
-        bbb.appendInstr(
-            OutInd{
-                callee_frame,
-                offsetof(_PyInterpreterFrame, owner),
-                OperandBase::k8bit},
-            Instruction::kMove,
-            Imm{static_cast<uint8_t>(FRAME_OWNED_BY_THREAD),
-                OperandBase::k8bit});
-#if PY_VERSION_HEX >= 0x030E0000
         bbb.appendInstr(
             OutInd{
                 callee_frame,
@@ -4205,145 +4471,64 @@ LIRGenerator::TranslatedBlock LIRGenerator::TranslateOneBasicBlock(
             Instruction::kMove,
             Imm{0, OperandBase::k8bit});
 #endif
+
+        // Incref executable/reifier.
 #if PY_VERSION_HEX < 0x030E0000
-        if (!_Py_IsImmortal(code.get()))
+        if (!_Py_IsImmortal(executable_obj))
 #endif
         {
-          makeIncref(bbb, code_reg, false);
+          bbb.annotateNext("Incref executable/reifier");
+          makeIncref(bbb, executable_reg, false);
         }
-
-        // Set our frame as top of stack
-#if PY_VERSION_HEX >= 0x030D0000
-        if (!_Py_IsImmortal(func_val)) {
-          makeIncref(bbb, func_reg, false);
+#if PY_VERSION_HEX >= 0x030E0000 && PY_VERSION_HEX < 0x030F0000
+        if (!_Py_IsImmortal(funcobj_val)) {
+          bbb.annotateNext("Incref funcobj");
+          makeIncref(bbb, funcobj_reg, false);
         }
-        bbb.appendInstr(
-            OutInd{env_->asm_tstate, offsetof(PyThreadState, current_frame)},
-            Instruction::kMove,
-            callee_frame);
-#else
-        Instruction* cframe_reg = bbb.appendInstr(
-            OutVReg{},
-            Instruction::kMove,
-            Ind{env_->asm_tstate, offsetof(PyThreadState, cframe)});
-        bbb.appendInstr(
-            OutInd{cframe_reg, offsetof(_PyCFrame, current_frame)},
-            Instruction::kMove,
-            callee_frame);
 #endif
 
-#endif
+        // Link frame into tstate.
+        makeCurrentFrameAccessor(bbb).store(callee_frame);
         break;
       }
       case Opcode::kEndInlinedFunction: {
-#if defined(ENABLE_LIGHTWEIGHT_FRAMES)
-        JIT_CHECK(
-            getConfig().frame_mode == FrameMode::kLightweight,
-            "Can only generate LIR for inlined functions in 3.12+ when "
-            "lightweight frames are enabled");
+        if (func_->frameMode == FrameMode::kNormal) {
+          break;
+        }
+        const auto& instr = static_cast<const EndInlinedFunction&>(i);
 
-        auto instr = static_cast<const EndInlinedFunction&>(i);
-
-        // Test to see if RTFS is still in place
         Instruction* callee_frame = getInlinedFrame(bbb, instr.matchingBegin());
-        auto rtfs_reg = bbb.appendInstr(
-            OutVReg{},
-            Instruction::kMove,
-            Ind{callee_frame,
-                (Py_ssize_t)offsetof(FrameHeader, func) -
-                    (Py_ssize_t)sizeof(FrameHeader)});
-        JIT_DCHECK(
-            JIT_FRAME_INITIALIZED == 2,
-            "JIT_FRAME_INITIALIZED changed"); // this is the bit we're testing
-                                              // below
-        bbb.appendInstr(Instruction::kBitTest, rtfs_reg, Imm{1});
-        auto done_block = bbb.allocateBlock();
-        auto materialized_block = bbb.allocateBlock();
-        auto not_materialized_block = bbb.allocateBlock();
-        bbb.appendBranch(Instruction::kBranchC, materialized_block);
-        bbb.appendBlock(bbb.allocateBlock());
+        BorrowedRef<PyCodeObject> code = instr.matchingBegin()->code();
+        bool has_freevars = code->co_nfreevars > 0;
 
-        Instruction* frame_obj = bbb.appendInstr(
-            OutVReg{},
-            Instruction::kMove,
-            Ind{callee_frame, offsetof(_PyInterpreterFrame, frame_obj)});
-        bbb.appendInstr(Instruction::kTest, frame_obj, frame_obj);
-        bbb.appendBranch(Instruction::kBranchZ, not_materialized_block);
-        bbb.appendBlock(materialized_block);
-
-        // The frame was materialized, let's use the unlink helper to clean
-        // things up.
-        bbb.appendInvokeInstruction(JITRT_UnlinkFrame, env_->asm_tstate);
-        bbb.appendBranch(Instruction::kBranch, done_block);
-
-        // The frame was not materialized, we just need to update thread state
-        // to point at the caller and maybe decref the code object.
-        bbb.switchBlock(not_materialized_block);
-        // The frame was never materialized, we just need to unlink the frame
-        // and potentiall decref the code object.
-        Instruction* caller_frame = bbb.appendInstr(
-            OutVReg{},
-            Instruction::kLea,
-            Stk{PhyLocation(
-                static_cast<int32_t>(
-                    frameOffsetBefore(instr.matchingBegin()) +
-                    sizeof(FrameHeader)))});
-#if PY_VERSION_HEX >= 0x030D0000
-        bbb.appendInstr(
-            OutInd{env_->asm_tstate, offsetof(PyThreadState, current_frame)},
-            Instruction::kMove,
-            caller_frame);
+        PyObject* executable;
+        std::optional<destructor> exec_dtor;
+#if PY_VERSION_HEX >= 0x030F0000 && defined(ENABLE_LIGHTWEIGHT_FRAMES)
+        BorrowedRef<> reifier = inline_code_to_reifier_.at(code.get());
+        executable = reifier.get();
+        exec_dtor = PyUnstable_JITExecutable_Type.tp_dealloc;
 #else
-        Instruction* cframe_reg = bbb.appendInstr(
-            OutVReg{},
-            Instruction::kMove,
-            Ind{env_->asm_tstate, offsetof(PyThreadState, cframe)});
-        bbb.appendInstr(
-            OutInd{cframe_reg, offsetof(_PyCFrame, current_frame)},
-            Instruction::kMove,
-            caller_frame);
+        exec_dtor = PyCode_Type.tp_dealloc;
+        executable = code.getObj();
 #endif
-        auto code = instr.matchingBegin()->code();
-#if PY_VERSION_HEX >= 0x030E0000
-        auto reifier = inline_code_to_reifier_.at(code.get());
-        Instruction* reifier_reg =
-            bbb.appendInstr(OutVReg{}, Instruction::kMove, reifier.get());
-#if PY_VERSION_HEX >= 0x030F0000
-        makeDecref(
-            bbb,
-            reifier_reg,
-            std::optional<destructor>(
-                PyUnstable_JITExecutable_Type.tp_dealloc));
-#else
-        makeDecref(
-            bbb,
-            reifier_reg,
-            std::optional<destructor>(PyCode_Type.tp_dealloc));
-#endif
-#if PY_VERSION_HEX < 0x030F0000
-        // On 3.14, we stored the function object in f_funcobj and incref'd it.
-        // Need to decref it here since the frame was not materialized.
-        PyObject* func = instr.matchingBegin()->func();
+
+        Instruction* func_reg = nullptr;
+        PyFunctionObject* func = instr.matchingBegin()->func();
         if (!_Py_IsImmortal(func)) {
-          Instruction* func_reg =
-              bbb.appendInstr(OutVReg{}, Instruction::kMove, func);
-          makeDecref(
-              bbb,
-              func_reg,
-              std::optional<destructor>(PyFunction_Type.tp_dealloc));
+          func_reg = bbb.appendInstr(OutVReg{}, Instruction::kMove, func);
         }
-#endif
-#else
-        if (!_Py_IsImmortal(code.get())) {
-          Instruction* code_reg =
-              bbb.appendInstr(OutVReg{}, Instruction::kMove, code.get());
-          makeDecref(
-              bbb, code_reg, std::optional<destructor>(PyCode_Type.tp_dealloc));
-        }
-#endif
 
-        bbb.appendBlock(done_block);
-#endif
+        bool is_generator =
+            reinterpret_cast<PyCodeObject*>(func->func_code)->co_flags &
+            jit::kCoFlagsAnyGenerator;
+        emitUnlinkFrame(
+            bbb,
+            has_freevars,
+            is_generator,
+            func_reg,
+            executable,
+            exec_dtor,
+            callee_frame);
         break;
       }
       case Opcode::kCompactLongUnbox: {
@@ -4548,15 +4733,16 @@ LIRGenerator::TranslatedBlock LIRGenerator::TranslateOneBasicBlock(
         const auto& instr = static_cast<const BuildString&>(i);
 
         // using vectorcall here although this is not strictly a vector call.
-        // the callable is always null, and all the components to be
+        // tstate and the callable are always null, and all the components to be
         // concatenated will be in the args argument.
 
         Instruction* lir = bbb.appendInstr(
             instr.output(),
-            Instruction::kVectorCall,
+            Instruction::kVectorCallTstate,
             JITRT_BuildString,
             nullptr,
             nullptr);
+        lir->addOperands(Imm{0});
         for (size_t operandIdx = 0; operandIdx < instr.NumOperands();
              operandIdx++) {
           lir->addOperands(VReg{bbb.getDefInstr(instr.GetOperand(operandIdx))});
@@ -4679,10 +4865,10 @@ LIRGenerator::TranslatedBlock LIRGenerator::TranslateOneBasicBlock(
                 : JITRT_GenSend);
         // Note: asm_interpreter_frame isn't right for inlined functions, but we
         // never inline generators so this is fine for now.
-        bbb.appendInstr(
+        appendCall2RetValues(
+            bbb,
             hir_instr.output(),
-            Instruction::kCall,
-            Imm{func},
+            func,
             hir_instr.GetOperand(0),
             hir_instr.GetOperand(1),
             Imm{0},
@@ -4716,7 +4902,8 @@ LIRGenerator::TranslatedBlock LIRGenerator::TranslateOneBasicBlock(
       }
       case Opcode::kLoadSpecial: {
         auto& load_special = static_cast<const LoadSpecial&>(i);
-        bbb.appendCallInstruction(
+        appendCall2RetValues(
+            bbb,
             load_special.output(),
             JITRT_LoadSpecial,
             load_special.GetOperand(0),
@@ -4972,7 +5159,7 @@ Instruction* LIRGenerator::getInlinedFrame(
              .emplace(
                  instr,
                  bbb.appendInstr(
-                     OutVReg{},
+                     OutVReg{DataType::k64bit},
                      Instruction::kLea,
                      Stk{PhyLocation(
                          static_cast<int32_t>(frameOffsetOf(instr)))}))
@@ -4980,6 +5167,51 @@ Instruction* LIRGenerator::getInlinedFrame(
   }
 
   return it->second;
+}
+
+#if PY_VERSION_HEX < 0x030D0000
+Instruction* CurrentFrameAccessor::loadCFrame() {
+  if (cframe_ == nullptr) {
+    cframe_ = bbb_.appendInstr(
+        OutVReg{},
+        Instruction::kMove,
+        Ind{tstate_, offsetof(PyThreadState, cframe)});
+  }
+  return cframe_;
+}
+#endif
+
+Instruction* CurrentFrameAccessor::load() {
+#if PY_VERSION_HEX >= 0x030D0000
+  return bbb_.appendInstr(
+      OutVReg{},
+      Instruction::kMove,
+      Ind{tstate_, offsetof(PyThreadState, current_frame)});
+#else
+  return bbb_.appendInstr(
+      OutVReg{},
+      Instruction::kMove,
+      Ind{loadCFrame(), offsetof(_PyCFrame, current_frame)});
+#endif
+}
+
+void CurrentFrameAccessor::store(Instruction* frame) {
+#if PY_VERSION_HEX >= 0x030D0000
+  bbb_.appendInstr(
+      OutInd{tstate_, offsetof(PyThreadState, current_frame)},
+      Instruction::kMove,
+      frame);
+#else
+  bbb_.appendInstr(
+      OutInd{loadCFrame(), offsetof(_PyCFrame, current_frame)},
+      Instruction::kMove,
+      frame);
+#endif
+}
+
+CurrentFrameAccessor LIRGenerator::makeCurrentFrameAccessor(
+    BasicBlockBuilder& bbb) {
+  return CurrentFrameAccessor(bbb, env_->asm_tstate);
 }
 
 void LIRGenerator::emitLoadFrame(BasicBlockBuilder& bbb) {
@@ -4993,14 +5225,17 @@ void LIRGenerator::emitLoadFrame(BasicBlockBuilder& bbb) {
     // Load the resume entry label address.
     bbb.annotateNext("Allocate generator + interpreter frame");
     Instruction* resume_label = bbb.appendInstr(
-        OutVReg{}, Instruction::kLea, AsmLbl{env_->gen_resume_entry_label});
+        OutVReg{DataType::k64bit},
+        Instruction::kLea,
+        AsmLbl{env_->gen_resume_entry_label});
     // spill_words is read from CodeRuntime by the runtime function,
     // so we don't need to pass it explicitly.
-    env_->asm_tstate = bbb.appendInstr(
-        OutVReg{},
-        Instruction::kCall,
-        Imm{reinterpret_cast<uint64_t>(
-            JITRT_AllocateAndLinkGenAndInterpreterFrame)},
+    Instruction* footer = nullptr;
+    appendCall2RetValues(
+        bbb,
+        env_->asm_tstate,
+        footer,
+        JITRT_AllocateAndLinkGenAndInterpreterFrame,
         env_->asm_func,
         Imm{reinterpret_cast<uint64_t>(env_->code_rt)},
         VReg{resume_label},
@@ -5011,18 +5246,20 @@ void LIRGenerator::emitLoadFrame(BasicBlockBuilder& bbb) {
     bbb.appendInstr(
         OutPhyReg{codegen::arch::reg_frame_pointer_loc},
         Instruction::kMove,
-        PhyReg{codegen::arch::reg_general_auxilary_return_loc});
+        VReg{footer});
 #if defined(CINDER_AARCH64) && defined(ENABLE_LIGHTWEIGHT_FRAMES)
-    // Now that FP points at the heap-allocated GenDataFooter, compute the
-    // deopt_idx address.  This must happen after the FP swap above —
-    // the kLea uses FP as its base register.
-    // TranslateOneBasicBlock reuses this for all deopt index stores.
     if (getConfig().frame_mode == FrameMode::kLightweight) {
+      // Now that FP points at the heap-allocated GenDataFooter, compute the
+      // deopt_idx address.  This must happen after the FP swap above —
+      // the kLea uses FP as its base register.
+      // TranslateOneBasicBlock reuses this for all deopt index stores.
       int32_t deopt_idx_offset = static_cast<int32_t>(
           offsetof(GenDataFooter, frame_header) +
           offsetof(FrameHeader, deopt_idx));
       deopt_idx_addr_ = bbb.appendInstr(
-          OutVReg{}, Instruction::kLea, Stk{PhyLocation(deopt_idx_offset)});
+          OutVReg{DataType::k64bit},
+          Instruction::kLea,
+          Stk{PhyLocation(deopt_idx_offset)});
     }
 #endif
   } else if (func_->frameMode == FrameMode::kNormal) {
@@ -5051,13 +5288,14 @@ void LIRGenerator::emitLoadFrame(BasicBlockBuilder& bbb) {
           offsetof(FrameHeader, deopt_idx));
       auto* instr = bbb.appendInstr(Instruction::kLea);
       instr->output()->setVirtualRegister();
+      instr->output()->setDataType(DataType::k64bit);
       instr->allocateStackInput(PhyLocation(deopt_idx_offset));
       deopt_idx_addr_ = instr;
     }
 #endif
 
     // Lightweight frame linking: populate all _PyInterpreterFrame
-    // fields inline, following the BeginInlinedFunction pattern.
+    // fields inline using the compile-time frame init table.
     bbb.annotateNext("Lightweight frame: load thread state");
     env_->asm_tstate =
         bbb.appendInstr(OutVReg{}, Instruction::kLoadThreadState);
@@ -5068,128 +5306,122 @@ void LIRGenerator::emitLoadFrame(BasicBlockBuilder& bbb) {
         OutVReg{},
         Instruction::kLea,
         Stk{PhyLocation(
-            static_cast<int32_t>(-fh_size + sizeof(jit::FrameHeader)))});
+            static_cast<int32_t>(-fh_size + jit::kFrameHeaderOverhead))});
 
-    // Store FrameHeader
-    bbb.annotateNext("Lightweight frame: store frame header");
+    // Load previous frame from tstate before we overwrite current_frame.
+    CurrentFrameAccessor cfa = makeCurrentFrameAccessor(bbb);
+    Instruction* prev_frame = cfa.load();
+
+    PyObject* code_obj = reinterpret_cast<PyObject*>(func_->code.get());
+
+    // Build frame init plan using the shared table with a top-level
+    // value provider.  The table defines WHICH fields to init; the
+    // lambda defines WHERE each value comes from.
+    Instruction* executable_or_reifier = nullptr;
+    BorrowedRef<> executable_or_reifier_obj = nullptr;
+    Instruction* zero_reg = nullptr;
+
+    auto plan = FrameInitPlan::build(
+        [&](FrameFieldKind kind, DataType dt) -> Instruction* {
+          switch (kind) {
+            case FrameFieldKind::kExecutable:
+              JIT_DCHECK(
+                  executable_or_reifier == nullptr ||
+                      executable_or_reifier_obj == code_obj,
+                  "should only be emitted once");
+              executable_or_reifier_obj = code_obj;
+              executable_or_reifier =
+                  bbb.appendInstr(OutVReg{}, Instruction::kMove, code_obj);
+              return executable_or_reifier;
+            case FrameFieldKind::kPrevFrame:
+              return prev_frame;
+            case FrameFieldKind::kFuncObj:
+              return env_->asm_func;
+            case FrameFieldKind::kFrameReifier:
+              if constexpr (PY_VERSION_HEX >= 0x030F0000) {
+                JIT_DCHECK(
+                    executable_or_reifier == nullptr,
+                    "should only be emitted once");
+                executable_or_reifier_obj = env_->code_rt->reifier();
+                executable_or_reifier = bbb.appendInstr(
+                    OutVReg{},
+                    Instruction::kMove,
+                    executable_or_reifier_obj.get());
+                return executable_or_reifier;
+              } else {
+                JIT_DCHECK(
+                    _Py_IsImmortal(cinderx::getModuleState()->frame_reifier),
+                    "Reifier must be immortal");
+                return bbb.appendInstr(
+                    OutVReg{},
+                    Instruction::kMove,
+                    cinderx::getModuleState()->frame_reifier.get());
+              }
+            case FrameFieldKind::kFrameHeaderFunc:
 #if PY_VERSION_HEX >= 0x030E0000
-    // Store rtfs = 0 in FrameHeader
-    bbb.appendInstr(
-        OutInd{
-            frame,
-            static_cast<Py_ssize_t>(offsetof(jit::FrameHeader, func)) -
-                static_cast<Py_ssize_t>(sizeof(jit::FrameHeader))},
-        Instruction::kMove,
-        Imm{0});
+              // 3.14 top-level: FrameHeader.func is zero
+              if (zero_reg == nullptr) {
+                zero_reg = bbb.appendInstr(
+                    OutVReg{dt}, Instruction::kMove, Imm{0, dt});
+              }
+              return zero_reg;
 #else
-    // Store func in FrameHeader (with incref)
-    Instruction* func_for_header =
-        bbb.appendInstr(OutVReg{}, Instruction::kMove, env_->asm_func);
-    bbb.appendInstr(
-        OutInd{
-            frame,
-            static_cast<Py_ssize_t>(offsetof(jit::FrameHeader, func)) -
-                static_cast<Py_ssize_t>(sizeof(jit::FrameHeader))},
-        Instruction::kMove,
-        func_for_header);
-    makeIncref(bbb, func_for_header, false);
+              // 3.12 top-level: FrameHeader.func is the function
+              return env_->asm_func;
 #endif
-
-    // Store f_executable
-    bbb.annotateNext("Set _PyInterpreterFrame::f_executable/f_code");
+            case FrameFieldKind::kInstrPtr: {
+              _Py_CODEUNIT* code_start;
+              if constexpr (PY_VERSION_HEX >= 0x030E0000) {
+                code_start = _PyCode_CODE(func_->code.get());
+              } else {
+                code_start = _PyCode_CODE(func_->code.get()) - 1;
+              }
+              return bbb.appendInstr(OutVReg{}, Instruction::kMove, code_start);
+            }
+            case FrameFieldKind::kStackPointer:
 #if PY_VERSION_HEX >= 0x030E0000
-    BorrowedRef<> reifier = env_->code_rt->reifier();
-    PyObject* executable = reifier.get();
-    if (executable == nullptr) {
-      executable = reinterpret_cast<PyObject*>(func_->code.get());
-    }
+              return bbb.appendInstr(
+                  OutVReg{},
+                  Instruction::kLea,
+                  Stk{PhyLocation(static_cast<int32_t>(
+                      -fh_size + jit::kFrameHeaderOverhead +
+                      offsetof(_PyInterpreterFrame, localsplus) +
+                      func_->code->co_nlocalsplus * sizeof(Ci_STACK_TYPE)))});
 #else
-    PyObject* executable = reinterpret_cast<PyObject*>(func_->code.get());
+              return bbb.appendInstr(
+                  OutVReg{dt},
+                  Instruction::kMove,
+                  Imm{static_cast<uint64_t>(func_->code->co_nlocalsplus), dt});
 #endif
-    Instruction* executable_reg =
-        bbb.appendInstr(OutVReg{}, Instruction::kMove, executable);
-    bbb.appendInstr(
-        OutInd{frame, FRAME_EXECUTABLE_OFFSET},
-        Instruction::kMove,
-        executable_reg);
-    if (!_Py_IsImmortal(executable)) {
-      makeIncref(bbb, executable_reg, false);
-    }
+            case FrameFieldKind::kBuiltins:
+              return bbb.appendInstr(
+                  OutVReg{},
+                  Instruction::kMove,
+                  Ind{env_->asm_func,
+                      offsetof(PyFunctionObject, func_builtins)});
+            case FrameFieldKind::kGlobals:
+              return bbb.appendInstr(
+                  OutVReg{},
+                  Instruction::kMove,
+                  Ind{env_->asm_func,
+                      offsetof(PyFunctionObject, func_globals)});
+            case FrameFieldKind::kZero:
+            case FrameFieldKind::kOwnerThread:
+              static_assert(
+                  FRAME_OWNED_BY_THREAD == 0,
+                  "FRAME_OWNED_BY_THREAD has changed");
+              if (zero_reg == nullptr) {
+                zero_reg = bbb.appendInstr(
+                    OutVReg{dt}, Instruction::kMove, Imm{0, dt});
+              }
+              return zero_reg;
+          }
+          JIT_ABORT("Unexpected FrameFieldKind");
+        },
+        func_->code->co_nlocalsplus);
+    plan.emit(bbb, frame);
 
-    // Store f_funcobj
-    bbb.annotateNext("Set _PyInterpreterFrame::f_funcobj");
-#if PY_VERSION_HEX >= 0x030E0000
-    // 3.14+: f_funcobj = func (with incref)
-    bbb.appendInstr(
-        OutInd{frame, offsetof(_PyInterpreterFrame, f_funcobj)},
-        Instruction::kMove,
-        env_->asm_func);
-    makeIncref(bbb, env_->asm_func, false);
-#else
-    // 3.12-3.13: f_funcobj = frame_reifier (immortal)
-    PyObject* frame_reifier = cinderx::getModuleState()->frame_reifier;
-    Instruction* reifier_reg =
-        bbb.appendInstr(OutVReg{}, Instruction::kMove, frame_reifier);
-    bbb.appendInstr(
-        OutInd{frame, offsetof(_PyInterpreterFrame, f_funcobj)},
-        Instruction::kMove,
-        reifier_reg);
-#endif
-
-    // Store previous = tstate->current_frame
-    bbb.annotateNext("Set _PyInterpreterFrame::previous");
-#if PY_VERSION_HEX >= 0x030D0000
-    Instruction* prev_frame = bbb.appendInstr(
-        OutVReg{},
-        Instruction::kMove,
-        Ind{env_->asm_tstate, offsetof(PyThreadState, current_frame)});
-#else
-    Instruction* cframe_reg = bbb.appendInstr(
-        OutVReg{},
-        Instruction::kMove,
-        Ind{env_->asm_tstate, offsetof(PyThreadState, cframe)});
-    Instruction* prev_frame = bbb.appendInstr(
-        OutVReg{},
-        Instruction::kMove,
-        Ind{cframe_reg, offsetof(_PyCFrame, current_frame)});
-#endif
-    bbb.appendInstr(
-        OutInd{frame, offsetof(_PyInterpreterFrame, previous)},
-        Instruction::kMove,
-        prev_frame);
-
-    // Store prev_instr / instr_ptr
-    bbb.annotateNext("Set _PyInterpreterFrame::prev_instr");
-#if PY_VERSION_HEX >= 0x030E0000
-    _Py_CODEUNIT* code_start = _PyCode_CODE(func_->code.get());
-#else
-    _Py_CODEUNIT* code_start = _PyCode_CODE(func_->code.get()) - 1;
-#endif
-    Instruction* code_start_reg =
-        bbb.appendInstr(OutVReg{}, Instruction::kMove, code_start);
-    bbb.appendInstr(
-        OutInd{frame, FRAME_INSTR_OFFSET}, Instruction::kMove, code_start_reg);
-
-#ifdef Py_GIL_DISABLED
-    bbb.annotateNext("Set _PyInterpreterFrame::store tlbc_index");
-    // Store tlbc_index = 0
-    bbb.appendInstr(
-        OutInd{
-            frame,
-            offsetof(_PyInterpreterFrame, tlbc_index),
-            OperandBase::k32bit},
-        Instruction::kMove,
-        Imm{0, OperandBase::k32bit});
-#endif
-
-    // Store owner = FRAME_OWNED_BY_THREAD
-    bbb.annotateNext("Set _PyInterpreterFrame::owner");
-    bbb.appendInstr(
-        OutInd{frame, offsetof(_PyInterpreterFrame, owner), OperandBase::k8bit},
-        Instruction::kMove,
-        Imm{static_cast<uint8_t>(FRAME_OWNED_BY_THREAD), OperandBase::k8bit});
-
-#if PY_VERSION_HEX >= 0x030E0000
+#if PY_VERSION_HEX >= 0x030E0000 && defined(ENABLE_LIGHTWEIGHT_FRAMES)
     bbb.annotateNext("Set _PyInterpreterFrame::f_globals");
     Instruction* globals = bbb.appendInstr(
         OutVReg{},
@@ -5226,26 +5458,6 @@ void LIRGenerator::emitLoadFrame(BasicBlockBuilder& bbb) {
         Imm{0, OperandBase::k16bit});
 
     bbb.annotateNext("Set _PyInterpreterFrame::localsplus");
-    // Store stackpointer = &localsplus[co_nlocalsplus]
-    Instruction* localsplus = bbb.appendInstr(
-        OutVReg{},
-        Instruction::kLea,
-        Stk{PhyLocation(
-            static_cast<int32_t>(
-                -fh_size + sizeof(jit::FrameHeader) +
-                offsetof(_PyInterpreterFrame, localsplus) +
-                func_->code->co_nlocalsplus * sizeof(Ci_STACK_TYPE)))});
-    bbb.appendInstr(
-        OutInd{frame, offsetof(_PyInterpreterFrame, stackpointer)},
-        Instruction::kMove,
-        localsplus);
-
-    // Store f_locals = NULL
-    bbb.annotateNext("Set _PyInterpreterFrame::f_locals");
-    bbb.appendInstr(
-        OutInd{frame, offsetof(_PyInterpreterFrame, f_locals)},
-        Instruction::kMove,
-        Imm{0});
     int free_offset = func_->code->co_nlocalsplus - func_->code->co_nfreevars;
     for (int local_idx = 0; local_idx < free_offset; local_idx++) {
       bbb.appendInstr(
@@ -5268,37 +5480,177 @@ void LIRGenerator::emitLoadFrame(BasicBlockBuilder& bbb) {
         Imm{0, OperandBase::k8bit});
 #endif
 
-    // Link frame into tstate
+    // Incref fields that need it.
+    bbb.annotateNext("Incref executable / reifier");
+    JIT_DCHECK(executable_or_reifier_obj != nullptr, "should have reifier");
+    if (!_Py_IsImmortal(executable_or_reifier_obj)) {
+      makeIncref(bbb, executable_or_reifier, false);
+    }
+#if PY_VERSION_HEX >= 0x030E0000 && PY_VERSION_HEX < 0x030F0000
+    bbb.annotateNext("Incref func");
+    makeIncref(bbb, env_->asm_func, false);
+#else
+    if (is_gen_) {
+      bbb.annotateNext("Incref func");
+      makeIncref(bbb, env_->asm_func, false);
+    }
+#endif
+
+    // Link frame into tstate.
     bbb.annotateNext("Set _PyInterpreterFrame as topmost frame");
-#if PY_VERSION_HEX >= 0x030D0000
-    bbb.appendInstr(
-        OutInd{env_->asm_tstate, offsetof(PyThreadState, current_frame)},
-        Instruction::kMove,
-        frame);
-#else
-    bbb.appendInstr(
-        OutInd{cframe_reg, offsetof(_PyCFrame, current_frame)},
-        Instruction::kMove,
-        frame);
-#endif
+    cfa.store(frame);
   }
-#endif // ENABLE_LIGHTWEIGHT_FRAMES
-#if PY_VERSION_HEX >= 0x030D0000
-  bbb.annotateNext("Load current interpreter frame");
-  env_->asm_interpreter_frame = bbb.appendInstr(
-      OutVReg{},
-      Instruction::kMove,
-      Ind{env_->asm_tstate, offsetof(PyThreadState, current_frame)});
-#else
-  auto* cframe = bbb.appendInstr(
-      OutVReg{},
-      Instruction::kMove,
-      Ind{env_->asm_tstate, offsetof(PyThreadState, cframe)});
-  env_->asm_interpreter_frame = bbb.appendInstr(
-      OutVReg{},
-      Instruction::kMove,
-      Ind{cframe, offsetof(_PyCFrame, current_frame)});
 #endif
+  bbb.annotateNext("Load current interpreter frame");
+  env_->asm_interpreter_frame = makeCurrentFrameAccessor(bbb).load();
+}
+
+void LIRGenerator::emitUnlinkFrame(
+    BasicBlockBuilder& bbb,
+    bool has_freevars,
+    bool is_generator,
+    Instruction* func_reg,
+    PyObject* executable,
+    std::optional<destructor> exec_dtor,
+    Instruction* callee_frame) {
+  if (has_freevars) {
+    bbb.appendInvokeInstruction(JITRT_UnlinkFrame, env_->asm_tstate);
+  } else if (!env_->can_deopt) {
+    emitInlineUnlinkLeafFrame(
+        bbb, is_generator, func_reg, executable, exec_dtor, callee_frame);
+  } else {
+    emitInlineUnlinkFastFrame(
+        bbb, is_generator, func_reg, executable, exec_dtor, callee_frame);
+  }
+}
+
+void LIRGenerator::emitInlineUnlinkLeafFrame(
+    BasicBlockBuilder& bbb,
+    bool is_generator,
+    Instruction* func_reg,
+    PyObject* executable,
+    std::optional<destructor> exec_dtor,
+    Instruction* callee_frame) {
+  CurrentFrameAccessor cfa = makeCurrentFrameAccessor(bbb);
+  Instruction* frame = callee_frame != nullptr ? callee_frame : cfa.load();
+
+  Instruction* prev = bbb.appendInstr(
+      OutVReg{},
+      Instruction::kMove,
+      Ind{frame,
+          static_cast<int32_t>(offsetof(_PyInterpreterFrame, previous))});
+
+  cfa.store(prev);
+
+  if (func_reg != nullptr &&
+#if PY_VERSION_HEX >= 0x030E0000 && PY_VERSION_HEX < 0x030F0000
+      true
+#else
+      is_generator
+#endif
+  ) {
+    makeDecref(
+        bbb,
+        func_reg,
+        std::optional<destructor>(PyFunction_Type.tp_dealloc),
+        false,
+        false);
+  }
+  if (!_Py_IsImmortal(executable)) {
+    Instruction* exec_reg =
+        bbb.appendInstr(OutVReg{}, Instruction::kMove, executable);
+    makeDecref(bbb, exec_reg, exec_dtor, false, false);
+  }
+}
+
+void LIRGenerator::emitInlineUnlinkFastFrame(
+    BasicBlockBuilder& bbb,
+    bool is_generator,
+    Instruction* func_reg,
+    PyObject* executable,
+    std::optional<destructor> exec_dtor,
+    Instruction* callee_frame) {
+  CurrentFrameAccessor cfa = makeCurrentFrameAccessor(bbb);
+  Instruction* frame = callee_frame != nullptr ? callee_frame : cfa.load();
+
+  auto done_block = bbb.allocateBlock();
+  auto not_materialized = bbb.allocateBlock();
+  auto materialized_block = bbb.allocateBlock();
+
+#if PY_VERSION_HEX >= 0x030F0000
+  auto check_frame_obj = bbb.allocateBlock();
+  Instruction* frame_status = bbb.appendInstr(
+      OutVReg{},
+      Instruction::kMove,
+      Ind{frame,
+          static_cast<int32_t>(
+              offsetof(FrameHeader, frame_status) - kFrameHeaderOverhead)});
+
+  static_assert(JIT_FRAME_INITIALIZED == 2);
+  bbb.appendBranch(
+      Instruction::kBranchBitNotSet, check_frame_obj, frame_status, Imm{1});
+#else
+  Instruction* frame_obj_reg = bbb.appendInstr(
+      OutVReg{},
+      Instruction::kMove,
+      Ind{frame,
+          static_cast<int32_t>(offsetof(_PyInterpreterFrame, frame_obj))});
+  bbb.appendInstr(Instruction::kTest, frame_obj_reg, frame_obj_reg);
+  bbb.appendBranch(Instruction::kBranchZ, not_materialized);
+#endif
+
+  {
+    bbb.appendBlock(materialized_block);
+    if (getConfig().multiple_code_sections) {
+      materialized_block->setSection(codegen::CodeSection::kCold);
+    }
+    bbb.appendInvokeInstruction(JITRT_UnlinkFrame, env_->asm_tstate);
+    bbb.appendBranch(Instruction::kBranch, done_block);
+  }
+
+#if PY_VERSION_HEX >= 0x030F0000
+  bbb.switchBlock(check_frame_obj);
+  Instruction* frame_obj_reg = bbb.appendInstr(
+      OutVReg{},
+      Instruction::kMove,
+      Ind{frame,
+          static_cast<int32_t>(offsetof(_PyInterpreterFrame, frame_obj))});
+  bbb.appendInstr(Instruction::kTest, frame_obj_reg, frame_obj_reg);
+  bbb.appendBranch(Instruction::kBranchNZ, materialized_block);
+  bbb.appendBranch(Instruction::kBranch, not_materialized);
+#endif
+
+  bbb.switchBlock(not_materialized);
+
+  Instruction* prev = bbb.appendInstr(
+      OutVReg{},
+      Instruction::kMove,
+      Ind{frame,
+          static_cast<int32_t>(offsetof(_PyInterpreterFrame, previous))});
+
+  cfa.store(prev);
+
+  if (func_reg != nullptr &&
+#if PY_VERSION_HEX >= 0x030E0000 && PY_VERSION_HEX < 0x030F0000
+      true
+#else
+      is_generator
+#endif
+  ) {
+    makeDecref(
+        bbb,
+        func_reg,
+        std::optional<destructor>(PyFunction_Type.tp_dealloc),
+        false,
+        false);
+  }
+  if (!_Py_IsImmortal(executable)) {
+    Instruction* exec_reg =
+        bbb.appendInstr(OutVReg{}, Instruction::kMove, executable);
+    makeDecref(bbb, exec_reg, exec_dtor, false, false);
+  }
+
+  bbb.appendBlock(done_block);
 }
 
 void GenerateDeoptTrampolineBlocks(
@@ -5331,8 +5683,8 @@ void GenerateDeoptTrampolineBlocks(
 
 #if defined(CINDER_X86_64)
   auto* vpush = block->allocateInstr(Instruction::kVariadicPush, nullptr);
-  // Push in descending order so the memory layout is ascending by PhyLocation.
-  // r15 was already saved by stage 2.
+  // Push in descending order so the memory layout is ascending by
+  // PhyLocation. r15 was already saved by stage 2.
   for (int i = 0; i < kStage3SavedRegs; i++) {
     vpush->addOperands(PhyReg{PhyLocation{i}});
   }
@@ -5572,8 +5924,7 @@ void GenerateDeoptTrampolineBlocks(
       Instruction::kLea, nullptr, OutPhyReg{sp_reg}, Ind(sp_reg, kPointerSize));
 #endif
   // Jump to the real epilogue.
-  block->allocateInstr(
-      Instruction::kIndirectJump, nullptr, PhyReg{jump_target_reg});
+  block->allocateInstr(Instruction::kBranch, nullptr, PhyReg{jump_target_reg});
 }
 
 void GenerateFailedDeferredCompileBlocks(

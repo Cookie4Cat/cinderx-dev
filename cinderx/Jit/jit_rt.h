@@ -69,7 +69,8 @@ void JITRT_DecrefFrame(PyFrameObject* frame);
 void JITRT_UnlinkFrame(PyThreadState* tstate);
 
 /*
- * Handles a call that includes kw arguments or excess tuple arguments
+ * Handles a call that includes kw arguments where the target function has
+ * *args, **kwargs, or keyword only args.
  */
 PyObject* JITRT_CallWithKeywordArgs(
     PyFunctionObject* func,
@@ -77,7 +78,25 @@ PyObject* JITRT_CallWithKeywordArgs(
     size_t nargsf,
     PyObject* kwnames);
 
-JITRT_StaticCallReturn JITRT_CallWithIncorrectArgcount(
+/*
+ * Handles a call that includes kw arguments where the target function doesn't
+ * have *args, **kwargs, or keyword only args.
+ */
+PyObject* JITRT_CallWithKeywordArgsSimple(
+    PyFunctionObject* func,
+    PyObject** args,
+    size_t nargsf,
+    PyObject* kwnames);
+
+// On Windows x64, returning JITRT_StaticCallReturn (16 bytes) would use a
+// hidden first parameter for the return pointer, shifting all visible
+// arguments. Return PyObject* instead to keep register assignments correct.
+#ifdef _WIN32
+PyObject*
+#else
+JITRT_StaticCallReturn
+#endif
+JITRT_CallWithIncorrectArgcount(
     PyFunctionObject* func,
     PyObject** args,
     size_t nargsf,
@@ -117,7 +136,7 @@ JITRT_StaticCallFPReturn JITRT_ReportStaticArgTypecheckErrorsWithDoubleReturn(
     PyObject* kwnames);
 
 /*
- * Mimics the behavior of Cix_PyDict_LoadGlobal except that it raises an error
+ * Mimics the behavior of _PyDict_LoadGlobal except that it raises an error
  * when the name does not exist.
  */
 PyObject*
@@ -176,6 +195,7 @@ JITRT_CallFunctionEx(PyObject* func, PyObject* pargs, PyObject* kwargs);
  * deopt.
  */
 PyObject* JITRT_Call(
+    PyThreadState* tstate,
     PyObject* callable,
     PyObject* const* args,
     size_t nargsf,
@@ -185,7 +205,8 @@ PyObject* JITRT_Call(
  * Performs a function call with a vectorcall. Will check and handle any
  * eval breaker events after the call.
  */
-PyObject* JITRT_Vectorcall(
+PyObject* JITRT_VectorcallTstate(
+    PyThreadState* tstate,
     PyObject* callable,
     PyObject* const* args,
     size_t nargsf,
@@ -365,6 +386,7 @@ PyObject* JITRT_FormatValue(
  * Concatenate strings from args
  */
 PyObject* JITRT_BuildString(
+    PyThreadState* /*tstate*/,
     void* /*unused*/,
     PyObject** args,
     size_t nargsf,
@@ -553,12 +575,12 @@ PyObject* JITRT_LookupAttrSpecial(
 
 LoadMethodResult JITRT_LoadSpecial(PyObject* self, int special_idx);
 
-#ifdef Py_GIL_DISABLED
 /*
- * Non-inline wrapper for _Py_qsbr_quiescent_state().
+ * Non-inline wrapper for _Py_qsbr_quiescent_state(). This is only meaningful
+ * in free-threaded builds; GIL builds compile a no-op so callers can branch on
+ * kFreeThreadedBuild instead of #ifdefs.
  */
 void JITRT_AtQuiescentState(PyThreadState* tstate);
-#endif
 
 #if PY_VERSION_HEX >= 0x030D0000
 

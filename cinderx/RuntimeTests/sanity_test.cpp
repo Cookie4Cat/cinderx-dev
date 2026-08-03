@@ -467,6 +467,165 @@ assert read(box) == 99
 )");
 }
 
+TEST_F(SanityTest, ExactLongAddSubFastPathPreservesSemantics) {
+#if defined(CINDER_AARCH64) && PY_VERSION_HEX >= 0x030E0000 &&  \
+    PY_VERSION_HEX < 0x030F0000 && !defined(Py_GIL_DISABLED) && \
+    !defined(Py_REF_DEBUG) && !defined(Py_STATS)
+  runStockCode(R"(
+import cinderx.jit as jit
+import sys
+
+# Compile generic BinaryOp HIR so the test exercises the LIR type-dispatch
+# stub rather than the existing LongBinaryOp lowering.
+jit.disable_specialized_opcodes()
+jit.compile_after_n_calls(1000000)
+
+def add(a, b):
+    return a + b
+
+def sub(a, b):
+    return a - b
+
+for func in (add, sub):
+    assert jit.force_compile(func), func.__name__
+    counts = jit.get_function_hir_opcode_counts(func)
+    assert counts.get("BinaryOp", 0) >= 1, (func.__name__, counts)
+
+# Exact arithmetic covers compact, negative, and multi-digit PyLong values.
+pairs = (
+    (0, 0),
+    (123456789, 0x55AA55AA),
+    (-123456789, 0x55AA55AA),
+    ((1 << 521) + (1 << 257) + 17, -((1 << 389) + 31)),
+)
+for left, right in pairs:
+    assert add(left, right) == left + right
+    assert sub(left, right) == left - right
+
+# bool is a distinct type and must take the generic helper path.
+assert type(add(True, True)) is int
+assert type(sub(True, False)) is int
+
+# A right-hand int subclass must retain reflected dispatch.
+class Reflected(int):
+    def __radd__(self, other):
+        return ("radd", other, int(self))
+
+    def __rsub__(self, other):
+        return ("rsub", other, int(self))
+
+rhs = Reflected(5)
+assert add(3, rhs) == ("radd", 3, 5)
+assert sub(3, rhs) == ("rsub", 3, 5)
+
+# A left-hand int subclass must retain its override.
+class LeftOverride(int):
+    def __add__(self, other):
+        return ("left-add", int(self), other)
+
+    def __sub__(self, other):
+        return ("left-sub", int(self), other)
+
+assert add(LeftOverride(9), 3) == ("left-add", 9, 3)
+assert sub(LeftOverride(9), 3) == ("left-sub", 9, 3)
+
+# Non-int behavior remains entirely on PyNumber_Add/Subtract.
+assert add("ab", "cd") == "abcd"
+assert add([1, 2], [3]) == [1, 2, 3]
+
+class NonInt:
+    def __add__(self, other):
+        return ("non-int-add", other)
+
+    def __sub__(self, other):
+        return ("non-int-sub", other)
+
+non_int = NonInt()
+assert add(non_int, 7) == ("non-int-add", 7)
+assert sub(non_int, 7) == ("non-int-sub", 7)
+
+for func in (add, sub):
+    try:
+        func(object(), object())
+    except TypeError:
+        pass
+    else:
+        raise AssertionError(f"{func.__name__} lost its TypeError")
+
+# Exceptions from reflected fallback methods must cross the stub unchanged.
+class MarkerError(Exception):
+    pass
+
+class RaisingRight(int):
+    def __radd__(self, other):
+        raise MarkerError("reflected add marker")
+
+    def __rsub__(self, other):
+        raise MarkerError("reflected sub marker")
+
+for func, message in (
+    (add, "reflected add marker"),
+    (sub, "reflected sub marker"),
+):
+    try:
+        func(1, RaisingRight(2))
+    except MarkerError as exc:
+        assert str(exc) == message
+    else:
+        raise AssertionError(f"{func.__name__} swallowed reflected exception")
+
+# Activate tracing from a reflected method. Returning crosses the original BL
+# return address and therefore exercises normal callsite/deopt bookkeeping.
+trace_events = []
+def traced_probe():
+    return 42
+
+def tracer(frame, event, arg):
+    if frame.f_code is traced_probe.__code__:
+        trace_events.append(event)
+    return tracer
+
+class TraceEnabler(int):
+    def __radd__(self, other):
+        sys.settrace(tracer)
+        return ("trace-enabled", other, int(self))
+
+try:
+    assert add(7, TraceEnabler(5)) == ("trace-enabled", 7, 5)
+    assert traced_probe() == 42
+finally:
+    sys.settrace(None)
+assert "call" in trace_events and "return" in trace_events
+
+# Exact-path borrowed inputs must retain stable reference counts.
+left = (1 << 521) + 123
+right = (1 << 389) - 1
+left_refs = sys.getrefcount(left)
+right_refs = sys.getrefcount(right)
+for _ in range(2000):
+    add_result = add(left, right)
+    sub_result = sub(left, right)
+del add_result, sub_result
+assert sys.getrefcount(left) == left_refs
+assert sys.getrefcount(right) == right_refs
+
+# The generic reflected path must obey the same ownership contract.
+fallback_left = int("1234567890123456789012345678901234567890")
+fallback_right = Reflected(5)
+fallback_left_refs = sys.getrefcount(fallback_left)
+fallback_right_refs = sys.getrefcount(fallback_right)
+for _ in range(2000):
+    add_result = add(fallback_left, fallback_right)
+    sub_result = sub(fallback_left, fallback_right)
+del add_result, sub_result
+assert sys.getrefcount(fallback_left) == fallback_left_refs
+assert sys.getrefcount(fallback_right) == fallback_right_refs
+)");
+#else
+  GTEST_SKIP() << "AArch64 CPython 3.14 GIL-only fast path";
+#endif
+}
+
 TEST_F(SanityTest, TruthinessGuardFailurePropagatesException) {
   runStockCode(R"(
 import cinderx.jit as jit

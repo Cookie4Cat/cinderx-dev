@@ -493,6 +493,10 @@ std::optional<TreeIterMatch> TreeIterStateMachinePass::matchTreeIter(
         tp->tp_as_sequence->sq_length != nullptr) {
       return false;
     }
+    if (tp->tp_as_mapping != nullptr &&
+        tp->tp_as_mapping->mp_length != nullptr) {
+      return false;
+    }
     return true;
   };
 
@@ -803,6 +807,54 @@ static FieldLoadResult emitFieldLoad(
   return {bb_join, value};
 }
 
+static void emitDefaultTruthinessChildBranch(
+    Function& func,
+    BasicBlock* block,
+    Environment& env,
+    Register* child,
+    Type exact_node_type,
+    BasicBlock* has_child,
+    BasicBlock* no_child,
+    const FrameState& frame_state) {
+  Register* none_const = env.AllocateRegister();
+  block->append<LoadConst>(none_const, Type::fromObject(Py_None));
+  Register* is_none = env.AllocateRegister();
+  block->append<PrimitiveCompare>(
+      is_none, PrimitiveCompareOp::kEqual, child, none_const);
+
+  BasicBlock* not_none = func.cfg.AllocateBlock();
+  block->append<CondBranch>(is_none, no_child, not_none);
+
+  PyTypeObject* node_type = exact_node_type.runtimePyType();
+  JIT_CHECK(node_type != nullptr, "TreeIter node type must be exact");
+  BasicBlock* fallback_truthiness = func.cfg.AllocateBlock();
+  Register* child_type = env.AllocateRegister();
+  not_none->append<LoadField>(
+      child_type, child, "ob_type", offsetof(PyObject, ob_type), TType);
+  Register* expected_type = env.AllocateRegister();
+  not_none->append<LoadConst>(
+      expected_type,
+      Type::fromObject(
+          env.addReference(reinterpret_cast<PyObject*>(node_type))));
+  Register* is_node = env.AllocateRegister();
+  not_none->append<PrimitiveCompare>(
+      is_node, PrimitiveCompareOp::kEqual, child_type, expected_type);
+
+  auto* child_type_branch =
+      not_none->append<CondBranch>(is_node, has_child, fallback_truthiness);
+  if (PyType_HasFeature(node_type, Py_TPFLAGS_HEAPTYPE)) {
+    // Heap types can gain or lose __bool__ / __len__ while this generator is
+    // suspended.  Keep the steady-state branch unchanged; any type
+    // modification atomically rewrites that branch to jump to IsTruthy.
+    child_type_branch->setFalseBranchPatcher(
+        func.allocateCodePatcher<TypeDeoptPatcher>(node_type));
+  }
+
+  Register* is_truthy = env.AllocateRegister();
+  fallback_truthiness->append<IsTruthy>(is_truthy, child, frame_state);
+  fallback_truthiness->append<CondBranch>(is_truthy, has_child, no_child);
+}
+
 static FrameState remapFrameStateRegister(
     const FrameState& frame_state,
     Register* from,
@@ -980,10 +1032,15 @@ void TreeIterStateMachinePass::buildTreeIterStateMachine(
   {
     JIT_CHECK(left_child != nullptr, "left child register was not created");
     if (match.left_guard.kind == ChildGuardKind::kDefaultTruthinessGuard) {
-      Register* is_truthy = env.AllocateRegister();
-      bb_check_null_left->append<IsTruthy>(is_truthy, left_child, fs);
-      bb_check_null_left->append<CondBranch>(
-          is_truthy, bb_has_left, bb_no_left);
+      emitDefaultTruthinessChildBranch(
+          func,
+          bb_check_null_left,
+          env,
+          left_child,
+          match.exact_node_type,
+          bb_has_left,
+          bb_no_left,
+          fs);
     } else {
       bb_check_null_left->append<CondBranch>(
           left_child, bb_has_left, bb_no_left);
@@ -1076,10 +1133,15 @@ void TreeIterStateMachinePass::buildTreeIterStateMachine(
   {
     JIT_CHECK(right_child != nullptr, "right child register was not created");
     if (match.right_guard.kind == ChildGuardKind::kDefaultTruthinessGuard) {
-      Register* is_truthy = env.AllocateRegister();
-      bb_check_null_right->append<IsTruthy>(is_truthy, right_child, fs);
-      bb_check_null_right->append<CondBranch>(
-          is_truthy, bb_has_right, bb_no_right);
+      emitDefaultTruthinessChildBranch(
+          func,
+          bb_check_null_right,
+          env,
+          right_child,
+          match.exact_node_type,
+          bb_has_right,
+          bb_no_right,
+          fs);
     } else {
       bb_check_null_right->append<CondBranch>(
           right_child, bb_has_right, bb_no_right);

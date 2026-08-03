@@ -76,6 +76,8 @@ namespace jit::hir {
   V(ImportFrom)                    \
   V(ImportName)                    \
   V(InitFrameCellVars)             \
+  V(InitListElements)              \
+  V(InitTupleElements)             \
   V(InPlaceOp)                     \
   V(Incref)                        \
   V(IndexUnbox)                    \
@@ -184,6 +186,7 @@ namespace jit::hir {
   V(UnpackSequence)                \
   V(Unreachable)                   \
   V(UpdatePrevInstr)               \
+  V(UseObj)                        \
   V(UseType)                       \
   V(VectorCall)                    \
   V(WaitHandleLoadCoroOrResult)    \

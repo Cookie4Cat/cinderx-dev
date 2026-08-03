@@ -31,6 +31,9 @@
   X(BINARY_SUBSCR_LIST)                \
   X(BINARY_SUBSCR_TUPLE)               \
   X(BINARY_SUBSCR_TUPLE_CONST_INT)     \
+  X(BINARY_OP_SUBSCR_LIST_INT)         \
+  X(BINARY_OP_SUBSCR_TUPLE_INT)        \
+  X(BINARY_OP_SUBSCR_DICT)             \
   X(BINARY_SUBTRACT)                   \
   X(BINARY_TRUE_DIVIDE)                \
   X(BINARY_XOR)                        \

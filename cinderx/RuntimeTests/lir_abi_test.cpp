@@ -1,5 +1,9 @@
 // Copyright (c) Meta Platforms, Inc. and affiliates.
 
+#include "cinderx/python.h"
+
+#include "internal/pycore_long.h"
+
 #include <gtest/gtest.h>
 
 #include "cinderx/Jit/code_allocator.h"
@@ -58,6 +62,14 @@ class LIRABITest : public RuntimeTest {
     auto insn = bb.allocateInstr(opcode, origin, args...);
     switch (opcode) {
       case Instruction::kBranch:
+        // kBranch supports both Label and MemoryIndirect operands. Only add
+        // a label if no operands were already provided (i.e., the caller did
+        // not pass an Ind operand).
+        if (insn->getNumInputs() == 0) {
+          environ.block_label_map.emplace(&bb, as.newLabel());
+          insn->addOperands(Lbl{&bb});
+        }
+        break;
       case Instruction::kBranchZ:
       case Instruction::kBranchNZ:
       case Instruction::kBranchA:
@@ -76,6 +88,8 @@ class LIRABITest : public RuntimeTest {
       case Instruction::kBranchNS:
       case Instruction::kBranchE:
       case Instruction::kBranchNE:
+      case Instruction::kBranchBitSet:
+      case Instruction::kBranchBitNotSet:
         environ.block_label_map.emplace(&bb, as.newLabel());
         insn->addOperands(Lbl{&bb});
         break;
@@ -153,6 +167,25 @@ class LIRABITest : public RuntimeTest {
   }
 };
 
+TEST_F(LIRABITest, TestMemImmAndOutMemImmPreserveDataType) {
+  Function function;
+  BasicBlock bb(&function);
+
+  auto* load = bb.allocateInstr(
+      Instruction::kMove,
+      nullptr,
+      makeOutPhyReg(),
+      MemImm{nullptr, DataType::k8bit});
+  EXPECT_EQ(load->getInput(0)->sizeInBits(), bitSize(DataType::k8bit));
+
+  auto* store = bb.allocateInstr(
+      Instruction::kMove,
+      nullptr,
+      OutMemImm{nullptr, DataType::k8bit},
+      makePhyReg(1, DataType::k8bit));
+  EXPECT_EQ(store->output()->sizeInBits(), bitSize(DataType::k8bit));
+}
+
 // kLea R m
 TEST_F(LIRABITest, TestkLea_OutPhyReg_Mem) {
   translateInstr(Instruction::kLea, makeOutPhyReg(), makeStk());
@@ -184,6 +217,70 @@ TEST_F(LIRABITest, TestkCall_Imm) {
 TEST_F(LIRABITest, TestkCall_PhyReg) {
   translateInstr(Instruction::kCall, makePhyReg());
 }
+
+#if defined(CINDER_AARCH64) && PY_VERSION_HEX >= 0x030E0000 &&  \
+    PY_VERSION_HEX < 0x030F0000 && !defined(Py_GIL_DISABLED) && \
+    !defined(Py_REF_DEBUG) && !defined(Py_STATS)
+TEST_F(LIRABITest, BinaryOpExactLongAddSubMapsHelpersAndRecordsCallsites) {
+  hir::Function hir_function;
+
+  Environ environ;
+  environ.ctx = getContext();
+  environ.code_rt = environ.ctx->allocateCodeRuntime(
+      hir_function.code.get(),
+      hir_function.builtins.get(),
+      hir_function.globals.get());
+
+  auto code_allocator = std::unique_ptr<ICodeAllocator>(CodeAllocator::make());
+  CodeHolder code;
+  code.init(code_allocator->asmJitEnvironment());
+  arch::Builder as(&code);
+  environ.as = &as;
+
+  Function function;
+  BasicBlock bb(&function);
+  PyCodeObject code_obj;
+  hir::FrameState frame_state(
+      BorrowedRef<PyCodeObject>(&code_obj), nullptr, nullptr, nullptr);
+  hir::Register out(0);
+  auto origin = std::unique_ptr<hir::InitialYield>(
+      hir::InitialYield::create(&out, frame_state));
+
+  struct Mapping {
+    binaryfunc generic;
+    uint64_t exact;
+  };
+  const Mapping mappings[] = {
+      {PyNumber_Add, reinterpret_cast<uint64_t>(_PyLong_Add)},
+      {PyNumber_Subtract, reinterpret_cast<uint64_t>(_PyLong_Subtract)},
+  };
+  constexpr size_t kNumMappings = sizeof(mappings) / sizeof(mappings[0]);
+
+  auto translate_mapping = [&](const Mapping& mapping) {
+    auto* instr = bb.allocateInstr(
+        Instruction::kBinaryOpExactLongAddSubFastPath,
+        origin.get(),
+        makeOutPhyReg(2, DataType::kObject),
+        Imm{reinterpret_cast<uint64_t>(mapping.generic)});
+    autogen::AutoTranslator::getInstance().translateInstr(&environ, instr);
+  };
+  for (const auto& mapping : mappings) {
+    translate_mapping(mapping);
+  }
+  // Reusing Add should produce a second callsite but not a duplicate stub.
+  translate_mapping(mappings[0]);
+
+  ASSERT_EQ(environ.exact_long_add_sub_stubs.size(), kNumMappings);
+  for (size_t i = 0; i < kNumMappings; ++i) {
+    const auto& stub = environ.exact_long_add_sub_stubs[i];
+    EXPECT_TRUE(stub.entry.isValid());
+    EXPECT_EQ(
+        stub.generic_target, reinterpret_cast<uint64_t>(mappings[i].generic));
+    EXPECT_EQ(stub.exact_target, mappings[i].exact);
+  }
+  EXPECT_EQ(environ.pending_debug_locs.size(), 3);
+}
+#endif
 
 // kCall m
 #if !defined(CINDER_AARCH64)
@@ -891,6 +988,18 @@ TEST_F(LIRABITest, TestkBranch_Label) {
   translateInstr(Instruction::kBranchNE);
 }
 
+// kBranch with MemoryIndirect (indirect jump)
+TEST_F(LIRABITest, TestkBranch_Indirect) {
+  translateInstr(Instruction::kBranch, Ind(ARGUMENT_REGS[0]));
+  translateInstr(Instruction::kBranch, Ind(ARGUMENT_REGS[0], 8));
+}
+
+// kBranch with Imm (direct address jump)
+TEST_F(LIRABITest, TestkBranch_Imm) {
+  translateInstr(
+      Instruction::kBranch, Imm{reinterpret_cast<uint64_t>(testImmPtrTarget)});
+}
+
 // kEqual R r r
 TEST_F(LIRABITest, TestkEqual_OutPhyReg_PhyReg_PhyReg) {
   translateInstr(
@@ -1269,11 +1378,27 @@ TEST_F(LIRABITest, TestkDec_Mem) {
 }
 #endif
 
-// kBitTest r i
-TEST_F(LIRABITest, TestkBitTest_PhyReg_PhyReg) {
-  translateInstr(Instruction::kBitTest, makePhyReg(0), Imm{0});
-  translateInstr(Instruction::kBitTest, makePhyReg(0), Imm{63});
+// kBranchBitSet r i l
+TEST_F(LIRABITest, TestkBranchBitSet_PhyReg_Imm_Label) {
+  translateInstr(Instruction::kBranchBitSet, makePhyReg(0), Imm{0});
+  translateInstr(Instruction::kBranchBitSet, makePhyReg(0), Imm{31});
+  translateInstr(Instruction::kBranchBitSet, makePhyReg(0), Imm{63});
 }
+
+// kBranchBitNotSet r i l
+TEST_F(LIRABITest, TestkBranchBitNotSet_PhyReg_Imm_Label) {
+  translateInstr(Instruction::kBranchBitNotSet, makePhyReg(0), Imm{0});
+  translateInstr(Instruction::kBranchBitNotSet, makePhyReg(0), Imm{31});
+  translateInstr(Instruction::kBranchBitNotSet, makePhyReg(0), Imm{63});
+}
+
+#if defined(CINDER_AARCH64)
+TEST_F(LIRABITest, TestTreeIterInt32Loads_NoneOutput) {
+  translateInstr(Instruction::kLoadPhase);
+  translateInstr(Instruction::kLoadPoppedPhase);
+  translateInstr(Instruction::kLoadStackTop);
+}
+#endif
 
 // kYieldInitial ANY
 TEST_F(LIRABITest, TestkYieldInitial) {
@@ -1352,6 +1477,13 @@ TEST_F(LIRABITest, TestkMoveRelaxed_Mem_PhyReg) {
 // kMoveRelaxed M i
 TEST_F(LIRABITest, TestkMoveRelaxed_Mem_Imm) {
   translateInstr(Instruction::kMoveRelaxed, makeOutInd(1, 16), Imm{0});
+}
+
+// kMoveRelaxed rejects reg <- reg (no memory operand)
+TEST_F(LIRABITest, TestkMoveRelaxed_RejectsRegReg) {
+  EXPECT_DEATH(
+      translateInstr(Instruction::kMoveRelaxed, makeOutPhyReg(), makePhyReg()),
+      "kMoveRelaxed only supports");
 }
 
 } // namespace jit::lir

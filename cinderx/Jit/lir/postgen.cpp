@@ -98,13 +98,13 @@ RewriteResult rewriteBinaryOpConstantPosition(instr_iter_t instr_iter) {
     return changed ? kChanged : kUnchanged;
   }
 
-  if (!instr->isAdd() && !instr->isSub() && !instr->isXor() &&
-      !instr->isAnd() && !instr->isOr() && !instr->isMul() &&
-      !instr->isCompare()) {
+  bool is_commutative_or_compare = instr->isAdd() || instr->isAnd() ||
+      instr->isMul() || instr->isOr() || instr->isXor() || instr->isCompare();
+  bool is_shift = instr->isLShift() || instr->isRShift() || instr->isRShiftUn();
+  if (!is_commutative_or_compare && !is_shift && !instr->isSub()) {
     return kUnchanged;
   }
 
-  bool is_commutative_or_compare = !instr->isSub();
   auto input0 = instr->getInput(0);
   auto input1 = instr->getInput(1);
 
@@ -323,7 +323,12 @@ RewriteResult rewriteLoadArg(instr_iter_t instr_iter, Environ* env) {
   JIT_CHECK(instr->getNumInputs() == 1, "expected one input");
   OperandBase* input = instr->getInput(0);
   JIT_CHECK(input->isImm(), "expected constant arg index as input");
-  auto arg_idx = input->getConstant();
+  size_t arg_idx = input->getConstant();
+  JIT_CHECK(
+      arg_idx < env->arg_locations.size(),
+      "arg index {} out of range for {} arg locations",
+      arg_idx,
+      env->arg_locations.size());
   auto loc = env->arg_locations[arg_idx];
   static_cast<Operand*>(input)->setPhyRegOrStackSlot(loc);
   static_cast<Operand*>(input)->setDataType(instr->output()->dataType());
@@ -682,8 +687,8 @@ RewriteResult rewriteMoveAbsoluteAddress(instr_iter_t instr_iter) {
   auto addr_move = block->allocateInstrBefore(
       instr_iter,
       Instruction::kMove,
-      OutVReg{DataType::k64bit},
-      Imm{addr, DataType::k64bit});
+      OutVReg{DataType::kObject},
+      Imm{addr, DataType::kObject});
 
   // Replace the Mem input with Ind{addr_vreg, offset=0}. For a simple
   // Ind with no index and offset 0, ptrIndirect resolves to ptr(base)
@@ -791,7 +796,8 @@ RewriteResult rewriteStackInputToVreg(instr_iter_t instr_iter) {
 //   - Binary ops: rewriteBinaryOpLargeConstant
 //   - Guard: rewriteGuardLargeConstant
 //   - Div/DivUn: rewriteBinaryOpConstantPosition
-//   - BitTest input 1: isLogicalImm(1<<n) always encodes
+//   - BranchBitSet/BranchBitNotSet input 1: TBZ/TBNZ encode bit positions
+//     directly
 //   - Move "Ri" (load immediate to register): this IS the lowering target
 //   - Inc/Dec: hardcoded constant 1, no immediate operand
 RewriteResult rewriteNonBinaryImmediateToVreg(instr_iter_t instr_iter) {
@@ -858,7 +864,8 @@ RewriteResult rewriteNonBinaryImmediateToVreg(instr_iter_t instr_iter) {
 // translateCall only needs blr(reg).
 RewriteResult rewriteCallInput(instr_iter_t instr_iter) {
   auto instr = instr_iter->get();
-  if (!instr->isCall() && !instr->isVarArgCall() && !instr->isVectorCall()) {
+  if (!instr->isCall() && !instr->isVarArgCall() &&
+      !instr->isVectorCallTstate()) {
     return kUnchanged;
   }
 
@@ -993,6 +1000,7 @@ RewriteResult rewriteMovConstPool(function_rewrite_arg_t func) {
 
   return changed ? kChanged : kUnchanged;
 }
+
 #endif
 
 } // namespace

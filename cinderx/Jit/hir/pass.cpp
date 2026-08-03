@@ -12,26 +12,26 @@ namespace {
 
 std::optional<Type> builtinFunctionReturnType(std::string_view name) {
   static const UnorderedMap<std::string_view, Type> kRetTypes = {
-      {"dict.copy", TDictExact},      {"hasattr", TBool},
-      {"isinstance", TBool},          {"len", TLongExact},
-      {"list.copy", TListExact},      {"list.count", TLongExact},
-      {"list.index", TLongExact},     {"str.capitalize", TUnicodeExact},
-      {"str.center", TUnicodeExact},  {"str.count", TLongExact},
-      {"str.endswith", TBool},        {"str.find", TLongExact},
-      {"str.format", TUnicodeExact},  {"str.index", TLongExact},
-      {"str.isalnum", TBool},         {"str.isalpha", TBool},
-      {"str.isascii", TBool},         {"str.isdecimal", TBool},
-      {"str.isdigit", TBool},         {"str.isidentifier", TBool},
-      {"str.islower", TBool},         {"str.isnumeric", TBool},
-      {"str.isprintable", TBool},     {"str.isspace", TBool},
-      {"str.istitle", TBool},         {"str.isupper", TBool},
-      {"str.join", TUnicodeExact},    {"str.lower", TUnicodeExact},
-      {"str.lstrip", TUnicodeExact},  {"str.partition", TTupleExact},
-      {"str.replace", TUnicodeExact}, {"str.rfind", TLongExact},
-      {"str.rindex", TLongExact},     {"str.rpartition", TTupleExact},
-      {"str.rsplit", TListExact},     {"str.split", TListExact},
-      {"str.splitlines", TListExact}, {"str.upper", TUnicodeExact},
-      {"tuple.count", TLongExact},    {"tuple.index", TLongExact},
+      {"dict.copy", TDictExact},          {"hasattr", TImmortalBool},
+      {"isinstance", TImmortalBool},      {"len", TLongExact},
+      {"list.copy", TListExact},          {"list.count", TLongExact},
+      {"list.index", TLongExact},         {"str.capitalize", TUnicodeExact},
+      {"str.center", TUnicodeExact},      {"str.count", TLongExact},
+      {"str.endswith", TImmortalBool},    {"str.find", TLongExact},
+      {"str.format", TUnicodeExact},      {"str.index", TLongExact},
+      {"str.isalnum", TImmortalBool},     {"str.isalpha", TImmortalBool},
+      {"str.isascii", TImmortalBool},     {"str.isdecimal", TImmortalBool},
+      {"str.isdigit", TImmortalBool},     {"str.isidentifier", TImmortalBool},
+      {"str.islower", TImmortalBool},     {"str.isnumeric", TImmortalBool},
+      {"str.isprintable", TImmortalBool}, {"str.isspace", TImmortalBool},
+      {"str.istitle", TImmortalBool},     {"str.isupper", TImmortalBool},
+      {"str.join", TUnicodeExact},        {"str.lower", TUnicodeExact},
+      {"str.lstrip", TUnicodeExact},      {"str.partition", TTupleExact},
+      {"str.replace", TUnicodeExact},     {"str.rfind", TLongExact},
+      {"str.rindex", TLongExact},         {"str.rpartition", TTupleExact},
+      {"str.rsplit", TListExact},         {"str.split", TListExact},
+      {"str.splitlines", TListExact},     {"str.upper", TUnicodeExact},
+      {"tuple.count", TLongExact},        {"tuple.index", TLongExact},
   };
   auto return_type = kRetTypes.find(name);
   if (return_type != kRetTypes.end()) {
@@ -134,7 +134,7 @@ Type outputType(
     case Opcode::kCompare: {
       CompareOp op = static_cast<const Compare&>(instr).op();
       if (op == CompareOp::kIn || op == CompareOp::kNotIn) {
-        return TBool;
+        return TImmortalBool;
       }
       return TObject;
     }
@@ -240,7 +240,7 @@ Type outputType(
     case Opcode::kUnaryOp: {
       auto op = static_cast<const UnaryOp&>(instr).op();
       if (op == UnaryOpKind::kNot) {
-        return TBool;
+        return TImmortalBool;
       }
       return TObject;
     }
@@ -315,7 +315,7 @@ Type outputType(
     case Opcode::kGetTuple:
       return TTupleExact;
     case Opcode::kInitialYield:
-      return TOptNoneType;
+      return TOptImmortalNoneType;
     case Opcode::kLoadArg: {
       auto& loadarg = static_cast<const LoadArg&>(instr);
       return loadarg.type();
@@ -367,7 +367,7 @@ Type outputType(
     case Opcode::kFloatCompare:
     case Opcode::kLongCompare:
     case Opcode::kUnicodeCompare:
-      return TBool;
+      return TImmortalBool;
     case Opcode::kDictUpdate:
     case Opcode::kDictMerge:
     case Opcode::kRunPeriodicTasks:
@@ -378,7 +378,7 @@ Type outputType(
     // we should get rid of this extra layer and deal with the int return value
     // directly.
     case Opcode::kListExtend:
-      return TNoneType;
+      return TImmortalNoneType;
 
     case Opcode::kListAppend:
     case Opcode::kMergeSetUnpack:
@@ -444,7 +444,7 @@ Type outputType(
     }
 
     case Opcode::kPrimitiveBoxBool: {
-      return TBool;
+      return TImmortalBool;
     }
 
     case Opcode::kPrimitiveBox: {
@@ -539,6 +539,8 @@ Type outputType(
     case Opcode::kHintType:
     case Opcode::kIncref:
     case Opcode::kInitFrameCellVars:
+    case Opcode::kInitListElements:
+    case Opcode::kInitTupleElements:
     case Opcode::kLoadFrame:
     case Opcode::kOSREntry:
     case Opcode::kRaise:
@@ -560,6 +562,7 @@ Type outputType(
     case Opcode::kTreeIterLeaveCurrentNode:
     case Opcode::kUnreachable:
     case Opcode::kUpdatePrevInstr:
+    case Opcode::kUseObj:
     case Opcode::kUseType:
     case Opcode::kWaitHandleRelease:
     case Opcode::kClearTreeIterState:

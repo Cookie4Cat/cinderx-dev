@@ -275,8 +275,13 @@ bool Instruction::isBranchCC() const {
   }
 }
 
+bool Instruction::isCmpBranch() const {
+  return opcode_ == kCmpBranchZero || opcode_ == kCmpBranchNonZero;
+}
+
 bool Instruction::isAnyBranch() const {
-  return (opcode_ == kCondBranch) || isBranchCC();
+  return opcode_ == kCondBranch || opcode_ == kBranchBitSet ||
+      opcode_ == kBranchBitNotSet || isBranchCC() || isCmpBranch();
 }
 
 bool Instruction::isTerminator() const {
@@ -305,8 +310,9 @@ bool Instruction::isCallLike() const {
   switch (opcode_) {
     case kCall:
     case kLoadAttrCachedFastPath:
+    case kBinaryOpExactLongAddSubFastPath:
     case kVarArgCall:
-    case kVectorCall:
+    case kVectorCallTstate:
       return true;
     default:
       return false;

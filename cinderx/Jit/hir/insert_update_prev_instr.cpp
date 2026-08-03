@@ -88,12 +88,20 @@ void InsertUpdatePrevInstr::Run([[maybe_unused]] Function& func) {
     worklist.pop();
 
     int prev_emitted_lno_or_bc = INT_MAX;
+    Instr* last_emitted = nullptr;
     for (Instr& instr : *block) {
       auto update_one = [&]() {
         auto add_update_prev_instr = [&](int line_no) {
-          Instr* update_instr = UpdatePrevInstr::create(line_no, parent);
-          update_instr->copyBytecodeOffset(instr);
-          update_instr->InsertBefore(instr);
+          if (last_emitted != nullptr) {
+            last_emitted->unlink();
+            static_cast<UpdatePrevInstr*>(last_emitted)->setLineNo(line_no);
+            last_emitted->copyBytecodeOffset(instr);
+            last_emitted->InsertBefore(instr);
+          } else {
+            last_emitted = UpdatePrevInstr::create(line_no, parent);
+            last_emitted->copyBytecodeOffset(instr);
+            last_emitted->InsertBefore(instr);
+          }
         };
         // If we don't have a valid line table to optimize with, update after
         // every bytecode.
@@ -135,42 +143,51 @@ void InsertUpdatePrevInstr::Run([[maybe_unused]] Function& func) {
         }
         parents[begin] = parent;
         parent = begin;
-        if (getConfig().frame_mode == FrameMode::kLightweight) {
-          inited_once = false;
-        }
+        last_emitted = nullptr;
+        prev_emitted_lno_or_bc = INT_MAX;
+#ifdef ENABLE_LIGHTWEIGHT_FRAMES
+        inited_once = false;
+#endif
       } else if (instr.IsEndInlinedFunction()) {
         parent =
             parents[static_cast<EndInlinedFunction&>(instr).matchingBegin()];
+        last_emitted = nullptr;
+        prev_emitted_lno_or_bc = INT_MAX;
       }
 
-      if (getConfig().frame_mode == FrameMode::kLightweight) {
-        // The first LoadEvalBreaker is emitted for the RESUME instruction which
-        // indicates when we should update the line number from the instruction
-        // - 1 to the first instruction to indicate that the frame is now
-        // complete.
-        if (!inited_once && instr.IsLoadEvalBreaker()) {
-          auto target_code = parent == nullptr ? func.code : parent->code();
-          auto& cur_bc_idx_to_line = code_bc_idx_map.at(target_code);
-          int line_no = cur_bc_idx_to_line.lineNoFor(
-              BCIndex(target_code->_co_firsttraceable));
-          Instr* update_instr = UpdatePrevInstr::create(line_no, parent);
-          update_instr->setBytecodeOffset(
-              BCIndex(target_code->_co_firsttraceable));
-          update_instr->InsertBefore(instr);
+#ifdef ENABLE_LIGHTWEIGHT_FRAMES
+      // The first LoadEvalBreaker is emitted for the RESUME instruction which
+      // indicates when we should update the line number from the instruction
+      // - 1 to the first instruction to indicate that the frame is now
+      // complete.
+      if (!inited_once && instr.IsLoadEvalBreaker()) {
+        auto target_code = parent == nullptr ? func.code : parent->code();
+        auto& cur_bc_idx_to_line = code_bc_idx_map.at(target_code);
+        int line_no = cur_bc_idx_to_line.lineNoFor(
+            BCIndex(target_code->_co_firsttraceable));
+        Instr* update_instr = UpdatePrevInstr::create(line_no, parent);
+        update_instr->setBytecodeOffset(
+            BCIndex(target_code->_co_firsttraceable));
+        update_instr->InsertBefore(instr);
+        last_emitted = update_instr;
 
-          inited_once = true;
-        }
+        inited_once = true;
+      }
 #if PY_VERSION_HEX < 0x030F0000
-        // Stock CPython 3.14 has no JIT executable reifier callback. Keep
-        // instr_ptr current before arbitrary execution so frame APIs observe a
-        // complete frame at the right source line.
-        else if (hasArbitraryExecution(instr)) {
-          update_one();
-        }
-#endif
-      } else if (hasArbitraryExecution(instr)) {
+      // Stock CPython 3.14 has no JIT executable reifier callback. Keep
+      // instr_ptr current before arbitrary execution so frame APIs observe a
+      // complete frame at the right source line.
+      else if (hasArbitraryExecution(instr)) {
         update_one();
+        last_emitted = nullptr;
       }
+#endif
+#else
+      if (hasArbitraryExecution(instr)) {
+        update_one();
+        last_emitted = nullptr;
+      }
+#endif
     }
 
     // Add the successors to be processed

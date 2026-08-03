@@ -102,8 +102,6 @@
 #define _Py_Specialize_LoadSuperAttr _Ci_Specialize_LoadSuperAttr
 #define _PyEval_MonitorRaise _CiEval_MonitorRaise
 #define _PyEval_FrameClearAndPop _CiEval_FrameClearAndPop
-#define _PyEvalFramePushAndInit _CiEvalFramePushAndInit
-#define _PyEvalFramePushAndInit_Ex _CiEvalFramePushAndInit_Ex
 #define _PyType_Validate _CiType_Validate
 #define _Py_Specialize_Call _Ci_Specialize_Call
 #define _PyTraceBack_FromFrame _CiTraceBack_FromFrame
@@ -184,6 +182,13 @@ int _Ci_Instrument(PyCodeObject* co, PyInterpreterState* interp);
 Py_ssize_t _PyDict_LookupIndex(PyDictObject*, PyObject*);
 
 Py_ssize_t _PyDictKeys_StringLookupSplit(PyDictKeysObject* dk, PyObject* key);
+
+#include "internal/pycore_stackref.h"
+PyAPI_FUNC(_PyStackRef) _PyFloat_FromDouble_ConsumeInputs(
+    _PyStackRef left,
+    _PyStackRef right,
+    double value);
+
 #endif
 
 #define Cix_PyGen_yf _PyGen_yf
@@ -191,9 +196,7 @@ Py_ssize_t _PyDictKeys_StringLookupSplit(PyDictKeysObject* dk, PyObject* key);
 #define Cix_Py_union_type_or _Py_union_type_or
 #define Cix_PyCode_InitAddressRange _PyCode_InitAddressRange
 #define Cix_PyLineTable_NextAddressRange _PyLineTable_NextAddressRange
-#define Cix_PyDict_LoadGlobal _PyDict_LoadGlobal
 #define Cix_PyThreadState_PushFrame _PyThreadState_PushFrame
-#define Cix_PyThreadState_PopFrame _PyThreadState_PopFrame
 #define Cix_PyFrame_ClearExceptCode _PyFrame_ClearExceptCode
 #define Cix_PyTypeAlias_Type _PyTypeAlias_Type
 
@@ -211,11 +214,6 @@ PyObject* Cix_PyAsyncGenValueWrapperNew(PyObject*);
 PyObject* Cix_compute_cr_origin(
     int origin_depth,
     _PyInterpreterFrame* current_frame);
-
-PyObject* Cix_PyDict_LoadGlobal(
-    PyDictObject* globals,
-    PyDictObject* builtins,
-    PyObject* key);
 
 int Cix_PyObjectDict_SetItem(
     PyTypeObject* tp,
@@ -264,10 +262,6 @@ _PyInterpreterFrame* Cix_PyThreadState_PushFrame(
     PyThreadState* tstate,
     size_t size);
 
-void Cix_PyThreadState_PopFrame(
-    PyThreadState* tstate,
-    _PyInterpreterFrame* frame);
-
 void Cix_PyFrame_ClearExceptCode(_PyInterpreterFrame* frame);
 
 #if PY_VERSION_HEX < 0x030F0000
@@ -314,6 +308,11 @@ extern _PyFrameEvalFunction Ci_EvalFrameFunc;
 #endif
 
 int init_upstream_borrow(void);
+
+// Function pointer for CPython's _Py_slot_tp_getattr_hook, which is installed
+// as tp_getattro when a class defines __getattr__. Discovered at init time
+// by creating a temporary class with __getattr__.
+extern getattrofunc Ci_tp_getattr_hook;
 
 #ifdef __cplusplus
 } // extern "C"

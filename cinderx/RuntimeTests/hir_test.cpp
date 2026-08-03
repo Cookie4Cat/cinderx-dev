@@ -3,20 +3,17 @@
 #include "cinderx/python.h"
 
 #include <gtest/gtest.h>
-#include <initializer_list>
-#include <string>
-#include <utility>
-
-#include <vector>
 
 #include "cinderx/Common/code.h"
 #include "cinderx/Common/ref.h"
+#include "cinderx/Common/util.h"
 #include "cinderx/Interpreter/cinder_opcode.h"
 #include "cinderx/Jit/bytecode.h"
 #include "cinderx/Jit/compiler.h"
 #include "cinderx/Jit/config.h"
 #include "cinderx/Jit/hir/builder.h"
 #include "cinderx/Jit/hir/hir.h"
+#include "cinderx/Jit/hir/inliner.h"
 #include "cinderx/Jit/hir/parser.h"
 #include "cinderx/Jit/hir/phi_elimination.h"
 #include "cinderx/Jit/hir/printer.h"
@@ -25,6 +22,11 @@
 #include "cinderx/Jit/jit_rt.h"
 #include "cinderx/Jit/pyjit.h"
 #include "cinderx/RuntimeTests/fixtures.h"
+
+#include <initializer_list>
+#include <string>
+#include <utility>
+#include <vector>
 
 extern "C" {
 #if PY_VERSION_HEX >= 0x030C0000
@@ -761,18 +763,27 @@ class HIRBuildTest : public RuntimeTest {
 
   std::unique_ptr<Function> build_specialized_source(
       const char* src,
-      int specialized_opcode,
+      std::initializer_list<int> specialized_opcodes,
       int backedge_opcode = 0) {
     Ref<PyFunctionObject> func(compileAndGet(src, "test"));
     PyCodeObject* code = reinterpret_cast<PyCodeObject*>(func->func_code);
 
-    replaceFirstOpcode(
-        code, unspecialize(specialized_opcode), specialized_opcode);
+    for (int specialized_opcode : specialized_opcodes) {
+      replaceFirstOpcode(
+          code, unspecialize(specialized_opcode), specialized_opcode);
+    }
     if (backedge_opcode != 0) {
       replaceFirstOpcode(code, JUMP_BACKWARD, backedge_opcode);
     }
 
     return buildHIR(func);
+  }
+
+  std::unique_ptr<Function> build_specialized_source(
+      const char* src,
+      int specialized_opcode,
+      int backedge_opcode = 0) {
+    return build_specialized_source(src, {specialized_opcode}, backedge_opcode);
   }
 
  private:
@@ -2392,10 +2403,36 @@ def replace_descriptor():
 #endif
 
 #if PY_VERSION_HEX >= 0x030C0000
-TEST_F(HIRBuildTest, NoBackedgeSpecializedIntBinaryOpSkipsLongExactGuards) {
+TEST_F(
+    HIRBuildTest,
+    SingleOpNumericLeafSpecializedIntBinaryOpSkipsLongExactGuards) {
   std::unique_ptr<Function> irfunc = build_specialized_source(
       "def test(a, b):\n"
       "    return a + b\n",
+      BINARY_OP_ADD_INT);
+
+  std::string hir = fullPrinter().ToString(*irfunc);
+  EXPECT_EQ(countSubstring(hir, "GuardType<LongExact>"), 0);
+}
+
+TEST_F(
+    HIRBuildTest,
+    MultiOpNumericLeafSpecializedIntBinaryOpKeepsLongExactGuards) {
+  std::unique_ptr<Function> irfunc = build_specialized_source(
+      "def test(a, b):\n"
+      "    return (a + b) * (a - b)\n",
+      {BINARY_OP_ADD_INT, BINARY_OP_MULTIPLY_FLOAT, BINARY_OP_SUBTRACT_FLOAT});
+
+  std::string hir = fullPrinter().ToString(*irfunc);
+  EXPECT_EQ(countSubstring(hir, "GuardType<LongExact>"), 2);
+}
+
+TEST_F(
+    HIRBuildTest,
+    NoBackedgeAttributeSpecializedIntBinaryOpSkipsLongExactGuards) {
+  std::unique_ptr<Function> irfunc = build_specialized_source(
+      "def test(a, b):\n"
+      "    return a.x + b.x\n",
       BINARY_OP_ADD_INT);
 
   std::string hir = fullPrinter().ToString(*irfunc);
@@ -2421,6 +2458,18 @@ TEST_F(HIRBuildTest, NoBackedgeSpecializedIntCompareSkipsLongExactGuards) {
 
   std::string hir = fullPrinter().ToString(*irfunc);
   EXPECT_EQ(countSubstring(hir, "GuardType<LongExact>"), 0);
+}
+
+TEST_F(
+    HIRBuildTest,
+    MultiOpNumericLeafSpecializedIntCompareKeepsLongExactGuards) {
+  std::unique_ptr<Function> irfunc = build_specialized_source(
+      "def test(a, b, c, d):\n"
+      "    return (a + b) < (c + d)\n",
+      {BINARY_OP_ADD_FLOAT, BINARY_OP_ADD_FLOAT, COMPARE_OP_INT});
+
+  std::string hir = fullPrinter().ToString(*irfunc);
+  EXPECT_EQ(countSubstring(hir, "GuardType<LongExact>"), 2);
 }
 
 TEST_F(HIRBuildTest, BackedgeSpecializedIntCompareKeepsLongExactGuards) {
@@ -2785,6 +2834,49 @@ def f():
   EXPECT_TRUE(isIntEquals(call_result2, 2));
 }
 
+TEST_F(CppInlinerTest, ColdCallThresholdZeroDoesNotPruneAll) {
+  struct RestoreFlag {
+    size_t old_value;
+    ~RestoreFlag() {
+      getMutableConfig().inliner_cold_call_threshold = old_value;
+    }
+  } restore{getConfig().inliner_cold_call_threshold};
+
+  // Setting threshold to 0 should disable pruning, not prune everything.
+  getMutableConfig().inliner_cold_call_threshold = 0;
+
+  const char* pycode = R"(
+def foo():
+    return 4
+
+def test():
+    return foo()
+)";
+  std::unique_ptr<Function> irfunc;
+  ASSERT_NO_FATAL_FAILURE(CompileToHIR(pycode, "test", irfunc));
+  ASSERT_NE(irfunc, nullptr);
+
+  // Run the inliner; should not crash or throw.
+  InlineFunctionCalls inliner;
+  EXPECT_NO_THROW(inliner.Run(*irfunc));
+}
+
+TEST_F(CppInlinerTest, CallFuncWithKeywordArgs) {
+  const char* pycode = R"(
+def f(a, b, c=3):
+    return a + b + c
+
+def test():
+    return f(1, b=2)
+)";
+  Ref<PyObject> pyfunc(compileAndGet(pycode, "test"));
+  ASSERT_NE(pyfunc, nullptr);
+  auto empty_tuple = Ref<>::steal(PyTuple_New(0));
+  auto result = Ref<>::steal(PyObject_Call(pyfunc, empty_tuple, nullptr));
+  ASSERT_NE(result, nullptr);
+  EXPECT_TRUE(isIntEquals(result, 6));
+}
+
 class HIRCloneTest : public RuntimeTest {};
 
 TEST_F(HIRCloneTest, CanCloneInstrs) {
@@ -2959,6 +3051,7 @@ TEST_F(HIRBuildTest, MatchMapping) {
   uint8_t bc[] = {LOAD_FAST, 0, MATCH_MAPPING, 0, RETURN_VALUE, 0};
   std::unique_ptr<Function> irfunc = build_test(bc, {Py_None});
 
+#if PY_VERSION_HEX >= 0x030E0000
   const char* expected = R"(fun jittestmodule:funcname {
   bb 0 {
     v0 = LoadArg<0; "param0">
@@ -2996,6 +3089,45 @@ TEST_F(HIRBuildTest, MatchMapping) {
   }
 }
 )";
+#elif PY_VERSION_HEX >= 0x030C0000
+  const char* expected = R"(fun jittestmodule:funcname {
+  bb 0 {
+    v0 = LoadArg<0; "param0">
+    v1 = LoadCurrentFunc
+    LoadFrame
+    Snapshot {
+      CurInstrOffset 0
+      Locals<1> v0
+    }
+    v2 = LoadField<ob_type@8, Type, borrowed> v0
+    v3 = LoadField<tp_flags@168, CUInt64, borrowed> v2
+    v4 = LoadConst<CUInt64[64]>
+    v5 = IntBinaryOp<And> v3 v4
+    CondBranch<1, 2> v5
+  }
+
+  bb 1 (preds 0) {
+    v6 = LoadConst<ImmortalBool[True]>
+    Branch<3>
+  }
+
+  bb 2 (preds 0) {
+    v6 = LoadConst<ImmortalBool[False]>
+    Branch<3>
+  }
+
+  bb 3 (preds 1, 2) {
+    Snapshot {
+      CurInstrOffset 4
+      Locals<1> v0
+      Stack<2> v0 v6
+    }
+    v2 = Assign v0
+    Return v6
+  }
+}
+)";
+#endif
   EXPECT_EQ(fullPrinter().ToString(*(irfunc)), expected);
 }
 
@@ -3003,6 +3135,7 @@ TEST_F(HIRBuildTest, MatchSequence) {
   uint8_t bc[] = {LOAD_FAST, 0, MATCH_SEQUENCE, 0, RETURN_VALUE, 0};
   std::unique_ptr<Function> irfunc = build_test(bc, {Py_None});
 
+#if PY_VERSION_HEX >= 0x030E0000
   const char* expected = R"(fun jittestmodule:funcname {
   bb 0 {
     v0 = LoadArg<0; "param0">
@@ -3040,6 +3173,45 @@ TEST_F(HIRBuildTest, MatchSequence) {
   }
 }
 )";
+#elif PY_VERSION_HEX >= 0x030C0000
+  const char* expected = R"(fun jittestmodule:funcname {
+  bb 0 {
+    v0 = LoadArg<0; "param0">
+    v1 = LoadCurrentFunc
+    LoadFrame
+    Snapshot {
+      CurInstrOffset 0
+      Locals<1> v0
+    }
+    v2 = LoadField<ob_type@8, Type, borrowed> v0
+    v3 = LoadField<tp_flags@168, CUInt64, borrowed> v2
+    v4 = LoadConst<CUInt64[32]>
+    v5 = IntBinaryOp<And> v3 v4
+    CondBranch<1, 2> v5
+  }
+
+  bb 1 (preds 0) {
+    v6 = LoadConst<ImmortalBool[True]>
+    Branch<3>
+  }
+
+  bb 2 (preds 0) {
+    v6 = LoadConst<ImmortalBool[False]>
+    Branch<3>
+  }
+
+  bb 3 (preds 1, 2) {
+    Snapshot {
+      CurInstrOffset 4
+      Locals<1> v0
+      Stack<2> v0 v6
+    }
+    v2 = Assign v0
+    Return v6
+  }
+}
+)";
+#endif
   EXPECT_EQ(fullPrinter().ToString(*(irfunc)), expected);
 }
 
@@ -3175,7 +3347,6 @@ TEST_F(HIRBuildTest, ListToTuple) {
   EXPECT_EQ(fullPrinter().ToString(*(irfunc)), expected);
 }
 
-#ifdef BINARY_OP_SUBSCR_DICT
 TEST_F(HIRBuildTest, BinaryOpSubscrDictSpecializationGuards) {
   const char* src = R"(
 def test(container, key):
@@ -3192,9 +3363,7 @@ for _ in range(100):
   EXPECT_NE(hir.find("GuardType<DictExact>"), std::string::npos) << hir;
   EXPECT_NE(hir.find("BinaryOp<Subscript>"), std::string::npos) << hir;
 }
-#endif
 
-#ifdef BINARY_OP_SUBSCR_LIST_INT
 TEST_F(HIRBuildTest, BinaryOpSubscrListIntSpecializationGuards) {
   const char* src = R"(
 def test(container, index):
@@ -3212,9 +3381,7 @@ for _ in range(100):
   EXPECT_NE(hir.find("GuardType<LongExact>"), std::string::npos) << hir;
   EXPECT_NE(hir.find("BinaryOp<Subscript>"), std::string::npos) << hir;
 }
-#endif
 
-#ifdef BINARY_OP_SUBSCR_TUPLE_INT
 TEST_F(HIRBuildTest, BinaryOpSubscrTupleIntSpecializationGuards) {
   const char* src = R"(
 def test(container, index):
@@ -3232,7 +3399,24 @@ for _ in range(100):
   EXPECT_NE(hir.find("GuardType<LongExact>"), std::string::npos) << hir;
   EXPECT_NE(hir.find("BinaryOp<Subscript>"), std::string::npos) << hir;
 }
-#endif
+
+TEST_F(HIRBuildTest, StoreSubscrListIntSpecializationGuards) {
+  const char* src = R"(
+def test(container, index, value):
+    container[index] = value
+
+for _ in range(100):
+    test(["a", "b"], 0, "c")
+)";
+  Ref<PyFunctionObject> func(compileAndGet(src, "test"));
+  ASSERT_NE(func.get(), nullptr);
+
+  std::unique_ptr<Function> irfunc(buildHIR(func));
+  const std::string hir = fullPrinter().ToString(*irfunc);
+  EXPECT_NE(hir.find("GuardType<ListExact>"), std::string::npos) << hir;
+  EXPECT_NE(hir.find("GuardType<LongExact>"), std::string::npos) << hir;
+  EXPECT_NE(hir.find("StoreSubscr"), std::string::npos) << hir;
+}
 
 TEST_F(HIRBuildTest, LoadFastAndClear) {
   uint8_t bc[] = {
@@ -3290,13 +3474,8 @@ def test():
     }
   }
 
-#ifdef Py_GIL_DISABLED
-  EXPECT_TRUE(found_at_quiescent_state)
-      << "AtQuiescentState should be present in free-threaded builds";
-#else
-  EXPECT_FALSE(found_at_quiescent_state)
-      << "AtQuiescentState should not be present in non-free-threaded builds";
-#endif
+  EXPECT_EQ(found_at_quiescent_state, kFreeThreadedBuild)
+      << "AtQuiescentState presence should match the build mode";
 }
 
 class HIRBuilderExtendedTest : public RuntimeTest {
@@ -3342,7 +3521,6 @@ def add(a, b):
   auto irfunc = buildHIR(func);
   ASSERT_NE(irfunc, nullptr);
 }
-
 TEST_F(HIRBuilderExtendedTest, BuildFuncWithCompare) {
   const char* py_src = R"(
 def cmp(a, b):

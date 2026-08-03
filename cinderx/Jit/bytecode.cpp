@@ -164,15 +164,9 @@ int BytecodeInstruction::specializedOpcode() const {
     case BINARY_SUBSCR_DICT:
     case BINARY_SUBSCR_LIST_INT:
     case BINARY_SUBSCR_TUPLE_INT:
-#ifdef BINARY_OP_SUBSCR_DICT
     case BINARY_OP_SUBSCR_DICT:
-#endif
-#ifdef BINARY_OP_SUBSCR_LIST_INT
     case BINARY_OP_SUBSCR_LIST_INT:
-#endif
-#ifdef BINARY_OP_SUBSCR_TUPLE_INT
     case BINARY_OP_SUBSCR_TUPLE_INT:
-#endif
     case COMPARE_OP_FLOAT:
     case COMPARE_OP_INT:
     case COMPARE_OP_STR:
@@ -187,6 +181,7 @@ int BytecodeInstruction::specializedOpcode() const {
     case LOAD_ATTR_MODULE:
     case STORE_ATTR_SLOT:
     case STORE_SUBSCR_DICT:
+    case STORE_SUBSCR_LIST_INT:
     case UNPACK_SEQUENCE_LIST:
     case UNPACK_SEQUENCE_TUPLE:
     case UNPACK_SEQUENCE_TWO_TUPLE:
@@ -247,6 +242,10 @@ bool BytecodeInstruction::isBranch() const {
     default:
       return false;
   }
+}
+
+bool BytecodeInstruction::isBackwardBranch() const {
+  return isBranch() && getJumpTarget() <= baseOffset();
 }
 
 bool BytecodeInstruction::isReturn() const {

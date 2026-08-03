@@ -46,7 +46,7 @@ static inline Ref<> runInInterpreterViaReify(
   PyThreadState* tstate = PyThreadState_Get();
   BorrowedRef<PyCodeObject> code = PyFunction_GetCode(func);
   _PyInterpreterFrame* interp_frame =
-      Cix_PyThreadState_PushFrame(tstate, jit::jitFrameGetSize(code));
+      Cix_PyThreadState_PushFrame(tstate, code->co_framesize);
   jit::jitFrameInit(
       tstate,
       interp_frame,
@@ -56,10 +56,10 @@ static inline Ref<> runInInterpreterViaReify(
       FRAME_OWNED_BY_THREAD,
       nullptr,
       makeFrameReifier(code));
-  if (getConfig().frame_mode == FrameMode::kLightweight) {
-    jit::jitFramePopulateFrame(interp_frame);
-    jit::jitFrameRemoveReifier(interp_frame);
-  }
+#ifdef ENABLE_LIGHTWEIGHT_FRAMES
+  jit::jitFramePopulateFrame(interp_frame);
+  jit::jitFrameRemoveReifier(interp_frame);
+#endif
   reifyFrame(interp_frame, dm, dfm, regs);
   // If we're at the start of the function, push IP past RESUME instruction
 #if PY_VERSION_HEX >= 0x030E0000
@@ -439,7 +439,8 @@ class DeoptStressTest : public RuntimeTest {
     Context* ngen_ctx = getContext();
     auto pyfunc = reinterpret_cast<PyFunctionObject*>(funcobj.get());
     while (!guards.empty()) {
-      NativeGenerator gen(irfunc.get());
+      NativeGeneratorFactory factory;
+      NativeGenerator gen(irfunc.get(), factory);
       auto jitfunc = reinterpret_cast<vectorcallfunc>(gen.getVectorcallEntry());
       ASSERT_NE(jitfunc, nullptr);
       ngen_ctx->setGuardFailureCallback(delete_one_deopt);
@@ -526,7 +527,8 @@ class DeoptStressTest : public RuntimeTest {
     // Recompile so we get the annotated disassembly
     bool old_dump_asm = true;
     std::swap(jit::getMutableConfig().log.dump_asm, old_dump_asm);
-    NativeGenerator gen(&irfunc);
+    NativeGeneratorFactory factory;
+    NativeGenerator gen(&irfunc, factory);
     gen.getVectorcallEntry();
     jit::getMutableConfig().log.dump_asm = old_dump_asm;
     std::cerr << '\n';

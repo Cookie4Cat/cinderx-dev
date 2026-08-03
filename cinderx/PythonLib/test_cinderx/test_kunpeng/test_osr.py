@@ -82,6 +82,7 @@ def _clean_env():
 def _run_scenario(scenario):
     env = _clean_env()
     env.update(scenario.env)
+    env.setdefault("PYTHONJITLIGHTWEIGHTFRAME", "0")
     env["PYTHONUNBUFFERED"] = "1"
 
     with tempfile.TemporaryDirectory(prefix=f"kunpeng-osr-{scenario.name}-") as cwd:

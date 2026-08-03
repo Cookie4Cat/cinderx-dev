@@ -11,14 +11,21 @@
 #include "cinderx/UpstreamBorrow/borrowed.h" // @donotremove
 #include "cinderx/module_state.h"
 
+#include <utility>
+
 #ifdef ENABLE_ZLIB
 #include <zlib.h>
 #endif
 
 #include "cpython/code.h"
 
-namespace jit {
-static std::string fullnameImpl(PyObject* module, PyObject* qualname) {
+namespace {
+
+CodeExtra* codeExtraIfPresent(BorrowedRef<PyCodeObject> code) {
+  return codeExtraIfExists(code);
+}
+
+std::string fullnameImpl(PyObject* module, PyObject* qualname) {
   auto safe_str = [](BorrowedRef<> str) {
     if (str == nullptr || !PyUnicode_Check(str)) {
       return "<invalid>";
@@ -27,6 +34,10 @@ static std::string fullnameImpl(PyObject* module, PyObject* qualname) {
   };
   return fmt::format("{}:{}", safe_str(module), safe_str(qualname));
 }
+
+} // namespace
+
+namespace jit {
 
 std::string codeFullname(
     BorrowedRef<PyObject> module,
@@ -224,6 +235,11 @@ CodeExtra* codeExtra(PyCodeObject* code) {
   }
 
   return extra;
+}
+
+size_t codeCallCount(PyCodeObject* code) {
+  CodeExtra* extra = codeExtraIfPresent(code);
+  return extra != nullptr ? Ci_code_extra_get_calls(extra) : 0;
 }
 
 CodeExtra* codeExtraIfExists(PyCodeObject* code) {

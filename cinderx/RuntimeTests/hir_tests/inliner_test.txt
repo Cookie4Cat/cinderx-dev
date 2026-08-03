@@ -529,7 +529,7 @@ fun jittestmodule:test {
     }
     Snapshot
     v17:MortalTupleExact[tuple:0xdeadbeef] = LoadConst<MortalTupleExact[tuple:0xdeadbeef]>
-    v18:NoneType = ListExtend v16 v17 {
+    v18:ImmortalNoneType = ListExtend v16 v17 {
       FrameState {
         CurInstrOffset 6
         Locals<1> v12
@@ -619,7 +619,7 @@ fun jittestmodule:test {
     }
     Snapshot
     v17:MortalTupleExact[tuple:0xdeadbeef] = LoadConst<MortalTupleExact[tuple:0xdeadbeef]>
-    v18:NoneType = ListExtend v16 v17 {
+    v18:ImmortalNoneType = ListExtend v16 v17 {
       FrameState {
         CurInstrOffset 6
         Locals<1> v12
@@ -660,18 +660,16 @@ fun jittestmodule:test {
 
   bb 4 (preds 1, 5) {
     Snapshot
-    UseType<ListExact> v16
-    UseType<LongExact> v23
-    v47:CInt64[1] = LoadConst<CInt64[1]>
-    v48:CInt64[0] = LoadConst<CInt64[0]>
-    v44:CInt64 = CheckSequenceBounds v16 v47 {
-      FrameState {
-        CurInstrOffset 4
-        Locals<2> v16 v23
-      }
+    UseType<MortalListExact> v16
+    UseType<ImmortalLongExact[1]> v23
+    UseType<MortalListExact> v16
+    v42:CInt64 = LoadField<ob_size@16, CInt64, borrowed> v16
+    v43:CInt64[1] = LoadConst<CInt64[1]>
+    v44:CBool = PrimitiveCompare<LessThanUnsigned> v43 v42
+    Guard v44 {
     }
     v45:CPtr = LoadField<ob_item@24, CPtr, borrowed> v16
-    v46:Object = LoadArrayItem v45 v44 v16
+    v46:Object = LoadArrayItem v45 v43 v16
     Snapshot
     EndInlinedFunction
     Snapshot
@@ -710,7 +708,7 @@ fun jittestmodule:test {
     }
     Snapshot
     v17:MortalTupleExact[tuple:0xdeadbeef] = LoadConst<MortalTupleExact[tuple:0xdeadbeef]>
-    v18:NoneType = ListExtend v16 v17 {
+    v18:ImmortalNoneType = ListExtend v16 v17 {
       FrameState {
         CurInstrOffset 8
         Locals<1> v12
@@ -1763,7 +1761,7 @@ fun jittestmodule:test {
     v23:OptObject = StealCellItem v16
     SetCellItem v16 v22 v23
     Snapshot
-    v24:MortalTupleExact = MakeTuple<1> v16 {
+    v24:MortalTupleExact = MakeTuple<1> {
       FrameState {
         CurInstrOffset 10
         Locals<1> v15
@@ -1771,6 +1769,7 @@ fun jittestmodule:test {
         Stack<1> v16
       }
     }
+    InitTupleElements<1> v24 v16
     Snapshot
     v25:MortalCode["inside"] = LoadConst<MortalCode["inside"]>
     v26:Nullptr = LoadConst<Nullptr>
@@ -1834,7 +1833,7 @@ fun jittestmodule:test {
     v23:OptObject = StealCellItem v16
     SetCellItem v16 v22 v23
     Snapshot
-    v24:MortalTupleExact = MakeTuple<1> v16 {
+    v24:MortalTupleExact = MakeTuple<1> {
       FrameState {
         CurInstrOffset 10
         Locals<1> v15
@@ -1842,6 +1841,7 @@ fun jittestmodule:test {
         Stack<1> v16
       }
     }
+    InitTupleElements<1> v24 v16
     Snapshot
     v25:MortalCode["inside"] = LoadConst<MortalCode["inside"]>
     v26:Nullptr = LoadConst<Nullptr>
@@ -1906,7 +1906,7 @@ fun jittestmodule:test {
     v23:OptObject = StealCellItem v16
     SetCellItem v16 v22 v23
     Snapshot
-    v24:MortalTupleExact = MakeTuple<1> v16 {
+    v24:MortalTupleExact = MakeTuple<1> {
       FrameState {
         CurInstrOffset 12
         Locals<1> v15
@@ -1914,6 +1914,7 @@ fun jittestmodule:test {
         Stack<1> v16
       }
     }
+    InitTupleElements<1> v24 v16
     Snapshot
     v25:MortalCode["inside"] = LoadConst<MortalCode["inside"]>
     v26:Nullptr = LoadConst<Nullptr>
@@ -2408,7 +2409,7 @@ fun jittestmodule:test {
         Locals<1> v17
       }
     }
-    v25:Bool = PrimitiveBoxBool v24
+    v25:ImmortalBool = PrimitiveBoxBool v24
     Snapshot
     v26:ImmortalBool[True] = LoadConst<ImmortalBool[True]>
     CondBranch<1, 2> v24
@@ -2479,7 +2480,7 @@ fun jittestmodule:test {
         Locals<1> v33
       }
     }
-    v61:Bool = PrimitiveBoxBool v60
+    v61:ImmortalBool = PrimitiveBoxBool v60
     Snapshot
     v62:ImmortalBool[True] = LoadConst<ImmortalBool[True]>
     CondBranch<6, 7> v60

@@ -422,6 +422,7 @@ bool Instr::isReplayable() const {
     case Opcode::kUnicodeCompare:
     case Opcode::kUnicodeConcat:
     case Opcode::kUnicodeSubscr:
+    case Opcode::kUseObj:
     case Opcode::kUseType:
     case Opcode::kWaitHandleLoadCoroOrResult:
     case Opcode::kWaitHandleLoadWaiter: {
@@ -497,6 +498,8 @@ bool Instr::isReplayable() const {
     case Opcode::kLoadStackTop:
     case Opcode::kLongBinaryOp:
     case Opcode::kLongInPlaceOp:
+    case Opcode::kInitListElements:
+    case Opcode::kInitTupleElements:
     case Opcode::kMakeCell:
     case Opcode::kMakeCheckedDict:
     case Opcode::kMakeCheckedList:
@@ -656,8 +659,9 @@ Register* const* Instr::operands() const {
 Register*& Instr::operandAt(std::size_t i) {
   JIT_DCHECK(
       i < NumOperands(),
-      "operand {} out of range (max is {})",
+      "Operand {} out of range for {} (max is {})",
       i,
+      opname(),
       NumOperands() - 1);
   return operands()[i];
 }
@@ -704,6 +708,7 @@ bool isPassthrough(const Instr& instr) {
     case Opcode::kGuardIs:
     case Opcode::kGuardType:
     case Opcode::kRefineType:
+    case Opcode::kUseObj:
     case Opcode::kUseType:
       return true;
 
@@ -865,6 +870,8 @@ bool isPassthrough(const Instr& instr) {
     case Opcode::kHintType:
     case Opcode::kIncref:
     case Opcode::kInitFrameCellVars:
+    case Opcode::kInitListElements:
+    case Opcode::kInitTupleElements:
     case Opcode::kRaise:
     case Opcode::kRaiseAwaitableError:
     case Opcode::kRaiseStatic:

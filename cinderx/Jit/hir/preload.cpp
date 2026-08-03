@@ -5,6 +5,7 @@
 #include "cinderx/Common/code.h"
 #include "cinderx/Common/dict.h"
 #include "cinderx/Common/extra-py-flags.h"
+#include "cinderx/Common/log.h"
 #include "cinderx/Common/util.h"
 #include "cinderx/Interpreter/cinder_opcode.h"
 #include "cinderx/Jit/bytecode.h"
@@ -26,7 +27,7 @@ namespace jit::hir {
 
 namespace {
 
-static OwnedType resolve_type_descr(BorrowedRef<> descr) {
+OwnedType resolve_type_descr(BorrowedRef<> descr) {
   int optional, exact;
   auto type = Ref<PyTypeObject>::steal(
       _PyClassLoader_ResolveType(descr, &optional, &exact));
@@ -35,11 +36,11 @@ static OwnedType resolve_type_descr(BorrowedRef<> descr) {
       std::move(type), static_cast<bool>(optional), static_cast<bool>(exact)};
 }
 
-static FieldInfo resolve_field_descr(BorrowedRef<PyTupleObject> descr) {
+FieldInfo resolve_field_descr(BorrowedRef<PyTupleObject> descr) {
   int field_type;
   Py_ssize_t offset = _PyClassLoader_ResolveFieldOffset(descr, &field_type);
 
-  JIT_CHECK(offset != -1, "failed to resolve field {}", repr(descr));
+  JIT_THROW_IF(offset == -1, "Failed to resolve field {}", repr(descr));
 
   return {
       offset,
@@ -47,9 +48,9 @@ static FieldInfo resolve_field_descr(BorrowedRef<PyTupleObject> descr) {
       PyTuple_GET_ITEM(descr, PyTuple_GET_SIZE(descr) - 1)};
 }
 
-static void _fill_primitive_arg_types_helper(
+void _fill_primitive_arg_types_helper(
     BorrowedRef<_PyTypedArgsInfo> prim_args_info,
-    ArgToType& map) {
+    ArgTypeMap& map) {
   for (Py_ssize_t i = 0; i < Py_SIZE(prim_args_info.get()); i++) {
     map.emplace(
         prim_args_info->tai_args[i].tai_argnum,
@@ -57,30 +58,39 @@ static void _fill_primitive_arg_types_helper(
   }
 }
 
-static void fill_primitive_arg_types_func(
+void fill_primitive_arg_types_func(
     BorrowedRef<PyFunctionObject> func,
-    ArgToType& map) {
+    ArgTypeMap& map) {
   auto prim_args_info =
       Ref<_PyTypedArgsInfo>::steal(_PyClassLoader_GetTypedArgsInfo(
           reinterpret_cast<PyCodeObject*>(func->func_code), 1));
+  JIT_THROW_IF(
+      prim_args_info == nullptr,
+      "Failed to load primitive argument type information for function {}",
+      funcFullname(func));
   _fill_primitive_arg_types_helper(prim_args_info, map);
 }
 
-static void fill_primitive_arg_types_thunk(
+void fill_primitive_arg_types_thunk(
     BorrowedRef<PyObject> thunk,
-    ArgToType& map,
+    ArgTypeMap& map,
     PyObject* container) {
   auto prim_args_info = Ref<_PyTypedArgsInfo>::steal(
       _PyClassLoader_GetTypedArgsInfoFromThunk(thunk, container, 1));
+  JIT_THROW_IF(
+      prim_args_info == nullptr,
+      "Failed to load primitive argument type information for thunk {}",
+      repr(thunk));
 
   _fill_primitive_arg_types_helper(prim_args_info, map);
 }
 
-static void fill_primitive_arg_types_builtin(
-    BorrowedRef<> callable,
-    ArgToType& map) {
+void fill_primitive_arg_types_builtin(BorrowedRef<> callable, ArgTypeMap& map) {
   Ci_PyTypedMethodDef* def = _PyClassLoader_GetTypedMethodDef(callable);
-  JIT_CHECK(def != nullptr, "expected typed method def");
+  JIT_THROW_IF(
+      def == nullptr,
+      "Failed to load typed method def from {} object",
+      Py_TYPE(callable)->tp_name);
   for (Py_ssize_t i = 0; def->tmd_sig[i] != nullptr; i++) {
     const Ci_Py_SigElement* elem = def->tmd_sig[i];
     int code = Ci_Py_SIG_TYPE_MASK(elem->se_argtype);
@@ -92,7 +102,7 @@ static void fill_primitive_arg_types_builtin(
 }
 
 #ifndef WIN32
-static std::unique_ptr<NativeTarget> resolve_native_target(
+std::unique_ptr<NativeTarget> resolve_native_target(
     BorrowedRef<> native_descr,
     BorrowedRef<> signature) {
   auto target = std::make_unique<NativeTarget>();
@@ -100,8 +110,11 @@ static std::unique_ptr<NativeTarget> resolve_native_target(
       PyTuple_GET_ITEM(native_descr.get(), 0),
       PyTuple_GET_ITEM(native_descr.get(), 1));
 
-  JIT_CHECK(
-      raw_ptr != nullptr, "invalid address for native function: {}", raw_ptr);
+  JIT_THROW_IF(
+      raw_ptr == nullptr,
+      "Invalid address {} for native function descr {}",
+      raw_ptr,
+      repr(native_descr));
 
   target->callable = raw_ptr;
 
@@ -109,18 +122,22 @@ static std::unique_ptr<NativeTarget> resolve_native_target(
   auto return_type_code = _PyClassLoader_ResolvePrimitiveType(
       PyTuple_GET_ITEM(signature.get(), siglen - 1));
   target->return_type = prim_type_to_type(return_type_code);
-  JIT_DCHECK(
-      target->return_type <= TCInt,
-      "native function return type must be a primitive");
+  JIT_THROW_IF(
+      !(target->return_type <= TCInt),
+      "Native function return type must be a primitive int, got {}",
+      target->return_type);
 
   // Fill in the primitive arg type map in the target (index -> Type)
-  ArgToType& primitive_arg_types = target->primitive_arg_types;
+  ArgTypeMap& primitive_arg_types = target->primitive_arg_types;
   for (Py_ssize_t i = 0; i < siglen - 1; i++) {
     int arg_type_code = _PyClassLoader_ResolvePrimitiveType(
         PyTuple_GET_ITEM(signature.get(), i));
     Type typ = prim_type_to_type(arg_type_code);
-    JIT_DCHECK(typ <= TCInt, "native function arg type must be a primitive");
-
+    JIT_THROW_IF(
+        !(typ <= TCInt),
+        "Native function argument {} must be a primitive int, got {}",
+        i,
+        typ);
     primitive_arg_types.emplace(i, typ);
   }
 
@@ -257,120 +274,68 @@ std::optional<OwnedType> infer_method_self_type_candidate(
 
 } // namespace
 
-std::unique_ptr<InvokeTarget> Preloader::resolve_target_descr(
-    BorrowedRef<> descr,
-    int opcode) {
-  auto target = std::make_unique<InvokeTarget>();
-  PyObject* container;
-  auto callable =
-      Ref<>::steal(_PyClassLoader_ResolveFunction(descr, &container));
-  if (callable == nullptr) {
-    JIT_LOG(
-        "unknown invoke target {} during preloading {}",
-        repr(descr),
-        fullname());
+std::unique_ptr<Preloader> Preloader::make(
+    BorrowedRef<PyFunctionObject> func,
+    Ref<> reifier) {
+  return Preloader::make(
+      func->func_code,
+      func->func_builtins,
+      func->func_globals,
+      AnnotationIndex::from_function(func),
+      funcFullname(func),
+      std::move(reifier));
+}
+
+std::unique_ptr<Preloader> Preloader::make(
+    BorrowedRef<PyCodeObject> code,
+    BorrowedRef<PyDictObject> builtins,
+    BorrowedRef<PyDictObject> globals,
+    std::unique_ptr<AnnotationIndex> annotations,
+    const std::string& fullname,
+    Ref<> reifier) {
+  auto preloader = std::unique_ptr<Preloader>(new Preloader(
+      code,
+      builtins,
+      globals,
+      std::move(annotations),
+      fullname,
+      std::move(reifier)));
+  bool success = preloader->preload();
+  JIT_THROW_IF(
+      success == static_cast<bool>(PyErr_Occurred()),
+      "Expecting Python exception only when preloading fails, preloading "
+      "result: {}",
+      success);
+  if (!success) {
     return nullptr;
   }
-
-  int optional, exact, func_flags;
-  auto return_pytype =
-      Ref<PyTypeObject>::steal(_PyClassLoader_ResolveReturnType(
-          callable, &optional, &exact, &func_flags));
-
-  target->container_is_immutable = _PyClassLoader_IsImmutable(container);
-  if (return_pytype != nullptr) {
-    if (func_flags & Ci_FUNC_FLAGS_COROUTINE) {
-      // TODO properly handle coroutine returns awaitable type
-      target->return_type = TObject;
-    } else {
-      OwnedType preloaded_type{
-          std::move(return_pytype),
-          static_cast<bool>(optional),
-          static_cast<bool>(exact)};
-      target->return_type = preloaded_type.toHir();
-    }
-  }
-  target->is_statically_typed = _PyClassLoader_IsStaticCallable(callable);
-  PyMethodDef* def;
-  Ci_PyTypedMethodDef* tmd;
-  bool is_thunk = false;
-  if (PyFunction_Check(callable)) {
-    target->is_function = true;
-  } else if (_PyClassLoader_IsPatchedThunk(callable)) {
-    is_thunk = true;
-  } else if ((def = _PyClassLoader_GetMethodDef(callable)) != nullptr) {
-    target->is_builtin = true;
-    target->builtin_c_func = reinterpret_cast<void*>(def->ml_meth);
-    if (def->ml_flags == METH_NOARGS) {
-      target->builtin_expected_nargs = 1;
-    } else if (def->ml_flags == METH_O) {
-      target->builtin_expected_nargs = 2;
-    } else if ((tmd = _PyClassLoader_GetTypedMethodDef(callable))) {
-      target->builtin_returns_error_code = (tmd->tmd_ret == Ci_Py_SIG_ERROR);
-      target->builtin_returns_void = (tmd->tmd_ret == Ci_Py_SIG_VOID);
-      target->builtin_c_func = tmd->tmd_meth;
-    }
-  }
-  target->callable = std::move(callable);
-
-  if (opcode == LOAD_METHOD_STATIC) {
-    target->slot = _PyClassLoader_ResolveMethod(descr);
-    JIT_CHECK(target->slot != -1, "method lookup failed: {}", repr(descr));
-  } else { // the rest of this only used by INVOKE_FUNCTION currently
-    if (!target->container_is_immutable) {
-      target->indirect_ptr = _PyClassLoader_ResolveIndirectPtr(descr);
-      if (target->indirect_ptr == nullptr) {
-        if (PyErr_Occurred()) {
-          PyErr_WriteUnraisable(descr);
-        }
-        JIT_ABORT("indirect_ptr null for {} (stale bytecode?)", repr(descr));
-      }
-    }
-  }
-
-  if (target->is_statically_typed) {
-    if (target->is_function) {
-      fill_primitive_arg_types_func(
-          target->func(), target->primitive_arg_types);
-    } else {
-      fill_primitive_arg_types_builtin(
-          target->callable, target->primitive_arg_types);
-    }
-  }
-
-  if (is_thunk) {
-    fill_primitive_arg_types_thunk(
-        target->callable.get(), target->primitive_arg_types, container);
-  }
-
-  return target;
+#if defined(CINDER_AARCH64)
+  preloader->setOSREntryTargetOffsets(collectBackedgeTargetOffsets(code));
+#endif
+  return preloader;
 }
 
 BorrowedRef<PyFunctionObject> InvokeTarget::func() const {
-  JIT_CHECK(is_function, "not a PyFunctionObject");
+  JIT_THROW_IF(!isFunction(), "InvokeTarget is not a PyFunctionObject");
   return reinterpret_cast<PyFunctionObject*>(callable.get());
 }
 
-Type Preloader::type(BorrowedRef<> descr) const {
-  return preloadedType(descr).toHir();
+bool InvokeTarget::isBuiltin() const {
+  return builtin_c_func != nullptr;
 }
 
-int Preloader::primitiveTypecode(BorrowedRef<> descr) const {
-  return _PyClassLoader_GetTypeCode(pyType(descr));
+bool InvokeTarget::isFunction() const {
+  return PyFunction_Check(callable);
 }
 
-BorrowedRef<PyTypeObject> Preloader::pyType(BorrowedRef<> descr) const {
-  auto const& preloader_type = preloadedType(descr);
-  JIT_CHECK(!preloader_type.optional, "unexpected optional type");
-  return preloader_type.type;
+const OwnedType* Preloader::preloadedType(BorrowedRef<> descr) const {
+  auto it = types_.find(descr);
+  return it != types_.end() ? &it->second : nullptr;
 }
 
-const OwnedType& Preloader::preloadedType(BorrowedRef<> descr) const {
-  return map_get(types_, descr);
-}
-
-const FieldInfo& Preloader::fieldInfo(BorrowedRef<> descr) const {
-  return map_get(fields_, descr);
+const FieldInfo* Preloader::fieldInfo(BorrowedRef<> descr) const {
+  auto it = fields_.find(descr);
+  return it != fields_.end() ? &it->second : nullptr;
 }
 
 const InvokeTarget& Preloader::invokeFunctionTarget(BorrowedRef<> descr) const {
@@ -385,8 +350,18 @@ const NativeTarget& Preloader::invokeNativeTarget(BorrowedRef<> target) const {
   return *(map_get(native_targets_, target));
 }
 
-Type Preloader::checkArgType(long local_idx) const {
-  return map_get(check_arg_types_, local_idx, TObject);
+const DescrMap<std::unique_ptr<InvokeTarget>>&
+Preloader::invokeFunctionTargets() const {
+  return func_targets_;
+}
+
+const GlobalNamesMap& Preloader::globalNames() const {
+  return global_names_;
+}
+
+Type Preloader::checkArgType(int local_idx) const {
+  auto it = check_arg_types_.find(local_idx);
+  return it != check_arg_types_.end() ? it->second.toHir() : TObject;
 }
 
 std::optional<Type> Preloader::inferredSelfType() const {
@@ -397,10 +372,15 @@ std::optional<Type> Preloader::inferredSelfType() const {
 }
 
 PyObject** Preloader::getGlobalCache(BorrowedRef<> name_obj) const {
-  JIT_DCHECK(
-      canCacheGlobals(),
-      "trying to get a globals cache with unwatchable builtins and/or globals");
-  JIT_CHECK(PyUnicode_CheckExact(name_obj), "Name must be a str");
+  JIT_THROW_IF(
+      !canCacheGlobals(),
+      "Trying to get a globals cache with unwatchable builtins and/or globals "
+      "for {}",
+      fullname());
+  JIT_THROW_IF(
+      !PyUnicode_CheckExact(name_obj),
+      "Name must be a str, got {}",
+      Py_TYPE(name_obj)->tp_name);
   BorrowedRef<PyUnicodeObject> name{name_obj};
   return cinderx::getModuleState()->cache_manager->getGlobalCache(
       builtins_, globals_, name);
@@ -428,9 +408,8 @@ std::unique_ptr<Function> Preloader::makeFunction() const {
   irfunc->globals.reset(globals_);
   irfunc->prim_args_info.reset(prim_args_info_);
   irfunc->return_type = return_type_;
-  irfunc->has_primitive_args = has_primitive_args_;
-  irfunc->has_primitive_first_arg = has_primitive_first_arg_;
-  for (auto& [local, preloaded_type] : check_arg_pytypes_) {
+  irfunc->has_primitive_args = hasPrimitiveArgs();
+  for (auto& [local, preloaded_type] : check_arg_types_) {
     irfunc->typed_args.emplace_back(
         local,
         preloaded_type.type,
@@ -439,6 +418,64 @@ std::unique_ptr<Function> Preloader::makeFunction() const {
         preloaded_type.toHir());
   }
   return irfunc;
+}
+
+BorrowedRef<PyCodeObject> Preloader::code() const {
+  return code_;
+}
+
+BorrowedRef<PyDictObject> Preloader::globals() const {
+  return globals_;
+}
+
+BorrowedRef<PyDictObject> Preloader::builtins() const {
+  return builtins_;
+}
+
+AnnotationIndex* Preloader::annotations() const {
+  return annotations_.get();
+}
+
+const std::string& Preloader::fullname() const {
+  return fullname_;
+}
+
+Type Preloader::returnType() const {
+  return return_type_;
+}
+
+int Preloader::numArgs() const {
+  if (code_ == nullptr) {
+    // code_ might be null if we parsed from textual ir
+    return 0;
+  }
+  return code_->co_argcount + code_->co_kwonlyargcount +
+      bool(code_->co_flags & CO_VARARGS) +
+      bool(code_->co_flags & CO_VARKEYWORDS);
+}
+
+bool Preloader::hasPrimitiveArgs() const {
+  return prim_args_info_ != nullptr;
+}
+
+BorrowedRef<> Preloader::reifier() const {
+  return reifier_;
+}
+
+Preloader::Preloader(
+    BorrowedRef<PyCodeObject> code,
+    BorrowedRef<PyDictObject> builtins,
+    BorrowedRef<PyDictObject> globals,
+    std::unique_ptr<AnnotationIndex> annotations,
+    const std::string& fullname,
+    Ref<> reifier)
+    : code_(Ref<>::create(code)),
+      builtins_(Ref<>::create(builtins)),
+      globals_(Ref<>::create(globals)),
+      annotations_(std::move(annotations)),
+      fullname_(fullname),
+      reifier_(std::move(reifier)) {
+  JIT_CHECK(PyCode_Check(code_), "Expected PyCodeObject");
 }
 
 BorrowedRef<> Preloader::constArg(BytecodeInstruction& bc_instr) const {
@@ -465,26 +502,26 @@ bool Preloader::preload() {
         PyObject* names = code_->co_names;
         Py_ssize_t names_len = PyTuple_Size(names);
         int name_idx = loadGlobalIndex(bc_instr.oparg());
-        JIT_CHECK(
-            name_idx < names_len,
+        JIT_THROW_IF(
+            name_idx >= names_len,
             "Preloaded LOAD_GLOBAL with index {} for names tuple of length {}",
             name_idx,
             names_len);
 
         BorrowedRef<> name = PyTuple_GET_ITEM(names, name_idx);
-        JIT_CHECK(name != nullptr, "name cannot be null");
+        JIT_THROW_IF(name == nullptr, "Name cannot be null");
         // Make sure the cached value has been loaded and any side effects of
         // loading it (e.g. lazy imports) have been exercised before we create
         // the GlobalCache; otherwise GlobalCache initialization can
         // self-destroy due to side effects of PyDict_GetItem and cause a
         // use-after-free.
-        PyObject* global_value = PyDict_GetItem(globals_, name);
-        if (!global_value) {
+        PyObject* global_value = PyDict_GetItemWithError(globals_, name);
+        if (!global_value && !PyErr_Occurred()) {
           // It's extremely unlikely that builtins dict could ever contain a
           // lazy import that needs warming up, but since it is technically
           // possible, we may as well go ahead and warm that up too if the key
           // isn't in globals.
-          PyDict_GetItem(builtins_, name);
+          PyDict_GetItemWithError(builtins_, name);
         }
         if (PyErr_Occurred()) {
           return false;
@@ -504,13 +541,11 @@ bool Preloader::preload() {
       case BUILD_CHECKED_MAP: {
         BorrowedRef<> descr = PyTuple_GetItem(constArg(bc_instr), 0);
         OwnedType collection_type = resolve_type_descr(descr);
-        if (collection_type.type == nullptr) {
-          JIT_LOG(
-              "unknown collection type descr {} during preloading of {}",
-              repr(descr),
-              fullname());
-          return false;
-        }
+        JIT_THROW_IF(
+            collection_type.type == nullptr,
+            "Unknown collection type descr {} during preloading of {}",
+            repr(descr),
+            fullname());
         types_.emplace(descr, std::move(collection_type));
         break;
       }
@@ -520,14 +555,12 @@ bool Preloader::preload() {
       case TP_ALLOC: {
         BorrowedRef<> descr = constArg(bc_instr);
         OwnedType alloc_type = resolve_type_descr(descr);
-        if (alloc_type.type == nullptr) {
-          JIT_LOG(
-              "unknown {} type descr {} during preloading of {}",
-              bc_instr.opcode(),
-              repr(descr),
-              fullname());
-          return false;
-        }
+        JIT_THROW_IF(
+            alloc_type.type == nullptr,
+            "Unknown {} type descr {} during preloading of {}",
+            bc_instr.opcode(),
+            repr(descr),
+            fullname());
         types_.emplace(descr, std::move(alloc_type));
         break;
       }
@@ -544,7 +577,7 @@ bool Preloader::preload() {
         auto& map = bc_instr.opcode() == INVOKE_FUNCTION ? func_targets_
                                                          : meth_targets_;
         std::unique_ptr<InvokeTarget> target =
-            resolve_target_descr(descr, bc_instr.opcode());
+            resolveTargetDescr(descr, bc_instr.opcode());
         if (target) {
           map.emplace(descr, std::move(target));
           break;
@@ -564,10 +597,6 @@ bool Preloader::preload() {
     }
   }
 
-  if (has_primitive_args_) {
-    prim_args_info_ = Ref<_PyTypedArgsInfo>::steal(
-        _PyClassLoader_GetTypedArgsInfo(code_, true));
-  }
   return true;
 }
 
@@ -581,60 +610,61 @@ bool Preloader::preloadStatic() {
       return true;
     }
 
-    JIT_LOG(
+    JIT_THROW(
         "Statically typed function {} has no return type descr, co_consts "
         "is {}",
         fullname(),
         repr(code_->co_consts));
-    return false;
   }
 
   OwnedType ret_type = resolve_type_descr(ret_type_descr);
-  if (ret_type.type == nullptr) {
-    JIT_LOG(
-        "unknown return type descr {} during preloading of {}",
-        repr(ret_type_descr),
-        fullname());
-    return false;
-  }
+  JIT_THROW_IF(
+      ret_type.type == nullptr,
+      "Unknown return type descr {} during preloading of {}",
+      repr(ret_type_descr),
+      fullname());
 
   return_type_ = ret_type.toHir();
 
   BorrowedRef<PyTupleObject> checks = reinterpret_cast<PyTupleObject*>(
       _PyClassLoader_GetCodeArgumentTypeDescrs(code_));
 
+  bool has_primitive_args = false;
+  constexpr Py_ssize_t kMaxLocals = 16384;
   for (int i = 0; i < PyTuple_GET_SIZE(checks); i += 2) {
-    long local = PyLong_AsLong(PyTuple_GET_ITEM(checks, i));
-    if (local < 0) {
-      JIT_ABORT(
-          "In Static Python function {}, hit negative local {} at index {}, "
-          "arguments checks tuple is {}",
-          fullname(),
-          local,
-          i,
-          repr(checks));
-    }
+    Py_ssize_t local = PyLong_AsSsize_t(PyTuple_GET_ITEM(checks, i));
+    JIT_THROW_IF(
+        local < 0 || local >= kMaxLocals,
+        "In Static Python function {}, hit bad local {} at index {}, "
+        "arguments checks tuple is {}",
+        fullname(),
+        local,
+        i,
+        repr(checks));
     OwnedType preloaded_type =
         resolve_type_descr(PyTuple_GET_ITEM(checks, i + 1));
-    if (preloaded_type.type == nullptr) {
-      JIT_LOG(
-          "unknown type descr {} during preloading of {}",
-          repr(PyTuple_GET_ITEM(checks, i + 1)),
-          fullname());
-      return false;
-    }
-    JIT_CHECK(
-        preloaded_type.type != reinterpret_cast<PyTypeObject*>(&PyObject_Type),
-        "shouldn't generate type checks for object");
+    JIT_THROW_IF(
+        preloaded_type.type == nullptr,
+        "Unknown type descr {} during preloading of {}",
+        repr(PyTuple_GET_ITEM(checks, i + 1)),
+        fullname());
+    JIT_THROW_IF(
+        preloaded_type.type == reinterpret_cast<PyTypeObject*>(&PyObject_Type),
+        "Shouldn't generate type checks for object type, in {} for local {} at "
+        "index {}",
+        fullname(),
+        local,
+        i);
     Type type = preloaded_type.toHir();
-    check_arg_types_.emplace(local, type);
-    check_arg_pytypes_.emplace(local, std::move(preloaded_type));
+    check_arg_types_.emplace(local, std::move(preloaded_type));
     if (type <= TPrimitive) {
-      has_primitive_args_ = true;
-      if (local == 0) {
-        has_primitive_first_arg_ = true;
-      }
+      has_primitive_args = true;
     }
+  }
+
+  if (has_primitive_args) {
+    prim_args_info_ = Ref<_PyTypedArgsInfo>::steal(
+        _PyClassLoader_GetTypedArgsInfo(code_, true));
   }
 
   return true;
@@ -643,6 +673,93 @@ bool Preloader::preloadStatic() {
 // Check if a code object is for the top-level code in a module.
 bool Preloader::isModuleCodeObject() const {
   return fullname().ends_with("<module>") || fullname() == "__main__:__main__";
+}
+
+std::unique_ptr<InvokeTarget> Preloader::resolveTargetDescr(
+    BorrowedRef<> descr,
+    int opcode) {
+  auto target = std::make_unique<InvokeTarget>();
+  PyObject* container;
+  auto callable =
+      Ref<>::steal(_PyClassLoader_ResolveFunction(descr, &container));
+  JIT_THROW_IF(
+      callable == nullptr,
+      "Unknown invoke target {} during preloading {}",
+      repr(descr),
+      fullname());
+
+  int optional, exact, func_flags;
+  auto return_pytype =
+      Ref<PyTypeObject>::steal(_PyClassLoader_ResolveReturnType(
+          callable, &optional, &exact, &func_flags));
+
+  target->container_is_immutable = _PyClassLoader_IsImmutable(container);
+  if (return_pytype != nullptr) {
+    if (func_flags & Ci_FUNC_FLAGS_COROUTINE) {
+      // TODO properly handle coroutine returns awaitable type
+      target->return_type = TObject;
+    } else {
+      OwnedType preloaded_type{
+          std::move(return_pytype),
+          static_cast<bool>(optional),
+          static_cast<bool>(exact)};
+      target->return_type = preloaded_type.toHir();
+    }
+  }
+  target->is_statically_typed = _PyClassLoader_IsStaticCallable(callable);
+  PyMethodDef* def;
+  Ci_PyTypedMethodDef* tmd;
+  bool is_thunk = false;
+  if (_PyClassLoader_IsPatchedThunk(callable)) {
+    is_thunk = true;
+  } else if ((def = _PyClassLoader_GetMethodDef(callable)) != nullptr) {
+    target->builtin_c_func = reinterpret_cast<void*>(def->ml_meth);
+    if (def->ml_flags == METH_NOARGS) {
+      target->builtin_expected_nargs = 1;
+    } else if (def->ml_flags == METH_O) {
+      target->builtin_expected_nargs = 2;
+    } else if ((tmd = _PyClassLoader_GetTypedMethodDef(callable))) {
+      target->builtin_returns_error_code = (tmd->tmd_ret == Ci_Py_SIG_ERROR);
+      target->builtin_returns_void = (tmd->tmd_ret == Ci_Py_SIG_VOID);
+      target->builtin_c_func = tmd->tmd_meth;
+    }
+  }
+  target->callable = std::move(callable);
+
+  if (opcode == LOAD_METHOD_STATIC) {
+    target->slot = _PyClassLoader_ResolveMethod(descr);
+    JIT_THROW_IF(
+        target->slot == -1,
+        "Method lookup failed for descr {} in function {}",
+        repr(descr),
+        fullname());
+  } else { // the rest of this only used by INVOKE_FUNCTION currently
+    if (!target->container_is_immutable) {
+      target->indirect_ptr = _PyClassLoader_ResolveIndirectPtr(descr);
+      JIT_THROW_IF(
+          target->indirect_ptr == nullptr,
+          "Indirect ptr null for {} in {} (stale bytecode?)",
+          repr(descr),
+          fullname());
+    }
+  }
+
+  if (target->is_statically_typed) {
+    if (target->isFunction()) {
+      fill_primitive_arg_types_func(
+          target->func(), target->primitive_arg_types);
+    } else {
+      fill_primitive_arg_types_builtin(
+          target->callable, target->primitive_arg_types);
+    }
+  }
+
+  if (is_thunk) {
+    fill_primitive_arg_types_thunk(
+        target->callable.get(), target->primitive_arg_types, container);
+  }
+
+  return target;
 }
 
 void PreloaderManager::add(

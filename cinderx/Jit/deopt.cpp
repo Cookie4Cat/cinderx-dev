@@ -41,7 +41,41 @@ const std::string& internDescr(const std::string& descr) {
   return *s_descrs.emplace(descr).first;
 }
 
+std::unordered_set<hir::Register*> collectFrameStateRegs(hir::FrameState* fs) {
+  std::unordered_set<hir::Register*> regs;
+  for (; fs != nullptr; fs = fs->parent) {
+    for (hir::Register* local : fs->localsplus) {
+      if (local != nullptr) {
+        regs.insert(local);
+      }
+    }
+    for (hir::Register* stack : fs->stack) {
+      if (stack != nullptr) {
+        regs.insert(stack);
+      }
+    }
+  }
+  return regs;
+}
+
 } // namespace
+
+DeoptLiveRegFilter::DeoptLiveRegFilter(const hir::DeoptBase& instr)
+    : instr_(instr),
+      frame_state_regs_(collectFrameStateRegs(instr.frameState())) {}
+
+bool DeoptLiveRegFilter::isUsed(const hir::RegState& reg_state) const {
+  if (reg_state.ref_kind == hir::RefKind::kOwned) {
+    return true;
+  }
+
+  hir::Register* reg = reg_state.reg;
+  if (instr_.guiltyReg() == reg) {
+    return true;
+  }
+
+  return frame_state_regs_.contains(reg);
+}
 
 hir::ValueKind deoptValueKind(hir::Type type) {
   if (type <= jit::hir::TCBool) {
@@ -209,7 +243,6 @@ Ref<> profileDeopt(const DeoptMetadata& meta, const MemoryView& mem) {
   return live_val == nullptr ? nullptr : mem.readOwned(*live_val);
 }
 
-#if PY_VERSION_HEX < 0x030E0000
 // This function handles all computation of the index to resume at for a given
 // deopt.
 //
@@ -250,23 +283,35 @@ static BCIndex getDeoptResumeIndex(
       forced_deopt) {
     return frame.cause_instr_idx;
   }
+
+#if PY_VERSION_HEX >= 0x030E0000
+  if (PyErr_Occurred() && is_innermost) {
+    // On 3.14+ the traceback is going to be generated based on instr_ptr
+    // and then we'll dispatch to the error handler. We're never going to
+    // execute the instruction but we need the instr_ptr to point at the
+    // faulting instruction for stack traces to show up correctly.
+    return BytecodeInstruction(frame.code, frame.cause_instr_idx)
+               .nextInstrOffset()
+               .asIndex() -
+        1;
+  }
+#endif
   return BytecodeInstruction(frame.code, frame.cause_instr_idx)
       .nextInstrOffset();
 }
-#endif
 
 bool shouldResumeInterpreterInErrorHandler(DeoptReason reason) {
   switch (reason) {
     case DeoptReason::kGuardFailure:
     case DeoptReason::kRaise:
       return false;
-    case jit::DeoptReason::kYieldFrom:
-    case jit::DeoptReason::kUnhandledException:
-    case jit::DeoptReason::kPeriodicTaskFailure:
-    case jit::DeoptReason::kUnhandledUnboundLocal:
-    case jit::DeoptReason::kUnhandledUnboundFreevar:
-    case jit::DeoptReason::kUnhandledNullField:
-    case jit::DeoptReason::kRaiseStatic:
+    case DeoptReason::kYieldFrom:
+    case DeoptReason::kUnhandledException:
+    case DeoptReason::kPeriodicTaskFailure:
+    case DeoptReason::kUnhandledUnboundLocal:
+    case DeoptReason::kUnhandledUnboundFreevar:
+    case DeoptReason::kUnhandledNullField:
+    case DeoptReason::kRaiseStatic:
       return true;
     default:
       JIT_ABORT("Unrecognized deopt reason {}", static_cast<int>(reason));
@@ -280,40 +325,6 @@ static void reifyFrameImpl(
     bool forced_deopt,
     const uint64_t* regs,
     bool is_instrumentation_deopt = false) {
-#if PY_VERSION_HEX >= 0x030E0000
-  BorrowedRef<PyCodeObject> code_obj = frameCode(frame);
-#ifdef Py_GIL_DISABLED
-  PyThreadState* tstate = _PyThreadState_GET();
-  frame->instr_ptr = _PyEval_GetExecutableCode(tstate, _PyFrame_GetCode(frame));
-  frame->tlbc_index = reinterpret_cast<_PyThreadStateImpl*>(tstate)->tlbc_index;
-#else
-  frame->instr_ptr = _PyCode_CODE(code_obj);
-#endif
-  int cause_instr_idx = frame_meta.cause_instr_idx.value();
-
-  // Resume with instr_ptr pointing to the cause instruction
-  // the interpreter to re-run a failed instruction, or implement an instruction
-  // we don't JIT.
-  frame->instr_ptr += cause_instr_idx;
-  if (&frame_meta != &meta.innermostFrame()) {
-    // If we're not the inner most frame then we're always deopting
-    // after the instruction that executed
-    frame->instr_ptr += inlineCacheSize(code_obj, cause_instr_idx) + 1;
-  } else if (is_instrumentation_deopt) {
-    // Instrumentation deopt: kPeriodicTaskFailure re-executes the bytecode.
-    // Other reasons advance past the inline cache (or to its end on error).
-    if (meta.reason != DeoptReason::kPeriodicTaskFailure) {
-      frame->instr_ptr += inlineCacheSize(code_obj, cause_instr_idx);
-      if (!PyErr_Occurred()) {
-        frame->instr_ptr++;
-      }
-    }
-  } else if (shouldResumeInterpreterInErrorHandler(meta.reason)) {
-    // Otherwise, have instr_ptr point to the next instruction
-    // (minus one _Py_CODEUNIT for some reason).
-    frame->instr_ptr += inlineCacheSize(code_obj, cause_instr_idx);
-  }
-#else
   // Note frame->prev_instr doesn't point to the previous instruction, it
   // actually points to the memory location sizeof(Py_CODEUNIT) bytes before
   // the next instruction to execute. This means it might point to inline-
@@ -326,6 +337,17 @@ static void reifyFrameImpl(
            meta, frame_meta, forced_deopt, is_instrumentation_deopt) -
        1)
           .value();
+
+#if PY_VERSION_HEX >= 0x030E0000
+#ifdef Py_GIL_DISABLED
+  PyThreadState* tstate = _PyThreadState_GET();
+  frame->instr_ptr =
+      _PyEval_GetExecutableCode(tstate, _PyFrame_GetCode(frame)) + prev_idx + 1;
+  frame->tlbc_index = reinterpret_cast<_PyThreadStateImpl*>(tstate)->tlbc_index;
+#else
+  frame->instr_ptr = _PyCode_CODE(_PyFrame_GetCode(frame)) + prev_idx + 1;
+#endif
+#else
   frame->prev_instr = _PyCode_CODE(_PyFrame_GetCode(frame)) + prev_idx;
 #endif
 
@@ -422,30 +444,43 @@ static DeoptReason getDeoptReason(const jit::hir::DeoptBase& instr) {
   }
 }
 
-DeoptMetadata DeoptMetadata::fromInstr(const jit::hir::DeoptBase& instr) {
-  auto get_source = [&](jit::hir::Register* reg) {
-    reg = hir::modelReg(reg);
-    auto instr = reg->instr();
-    if (isAnyLoadMethod(*instr)) {
-      return LiveValue::Source::kLoadMethod;
-    }
-    return LiveValue::Source::kUnknown;
-  };
+LiveValue::Source getLiveValueSource(jit::hir::Register* reg) {
+  reg = hir::modelReg(reg);
+  auto instr = reg->instr();
+  if (isAnyLoadMethod(*instr)) {
+    return LiveValue::Source::kLoadMethod;
+  }
+  return LiveValue::Source::kUnknown;
+}
 
+std::vector<const hir::RegState*> usedLiveRegs(const hir::DeoptBase& instr) {
+  DeoptLiveRegFilter live_reg_filter{instr};
+  std::vector<const hir::RegState*> live_regs;
+  live_regs.reserve(instr.live_regs().size());
+  for (const auto& reg_state : instr.live_regs()) {
+    if (live_reg_filter.isUsed(reg_state)) {
+      live_regs.push_back(&reg_state);
+    }
+  }
+  return live_regs;
+}
+
+DeoptMetadata DeoptMetadata::fromInstr(const jit::hir::DeoptBase& instr) {
+  std::vector<const hir::RegState*> live_regs = usedLiveRegs(instr);
   DeoptMetadata meta;
-  meta.live_values.resize(instr.live_regs().size());
+  meta.live_values.resize(live_regs.size());
 
   std::unordered_map<jit::hir::Register*, int> reg_idx;
   int i = 0;
-  for (const auto& reg_state : instr.live_regs()) {
-    auto reg = reg_state.reg;
+  for (const hir::RegState* reg_state : live_regs) {
+    auto reg = reg_state->reg;
 
     LiveValue lv = {
         // location will be filled in once we've generated code
         .location = 0,
-        .ref_kind = reg_state.ref_kind,
-        .value_kind = reg_state.value_kind,
-        .source = get_source(reg),
+        .ref_kind = reg_state->ref_kind,
+        .value_kind = reg_state->value_kind,
+        .source = getLiveValueSource(reg),
     };
     meta.live_values[i] = std::move(lv);
     reg_idx[reg] = i;

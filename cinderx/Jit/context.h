@@ -31,9 +31,9 @@
 
 namespace jit {
 
-#ifdef Py_GIL_DISABLED
+// Only used to serialize FT-only entrypoints, but declared unconditionally so
+// callers can branch on kFreeThreadedBuild instead of the preprocessor.
 std::recursive_mutex& freeThreadedJITEntrypointMutex();
-#endif
 
 // Free-threaded builds can enter top-level JIT operations concurrently:
 // function/code registration, compilation, and destruction hooks.
@@ -42,15 +42,15 @@ std::recursive_mutex& freeThreadedJITEntrypointMutex();
 class FreeThreadedJITEntrypointGuard {
  public:
   FreeThreadedJITEntrypointGuard() {
-#ifdef Py_GIL_DISABLED
-    freeThreadedJITEntrypointMutex().lock();
-#endif
+    if constexpr (kFreeThreadedBuild) {
+      freeThreadedJITEntrypointMutex().lock();
+    }
   }
 
   ~FreeThreadedJITEntrypointGuard() {
-#ifdef Py_GIL_DISABLED
-    freeThreadedJITEntrypointMutex().unlock();
-#endif
+    if constexpr (kFreeThreadedBuild) {
+      freeThreadedJITEntrypointMutex().unlock();
+    }
   }
 
   FreeThreadedJITEntrypointGuard(const FreeThreadedJITEntrypointGuard&) =
@@ -91,6 +91,7 @@ class Builtins {
 
  private:
   std::atomic<bool> is_initialized_{false};
+  std::mutex mtx_;
   UnorderedMap<PyMethodDef*, std::string> cfunc_to_name_;
   UnorderedMap<std::string, PyMethodDef*> name_to_cfunc_;
 };
@@ -110,9 +111,9 @@ struct CompilationKey {
         globals{func->func_globals} {}
 
   explicit CompilationKey(const CompiledFunction& func)
-      : code{func.runtime()->frameState()->code()},
-        builtins{func.runtime()->frameState()->builtins()},
-        globals{func.runtime()->frameState()->globals()} {}
+      : code{func.runtime()->code()},
+        builtins{func.runtime()->builtins()},
+        globals{func.runtime()->globals()} {}
 
   CompilationKey(PyObject* code, PyObject* builtins, PyObject* globals)
       : code(code), builtins(builtins), globals(globals) {}
@@ -195,6 +196,47 @@ class Context : public IJitContext, public CompiledFunctionOwner {
    */
   bool addCompiledFunc(
       BorrowedRef<PyFunctionObject> func,
+      BorrowedRef<CompiledFunction> compiled);
+
+  /*
+   * Content-keyed reuse of compiled code for provably namespace-free code
+   * objects that the process keeps recreating. Donors are promoted by
+   * behavioral evidence -- the second compilation of identical content (see
+   * noteCodeCompiled) or the death of a compiled instance while the
+   * interpreter keeps running (see noteCompiledFuncDestroyed); if a
+   * function's code is value-identical to a same-origin donor, the function is
+   * canonicalized onto the donor code object and attached to the pinned
+   * artifact. Returns true when the function was attached and needs no
+   * compilation.
+   */
+  bool reuseDedupedCompiled(BorrowedRef<PyFunctionObject> func);
+
+  /*
+   * Record a completed compilation's content; the second compilation of
+   * identical content promotes it to a reuse donor with a pinned artifact.
+   */
+  void noteCodeCompiled(
+      const CompilationKey& key,
+      BorrowedRef<CompiledFunction> compiled);
+
+  /*
+   * Rescue the artifact of a dying compiled function whose content is
+   * recorded but not yet promoted; called from funcDestroyed while the
+   * artifact is alive.
+   */
+  void noteCompiledFuncDestroyed(
+      BorrowedRef<PyFunctionObject> func,
+      BorrowedRef<CompiledFunction> compiled);
+
+  /*
+   * Demote any donor entry holding this artifact back to a recurrence
+   * candidate. Called before CompiledFunction::clear() guts the artifact
+   * (force_uncompile, ROI backoff): the entry's strong reference would
+   * otherwise keep serving a cleared artifact to future twins. Identical
+   * content seen later recompiles normally and can be re-promoted.
+   */
+  void dropDedupArtifact(
+      BorrowedRef<PyCodeObject> code,
       BorrowedRef<CompiledFunction> compiled);
 
   /*
@@ -316,15 +358,14 @@ class Context : public IJitContext, public CompiledFunctionOwner {
       const CodeRuntime* code_runtime,
       std::size_t deopt_idx,
       F&& f) const {
-#ifdef Py_GIL_DISABLED
-    std::lock_guard<std::mutex> lock(deopt_stats_mutex_);
-#endif
-    const DeoptStat* stat = deoptStat(code_runtime, deopt_idx);
-    if (stat == nullptr) {
-      return false;
-    }
-    f(*stat);
-    return true;
+    return withDeoptStatsLock([&]() {
+      const DeoptStat* stat = deoptStat(code_runtime, deopt_idx);
+      if (stat == nullptr) {
+        return false;
+      }
+      f(*stat);
+      return true;
+    });
   }
 
   // Record that a deopt of the given index happened at runtime, with an
@@ -456,14 +497,24 @@ class Context : public IJitContext, public CompiledFunctionOwner {
 
   FunctionEntryCacheMap function_entry_caches_;
 
+  template <typename F>
+  decltype(auto) withDeoptStatsLock(F&& f) const {
+    if constexpr (kFreeThreadedBuild) {
+      std::lock_guard<std::mutex> lock(deopt_stats_mutex_);
+      return f();
+    }
+    return f();
+  }
+
   std::vector<DeoptMetadata> deopt_metadata_;
   DeoptStats deopt_stats_;
-#ifdef Py_GIL_DISABLED
+  // Only needed in free-threaded builds; kept unconditional so callers can use
+  // kFreeThreadedBuild instead of #ifdefs.
   mutable std::mutex deopt_stats_mutex_;
-#endif
 
-  // Get the stat object for a given deopt.  It will not exist if the deopt has
-  // never been hit.  Caller must hold deopt_stats_mutex_ when Py_GIL_DISABLED.
+  // Get the stat object for a given deopt. It will not exist if the deopt has
+  // never been hit. Caller must hold deopt_stats_mutex_ in free-threaded
+  // builds.
   const DeoptStat* deoptStat(
       const CodeRuntime* code_runtime,
       std::size_t deopt_idx) const;
@@ -488,6 +539,18 @@ class Context : public IJitContext, public CompiledFunctionOwner {
  private:
   /* Deopts a function but doesn't touch deopted_funcs_. */
   bool deoptFuncImpl(BorrowedRef<PyFunctionObject> func);
+
+  /*
+   * One content class of namespace-free compiled code. A first compilation
+   * records the content only; a second compilation of identical content (or
+   * the death of a compiled instance) promotes the entry to a donor, whose
+   * strong references keep the canonical code object and its artifact alive
+   * across the death of short-lived producer functions.
+   */
+  struct CodeDedupEntry {
+    Ref<PyCodeObject> code;
+    Ref<CompiledFunction> compiled;
+  };
 
   /*
    * Map of all compiled code objects, keyed by their address and also their
@@ -534,6 +597,14 @@ class Context : public IJitContext, public CompiledFunctionOwner {
    * multithreaded_compile_test.
    */
   std::vector<Ref<CompiledFunction>> orphaned_compiled_codes_;
+
+  /*
+   * Donor index for reuseDedupedCompiled, keyed by a structural fingerprint
+   * over immutable code-object fields; each bucket holds the entries sharing
+   * that fingerprint, disambiguated by code-object value equality.
+   */
+  UnorderedMap<uint64_t, std::vector<CodeDedupEntry>> code_dedup_cache_;
+  size_t code_dedup_size_{0};
 
   Ref<> cinderjit_module_;
 

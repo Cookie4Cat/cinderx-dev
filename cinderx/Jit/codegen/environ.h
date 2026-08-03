@@ -22,8 +22,8 @@ struct Environ {
   arch::Builder* as{nullptr};
 
   // Modified registers. Set by VariableManager and read by generatePrologue()
-  // and generateEpilogue().
-  PhyRegisterSet changed_regs{0};
+  // and deoptimization exit generation.
+  PhyRegisterSet changed_regs{};
 
   // The size of all data stored on the C stack: shadow frames, spilled values,
   // saved callee-saved registers, and space for stack arguments to called
@@ -42,6 +42,15 @@ struct Environ {
   asmjit::Label hard_exit_label;
   asmjit::Label exit_label;
   asmjit::Label gen_resume_entry_label;
+  asmjit::Label finish_frame_setup;
+  asmjit::Label correct_arg_count;
+  asmjit::Label prologue_exit;
+  asmjit::Label wrapper_exit;
+
+  // Static type check jump table, resolved after code generation.
+  void** static_typecheck_table{nullptr};
+  std::vector<std::pair<int, jit::lir::BasicBlock*>>
+      static_typecheck_jt_entries;
 
   // Resume label shared between StoreGenYieldPoint/YieldInitial and
   // ResumeGenYield. Created by translateStoreGenYieldPoint or
@@ -97,6 +106,13 @@ struct Environ {
 
   asmjit::Label load_attr_invoke_stub;
 
+  struct Aarch64ExactLongAddSubStub {
+    asmjit::Label entry;
+    uint64_t generic_target;
+    uint64_t exact_target;
+  };
+  std::vector<Aarch64ExactLongAddSubStub> exact_long_add_sub_stubs;
+
   struct IndirectInfo {
     explicit IndirectInfo(void** indirect_ptr) : indirect(indirect_ptr) {}
 
@@ -115,8 +131,17 @@ struct Environ {
 
   template <typename T>
   void addAnnotation(T&& item, asmjit::BaseNode* start_cursor) {
+    if (suppress_annotations) {
+      return;
+    }
     annotations.add(std::forward<T>(item), as, start_cursor);
   }
+
+  // When true, addAnnotation() calls are suppressed. Set by
+  // generateAssemblyBody() while a text annotation is active so that
+  // translator-internal annotations (e.g. "Set up frame pointer") don't
+  // conflict with the higher-level text annotation.
+  bool suppress_annotations{false};
 
   // Map of GenYieldPoints which need their resume_target_ setting after code-
   // gen is complete.
@@ -161,6 +186,15 @@ struct Environ {
 
   bool has_inlined_functions{false};
 
+#if defined(CINDER_X86_64) && defined(_WIN32)
+  int win_struct_ret_offset{0};
+#endif
+
+  // True if the function has any DeoptBase instructions in its final HIR.
+  // When false, the interpreter frame can never be materialized, enabling a
+  // cheaper inline frame unlink at exit.
+  bool can_deopt{true};
+
 #if defined(CINDER_AARCH64)
   // Constant pool for large immediate values. translateMovConstPool populates
   // these; gen_asm.cpp emits the pool data after deopt exits.
@@ -171,7 +205,7 @@ struct Environ {
   // autogen translator for both the normal entry and generator resume entry.
   int resume_frame_total_size{0};
   int resume_header_and_spill_size{0};
-  PhyRegisterSet resume_saved_regs{0};
+  PhyRegisterSet resume_saved_regs{};
 
   // Byte offset of gi_jit_data within a generator object, computed per
   // function. Read by the resume entry block builder.

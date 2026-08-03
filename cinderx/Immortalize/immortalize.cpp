@@ -65,12 +65,13 @@ bool immortalize(PyObject* obj) {
 }
 
 PyObject* immortalize_heap([[maybe_unused]] PyObject* mod) {
-#ifdef Py_GIL_DISABLED
-  PyErr_SetString(
-      PyExc_RuntimeError,
-      "Immortalizing the heap is not yet supported in FT Python");
-  return nullptr;
-#else
+  if constexpr (kFreeThreadedBuild) {
+    PyErr_SetString(
+        PyExc_RuntimeError,
+        "Immortalizing the heap is not yet supported in FT Python");
+    return nullptr;
+  }
+
   // TODO(T251571267): Low priority for now.
   /* Remove any dead objects to avoid immortalizing them */
   PyGC_Collect();
@@ -100,7 +101,6 @@ PyObject* immortalize_heap([[maybe_unused]] PyObject* mod) {
     Py_TYPE(FROM_GC(gc))
         ->tp_traverse(FROM_GC(gc), immortalize_visitor, nullptr);
   }
-#endif
 
   Py_RETURN_NONE;
 }
