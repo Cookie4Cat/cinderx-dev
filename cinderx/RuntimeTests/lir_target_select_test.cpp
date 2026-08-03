@@ -19,6 +19,7 @@
 #include <regex>
 #include <sstream>
 #include <string>
+#include <vector>
 
 namespace jit::lir {
 
@@ -88,6 +89,105 @@ static std::string runTargetSelect(const char* lir_input_str) {
   std::unique_ptr<Function> func = Parser().parse(lir_input_str);
   selectTargetOpcodes(func.get());
   return fmt::format("{}", *func);
+}
+
+static std::vector<Instruction*> collectTargetSelectInstrs(BasicBlock& block) {
+  std::vector<Instruction*> result;
+  for (auto& instr : block.instructions()) {
+    result.push_back(instr.get());
+  }
+  return result;
+}
+
+TEST_F(LIRTargetSelectTest, LegalizesStackIncDecInputs) {
+  for (Instruction::Opcode opcode :
+       {Instruction::kInc, Instruction::kDec}) {
+    SCOPED_TRACE(static_cast<int>(opcode));
+    Function func;
+    BasicBlock* block = func.allocateBasicBlock();
+    PhyLocation stack_loc{-24, 64};
+    block->allocateInstr(
+        opcode, nullptr, Stk{stack_loc, DataType::k64bit});
+
+    selectTargetOpcodes(&func);
+
+    std::vector<Instruction*> instrs = collectTargetSelectInstrs(*block);
+    ASSERT_EQ(instrs.size(), 3);
+    EXPECT_TRUE(instrs[0]->isMove());
+    EXPECT_TRUE(instrs[0]->getInput(0)->isStack());
+    EXPECT_EQ(instrs[1]->opcode(), opcode);
+    ASSERT_TRUE(instrs[1]->getInput(0)->isLinked());
+    EXPECT_EQ(
+        static_cast<LinkedOperand*>(instrs[1]->getInput(0))->getLinkedInstr(),
+        instrs[0]);
+    EXPECT_TRUE(instrs[2]->isMove());
+    EXPECT_TRUE(instrs[2]->output()->isStack());
+    ASSERT_TRUE(instrs[2]->getInput(0)->isLinked());
+    EXPECT_EQ(
+        static_cast<LinkedOperand*>(instrs[2]->getInput(0))->getLinkedInstr(),
+        instrs[0]);
+  }
+}
+
+TEST_F(LIRTargetSelectTest, LegalizesUnaryStackInputs) {
+  for (Instruction::Opcode opcode :
+       {Instruction::kNegate, Instruction::kInvert}) {
+    SCOPED_TRACE(static_cast<int>(opcode));
+    Function func;
+    BasicBlock* block = func.allocateBasicBlock();
+    block->allocateInstr(
+        opcode,
+        nullptr,
+        OutVReg{DataType::k64bit},
+        Stk{PhyLocation{-32, 64}, DataType::k64bit});
+
+    selectTargetOpcodes(&func);
+
+    std::vector<Instruction*> instrs = collectTargetSelectInstrs(*block);
+    ASSERT_EQ(instrs.size(), 2);
+    EXPECT_TRUE(instrs[0]->isMove());
+    EXPECT_TRUE(instrs[0]->getInput(0)->isStack());
+    EXPECT_EQ(instrs[1]->opcode(), opcode);
+    ASSERT_TRUE(instrs[1]->getInput(0)->isLinked());
+    EXPECT_EQ(
+        static_cast<LinkedOperand*>(instrs[1]->getInput(0))->getLinkedInstr(),
+        instrs[0]);
+  }
+}
+
+TEST_F(LIRTargetSelectTest, LegalizesSignedSubWordInputs) {
+  for (Instruction::Opcode opcode :
+       {Instruction::kLessThanSigned, Instruction::kDiv}) {
+    SCOPED_TRACE(static_cast<int>(opcode));
+    Function func;
+    BasicBlock* block = func.allocateBasicBlock();
+    Instruction* lhs = block->allocateInstr(
+        Instruction::kMove,
+        nullptr,
+        OutVReg{DataType::k8bit},
+        Imm{0xff, DataType::k8bit});
+    Instruction* rhs = block->allocateInstr(
+        Instruction::kMove,
+        nullptr,
+        OutVReg{DataType::k16bit},
+        Imm{1, DataType::k16bit});
+    Instruction* op = block->allocateInstr(
+        opcode,
+        nullptr,
+        OutVReg{DataType::k8bit},
+        VReg{lhs},
+        VReg{rhs});
+
+    selectTargetOpcodes(&func);
+
+    for (size_t i = 0; i < 2; i++) {
+      ASSERT_TRUE(op->getInput(i)->isLinked());
+      Instruction* input =
+          static_cast<LinkedOperand*>(op->getInput(i))->getLinkedInstr();
+      EXPECT_EQ(input->opcode(), Instruction::kSext);
+      EXPECT_EQ(input->output()->dataType(), DataType::k32bit);
+    }
+  }
 }
 
 TEST_F(LIRTargetSelectTest, SelectsMulAddForLeaLargeMultiplier) {

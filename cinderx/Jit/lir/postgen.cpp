@@ -448,46 +448,6 @@ RewriteResult rewriteLoadSecondCallResult(instr_iter_t instr_iter) {
 }
 
 #if defined(CINDER_AARCH64)
-// On AArch64, signed operations on sub-32-bit values need sign-extension.
-// LIR DataType doesn't track signedness (both cint8 and cuint8 become k8bit),
-// so values in registers are zero-extended by default (via ldrb/ldrh/cset).
-// For signed comparisons, e.g. cint8 -1 is 0xFF in a register; without
-// sign-extension "cmp w0(=255), w1(=1)" with kLT gives false (wrong), but
-// with sign-extension "cmp w0(=-1), w1(=1)" with kLT gives true (correct).
-// Similarly, signed division (sdiv) needs sign-extended inputs for correctness.
-RewriteResult rewriteSignedSubWordOps(instr_iter_t instr_iter) {
-  auto instr = instr_iter->get();
-  switch (instr->opcode()) {
-    case Instruction::kGreaterThanSigned:
-    case Instruction::kGreaterThanEqualSigned:
-    case Instruction::kLessThanSigned:
-    case Instruction::kLessThanEqualSigned:
-    case Instruction::kDiv:
-      break;
-    default:
-      return kUnchanged;
-  }
-
-  auto block = instr->basicblock();
-  bool changed = false;
-  for (size_t i = 0; i < instr->getNumInputs(); i++) {
-    auto input = instr->getInput(i);
-    if (!input->isReg()) {
-      continue;
-    }
-    auto dt = input->dataType();
-    if (dt != OperandBase::k8bit && dt != OperandBase::k16bit) {
-      continue;
-    }
-    auto sext = block->allocateInstrBefore(
-        instr_iter, Instruction::kSext, OutVReg{DataType::k32bit});
-    sext->appendInput(instr->releaseInput(i));
-    instr->setInput(i, std::make_unique<LinkedOperand>(sext));
-    changed = true;
-  }
-  return changed ? kChanged : kUnchanged;
-}
-
 // On AArch64, Guards with kHasType load obj->ob_type into a scratch register
 // in TranslateGuard. Decompose this into an explicit Move(Ind) to load the
 // type, then convert the guard to kIs so register allocation handles the
@@ -574,81 +534,59 @@ RewriteResult rewriteMoveAbsoluteAddress(instr_iter_t instr_iter) {
 //   - MovZX/MovSX/MovSXD: specialized sign/zero-extending loads from stack
 //   - Lea: takes the ADDRESS of a stack slot, not the value
 //   - Call: late-created by PostRegAllocRewrite via setOpcode()
+//   - Negate/Invert: handled by AArch64 target selection
+//   - Inc/Dec: handled by AArch64 target selection
 //   - EpilogueEnd: special return-value handling
 //   - Pop: stack output, not input
-RewriteResult rewriteStackInputToVreg(instr_iter_t instr_iter) {
+bool lowerStackInputToVreg(instr_iter_t instr_iter, size_t idx) {
   auto instr = instr_iter->get();
-  auto block = instr->basicblock();
-
-  auto lowerStackInput = [&](size_t idx) -> bool {
-    auto input = instr->getInput(idx);
-    if (!input->isStack()) {
-      return false;
-    }
-    auto loc = input->getStackSlot();
-    auto dt = input->dataType();
-    auto move = block->allocateInstrBefore(
-        instr_iter, Instruction::kMove, OutVReg{dt}, Stk{loc, dt});
-    instr->setInput(idx, std::make_unique<LinkedOperand>(move));
-    return true;
-  };
-
-  bool changed = false;
-
-  if (instr->isAdd() || instr->isSub() || instr->isXor() || instr->isAnd() ||
-      instr->isOr() || instr->isMul() || instr->isCompare()) {
-    // Binary ops and compare ops: lower any stack input.
-    for (size_t i = 0; i < instr->getNumInputs(); i++) {
-      changed |= lowerStackInput(i);
-    }
-  } else if (instr->isDiv() || instr->isDivUn()) {
-    // Div/DivUn may have an Imm{0} prefix for x86 high-half. Lower any
-    // non-immediate stack inputs.
-    for (size_t i = 0; i < instr->getNumInputs(); i++) {
-      changed |= lowerStackInput(i);
-    }
-  } else {
-    switch (instr->opcode()) {
-      case Instruction::kNegate:
-      case Instruction::kInvert:
-        changed |= lowerStackInput(0);
-        break;
-      case Instruction::kPush:
-        changed |= lowerStackInput(0);
-        break;
-      case Instruction::kInc:
-      case Instruction::kDec: {
-        // Inc/Dec are read-modify-write: the single operand is both input and
-        // output. For a stack operand, insert a load before and a store after:
-        //   vreg = Move [stack]
-        //   Inc/Dec vreg
-        //   Move vreg -> [stack]
-        auto input = instr->getInput(0);
-        if (input->isStack()) {
-          auto loc = input->getStackSlot();
-          auto dt = input->dataType();
-          auto move = block->allocateInstrBefore(
-              instr_iter, Instruction::kMove, OutVReg{dt}, Stk{loc, dt});
-          instr->setInput(0, std::make_unique<LinkedOperand>(move));
-          auto next_iter = std::next(instr_iter);
-          block->allocateInstrBefore(
-              next_iter, Instruction::kMove, OutStk{loc, dt}, VReg{move});
-          changed = true;
-        }
-        break;
-      }
-      case Instruction::kSelect:
-        // Select: condition (0), true_val (1), false_val (2)
-        for (size_t i = 0; i < instr->getNumInputs(); i++) {
-          changed |= lowerStackInput(i);
-        }
-        break;
-      default:
-        break;
-    }
+  auto input = instr->getInput(idx);
+  if (!input->isStack()) {
+    return false;
   }
 
+  auto loc = input->getStackSlot();
+  auto dt = input->dataType();
+  auto move = instr->basicblock()->allocateInstrBefore(
+      instr_iter, Instruction::kMove, OutVReg{dt}, Stk{loc, dt});
+  instr->setInput(idx, std::make_unique<LinkedOperand>(move));
+  return true;
+}
+
+RewriteResult rewriteAllStackInputsToVreg(instr_iter_t instr_iter) {
+  auto instr = instr_iter->get();
+  bool changed = false;
+  for (size_t i = 0; i < instr->getNumInputs(); i++) {
+    changed |= lowerStackInputToVreg(instr_iter, i);
+  }
   return changed ? kChanged : kUnchanged;
+}
+
+RewriteResult rewriteSingleStackInputToVreg(
+    instr_iter_t instr_iter,
+    size_t idx) {
+  return lowerStackInputToVreg(instr_iter, idx) ? kChanged : kUnchanged;
+}
+
+RewriteResult rewriteStackInputToVreg(instr_iter_t instr_iter) {
+  auto instr = instr_iter->get();
+  if (instr->isAdd() || instr->isSub() || instr->isXor() || instr->isAnd() ||
+      instr->isOr() || instr->isMul() || instr->isCompare()) {
+    return rewriteAllStackInputsToVreg(instr_iter);
+  }
+
+  if (instr->isDiv() || instr->isDivUn()) {
+    return rewriteAllStackInputsToVreg(instr_iter);
+  }
+
+  switch (instr->opcode()) {
+    case Instruction::kPush:
+      return rewriteSingleStackInputToVreg(instr_iter, 0);
+    case Instruction::kSelect:
+      return rewriteAllStackInputsToVreg(instr_iter);
+    default:
+      return kUnchanged;
+  }
 }
 
 // On AArch64, lower immediate operands to virtual registers for instructions
@@ -664,60 +602,54 @@ RewriteResult rewriteStackInputToVreg(instr_iter_t instr_iter) {
 //     directly
 //   - Move "Ri" (load immediate to register): this IS the lowering target
 //   - Inc/Dec: hardcoded constant 1, no immediate operand
+bool lowerImmediateInputToVreg(instr_iter_t instr_iter, size_t idx) {
+  auto instr = instr_iter->get();
+  auto input = instr->getInput(idx);
+  if (!input->isImm()) {
+    return false;
+  }
+
+  auto move = instr->basicblock()->allocateInstrBefore(
+      instr_iter,
+      Instruction::kMove,
+      OutVReg{input->dataType()},
+      Imm{input->getConstant(), input->dataType()});
+  instr->setInput(idx, std::make_unique<LinkedOperand>(move));
+  return true;
+}
+
+RewriteResult rewritePushImmediateToVreg(instr_iter_t instr_iter) {
+  // ARM str can't take an immediate data operand.
+  return lowerImmediateInputToVreg(instr_iter, 0) ? kChanged : kUnchanged;
+}
+
+RewriteResult rewriteSelectFalseImmediateToVreg(instr_iter_t instr_iter) {
+  // ARM csel is register-only; the false_val (input 2) must be a register.
+  return lowerImmediateInputToVreg(instr_iter, 2) ? kChanged : kUnchanged;
+}
+
+RewriteResult rewriteMemoryMoveImmediateToVreg(instr_iter_t instr_iter) {
+  auto instr = instr_iter->get();
+  auto output = instr->output();
+  if (!output->isInd() && !output->isStack()) {
+    return kUnchanged;
+  }
+  return lowerImmediateInputToVreg(instr_iter, 0) ? kChanged : kUnchanged;
+}
+
 RewriteResult rewriteNonBinaryImmediateToVreg(instr_iter_t instr_iter) {
   auto instr = instr_iter->get();
-  auto block = instr->basicblock();
-
   switch (instr->opcode()) {
-    case Instruction::kPush: {
-      // ARM str can't take an immediate data operand.
-      auto input = instr->getInput(0);
-      if (!input->isImm()) {
-        return kUnchanged;
-      }
-      auto move = block->allocateInstrBefore(
-          instr_iter,
-          Instruction::kMove,
-          OutVReg{input->dataType()},
-          Imm{input->getConstant(), input->dataType()});
-      instr->setInput(0, std::make_unique<LinkedOperand>(move));
-      return kChanged;
-    }
-    case Instruction::kSelect: {
-      // ARM csel is register-only; the false_val (input 2) must be a register.
-      auto input = instr->getInput(2);
-      if (!input->isImm()) {
-        return kUnchanged;
-      }
-      auto move = block->allocateInstrBefore(
-          instr_iter,
-          Instruction::kMove,
-          OutVReg{input->dataType()},
-          Imm{input->getConstant(), input->dataType()});
-      instr->setInput(2, std::make_unique<LinkedOperand>(move));
-      return kChanged;
-    }
+    case Instruction::kPush:
+      return rewritePushImmediateToVreg(instr_iter);
+    case Instruction::kSelect:
+      return rewriteSelectFalseImmediateToVreg(instr_iter);
     case Instruction::kMove:
-    case Instruction::kMoveRelaxed: {
+    case Instruction::kMoveRelaxed:
       // Lower immediate input ONLY when the output is memory (Ind or Stack).
       // Do NOT lower "Ri" (register = immediate) — that's the load-immediate
       // instruction and is the target of all other lowerings.
-      auto output = instr->output();
-      if (!output->isInd() && !output->isStack()) {
-        return kUnchanged;
-      }
-      auto input = instr->getInput(0);
-      if (!input->isImm()) {
-        return kUnchanged;
-      }
-      auto move = block->allocateInstrBefore(
-          instr_iter,
-          Instruction::kMove,
-          OutVReg{input->dataType()},
-          Imm{input->getConstant(), input->dataType()});
-      instr->setInput(0, std::make_unique<LinkedOperand>(move));
-      return kChanged;
-    }
+      return rewriteMemoryMoveImmediateToVreg(instr_iter);
     default:
       return kUnchanged;
   }
@@ -882,7 +814,6 @@ void PostGenerationRewrite::registerRewrites() {
 #if defined(CINDER_X86_64)
   registerOneRewriteFunction(rewriteMoveToMemoryLargeConstant, 1);
 #elif defined(CINDER_AARCH64)
-  registerOneRewriteFunction(rewriteSignedSubWordOps, 1);
   registerOneRewriteFunction(rewriteGuardHasType, 1);
   registerOneRewriteFunction(rewriteMoveAbsoluteAddress, 1);
   registerOneRewriteFunction(rewriteStackInputToVreg, 1);
