@@ -2,15 +2,16 @@
 
 #pragma once
 
-#include "cinderx/Interpreter/3.11/interpreter_contract.h"
+#include "Python.h"
 #include "internal/pycore_frame.h"
+
+#include "cinderx/Interpreter/3.11/interpreter_contract.h"
 
 #ifdef __cplusplus
 extern "C" {
 #endif
 
-PyFrameObject* Ci_PyFrame_MakeAndSetFrameObject_311(
-    _PyInterpreterFrame* frame);
+PyFrameObject* Ci_PyFrame_MakeAndSetFrameObject_311(_PyInterpreterFrame* frame);
 PyFrameObject* Ci_PyFrame_New_NoTrack_311(PyCodeObject* code);
 void Ci_PyFrame_Copy_311(
     _PyInterpreterFrame* source,

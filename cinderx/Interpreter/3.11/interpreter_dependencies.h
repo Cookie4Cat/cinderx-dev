@@ -13,9 +13,7 @@ _PyInterpreterFrame* Cix_PyThreadState_PushFrame(
     PyThreadState* tstate,
     size_t size);
 uint64_t Cix_PyDict_NextVersion(void);
-Py_ssize_t Cix_PyDictKeys_StringLookup(
-    PyDictKeysObject* keys,
-    PyObject* key);
+Py_ssize_t Cix_PyDictKeys_StringLookup(PyDictKeysObject* keys, PyObject* key);
 Py_ssize_t Cix_PyDict_GetItemHint(
     PyDictObject* dict,
     PyObject* key,

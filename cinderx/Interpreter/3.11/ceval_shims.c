@@ -8,6 +8,7 @@
 #include "Python.h"
 #include "internal/pycore_frame.h"
 #include "internal/pycore_pystate.h"
+
 #include "upstream/condvar.h"
 
 #include <pthread.h>
@@ -35,9 +36,8 @@ PyObject* _PyDict_FromItems(
   }
   for (Py_ssize_t index = 0; index < length; index++) {
     if (PyDict_SetItem(
-            dict,
-            keys[index * keys_offset],
-            values[index * values_offset]) < 0) {
+            dict, keys[index * keys_offset], values[index * values_offset]) <
+        0) {
       Py_DECREF(dict);
       return NULL;
     }
@@ -45,10 +45,7 @@ PyObject* _PyDict_FromItems(
   return dict;
 }
 
-int _PyDict_SetItem_Take2(
-    PyDictObject* dict,
-    PyObject* key,
-    PyObject* value) {
+int _PyDict_SetItem_Take2(PyDictObject* dict, PyObject* key, PyObject* value) {
   int result = PyDict_SetItem((PyObject*)dict, key, value);
   Py_DECREF(key);
   Py_DECREF(value);
@@ -138,8 +135,7 @@ static pthread_condattr_t* Ci_CondAttr_311(void) {
   static pthread_condattr_t attributes;
   static int initialized;
   if (initialized == 0) {
-    initialized =
-        pthread_condattr_init(&attributes) == 0 &&
+    initialized = pthread_condattr_init(&attributes) == 0 &&
             pthread_condattr_setclock(&attributes, CLOCK_MONOTONIC) == 0
         ? 1
         : -1;
@@ -169,8 +165,6 @@ void _PyThread_cond_after(long long microseconds, struct timespec* deadline) {
 #endif
   struct timeval now;
   gettimeofday(&now, NULL);
-  deadline->tv_sec =
-      now.tv_sec + (now.tv_usec + microseconds) / 1000000;
-  deadline->tv_nsec =
-      ((now.tv_usec + microseconds) % 1000000) * 1000;
+  deadline->tv_sec = now.tv_sec + (now.tv_usec + microseconds) / 1000000;
+  deadline->tv_nsec = ((now.tv_usec + microseconds) % 1000000) * 1000;
 }

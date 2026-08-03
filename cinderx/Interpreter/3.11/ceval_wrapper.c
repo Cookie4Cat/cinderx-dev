@@ -8,16 +8,17 @@
 // Route frame operations to the separately wrapped, pristine frame.c.
 // These mappings must precede pycore_frame.h so its inline helpers bind to the
 // vendored symbols rather than libpython's private, unexported definitions.
-#define _PyFrame_MakeAndSetFrameObject \
-  Ci_PyFrame_MakeAndSetFrameObject_311
+#define _PyFrame_MakeAndSetFrameObject Ci_PyFrame_MakeAndSetFrameObject_311
 #define _PyFrame_Copy Ci_PyFrame_Copy_311
 #define _PyFrame_Clear Ci_PyFrame_Clear_311
 #define _PyFrame_Push Ci_PyFrame_Push_311
 #define _PyInterpreterFrame_GetLine Ci_PyInterpreterFrame_GetLine_311
 
-#include "cinderx/Interpreter/3.11/interpreter_internal.h"
-#include "cinderx/Interpreter/3.11/interpreter_dependencies.h"
+#include "Python.h"
 #include "internal/pycore_dict.h"
+
+#include "cinderx/Interpreter/3.11/interpreter_dependencies.h"
+#include "cinderx/Interpreter/3.11/interpreter_internal.h"
 
 // Stable, versioned entry point. Recursive evaluator calls remain in the
 // vendored loop and cannot bind to libpython's stock entry point.
