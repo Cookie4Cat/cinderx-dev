@@ -234,15 +234,28 @@ BB %0
   Return %3
 )";
 
-  std::string lir_str = runTargetSelect(lir_input_str);
+  std::unique_ptr<Function> func = Parser().parse(lir_input_str);
+  selectTargetOpcodes(func.get());
 
-  EXPECT_NE(lir_str.find("= Move 16(0x10):64bit"), std::string::npos)
-      << lir_str;
-  EXPECT_NE(lir_str.find("= Move 1048577(0x100001):64bit"), std::string::npos)
-      << lir_str;
-  EXPECT_NE(lir_str.find("= MulAdd %2:64bit"), std::string::npos) << lir_str;
-  EXPECT_NE(lir_str.find("= Add "), std::string::npos) << lir_str;
-  EXPECT_EQ(lir_str.find("Lea "), std::string::npos) << lir_str;
+  ASSERT_EQ(func->basicblocks().size(), 1);
+  std::vector<Instruction*> instrs =
+      collectTargetSelectInstrs(*func->basicblocks()[0]);
+  ASSERT_EQ(instrs.size(), 8);
+
+  Instruction* offset_move = instrs[4];
+  ASSERT_TRUE(offset_move->isMove());
+  ASSERT_TRUE(offset_move->getInput(0)->isImm());
+  EXPECT_EQ(offset_move->getInput(0)->getConstant(), 0x100001);
+
+  Instruction* add = instrs[5];
+  ASSERT_TRUE(add->isAdd());
+  ASSERT_EQ(add->getNumInputs(), 2);
+  ASSERT_TRUE(add->getInput(1)->isLinked());
+  EXPECT_EQ(
+      static_cast<LinkedOperand*>(add->getInput(1))->getLinkedInstr(),
+      offset_move);
+
+  EXPECT_TRUE(instrs[6]->isMove());
 }
 
 TEST_F(LIRTargetSelectTest, LegalizesComparisonOutputToMin32Bit) {

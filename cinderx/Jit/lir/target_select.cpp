@@ -314,16 +314,20 @@ void selectA64LeaLargeMultiplier(BasicBlock* block, instr_iter_t instr_iter) {
   if (offset != 0) {
     uint64_t offset_value = static_cast<uint64_t>(static_cast<int64_t>(offset));
 
-    Instruction* add = block->allocateInstrBefore(
-        instr_iter, Instruction::kAdd, OutVReg{DataType::k64bit}, VReg{muladd});
-    if (asmjit::arm::Utils::isAddSubImm(offset_value)) {
-      add->addOperands(Imm{offset_value, DataType::k64bit});
-    } else {
-      Instruction* offset_move = block->allocateInstrBefore(
+    Instruction* offset_move = nullptr;
+    if (!asmjit::arm::Utils::isAddSubImm(offset_value)) {
+      offset_move = block->allocateInstrBefore(
           instr_iter,
           Instruction::kMove,
           OutVReg{DataType::k64bit},
           Imm{offset_value, DataType::k64bit});
+    }
+
+    Instruction* add = block->allocateInstrBefore(
+        instr_iter, Instruction::kAdd, OutVReg{DataType::k64bit}, VReg{muladd});
+    if (offset_move == nullptr) {
+      add->addOperands(Imm{offset_value, DataType::k64bit});
+    } else {
       add->addOperands(VReg{offset_move});
     }
 
