@@ -1,12 +1,12 @@
 import os
 import platform
-import subprocess
 import sys
 import unittest
 from pathlib import Path
 
 import cinderx
 import cinderx.jit
+from cinderx.test_support import run_python_child
 
 try:
     import cinderjit
@@ -14,7 +14,7 @@ except ImportError:
     cinderjit = None
 
 
-HELPER = Path(__file__).resolve()
+HELPER = Path(__file__).with_name("child_cases") / "lightweight_frames.py"
 IS_AARCH64 = platform.machine().lower() in {"aarch64", "arm64"}
 
 
@@ -45,11 +45,10 @@ def _run_tls_case(case: str) -> str:
             "PYTHONUNBUFFERED": "1",
         }
     )
-    completed = subprocess.run(
-        [sys.executable, str(HELPER), "--tls-case", case],
+    completed = run_python_child(
+        HELPER,
+        case,
         env=env,
-        capture_output=True,
-        text=True,
         timeout=120,
     )
     output = completed.stdout + completed.stderr
@@ -60,29 +59,6 @@ def _run_tls_case(case: str) -> str:
     )
     assert "Traceback" not in output, output
     return output
-
-
-def _minimal_jit_target() -> int:
-    return 41 + 1
-
-
-def _run_inline_tls_case(force_fallback: bool = False) -> None:
-    if not cinderx.is_lightweight_frames_enabled():
-        raise RuntimeError("LWF not compiled in")
-    if not cinderx.jit.is_enabled():
-        raise RuntimeError("JIT not enabled")
-    if cinderjit is None:
-        raise RuntimeError("cinderjit unavailable")
-
-    if force_fallback:
-        cinderjit._test_set_thread_state_offset(-1)
-
-    assert cinderx.jit.force_compile(_minimal_jit_target)
-    assert cinderx.jit.is_jit_compiled(_minimal_jit_target)
-    for _ in range(20):
-        assert _minimal_jit_target() == 42
-    print("CASE_RESULT minimal_jit_target OK 42")
-    cinderx.jit.disassemble(_minimal_jit_target)
 
 
 class LightweightFramesTests(unittest.TestCase):
@@ -238,11 +214,4 @@ class LightweightFramesTests(unittest.TestCase):
 
 
 if __name__ == "__main__":
-    if "--tls-case" in sys.argv:
-        index = sys.argv.index("--tls-case")
-        case = sys.argv[index + 1]
-        del sys.argv[index : index + 2]
-        _run_inline_tls_case(force_fallback=(case == "fallback"))
-        raise SystemExit(0)
-
     unittest.main()

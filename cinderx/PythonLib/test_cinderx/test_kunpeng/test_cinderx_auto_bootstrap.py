@@ -1,13 +1,15 @@
 import os
 from pathlib import Path
-import subprocess
-import sys
+import shutil
 import tempfile
-import textwrap
 import unittest
+
+from cinderx.test_support import assert_python_child_ok, run_python_child
 
 
 PYTHONLIB = Path(__file__).parents[2]
+CHILD = Path(__file__).with_name("child_cases") / "auto_bootstrap.py"
+FIXTURES = Path(__file__).with_name("fixtures") / "auto_bootstrap"
 
 
 class CinderXAutoBootstrapTest(unittest.TestCase):
@@ -15,124 +17,48 @@ class CinderXAutoBootstrapTest(unittest.TestCase):
         with self.subTest("does not import the full cinderx package"):
             with tempfile.TemporaryDirectory() as tempdir:
                 temp = Path(tempdir)
-                (temp / "cinderx.py").write_text(
-                    "raise AssertionError('full cinderx package imported')\n"
-                )
-                (temp / "_cinderx.py").write_text(
-                    textwrap.dedent(
-                        """
-                        def install_frame_evaluator():
-                            pass
-
-                        def _autojit_import_enter():
-                            pass
-
-                        def _autojit_import_leave():
-                            pass
-
-                        def _autojit_import_depth():
-                            return 0
-
-                        def _autojit_import_scope_depth():
-                            return 0
-
-                        def _autojit_setup_enter():
-                            pass
-
-                        def _autojit_setup_leave():
-                            pass
-
-                        def _autojit_setup_depth():
-                            return 0
-                        """
-                    )
-                )
-                (temp / "cinderjit.py").write_text(
-                    textwrap.dedent(
-                        """
-                        def is_enabled():
-                            return True
-                        """
-                    )
-                )
+                shutil.copytree(FIXTURES / "lightweight", temp, dirs_exist_ok=True)
 
                 env = os.environ.copy()
                 env["CINDERX_PLUGIN_ENABLE"] = "1"
                 env["PYTHONJITAUTO"] = "auto:2"
                 env["PYTHONPATH"] = f"{temp}{os.pathsep}{PYTHONLIB}"
 
-                completed = subprocess.run(
-                    [
-                        sys.executable,
-                        "-S",
-                        "-c",
-                        textwrap.dedent(
-                            """
-                            import sys
-                            import _cinderx_auto
-
-                            assert "cinderx" not in sys.modules
-                            assert "_cinderx" in sys.modules
-                            assert "cinderjit" in sys.modules
-                            """
-                        ),
-                    ],
+                completed = run_python_child(
+                    CHILD,
+                    "lightweight-bootstrap",
+                    python_options=("-S",),
                     env=env,
-                    capture_output=True,
-                    text=True,
                     timeout=30,
                 )
-
-                self.assertEqual(
-                    completed.returncode,
-                    0,
-                    f"stdout:\n{completed.stdout}\nstderr:\n{completed.stderr}",
+                assert_python_child_ok(
+                    completed,
+                    context="lightweight CinderX auto bootstrap",
                 )
 
     def test_jit_disabled_startup_does_not_import_cinderjit(self) -> None:
         with tempfile.TemporaryDirectory() as tempdir:
             temp = Path(tempdir)
-            (temp / "_cinderx.py").write_text(
-                textwrap.dedent(
-                    """
-                    def has_parallel_gc():
-                        return False
-                    """
-                )
-            )
+            shutil.copytree(FIXTURES / "jit_disabled", temp, dirs_exist_ok=True)
 
             env = os.environ.copy()
             env["CINDERX_PLUGIN_ENABLE"] = "1"
             env["PYTHONJITDISABLE"] = "1"
             env["PYTHONPATH"] = f"{temp}{os.pathsep}{PYTHONLIB}"
 
-            completed = subprocess.run(
-                [
-                    sys.executable,
-                    "-S",
-                    "-c",
-                    textwrap.dedent(
-                        """
-                        import sys
-                        import _cinderx_auto
-
-                        assert "_cinderx" in sys.modules
-                        assert "cinderjit" not in sys.modules
-                        """
-                    ),
-                ],
+            completed = run_python_child(
+                CHILD,
+                "jit-disabled",
+                python_options=("-S",),
                 env=env,
-                capture_output=True,
-                text=True,
                 timeout=30,
             )
-
-            self.assertEqual(
-                completed.returncode,
-                0,
-                f"stdout:\n{completed.stdout}\nstderr:\n{completed.stderr}",
+            stderr = completed.stderr or ""
+            assert_python_child_ok(
+                completed,
+                context="JIT-disabled CinderX auto bootstrap",
             )
-            self.assertNotIn("Traceback", completed.stderr)
+            self.assertNotIn("Traceback", stderr)
 
 
 if __name__ == "__main__":
