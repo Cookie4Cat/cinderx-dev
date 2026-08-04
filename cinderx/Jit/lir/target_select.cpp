@@ -2,6 +2,7 @@
 
 #include "cinderx/Jit/lir/target_select.h"
 
+#include "cinderx/Jit/codegen/arch.h"
 #include "cinderx/Jit/codegen/arch/detection.h"
 #include "cinderx/Jit/lir/block.h"
 #include "cinderx/Jit/lir/function.h"
@@ -345,6 +346,141 @@ bool flagsPreservedBetween(instr_iter_t begin, instr_iter_t end) {
   return true;
 }
 
+/* AArch64 GPR operations produce at least 32-bit results. Keep semantic
+ * sub-32-bit types in generic LIR, then legalize them before register
+ * allocation so codegen does not need to mask partial-register results.
+ */
+void legalizeA64Min32BitOutput(instr_iter_t instr_iter) {
+  Instruction* instr = instr_iter->get();
+  if (instr->output()->sizeInBits() < 32) {
+    instr->output()->setDataType(DataType::k32bit);
+  }
+}
+
+/* AArch64 signed operations on sub-32-bit values need sign-extension. LIR
+ * DataType doesn't track signedness, so values in registers are zero-extended
+ * by default. Signed comparisons and signed division need explicit 32-bit
+ * signed inputs for correctness.
+ */
+void legalizeA64SignedSubWordInputs(
+    BasicBlock* block,
+    instr_iter_t instr_iter) {
+  Instruction* instr = instr_iter->get();
+  JIT_DCHECK(
+      instr->opcode() == Instruction::kGreaterThanSigned ||
+          instr->opcode() == Instruction::kGreaterThanEqualSigned ||
+          instr->opcode() == Instruction::kLessThanSigned ||
+          instr->opcode() == Instruction::kLessThanEqualSigned ||
+          instr->opcode() == Instruction::kDiv,
+      "Expected signed comparison or Div, got {}",
+      instr->opname());
+
+  for (size_t i = 0; i < instr->getNumInputs(); i++) {
+    OperandBase* input = instr->getInput(i);
+    if (!input->isReg() && !input->isLinked()) {
+      continue;
+    }
+
+    DataType dt = input->dataType();
+    if (dt != OperandBase::k8bit && dt != OperandBase::k16bit) {
+      continue;
+    }
+
+    Instruction* sext = block->allocateInstrBefore(
+        instr_iter, Instruction::kSext, OutVReg{DataType::k32bit});
+    sext->appendInput(instr->releaseInput(i));
+    instr->setInput(i, std::make_unique<LinkedOperand>(sext));
+  }
+}
+
+/* AArch64 cannot directly test-and-branch on FP registers. Move double guard
+ * inputs through a GP-sized vreg before guard selection and register
+ * allocation.
+ */
+void legalizeA64GuardFPInput(BasicBlock* block, instr_iter_t instr_iter) {
+  Instruction* instr = instr_iter->get();
+  JIT_DCHECK(instr->isGuard(), "Expected Guard, got {}", instr->opname());
+
+  constexpr size_t kGuardVarIndex = 2;
+  OperandBase* guard_var = instr->getInput(kGuardVarIndex);
+  if (guard_var->dataType() != DataType::kDouble) {
+    return;
+  }
+
+  Instruction* move = block->allocateInstrBefore(
+      instr_iter, Instruction::kMove, OutVReg{DataType::k64bit});
+  move->appendInput(instr->releaseInput(kGuardVarIndex));
+  instr->setInput(kGuardVarIndex, std::make_unique<LinkedOperand>(move));
+}
+
+Instruction* moveA64StackInputToVreg(
+    BasicBlock* block,
+    instr_iter_t instr_iter,
+    size_t idx) {
+  Instruction* instr = instr_iter->get();
+  OperandBase* input = instr->getInput(idx);
+  JIT_DCHECK(input->isStack(), "Expected stack input");
+
+  PhyLocation loc = input->getStackSlot();
+  DataType dt = input->dataType();
+  Instruction* move = block->allocateInstrBefore(
+      instr_iter, Instruction::kMove, OutVReg{dt}, Stk{loc, dt});
+  instr->setInput(idx, std::make_unique<LinkedOperand>(move));
+  return move;
+}
+
+/* AArch64 unary arithmetic instructions only operate on registers. */
+void legalizeA64UnaryStackInput(BasicBlock* block, instr_iter_t instr_iter) {
+  Instruction* instr = instr_iter->get();
+  JIT_DCHECK(
+      instr->isNegate() || instr->isInvert(),
+      "Expected Negate or Invert, got {}",
+      instr->opname());
+
+  if (!instr->getInput(0)->isStack()) {
+    return;
+  }
+
+  moveA64StackInputToVreg(block, instr_iter, 0);
+}
+
+/* AArch64 Select lowers to register-only csel. */
+void legalizeA64SelectStackInputs(BasicBlock* block, instr_iter_t instr_iter) {
+  Instruction* instr = instr_iter->get();
+  JIT_DCHECK(instr->isSelect(), "Expected Select, got {}", instr->opname());
+
+  for (size_t i = 0; i < instr->getNumInputs(); i++) {
+    if (instr->getInput(i)->isStack()) {
+      moveA64StackInputToVreg(block, instr_iter, i);
+    }
+  }
+}
+
+/* AArch64 Inc/Dec only operate on registers. Rewrite stack updates through a
+ * virtual register so register allocation handles the temporary.
+ */
+void legalizeA64StackInputForIncDec(
+    BasicBlock* block,
+    instr_iter_t instr_iter) {
+  Instruction* instr = instr_iter->get();
+  JIT_DCHECK(
+      instr->isInc() || instr->isDec(),
+      "Expected Inc or Dec, got {}",
+      instr->opname());
+
+  OperandBase* input = instr->getInput(0);
+  if (!input->isStack()) {
+    return;
+  }
+
+  PhyLocation loc = input->getStackSlot();
+  DataType dt = input->dataType();
+  Instruction* move = moveA64StackInputToVreg(block, instr_iter, 0);
+
+  block->allocateInstrBefore(
+      std::next(instr_iter), Instruction::kMove, OutStk{loc, dt}, VReg{move});
+}
+
 bool sameGpValue(
     const OperandBase* left,
     const OperandBase* right,
@@ -451,6 +587,85 @@ void selectA64CondBranch(
 
 /* Convert from:
  *
+ *     addr = Lea [base + index * (1 << mult) + offset]  where mult >= 4
+ *
+ * to:
+ *
+ *     scale = Move(Imm(1 << mult))
+ *     addr' = MulAdd(index, scale, base)
+ *     [if offset != 0: addr' = Add(addr', Imm(offset))]
+ *     addr = Move(addr')
+ */
+void selectA64LeaLargeMultiplier(BasicBlock* block, instr_iter_t instr_iter) {
+  Instruction* instr = instr_iter->get();
+  JIT_DCHECK(instr->isLea(), "Expected Lea, got {}", instr->opname());
+
+  OperandBase* input = instr->getInput(0);
+  if (!input->isInd()) {
+    return;
+  }
+
+  MemoryIndirect* ind = input->getMemoryIndirect();
+  OperandBase* index_op = ind->getIndexRegOperand();
+  if (index_op == nullptr) {
+    return;
+  }
+
+  uint8_t mult = ind->getMultipiler();
+  if (mult < 4) {
+    return;
+  }
+
+  int32_t offset = ind->getOffset();
+
+  std::unique_ptr<OperandBase> ind_input = instr->removeInput(0);
+  ind = ind_input->getMemoryIndirect();
+  std::unique_ptr<OperandBase> index = ind->releaseIndexRegOperand();
+  std::unique_ptr<OperandBase> base = ind->releaseBaseRegOperand();
+  JIT_CHECK(base != nullptr, "Expected Lea with index to also have a base");
+
+  Instruction* scale_move = block->allocateInstrBefore(
+      instr_iter,
+      Instruction::kMove,
+      OutVReg{DataType::k64bit},
+      Imm{uint64_t{1} << mult, DataType::k64bit});
+
+  Instruction* muladd = block->allocateInstrBefore(
+      instr_iter, Instruction::kMulAdd, OutVReg{DataType::k64bit});
+  muladd->appendInput(std::move(index));
+  muladd->appendInput(std::make_unique<LinkedOperand>(scale_move));
+  muladd->appendInput(std::move(base));
+
+  Instruction* final_result = muladd;
+  if (offset != 0) {
+    uint64_t offset_value = static_cast<uint64_t>(static_cast<int64_t>(offset));
+
+    Instruction* offset_move = nullptr;
+    if (!asmjit::arm::Utils::isAddSubImm(offset_value)) {
+      offset_move = block->allocateInstrBefore(
+          instr_iter,
+          Instruction::kMove,
+          OutVReg{DataType::k64bit},
+          Imm{offset_value, DataType::k64bit});
+    }
+
+    Instruction* add = block->allocateInstrBefore(
+        instr_iter, Instruction::kAdd, OutVReg{DataType::k64bit}, VReg{muladd});
+    if (offset_move == nullptr) {
+      add->addOperands(Imm{offset_value, DataType::k64bit});
+    } else {
+      add->addOperands(VReg{offset_move});
+    }
+
+    final_result = add;
+  }
+
+  instr->setOpcode(Instruction::kMove);
+  instr->appendInput(std::make_unique<LinkedOperand>(final_result));
+}
+
+/* Convert from:
+ *
  *     cmp x0, x1
  *     cset w2, lt
  *     cbz w2, deopt
@@ -526,6 +741,32 @@ void selectA64Opcodes(Function* func) {
     for (instr_iter_t iter = instrs.begin(); iter != instrs.end();) {
       instr_iter_t cur_iter = iter++;
       switch (cur_iter->get()->opcode()) {
+        case Instruction::kEqual:
+        case Instruction::kNotEqual:
+          legalizeA64Min32BitOutput(cur_iter);
+          break;
+        case Instruction::kGreaterThanSigned:
+        case Instruction::kGreaterThanEqualSigned:
+        case Instruction::kLessThanSigned:
+        case Instruction::kLessThanEqualSigned:
+          legalizeA64SignedSubWordInputs(block, cur_iter);
+          legalizeA64Min32BitOutput(cur_iter);
+          break;
+        case Instruction::kGreaterThanUnsigned:
+        case Instruction::kGreaterThanEqualUnsigned:
+        case Instruction::kLessThanUnsigned:
+        case Instruction::kLessThanEqualUnsigned:
+        case Instruction::kAnd:
+        case Instruction::kXor:
+        case Instruction::kOr:
+          legalizeA64Min32BitOutput(cur_iter);
+          break;
+        case Instruction::kDiv:
+          legalizeA64SignedSubWordInputs(block, cur_iter);
+          break;
+        case Instruction::kLea:
+          selectA64LeaLargeMultiplier(block, cur_iter);
+          break;
         case Instruction::kMul:
           selectA64MulArithmetic(block, cur_iter, use_counts);
           break;
@@ -539,7 +780,19 @@ void selectA64Opcodes(Function* func) {
           selectA64CondBranch(block, cur_iter, use_counts);
           break;
         case Instruction::kGuard:
+          legalizeA64GuardFPInput(block, cur_iter);
           selectA64Guard(block, cur_iter, use_counts);
+          break;
+        case Instruction::kNegate:
+        case Instruction::kInvert:
+          legalizeA64UnaryStackInput(block, cur_iter);
+          break;
+        case Instruction::kSelect:
+          legalizeA64SelectStackInputs(block, cur_iter);
+          break;
+        case Instruction::kInc:
+        case Instruction::kDec:
+          legalizeA64StackInputForIncDec(block, cur_iter);
           break;
         default:
           break;

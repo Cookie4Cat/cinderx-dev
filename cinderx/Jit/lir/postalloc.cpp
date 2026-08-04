@@ -1098,7 +1098,7 @@ RewriteResult rewriteMemoryInputsToReg(instr_iter_t instr_iter) {
   int fp_scratch_idx = 0;
 
   // Signed sub-word operations (signed comparisons, signed division) expect
-  // sign-extended inputs. rewriteSignedSubWordOps (pre-regalloc) inserts kSext
+  // sign-extended inputs. Target selection inserts kSext
   // to widen k8bit/k16bit to k32bit, but if that k32bit value gets spilled,
   // its stack operand may still carry the original k8bit/k16bit data type.
   // Loading with that narrow type produces a zero-extending load (ldrb/ldrh),
