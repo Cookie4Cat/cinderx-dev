@@ -22,7 +22,7 @@ int Ci_InitFrameEvalFunc() {
   // Let borrowed.h know the eval frame pointer
   Ci_EvalFrameFunc = Ci_EvalFrame;
 
-  auto interp = _PyInterpreterState_GET();
+  auto interp = PyInterpreterState_Get();
   auto current_eval_frame = _PyInterpreterState_GetEvalFrameFunc(interp);
   if (current_eval_frame == Ci_EvalFrame) {
     return 0;
@@ -51,7 +51,7 @@ void Ci_FiniFrameEvalFunc() {
 #ifdef ENABLE_EVAL_HOOK
   Ci_hook_EvalFrame = nullptr;
 #elif defined(ENABLE_PEP523_HOOK)
-  _PyInterpreterState_SetEvalFrameFunc(_PyInterpreterState_GET(), nullptr);
+  _PyInterpreterState_SetEvalFrameFunc(PyInterpreterState_Get(), nullptr);
 #endif
 #endif
 }

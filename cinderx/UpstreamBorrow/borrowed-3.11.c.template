@@ -9,10 +9,7 @@
 
 #include "cinderx/UpstreamBorrow/borrowed.h"
 
-// The stock opcode tables are not exported by libpython; NEED_OPCODE_TABLES
-// makes pycore_opcode.h define them privately in this translation unit.
-#define NEED_OPCODE_TABLES
-#include "internal/pycore_opcode.h"
+#include "cinderx/Interpreter/cinder_opcode.h"
 
 #include "internal/pycore_genobject.h"
 #include "internal/pycore_pyerrors.h"
@@ -32,9 +29,11 @@ _PyFrameEvalFunction Ci_EvalFrameFunc;
 // Generator and coroutine helpers.
 // @Borrow CPP directives from Objects/genobject.c
 
-// _PyGen_yf consults the opcode deopt table, which NEED_OPCODE_TABLES above
-// defines privately in this translation unit.
+// _PyGen_yf consults the opcode deopt table.  The stock table is not exported
+// by CPython 3.11, so use the copy owned by the interpreter source set.
+#define _PyOpcode_Deopt _CiOpcode_Deopt
 // @Borrow function _PyGen_yf from Objects/genobject.c
+#undef _PyOpcode_Deopt
 
 // Internal dependency for _PyCoro_GetAwaitableIter.
 // @Borrow function gen_is_coroutine from Objects/genobject.c
@@ -194,6 +193,16 @@ int Cix_set_attribute_error_context(PyObject* v, PyObject* name) {
 #undef FREELIST_FINALIZED
 #undef STATE
 
+// pycore_frame.h's inline helpers call these private frame functions by their
+// real names, and the target libpython does not export them.  Keep their exact
+// 3.11.6 implementation and dependency closure here; the vendored evaluator
+// binds to its own renamed copy so the two never collide.
+// @Borrow function _PyFrame_New_NoTrack from Objects/frameobject.c
+// @Borrow function _PyFrame_MakeAndSetFrameObject from Python/frame.c
+// @Borrow function take_ownership from Python/frame.c
+// @Borrow function _PyFrame_Clear from Python/frame.c
+// @Borrow function _PyInterpreterFrame_GetLine from Python/frame.c
+
 // 3.11 has no _PyFrame_ClearExceptCode.  Delegate to the verbatim vendored
 // _PyFrame_Clear while preserving the code reference owned by JIT cleanup.
 void _PyFrame_ClearExceptCode(_PyInterpreterFrame* frame) {
@@ -241,9 +250,9 @@ static void Cix_PyObject_VirtualFree(void* ptr, size_t size) {
 // @Borrow function _PyThreadState_BumpFramePointerSlow from Python/pystate.c
 #undef _PyThreadState_BumpFramePointerSlow
 
-#define _PyThreadState_PopFrame Cix_PyThreadState_PopFrame
+// Keep the real name: pycore_frame.h's inline helpers call it directly and the
+// target libpython does not export it.
 // @Borrow function _PyThreadState_PopFrame from Python/pystate.c
-#undef _PyThreadState_PopFrame
 #undef _PyObject_VirtualFree
 #undef _PyObject_VirtualAlloc
 

@@ -222,12 +222,6 @@ int Cix_PyObjectDict_SetItem(
     PyObject* key,
     PyObject* value);
 
-#if PY_VERSION_HEX < 0x030C0000
-// 3.12+ dict-watcher event type. It exists on 3.11 only so the compile-compat
-// watcher stub keeps a single cross-version signature.
-typedef int PyDict_WatchEvent;
-#endif
-
 void Cix_PyDict_SendEvent(
     int watcher_bits,
     PyDict_WatchEvent event,

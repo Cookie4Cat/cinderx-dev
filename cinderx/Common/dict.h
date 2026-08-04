@@ -63,12 +63,21 @@ static inline uint32_t dictGetKeysVersion(
   if (dictkeys->dk_version != 0) {
     return dictkeys->dk_version;
   }
+#if PY_VERSION_HEX < 0x030C0000
+  // 3.11 keeps its keys-version allocator private to libpython and does not
+  // export it.  Handing out numbers from a private counter would collide with
+  // the stock stream, so an unversioned keys object simply stays unversioned:
+  // callers treat 0 as "no evidence" and take the generic path.
+  (void)interp;
+  return 0;
+#else
   if (interp->dict_state.next_keys_version == 0) {
     return 0;
   }
   uint32_t v = interp->dict_state.next_keys_version++;
   dictkeys->dk_version = v;
   return v;
+#endif
 }
 
 #if PY_VERSION_HEX >= 0x030E0000

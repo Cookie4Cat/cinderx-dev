@@ -23,10 +23,11 @@ def _cinderx_jit_disabled():
 if _cinderx_plugin_enabled() and not _cinderx_force_disabled():
     import _cinderx  # noqa: F401
 
-    if not _cinderx_jit_disabled():
-        import cinderjit  # noqa: F401
-    else:
+    if _cinderx_jit_disabled() or sys.version_info[:2] < (3, 12):
+        # The 3.11 capability contract forbids JIT machine-code execution.
         cinderjit = None
+    else:
+        import cinderjit  # noqa: F401
 
     _AUTOJIT_IMPORT_PROVIDER_MARKER = "_cinderx_autojit_import_provider"
     _AUTOJIT_SETUP_PROVIDER_MARKER = "_cinderx_autojit_setup_provider"

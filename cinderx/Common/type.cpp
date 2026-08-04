@@ -15,7 +15,7 @@
 namespace jit {
 
 std::string typeFullname(PyTypeObject* type) {
-  PyObject* dict = _PyType_GetDict(type);
+  PyObject* dict = getBorrowedTypeDict(type);
   PyObject* module_str =
       dict ? PyDict_GetItemString(dict, "__module__") : nullptr;
   if (module_str != nullptr && PyUnicode_Check(module_str)) {

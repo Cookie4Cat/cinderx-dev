@@ -83,8 +83,18 @@ JIT_COLD void logImplV(
 
 void printPythonException() {
   if (PyErr_Occurred()) {
+#if PY_VERSION_HEX < 0x030C0000
+    PyObject *type, *value, *traceback;
+    PyErr_Fetch(&type, &value, &traceback);
+    PyErr_NormalizeException(&type, &value, &traceback);
+    PyErr_Display(type, value, traceback);
+    Py_XDECREF(type);
+    Py_XDECREF(value);
+    Py_XDECREF(traceback);
+#else
     auto exc = Ref<>::steal(PyErr_GetRaisedException());
     PyErr_DisplayException(exc);
+#endif
   }
 }
 
@@ -113,9 +123,21 @@ void setRuntimeError(const std::exception& exn) {
   // Shouldn't happen, but in case we doubled up on Python and C++ exceptions,
   // make sure to log the Python exception first, then override it with the C++
   // exception.  Otherwise it would just be lost.
+#if PY_VERSION_HEX < 0x030C0000
+  if (PyErr_Occurred()) {
+    PyObject *type, *value, *traceback;
+    PyErr_Fetch(&type, &value, &traceback);
+    PyErr_NormalizeException(&type, &value, &traceback);
+    PyErr_Display(type, value, traceback);
+    Py_XDECREF(type);
+    Py_XDECREF(value);
+    Py_XDECREF(traceback);
+  }
+#else
   if (auto err = Ref<>::steal(PyErr_GetRaisedException())) {
     PyErr_DisplayException(err);
   }
+#endif
   PyErr_SetString(PyExc_RuntimeError, exn.what());
 }
 
