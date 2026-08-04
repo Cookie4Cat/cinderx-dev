@@ -1,0 +1,45 @@
+# CPython 3.11 acceptance gate.
+#
+# Scenario 5 (the CPython 3.14 reference line stays unchanged) is covered by
+# the existing 3.14 suites and has no job here.
+#
+# Not wired into a pipeline yet.  Every job runs on the venv the first job
+# builds, so the suite is self-contained in a clean worktree; the scenario-3
+# differential engine (ci_pipeline/libtest_diff_311.py) lands in its own MR
+# and that job cannot run until it does.  The observe-mode job arrives with
+# the runtime-mode change.
+
+fail_fast = true
+
+[target]
+python = "3.11"
+arch = "arm64"
+system = "Linux"
+
+# Scenario 1: build a wheel, install it into a clean venv, import it.
+[[jobs]]
+name = "wheel_build_import"
+command = "bash -lc 'python3.11 -m pip wheel . -w \"{run_dir}/wheels\" --no-deps && python3.11 -m venv \"{run_dir}/venv\" && \"{run_dir}/venv/bin/pip\" install \"{run_dir}\"/wheels/cinderx-*.whl && \"{run_dir}/venv/bin/python\" -c \"import _cinderx, cinderx\"'"
+
+# Scenario 2: the evaluator takes and returns the PEP 523 entry point, and
+# code executes correctly on the vendored loop while it holds it.
+[[jobs]]
+name = "interpreter_and_eval_hook"
+command = "bash -lc 'cd cinderx/PythonLib && \"{run_dir}/venv/bin/python\" -m unittest test_cinderx.test_interpreter_311 test_cinderx.test_jit_unsupported_311'"
+
+# Scenario 3: the full stdlib suite behaves identically with and without the
+# CinderX evaluator installed.  Only regressions are red; the excluded
+# modules depend on network access or are broken in the offline container in
+# the stock arm as well, and carry no interpreter signal.  Shrink the list if
+# the environment ever provides what they need.
+[[jobs]]
+name = "libtest_jitoff_diff"
+command = "bash -lc 'mkdir -p \"{run_dir}/startup\" && printf \"import _cinderx, cinderx\\ncinderx.init()\\n_cinderx.install_frame_evaluator()\\n\" > \"{run_dir}/startup/sitecustomize.py\" && \"{run_dir}/venv/bin/python\" ci_pipeline/libtest_diff_311.py gate --out \"{run_dir}/libtest\" --pythonpath-prepend \"{run_dir}/startup\" --exclude test_ftplib --exclude test_httplib --exclude test_imaplib --exclude test_nntplib --exclude test_urllib2_localnet --exclude test_logging --exclude test_xml_etree --exclude test_xml_etree_c'"
+
+# Scenario 4: observe mode reaches the compile entry point and is refused
+# before any bytecode is read.  Test body arrives with the runtime-mode
+# change; until then the refusal itself is covered by
+# test_jit_unsupported_311 above.
+# [[jobs]]
+# name = "observe_gate"
+# command = "..."
