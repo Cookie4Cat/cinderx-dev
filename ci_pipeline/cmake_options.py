@@ -92,9 +92,7 @@ def cmake_feature_options(
         should_enable_lightweight_frames(py_version, meta_python=meta_python),
     )
     set_option("ENABLE_PARALLEL_GC", meta_312)
-    # MR-3 owns PEP 523 installation on 3.11. MR-1/MR-2 only build and expose
-    # the versioned evaluator contract.
-    set_option("ENABLE_PEP523_HOOK", meta_312 or is_314plus)
+    set_option("ENABLE_PEP523_HOOK", is_stock_311 or meta_312 or is_314plus)
     set_option("ENABLE_PERF_TRAMPOLINE", meta_312)
     set_option("ENABLE_SYMBOLIZER", linux and not is_stock_311)
     set_option("ENABLE_USDT", linux)

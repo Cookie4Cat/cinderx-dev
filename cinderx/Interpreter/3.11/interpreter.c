@@ -14,6 +14,15 @@
 // is no CinderX table to initialize.
 void Ci_InitOpcodes() {}
 
+// PEP 523 entry point.  Once installed, every Python frame in the process
+// enters here and runs on the vendored CPython 3.11.6 evaluator instead of
+// libpython's own copy.  Hot-code observation and its scheduling chain arrive
+// with the runtime-mode milestone; this stays a plain pass-through until then.
+PyObject* _Py_HOT_FUNCTION
+Ci_EvalFrame(PyThreadState* tstate, _PyInterpreterFrame* frame, int throwflag) {
+  return Ci_EvalFrameDefault_311(tstate, frame, throwflag);
+}
+
 // Static Python is out of scope on 3.11; these entry points exist because the
 // shared runtime links against them, and they behave as ordinary calls.
 PyObject* Ci_StaticFunction_Vectorcall(

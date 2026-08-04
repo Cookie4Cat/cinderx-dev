@@ -12,6 +12,7 @@
 #include "cinderx/Immortalize/immortalize.h"
 #include "cinderx/Interpreter/interpreter.h"
 #if PY_VERSION_HEX < 0x030C0000
+#include "cinderx/Interpreter/3.11/eval_hook.h"
 #include "cinderx/Interpreter/3.11/interpreter_contract.h"
 #endif
 #include "cinderx/Jit/anextawaitable.h"
@@ -692,8 +693,28 @@ PyDoc_STRVAR(
     "standard CPython frame evaluator.  This function should generally be "
     "avoided, and is exposed primarily for testing purposes.");
 PyObject* remove_frame_evaluator(PyObject* /* mod */, PyObject* /* args */) {
+#if PY_VERSION_HEX < 0x030C0000
+  // Report ownership loss rather than pretending the removal succeeded: the
+  // entry point now belongs to whoever replaced us.
+  switch (Ci_EvalHook311_Remove()) {
+    case CI_EVAL_HOOK_REMOVED:
+      break;
+    case CI_EVAL_HOOK_OWNERSHIP_LOST:
+      PyErr_SetString(
+          PyExc_RuntimeError,
+          "another component replaced the CinderX frame evaluator; its entry "
+          "point was left in place");
+      return nullptr;
+    case CI_EVAL_HOOK_ERROR:
+      return nullptr;
+  }
+  Ci_SetStaticFunctionVectorcall(nullptr);
+  Ci_EvalFrameFunc = nullptr;
+  Py_RETURN_NONE;
+#else
   Ci_FiniFrameEvalFunc();
   Py_RETURN_NONE;
+#endif
 }
 
 PyDoc_STRVAR(
@@ -702,6 +723,11 @@ PyDoc_STRVAR(
 PyObject* is_frame_evaluator_installed(
     PyObject* /* mod */,
     PyObject* /* args */) {
+#if PY_VERSION_HEX < 0x030C0000
+  // 3.11 answers from the ownership record, which also notices a third party
+  // having taken the entry point away from us.
+  return PyBool_FromLong(Ci_EvalHook311_IsInstalled());
+#else
 #ifdef ENABLE_INTERPRETER_LOOP
 #if defined(ENABLE_EVAL_HOOK)
   return PyBool_FromLong(Ci_hook_EvalFrame == Ci_EvalFrame);
@@ -711,6 +737,7 @@ PyObject* is_frame_evaluator_installed(
   return PyBool_FromLong(current_eval_frame == Ci_EvalFrame);
 #endif
 #endif
+#endif // PY_VERSION_HEX < 0x030C0000
   Py_RETURN_FALSE;
 }
 

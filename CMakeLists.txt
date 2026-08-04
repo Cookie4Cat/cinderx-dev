@@ -490,6 +490,7 @@ if (${PY_VERSION} EQUAL 3.11)
       ${PROJECT_SOURCE_DIR}/Interpreter/3.11/borrowed-ceval.gen_cached.c
       ${PROJECT_SOURCE_DIR}/Interpreter/3.11/ceval_shims.c
       ${PROJECT_SOURCE_DIR}/Interpreter/3.11/ceval_wrapper.c
+      ${PROJECT_SOURCE_DIR}/Interpreter/3.11/eval_hook.c
       ${PROJECT_SOURCE_DIR}/Interpreter/3.11/frame_wrapper.c
       ${PROJECT_SOURCE_DIR}/Interpreter/3.11/interpreter.c
       ${PROJECT_SOURCE_DIR}/Interpreter/3.11/specialize_wrapper.c
