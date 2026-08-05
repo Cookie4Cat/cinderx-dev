@@ -45,13 +45,6 @@ PyObject* _PyDict_FromItems(
   return dict;
 }
 
-int _PyDict_SetItem_Take2(PyDictObject* dict, PyObject* key, PyObject* value) {
-  int result = PyDict_SetItem((PyObject*)dict, key, value);
-  Py_DECREF(key);
-  Py_DECREF(value);
-  return result;
-}
-
 PyObject* _PyLong_Add(PyLongObject* left, PyLongObject* right) {
   return PyLong_Type.tp_as_number->nb_add((PyObject*)left, (PyObject*)right);
 }

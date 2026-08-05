@@ -13,6 +13,10 @@ extern "C" {
 
 PyFrameObject* Ci_PyFrame_MakeAndSetFrameObject_311(_PyInterpreterFrame* frame);
 PyFrameObject* Ci_PyFrame_New_NoTrack_311(PyCodeObject* code);
+int Cix_PyDict_SetItem_Take2_311(
+    PyDictObject* dict,
+    PyObject* key,
+    PyObject* value);
 void Ci_PyFrame_Copy_311(
     _PyInterpreterFrame* source,
     _PyInterpreterFrame* destination);

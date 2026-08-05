@@ -28,6 +28,7 @@
 // the interpreter-local cache.
 #define _PyAsyncGenValueWrapperNew Cix_PyAsyncGenValueWrapperNew
 #define _PyThreadState_BumpFramePointerSlow Cix_PyThreadState_PushFrame
+#define _PyDict_SetItem_Take2 Cix_PyDict_SetItem_Take2_311
 
 // Allocate PEP 509 versions from libpython's real stream via the private clock
 // dict owned by common Borrow. No independent shadow counter is permitted.
