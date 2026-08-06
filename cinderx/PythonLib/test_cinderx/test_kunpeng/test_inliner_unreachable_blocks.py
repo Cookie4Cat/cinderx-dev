@@ -46,6 +46,13 @@ class InlinerUnreachableBlockTests(unittest.TestCase):
 
     def test_inlined_short_circuit_condition_compiles(self) -> None:
         funcs = (target, short_circuit_condition, cold_path)
+        # test_jitlist.py runs earlier in the aggregate suite and leaves an
+        # explicit JIT list active. Make the callee eligible for dependency
+        # preloading so this test does not depend on process-wide test order.
+        cinderx.jit.append_jit_list(
+            f"{short_circuit_condition.__module__}:"
+            f"{short_circuit_condition.__qualname__}"
+        )
         for func in funcs:
             cinderx.jit.force_uncompile(func)
             cinderx.jit.jit_suppress(func)
@@ -62,6 +69,11 @@ class InlinerUnreachableBlockTests(unittest.TestCase):
         # segfault in PhiElimination before unreachable blocks were removed.
         self.assertTrue(cinderx.jit.force_compile(target))
         self.assertTrue(cinderx.jit.is_jit_compiled(target))
+        # The crash only reproduces when the helper is actually inlined; make
+        # sure inlining was not silently skipped (e.g. missing preloader).
+        self.assertGreaterEqual(
+            cinderx.jit.get_num_inlined_functions(target), 1
+        )
         self.assertEqual(target(), 42)
 
 
