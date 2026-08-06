@@ -49,6 +49,14 @@ bool absorbDstBlock(BasicBlock* block) {
 void CleanCFG::Run(Function& irfunc) {
   bool changed = false;
 
+  // The passes below walk every block in the CFG, but CopyPropagation only
+  // rewrites uses in blocks reachable from the entry. Unreachable blocks left
+  // behind by earlier passes (e.g. the inliner or Simplify's branch folding)
+  // may hold uses of Assign outputs that CopyPropagation already deleted, and
+  // chasing those dangling defs crashes PhiElimination. Drop unreachable
+  // blocks up front; their instructions must never be inspected.
+  removeUnreachableBlocks(irfunc);
+
   do {
     removeUnreachableInstructions(irfunc);
     // Remove any trivial Phis; absorbDstBlock cannot handle them.
