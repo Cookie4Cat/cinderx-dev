@@ -23,7 +23,11 @@ bool installAuditHook(Py_AuditHookFunction func, void* userData) {
     return true;
   }
 #endif
+#if PY_VERSION_HEX < 0x030C0000
+  _Py_AuditHookEntry* audit_hook_head = runtime->audit_hook_head;
+#else
   _Py_AuditHookEntry* audit_hook_head = runtime->audit_hooks.head;
+#endif
 
   // Verify that the hook was actually installed.
   for (_Py_AuditHookEntry* e = audit_hook_head; e != nullptr; e = e->next) {

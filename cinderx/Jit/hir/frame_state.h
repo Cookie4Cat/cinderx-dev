@@ -30,12 +30,23 @@ struct ExecutionBlock {
   }
 
   bool isTryBlock() const {
+#if PY_VERSION_HEX < 0x030C0000
+    // 3.11 has zero-cost exceptions and no block stack, so SETUP_FINALLY does
+    // not exist and no bytecode can produce a try block here.
+    return false;
+#else
     return opcode == SETUP_FINALLY;
+#endif
   }
 
   bool isAsyncForHeaderBlock(const BytecodeInstructionBlock& instrs) const {
+#if PY_VERSION_HEX < 0x030C0000
+    (void)instrs;
+    return false;
+#else
     return opcode == SETUP_FINALLY &&
         instrs.at(handler_off).opcode() == END_ASYNC_FOR;
+#endif
   }
 };
 

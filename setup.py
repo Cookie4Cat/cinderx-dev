@@ -33,7 +33,13 @@ PYTHON_LIB_DIR = "cinderx/PythonLib"
 
 if CHECKOUT_ROOT_DIR not in sys.path:
     sys.path.insert(0, CHECKOUT_ROOT_DIR)
-from ci_pipeline.cmake_options import cmake_feature_options, compute_py_version
+from ci_pipeline.cmake_options import (
+    cmake_feature_options,
+    compute_py_version,
+    validate_running_python,
+)
+
+validate_running_python()
 
 MIN_GCC_VERSION = 13
 CINDERX_LOCAL_DEPS_ENV = "CINDERX_LOCAL_DEPS"
@@ -434,7 +440,9 @@ class BuildExt(build_ext):
         # pyre-ignore[16]: No pyre types for build_ext.
         self.extensions = other_extensions
         super().run()
-        
+
+        os.makedirs(self.build_lib, exist_ok=True)
+
         # Copy .pth file to build_lib root for auto-import on Python startup
         pth_source = os.path.join(PYTHON_LIB_DIR, "cinderx.pth")
         pth_dest = os.path.join(self.build_lib, "cinderx.pth")
