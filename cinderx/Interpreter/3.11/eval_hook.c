@@ -14,6 +14,7 @@
 #include "internal/pycore_pystate.h"
 
 #include "cinderx/Interpreter/3.11/interpreter_contract.h"
+#include "cinderx/Interpreter/3.11/observe.h"
 #include "cinderx/Interpreter/interpreter.h"
 
 typedef struct {
@@ -69,6 +70,13 @@ int Ci_EvalHook311_Install(void) {
   // ready before any frame can reach Ci_EvalFrame; failing here leaves the
   // stock entry point untouched.
   if (Ci_InitInterpreter_311() < 0) {
+    return -1;
+  }
+
+  // Runtime-mode configuration shares the takeover choke point: an
+  // unaccepted CINDERX_JIT_MODE refuses the installation outright, and the
+  // observe counters exist before the first frame can enter Ci_EvalFrame.
+  if (Ci_Observe311_Configure() < 0) {
     return -1;
   }
 
