@@ -29,6 +29,22 @@ if _cinderx_plugin_enabled() and not _cinderx_force_disabled():
     else:
         import cinderjit  # noqa: F401
 
+    if sys.version_info[:2] == (3, 11):
+        # Startup control: the takeover happens only on explicit request --
+        # plugin enabled plus CINDERX_EVAL_MODE=cinder.  Scoped to 3.11 so
+        # other versions keep their existing startup behavior.
+        _eval_mode = os.environ.get("CINDERX_EVAL_MODE", "stock")
+        if _eval_mode not in ("stock", "cinder"):
+            raise RuntimeError(
+                "CINDERX_EVAL_MODE=%r is not accepted; this build takes "
+                "'stock' or 'cinder'" % (_eval_mode,)
+            )
+        if _eval_mode == "cinder":
+            import cinderx
+
+            cinderx.init()
+            _cinderx.install_frame_evaluator()
+
     _AUTOJIT_IMPORT_PROVIDER_MARKER = "_cinderx_autojit_import_provider"
     _AUTOJIT_SETUP_PROVIDER_MARKER = "_cinderx_autojit_setup_provider"
     _AUTOJIT_GATE_STATS_PREFIX = "CINDERX_AUTOJIT_GATE_STATS: "

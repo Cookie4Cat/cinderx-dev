@@ -7,13 +7,14 @@
 // machine-code execution is structurally impossible, not merely gated.  This
 // translation unit carries the JIT surface the runtime links against:
 // initialization and lifecycle hooks are inert, and compilation entry points
-// refuse before any bytecode is read.  Observe-mode counting and the
-// scheduling chain arrive with the runtime-mode milestone.
+// refuse before any bytecode is read.  Observe mode's scheduling requests
+// terminate at Ci_JitShell311_RequestCompile below.
 
 #include "cinderx/python.h"
 
 #if PY_VERSION_HEX < 0x030C0000
 
+#include "cinderx/Interpreter/3.11/observe.h"
 #include "cinderx/Jit/anextawaitable.h"
 #include "cinderx/Jit/config.h"
 #include "cinderx/Jit/context.h"
@@ -109,5 +110,13 @@ bool isPreforkCompilationEnabled() {
 } // namespace perf
 
 } // namespace jit
+
+// The unified compile entry point for this build.  The capability gate fires
+// before any bytecode is read: 3.11 ships no machine-code execution, so every
+// scheduling request terminates here with the typed refusal.
+extern "C" const char* Ci_JitShell311_RequestCompile(PyCodeObject* code) {
+  (void)code;
+  return CI_OBSERVE_311_REFUSAL;
+}
 
 #endif // PY_VERSION_HEX < 0x030C0000

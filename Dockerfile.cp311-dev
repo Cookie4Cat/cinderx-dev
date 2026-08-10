@@ -6,7 +6,7 @@
 # rpm (python3-3.11.6-34.oe2403sp3) instead of a source-built CPython.
 #
 # Build:
-#   docker build -f Dockerfile.cp311-dev -t cinderx-cp311-dev:v1 .
+#   docker build -f Dockerfile.cp311-dev -t cinderx-cp311-dev:v2 .
 #   docker inspect --format='{{index .RepoDigests 0}}' openeuler/openeuler:24.03-lts-sp3  # record base digest
 #
 # Run (per-developer container, source mounted from host):
@@ -92,6 +92,20 @@ RUN rpm -q python3 | grep -F "python3-${PYTHON3_NVR}" \
     && /usr/bin/python3.11 -c "import test.test_grammar" \
     && /usr/bin/python3.11 -m test.regrtest --list-tests > /dev/null \
     && echo "anchor + Lib/test OK"
+
+# --- Baked acceptance tooling (v2) -----------------------------------------
+# The CinderX build needs setuptools>=77 (pyproject license metadata) and the
+# differential engine's unit tests run under pytest.  Pinned so image
+# rebuilds stay deterministic; versions recorded in docs/cp311-anchor.md.
+# The pypi mirror matches the GCC download mirror above.
+RUN python3.11 -m pip install --no-cache-dir \
+    -i https://mirrors.huaweicloud.com/repository/pypi/simple \
+    "setuptools==80.9.0" "pytest==8.4.1"
+
+# Intranet git hosts commonly sit behind TLS-intercepting proxies, so
+# transport verification is off for git.  Dependency integrity is carried by
+# pinned commits and the vendored SHA256SUMS manifest, not by the channel.
+RUN git config --system http.sslVerify false
 
 # libstdc++ strategy, verbatim from the 3.14.3 recipe: bake the GCC14 lib64
 # into RPATH of everything we build (including _cinderx.so), so no

@@ -14,6 +14,7 @@
 #if PY_VERSION_HEX < 0x030C0000
 #include "cinderx/Interpreter/3.11/eval_hook.h"
 #include "cinderx/Interpreter/3.11/interpreter_contract.h"
+#include "cinderx/Interpreter/3.11/observe.h"
 #endif
 #include "cinderx/Jit/anextawaitable.h"
 #include "cinderx/Jit/autojit_import.h"
@@ -874,7 +875,19 @@ static PyObject* autojit_setup_depth(PyObject*, PyObject*) {
   return PyLong_FromUnsignedLong(jit::autoJitSetupDepth());
 }
 
+#if PY_VERSION_HEX < 0x030C0000
+static PyObject* get_observe_stats(PyObject*, PyObject*) {
+  return Ci_Observe311_Stats();
+}
+#endif
+
 PyMethodDef _cinderx_methods[] = {
+#if PY_VERSION_HEX < 0x030C0000
+    {"_get_observe_stats",
+     get_observe_stats,
+     METH_NOARGS,
+     PyDoc_STR("Snapshot of observe-mode counters and scheduling events.")},
+#endif
     {"install_frame_evaluator",
      install_frame_evaluator,
      METH_NOARGS,

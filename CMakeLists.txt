@@ -493,6 +493,7 @@ if (${PY_VERSION} EQUAL 3.11)
       ${PROJECT_SOURCE_DIR}/Interpreter/3.11/eval_hook.c
       ${PROJECT_SOURCE_DIR}/Interpreter/3.11/frame_wrapper.c
       ${PROJECT_SOURCE_DIR}/Interpreter/3.11/interpreter.c
+      ${PROJECT_SOURCE_DIR}/Interpreter/3.11/observe.c
       ${PROJECT_SOURCE_DIR}/Interpreter/3.11/specialize_wrapper.c
     )
   endif()
