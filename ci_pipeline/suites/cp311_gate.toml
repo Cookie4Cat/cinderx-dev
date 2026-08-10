@@ -35,7 +35,7 @@ command = "bash -lc 'SO=$(\"{run_dir}/venv/bin/python\" -c \"import _cinderx; pr
 # code executes correctly on the vendored loop while it holds it.
 [[jobs]]
 name = "interpreter_and_eval_hook"
-command = "bash -lc 'cd cinderx/PythonLib && \"{run_dir}/venv/bin/python\" -m unittest test_cinderx.test_interpreter_311 test_cinderx.test_jit_unsupported_311'"
+command = "bash -lc 'cd cinderx/PythonLib && \"{run_dir}/venv/bin/python\" -m unittest test_cinderx.test_kunpeng.test_interpreter_311 test_cinderx.test_kunpeng.test_jit_unsupported_311'"
 
 # Scenario 3: the full stdlib suite behaves identically with and without the
 # CinderX evaluator installed.  Only regressions are red, and the excluded
@@ -65,4 +65,4 @@ command = "bash -lc '\"{run_dir}/venv/bin/python\" ci_pipeline/libtest_diff_311.
 # read.
 [[jobs]]
 name = "observe_gate"
-command = "bash -lc 'cd cinderx/PythonLib && \"{run_dir}/venv/bin/python\" -m unittest test_cinderx.test_observe_311'"
+command = "bash -lc 'cd cinderx/PythonLib && \"{run_dir}/venv/bin/python\" -m unittest test_cinderx.test_kunpeng.test_observe_311'"
