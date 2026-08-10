@@ -14,6 +14,12 @@ python = "3.11"
 arch = "arm64"
 system = "Linux"
 
+# The differential engine is this suite's judge; its own unit tests run
+# first, so a broken judge can never wave anything through.
+[[jobs]]
+name = "diff_engine_selftest"
+command = "python3.11 -m pytest -q ci_pipeline/test_libtest_diff_311.py"
+
 # The vendored interpreter sources must match their pinned manifest before
 # anything is built from them.
 [[jobs]]
