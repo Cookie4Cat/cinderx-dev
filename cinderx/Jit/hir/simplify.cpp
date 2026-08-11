@@ -2970,7 +2970,12 @@ void Simplify::Run(Function& irfunc) {
     }
 
     if (changed) {
-      // Perform some simple cleanup between each pass.
+      // Perform some simple cleanup between each pass. Folding a CondBranch
+      // into a Branch above can leave unreachable blocks whose instructions
+      // still use registers defined by reachable code. Remove those blocks
+      // before CopyPropagation deletes Assigns, or the stale uses would keep
+      // pointing at freed instructions.
+      removeUnreachableBlocks(irfunc);
       CopyPropagation{}.Run(irfunc);
       reflowTypes(irfunc);
       CleanCFG{}.Run(irfunc);

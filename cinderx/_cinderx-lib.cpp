@@ -11,6 +11,11 @@
 #include "cinderx/Common/watchers.h"
 #include "cinderx/Immortalize/immortalize.h"
 #include "cinderx/Interpreter/interpreter.h"
+#if PY_VERSION_HEX < 0x030C0000
+#include "cinderx/Interpreter/3.11/eval_hook.h"
+#include "cinderx/Interpreter/3.11/interpreter_contract.h"
+#include "cinderx/Interpreter/3.11/observe.h"
+#endif
 #include "cinderx/Jit/anextawaitable.h"
 #include "cinderx/Jit/autojit_import.h"
 #include "cinderx/Jit/compiled_function.h"
@@ -689,8 +694,28 @@ PyDoc_STRVAR(
     "standard CPython frame evaluator.  This function should generally be "
     "avoided, and is exposed primarily for testing purposes.");
 PyObject* remove_frame_evaluator(PyObject* /* mod */, PyObject* /* args */) {
+#if PY_VERSION_HEX < 0x030C0000
+  // Report ownership loss rather than pretending the removal succeeded: the
+  // entry point now belongs to whoever replaced us.
+  switch (Ci_EvalHook311_Remove()) {
+    case CI_EVAL_HOOK_REMOVED:
+      break;
+    case CI_EVAL_HOOK_OWNERSHIP_LOST:
+      PyErr_SetString(
+          PyExc_RuntimeError,
+          "another component replaced the CinderX frame evaluator; its entry "
+          "point was left in place");
+      return nullptr;
+    case CI_EVAL_HOOK_ERROR:
+      return nullptr;
+  }
+  Ci_SetStaticFunctionVectorcall(nullptr);
+  Ci_EvalFrameFunc = nullptr;
+  Py_RETURN_NONE;
+#else
   Ci_FiniFrameEvalFunc();
   Py_RETURN_NONE;
+#endif
 }
 
 PyDoc_STRVAR(
@@ -699,6 +724,11 @@ PyDoc_STRVAR(
 PyObject* is_frame_evaluator_installed(
     PyObject* /* mod */,
     PyObject* /* args */) {
+#if PY_VERSION_HEX < 0x030C0000
+  // 3.11 answers from the ownership record, which also notices a third party
+  // having taken the entry point away from us.
+  return PyBool_FromLong(Ci_EvalHook311_IsInstalled());
+#else
 #ifdef ENABLE_INTERPRETER_LOOP
 #if defined(ENABLE_EVAL_HOOK)
   return PyBool_FromLong(Ci_hook_EvalFrame == Ci_EvalFrame);
@@ -708,6 +738,7 @@ PyObject* is_frame_evaluator_installed(
   return PyBool_FromLong(current_eval_frame == Ci_EvalFrame);
 #endif
 #endif
+#endif // PY_VERSION_HEX < 0x030C0000
   Py_RETURN_FALSE;
 }
 
@@ -844,7 +875,19 @@ static PyObject* autojit_setup_depth(PyObject*, PyObject*) {
   return PyLong_FromUnsignedLong(jit::autoJitSetupDepth());
 }
 
+#if PY_VERSION_HEX < 0x030C0000
+static PyObject* get_observe_stats(PyObject*, PyObject*) {
+  return Ci_Observe311_Stats();
+}
+#endif
+
 PyMethodDef _cinderx_methods[] = {
+#if PY_VERSION_HEX < 0x030C0000
+    {"_get_observe_stats",
+     get_observe_stats,
+     METH_NOARGS,
+     PyDoc_STR("Snapshot of observe-mode counters and scheduling events.")},
+#endif
     {"install_frame_evaluator",
      install_frame_evaluator,
      METH_NOARGS,
@@ -1003,6 +1046,22 @@ int _cinderx_exec_impl(PyObject* m) {
     return -1;
   }
 
+#if PY_VERSION_HEX < 0x030C0000
+  // This build is hash-locked against the CPython 3.11.6 sources.  The cp311
+  // wheel tag would let it load into any 3.11.x, so refuse a near-miss
+  // interpreter here rather than run somebody else's internals.
+  const char* running_version = Py_GetVersion();
+  if (strncmp(running_version, "3.11.6", 6) != 0 ||
+      (running_version[6] != ' ' && running_version[6] != '\0' &&
+       running_version[6] != '+')) {
+    PyErr_Format(
+        PyExc_ImportError,
+        "this CinderX build supports exactly CPython 3.11.6, not %.32s",
+        running_version);
+    return -1;
+  }
+#endif
+
   cinderx::initStaticObjects();
 
   // The JIT is going to need the Python function entrypoint during its
@@ -1011,12 +1070,17 @@ int _cinderx_exec_impl(PyObject* m) {
 
   cinderx::setModuleState(m);
 
+#if PY_VERSION_HEX >= 0x030C0000
+  // The global cache serves JIT-compiled code only, and 3.11 does not build
+  // the JIT.  Its slot stays empty rather than holding an object nothing can
+  // reach.
   auto cache_manager = new (std::nothrow) jit::GlobalCacheManager();
   if (cache_manager == nullptr) {
     return -1;
   }
 
   state->cache_manager.reset(cache_manager);
+#endif
 
   // Code allocator is initialized in jit::initialize(), because it needs to
   // read -X options from the CLI and environment variables to figure out which
@@ -1032,6 +1096,7 @@ int _cinderx_exec_impl(PyObject* m) {
   }
   state->builtin_next = Ref<>::create(next);
 
+#if PY_VERSION_HEX >= 0x030C0000
   auto async_lazy_value = new (std::nothrow) cinderx::AsyncLazyValueState();
   if (async_lazy_value == nullptr) {
     return -1;
@@ -1041,7 +1106,12 @@ int _cinderx_exec_impl(PyObject* m) {
   }
 
   state->async_lazy_value.reset(async_lazy_value);
+#endif
 
+#if PY_VERSION_HEX >= 0x030C0000
+  // These types belong to JIT-compiled generators, coroutines and awaitables.
+  // 3.11 builds no JIT, so no instance of them can ever exist and the module
+  // does not create them.
   PyTypeObject* gen_type = (PyTypeObject*)PyType_FromSpec(&jit::JitGen_Spec);
   if (gen_type == nullptr) {
     return -1;
@@ -1090,12 +1160,17 @@ int _cinderx_exec_impl(PyObject* m) {
     return -1;
   }
   state->anext_awaitable_type = Ref<PyTypeObject>::steal(anext_awaitable_type);
+#endif // PY_VERSION_HEX >= 0x030C0000
 
+#if PY_VERSION_HEX >= 0x030C0000
+  // The JIT-generator-aware anext replacement is only registered on 3.12+
+  // (matching the method-table guard); 3.11 keeps the stock builtin.
   auto anext_func = Ref<>::steal(PyObject_GetAttrString(m, "anext"));
   if (anext_func == nullptr ||
       PyObject_SetAttrString(builtins_mod, "anext", anext_func) < 0) {
     return -1;
   }
+#endif
 
 #if PY_VERSION_HEX >= 0x030E0000 && defined(ENABLE_PARALLEL_GC)
   Ref<> gc_mod = Ref<>::steal(PyImport_ImportModule("gc"));
@@ -1111,11 +1186,15 @@ int _cinderx_exec_impl(PyObject* m) {
   }
 #endif
 
+#if PY_VERSION_HEX >= 0x030C0000
+  // Symbolization exists to name JIT frames in profiles; nothing on 3.11
+  // produces them.
   auto symbolizer = new (std::nothrow) jit::Symbolizer();
   if (symbolizer == nullptr) {
     return -1;
   }
   state->symbolizer.reset(symbolizer);
+#endif
 
   if (!state->initBuiltinMembers()) {
     return -1;
@@ -1159,9 +1238,13 @@ int _cinderx_exec_impl(PyObject* m) {
   if (PyType_Ready(&_Ci_ObjectKeyType) < 0) {
     return -1;
   }
+#if PY_VERSION_HEX >= 0x030C0000
+  // Wrapper type for JIT-compiled coroutines; 3.11 builds no JIT and never
+  // produces one.
   if (PyType_Ready(&jit::_JitCoroWrapper_Type) < 0) {
     return -1;
   }
+#endif
 
   PyObject* cached_classproperty =
       PyType_FromSpec(&_PyCachedClassProperty_TypeSpec);
@@ -1186,8 +1269,10 @@ int _cinderx_exec_impl(PyObject* m) {
   ADDITEM("cached_property_with_descr", &PyCachedPropertyWithDescr_Type);
   ADDITEM("async_cached_property", &PyAsyncCachedProperty_Type);
   ADDITEM("async_cached_classproperty", &PyAsyncCachedClassProperty_Type);
+#if PY_VERSION_HEX >= 0x030C0000
   ADDITEM("AsyncLazyValue", async_lazy_value->asyncLazyValueType());
   ADDITEM("AwaitableValue", async_lazy_value->awaitableValueType());
+#endif
 
 #undef ADDITEM
 
@@ -1297,9 +1382,21 @@ int _cinderx_exec(PyObject* m) {
     // Shouldn't happen, but in case we doubled up on Python and C++ exceptions,
     // make sure to log the Python exception first, then override it with the
     // C++ exception.  Otherwise it would just be lost.
+#if PY_VERSION_HEX < 0x030C0000
+    if (PyErr_Occurred()) {
+      PyObject *type, *value, *traceback;
+      PyErr_Fetch(&type, &value, &traceback);
+      PyErr_NormalizeException(&type, &value, &traceback);
+      PyErr_Display(type, value, traceback);
+      Py_XDECREF(type);
+      Py_XDECREF(value);
+      Py_XDECREF(traceback);
+    }
+#else
     if (auto err = Ref<>::steal(PyErr_GetRaisedException())) {
       PyErr_DisplayException(err);
     }
+#endif
 
     PyErr_SetString(PyExc_RuntimeError, exn.what());
     return -1;
@@ -1308,7 +1405,9 @@ int _cinderx_exec(PyObject* m) {
 
 PyModuleDef_Slot _cinderx_slots[] = {
     {Py_mod_exec, reinterpret_cast<void*>(_cinderx_exec)},
+#if PY_VERSION_HEX >= 0x030C0000
     {Py_mod_multiple_interpreters, Py_MOD_MULTIPLE_INTERPRETERS_NOT_SUPPORTED},
+#endif
 #if PY_VERSION_HEX >= 0x030E0000
     {Py_mod_gil, Py_MOD_GIL_NOT_USED},
 #endif

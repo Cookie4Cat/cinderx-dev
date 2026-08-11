@@ -89,7 +89,11 @@ bool ModuleState::initBuiltinMembers() {
           reinterpret_cast<PyTypeObject*>(PyTuple_GetItem(mro, i));
       Py_ssize_t cur_mem = 0;
       PyObject *key, *value;
+#if PY_VERSION_HEX < 0x030C0000
+      Ref<> tp_dict = Ref<>::create(base->tp_dict);
+#else
       Ref<> tp_dict = Ref<>::steal(PyType_GetDict(base));
+#endif
       while (PyDict_Next(tp_dict, &cur_mem, &key, &value)) {
         if (PyDict_Contains(type_members, key)) {
           continue;

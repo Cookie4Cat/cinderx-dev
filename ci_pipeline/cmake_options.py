@@ -16,6 +16,15 @@ def compute_py_version() -> str:
     return f"{sys.version_info.major}.{sys.version_info.minor}"
 
 
+def validate_running_python() -> None:
+    if sys.version_info[:2] == (3, 11) and sys.version_info[:3] != (3, 11, 6):
+        running = ".".join(str(part) for part in sys.version_info[:3])
+        raise RuntimeError(
+            "CinderX CPython 3.11 support is pinned to exactly 3.11.6; "
+            f"the build is running with {running}"
+        )
+
+
 def cmake_value(value: object) -> str:
     if type(value) == bool:
         value = int(value)
@@ -47,6 +56,7 @@ def cmake_feature_options(
     python_root: str | None = None,
     env: Mapping[str, str] | None = None,
 ) -> dict[str, str]:
+    validate_running_python()
     if env is None:
         env = os.environ
     if py_version is None:
@@ -57,6 +67,7 @@ def cmake_feature_options(
     mac = sys.platform == "darwin"
     meta_312 = meta_python and py_version == "3.12"
     is_314plus = py_version in {"3.14", "3.15"}
+    is_stock_311 = py_version == "3.11" and not meta_python
 
     options: dict[str, str] = {
         "PY_VERSION": py_version,
@@ -69,21 +80,21 @@ def cmake_feature_options(
 
     set_option("META_PYTHON", meta_python)
     set_option("ENABLE_ADAPTIVE_STATIC_PYTHON", meta_312)
-    set_option("ENABLE_DISASSEMBLER", True)
+    set_option("ENABLE_DISASSEMBLER", not is_stock_311)
     set_option("ENABLE_ELF_READER", linux)
     set_option("ENABLE_EVAL_HOOK", meta_312)
     set_option("ENABLE_FUNC_EVENT_MODIFY_QUALNAME", meta_312)
     set_option("ENABLE_GENERATOR_AWAITER", meta_312)
-    set_option("ENABLE_INTERPRETER_LOOP", meta_312 or is_314plus)
+    set_option("ENABLE_INTERPRETER_LOOP", is_stock_311 or meta_312 or is_314plus)
     set_option("ENABLE_LAZY_IMPORTS", meta_312)
     set_option(
         "ENABLE_LIGHTWEIGHT_FRAMES",
         should_enable_lightweight_frames(py_version, meta_python=meta_python),
     )
     set_option("ENABLE_PARALLEL_GC", meta_312)
-    set_option("ENABLE_PEP523_HOOK", meta_312 or is_314plus)
+    set_option("ENABLE_PEP523_HOOK", is_stock_311 or meta_312 or is_314plus)
     set_option("ENABLE_PERF_TRAMPOLINE", meta_312)
-    set_option("ENABLE_SYMBOLIZER", linux)
+    set_option("ENABLE_SYMBOLIZER", linux and not is_stock_311)
     set_option("ENABLE_USDT", linux)
     set_option("ENABLE_XXCLASSLOADER", False)
     set_option("ENABLE_ZLIB", linux or mac)

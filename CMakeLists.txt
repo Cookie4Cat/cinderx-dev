@@ -53,6 +53,12 @@ macro(set_flag VAR)
   endif()
 endmacro()
 
+if (DEFINED PY_VERSION AND ${PY_VERSION} EQUAL 3.11)
+  # There is no 3.11 product without the interpreter loop: the runtime paths
+  # call into it unconditionally, so the option cannot be turned off here.
+  set(ENABLE_INTERPRETER_LOOP ON)
+endif()
+
 set_flag(ENABLE_ADAPTIVE_STATIC_PYTHON)
 set_flag(ENABLE_DISASSEMBLER)
 set_flag(ENABLE_ELF_READER)
@@ -251,6 +257,20 @@ function(cinderx_local_dep_matches NAME REPOSITORY TAG LOCAL_DIR OUT_VAR)
     endif()
   endif()
 
+  # A dirty checkout must not be compiled while the provenance claims the
+  # clean declared commit; refresh it instead of trusting it.
+  if(matches)
+    execute_process(
+      COMMAND "${CINDERX_GIT_EXECUTABLE}" -C "${LOCAL_DIR}" status --porcelain
+      RESULT_VARIABLE status_result
+      OUTPUT_VARIABLE status_output
+      ERROR_QUIET)
+    if(NOT status_result EQUAL 0 OR NOT status_output STREQUAL "")
+      message(STATUS "Local dependency ${NAME} checkout is dirty; refreshing")
+      set(matches FALSE)
+    endif()
+  endif()
+
   set(${OUT_VAR} ${matches} PARENT_SCOPE)
 endfunction()
 
@@ -335,7 +355,7 @@ endif()
 cinderx_declare_dependency(
   fmt
   https://github.com/fmtlib/fmt
-  11.2.0 # 2025-May-03
+  40626af88bd7df9a5fb80be7b25ac85b122d6c21 # tag 11.2.0, 2025-May-03
 )
 FetchContent_MakeAvailable(fmt)
 
@@ -383,7 +403,7 @@ if (${ENABLE_DISASSEMBLER})
   cinderx_declare_dependency(
     capstone
     https://github.com/capstone-engine/capstone
-    5.0.7
+    52c66920fc7bfa15fd9626dfd9f646c698aaa99b # tag 5.0.7
   )
 
   # Skip unsupported architectures while preserving x86's Capstone default,
@@ -451,7 +471,7 @@ endif()
 ########################################
 # UpstreamBorrow/
 
-if (${PY_VERSION} EQUAL 3.12 OR ${PY_VERSION} EQUAL 3.14 OR ${PY_VERSION} EQUAL 3.15)
+if (${PY_VERSION} EQUAL 3.11 OR ${PY_VERSION} EQUAL 3.12 OR ${PY_VERSION} EQUAL 3.14 OR ${PY_VERSION} EQUAL 3.15)
   set(BORROWED_C ${PROJECT_SOURCE_DIR}/UpstreamBorrow/borrowed-${PY_VERSION}.gen_cached.c)
 else()
   set(BORROWED_C "${GENERATED_HEADER_DIR}/dummy-borrowed.c")
@@ -470,11 +490,34 @@ target_link_libraries(cached-properties PRIVATE common borrowed)
 ########################################
 # Interpreter/
 
+if (${PY_VERSION} EQUAL 3.11)
+  # The 3.11 source set carries no generated opcode headers; the vendored
+  # evaluator takes its tables from pycore_opcode.h via NEED_OPCODE_TABLES,
+  # so cinder_opcode.c and the header-copy step below do not apply.
+  set(INTERP_SOURCES
+    ${PROJECT_SOURCE_DIR}/Interpreter/interpreter_base.cpp
+    ${PROJECT_SOURCE_DIR}/Interpreter/3.11/cinder_opcode_tables.c
+  )
+  if (${ENABLE_INTERPRETER_LOOP})
+    set(INTERP_SOURCES
+      ${INTERP_SOURCES}
+      ${PROJECT_SOURCE_DIR}/Interpreter/3.11/borrowed-ceval.gen_cached.c
+      ${PROJECT_SOURCE_DIR}/Interpreter/3.11/ceval_shims.c
+      ${PROJECT_SOURCE_DIR}/Interpreter/3.11/ceval_wrapper.c
+      ${PROJECT_SOURCE_DIR}/Interpreter/3.11/eval_hook.c
+      ${PROJECT_SOURCE_DIR}/Interpreter/3.11/frame_wrapper.c
+      ${PROJECT_SOURCE_DIR}/Interpreter/3.11/interpreter.c
+      ${PROJECT_SOURCE_DIR}/Interpreter/3.11/observe.c
+      ${PROJECT_SOURCE_DIR}/Interpreter/3.11/specialize_wrapper.c
+    )
+  endif()
+else()
 set(INTERP_SOURCES
   ${PROJECT_SOURCE_DIR}/Interpreter/cinder_opcode.c
   ${PROJECT_SOURCE_DIR}/Interpreter/interpreter_base.cpp
   ${PROJECT_SOURCE_DIR}/Interpreter/iter_helpers.c
 )
+endif()
 
 if (${PY_VERSION} EQUAL 3.12 OR ${PY_VERSION} EQUAL 3.14 OR ${PY_VERSION} EQUAL 3.15)
   set(SOURCE_CINDERX_OPCODE_TARGETS_H ${PROJECT_SOURCE_DIR}/Interpreter/${PY_VERSION}/cinderx_opcode_targets.h)
@@ -489,6 +532,12 @@ endif()
 
 # Generate cinderx/Interpreter header files.
 
+if (${PY_VERSION} EQUAL 3.11)
+  # 3.11 generates no opcode metadata: shared code gets the target
+  # interpreter's own tables through a thin renaming header.
+  file(READ ${PROJECT_SOURCE_DIR}/Interpreter/3.11/cinder_opcode.h FILE_CONTENTS)
+  file(WRITE ${GENERATED_HEADER_DIR}/cinderx/Interpreter/cinder_opcode.h "${FILE_CONTENTS}")
+else()
 set(CINDERX_OPCODE_TARGETS_H ${GENERATED_HEADER_DIR}/cinderx/Interpreter/cinderx_opcode_targets.h)
 set(CINDER_OPCODE_H ${GENERATED_HEADER_DIR}/cinderx/Interpreter/cinder_opcode.h)
 set(CINDER_OPCODE_IDS_H ${GENERATED_HEADER_DIR}/cinderx/Interpreter/cinder_opcode_ids.h)
@@ -505,13 +554,16 @@ file(WRITE ${CINDER_OPCODE_METADATA_H} "${FILE_CONTENTS}")
 
 file(READ ${SOURCE_CINDER_OPCODE_H} FILE_CONTENTS)
 file(WRITE ${CINDER_OPCODE_H} "${FILE_CONTENTS}")
+endif()
 
 add_library(interpreter ${INTERP_SOURCES})
+if (NOT ${PY_VERSION} EQUAL 3.11)
 target_include_directories(
   interpreter
   PUBLIC
   ${PROJECT_SOURCE_DIR}/Interpreter/${PY_VERSION}/Includes
 )
+endif()
 
 ########################################
 # Immortalize/
@@ -523,14 +575,27 @@ target_link_libraries(immortalize PRIVATE asmjit::asmjit fmt::fmt)
 ########################################
 # StaticPython/
 
-file(GLOB_RECURSE STATIC_PYTHON_SOURCES ${PROJECT_SOURCE_DIR}/StaticPython/*.c)
+if (${PY_VERSION} EQUAL 3.11)
+  # Static Python is out of scope on 3.11; a stub carries the runtime-facing
+  # surface (StrictModule minimum plus cache-clear hooks).
+  set(STATIC_PYTHON_SOURCES ${PROJECT_SOURCE_DIR}/StaticPython/static_python_stub.cpp)
+else()
+  file(GLOB_RECURSE STATIC_PYTHON_SOURCES ${PROJECT_SOURCE_DIR}/StaticPython/*.c)
+endif()
 add_library(static-python ${STATIC_PYTHON_SOURCES})
 target_link_libraries(static-python PRIVATE fmt::fmt asmjit::asmjit common borrowed)
 
 ########################################
 # Jit/
 
-file(GLOB_RECURSE JIT_SOURCES ${PROJECT_SOURCE_DIR}/Jit/*.cpp ${PROJECT_SOURCE_DIR}/Jit/*.c)
+if (${PY_VERSION} EQUAL 3.11)
+  # This SR ships only the JIT scheduling shell on 3.11: the JIT source set is
+  # not compiled, and machine-code execution is structurally impossible.  The
+  # stub carries the module-facing API surface and refuses compilation.
+  set(JIT_SOURCES ${PROJECT_SOURCE_DIR}/Jit/pyjit_stub_311.cpp)
+else()
+  file(GLOB_RECURSE JIT_SOURCES ${PROJECT_SOURCE_DIR}/Jit/*.cpp ${PROJECT_SOURCE_DIR}/Jit/*.c)
+endif()
 
 add_library(jit ${JIT_SOURCES})
 target_compile_options(jit PRIVATE -Wno-free-nonheap-object)
@@ -589,6 +654,16 @@ endif()
 # _cinderx.so's internal symbols, so this is safe.
 if (${CMAKE_SYSTEM_NAME} MATCHES "Linux")
   target_link_options(${PROJECT_NAME} PRIVATE -Wl,-Bsymbolic-functions)
+endif()
+
+# The 3.11 build links a vendored interpreter whose PyAPI_FUNC definitions
+# carry default visibility; export nothing but the module init so they can
+# never shadow libpython's own under RTLD_GLOBAL loading.
+if (DEFINED PY_VERSION AND ${PY_VERSION} EQUAL 3.11 AND ${CMAKE_SYSTEM_NAME} MATCHES "Linux")
+  target_link_options(${PROJECT_NAME} PRIVATE
+    -Wl,--version-script=${PROJECT_SOURCE_DIR}/_cinderx.version)
+  set_target_properties(${PROJECT_NAME} PROPERTIES
+    LINK_DEPENDS ${PROJECT_SOURCE_DIR}/_cinderx.version)
 endif()
 
 set_target_properties(${PROJECT_NAME} PROPERTIES PREFIX "")

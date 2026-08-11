@@ -44,6 +44,8 @@ def is_supported_runtime() -> bool:
         return False
 
     version = (sys.version_info.major, sys.version_info.minor)
+    if version == (3, 11):
+        return sys.version_info.micro == 6
     if version == (3, 14) or version == (3, 15):
         return True
     if version == (3, 12):
@@ -540,6 +542,9 @@ except ImportError as e:
         pass
 
     def is_frame_evaluator_installed() -> bool:
+        return False
+
+    def is_lightweight_frames_enabled() -> bool:
         return False
 
     def is_immortal(obj: object) -> bool:

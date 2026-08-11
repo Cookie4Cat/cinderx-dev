@@ -5,79 +5,14 @@ import sys
 import tempfile
 import unittest
 
+from cinderx.test_support import run_python_child
 
-HELPER = Path(__file__).resolve()
+
+HELPER = Path(__file__).with_name("child_cases") / "autojit_policy.py"
 CP3140_AUTOJIT_DIRECT_CALL_GATE_UNSUPPORTED = sys.version_info[:3] == (3, 14, 0)
 CP3140_AUTOJIT_SKIP_REASON = (
     "CPython 3.14.0 direct calls bypass the AutoJIT classification gate"
 )
-
-
-def _run_compile_smoke():
-    import cinderx.jit as jit
-
-    def straight_compute(a, b):
-        return (a + b) * 2
-
-    for value in range(16):
-        straight_compute(value, value + 1)
-    assert jit.is_jit_compiled(straight_compute), (
-        "AutoJIT smoke target did not compile",
-        jit.count_interpreted_calls(straight_compute),
-    )
-    return jit
-
-
-def case_asyncio_event_loop_helpers():
-    import asyncio
-
-    jit = _run_compile_smoke()
-    loop = asyncio.new_event_loop()
-    try:
-        for _ in range(128):
-            loop.call_soon(lambda: None)
-    finally:
-        loop.close()
-
-    assert not jit.is_jit_compiled(asyncio.BaseEventLoop.call_soon), (
-        "BaseEventLoop.call_soon should stay interpreted",
-        jit.count_interpreted_calls(asyncio.BaseEventLoop.call_soon),
-    )
-    assert not jit.is_jit_compiled(asyncio.BaseEventLoop._call_soon), (
-        "BaseEventLoop._call_soon should stay interpreted",
-        jit.count_interpreted_calls(asyncio.BaseEventLoop._call_soon),
-    )
-
-
-def case_deepcopy_exception_helpers():
-    import copy
-
-    jit = _run_compile_smoke()
-    for _ in range(2048):
-        copy._deepcopy_tuple((object(),), {})
-    assert not jit.is_jit_compiled(copy._deepcopy_tuple), (
-        "_deepcopy_tuple should stay deferred",
-        jit.count_interpreted_calls(copy._deepcopy_tuple),
-    )
-
-    memo = {}
-    for _ in range(2048):
-        copy._keep_alive(object(), memo)
-    assert not jit.is_jit_compiled(copy._keep_alive), (
-        "_keep_alive should keep the existing RiskDefer behavior",
-        jit.count_interpreted_calls(copy._keep_alive),
-    )
-
-
-CASES = {
-    "asyncio_event_loop_helpers": case_asyncio_event_loop_helpers,
-    "deepcopy_exception_helpers": case_deepcopy_exception_helpers,
-}
-
-
-if "--case" in sys.argv:
-    CASES[sys.argv[sys.argv.index("--case") + 1]]()
-    sys.exit(0)
 
 
 def _plugin_env() -> dict[str, str]:
@@ -102,12 +37,11 @@ class AutoJitPolicyTests(unittest.TestCase):
         if env_overrides:
             env.update(env_overrides)
         with tempfile.TemporaryDirectory() as tmpdir:
-            return subprocess.run(
-                [sys.executable, str(HELPER), "--case", case_name],
+            return run_python_child(
+                HELPER,
+                case_name.replace("_", "-"),
                 cwd=tmpdir,
                 env=env,
-                capture_output=True,
-                text=True,
                 timeout=60,
             )
 

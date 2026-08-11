@@ -33,7 +33,13 @@ PYTHON_LIB_DIR = "cinderx/PythonLib"
 
 if CHECKOUT_ROOT_DIR not in sys.path:
     sys.path.insert(0, CHECKOUT_ROOT_DIR)
-from ci_pipeline.cmake_options import cmake_feature_options, compute_py_version
+from ci_pipeline.cmake_options import (
+    cmake_feature_options,
+    compute_py_version,
+    validate_running_python,
+)
+
+validate_running_python()
 
 MIN_GCC_VERSION = 13
 CINDERX_LOCAL_DEPS_ENV = "CINDERX_LOCAL_DEPS"
@@ -72,7 +78,17 @@ def compute_package_version() -> str:
                     print(f"Using version from PKG-INFO: {version}")
                     return version
 
-    utc_now = datetime.datetime.now(datetime.timezone.utc)
+    # SOURCE_DATE_EPOCH pins the date so the same commit produces the same
+    # version (and the same wheel filename/METADATA) no matter when or where
+    # it is rebuilt; release drivers set it from the commit time.  Without
+    # it, fall back to the build day as before.
+    source_date_epoch = os.environ.get("SOURCE_DATE_EPOCH")
+    if source_date_epoch:
+        utc_now = datetime.datetime.fromtimestamp(
+            int(source_date_epoch), datetime.timezone.utc
+        )
+    else:
+        utc_now = datetime.datetime.now(datetime.timezone.utc)
     date_part = utc_now.strftime("%Y.%m.%d")
     patch = int(os.environ.get("CINDERX_VERSION_PATCH", "0"))
     return f"{date_part}.{patch:02}"
@@ -434,7 +450,9 @@ class BuildExt(build_ext):
         # pyre-ignore[16]: No pyre types for build_ext.
         self.extensions = other_extensions
         super().run()
-        
+
+        os.makedirs(self.build_lib, exist_ok=True)
+
         # Copy .pth file to build_lib root for auto-import on Python startup
         pth_source = os.path.join(PYTHON_LIB_DIR, "cinderx.pth")
         pth_dest = os.path.join(self.build_lib, "cinderx.pth")
@@ -520,12 +538,17 @@ class BuildExt(build_ext):
         for name, value in cmake_feature_options(python_root=self._find_python()).items():
             cmake_args.append(f"-D{name}={value}")
 
+        # CMAKE_BUILD_PARALLEL_LEVEL wins over the cpu count when it holds a
+        # positive integer; otherwise the explicit -j here would silently
+        # override it.
+        jobs_env = os.environ.get("CMAKE_BUILD_PARALLEL_LEVEL", "")
+        jobs = int(jobs_env) if jobs_env.isdigit() and int(jobs_env) > 0 else (os.cpu_count() or 1)
         build_args = [
             "--config",
             build_type,
             "--",
             "-j",
-            str(os.cpu_count() or 1),
+            str(jobs),
         ]
 
         # pyre-ignore[16]: No pyre types for build_ext.

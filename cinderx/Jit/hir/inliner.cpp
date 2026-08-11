@@ -480,7 +480,10 @@ void InlineFunctionCalls::Run(Function& irfunc) {
   // to make the CFG valid again. While inlining might make some blocks
   // unreachable and therefore make less work (less to inline), we cannot
   // remove unreachable blocks in the above loop. It might delete instructions
-  // pointed to by `to_inline`.
+  // pointed to by `to_inline`. Remove them before CopyPropagation: it only
+  // rewrites uses in reachable blocks, so instructions in unreachable blocks
+  // would otherwise be left referencing the Assigns it deletes.
+  removeUnreachableBlocks(irfunc);
   CopyPropagation{}.Run(irfunc);
   CleanCFG{}.Run(irfunc);
 }

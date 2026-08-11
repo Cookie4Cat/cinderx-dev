@@ -5,6 +5,7 @@
 #include "cinderx/Jit/codegen/arch.h"
 #include "cinderx/Jit/containers.h"
 #include "cinderx/Jit/jit_rt.h"
+#include "cinderx/Jit/lir/aarch64_peephole.h"
 #include "cinderx/Jit/lir/function.h"
 #include "cinderx/Jit/lir/operand.h"
 #include "cinderx/Jit/lir/printer.h"
@@ -1018,6 +1019,8 @@ RewriteResult rewriteMemoryInputsToReg(instr_iter_t instr_iter) {
     case Instruction::kDeoptPatchpoint:
     case Instruction::kSelect:
     case Instruction::kMulAdd:
+    case Instruction::kMulSub:
+    case Instruction::kA64SubSetFlags:
     case Instruction::kSext:
     case Instruction::kZext:
     case Instruction::kInt64ToDouble:
@@ -1073,6 +1076,7 @@ RewriteResult rewriteMemoryInputsToReg(instr_iter_t instr_iter) {
     case Instruction::kReserveStack:
     case Instruction::kVariadicPush:
     case Instruction::kStorePair:
+    case Instruction::kLoadPair:
     case Instruction::kLeave:
     case Instruction::kRet:
     case Instruction::kCmpBranchZero:
@@ -1094,7 +1098,7 @@ RewriteResult rewriteMemoryInputsToReg(instr_iter_t instr_iter) {
   int fp_scratch_idx = 0;
 
   // Signed sub-word operations (signed comparisons, signed division) expect
-  // sign-extended inputs. rewriteSignedSubWordOps (pre-regalloc) inserts kSext
+  // sign-extended inputs. Target selection inserts kSext
   // to widen k8bit/k16bit to k32bit, but if that k32bit value gets spilled,
   // its stack operand may still carry the original k8bit/k16bit data type.
   // Loading with that narrow type produces a zero-extending load (ldrb/ldrh),
@@ -1846,6 +1850,10 @@ void PostRegAllocRewrite::registerRewrites() {
 
   registerOneRewriteFunction(optimizeMoveSequence, 1);
   registerOneRewriteFunction(optimizeMoveInstrs, 1);
+
+#if defined(CINDER_AARCH64)
+  registerAArch64PeepholeRewrites(*this);
+#endif
 
 #if defined(CINDER_X86_64)
   registerOneRewriteFunction(rewriteDivide);

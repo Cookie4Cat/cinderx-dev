@@ -76,11 +76,18 @@ int numLocalsplus(PyCodeObject* code);
 uint8_t Cix_GetOriginalOpcode(
     _PyCoLineInstrumentationData* line_data,
     int index);
-#else
+#elif PY_VERSION_HEX >= 0x030C0000
 static inline uint8_t Cix_GetOriginalOpcode(
     _PyCoLineInstrumentationData* line_data,
     int index) {
   return line_data[index].original_opcode;
+}
+#else
+typedef uint8_t _PyCoLineInstrumentationData;
+static inline uint8_t Cix_GetOriginalOpcode(
+    _PyCoLineInstrumentationData*,
+    int) {
+  return 0;
 }
 #endif
 

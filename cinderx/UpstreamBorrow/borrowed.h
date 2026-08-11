@@ -229,6 +229,20 @@ void Cix_PyDict_SendEvent(
     PyObject* key,
     PyObject* value);
 
+#if PY_VERSION_HEX < 0x030C0000
+// CPython 3.11 only: the target libpython does not export its dict-version
+// allocator or the private lookup helpers, so the Borrow library supplies
+// them.  Cix_PyDict_NextVersion draws from libpython's real version stream
+// via a private clock dict; see borrowed-3.11.c.template.
+uint64_t Cix_PyDict_NextVersion(void);
+Py_ssize_t Cix_PyDictKeys_StringLookup(PyDictKeysObject* keys, PyObject* key);
+Py_ssize_t Cix_PyDict_GetItemHint(
+    PyDictObject* dict,
+    PyObject* key,
+    Py_ssize_t hint,
+    PyObject** value);
+#endif
+
 int Cix_set_attribute_error_context(PyObject* v, PyObject* name);
 
 #if PY_VERSION_HEX < 0x030F0000
@@ -247,14 +261,32 @@ void _PyDict_InsertSplitValue(
 #define Cix_PyTuple_FromArray PyTuple_FromArray
 #endif
 
+// managed_static_type_state does not exist on stock 3.11. The static-builtin
+// branches are unreachable there because _Py_TPFLAGS_STATIC_BUILTIN is 0.
+#if PY_VERSION_HEX < 0x030C0000
+typedef struct {
+  PyObject* tp_dict;
+  PyObject* tp_subclasses;
+} managed_static_type_state;
+static inline managed_static_type_state* Cix_PyStaticType_GetState(
+    PyInterpreterState* interp,
+    PyTypeObject* type) {
+  (void)interp;
+  (void)type;
+  return NULL;
+}
+#elif PY_VERSION_HEX < 0x030D0000
 // managed_static_type_state was known as static_builtin_state only in 3.12.
-#if PY_VERSION_HEX < 0x030D0000
 typedef static_builtin_state managed_static_type_state;
-#endif
 
 managed_static_type_state* Cix_PyStaticType_GetState(
     PyInterpreterState*,
     PyTypeObject*);
+#else
+managed_static_type_state* Cix_PyStaticType_GetState(
+    PyInterpreterState*,
+    PyTypeObject*);
+#endif
 
 PyObject* Cix_Py_union_type_or(PyObject*, PyObject*);
 
@@ -264,7 +296,13 @@ _PyInterpreterFrame* Cix_PyThreadState_PushFrame(
 
 void Cix_PyFrame_ClearExceptCode(_PyInterpreterFrame* frame);
 
-#if PY_VERSION_HEX < 0x030F0000
+#if PY_VERSION_HEX < 0x030C0000
+// 3.11 has no bytecode instrumentation; nothing to strip.
+static inline uint8_t Cix_DEINSTRUMENT(uint8_t op) {
+  (void)op;
+  return 0;
+}
+#elif PY_VERSION_HEX < 0x030F0000
 uint8_t Cix_DEINSTRUMENT(uint8_t op);
 #endif
 

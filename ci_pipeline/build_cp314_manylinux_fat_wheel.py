@@ -204,6 +204,14 @@ def build_docker_command(args: argparse.Namespace, dirs: dict[str, Path]) -> lis
             dirs["work"]: "/work",
         }
     )
+    # Production convention (the Jenkins tag-release job): when the host
+    # carries local git mirrors for the FetchContent dependencies, mount
+    # them plus the URL-rewriting .gitconfig into the builder.  The literal
+    # mount strings below double as the marker the legacy Jenkins in-place
+    # patch checks for, so it skips its own insertion.
+    if Path("/root/.gitconfig").is_file() and Path("/opt/cinderx-git-mirrors").is_dir():
+        command += ["-v", "/root/.gitconfig:/root/.gitconfig:ro"]
+        command += ["-v", "/opt/cinderx-git-mirrors:/opt/cinderx-git-mirrors:ro"]
     command.extend(
         [
             args.image,

@@ -42,6 +42,11 @@ COUNT_KEY_ALIASES = {
 }
 COVERAGE_TOOLS = ("gcov", "lcov", "genhtml")
 
+# TODO(cp311-source-gate): The SHA256SUMS manifest is now validated by the
+# vendored_manifest job in cp311_gate.toml; comparing the manifest itself
+# byte-for-byte with the rpmbuild output of python3-3.11.6-34.oe2403sp3.src.rpm
+# still needs an environment that can run rpmbuild.
+
 # Minimum coverage percentages enforced by --coverage after final lcov filters.
 # Tune these values when the accepted project baseline changes.
 COVERAGE_MIN_PERCENT = {
@@ -58,6 +63,10 @@ PIPELINES = {
         ("runtime", True),
         ("cinderx_local", False, {"CINDERX_LOCAL_RUN_LIBTEST": "1"}),
     ),
+    # CPython 3.11 runners invoke these; the suite's [target] check keeps a
+    # mis-provisioned runner loud instead of silently green.
+    "pr311": (("cp311_gate", False),),
+    "daily311": (("cp311_gate", False),),
 }
 DAILY_COMPAT_GROUPS = (
     ("supported", "wheel_compat"),

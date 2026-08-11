@@ -48,6 +48,7 @@ def timestamp() -> str:
 EXCLUDED_PREFIXES = (
     "ThirdParty/",
     "cinderx/ThirdParty/",
+    "cinderx/Interpreter/3.11/upstream/",
     "cinderx/UpstreamBorrow/",
 )
 

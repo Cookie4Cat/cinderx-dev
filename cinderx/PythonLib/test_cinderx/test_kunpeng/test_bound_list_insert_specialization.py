@@ -1,10 +1,19 @@
-import subprocess
+from pathlib import Path
 import sys
-import textwrap
 import unittest
 
 import cinderx.jit
-from cinderx.test_support import subprocess_env
+from cinderx.test_support import (
+    assert_python_child_ok,
+    run_python_child,
+    subprocess_env,
+)
+
+
+CHILD = (
+    Path(__file__).with_name("child_cases")
+    / "bound_list_insert_specialization.py"
+)
 
 
 @unittest.skipUnless(cinderx.jit.is_enabled(), "requires CinderX JIT")
@@ -83,41 +92,15 @@ class BoundListInsertSpecializationTests(unittest.TestCase):
         self.assertEqual(insert_negative("x"), [1, 2, "x", 3])
 
     def test_bound_list_insert_negative_index_parallel_precompile(self):
-        code = textwrap.dedent(
-            """
-            import cinderx.jit
-
-            cinderx.jit.enable_specialized_opcodes()
-
-            def insert_negative(item):
-                values = [1, 2, 3]
-                insert = values.insert
-                insert(-1, item)
-                return values
-
-            cinderx.jit.jit_suppress(insert_negative)
-            try:
-                for _ in range(20):
-                    insert_negative(0)
-            finally:
-                cinderx.jit.jit_unsuppress(insert_negative)
-
-            cinderx.jit.lazy_compile(insert_negative)
-            assert cinderx.jit.precompile_all(workers=2)
-            assert cinderx.jit.is_jit_compiled(insert_negative)
-            counts = cinderx.jit.get_function_hir_opcode_counts(insert_negative)
-            assert counts.get("CallStatic", 0) == 2, counts
-            assert counts.get("VectorCall", 0) == 0, counts
-            assert insert_negative("x") == [1, 2, "x", 3]
-            """
-        )
-        proc = subprocess.run(
-            [sys.executable, "-c", code],
-            capture_output=True,
-            text=True,
+        proc = run_python_child(
+            CHILD,
+            "negative-index-parallel-precompile",
             env=subprocess_env(),
         )
-        self.assertEqual(proc.returncode, 0, proc.stderr)
+        assert_python_child_ok(
+            proc,
+            context="bound list.insert negative-index parallel precompile",
+        )
 
     def test_bound_list_insert_preserves_receiver_and_value_refcounts(self):
         def insert_local(values, item):

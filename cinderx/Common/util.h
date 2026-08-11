@@ -503,6 +503,10 @@ inline void setVectorcall(
 using FuncVisitor = void (*)(BorrowedRef<PyFunctionObject>);
 
 inline void walkFunctionObjects(FuncVisitor visitor) {
+#if PY_VERSION_HEX < 0x030C0000
+  // PyUnstable_GC_VisitObjects does not exist before 3.12.
+  (void)visitor;
+#else
   auto wrapper = [](PyObject* obj, void* arg) {
     if (PyFunction_Check(obj)) {
       BorrowedRef<PyFunctionObject> func{obj};
@@ -512,6 +516,7 @@ inline void walkFunctionObjects(FuncVisitor visitor) {
   };
 
   PyUnstable_GC_VisitObjects(wrapper, reinterpret_cast<void*>(visitor));
+#endif
 }
 
 } // namespace jit

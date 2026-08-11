@@ -1,0 +1,117 @@
+# CinderX CPython 3.11.6 development environment (openEuler 24.03-LTS-SP3).
+#
+# Derived from the repo-root Dockerfile (the 3.14.3 recipe): same base image,
+# same source-built GCC 14.2.0, same rpath scheme for libstdc++.  The only
+# substantive difference is Python provisioning: the anchored openEuler distro
+# rpm (python3-3.11.6-34.oe2403sp3) instead of a source-built CPython.
+#
+# Build:
+#   docker build -f Dockerfile.cp311-dev -t cinderx-cp311-dev:v2 .
+#   docker inspect --format='{{index .RepoDigests 0}}' openeuler/openeuler:24.03-lts-sp3  # record base digest
+#
+# Run (per-developer container, source mounted from host):
+#   docker run -d --name cp311-dev-<you> -v <your-clone>:/workspace/cinderx \
+#       cinderx-cp311-dev:v1 sleep infinity
+#
+# Anchored facts and evidence-collection commands: docs/cp311-anchor.md.
+
+ARG GCC_VERSION=14.2.0
+ARG PYTHON3_NVR=3.11.6-34.oe2403sp3
+
+FROM openeuler/openeuler:24.03-lts-sp3
+
+ARG GCC_VERSION
+ARG PYTHON3_NVR
+
+ENV LANG=en_US.UTF-8
+
+# Build prerequisites (same set as the root Dockerfile; gmp/mpfr/mpc/isl are
+# for the GCC build itself).
+RUN dnf install -y \
+    gcc \
+    gcc-c++ \
+    make \
+    cmake \
+    git \
+    wget \
+    curl \
+    openssl-devel \
+    zlib-devel \
+    bzip2-devel \
+    readline-devel \
+    sqlite-devel \
+    llvm \
+    ncurses-devel \
+    xz-devel \
+    tk-devel \
+    libxml2-devel \
+    libffi-devel \
+    gmp-devel \
+    mpfr-devel \
+    libmpc-devel \
+    isl-devel \
+    && dnf clean all
+
+WORKDIR /tmp
+
+# Source-built GCC 14.2.0 — identical to the root Dockerfile.
+RUN wget https://mirrors.huaweicloud.com/gnu/gcc/gcc-${GCC_VERSION}/gcc-${GCC_VERSION}.tar.xz \
+    && tar xf gcc-${GCC_VERSION}.tar.xz \
+    && mkdir -p gcc-build \
+    && cd gcc-build \
+    && ../gcc-${GCC_VERSION}/configure --prefix=/usr/local/gcc-${GCC_VERSION} \
+        --enable-languages=c,c++ \
+        --disable-multilib \
+        --with-system-zlib \
+    && make -j$(nproc) \
+    && make install \
+    && cd /tmp \
+    && rm -rf gcc-${GCC_VERSION} gcc-${GCC_VERSION}.tar.xz gcc-build
+
+RUN ln -sf /usr/local/gcc-${GCC_VERSION}/bin/gcc /usr/local/bin/gcc \
+    && ln -sf /usr/local/gcc-${GCC_VERSION}/bin/g++ /usr/local/bin/g++ \
+    && ln -sf /usr/local/gcc-${GCC_VERSION}/bin/c++ /usr/local/bin/c++
+
+ENV PATH=/usr/local/bin:$PATH
+
+# --- CPython 3.11.6: anchored openEuler distro package ---------------------
+# The base image already carries a python3 for dnf; pin it to the anchored NVR.
+# If the update repo has moved past this NVR, see the manual for the archived
+# rpm fallback.
+RUN dnf install -y \
+    python3-${PYTHON3_NVR} \
+    python3-devel-${PYTHON3_NVR} \
+    python3-pip \
+    dnf-plugins-core \
+    rpm-build \
+    gdb \
+    && dnf clean all
+
+# Fail the image build early if the anchor or Lib/test corpus is not in place.
+RUN rpm -q python3 | grep -F "python3-${PYTHON3_NVR}" \
+    && /usr/bin/python3.11 -c "import test.test_grammar" \
+    && /usr/bin/python3.11 -m test.regrtest --list-tests > /dev/null \
+    && echo "anchor + Lib/test OK"
+
+# --- Baked acceptance tooling (v2) -----------------------------------------
+# The CinderX build needs setuptools>=77 (pyproject license metadata) and the
+# differential engine's unit tests run under pytest.  Pinned so image
+# rebuilds stay deterministic; versions recorded in docs/cp311-anchor.md.
+# The pypi mirror matches the GCC download mirror above.
+RUN python3.11 -m pip install --no-cache-dir \
+    -i https://mirrors.huaweicloud.com/repository/pypi/simple \
+    "setuptools==80.9.0" "pytest==8.4.1"
+
+# Intranet git hosts commonly sit behind TLS-intercepting proxies, so
+# transport verification is off for git.  Dependency integrity is carried by
+# pinned commits and the vendored SHA256SUMS manifest, not by the channel.
+RUN git config --system http.sslVerify false
+
+# libstdc++ strategy, verbatim from the 3.14.3 recipe: bake the GCC14 lib64
+# into RPATH of everything we build (including _cinderx.so), so no
+# LD_LIBRARY_PATH is needed at run time.
+ENV LDFLAGS="-Wl,-rpath,/usr/local/gcc-${GCC_VERSION}/lib64"
+
+WORKDIR /workspace/cinderx
+
+CMD ["/bin/bash"]

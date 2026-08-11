@@ -1,0 +1,179 @@
+// -*- mode: c++ -*- vi: set ft=cpp:
+// Copyright (c) Meta Platforms, Inc. and affiliates.
+
+// Interpreter-local dependencies for the pristine CPython 3.11.6 evaluator.
+// Generate this file only with the standalone UpstreamBorrow mechanism and
+// python3-3.11.6-34.oe2403sp3.src.rpm's rpmbuild source tree.
+
+// clang-format off
+
+#define Py_BUILD_CORE
+
+#include "Python.h"
+#include "frameobject.h"
+#include "internal/pycore_bitutils.h"
+#include "internal/pycore_ceval.h"
+#include "internal/pycore_code.h"
+#include "internal/pycore_dict.h"
+#include "internal/pycore_exceptions.h"
+#include "internal/pycore_frame.h"
+#include "internal/pycore_function.h"
+#include "internal/pycore_genobject.h"
+#include "internal/pycore_global_objects.h"
+#include "internal/pycore_list.h"
+#include "internal/pycore_moduleobject.h"
+#include "internal/pycore_object.h"
+#include "internal/pycore_opcode.h"
+#include "internal/pycore_pyerrors.h"
+#include "internal/pycore_pystate.h"
+#include "internal/pycore_tuple.h"
+
+#include <assert.h>
+
+// Preserve the ownership-taking behavior of _PyDict_SetItem_Take2.  The
+// public PyDict_SetItem API temporarily increments both arguments and cannot
+// reproduce the branch-specific destruction order of the upstream helper.
+// @Borrow CPP directives noinclude from Objects/dictobject.c
+
+// The empty-keys singleton is file-local in libpython.  Capture its runtime
+// identity before the helper is used; pointer equality is part of dictobject.c
+// insertion behavior.
+#undef Py_EMPTY_KEYS
+static PyDictKeysObject* ci_dict_empty_keys_311;
+#define Py_EMPTY_KEYS ci_dict_empty_keys_311
+
+int Ci_InitInterpreter_311(void) {
+  PyObject* empty_dict = PyDict_New();
+  if (empty_dict == NULL) {
+    return -1;
+  }
+  ci_dict_empty_keys_311 = ((PyDictObject*)empty_dict)->ma_keys;
+  Py_DECREF(empty_dict);
+  return 0;
+}
+
+// Borrowed insertions must use the runtime's version stream rather than the
+// file-local dictobject.c counter.
+uint64_t Cix_PyDict_NextVersion(void);
+#undef DICT_NEXT_VERSION
+#define DICT_NEXT_VERSION() Cix_PyDict_NextVersion()
+
+// Avoid a dependency on CPython's debug-only consistency implementation.
+#undef ASSERT_CONSISTENT
+#define ASSERT_CONSISTENT(op) ((void)0)
+
+// stringlib/eq.h is an include fragment, so retain the exact comparison used
+// by the borrowed lookup closure here.
+Py_LOCAL_INLINE(int)
+unicode_eq(PyObject* aa, PyObject* bb) {
+  assert(PyUnicode_Check(aa));
+  assert(PyUnicode_Check(bb));
+  assert(PyUnicode_IS_READY(aa));
+  assert(PyUnicode_IS_READY(bb));
+
+  PyUnicodeObject* a = (PyUnicodeObject*)aa;
+  PyUnicodeObject* b = (PyUnicodeObject*)bb;
+
+  if (PyUnicode_GET_LENGTH(a) != PyUnicode_GET_LENGTH(b)) {
+    return 0;
+  }
+  if (PyUnicode_GET_LENGTH(a) == 0) {
+    return 1;
+  }
+  if (PyUnicode_KIND(a) != PyUnicode_KIND(b)) {
+    return 0;
+  }
+  return memcmp(
+             PyUnicode_1BYTE_DATA(a),
+             PyUnicode_1BYTE_DATA(b),
+             PyUnicode_GET_LENGTH(a) * PyUnicode_KIND(a)) == 0;
+}
+
+// Generated from the Release 34 dictobject.c call graph.  Functions reached
+// through lookup function pointers are listed explicitly.
+// @Borrow function unicode_get_hash from Objects/dictobject.c
+// @Borrow function get_dict_state from Objects/dictobject.c
+// @Borrow function new_keys_object from Objects/dictobject.c
+// @Borrow function free_keys_object from Objects/dictobject.c
+// @Borrow function dictkeys_decref from Objects/dictobject.c
+// @Borrow function dictkeys_set_index from Objects/dictobject.c
+// @Borrow function insert_to_emptydict from Objects/dictobject.c
+// @Borrow function get_index_from_order from Objects/dictobject.c
+// @Borrow function dictkeys_get_index from Objects/dictobject.c
+// @Borrow function build_indices_generic from Objects/dictobject.c
+// @Borrow function build_indices_unicode from Objects/dictobject.c
+// @Borrow function free_values from Objects/dictobject.c
+// @Borrow function dictresize from Objects/dictobject.c
+// @Borrow function calculate_log2_keysize from Objects/dictobject.c
+// @Borrow function insertion_resize from Objects/dictobject.c
+// @Borrow function unicodekeys_lookup_unicode from Objects/dictobject.c
+// @Borrow function unicodekeys_lookup_generic from Objects/dictobject.c
+// @Borrow function dictkeys_generic_lookup from Objects/dictobject.c
+#define _Py_dict_lookup Cix_PyDictLookupForSetItem_311
+// @Borrow function _Py_dict_lookup from Objects/dictobject.c
+// @Borrow function find_empty_slot from Objects/dictobject.c
+// @Borrow function insertdict from Objects/dictobject.c
+#define _PyDict_SetItem_Take2 Cix_PyDict_SetItem_Take2_Impl_311
+// @Borrow function _PyDict_SetItem_Take2 from Objects/dictobject.c
+#undef _PyDict_SetItem_Take2
+#undef _Py_dict_lookup
+
+int Cix_PyDict_SetItem_Take2_311(
+    PyDictObject* dict,
+    PyObject* key,
+    PyObject* value) {
+  if (ci_dict_empty_keys_311 == NULL) {
+    PyErr_SetString(
+        PyExc_RuntimeError,
+        "CPython 3.11 dict helper used before initialization");
+    Py_DECREF(key);
+    Py_DECREF(value);
+    return -1;
+  }
+  return Cix_PyDict_SetItem_Take2_Impl_311(dict, key, value);
+}
+
+// List and line-table helpers used directly by opcode implementations.
+// @Borrow function list_resize from Objects/listobject.c
+// @Borrow function _PyList_AppendTakeRefListResize from Objects/listobject.c
+// @Borrow function _PyCode_CreateLineArray from Objects/codeobject.c
+
+// Frame/local synchronization and function construction.
+// @Borrow function _PyFrame_OpAlreadyRan from Objects/frameobject.c
+// @Borrow function _PyFrame_FastToLocalsWithError from Objects/frameobject.c
+// @Borrow function _PyFrame_LocalsToFast from Objects/frameobject.c
+// @Borrow function _PyEval_BuiltinsFromGlobals from Objects/frameobject.c
+// @Borrow function _PyFunction_FromConstructor from Objects/funcobject.c
+
+// Complete the single vendored frame implementation. Python/frame.c calls this
+// Objects/frameobject.c helper, which libpython does not export.
+#define _PyFrame_New_NoTrack Ci_PyFrame_New_NoTrack_311
+// @Borrow function _PyFrame_New_NoTrack from Objects/frameobject.c
+#undef _PyFrame_New_NoTrack
+
+// Coroutine construction. _PyAsyncGenValueWrapperNew is already provided by
+// the common 3.11 Borrow cache and is macro-routed in ceval_wrapper.c.
+// @Borrow CPP directives from Objects/genobject.c
+// @Borrow function make_gen from Objects/genobject.c
+PyObject* Cix_compute_cr_origin(
+    int origin_depth,
+    _PyInterpreterFrame* current_frame);
+#define compute_cr_origin Cix_compute_cr_origin
+// @Borrow function _Py_MakeCoro from Objects/genobject.c
+#undef compute_cr_origin
+
+// ExceptionGroup reraising dependency closure.
+// @Borrow typedef _exceptiongroup_split_matcher_type from Objects/exceptions.c
+// @Borrow typedef _exceptiongroup_split_result from Objects/exceptions.c
+// @Borrow function _PyBaseExceptionGroupObject_cast from Objects/exceptions.c
+// @Borrow function is_same_exception_metadata from Objects/exceptions.c
+// @Borrow function exceptiongroup_split_check_match from Objects/exceptions.c
+// @Borrow function exceptiongroup_subset from Objects/exceptions.c
+// @Borrow function exceptiongroup_split_recursive from Objects/exceptions.c
+// @Borrow function collect_exception_group_leaf_ids from Objects/exceptions.c
+// @Borrow function exception_group_projection from Objects/exceptions.c
+// @Borrow function _PyExc_CreateExceptionGroup from Objects/exceptions.c
+// @Borrow function _PyExc_PrepReraiseStar from Objects/exceptions.c
+
+// GIL drop checks use the exact target runtime predicate.
+// @Borrow function _PyThreadState_MustExit from Python/pystate.c

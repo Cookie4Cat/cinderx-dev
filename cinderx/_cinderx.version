@@ -1,0 +1,10 @@
+/* The _cinderx extension exports its module init function and nothing else.
+ * The CPython 3.11 build links a vendored copy of the interpreter whose
+ * PyAPI_FUNC definitions would otherwise appear in the dynamic symbol table
+ * and shadow libpython's own under RTLD_GLOBAL loading. */
+{
+  global:
+    PyInit__cinderx;
+  local:
+    *;
+};

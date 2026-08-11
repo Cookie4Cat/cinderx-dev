@@ -126,7 +126,8 @@ enum OperandSizeType {
   X(Div, false, FlagEffects::kSet, kDefault, 1, {1})                           \
   X(DivUn, false, FlagEffects::kSet, kDefault, 1, {1})                         \
   X(Mul, false, FlagEffects::kSet, kOut, 1, {1})                               \
-  X(MulAdd, false, FlagEffects::kNone, kAlways64, 1, {1, 1, 1})                \
+  X(MulAdd, false, FlagEffects::kNone, kOut, 1, {1, 1, 1})                     \
+  X(MulSub, false, FlagEffects::kNone, kOut, 1, {1, 1, 1})                     \
   X(Or, false, FlagEffects::kSet, kOut, 1, {1})                                \
   X(Fadd, false, FlagEffects::kNone, kAlways64, 1, {1, 1})                     \
   X(Fsub, true, FlagEffects::kNone, kAlways64, 1, {1, 1})                      \
@@ -210,6 +211,9 @@ enum OperandSizeType {
   X(SetupFrame, false, FlagEffects::kInvalidate, kDefault, 0, {}, 1)           \
   X(VariadicPush, false, FlagEffects::kNone, kDefault, 0, {}, 1)               \
   X(StorePair, false, FlagEffects::kNone, kDefault, 0, {0, 1, 1, 1}, 1)        \
+  /* Post-RA-only AArch64 pseudo. dst0/dst1 are hidden physical definitions.   \
+   */                                                                          \
+  X(LoadPair, false, FlagEffects::kNone, kDefault, 0, {0, 1, 1, 1}, 1)         \
   X(Leave, false, FlagEffects::kInvalidate, kDefault, 0, {}, 1)                \
   X(Ret, false, FlagEffects::kInvalidate, kDefault, 0, {}, 1)                  \
   /* TreeIter state machine LIR opcodes. All are essential side-effect ops. */ \
@@ -240,6 +244,7 @@ enum OperandSizeType {
   X(ClearTreeIterState, false, FlagEffects::kInvalidate, kDefault, 0, {}, 1)   \
   X(CmpBranchZero, false, FlagEffects::kNone, kDefault, 0, {1}, 1)             \
   X(CmpBranchNonZero, false, FlagEffects::kNone, kDefault, 0, {1}, 1)          \
+  X(A64SubSetFlags, true, FlagEffects::kSet, kOut, 1, {1, 1})                  \
   X(A64GuardCC, false, FlagEffects::kInvalidate, kDefault, 0, {0, 0}, 1)
 // Instruction class defines instructions in LIR.
 // Every instruction can have no more than one output, but arbitrary

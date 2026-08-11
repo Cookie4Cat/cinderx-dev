@@ -84,6 +84,14 @@ OperandBase* MemoryIndirect::getIndexRegOperand() const {
   return index_reg_.get();
 }
 
+std::unique_ptr<OperandBase> MemoryIndirect::releaseBaseRegOperand() {
+  return std::move(base_reg_);
+}
+
+std::unique_ptr<OperandBase> MemoryIndirect::releaseIndexRegOperand() {
+  return std::move(index_reg_);
+}
+
 uint8_t MemoryIndirect::getMultipiler() const {
   return multiplier_;
 }

@@ -135,19 +135,28 @@ int uninstrument(PyCodeObject* code, int index) {
     return base_opcode;
   }
 
-  // Instrumented lines and arbitrary instrumented instructions need to check
-  // different tables.
+// Instrumented lines and arbitrary instrumented instructions need to check
+// different tables. CPython 3.11 does not have PEP 669 monitoring opcodes.
+#if PY_VERSION_HEX >= 0x030C0000
   if (opcode == INSTRUMENTED_INSTRUCTION) {
     return code->_co_monitoring->per_instruction_opcodes[index];
   }
   if (opcode == INSTRUMENTED_LINE) {
     return Cix_GetOriginalOpcode(code->_co_monitoring->lines, index);
   }
+#endif
 
   return opcode;
 }
 
 const char* opcodeName(int opcode) {
+#if PY_VERSION_HEX < 0x030C0000
+  // CPython 3.11 only compiles its opcode name table under Py_DEBUG, and the
+  // only consumers of this helper are JIT diagnostics, which are not built on
+  // 3.11.  Report the number rather than generating a table nothing reads.
+  (void)opcode;
+  return "<opcode name unavailable on 3.11>";
+#else
   constexpr size_t num_opcodes =
       sizeof(_CiOpcode_OpName) / sizeof(_CiOpcode_OpName[0]);
   if (opcode < 0 || opcode >= num_opcodes) {
@@ -155,6 +164,7 @@ const char* opcodeName(int opcode) {
   }
   const char* name = _CiOpcode_OpName[opcode];
   return name != nullptr ? name : "<unknown opcode>";
+#endif
 }
 
 Py_ssize_t inlineCacheSize(PyCodeObject* code, int index) {
@@ -162,7 +172,11 @@ Py_ssize_t inlineCacheSize(PyCodeObject* code, int index) {
 }
 
 int loadAttrIndex(int oparg) {
+#if PY_VERSION_HEX < 0x030C0000
+  return oparg;
+#else
   return oparg >> 1;
+#endif
 }
 
 int loadGlobalIndex(int oparg) {

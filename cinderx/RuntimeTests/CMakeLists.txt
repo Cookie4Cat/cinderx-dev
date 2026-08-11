@@ -6,7 +6,7 @@ include(GoogleTest)
 cinderx_declare_dependency(
   googletest
   https://github.com/google/googletest.git
-  v1.17.0
+  262727f0a23e27678c4aa939fc00d32b00661b7c # tag v1.17.0
 )
 set(BUILD_GMOCK OFF CACHE BOOL "" FORCE)
 set(INSTALL_GTEST OFF CACHE BOOL "" FORCE)
