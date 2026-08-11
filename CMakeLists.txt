@@ -257,6 +257,20 @@ function(cinderx_local_dep_matches NAME REPOSITORY TAG LOCAL_DIR OUT_VAR)
     endif()
   endif()
 
+  # A dirty checkout must not be compiled while the provenance claims the
+  # clean declared commit; refresh it instead of trusting it.
+  if(matches)
+    execute_process(
+      COMMAND "${CINDERX_GIT_EXECUTABLE}" -C "${LOCAL_DIR}" status --porcelain
+      RESULT_VARIABLE status_result
+      OUTPUT_VARIABLE status_output
+      ERROR_QUIET)
+    if(NOT status_result EQUAL 0 OR NOT status_output STREQUAL "")
+      message(STATUS "Local dependency ${NAME} checkout is dirty; refreshing")
+      set(matches FALSE)
+    endif()
+  endif()
+
   set(${OUT_VAR} ${matches} PARENT_SCOPE)
 endfunction()
 
@@ -341,7 +355,7 @@ endif()
 cinderx_declare_dependency(
   fmt
   https://github.com/fmtlib/fmt
-  11.2.0 # 2025-May-03
+  40626af88bd7df9a5fb80be7b25ac85b122d6c21 # tag 11.2.0, 2025-May-03
 )
 FetchContent_MakeAvailable(fmt)
 
@@ -389,7 +403,7 @@ if (${ENABLE_DISASSEMBLER})
   cinderx_declare_dependency(
     capstone
     https://github.com/capstone-engine/capstone
-    5.0.7
+    52c66920fc7bfa15fd9626dfd9f646c698aaa99b # tag 5.0.7
   )
 
   # Skip unsupported architectures while preserving x86's Capstone default,
