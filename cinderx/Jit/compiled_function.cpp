@@ -87,9 +87,8 @@ PyMethodDef compiledfunc_methods[] = {
     {"__reduce__",
      jit::compiledfunc_reduce,
      METH_NOARGS,
-     PyDoc_STR(
-         "Reduce to a picklable None placeholder, dropping JIT machine "
-         "code so a JIT-compiled function can be pickled/copied.")},
+     PyDoc_STR("Reduce to a picklable None placeholder, dropping JIT machine "
+               "code so a JIT-compiled function can be pickled/copied.")},
     {nullptr, nullptr, 0, nullptr},
 };
 
