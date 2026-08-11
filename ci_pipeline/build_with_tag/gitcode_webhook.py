@@ -9,7 +9,9 @@ import shlex
 import shutil
 import socket
 import subprocess
+import sys
 import time
+import zipfile
 import urllib.error
 import urllib.parse
 import urllib.request
@@ -55,8 +57,14 @@ RUN_DIR = WORK_BASE / "run"
 
 BUILD_COMMAND = env(
     "CINDERX_BUILD_COMMAND",
-    "/home/pybin/bin/python3.14 -m cibuildwheel --output-dir wheelhouse --only cp314-manylinux_aarch64",
+    "/home/pybin/bin/python3.14 ci_pipeline/build_release_wheels.py",
 )
+# The release wheel set is defined by this repo, not by the operator-pinned
+# build command: when the pinned command leaves no cp311 wheel in the
+# wheelhouse, the webhook builds it before publishing.  Set to 0/false to
+# opt out (the setting survives in /etc/cinderx-webhook.env because the
+# Jenkins job only rewrites its own keys).
+RELEASE_CP311 = env_bool("CINDERX_RELEASE_CP311", True)
 RELEASE_STATUS = env("GITCODE_RELEASE_STATUS", "latest")
 STRICT_RELEASE_CREATE = env_bool("GITCODE_STRICT_RELEASE_CREATE", False)
 HTTP_TIMEOUT = int(env("CINDERX_WEBHOOK_HTTP_TIMEOUT", "120"))
@@ -334,6 +342,112 @@ def format_section(title, entries):
     return "\n".join(lines)
 
 
+def parse_wheel_name(name):
+    if not name.endswith(".whl"):
+        raise RuntimeError(f"not a wheel filename: {name}")
+    parts = name[:-4].split("-")
+    if len(parts) not in (5, 6):
+        raise RuntimeError(f"cannot parse wheel filename: {name}")
+    return {
+        "distribution": parts[0],
+        "version": parts[1],
+        "python_tag": parts[-3],
+        "abi_tag": parts[-2],
+        "platform_tag": parts[-1],
+    }
+
+
+def validate_release_manifest(wheels, log):
+    """The release carries the exact expected wheel set or nothing.
+
+    Exactly one cp314 manylinux fat wheel; exactly one cp311 linux wheel
+    when CINDERX_RELEASE_CP311 is on (and none when it is off); every wheel
+    the same distribution and version; nothing else.
+    """
+    parsed = [parse_wheel_name(wheel.name) for wheel in wheels]
+    for meta in parsed:
+        if meta["distribution"] != "cinderx":
+            raise RuntimeError(f"unexpected distribution in wheelhouse: {meta}")
+    versions = sorted({meta["version"] for meta in parsed})
+    if len(versions) != 1:
+        raise RuntimeError(f"wheel versions disagree: {versions}")
+    cp314 = [meta for meta in parsed if meta["python_tag"] == "cp314"]
+    cp311 = [meta for meta in parsed if meta["python_tag"] == "cp311"]
+    others = [meta for meta in parsed if meta["python_tag"] not in ("cp311", "cp314")]
+    if len(cp314) != 1:
+        raise RuntimeError(f"expected exactly one cp314 wheel, found {len(cp314)}")
+    if cp314[0]["abi_tag"] != "cp314":
+        raise RuntimeError(f"cp314 wheel has unexpected abi: {cp314[0]['abi_tag']}")
+    # Every dot-separated platform component must be a manylinux aarch64
+    # tag; substring checks would wave fabricated platforms through.
+    if not all(
+        re.fullmatch(r"manylinux_\d+_\d+_aarch64", component)
+        for component in cp314[0]["platform_tag"].split(".")
+    ):
+        raise RuntimeError(f"cp314 wheel has unexpected platform: {cp314[0]['platform_tag']}")
+    if RELEASE_CP311:
+        if len(cp311) != 1:
+            raise RuntimeError(f"expected exactly one cp311 wheel, found {len(cp311)}")
+        if cp311[0]["abi_tag"] != "cp311":
+            raise RuntimeError(f"cp311 wheel has unexpected abi: {cp311[0]['abi_tag']}")
+        if cp311[0]["platform_tag"] != "linux_aarch64":
+            raise RuntimeError(f"cp311 wheel has unexpected platform: {cp311[0]['platform_tag']}")
+    elif cp311:
+        raise RuntimeError("cp311 wheels present although CINDERX_RELEASE_CP311 is off")
+    if others:
+        raise RuntimeError(f"unexpected wheels in wheelhouse: {others}")
+    log_line(log, f"release manifest ok: {len(parsed)} wheels, version {versions[0]}")
+
+
+def validate_fat_wheel_content(wheel_path, expected_version, log):
+    """Prove the cp314 wheel really is the 3.14.0-3.14.3 fat wheel.
+
+    An ordinary cp314 manylinux wheel carries the same filename tags, so the
+    name-level manifest cannot tell them apart; a misconfigured build command
+    (the historic default built exactly such a wheel) must not publish one.
+    """
+    with zipfile.ZipFile(wheel_path) as wheel:
+        names = set(wheel.namelist())
+        if "_cinderx.py" not in names:
+            raise RuntimeError(f"{wheel_path.name} is missing the fat loader _cinderx.py")
+        if "cinderx/_native/fat_wheel.json" not in names:
+            raise RuntimeError(f"{wheel_path.name} is missing cinderx/_native/fat_wheel.json")
+        variants = {
+            name.split("/")[2]
+            for name in names
+            if name.startswith("cinderx/_native/") and name.endswith(".so")
+        }
+        expected_variants = {"py314_0", "py314_1", "py314_2", "py314_3"}
+        if variants != expected_variants:
+            raise RuntimeError(
+                f"{wheel_path.name} native variants {sorted(variants)} != {sorted(expected_variants)}"
+            )
+        top_level_native = [
+            name
+            for name in names
+            if "/" not in name and name.startswith("_cinderx") and name.endswith(".so")
+        ]
+        if top_level_native:
+            raise RuntimeError(
+                f"{wheel_path.name} carries top-level native extensions: {top_level_native}"
+            )
+        metadata_name = next(
+            (name for name in names if name.endswith(".dist-info/METADATA")), None
+        )
+        if metadata_name is None:
+            raise RuntimeError(f"{wheel_path.name} is missing METADATA")
+        metadata = wheel.read(metadata_name).decode("utf-8", "replace")
+        version_lines = [
+            line for line in metadata.splitlines() if line.startswith("Version:")
+        ]
+        if [f"Version: {expected_version}"] != version_lines:
+            raise RuntimeError(
+                f"{wheel_path.name} METADATA version {version_lines} != filename "
+                f"version {expected_version}"
+            )
+    log_line(log, f"fat wheel content ok: {wheel_path.name}")
+
+
 def sha256_file(path):
     digest = hashlib.sha256()
     with path.open("rb") as handle:
@@ -365,6 +479,32 @@ def collect_wheel_assets(wheels):
     return assets
 
 
+def interpreter_for_python_tag(python_tag):
+    if python_tag.startswith("cp3") and python_tag[3:].isdigit():
+        return f"python3.{python_tag[3:]}"
+    return "python3"
+
+
+PYTHON_TAG_DESCRIPTIONS = {
+    "cp314": "CPython 3.14（manylinux fat wheel，覆盖 3.14.0–3.14.3）",
+    "cp311": "CPython 3.11（openEuler 24.03-LTS-SP3 wheel，`cp311` 标签）",
+}
+
+
+def python_support_line(wheel_assets):
+    # Derived from the wheels actually being published, so a CP314-only
+    # release does not advertise a CPython 3.11 wheel it does not carry.
+    tags = sorted(
+        {parse_wheel_name(asset["name"])["python_tag"] for asset in wheel_assets},
+        reverse=True,
+    )
+    if not tags:
+        return "- Python: 见本 Release 附件"
+    return "- Python: " + "；".join(
+        PYTHON_TAG_DESCRIPTIONS.get(tag, tag) for tag in tags
+    )
+
+
 def format_integrity_section(wheel_assets):
     lines = [
         "## 完整性校验",
@@ -374,30 +514,34 @@ def format_integrity_section(wheel_assets):
         "sha256sum -c <wheel-file>.sha256",
         "```",
         "",
-        "安装时可使用 pip hash-checking mode，让 pip 在安装过程中再次校验 wheel：",
+        "安装时可使用 pip hash-checking mode，让 pip 在安装过程中再次校验 wheel。"
+        "按运行环境选择对应的 wheel 与解释器：",
         "",
-        "```bash",
-        "python3.14 -m pip install --no-deps --require-hashes -r cinderx-release-requirements.txt",
-        "```",
-        "",
-        "`cinderx-release-requirements.txt` 内容示例：",
-        "",
-        "```text",
     ]
     if wheel_assets:
-        lines.extend(
-            f"./{asset['name']} --hash=sha256:{asset['sha256']}"
-            for asset in wheel_assets
-        )
+        for asset in wheel_assets:
+            interpreter = interpreter_for_python_tag(
+                parse_wheel_name(asset["name"])["python_tag"]
+            )
+            lines.extend(
+                [
+                    "```bash",
+                    f"printf '%s\\n' './{asset['name']} --hash=sha256:{asset['sha256']}' > requirements.txt",
+                    f"{interpreter} -m pip install --no-deps --require-hashes -r requirements.txt",
+                    "```",
+                    "",
+                ]
+            )
     else:
-        lines.append("./<wheel-file>.whl --hash=sha256:<sha256>")
-    lines.extend(
-        [
-            "```",
-            "",
-            "Release 附件 SHA256：",
-        ]
-    )
+        lines.extend(
+            [
+                "```text",
+                "./<wheel-file>.whl --hash=sha256:<sha256>",
+                "```",
+                "",
+            ]
+        )
+    lines.append("Release 附件 SHA256：")
     if wheel_assets:
         for asset in wheel_assets:
             lines.append(
@@ -437,8 +581,8 @@ def build_release_body(tag, sha, log, wheel_assets=None):
         format_section("其他变更 (Chores)", grouped["chores"]),
         "",
         "## 安装与部署",
-        "- Python: CPython 3.14",
-        "- Wheel: 请在本 Release 附件中下载对应 `.whl`",
+        python_support_line(wheel_assets),
+        "- Wheel: 请在本 Release 附件中下载与运行环境匹配的 `.whl`",
         f"- 构建命令: `{BUILD_COMMAND}`",
         "",
         format_integrity_section(wheel_assets),
@@ -516,7 +660,7 @@ def upload_asset(tag, file_path, log):
         raise RuntimeError(f"PUT upload for {name} returned {exc.code}: {text[:1000]}") from exc
 
 
-def build_and_publish(tag, sha):
+def build_and_publish(tag, sha, publish=True):
     validate_release_tag(tag)
     LOG_DIR.mkdir(parents=True, exist_ok=True)
     STATE_DIR.mkdir(parents=True, exist_ok=True)
@@ -526,26 +670,82 @@ def build_and_publish(tag, sha):
     success_marker = STATE_DIR / f"{safe_tag}.success"
     running_marker = STATE_DIR / f"{safe_tag}.running"
     with log_path.open("a", encoding="utf-8") as log:
-        log_line(log, f"job start tag={tag} sha={sha}")
-        if not ACCESS_TOKEN:
+        log_line(log, f"job start tag={tag} sha={sha} publish={publish}")
+        if publish and not ACCESS_TOKEN:
             raise RuntimeError("GITCODE_ACCESS_TOKEN is empty; fill /etc/cinderx-webhook.env before publishing")
-        if success_marker.exists():
+        if success_marker.exists() and publish:
+            # The marker guards against duplicate publishing only; a
+            # rehearsal of an already-released tag must still build.
             log_line(log, f"success marker exists for {tag}; skipping duplicate build")
             return str(log_path)
         running_marker.write_text(str(os.getpid()), encoding="utf-8")
         try:
             checked_sha = checkout_tag(tag, sha, log)
+            # One commit epoch drives every builder: both wheels then carry
+            # the same date-derived version and deterministic zip metadata
+            # (setup.py and the normalize step consume it).
+            build_env = {}
+            epoch = check_output(["git", "log", "-1", "--format=%ct", "HEAD"], REPO_DIR)
+            if epoch:
+                build_env["SOURCE_DATE_EPOCH"] = epoch
             wheelhouse = REPO_DIR / "wheelhouse"
             if wheelhouse.exists():
                 shutil.rmtree(wheelhouse)
-            run_cmd(shlex.split(BUILD_COMMAND), REPO_DIR, log)
+            build_command = BUILD_COMMAND
+            default_entry = REPO_DIR / "ci_pipeline" / "build_release_wheels.py"
+            if not env("CINDERX_BUILD_COMMAND") and not default_entry.is_file():
+                # Tags predating the two-wheel flow do not carry the default
+                # entry point; replaying them falls back to the legacy cp314
+                # build they shipped with.  An operator-pinned command is
+                # always respected as-is.
+                build_command = (
+                    f"{sys.executable} ci_pipeline/build_cp314_manylinux_fat_wheel.py "
+                    f"--output-dir {WORK_BASE / 'build' / 'cp314-fat-wheel'}"
+                )
+                log_line(log, f"pre-cp311 tag: legacy build command: {build_command}")
+            run_cmd(shlex.split(build_command), REPO_DIR, log, build_env)
+            # Top up the release wheel set (see RELEASE_CP311): today this
+            # builds the cp311 wheel while the operator-pinned command only
+            # builds the cp314 fat wheel; once the pinned command moves to
+            # ci_pipeline/build_release_wheels.py it becomes a no-op.  Tags
+            # predating the cp311 flow carry no top-up script and are
+            # published as before.
+            topup_script = REPO_DIR / "ci_pipeline" / "build_cp311_wheel.py"
+            if RELEASE_CP311 and not topup_script.is_file():
+                log_line(log, "cp311 top-up script not in this tag; skipping top-up")
+            elif RELEASE_CP311 and not list(wheelhouse.glob("cinderx-*-cp311-*.whl")):
+                run_cmd(
+                    [
+                        sys.executable,
+                        "ci_pipeline/build_cp311_wheel.py",
+                        "--output-dir", str(wheelhouse),
+                    ],
+                    REPO_DIR,
+                    log,
+                    build_env,
+                )
             wheels = sorted(wheelhouse.glob("*.whl"))
             if not wheels:
                 raise RuntimeError(f"no wheels found in {wheelhouse}")
+            if topup_script.is_file():
+                validate_release_manifest(wheels, log)
+                cp314_wheel = next(
+                    wheel
+                    for wheel in wheels
+                    if parse_wheel_name(wheel.name)["python_tag"] == "cp314"
+                )
+                validate_fat_wheel_content(
+                    cp314_wheel, parse_wheel_name(cp314_wheel.name)["version"], log
+                )
+            else:
+                log_line(log, "pre-cp311 tag: skipping release manifest validation")
             log_line(log, "built wheels: " + ", ".join(w.name for w in wheels))
             wheel_assets = collect_wheel_assets(wheels)
             for asset in wheel_assets:
                 log_line(log, f"sha256 {asset['name']} {asset['sha256']}")
+            if not publish:
+                log_line(log, f"publish skipped (rehearsal); wheels stay in {wheelhouse}")
+                return str(log_path)
             create_release(tag, checked_sha, log, wheel_assets)
             for asset in wheel_assets:
                 upload_asset(tag, asset["path"], log)
@@ -562,13 +762,20 @@ def main():
     parser.add_argument("--build-tag", required=True, help="tag name to build and publish")
     parser.add_argument("--sha", default="", help="expected commit sha from GitCode webhook")
     parser.add_argument("--repo-dir", help="existing local cinderx git repository")
+    parser.add_argument(
+        "--skip-publish",
+        action="store_true",
+        help="rehearsal mode: build and checksum everything, create no release "
+        "and upload nothing (also via CINDERX_SKIP_PUBLISH=1)",
+    )
     args = parser.parse_args()
 
     global REPO_DIR
     if args.repo_dir:
         REPO_DIR = Path(args.repo_dir)
 
-    build_and_publish(args.build_tag, args.sha)
+    publish = not (args.skip_publish or env_bool("CINDERX_SKIP_PUBLISH", False))
+    build_and_publish(args.build_tag, args.sha, publish=publish)
 
 
 if __name__ == "__main__":
