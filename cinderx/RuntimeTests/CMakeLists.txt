@@ -3,10 +3,17 @@
 include(FetchContent)
 include(GoogleTest)
 
+# Deliberately a tag, not a commit pin: build environments resolve
+# github.com through differing lineages (some via curated local mirrors
+# whose googletest history is not the public upstream's), so no single
+# commit SHA exists in all of them, while the v1.17.0 tag resolves in
+# each.  googletest is a test-only dependency and never ships in a
+# wheel; pinning it by SHA waits until the lineages are unified
+# (issue #18).
 cinderx_declare_dependency(
   googletest
   https://github.com/google/googletest.git
-  262727f0a23e27678c4aa939fc00d32b00661b7c # tag v1.17.0
+  v1.17.0
 )
 set(BUILD_GMOCK OFF CACHE BOOL "" FORCE)
 set(INSTALL_GTEST OFF CACHE BOOL "" FORCE)
