@@ -20,6 +20,13 @@ system = "Linux"
 name = "diff_engine_selftest"
 command = "python3.11 -m pytest -q ci_pipeline/test_libtest_diff_311.py"
 
+# The bytecode support list is the fact source the 3.11 JIT front end is
+# held to.  Its checker's own fault-injection tests run first, so a checker
+# that cannot see mutations can never wave a stale list through.
+[[jobs]]
+name = "bytecode_support_gate"
+command = "bash -lc 'python3.11 -m pytest -q ci_pipeline/test_check_bytecode_support_311.py && python3.11 ci_pipeline/check_bytecode_support_311.py'"
+
 # The vendored interpreter sources must match their pinned manifest before
 # anything is built from them.
 [[jobs]]
