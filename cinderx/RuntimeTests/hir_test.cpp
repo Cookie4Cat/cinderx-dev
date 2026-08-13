@@ -18,6 +18,7 @@
 #include "cinderx/Jit/hir/phi_elimination.h"
 #include "cinderx/Jit/hir/printer.h"
 #include "cinderx/Jit/hir/refcount_insertion.h"
+#include "cinderx/Jit/hir/simplify.h"
 #include "cinderx/Jit/hir/ssa.h"
 #include "cinderx/Jit/jit_rt.h"
 #include "cinderx/Jit/pyjit.h"
@@ -1431,6 +1432,295 @@ def test(perm, k):
   std::string hir = fullPrinter().ToString(*irfunc);
   EXPECT_GE(countOpcode(*irfunc, Opcode::kBuildSlice), 1) << hir;
   EXPECT_GE(countOpcode(*irfunc, Opcode::kStoreSubscr), 1) << hir;
+}
+#endif
+
+#if PY_VERSION_HEX < 0x030C0000
+TEST_F(HIRBuildTest, NoArgSuperMethodCall311LowersToLoadMethodSuper) {
+  const char* src = R"(
+class A:
+    def f(self, x):
+        return x
+
+class B(A):
+    def f(self, x):
+        return super().f(x)
+
+test = B.f
+)";
+  Ref<PyFunctionObject> func(compileAndGet(src, "test"));
+  ASSERT_NE(func, nullptr);
+
+  std::unique_ptr<Function> irfunc(buildHIR(func));
+  ASSERT_NE(irfunc, nullptr);
+
+  int load_method_super_count = 0;
+  for (auto& block : irfunc->cfg.blocks) {
+    for (auto& instr : block) {
+      if (instr.IsLoadMethodSuper()) {
+        load_method_super_count++;
+      }
+    }
+  }
+
+  EXPECT_EQ(load_method_super_count, 1);
+}
+
+TEST_F(HIRBuildTest, NoArgSuperCellReceiver311LoadsReceiverCell) {
+  const char* src = R"(
+class A:
+    @classmethod
+    def f(cls):
+        return 1
+
+class B(A):
+    @classmethod
+    def f(cls):
+        def capture():
+            return cls
+        return super().f()
+
+test = B.__dict__["f"].__func__
+)";
+  Ref<PyFunctionObject> func(compileAndGet(src, "test"));
+  ASSERT_NE(func, nullptr);
+
+  std::unique_ptr<Function> irfunc(buildHIR(func));
+  ASSERT_NE(irfunc, nullptr);
+
+  int load_cell_item_count = 0;
+  int load_method_super_count = 0;
+  for (auto& block : irfunc->cfg.blocks) {
+    for (auto& instr : block) {
+      if (instr.IsLoadCellItem()) {
+        load_cell_item_count++;
+      } else if (instr.IsLoadMethodSuper()) {
+        load_method_super_count++;
+      }
+    }
+  }
+
+  EXPECT_EQ(load_cell_item_count, 2);
+  EXPECT_EQ(load_method_super_count, 1);
+}
+
+TEST_F(HIRBuildTest, InPlaceBinaryOpSpecialization311DoesNotGuardLongs) {
+  _Py_CODEUNIT bc[] = {
+      _Py_MAKE_CODEUNIT(LOAD_FAST, 0),
+      _Py_MAKE_CODEUNIT(LOAD_FAST, 1),
+      _Py_MAKE_CODEUNIT(BINARY_OP_ADD_INT, NB_INPLACE_ADD),
+      _Py_MAKE_CODEUNIT(CACHE, 0),
+      _Py_MAKE_CODEUNIT(RETURN_VALUE, 0),
+  };
+  std::unique_ptr<Function> irfunc = build_test(bc, {Py_None, Py_None});
+  ASSERT_NE(irfunc, nullptr);
+
+  int guard_type_count = 0;
+  int inplace_op_count = 0;
+  for (auto& block : irfunc->cfg.blocks) {
+    for (auto& instr : block) {
+      if (instr.IsGuardType()) {
+        guard_type_count++;
+      } else if (instr.IsInPlaceOp()) {
+        inplace_op_count++;
+      }
+    }
+  }
+
+  EXPECT_EQ(guard_type_count, 0);
+  EXPECT_EQ(inplace_op_count, 1);
+}
+
+TEST_F(HIRBuildTest, LoadGlobalModule311UsesIndexedValueGuard) {
+  const char* src = R"(
+value = object()
+
+def test():
+    return value
+)";
+  Ref<PyFunctionObject> func(compileAndGet(src, "test"));
+  ASSERT_NE(func, nullptr);
+
+  for (int i = 0; i < 200; ++i) {
+    Ref<> result = Ref<>::steal(
+        PyObject_CallNoArgs(reinterpret_cast<PyObject*>(func.get())));
+    ASSERT_NE(result, nullptr);
+  }
+
+  std::unique_ptr<Function> irfunc(buildHIR(func));
+  ASSERT_NE(irfunc, nullptr);
+
+  int call_static_count = 0;
+  int guard_count = 0;
+  int load_global_count = 0;
+  int load_global_cached_count = 0;
+  for (auto& block : irfunc->cfg.blocks) {
+    for (auto& instr : block) {
+      if (instr.IsCallStatic()) {
+        call_static_count++;
+      } else if (instr.IsGuard()) {
+        guard_count++;
+      } else if (instr.IsLoadGlobal()) {
+        load_global_count++;
+      } else if (instr.IsLoadGlobalCached()) {
+        load_global_cached_count++;
+      }
+    }
+  }
+
+  EXPECT_EQ(call_static_count, 1);
+  EXPECT_EQ(guard_count, 1);
+  EXPECT_EQ(load_global_count, 0);
+  EXPECT_EQ(load_global_cached_count, 0);
+}
+
+TEST_F(HIRBuildTest, ColdLoadGlobalModule311UsesIndexedValueGuard) {
+  const char* src = R"(
+value = object()
+
+def test():
+    return value
+)";
+  Ref<PyFunctionObject> func(compileAndGet(src, "test"));
+  ASSERT_NE(func, nullptr);
+
+  std::unique_ptr<Function> irfunc(buildHIR(func));
+  ASSERT_NE(irfunc, nullptr);
+
+  int call_static_count = 0;
+  int guard_count = 0;
+  int load_global_count = 0;
+  int load_global_cached_count = 0;
+  for (auto& block : irfunc->cfg.blocks) {
+    for (auto& instr : block) {
+      if (instr.IsCallStatic()) {
+        call_static_count++;
+      } else if (instr.IsGuard()) {
+        guard_count++;
+      } else if (instr.IsLoadGlobal()) {
+        load_global_count++;
+      } else if (instr.IsLoadGlobalCached()) {
+        load_global_cached_count++;
+      }
+    }
+  }
+
+  EXPECT_EQ(call_static_count, 1);
+  EXPECT_EQ(guard_count, 1);
+  EXPECT_EQ(load_global_count, 0);
+  EXPECT_EQ(load_global_cached_count, 0);
+}
+
+static void expectCompactLongInPlaceFastPath(Function& irfunc) {
+  reflowTypes(irfunc);
+  Simplify{}.Run(irfunc);
+
+  int compact_check_count = 0;
+  int compact_unbox_count = 0;
+  int int_binary_count = 0;
+  int primitive_box_count = 0;
+  int inplace_count = 0;
+  int long_inplace_count = 0;
+  for (auto& block : irfunc.cfg.blocks) {
+    for (auto& instr : block) {
+      if (instr.IsIsCompactLong()) {
+        compact_check_count++;
+      } else if (instr.IsCompactLongUnbox()) {
+        compact_unbox_count++;
+      } else if (instr.IsIntBinaryOp()) {
+        int_binary_count++;
+      } else if (instr.IsPrimitiveBox()) {
+        primitive_box_count++;
+      } else if (instr.IsInPlaceOp()) {
+        inplace_count++;
+      } else if (instr.IsLongInPlaceOp()) {
+        long_inplace_count++;
+      }
+    }
+  }
+
+  EXPECT_EQ(compact_check_count, 2);
+  EXPECT_EQ(compact_unbox_count, 2);
+  EXPECT_EQ(int_binary_count, 2);
+  EXPECT_EQ(primitive_box_count, 1);
+  EXPECT_EQ(inplace_count, 0);
+  EXPECT_EQ(long_inplace_count, 0);
+}
+
+TEST_F(HIRBuildTest, ExactLongInPlaceAddUsesCompactPrimitiveFastPath) {
+  const char* hir = R"(fun test {
+  bb 0 {
+    v0 = LoadArg<0>
+    v1 = LoadArg<1>
+    v2 = GuardType<LongExact> v0
+    v3 = GuardType<LongExact> v1
+    v4 = InPlaceOp<Add> v2 v3 {
+      FrameState {
+        CurInstrOffset -2
+      }
+    }
+    Return v4
+  }
+}
+)";
+  std::unique_ptr<Function> irfunc = HIRParser{}.ParseHIR(hir);
+  ASSERT_NE(irfunc, nullptr);
+
+  expectCompactLongInPlaceFastPath(*irfunc);
+}
+
+TEST_F(HIRBuildTest, ExactLongInPlaceSubtractUsesCompactPrimitiveFastPath) {
+  const char* hir = R"(fun test {
+  bb 0 {
+    v0 = LoadArg<0>
+    v1 = LoadArg<1>
+    v2 = GuardType<LongExact> v0
+    v3 = GuardType<LongExact> v1
+    v4 = InPlaceOp<Subtract> v2 v3 {
+      FrameState {
+        CurInstrOffset -2
+      }
+    }
+    Return v4
+  }
+}
+)";
+  std::unique_ptr<Function> irfunc = HIRParser{}.ParseHIR(hir);
+  ASSERT_NE(irfunc, nullptr);
+
+  expectCompactLongInPlaceFastPath(*irfunc);
+}
+
+TEST_F(HIRBuildTest, TryLoopReturningHandler311IsNotCompiled) {
+  const char* src = R"(
+class Done(Exception):
+    pass
+
+def test(limit):
+    try:
+        i = 0
+        while True:
+            i += 1
+            if i >= limit:
+                raise Done(i)
+    except Done as exc:
+        return exc.args[0]
+)";
+  Ref<PyFunctionObject> func(compileAndGet(src, "test"));
+  ASSERT_NE(func, nullptr);
+
+  EXPECT_THROW(buildHIR(func), std::runtime_error);
+}
+
+TEST_F(HIRBuildTest, RaiseOnlyFunction311IsNotCompiled) {
+  const char* src = R"(
+def test(value):
+    raise RuntimeError(value)
+)";
+  Ref<PyFunctionObject> func(compileAndGet(src, "test"));
+  ASSERT_NE(func, nullptr);
+
+  EXPECT_THROW(buildHIR(func), std::runtime_error);
 }
 #endif
 
@@ -3047,6 +3337,7 @@ TEST_F(HIRCloneTest, CanCloneDeoptBase) {
   EXPECT_TRUE(orig->live_regs() == dup->live_regs());
 }
 
+#if PY_VERSION_HEX >= 0x030C0000
 TEST_F(HIRBuildTest, MatchMapping) {
   uint8_t bc[] = {LOAD_FAST, 0, MATCH_MAPPING, 0, RETURN_VALUE, 0};
   std::unique_ptr<Function> irfunc = build_test(bc, {Py_None});
@@ -3214,6 +3505,7 @@ TEST_F(HIRBuildTest, MatchSequence) {
 #endif
   EXPECT_EQ(fullPrinter().ToString(*(irfunc)), expected);
 }
+#endif
 
 TEST_F(HIRBuildTest, MatchKeys) {
   uint8_t bc[] = {LOAD_FAST, 0, LOAD_FAST, 1, MATCH_KEYS, 0, RETURN_VALUE, 0};
@@ -3298,6 +3590,7 @@ TEST_F(HIRBuildTest, ListExtend) {
   EXPECT_EQ(fullPrinter().ToString(*(irfunc)), expected);
 }
 
+#if PY_VERSION_HEX >= 0x030C0000
 TEST_F(HIRBuildTest, ListToTuple) {
   uint8_t bc[] = {
       LOAD_FAST, 0, CALL_INTRINSIC_1, INTRINSIC_LIST_TO_TUPLE, RETURN_VALUE, 0};
@@ -3346,6 +3639,7 @@ TEST_F(HIRBuildTest, ListToTuple) {
 #endif
   EXPECT_EQ(fullPrinter().ToString(*(irfunc)), expected);
 }
+#endif
 
 TEST_F(HIRBuildTest, BinaryOpSubscrDictSpecializationGuards) {
   const char* src = R"(
@@ -3418,6 +3712,7 @@ for _ in range(100):
   EXPECT_NE(hir.find("StoreSubscr"), std::string::npos) << hir;
 }
 
+#if PY_VERSION_HEX >= 0x030C0000
 TEST_F(HIRBuildTest, LoadFastAndClear) {
   uint8_t bc[] = {
       LOAD_FAST_AND_CLEAR, 1, LOAD_FAST_CHECK, 0, POP_TOP, 0, RETURN_VALUE, 0};
@@ -3449,6 +3744,7 @@ TEST_F(HIRBuildTest, LoadFastAndClear) {
 
   EXPECT_EQ(fullPrinter().ToString(*(irfunc)), expected);
 }
+#endif
 
 TEST_F(HIRBuildTest, AtQuiescentStateInEvalBreakerCheck) {
   const char* src = R"(

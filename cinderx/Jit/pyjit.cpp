@@ -466,11 +466,16 @@ bool shouldSkipAutoJitScheduleForRoiBackoffFrozen(
   return roiBackoffCtlFrozen(Ci_code_extra_load_roi_ctl_relaxed(extra));
 }
 
-void setInterpreterJitFlag(bool enabled) {
+void setInterpreterJitFlag([[maybe_unused]] bool enabled) {
+#if PY_VERSION_HEX >= 0x030D0000
+  // PyInterpreterState.jit is the upstream tier-2 interpreter's own flag,
+  // added in 3.13; it does not exist earlier.  On 3.11 the JIT never
+  // initializes, so there is no flag to set.
   PyThreadState* tstate = _PyThreadState_UncheckedGet();
   if (tstate != nullptr && tstate->interp != nullptr) {
     tstate->interp->jit = enabled;
   }
+#endif
 }
 
 // If functions in the cinderx module get compiled, they will somehow keep the
@@ -487,6 +492,20 @@ bool isCinderModule(BorrowedRef<> module_name) {
   std::string_view name = PyUnicode_AsUTF8(module_name);
   return name == "cinderx";
 }
+
+#if PY_VERSION_HEX < 0x030C0000
+// On the CPython 3.11 delivery, import machinery functions are kept out of
+// the JIT wholesale: compiling them buys no steady-state time and taxes
+// startup.  3.14 keeps its own startup-cost mechanisms unchanged.
+bool isImportlibBootstrapModule(BorrowedRef<> module_name) {
+  if (module_name == nullptr || !PyUnicode_Check(module_name)) {
+    return false;
+  }
+  std::string_view name = PyUnicode_AsUTF8(module_name);
+  return name == "_frozen_importlib" || name == "_frozen_importlib_external" ||
+      name == "importlib._bootstrap" || name == "importlib._bootstrap_external";
+}
+#endif
 
 bool shouldAlwaysScheduleCompile(BorrowedRef<PyCodeObject> code) {
   // There's a config option for forcing all Static Python functions to be
@@ -1713,11 +1732,21 @@ JitEligibility getCompilationEligibility(BorrowedRef<PyFunctionObject> func) {
   if (jitCtx() == nullptr || isCinderModule(func->func_module)) {
     return JitEligibility::Ineligible;
   }
+#if PY_VERSION_HEX < 0x030C0000
+  if (isImportlibBootstrapModule(func->func_module)) {
+    return JitEligibility::Ineligible;
+  }
+#endif
 
   BorrowedRef<PyCodeObject> code{func->func_code};
   if (!hasRequiredFlags(code)) {
     return JitEligibility::Ineligible;
   }
+#if PY_VERSION_HEX < 0x030C0000
+  if (code->co_flags & kCoFlagsAnyGenerator) {
+    return JitEligibility::Ineligible;
+  }
+#endif
 
   // Note: This is not the same as fetching the function's code object and
   // checking its module and qualname, as functions can be renamed after they
@@ -1746,10 +1775,20 @@ JitEligibility getCompilationEligibility(
   if (isCinderModule(module_name)) {
     return JitEligibility::Ineligible;
   }
+#if PY_VERSION_HEX < 0x030C0000
+  if (isImportlibBootstrapModule(module_name)) {
+    return JitEligibility::Ineligible;
+  }
+#endif
 
   if (!hasRequiredFlags(code)) {
     return JitEligibility::Ineligible;
   }
+#if PY_VERSION_HEX < 0x030C0000
+  if (code->co_flags & kCoFlagsAnyGenerator) {
+    return JitEligibility::Ineligible;
+  }
+#endif
 
   if (auto jit_list = cinderx::getModuleState()->jit_list.get()) {
     if (jit_list->lookupCode(code) == 1 ||
@@ -2005,6 +2044,9 @@ PyObject* enable_jit(PyObject* /* self */, PyObject* /* arg */) {
 // Check if there are any active callback registered through
 // sys.monitoring.register_callback()
 bool hasRegisteredMonitoringCallbacks() {
+#if PY_VERSION_HEX < 0x030C0000
+  return false;
+#else
   auto is = PyInterpreterState_Get();
   for (int tool_id = 0; tool_id < PY_MONITORING_TOOL_IDS; ++tool_id) {
     // Skip the internal Python tool IDs used by sys.setprofile and
@@ -2029,12 +2071,18 @@ bool hasRegisteredMonitoringCallbacks() {
     }
   }
   return false;
+#endif
 }
 
 // Check if sys.setprofile or sys.settrace have active callbacks registered.
 bool hasActiveLegacyTracing() {
+#if PY_VERSION_HEX < 0x030C0000
+  PyThreadState* tstate = PyThreadState_Get();
+  return tstate->c_profilefunc != nullptr || tstate->c_tracefunc != nullptr;
+#else
   auto is = PyInterpreterState_Get();
   return is->sys_profiling_threads > 0 || is->sys_tracing_threads > 0;
+#endif
 }
 
 bool isInstrumentationActive() {
@@ -4267,6 +4315,17 @@ int initialize() {
   if (isJitInitialized()) {
     return 0;
   }
+
+#if PY_VERSION_HEX < 0x030C0000
+  // Capability gate for the CPython 3.11 delivery: the JIT source set is
+  // compiled and linked, but machine-code execution has not shipped.  Leaving
+  // the JIT uninitialized keeps every entry point fail-closed before any
+  // bytecode is read -- isJitUsable() stays false, so scheduleJitCompile(),
+  // force_compile() and compileFunction() all refuse, and the cinderjit
+  // module is never created.  Observe-mode scheduling requests terminate in
+  // Ci_JitShell311_RequestCompile with the typed refusal.
+  return 0;
+#endif
 
   // Save fields that might have been set by test code before jit::initialize()
   // is called.

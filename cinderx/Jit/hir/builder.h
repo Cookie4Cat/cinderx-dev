@@ -184,12 +184,39 @@ class HIRBuilder {
       Register* receiver,
       uint32_t type_version,
       const char* descr);
+  bool tryEmitLoadAttrInstanceValue311(
+      TranslationContext& tc,
+      const jit::BytecodeInstruction& bc_instr,
+      Register* receiver,
+      int name_idx);
   void emitLoadMethod(TranslationContext& tc, int name_idx);
+  void emitLoadMethod(
+      TranslationContext& tc,
+      const jit::BytecodeInstruction& bc_instr);
+  bool tryEmitLoadMethodWithValues311(
+      TranslationContext& tc,
+      const jit::BytecodeInstruction& bc_instr);
   void emitLoadMethodOrAttrSuper(
       CFG& cfg,
       TranslationContext& tc,
       const jit::BytecodeInstruction& bc_instr,
       bool load_method);
+  void emitLoadMethodOrAttrSuper(
+      CFG& cfg,
+      TranslationContext& tc,
+      int name_idx,
+      Register* global_super,
+      Register* type,
+      Register* receiver,
+      bool load_method,
+      bool no_args_in_super_call,
+      BCOffset deopt_off,
+      const FrameState& deopt_state);
+  bool tryEmitLoadMethodOrAttrSuper311(
+      CFG& cfg,
+      TranslationContext& tc,
+      jit::BytecodeInstructionBlock::Iterator& bc_it,
+      const jit::BytecodeInstructionBlock& bc_block);
   void emitCopy(TranslationContext& tc, int item_idx);
   void emitCopyFreeVars(TranslationContext& tc, int nfreevars);
   void emitSwap(TranslationContext& tc, int item_idx);
@@ -491,6 +518,14 @@ class HIRBuilder {
 
   bool emitTypeAnnotationGuards(TranslationContext& tc);
 
+#if PY_VERSION_HEX < 0x030C0000
+  bool tryEmitLoadGlobalModuleValue311(
+      TranslationContext& tc,
+      const jit::BytecodeInstruction& bc_instr,
+      int name_idx,
+      Register* result);
+#endif
+
   void emitBuildInterpolation(
       TranslationContext& tc,
       const jit::BytecodeInstruction& bc_instr);
@@ -581,6 +616,7 @@ class HIRBuilder {
   const Preloader& preloader_;
 
   TempAllocator temps_{nullptr};
+  Environment* env_{nullptr};
 
   // Tracks the function for compilations that require it.
   Register* func_{nullptr};

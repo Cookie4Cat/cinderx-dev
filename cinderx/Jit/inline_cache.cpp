@@ -88,7 +88,7 @@ inline Ref<PyDictObject> get_dict(PyObject* obj, Py_ssize_t dictoffset) {
 
 inline bool is_dict_unmaterialized(PyDictObject* dict) {
   return
-#if PY_VERSION_HEX < 0x030E0000
+#if PY_VERSION_HEX >= 0x030C0000 && PY_VERSION_HEX < 0x030E0000
       // On 3.12 if we have values then it means we all of our dict indxes
       // are in the array. We won't have a combined mutator that has
       // this index
@@ -261,7 +261,7 @@ bool isValidKeysVersion(uint32_t keys_version, BorrowedRef<> obj) {
     }
     return dict->ma_keys->dk_version == keys_version;
   }
-#else
+#elif PY_VERSION_HEX >= 0x030C0000
   PyTypeObject* tp = Py_TYPE(obj);
   if (PyType_HasFeature(tp, Py_TPFLAGS_MANAGED_DICT)) {
     PyDictOrValues dorv = *_PyObject_DictOrValuesPointer(obj);
@@ -273,6 +273,21 @@ bool isValidKeysVersion(uint32_t keys_version, BorrowedRef<> obj) {
       return ht->ht_cached_keys->dk_version == keys_version;
     }
     PyDictObject* dict = (PyDictObject*)_PyDictOrValues_GetDict(dorv);
+    if (dict == nullptr) {
+      return true;
+    }
+    return dict->ma_keys->dk_version == keys_version;
+  }
+#else
+  PyTypeObject* tp = Py_TYPE(obj);
+  if (PyType_HasFeature(tp, Py_TPFLAGS_MANAGED_DICT)) {
+    PyDictValues* values = *_PyObject_ValuesPointer(obj);
+    if (values != nullptr) {
+      PyHeapTypeObject* ht = reinterpret_cast<PyHeapTypeObject*>(tp);
+      return ht->ht_cached_keys->dk_version == keys_version;
+    }
+    PyDictObject* dict =
+        reinterpret_cast<PyDictObject*>(*_PyObject_ManagedDictPointer(obj));
     if (dict == nullptr) {
       return true;
     }
@@ -449,7 +464,7 @@ int SplitMutator::setAttr(PyObject* obj, PyObject* name, PyObject* value) {
   return 0;
 }
 
-#else
+#elif PY_VERSION_HEX >= 0x030C0000
 
 int SplitMutator::setAttr(PyObject* obj, PyObject* name, PyObject* value) {
   PyDictOrValues dorv = *_PyObject_DictOrValuesPointer(obj);
@@ -551,6 +566,37 @@ PyObject* SplitMutator::getAttr(PyObject* obj, PyObject* name) {
   Py_INCREF(result);
   return result;
 }
+#else
+int SplitMutator::setAttr(PyObject* obj, PyObject* name, PyObject* value) {
+  PyDictValues* values = *_PyObject_ValuesPointer(obj);
+  if (values == nullptr) {
+    return PyObject_SetAttr(obj, name, value);
+  }
+
+  JIT_DCHECK(val_offset != -1, "Should have value offset");
+  PyObject* old_value = values->values[val_offset];
+  values->values[val_offset] = Py_NewRef(value);
+  if (old_value == nullptr) {
+    _PyDictValues_AddToInsertionOrder(values, val_offset);
+  } else {
+    Py_DECREF(old_value);
+  }
+  return 0;
+}
+
+PyObject* SplitMutator::getAttr(PyObject* obj, PyObject* name) {
+  PyDictValues* values = *_PyObject_ValuesPointer(obj);
+  if (values == nullptr) {
+    return PyObject_GetAttr(obj, name);
+  }
+
+  JIT_DCHECK(val_offset != -1, "Should have value offset");
+  PyObject* result = values->values[val_offset];
+  if (result == nullptr) {
+    return getAttrFallback(obj, name);
+  }
+  return Py_NewRef(result);
+}
 #endif // PY_VERSION_HEX < 0x030E0000
 
 int CombinedMutator::setAttr(PyObject* obj, PyObject* name, PyObject* value) {
@@ -598,6 +644,32 @@ PyObject* DictMutator::getAttr(PyObject* obj, PyObject* name) {
   if (dict == nullptr) {
     return getAttrFallback(obj, name);
   }
+  auto strong_ref = Ref<>::create(dict);
+  PyObject* result = PyDict_GetItem(dict, name);
+  if (result == nullptr) {
+    return getAttrFallback(obj, name);
+  }
+  return Py_NewRef(result);
+}
+#elif PY_VERSION_HEX < 0x030C0000
+// 3.11 has no DictOrValues tagging: the instance dict is a plain object read
+// through _PyObject_GetDictPtr.  This mutator is inline-cache runtime and is
+// never reached under the 3.11 capability gate; a real 3.11 fast path is
+// inline-cache work, out of scope here.
+int DictMutator::setAttr(PyObject* obj, PyObject* name, PyObject* value) {
+  auto dict = Ref<>::steal(PyObject_GenericGetDict(obj, nullptr));
+  if (dict == nullptr) {
+    return -1;
+  }
+  return PyDict_SetItem(dict, name, value);
+}
+
+PyObject* DictMutator::getAttr(PyObject* obj, PyObject* name) {
+  PyObject** dictptr = _PyObject_GetDictPtr(obj);
+  if (dictptr == nullptr || *dictptr == nullptr) {
+    return getAttrFallback(obj, name);
+  }
+  BorrowedRef<PyDictObject> dict = reinterpret_cast<PyDictObject*>(*dictptr);
   auto strong_ref = Ref<>::create(dict);
   PyObject* result = PyDict_GetItem(dict, name);
   if (result == nullptr) {
@@ -1322,6 +1394,21 @@ PyObject* GetAttrMutator::getAttr(PyObject* obj, PyObject* name) {
         PyDict_GetItem(reinterpret_cast<PyObject*>(dict.get()), name);
     if (res != nullptr) {
       return Py_NewRef(res);
+    }
+    return callGetAttr(getattr_method, obj, name);
+#elif PY_VERSION_HEX < 0x030C0000
+    // 3.11 has neither inline values nor DictOrValues tagging; read the plain
+    // instance dict directly.  This is inline-cache runtime, never reached
+    // under the 3.11 capability gate.
+    PyObject** dictptr = _PyObject_GetDictPtr(obj);
+    if (dictptr != nullptr && *dictptr != nullptr) {
+      BorrowedRef<PyDictObject> dict =
+          reinterpret_cast<PyDictObject*>(*dictptr);
+      PyObject* res =
+          PyDict_GetItem(reinterpret_cast<PyObject*>(dict.get()), name);
+      if (res != nullptr) {
+        return Py_NewRef(res);
+      }
     }
     return callGetAttr(getattr_method, obj, name);
 #else

@@ -1071,9 +1071,9 @@ int _cinderx_exec_impl(PyObject* m) {
   cinderx::setModuleState(m);
 
 #if PY_VERSION_HEX >= 0x030C0000
-  // The global cache serves JIT-compiled code only, and 3.11 does not build
-  // the JIT.  Its slot stays empty rather than holding an object nothing can
-  // reach.
+  // The global cache serves JIT-compiled code only, and the 3.11 delivery
+  // ships no machine-code execution.  Its slot stays empty rather than
+  // holding an object nothing can reach.
   auto cache_manager = new (std::nothrow) jit::GlobalCacheManager();
   if (cache_manager == nullptr) {
     return -1;
@@ -1110,8 +1110,8 @@ int _cinderx_exec_impl(PyObject* m) {
 
 #if PY_VERSION_HEX >= 0x030C0000
   // These types belong to JIT-compiled generators, coroutines and awaitables.
-  // 3.11 builds no JIT, so no instance of them can ever exist and the module
-  // does not create them.
+  // The 3.11 delivery ships no machine-code execution, so no instance of them
+  // can ever exist and the module does not create them.
   PyTypeObject* gen_type = (PyTypeObject*)PyType_FromSpec(&jit::JitGen_Spec);
   if (gen_type == nullptr) {
     return -1;

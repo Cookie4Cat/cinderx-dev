@@ -203,6 +203,13 @@ static inline int PyType_Unwatch(int, PyObject*) {
 #define PyUnstable_Long_IsCompact _PyLong_IsCompact
 #define PyUnstable_Long_CompactValue _PyLong_CompactValue
 
+// PyUnicode_EqualToUTF8 arrived in 3.13.  Shared code compares interned name
+// objects against ASCII C-string literals, so the 3.11 equivalent is the
+// exact-ASCII comparison, which allocates nothing and sets no exception.
+static inline int PyUnicode_EqualToUTF8(PyObject* unicode, const char* str) {
+  return _PyUnicode_EqualToASCIIString(unicode, str);
+}
+
 #define PyUnstable_Code_GetExtra _PyCode_GetExtra
 #define PyUnstable_Code_SetExtra _PyCode_SetExtra
 #define PyUnstable_Eval_RequestCodeExtraIndex _PyEval_RequestCodeExtraIndex

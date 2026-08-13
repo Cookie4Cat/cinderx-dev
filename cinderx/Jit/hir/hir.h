@@ -4179,7 +4179,8 @@ struct TypedArgument {
     "it is a vectorcalled static function with pimitive args")             \
   V(GlobalsNotDict, "globals is not a dict")                               \
   V(BuiltinsNotDict, "builtins is not a dict")                             \
-  V(HasEagerImportName, "has an eager import name instruction")
+  V(HasEagerImportName, "has an eager import name instruction")            \
+  V(HasStoreGlobal, "it stores a global")
 
 enum class InlineFailureType {
 #define DECLARE_FAILURE_TYPE(failure, msg) k##failure,
