@@ -38,7 +38,7 @@ command = "bash -lc '\"{run_dir}/venv/bin/python\" -m pytest -q ci_pipeline/test
 # that cannot see mutations can never wave a stale list through.
 [[jobs]]
 name = "bytecode_support_gate"
-command = "bash -lc '\"{run_dir}/venv/bin/python\" -m pytest -q ci_pipeline/test_check_bytecode_support_311.py && \"{run_dir}/venv/bin/python\" ci_pipeline/check_bytecode_support_311.py'"
+command = "bash -lc '\"{run_dir}/venv/bin/python\" -m pytest -q ci_pipeline/test_check_bytecode_support_311.py ci_pipeline/test_bytecode_support_311_registry.py && \"{run_dir}/venv/bin/python\" ci_pipeline/check_bytecode_support_311.py'"
 
 # The module exports its init function and nothing else: the vendored
 # interpreter's PyAPI definitions must never reach the dynamic symbol table.
@@ -63,12 +63,10 @@ command = "bash -lc 'cd cinderx/PythonLib && \"{run_dir}/venv/bin/python\" -m un
 # never count as a skip, and configuration must be asserted in the child.
 [[jobs]]
 name = "jit311_runner_selftests"
-command = "bash -lc 'PYTHONPATH=$(ls -d \"{run_dir}\"/venv/lib/python3.11/site-packages) \"{run_dir}/venv/bin/python\" -m pytest -q ci_pipeline/test_jit311_runners.py ci_pipeline/test_jit311_corpus.py'"
+command = "bash -lc 'PYTHONPATH=$(ls -d \"{run_dir}\"/venv/lib/python3.11/site-packages) \"{run_dir}/venv/bin/python\" -m pytest -q ci_pipeline/test_jit311_runners.py ci_pipeline/test_jit311_corpus.py ci_pipeline/test_jit311_shadow_surface.py'"
 
 # RuntimeTests on 3.11: the green baseline (LIR, register allocation,
-# dataflow and utility families) must stay green.  The remaining families
-# need JIT initialization and are the known-fail set owned by the front-end
-# MR; the daily census asserts the binary still runs to completion.
+# dataflow, utilities, shadow compile, and HIRBuildTest) must stay green.
 [[jobs]]
 name = "runtime_tests_311_green"
 command = "bash -lc 'ci_pipeline/scripts/run_rt311_green.sh \"{run_dir}/rt311-build\"'"
@@ -110,3 +108,13 @@ command = "bash -lc '\"{run_dir}/venv/bin/python\" -m ci_pipeline.jit311.runners
 [[jobs]]
 name = "observe_gate"
 command = "bash -lc 'cd cinderx/PythonLib && \"{run_dir}/venv/bin/python\" -m unittest test_cinderx.test_kunpeng.test_observe_311'"
+
+# MR-03 blocking proof: real cold, warm and threshold-driven requests traverse
+# the complete shadow compiler, while code allocation, installation and entry
+# counters remain zero. The same driver covers lifecycle churn, five shutdown
+# repetitions, the configuration matrix and the 72-module import canary.
+# Frozen-surface execution (440 modules + test_cinderx under shadow) lives
+# on the daily completeness job, not this fail-fast PR suite.
+[[jobs]]
+name = "shadow_compile_gate"
+command = "bash -lc 'PYTHONPATH=$(ls -d \"{run_dir}\"/venv/lib/python3.11/site-packages) \"{run_dir}/venv/bin/python\" -m ci_pipeline.jit311.runners'"

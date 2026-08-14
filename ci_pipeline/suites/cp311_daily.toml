@@ -44,11 +44,23 @@ command = "bash -lc 'PYTHONPATH=$(ls -d \"{run_dir}\"/venv/lib/python3.11/site-p
 name = "debug_build_311"
 command = "bash -lc 'ci_pipeline/scripts/run_debug_build_311.sh \"{run_dir}/debug-build\"'"
 
-# Completion-oriented pyperformance leg: benchmarks must finish with zero
-# worker crashes.  The benchmark set is the committed data manifest
-# (jit311/data/pyperf_benchmarks.txt) -- growing the set is a data edit.
-# The job provisions the pinned pyperformance itself; a runner without
-# network for the pin fails loud rather than shrinking coverage silently.
+# Completion-oriented pyperformance leg: the provisioned package's own
+# applicable set (`pyperformance list`), one name at a time so a dead
+# worker keeps its identity. Worker crashes, unknown rejects and
+# supported-opcode failures are red. pyperformance==1.13.0 is the MR-03
+# pin (docs/cp311-anchor.md). The 33-name pyperf_benchmarks.txt tranche
+# remains the local `--pyperf` shortcut; daily must not shrink to it.
+# A runner that cannot provision the pin fails loud.
 [[jobs]]
 name = "jit311_pyperf_completeness"
-command = "bash -lc '\"{run_dir}/venv/bin/pip\" install --disable-pip-version-check -q pyperformance==1.11.0 && PYTHONPATH=$(ls -d \"{run_dir}\"/venv/lib/python3.11/site-packages) python3.11 -m ci_pipeline.jit311.runners --pyperf'"
+command = "bash -lc '\"{run_dir}/venv/bin/pip\" install --disable-pip-version-check -q pyperformance==1.13.0 && PYTHONPATH=$(ls -d \"{run_dir}\"/venv/lib/python3.11/site-packages) python3.11 -m ci_pipeline.jit311.runners --pyperformance-all'"
+
+# MR-03 completeness bar: actually execute the frozen 440-module regrtest
+# surface and the full test_cinderx tree under shadow (interpreter runs the
+# tests; the compiler discards the artifact). The 72-module import driver
+# on the PR gate is only the MR-05 canary. Per-module and per-case
+# completeness is written to completeness.json; worker crashes, unknown
+# rejects and any machine-code side effect are red.
+[[jobs]]
+name = "jit311_shadow_surface"
+command = "bash -lc 'PYTHONPATH=$(ls -d \"{run_dir}\"/venv/lib/python3.11/site-packages) python3.11 -m ci_pipeline.jit311.runners --shadow-surface --out \"{run_dir}/shadow-surface\"'"

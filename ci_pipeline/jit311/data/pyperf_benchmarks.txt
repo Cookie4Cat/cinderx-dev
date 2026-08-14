@@ -1,7 +1,8 @@
-# pyperformance completion set for the 3.11 gates -- first tranche of the
-# plan's applicable suite: pure-Python benchmarks with no external service
-# dependencies.  Growing toward the full applicable set is a data edit
-# here, not a code change.
+# Local `--pyperf` shortcut: first tranche of the plan's applicable suite,
+# pure-Python benchmarks with no external service dependencies. Daily
+# completeness uses `--pyperformance-all` (the provisioned pyperformance's
+# own list) instead of this file. Names here are still validated against
+# that list.
 #
 # Format, one line per pyperformance TASK:
 #
