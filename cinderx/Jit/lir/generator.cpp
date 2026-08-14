@@ -52,6 +52,7 @@ extern "C" {
 #include <fmt/format.h>
 #include <fmt/ostream.h>
 
+#include <algorithm>
 #include <cstring>
 #include <functional>
 #include <iterator>
@@ -252,13 +253,14 @@ LIRGenerator::LIRGenerator(
       is_gen_(
           func->code != nullptr &&
           (func->code->co_flags & kCoFlagsAnyGenerator)) {
+  JIT_CHECK(env_->ctx != nullptr, "LIR generation requires a cache context");
   for (int i = 0, n = func->env.numLoadTypeAttrCaches(); i < n; i++) {
     load_type_attr_caches_.emplace_back(
-        getContext()->allocateLoadTypeAttrCache());
+        env_->ctx->allocateLoadTypeAttrCache());
   }
   for (int i = 0, n = func->env.numLoadTypeMethodCaches(); i < n; i++) {
     load_type_method_caches_.emplace_back(
-        getContext()->allocateLoadTypeMethodCache());
+        env_->ctx->allocateLoadTypeMethodCache());
   }
 }
 
@@ -1154,41 +1156,59 @@ void GenerateBoxedReturnWrapperBlocks(
   box_block->allocateInstr(Instruction::kBranch, nullptr, AsmLbl{wrapper_exit});
 }
 
-void LIRGenerator::GenerateExitBlocks() {
+void LIRGenerator::GenerateExitBlocks(bool has_normal_return) {
   if (!is_gen_) {
     auto* block = lir_func_->allocateBasicBlock();
     exit_block_ = block;
-
-    // func_->code may be null in unit tests that parse HIR directly.
-    if (func_->code == nullptr) {
-      exit_phi_ = block->allocateInstr(
-          Instruction::kPhi, nullptr, OutVReg{DataType::kObject});
-      block->allocateInstr(Instruction::kEpilogueEnd, nullptr, VReg{exit_phi_});
-      return;
-    }
 
     BasicBlockBuilder bbb{env_, lir_func_};
     bbb.switchBlock(block);
 
     auto ret_data_type = hirTypeToDataType(func_->return_type);
-    exit_phi_ = bbb.appendInstr(OutVReg{ret_data_type}, Instruction::kPhi);
-
-    // Unlink frame before epilogue. Non-generators always unlink.
-    bool has_freevars = func_->code != nullptr && func_->code->co_nfreevars > 0;
-    if (func_->frameMode == FrameMode::kNormal) {
-      bbb.appendInvokeInstruction(JITRT_UnlinkFrame, env_->asm_tstate);
+    if (has_normal_return) {
+      exit_phi_ = bbb.appendInstr(OutVReg{ret_data_type}, Instruction::kPhi);
+    } else if (ret_data_type == DataType::kDouble) {
+      Instruction* zero_bits = bbb.appendInstr(
+          OutVReg{DataType::k64bit}, Instruction::kMove, Imm{0});
+      exit_phi_ = bbb.appendInstr(
+          OutVReg{DataType::kDouble}, Instruction::kMove, VReg{zero_bits});
     } else {
-      PyObject* executable;
-      std::optional<destructor> exec_dtor;
+      // The epilogue is unreachable from the function body, but deopt exits
+      // still reference its hard-exit label. Give it a defined placeholder
+      // value instead of manufacturing a zero-input Phi.
+      exit_phi_ = bbb.appendInstr(
+          OutVReg{ret_data_type}, Instruction::kMove, Imm{0, ret_data_type});
+    }
+
+    // func_->code may be null in unit tests that parse HIR directly.
+    if (func_->code == nullptr) {
+      bbb.appendInstr(Instruction::kEpilogueEnd, VReg{exit_phi_});
+      return;
+    }
+
+    // Unlink frame before epilogue.  Skip it when the body has no normal
+    // return: this block is disconnected, deopt jumps to hard_exit_label
+    // (EpilogueEnd) and never executes UnlinkFrame, and body SSA values
+    // such as LoadFrame's func vreg are not live here.  Using them leaves
+    // a kNone operand after register allocation (Move: Reg + None).
+    if (has_normal_return) {
+      bool has_freevars =
+          func_->code != nullptr && func_->code->co_nfreevars > 0;
+      if (func_->frameMode == FrameMode::kNormal) {
+        bbb.appendInvokeInstruction(JITRT_UnlinkFrame, env_->asm_tstate);
+      } else {
+        PyObject* executable;
+        std::optional<destructor> exec_dtor;
 #if PY_VERSION_HEX >= 0x030F0000 && defined(ENABLE_LIGHTWEIGHT_FRAMES)
-      executable = env_->code_rt->reifier().get();
-      exec_dtor = PyUnstable_JITExecutable_Type.tp_dealloc;
+        executable = env_->code_rt->reifier().get();
+        exec_dtor = PyUnstable_JITExecutable_Type.tp_dealloc;
 #else
-      executable = reinterpret_cast<PyObject*>(func_->code.get());
-      exec_dtor = PyCode_Type.tp_dealloc;
+        executable = reinterpret_cast<PyObject*>(func_->code.get());
+        exec_dtor = PyCode_Type.tp_dealloc;
 #endif
-      emitUnlinkFrame(
-          bbb, has_freevars, is_gen_, env_->asm_func, executable, exec_dtor);
+        emitUnlinkFrame(
+            bbb, has_freevars, is_gen_, env_->asm_func, executable, exec_dtor);
+      }
     }
 
     // EpilogueEnd goes on the builder's current block which may differ
@@ -1374,7 +1394,16 @@ std::unique_ptr<jit::lir::Function> LIRGenerator::TranslateFunction() {
     }
   }
 
-  GenerateExitBlocks();
+  bool has_normal_return = std::any_of(
+      translated.begin(), translated.end(), [](const hir::BasicBlock* block) {
+        const auto* terminator = block->GetTerminator();
+        if (terminator->opcode() != Opcode::kReturn) {
+          return false;
+        }
+        const auto* ret = static_cast<const Return*>(terminator);
+        return !(ret->GetOperand(0)->type() <= TBottom);
+      });
+  GenerateExitBlocks(has_normal_return);
 
   // Track the exit block explicitly so the block sorter doesn't have to
   // rely on it being basic_blocks_.back().
@@ -1406,10 +1435,16 @@ std::unique_ptr<jit::lir::Function> LIRGenerator::TranslateFunction() {
         break;
       }
       case Opcode::kReturn: {
-        last_bb->addSuccessor(exit_block_);
         auto* ret = static_cast<const Return*>(hir_term);
-        return_edges_.push_back(
-            {last_bb, phi_bbb.getDefInstr(ret->GetOperand(0))});
+        Instruction* return_value = phi_bbb.getDefInstr(ret->GetOperand(0));
+        if (return_value == nullptr) {
+          JIT_CHECK(
+              ret->GetOperand(0)->type() <= TBottom,
+              "missing LIR definition for non-Bottom return value");
+          break;
+        }
+        last_bb->addSuccessor(exit_block_);
+        return_edges_.push_back({last_bb, return_value});
         break;
       }
       default:
@@ -2397,8 +2432,9 @@ LIRGenerator::TranslatedBlock LIRGenerator::TranslateOneBasicBlock(
         auto false_addr = reinterpret_cast<uint64_t>(Py_False);
         Instruction* temp_true = bbb.appendInstr(
             Instruction::kMove, OutVReg{OperandBase::k64bit}, Imm{true_addr});
-        bbb.appendInstr(
-            dest, Instruction::kSelect, src, temp_true, Imm{false_addr});
+        Instruction* temp_false = bbb.appendInstr(
+            Instruction::kMove, OutVReg{OperandBase::k64bit}, Imm{false_addr});
+        bbb.appendInstr(dest, Instruction::kSelect, src, temp_true, temp_false);
         break;
       }
       case Opcode::kPrimitiveBox: {
@@ -2558,6 +2594,7 @@ LIRGenerator::TranslatedBlock LIRGenerator::TranslateOneBasicBlock(
 
         // Set to -1 in the error case.
         bbb.appendInstr(Instruction::kDec, instr->output());
+        bbb.appendBranch(Instruction::kBranch, done);
         bbb.switchBlock(done);
         break;
       }
@@ -2799,7 +2836,7 @@ LIRGenerator::TranslatedBlock LIRGenerator::TranslateOneBasicBlock(
         hir::Register* dst = instr->output();
         hir::Register* base = instr->GetOperand(0);
         Instruction* name = getNameFromIdx(bbb, instr);
-        auto cache = getContext()->allocateLoadAttrCache();
+        auto cache = env_->ctx->allocateLoadAttrCache();
 #if defined(CINDER_AARCH64) && PY_VERSION_HEX >= 0x030E0000 && \
     !defined(Py_GIL_DISABLED)
         bbb.appendInstr(
@@ -2925,7 +2962,7 @@ LIRGenerator::TranslatedBlock LIRGenerator::TranslateOneBasicBlock(
         hir::Register* dst = instr->output();
         hir::Register* base = instr->receiver();
         Instruction* name = getNameFromIdx(bbb, instr);
-        auto cache = getContext()->allocateLoadMethodCache();
+        auto cache = env_->ctx->allocateLoadMethodCache();
         if (getConfig().collect_attr_cache_stats) {
           BorrowedRef<PyCodeObject> code = instr->frameState()->code;
           cache->initCacheStats(
@@ -2942,7 +2979,7 @@ LIRGenerator::TranslatedBlock LIRGenerator::TranslateOneBasicBlock(
             "Inline caches must be enabled to use LoadModuleAttrCached");
         auto instr = static_cast<const LoadModuleAttrCached*>(&i);
         Instruction* name = getNameFromIdx(bbb, instr);
-        auto cache = getContext()->allocateLoadModuleAttrCache();
+        auto cache = env_->ctx->allocateLoadModuleAttrCache();
         bbb.appendCallInstruction(
             instr->output(),
             LoadModuleAttrCache::lookupHelper,
@@ -2957,7 +2994,7 @@ LIRGenerator::TranslatedBlock LIRGenerator::TranslateOneBasicBlock(
             "Inline caches must be enabled to use LoadModuleMethodCached");
         auto instr = static_cast<const LoadModuleMethodCached*>(&i);
         Instruction* name = getNameFromIdx(bbb, instr);
-        auto cache_entry = getContext()->allocateLoadModuleMethodCache();
+        auto cache_entry = env_->ctx->allocateLoadModuleMethodCache();
         appendCall2RetValues(
             bbb,
             instr->output(),
@@ -3720,7 +3757,7 @@ LIRGenerator::TranslatedBlock LIRGenerator::TranslateOneBasicBlock(
         hir::Register* base = instr->GetOperand(0);
         Instruction* name = getNameFromIdx(bbb, instr);
         hir::Register* value = instr->GetOperand(1);
-        auto cache = getContext()->allocateStoreAttrCache();
+        auto cache = env_->ctx->allocateStoreAttrCache();
         Instruction* result = bbb.appendCallInstruction(
             OutVReg{OperandBase::k32bit},
             jit::StoreAttrCache::invoke,

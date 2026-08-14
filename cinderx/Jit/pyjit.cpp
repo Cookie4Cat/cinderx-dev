@@ -55,6 +55,7 @@
 #include <cstddef>
 #include <cstdio>
 #include <cstdlib>
+#include <cstring>
 #include <fstream>
 #include <iostream>
 #include <iterator>
@@ -2004,6 +2005,15 @@ PyObject* disable_jit(PyObject* /* self */, PyObject* args, PyObject* kwargs) {
 
 bool enable_jit_impl() {
   FreeThreadedJITEntrypointGuard guard;
+  // Shadow compilation is a terminal, non-executing state on CPython 3.11.
+  // It is intentionally not a paused executing JIT and must never be promoted
+  // to kRunning through an internal re-enable path.
+  if (isJitShadow()) {
+    PyErr_SetString(
+        PyExc_RuntimeError,
+        "Trying to enable machine-code execution from shadow JIT mode");
+    return false;
+  }
   if (jitCtx() == nullptr) {
     PyErr_SetString(
         PyExc_RuntimeError,
@@ -4316,21 +4326,23 @@ int initialize() {
     return 0;
   }
 
-#if PY_VERSION_HEX < 0x030C0000
-  // Capability gate for the CPython 3.11 delivery: the JIT source set is
-  // compiled and linked, but machine-code execution has not shipped.  Leaving
-  // the JIT uninitialized keeps every entry point fail-closed before any
-  // bytecode is read -- isJitUsable() stays false, so scheduleJitCompile(),
-  // force_compile() and compileFunction() all refuse, and the cinderjit
-  // module is never created.  Observe-mode scheduling requests terminate in
-  // Ci_JitShell311_RequestCompile with the typed refusal.
-  return 0;
-#endif
-
   // Save fields that might have been set by test code before jit::initialize()
   // is called.
   auto force_init = getConfig().force_init;
   auto use_stable_pointers = getConfig().use_stable_pointers;
+
+#if PY_VERSION_HEX < 0x030C0000
+  // CPython 3.11 only initializes the compiler for explicit shadow mode (or
+  // RuntimeTests' force-init hook). Observe and off stay capability-gated
+  // before a compiler context or code allocator is created.
+  const char* runtime_mode = std::getenv("CINDERX_JIT_MODE");
+  bool shadow_requested =
+      runtime_mode != nullptr && std::strcmp(runtime_mode, "shadow") == 0;
+  if (!shadow_requested && force_init != std::make_optional(true)) {
+    return 0;
+  }
+#endif
+
   getMutableConfig() = Config{};
   if (force_init.has_value()) {
     getMutableConfig().force_init = force_init;
@@ -4368,6 +4380,24 @@ int initialize() {
         "must share a contiguous allocation to stay within branch range). "
         "The flag will be ignored.");
   }
+#endif
+
+#if PY_VERSION_HEX < 0x030C0000
+  // Shadow owns the same front-end/compiler context as the executing JIT so
+  // HIR, optimization, LIR, register allocation and target relocation all run
+  // normally. It deliberately omits CompiledFunction/cinderjit initialization,
+  // interpreter entry installation, generator types, audit hooks and OSR.
+  cinderx::ModuleState* shadow_mod_state = cinderx::getModuleState();
+  // Construct all throwing state locally and publish it only after every
+  // constructor succeeds. A failed import must not leave a half-initialized
+  // allocator or context behind while Config still says kNotInitialized.
+  std::unique_ptr<ICodeAllocator> code_allocator{CodeAllocator::make()};
+  auto jit_context = std::make_unique<CompilerContext<Compiler>>();
+  jit::codegen::initThreadStateOffset();
+  shadow_mod_state->code_allocator = std::move(code_allocator);
+  shadow_mod_state->jit_context = std::move(jit_context);
+  getMutableConfig().state = State::kShadow;
+  return 0;
 #endif
 
   std::unique_ptr<JITList> jit_list;
@@ -4453,6 +4483,32 @@ int initialize() {
 void finalize() {
   FreeThreadedJITEntrypointGuard guard;
   if (!isJitInitialized()) {
+    return;
+  }
+
+  if (isJitShadow()) {
+    getMutableConfig().state = State::kFinalizing;
+
+    auto mod_state = cinderx::getModuleState();
+    auto* context = static_cast<Context*>(mod_state->jit_context.get());
+    if (context != nullptr) {
+      context->clearDeoptStats();
+      context->releaseReferences();
+      context->codeOuterFunctions().clear();
+    }
+    mod_state->registered_compilation_units.clear();
+    JIT_CHECK(
+        hir::preloaderManager().empty(),
+        "Shadow JIT cannot be finalized while compilation is active size:{} "
+        "is_global:{}",
+        hir::preloaderManager().size(),
+        hir::preloaderManager().isGlobalManager());
+    if (mod_state->cache_manager != nullptr) {
+      mod_state->cache_manager->clear();
+    }
+    mod_state->jit_context.reset();
+    mod_state->code_allocator.reset();
+    getMutableConfig().state = State::kNotInitialized;
     return;
   }
 
@@ -4610,6 +4666,13 @@ bool tryAttachCachedCompiledEntry(BorrowedRef<PyFunctionObject> func) {
 
 bool scheduleJitCompile(BorrowedRef<PyFunctionObject> func) {
   FreeThreadedJITEntrypointGuard guard;
+
+  // CPython 3.11 shadow requests are dispatched synchronously by the observe
+  // gate. Never attach entries, retain scheduling metadata, or route them into
+  // the executing JIT scheduler.
+  if (isJitShadow()) {
+    return false;
+  }
 
   if (shouldSkipAutoJitScheduleForRoiBackoffFrozen(func)) {
     return true;
@@ -4875,6 +4938,13 @@ Result compilePreloaderImpl(
     jit::CompilerContext<Compiler>* jit_ctx,
     const hir::Preloader& preloader,
     BorrowedRef<PyFunctionObject> func) {
+#if PY_VERSION_HEX < 0x030C0000
+  // CPython 3.11 only supports the explicit CompileShadow() path.  Refuse
+  // internal execution-mode callers before they can allocate or install a
+  // CompiledFunction.
+  return Result::CANNOT_SPECIALIZE;
+#endif
+
   // We are compiling the code stored in the preloader. Includes an optional
   // function if we have the function for which we're currently compiling. We
   // could just be compiling a code object for a nested function in which case

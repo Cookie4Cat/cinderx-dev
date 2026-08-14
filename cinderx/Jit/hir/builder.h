@@ -83,6 +83,14 @@ class BlockCanonicalizer {
 // analysis.
 std::unique_ptr<Function> buildHIR(const Preloader& preloader);
 
+// Return the stable refusal reason for a CPython 3.11 code-object shape, or
+// nullptr when the shape may proceed to bytecode/HIR translation.
+const char* unsupportedShapeReason311(BorrowedRef<PyCodeObject> code);
+
+// Return the stable refusal reason for the first unsupported CPython 3.11
+// opcode/front-end policy in code, or nullptr when checkTranslate() may run.
+const char* unsupportedOpcodeReason311(BorrowedRef<PyCodeObject> code);
+
 // Inlining merges all of the different callee Returns (which terminate blocks,
 // leading to a bunch of distinct exit blocks) into Branches to one Return
 // block (one exit block), which the caller can transform into an Assign to the

@@ -1326,7 +1326,7 @@ DEFINE_SIMPLE_INSTR(
     Operands<1>,
     DeoptBase);
 
-class INSTR_CLASS(LoadField, (TOptObject), HasOutput, Operands<1>) {
+class INSTR_CLASS(LoadField, (TOptObject | TCPtr), HasOutput, Operands<1>) {
  public:
   LoadField(
       Register* dst,

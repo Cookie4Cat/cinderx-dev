@@ -10,20 +10,19 @@
 
 namespace jit {
 
-// Lifetime diagram of the JIT compiler:
+// Lifetime transitions of the JIT compiler:
 //
-//   NotInitialized <---------+
-//        |                   |
-//        v                   |
-//     Running <---> Paused   |
-//        |            |      |
-//        v            |      |
-//    Finalizing <-----+      |
-//        |                   |
-//        |                   |
-//        +-------------------+
+//   Non-executing: NotInitialized -> Shadow -> Finalizing -> NotInitialized
+//   Executing:     NotInitialized -> Running <-> Paused
+//                                      |           |
+//                                      +-> Finalizing -> NotInitialized
+//
+// Shadow never transitions to Running or Paused.
 enum class State : uint8_t {
   kNotInitialized,
+  // The compiler pipeline is available, but generated code is never
+  // published or entered.
+  kShadow,
   kRunning,
   kPaused,
   kFinalizing,
@@ -290,12 +289,15 @@ inline Config& getMutableConfig() {
   return s_jit_config;
 }
 
-// Check that the JIT is initialized.  Though it might be paused and or
-// finalizing, it's not necessarily usable.
+// Check that the JIT has initialized state. It may be shadow-compiling, paused,
+// or finalizing, so this does not imply that machine-code execution is usable.
 bool isJitInitialized();
 
 // Check that the JIT is initialized and is currently usable.
 bool isJitUsable();
+
+// Check that only the non-executing shadow compiler is initialized.
+bool isJitShadow();
 
 // Check that the JIT is initialized but currently paused and unusable.
 bool isJitPaused();

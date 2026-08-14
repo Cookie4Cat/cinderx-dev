@@ -11,6 +11,7 @@
 #include "cinderx/Jit/hir/preload.h"
 
 #include <cstddef>
+#include <cstdint>
 #include <memory>
 #include <span>
 #include <string_view>
@@ -20,6 +21,12 @@ namespace jit {
 
 using PostPassFunction = std::function<
     void(hir::Function& func, std::string_view pass_name, std::size_t time_ns)>;
+
+struct ShadowCompileResult {
+  size_t code_size{0};
+  hir::OpcodeCounts hir_opcode_counts{};
+  uint64_t specialized_opcodes{0};
+};
 
 // Controls what compiler passes are run.
 enum PassConfig : uint64_t {
@@ -63,6 +70,13 @@ class Compiler {
   // Convenience wrapper to create and compile a preloader from a
   // PyFunctionObject.
   std::optional<CompiledFunctionData> Compile(
+      BorrowedRef<PyFunctionObject> func);
+
+  // Validate the entire compilation pipeline without allocating executable
+  // memory, creating a CompiledFunction, or installing an entry point.
+  std::optional<ShadowCompileResult> CompileShadow(
+      const hir::Preloader& preloader);
+  std::optional<ShadowCompileResult> CompileShadow(
       BorrowedRef<PyFunctionObject> func);
 
   // Runs all the compiler passes on the HIR function.

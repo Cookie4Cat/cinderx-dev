@@ -3,6 +3,7 @@
 #include "cinderx/Jit/compiler.h"
 
 #include "cinderx/Common/log.h"
+#include "cinderx/Jit/bytecode.h"
 #include "cinderx/Jit/codegen/arch/detection.h"
 #include "cinderx/Jit/config.h"
 #include "cinderx/Jit/frame.h"
@@ -31,6 +32,7 @@
 
 #include <chrono>
 #include <iostream>
+#include <sstream>
 
 namespace jit {
 
@@ -167,6 +169,27 @@ std::optional<CompiledFunctionData> Compiler::Compile(
   return preloader ? Compile(*preloader) : std::nullopt;
 }
 
+std::optional<ShadowCompileResult> Compiler::CompileShadow(
+    BorrowedRef<PyFunctionObject> func) {
+  ShadowCompileScope shadow_scope;
+  JIT_CHECK(PyFunction_Check(func), "Expected PyFunctionObject");
+  JIT_CHECK(
+      !getThreadedCompileContext().compileRunning(),
+      "multi-thread compile must preload first");
+  std::unique_ptr<hir::Preloader> preloader =
+      hir::Preloader::make(func, makeFrameReifier(func->func_code));
+  if (preloader == nullptr) {
+    const char* name = "<unknown>";
+    if (func->func_qualname != nullptr) {
+      if (const char* utf8 = PyUnicode_AsUTF8(func->func_qualname)) {
+        name = utf8;
+      }
+    }
+    JIT_THROW("shadow preload failed for {}", name);
+  }
+  return CompileShadow(*preloader);
+}
+
 PassConfig createConfig() {
   auto result = static_cast<uint64_t>(PassConfig::kMinimal);
 
@@ -197,6 +220,64 @@ PassConfig createConfig() {
   set(hir_opts.tree_iter_state_machine, PassConfig::kTreeIterStateMachine);
 
   return static_cast<PassConfig>(result);
+}
+
+std::optional<ShadowCompileResult> Compiler::CompileShadow(
+    const jit::hir::Preloader& preloader) {
+  ShadowCompileScope shadow_scope;
+  const std::string& fullname = preloader.fullname();
+  if (!PyDict_CheckExact(preloader.globals()) ||
+      !PyDict_CheckExact(preloader.builtins())) {
+    JIT_DLOG(
+        "Refusing shadow compilation for {}: globals and builtins must be "
+        "exact dicts",
+        fullname);
+    return std::nullopt;
+  }
+
+  std::unique_ptr<hir::Function> irfunc(hir::buildHIR(preloader));
+  irfunc->reifier = ThreadedRef<>::create(preloader.reifier());
+  Compiler::runPasses(*irfunc, createConfig());
+
+  // Unlike the per-pass debug checks, the shadow verifier is part of the
+  // release gate: malformed CFG, missing terminators/definitions, bad phi
+  // edges, and illegal typed operands must become a stable compile failure.
+  std::ostringstream verifier_errors;
+  if (!hir::checkFunc(*irfunc, verifier_errors) ||
+      !hir::funcTypeChecks(*irfunc, verifier_errors)) {
+    JIT_DLOG(
+        "Shadow HIR for {} failed verification:\n{}\n{}",
+        fullname,
+        verifier_errors.str(),
+        *irfunc);
+    JIT_THROW(
+        "Shadow HIR for {} failed verification: {}",
+        fullname,
+        verifier_errors.str());
+  }
+
+  ShadowCompileResult result;
+  result.hir_opcode_counts = hir::count_opcodes(*irfunc);
+  for (const auto& instr : BytecodeInstructionBlock{preloader.code()}) {
+    int physical_opcode = instr.specializedOpcode();
+    if (physical_opcode != unspecialize(physical_opcode)) {
+      result.specialized_opcodes++;
+    }
+  }
+
+  auto ngen = ngen_factory_(irfunc.get());
+  if (ngen == nullptr) {
+    JIT_THROW("shadow native generator missing for {}", fullname);
+  }
+  result.code_size = ngen->getShadowCodeSize();
+  if (result.code_size == 0) {
+    JIT_THROW("shadow codegen produced no bytes for {}", fullname);
+  }
+  JIT_DLOG(
+      "Finished shadow compilation for {}, code size: {} bytes",
+      fullname,
+      result.code_size);
+  return result;
 }
 
 std::optional<CompiledFunctionData> Compiler::Compile(

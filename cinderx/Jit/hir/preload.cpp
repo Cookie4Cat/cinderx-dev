@@ -9,6 +9,7 @@
 #include "cinderx/Common/util.h"
 #include "cinderx/Interpreter/cinder_opcode.h"
 #include "cinderx/Jit/bytecode.h"
+#include "cinderx/Jit/config.h"
 #include "cinderx/StaticPython/classloader.h"
 #include "cinderx/StaticPython/strictmoduleobject.h"
 #include "cinderx/StaticPython/vtable_builder.h"
@@ -573,6 +574,15 @@ bool Preloader::preload() {
   for (auto bc_instr : bc_instrs) {
     switch (bc_instr.opcode()) {
       case LOAD_GLOBAL: {
+#if PY_VERSION_HEX < 0x030C0000
+        // Shadow compilation validates generated code but never installs it.
+        // Do not register process-lifetime dict watchers for an artifact that
+        // is discarded at the end of this compile. The 3.11 builder lowers
+        // global loads from preloaded dictionary facts without this cache.
+        if (isJitShadow()) {
+          break;
+        }
+#endif
         if (!canCacheGlobals()) {
           break;
         }

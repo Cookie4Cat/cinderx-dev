@@ -1,13 +1,11 @@
 // Copyright (c) Meta Platforms, Inc. and affiliates.
 
-// Eval/Observe runtime mode for CPython 3.11.
+// Eval/Observe and shadow runtime modes for CPython 3.11.
 //
-// Observe validates the scheduling base without any machine code: the frame
-// entry counts executions per code object, one scheduling request fires when
-// a code object crosses the hot threshold, and the request walks into the
-// JIT shell's compile entry point, which refuses before reading any
-// bytecode.  The refusal is the designed terminal state of this release,
-// not an error.
+// The frame entry counts executions per code object and fires one scheduling
+// request when a code object crosses the hot threshold.  Observe terminates
+// at the capability gate; shadow passes the real function through the
+// discard-only compile pipeline.  Neither mode changes Python execution.
 //
 // Counters live in a private table, deliberately not in co_extra: code
 // deallocation runs every registered co_extra free function for every slot
@@ -28,6 +26,10 @@ int Ci_Observe311_Enabled;
 static int ci_observe_configured;
 static uint64_t ci_observe_threshold;
 static FILE* ci_observe_file;
+// Compilation is synchronous under the 3.11 GIL.  Keep all frames entered by
+// the compiler itself out of observation and protect the single JIT context
+// from recursive compilation.
+static int ci_observe_compiling;
 
 static uint64_t ci_observe_codes_seen;
 static uint64_t ci_observe_events_dropped;
@@ -48,7 +50,10 @@ static Ci_ObserveSlot* ci_observe_table;
 static size_t ci_observe_capacity; // power of two, 0 until first insert
 static size_t ci_observe_live;
 
-enum { CI_OBSERVE_MAX_EVENTS = 1024 };
+enum {
+  CI_OBSERVE_INITIAL_EVENTS = 1024,
+  CI_OBSERVE_MAX_EVENTS = 65536,
+};
 
 typedef struct {
   PyObject* qualname; // owned; NULL when the code object carries none
@@ -56,8 +61,9 @@ typedef struct {
   const char* result; // static string from the compile entry point
 } Ci_ObserveEvent;
 
-static Ci_ObserveEvent ci_observe_events[CI_OBSERVE_MAX_EVENTS];
+static Ci_ObserveEvent* ci_observe_events;
 static Py_ssize_t ci_observe_event_count;
+static size_t ci_observe_event_capacity;
 
 int Ci_Observe311_Configure(void) {
   if (ci_observe_configured) {
@@ -70,13 +76,12 @@ int Ci_Observe311_Configure(void) {
     Ci_Observe311_Enabled = 0;
     return 0;
   }
-  if (strcmp(mode, "observe") != 0) {
-    // Configuration parsing accepts no execution-capable mode on 3.11;
-    // refuse outright rather than degrade to something else.
+  if (strcmp(mode, "observe") != 0 && strcmp(mode, "shadow") != 0) {
+    // Configuration parsing accepts no execution-capable mode on 3.11.
     PyErr_Format(
         PyExc_RuntimeError,
         "CINDERX_JIT_MODE=%s is not accepted on CPython 3.11: this build "
-        "takes \"off\" or \"observe\"",
+        "takes \"off\", \"observe\" or \"shadow\"",
         mode);
     return -1;
   }
@@ -239,14 +244,41 @@ static Ci_ObserveSlot* observe_slot_for(PyCodeObject* code) {
   }
 }
 
+static int observe_events_grow(void) {
+  if (ci_observe_event_capacity >= CI_OBSERVE_MAX_EVENTS) {
+    return -1;
+  }
+  size_t capacity = ci_observe_event_capacity == 0
+      ? CI_OBSERVE_INITIAL_EVENTS
+      : ci_observe_event_capacity * 2;
+  if (capacity > CI_OBSERVE_MAX_EVENTS) {
+    capacity = CI_OBSERVE_MAX_EVENTS;
+  }
+  Ci_ObserveEvent* events = realloc(
+      ci_observe_events, capacity * sizeof(Ci_ObserveEvent));
+  if (events == NULL) {
+    return -1;
+  }
+  ci_observe_events = events;
+  ci_observe_event_capacity = capacity;
+  return 0;
+}
+
 // Record the event and walk it into the compile entry point.  Only the
 // function's identity, its count and the scheduling result are recorded --
 // never arguments, return values or any other program data.
-static void observe_emit(PyCodeObject* code, uint64_t count) {
-  const char* result = Ci_JitShell311_RequestCompile(code);
+static void observe_emit(
+    PyFunctionObject* func,
+    PyCodeObject* code,
+    uint64_t count) {
+  const char* result = Ci_JitShell311_RequestCompile(func);
+  // The observer only runs when no exception is active.  Compilation is
+  // diagnostic and may fail, but that failure must not leak into evaluation.
+  PyErr_Clear();
 
   PyObject* qualname = code->co_qualname;
-  if (ci_observe_event_count < CI_OBSERVE_MAX_EVENTS) {
+  if ((size_t)ci_observe_event_count < ci_observe_event_capacity ||
+      observe_events_grow() == 0) {
     Ci_ObserveEvent* event = &ci_observe_events[ci_observe_event_count++];
     Py_XINCREF(qualname);
     event->qualname = qualname;
@@ -274,8 +306,8 @@ static void observe_emit(PyCodeObject* code, uint64_t count) {
   }
 }
 
-void Ci_Observe311_OnFrame(PyCodeObject* code) {
-  if (!Ci_Observe311_Enabled || code == NULL) {
+void Ci_Observe311_OnFrame(PyFunctionObject* func) {
+  if (!Ci_Observe311_Enabled || func == NULL || ci_observe_compiling) {
     return;
   }
   // Observation stops where normal execution stops: nothing is counted
@@ -287,6 +319,7 @@ void Ci_Observe311_OnFrame(PyCodeObject* code) {
     return;
   }
 
+  PyCodeObject* code = (PyCodeObject*)func->func_code;
   Ci_ObserveSlot* slot = observe_slot_for(code);
   if (slot == NULL || slot->dispatched) {
     return;
@@ -297,7 +330,9 @@ void Ci_Observe311_OnFrame(PyCodeObject* code) {
     // Mark before dispatching, so nothing the compile entry point ever does
     // can re-enter into a second event for this code object.
     slot->dispatched = 1;
-    observe_emit(code, slot->count);
+    ci_observe_compiling = 1;
+    observe_emit(func, code, slot->count);
+    ci_observe_compiling = 0;
   }
 }
 
@@ -362,4 +397,35 @@ PyObject* Ci_Observe311_Stats(void) {
 error:
   Py_DECREF(events);
   return NULL;
+}
+
+void Ci_Observe311_Finalize(void) {
+  // Disable the hot path before dropping anything it can reach.
+  Ci_Observe311_Enabled = 0;
+  ci_observe_compiling = 0;
+
+  for (size_t i = 0; i < ci_observe_capacity; i++) {
+    slot_clear(&ci_observe_table[i]);
+  }
+  free(ci_observe_table);
+  ci_observe_table = NULL;
+  ci_observe_capacity = 0;
+  ci_observe_live = 0;
+
+  for (Py_ssize_t i = 0; i < ci_observe_event_count; i++) {
+    Py_CLEAR(ci_observe_events[i].qualname);
+  }
+  free(ci_observe_events);
+  ci_observe_events = NULL;
+  ci_observe_event_count = 0;
+  ci_observe_event_capacity = 0;
+
+  if (ci_observe_file != NULL) {
+    fclose(ci_observe_file);
+    ci_observe_file = NULL;
+  }
+  ci_observe_configured = 0;
+  ci_observe_threshold = 0;
+  ci_observe_codes_seen = 0;
+  ci_observe_events_dropped = 0;
 }
