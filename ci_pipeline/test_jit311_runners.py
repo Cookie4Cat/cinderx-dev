@@ -230,11 +230,12 @@ GATE_REQUIRED_JOBS = {
     "bytecode_support_gate", "dynsym_allowlist", "interpreter_and_eval_hook",
     "trigger_stats_gate", "jit311_runner_selftests",
     "runtime_tests_311_green", "libtest_jitoff_diff", "unified_report_gate",
-    "observe_gate",
+    "observe_gate", "shadow_compile_gate",
 }
 DAILY_REQUIRED_JOBS = {
     "asan_build_311", "debug_build_311", "runtime_tests_311_census",
     "jit311_drivers", "jit311_pyperf_completeness",
+    "jit311_shadow_surface",
 }
 
 
@@ -242,6 +243,48 @@ def _suite_jobs(path):
     import re as _re
 
     return set(_re.findall(r'name = "([a-z0-9_]+)"', Path(path).read_text()))
+
+
+def test_daily_pyperf_job_runs_the_full_applicable_set():
+    # Review P1: daily must not shrink to the 33-name --pyperf tranche.
+    # `--pyperf` is a prefix of `--pyperformance-all`; match argv tokens.
+    import re as _re
+
+    daily = (
+        Path(runners.REPO_ROOT) / "ci_pipeline" / "suites" / "cp311_daily.toml"
+    ).read_text()
+    assert "pyperformance==1.13.0" in daily
+    assert _re.search(r"runners --pyperformance-all(?:['\"\s]|$)", daily)
+    assert not _re.search(r"runners --pyperf(?:['\"\s]|$)", daily)
+
+
+def test_pyperformance_all_flag_is_not_swallowed_by_pyperf(monkeypatch):
+    # `--pyperf` is a prefix of `--pyperformance-all`. Dispatch must call
+    # discover_all, never the 33-name manifest loader.
+    seen = {}
+
+    def fake_discover():
+        seen["discover"] = True
+        return ["nbody"]
+
+    def fake_load():
+        seen["load"] = True
+        return ["nbody"]
+
+    def fake_runner(*, benchmarks=None):
+        seen["benchmarks"] = list(benchmarks or [])
+        return None
+
+    monkeypatch.setattr(runners, "discover_all_pyperf_benchmarks", fake_discover)
+    monkeypatch.setattr(runners, "load_pyperf_benchmarks", fake_load)
+    monkeypatch.setattr(
+        runners, "pyperformance_completeness_runner", fake_runner
+    )
+    rc = runners.main(["--pyperformance-all"])
+    assert rc == 2
+    assert seen.get("discover") is True
+    assert "load" not in seen
+    assert seen.get("benchmarks") == ["nbody"]
 
 
 def test_suites_carry_the_required_jobs():
@@ -253,12 +296,14 @@ def test_suites_carry_the_required_jobs():
     assert "rt314_differential" in _suite_jobs(root / "cp314_reference.toml")
 
 
-def test_shadow_mode_is_not_silently_accepted():
-    # Until shadow ships, requesting it is an explicit startup rejection
-    # (RuntimeError from the mode parser), never a silent fallback.
+def test_shadow_compile_succeeds_without_install():
+    # MR-03: shadow mode is accepted, compiles, and discards the artifact.
     result = runners.run(runners.shadow_compile_runner())
     assert result.ok, result.summary()
-    assert result.returncode == 1
+    assert result.returncode == 0
+    assert result.report is not None
+    assert result.report["compiled_function_creations"] == 0
+    assert result.report["machine_code_entries"] == 0
 
 
 def _load_run_gate():
@@ -421,6 +466,19 @@ def test_pyperf_completion_judge_turns_red():
     assert len(both) == 2
 
 
+def test_pyperformance_sitecustomize_loads_cinderx_from_host_site():
+    # Nested pyperformance venvs do not install _cinderx.  The completeness
+    # driver must pass the host-venv site-packages path through inherit so
+    # worker sitecustomize does not ModuleNotFoundError onto pyperf stdout.
+    assert "JIT311_CINDERX_SITE" in runners.PYPERFORMANCE_SITECUSTOMIZE
+    spec = runners.pyperformance_completeness_runner(benchmarks=["nbody"])
+    if spec is None:
+        return
+    assert "JIT311_CINDERX_SITE" in spec.payload
+    assert "_cinderx.__file__" in spec.payload
+    assert "k.startswith('PIP_')" in spec.payload
+
+
 def test_libtest_target_manifest_is_wellformed():
     sys.path.insert(0, str(Path(runners.REPO_ROOT) / "ci_pipeline"))
     import libtest_diff_311 as lt
@@ -508,6 +566,20 @@ def test_runtime_tests_manifests_are_consistent():
     failing_suites = {entry.split(".", 1)[0] for entry in known_fail}
     overlap = failing_suites & set(families)
     assert not overlap, overlap
+    allowed = _rt_data("rt311_allowed_skips.txt")
+    green_skips = [
+        entry for entry in allowed if entry.split(".", 1)[0] in set(families)
+    ]
+    assert not green_skips, green_skips
+    assert "HIRBuildTest" in families
+    writeoff = {
+        "LIRGeneratorTest.IsNegativeAndErrOccurredSetErrBranchesToDone",
+        "LIRGeneratorTest.RaiseOnlyFunctionHasVerifierSafeSyntheticExit",
+        "HIRBuildTest.TryLoopReturningHandler311BuildsHIR",
+        "HIRBuildTest.RaiseOnlyFunction311BuildsHIR",
+    }
+    assert writeoff <= set(registered)
+    assert not (writeoff & set(known_fail))
 
 
 def test_registered_test_disappearance_turns_red(tmp_path):
@@ -569,6 +641,30 @@ def test_baseline_growth_turns_red(tmp_path):
     )
     assert proc.returncode == 1
     assert "washed green" in proc.stdout
+
+
+def test_skip_allowlist_growth_turns_red(tmp_path):
+    import subprocess as _sp
+
+    script = (
+        Path(runners.REPO_ROOT)
+        / "ci_pipeline" / "scripts" / "run_rt311_green.sh"
+    )
+    old = tmp_path / "old.txt"
+    new = tmp_path / "new.txt"
+    old.write_text("Suite.SkipA\n")
+    new.write_text("Suite.SkipA\nSuite.SkipB\n")
+    proc = _sp.run(
+        ["bash", str(script), "--verify-skip-growth", str(old), str(new)],
+        capture_output=True, text=True, timeout=60,
+    )
+    assert proc.returncode == 1
+    assert "washed green" in proc.stdout
+    new.write_text("Suite.SkipA\n")
+    assert _sp.run(
+        ["bash", str(script), "--verify-skip-growth", str(old), str(new)],
+        capture_output=True, timeout=60,
+    ).returncode == 0
 
 
 def test_registered_verification_is_locale_proof(tmp_path):
@@ -703,6 +799,26 @@ def test_rt314_log_stage_normalizes_and_compares(tmp_path):
         capture_output=True, timeout=60,
     ).returncode == 0
 
+    # gtest AssertionHelper prints `file", LINE` rather than `file:LINE`.
+    gtest_base = tmp_path / "gtest-base.log"
+    gtest_base.write_text(
+        "[ RUN      ] CmdLineTest.OSREnabledFlag\n"
+        'cmdline_test.cpp", 698, GetBoolAssertionFailureMessage('
+        'gtest_ar_, "getConfig().osr_enabled", "false", "true")\n'
+        "[  FAILED  ] CmdLineTest.OSREnabledFlag (12 ms)\n"
+        "[==========] 1 test from 1 test suite ran. (12 ms total)\n"
+        "[  FAILED  ] 1 test, listed below:\n"
+        "[  FAILED  ] CmdLineTest.OSREnabledFlag\n"
+    )
+    gtest_shift = tmp_path / "gtest-shift.log"
+    gtest_shift.write_text(
+        gtest_base.read_text().replace('cpp", 698', 'cpp", 708')
+    )
+    assert _sp.run(
+        ["bash", str(script), "--verify-logs", str(gtest_base), str(gtest_shift)],
+        capture_output=True, timeout=60,
+    ).returncode == 0
+
     # An allowlisted failure failing DIFFERENTLY is not excusable.
     diag = tmp_path / "diag.log"
     diag.write_text(
@@ -731,3 +847,34 @@ def test_rt314_log_stage_normalizes_and_compares(tmp_path):
         capture_output=True, text=True, timeout=60,
     )
     assert proc.returncode == 1 and "skipped-test sets diverged" in proc.stdout
+
+
+def test_rt314_allowlist_growth_must_be_symmetric_failures(tmp_path):
+    import subprocess as _sp
+
+    script = (
+        Path(runners.REPO_ROOT)
+        / "ci_pipeline" / "scripts" / "rt314_differential.sh"
+    )
+    grown = tmp_path / "grown.txt"
+    symmetric = tmp_path / "symmetric.txt"
+    grown.write_text(
+        "OSRDetectionTest.HotWhileLoopAtThresholdCallsTryOSRAndContinues\n"
+    )
+    symmetric.write_text(
+        "CmdLineTest.OSREnabledFlag\n"
+        "OSRDetectionTest.HotWhileLoopAtThresholdCallsTryOSRAndContinues\n"
+    )
+    assert _sp.run(
+        ["bash", str(script), "--verify-allowlist-growth",
+         str(grown), str(symmetric)],
+        capture_output=True, timeout=60,
+    ).returncode == 0
+    grown.write_text("NotARealTest.WashesGreen\n")
+    proc = _sp.run(
+        ["bash", str(script), "--verify-allowlist-growth",
+         str(grown), str(symmetric)],
+        capture_output=True, text=True, timeout=60,
+    )
+    assert proc.returncode == 1
+    assert "did not fail identically" in proc.stdout
