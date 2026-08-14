@@ -67,7 +67,8 @@ JIT_COLD void logImplV(
     int line,
     fmt::string_view format,
     fmt::format_args args) {
-  std::string msg = fmt::format("JIT: {}:{} -- Abort\n", trimSourcePath(file), line);
+  std::string msg =
+      fmt::format("JIT: {}:{} -- Abort\n", trimSourcePath(file), line);
   fmt::vformat_to(std::back_inserter(msg), format, args);
   abortImpl(msg);
 }

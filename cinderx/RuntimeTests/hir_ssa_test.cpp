@@ -116,8 +116,7 @@ TEST(CheckFuncTest, EmptyPhi) {
 
   std::ostringstream err;
   ASSERT_FALSE(checkFunc(func, err));
-  EXPECT_EQ(
-      err.str(), "ERROR: Empty Phi instruction 'v0 = Phi' in bb 0\n");
+  EXPECT_EQ(err.str(), "ERROR: Empty Phi instruction 'v0 = Phi' in bb 0\n");
 }
 #endif
 

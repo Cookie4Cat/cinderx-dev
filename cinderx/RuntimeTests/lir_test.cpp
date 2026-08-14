@@ -952,9 +952,9 @@ BB %10
       PhyLocation{10, 64},
       PhyLocation{11, 64},
 #if defined(CINDER_X86_64)
-      PhyLocation{7, 64}
+      PhyLocation { 7, 64 }
 #else
-      PhyLocation{0, 64}
+      PhyLocation { 0, 64 }
 #endif
   );
 #else
@@ -994,9 +994,9 @@ BB %10
       PhyLocation{10, 64},
       PhyLocation{11, 64},
 #if defined(CINDER_X86_64)
-      PhyLocation{7, 64}
+      PhyLocation { 7, 64 }
 #else
-      PhyLocation{0, 64}
+      PhyLocation { 0, 64 }
 #endif
   );
 #endif

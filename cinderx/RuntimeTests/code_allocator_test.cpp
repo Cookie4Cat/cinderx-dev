@@ -1,12 +1,13 @@
 // Copyright (c) Meta Platforms, Inc. and affiliates.
 
+#include "cinderx/python.h"
+
 #include <gtest/gtest.h>
 
 #include "cinderx/Jit/code_allocator.h"
 #include "cinderx/Jit/codegen/arch.h"
 #include "cinderx/Jit/codegen/code_section.h"
 #include "cinderx/Jit/config.h"
-#include "cinderx/python.h"
 
 #include <array>
 #include <cstdint>

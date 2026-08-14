@@ -105,8 +105,7 @@ TEST_F(CodePatcherTest, CodePatch) {
 
 TEST_F(CodePatcherTest, DeoptPatch) {
 #if PY_VERSION_HEX < 0x030C0000
-  GTEST_SKIP()
-      << "CPython 3.11 JIT support is shadow-compilation only";
+  GTEST_SKIP() << "CPython 3.11 JIT support is shadow-compilation only";
 #endif
 
   const char* pycode = R"(

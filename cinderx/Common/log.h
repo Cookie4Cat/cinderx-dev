@@ -152,15 +152,15 @@ template <typename... Args>
     }                                                               \
   }
 
-#define JIT_CHECK_ONCE(COND, ...)                            \
-  {                                                          \
-    static bool checked = false;                             \
-    if (!checked) {                                          \
-      if (!(COND)) {                                         \
+#define JIT_CHECK_ONCE(COND, ...)                                     \
+  {                                                                   \
+    static bool checked = false;                                      \
+    if (!checked) {                                                   \
+      if (!(COND)) {                                                  \
         jit::checkFailedImpl(__FILE__, __LINE__, #COND, __VA_ARGS__); \
-      }                                                      \
-      checked = true;                                        \
-    }                                                        \
+      }                                                               \
+      checked = true;                                                 \
+    }                                                                 \
   }
 
 #define JIT_ABORT(...) jit::abortImpl(__FILE__, __LINE__, __VA_ARGS__)

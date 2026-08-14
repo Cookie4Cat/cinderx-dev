@@ -1979,8 +1979,7 @@ void NativeGenerator::generateCode(
                 codeholder.labelOffsetFromBase(static_jmp_location));
       }
     }
-    bool valid_reentry_offset =
-        codeholder.labelOffset(correct_args_entry) ==
+    bool valid_reentry_offset = codeholder.labelOffset(correct_args_entry) ==
         codeholder.labelOffset(vectorcall_entry_label) +
             JITRT_CALL_REENTRY_OFFSET;
     if (!valid_reentry_offset) {

@@ -11,8 +11,8 @@
 #include "cinderx/RuntimeTests/fixtures.h"
 #include "cinderx/module_state.h"
 
-#include <string>
 #include <stdexcept>
+#include <string>
 #include <utility>
 
 using namespace asmjit;
@@ -25,8 +25,7 @@ class ASMGeneratorTest : public RuntimeTest {
   void SetUp() override {
     RuntimeTest::SetUp();
 #if PY_VERSION_HEX < 0x030C0000
-    GTEST_SKIP()
-        << "CPython 3.11 JIT support is shadow-compilation only";
+    GTEST_SKIP() << "CPython 3.11 JIT support is shadow-compilation only";
 #endif
   }
 
@@ -1684,8 +1683,7 @@ class NewASMGeneratorTest : public RuntimeTest {
 
 TEST_F(NewASMGeneratorTest, Linear) {
 #if PY_VERSION_HEX < 0x030C0000
-  GTEST_SKIP()
-      << "CPython 3.11 JIT support is shadow-compilation only";
+  GTEST_SKIP() << "CPython 3.11 JIT support is shadow-compilation only";
 #endif
 
   const char* src = R"(
@@ -1709,8 +1707,7 @@ def func(x):
 
 TEST_F(NewASMGeneratorTest, DiamondControlBlock) {
 #if PY_VERSION_HEX < 0x030C0000
-  GTEST_SKIP()
-      << "CPython 3.11 JIT support is shadow-compilation only";
+  GTEST_SKIP() << "CPython 3.11 JIT support is shadow-compilation only";
 #endif
 
   const char* src = R"(

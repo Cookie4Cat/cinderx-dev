@@ -254,8 +254,8 @@ static int observe_events_grow(void) {
   if (capacity > CI_OBSERVE_MAX_EVENTS) {
     capacity = CI_OBSERVE_MAX_EVENTS;
   }
-  Ci_ObserveEvent* events = realloc(
-      ci_observe_events, capacity * sizeof(Ci_ObserveEvent));
+  Ci_ObserveEvent* events =
+      realloc(ci_observe_events, capacity * sizeof(Ci_ObserveEvent));
   if (events == NULL) {
     return -1;
   }
@@ -267,10 +267,8 @@ static int observe_events_grow(void) {
 // Record the event and walk it into the compile entry point.  Only the
 // function's identity, its count and the scheduling result are recorded --
 // never arguments, return values or any other program data.
-static void observe_emit(
-    PyFunctionObject* func,
-    PyCodeObject* code,
-    uint64_t count) {
+static void
+observe_emit(PyFunctionObject* func, PyCodeObject* code, uint64_t count) {
   const char* result = Ci_JitShell311_RequestCompile(func);
   // The observer only runs when no exception is active.  Compilation is
   // diagnostic and may fail, but that failure must not leak into evaluation.

@@ -255,8 +255,7 @@ LIRGenerator::LIRGenerator(
           (func->code->co_flags & kCoFlagsAnyGenerator)) {
   JIT_CHECK(env_->ctx != nullptr, "LIR generation requires a cache context");
   for (int i = 0, n = func->env.numLoadTypeAttrCaches(); i < n; i++) {
-    load_type_attr_caches_.emplace_back(
-        env_->ctx->allocateLoadTypeAttrCache());
+    load_type_attr_caches_.emplace_back(env_->ctx->allocateLoadTypeAttrCache());
   }
   for (int i = 0, n = func->env.numLoadTypeMethodCaches(); i < n; i++) {
     load_type_method_caches_.emplace_back(

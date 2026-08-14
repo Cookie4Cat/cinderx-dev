@@ -1,10 +1,11 @@
 // Copyright (c) Meta Platforms, Inc. and affiliates.
 
+#include "cinderx/python.h"
+
 #include "cinderx/Common/util.h"
 #include "cinderx/Jit/lir/dce.h"
 #include "cinderx/Jit/lir/instruction.h"
 #include "cinderx/Jit/lir/printer.h"
-#include "cinderx/python.h"
 
 #include <algorithm>
 
@@ -31,8 +32,7 @@ bool verifyPostRegAllocInvariants(Function* func, std::ostream& err) {
       return false;
     }
 
-    auto recordBranchTarget = [&](const Instruction* instr,
-                                  size_t input_idx) {
+    auto recordBranchTarget = [&](const Instruction* instr, size_t input_idx) {
       const OperandBase* operand = instr->getInput(input_idx);
       if (operand == nullptr || operand->isLinked() || !operand->isLabel()) {
         fmt::print(
@@ -60,8 +60,7 @@ bool verifyPostRegAllocInvariants(Function* func, std::ostream& err) {
     };
 
     for (auto& instr : block->instructions()) {
-      if (instr->opcode() == Instruction::kPhi &&
-          instr->getNumInputs() == 0) {
+      if (instr->opcode() == Instruction::kPhi && instr->getNumInputs() == 0) {
         fmt::print(
             err, "ERROR: Basic block {} contains an empty Phi.\n", block->id());
         return false;

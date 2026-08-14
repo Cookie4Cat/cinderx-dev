@@ -844,8 +844,7 @@ class HIRBuildUnsupportedOpcode311Test
       public testing::WithParamInterface<int> {};
 
 TEST_P(HIRBuildUnsupportedOpcode311Test, RefusesManifestOpcode) {
-  uint8_t bc[] = {
-      static_cast<uint8_t>(GetParam()), 0, RETURN_VALUE, 0};
+  uint8_t bc[] = {static_cast<uint8_t>(GetParam()), 0, RETURN_VALUE, 0};
 
   try {
     build_test(bc, {Py_None});
@@ -1073,7 +1072,9 @@ class ClosureBox:
       method, *irfunc, {COPY_FREE_VARS, MAKE_CELL, RESUME}));
 }
 
-TEST_F(HIR_BUILD_DEFERRED_TEST, InferredSelfGuardFrameStateAfterGeneratorSetup) {
+TEST_F(
+    HIR_BUILD_DEFERRED_TEST,
+    InferredSelfGuardFrameStateAfterGeneratorSetup) {
 #if PY_VERSION_HEX < 0x030C0000
   GTEST_SKIP() << "CPython 3.11 generator HIR remains disabled until MR-10";
 #endif
@@ -1095,7 +1096,9 @@ class YieldBox:
       method, *irfunc, {RETURN_GENERATOR, POP_TOP, RESUME}));
 }
 
-TEST_F(HIR_BUILD_DEFERRED_TEST, InferredSelfGuardFrameStateAfterInitialYieldPop) {
+TEST_F(
+    HIR_BUILD_DEFERRED_TEST,
+    InferredSelfGuardFrameStateAfterInitialYieldPop) {
 #if PY_VERSION_HEX < 0x030C0000
   GTEST_SKIP() << "CPython 3.11 generator HIR remains disabled until MR-10";
 #endif
@@ -1119,7 +1122,9 @@ class YieldBox:
       method, *irfunc, {RETURN_GENERATOR, RESUME, POP_TOP}));
 }
 
-TEST_F(HIR_BUILD_DEFERRED_TEST, InferredSelfGuardMissAfterClosureSetupMatchesInterpreter) {
+TEST_F(
+    HIR_BUILD_DEFERRED_TEST,
+    InferredSelfGuardMissAfterClosureSetupMatchesInterpreter) {
 #if PY_VERSION_HEX < 0x030C0000
   GTEST_SKIP()
       << "CPython 3.11 execution and deopt are outside shadow-only MR-03";
@@ -1178,9 +1183,12 @@ closure_baseline_error = capture_error(closure_baseline, closure_missing)
   ASSERT_EQ(PyObject_RichCompareBool(guard_error, baseline_error, Py_EQ), 1);
 }
 
-TEST_F(HIR_BUILD_DEFERRED_TEST, InferredSelfGuardMissAfterGeneratorSetupMatchesInterpreter) {
+TEST_F(
+    HIR_BUILD_DEFERRED_TEST,
+    InferredSelfGuardMissAfterGeneratorSetupMatchesInterpreter) {
 #if PY_VERSION_HEX < 0x030C0000
-  GTEST_SKIP() << "CPython 3.11 generator execution remains disabled until MR-10";
+  GTEST_SKIP()
+      << "CPython 3.11 generator execution remains disabled until MR-10";
 #endif
   const char* src = R"(
 class YieldBox:
@@ -1826,8 +1834,7 @@ def make_arange(n):
 
   EXPECT_EQ(unsupportedShapeReason311(func->func_code), nullptr);
   EXPECT_STREQ(
-      unsupportedOpcodeReason311(func->func_code),
-      "INTERP_ONLY_ASYNC_CODE");
+      unsupportedOpcodeReason311(func->func_code), "INTERP_ONLY_ASYNC_CODE");
   EXPECT_THROW(buildHIR(func), std::runtime_error);
 }
 
@@ -1848,8 +1855,7 @@ TEST_F(HIRBuildTest, OversizedBytecode311RefusesCodegenSpan) {
   ASSERT_GT(_PyCode_NBYTES(func->func_code), 65536);
 
   EXPECT_STREQ(
-      unsupportedShapeReason311(func->func_code),
-      "REFUSE_SHAPE_CODEGEN_SPAN");
+      unsupportedShapeReason311(func->func_code), "REFUSE_SHAPE_CODEGEN_SPAN");
   EXPECT_THROW(buildHIR(func), std::runtime_error);
 }
 
@@ -2097,7 +2103,9 @@ def test(obj):
   EXPECT_GE(countOpcode(*irfunc, Opcode::kCondBranch), 1) << hir;
 }
 
-TEST_F(HIR_BUILD_DEFERRED_TEST, SlotSpecializedLoadAttrUnsetSlotUsesCheckField) {
+TEST_F(
+    HIR_BUILD_DEFERRED_TEST,
+    SlotSpecializedLoadAttrUnsetSlotUsesCheckField) {
 #if PY_VERSION_HEX < 0x030C0000
   GTEST_SKIP() << "CPython 3.11 slot fast paths remain disabled until MR-09";
 #endif
@@ -2138,7 +2146,9 @@ def test(obj):
   EXPECT_GE(countOpcode(*irfunc, Opcode::kCondBranch), 1) << hir;
 }
 
-TEST_F(HIR_BUILD_DEFERRED_TEST, SlotSpecializedLoadAttrUnsetSlotWithGetattrFallsBack) {
+TEST_F(
+    HIR_BUILD_DEFERRED_TEST,
+    SlotSpecializedLoadAttrUnsetSlotWithGetattrFallsBack) {
 #if PY_VERSION_HEX < 0x030C0000
   GTEST_SKIP() << "CPython 3.11 slot fast paths remain disabled until MR-09";
 #endif
@@ -2667,7 +2677,8 @@ def replace_with_callable():
 
 TEST_F(HIR_BUILD_DEFERRED_TEST, MemberDescriptorStoreSimplifiesToStoreField) {
 #if PY_VERSION_HEX < 0x030C0000
-  GTEST_SKIP() << "CPython 3.11 descriptor fast paths remain disabled until MR-09";
+  GTEST_SKIP()
+      << "CPython 3.11 descriptor fast paths remain disabled until MR-09";
 #endif
   const char* src = R"(
 class SlotValue:
@@ -2714,7 +2725,9 @@ def test(value):
   EXPECT_GE(countOpcode(*irfunc, Opcode::kStoreAttrCached), 1) << hir;
 }
 
-TEST_F(HIR_BUILD_DEFERRED_TEST, SlotLoadTypeVersionGuardFallsBackAfterDescriptorChange) {
+TEST_F(
+    HIR_BUILD_DEFERRED_TEST,
+    SlotLoadTypeVersionGuardFallsBackAfterDescriptorChange) {
 #if PY_VERSION_HEX < 0x030C0000
   GTEST_SKIP() << "CPython 3.11 slot invalidation remains disabled until MR-09";
 #endif
@@ -2760,7 +2773,8 @@ def replace_descriptor():
 
 TEST_F(HIR_BUILD_DEFERRED_TEST, SplitDictLoadFallsBackAfterDescriptorChange) {
 #if PY_VERSION_HEX < 0x030C0000
-  GTEST_SKIP() << "CPython 3.11 attribute invalidation remains disabled until MR-09";
+  GTEST_SKIP()
+      << "CPython 3.11 attribute invalidation remains disabled until MR-09";
 #endif
   const char* src = R"(
 class Vector:
@@ -2808,7 +2822,9 @@ def replace_descriptor():
   ASSERT_DOUBLE_EQ(PyFloat_AsDouble(result), 128.0);
 }
 
-TEST_F(HIR_BUILD_DEFERRED_TEST, SlotStoreTypeVersionGuardFallsBackAfterDescriptorChange) {
+TEST_F(
+    HIR_BUILD_DEFERRED_TEST,
+    SlotStoreTypeVersionGuardFallsBackAfterDescriptorChange) {
 #if PY_VERSION_HEX < 0x030C0000
   GTEST_SKIP() << "CPython 3.11 slot invalidation remains disabled until MR-09";
 #endif

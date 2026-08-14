@@ -9,8 +9,8 @@
 
 #if PY_VERSION_HEX < 0x030C0000
 
-#include "cinderx/Common/log.h"
 #include "cinderx/Common/extra-py-flags.h"
+#include "cinderx/Common/log.h"
 #include "cinderx/Common/py-portability.h"
 #include "cinderx/Common/ref.h"
 #include "cinderx/Common/util.h"
@@ -95,8 +95,7 @@ extern "C" const char* Ci_JitShell311_RequestCompile(
     auto result = context->compiler().CompileShadow(func);
     if (!result.has_value()) {
       PyErr_Clear();
-      JIT_LOG(
-          "shadow compile returned empty for {}", functionName(func));
+      JIT_LOG("shadow compile returned empty for {}", functionName(func));
       return "SUPPORTED_OPCODE_FAILURE";
     }
     jit::triggerStatsOnShadowCompile(
@@ -106,8 +105,7 @@ extern "C" const char* Ci_JitShell311_RequestCompile(
     // Shadow compilation is observational: failures are reported through the
     // stable event reason and must never perturb the interpreted call.
     PyErr_Clear();
-    JIT_LOG(
-        "shadow compile failed for {}: {}", functionName(func), exc.what());
+    JIT_LOG("shadow compile failed for {}: {}", functionName(func), exc.what());
     if (std::string_view(exc.what()).find("RelocOffsetOutOfRange") !=
         std::string_view::npos) {
       return "REFUSE_SHAPE_CODEGEN_SPAN";
@@ -115,7 +113,8 @@ extern "C" const char* Ci_JitShell311_RequestCompile(
     return "SUPPORTED_OPCODE_FAILURE";
   } catch (...) {
     PyErr_Clear();
-    JIT_LOG("shadow compile failed for {}: unknown exception", functionName(func));
+    JIT_LOG(
+        "shadow compile failed for {}: unknown exception", functionName(func));
     return "SUPPORTED_OPCODE_FAILURE";
   }
 }

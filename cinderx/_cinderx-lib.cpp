@@ -21,7 +21,6 @@
 #include "cinderx/Jit/compiled_function.h"
 #include "cinderx/Jit/config.h"
 #include "cinderx/Jit/frame.h"
-#include "cinderx/Jit/trigger_stats.h"
 #include "cinderx/Jit/generators_rt.h"
 #include "cinderx/Jit/global_cache.h"
 #include "cinderx/Jit/osr.h"
@@ -936,9 +935,8 @@ PyMethodDef _cinderx_methods[] = {
     {"_get_trigger_stats",
      get_trigger_stats,
      METH_NOARGS,
-     PyDoc_STR(
-         "Monotonic trigger-proof counters: executable allocations, "
-         "compiled-function creations and machine-code entries.")},
+     PyDoc_STR("Monotonic trigger-proof counters: executable allocations, "
+               "compiled-function creations and machine-code entries.")},
     {"install_frame_evaluator",
      install_frame_evaluator,
      METH_NOARGS,

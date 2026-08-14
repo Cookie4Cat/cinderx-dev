@@ -211,8 +211,7 @@ TEST_F(LIRVerifyTest, TestEmptyBasicBlockWithImmediateFallthroughOK) {
 TEST_F(LIRVerifyTest, TestEmptyPhiRejected) {
   Function function;
   auto* block = function.allocateBasicBlock();
-  block->allocateInstr(
-      Instruction::kPhi, nullptr, OutVReg{DataType::kObject});
+  block->allocateInstr(Instruction::kPhi, nullptr, OutVReg{DataType::kObject});
   block->allocateInstr(Instruction::kUnreachable, nullptr);
   std::ostringstream errors;
   EXPECT_FALSE(verifyPostRegAllocInvariants(&function, errors));
@@ -226,8 +225,7 @@ TEST_F(LIRVerifyTest, TestBranchWithoutOperandRejected) {
   std::ostringstream errors;
   EXPECT_FALSE(verifyPostRegAllocInvariants(&function, errors));
   EXPECT_EQ(
-      errors.str(),
-      "ERROR: Branch in block 0 must have exactly one input.\n");
+      errors.str(), "ERROR: Branch in block 0 must have exactly one input.\n");
 }
 
 TEST_F(LIRVerifyTest, TestBranchWithInvalidOperandRejected) {
@@ -237,8 +235,7 @@ TEST_F(LIRVerifyTest, TestBranchWithInvalidOperandRejected) {
   branch->allocateImmediateInput(0)->setNone();
   std::ostringstream errors;
   EXPECT_FALSE(verifyPostRegAllocInvariants(&function, errors));
-  EXPECT_EQ(
-      errors.str(), "ERROR: Branch target in block 0 must be a label.\n");
+  EXPECT_EQ(errors.str(), "ERROR: Branch target in block 0 must be a label.\n");
 }
 
 TEST_F(LIRVerifyTest, TestBlockWithoutTerminatorOrFallthroughRejected) {
