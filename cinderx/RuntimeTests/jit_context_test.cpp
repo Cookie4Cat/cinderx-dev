@@ -8,12 +8,20 @@
 #include "cinderx/Jit/frame.h"
 #include "cinderx/Jit/jit_rt.h"
 #include "cinderx/Jit/pyjit.h"
+#include "cinderx/Jit/trigger_stats.h"
 #include "cinderx/RuntimeTests/fixtures.h"
 
 #include <initializer_list>
 #include <memory>
 #include <stdexcept>
 #include <string>
+
+#if PY_VERSION_HEX < 0x030C0000
+#define SKIP_311_EXECUTABLE_COMPILE() \
+  GTEST_SKIP() << "CPython 3.11 JIT support is shadow-compilation only"
+#else
+#define SKIP_311_EXECUTABLE_COMPILE() static_cast<void>(0)
+#endif
 
 class JITContextTest : public RuntimeTest {
  public:
@@ -31,7 +39,53 @@ class JITContextTest : public RuntimeTest {
   std::unique_ptr<jit::CompilerContext<jit::Compiler>> jit_ctx_;
 };
 
+#if PY_VERSION_HEX < 0x030C0000
+TEST_F(JITContextTest, RejectsExecutableCompileInShadowMode) {
+  Ref<PyFunctionObject> func(compileAndGet("def func(): return 42", "func"));
+  ASSERT_NE(func, nullptr);
+
+  std::unique_ptr<jit::hir::Preloader> preloader(
+      jit::hir::Preloader::make(func, jit::makeFrameReifier(func->func_code)));
+  ASSERT_NE(preloader, nullptr);
+
+  auto* module_state = cinderx::getModuleState();
+  ASSERT_NE(module_state, nullptr);
+  ASSERT_NE(module_state->code_allocator, nullptr);
+  size_t used_before = module_state->code_allocator->usedBytes();
+  vectorcallfunc vectorcall_before = func->vectorcall;
+  jit::TriggerStats trigger_before = jit::triggerStatsSnapshot();
+
+  EXPECT_EQ(
+      jit::compilePreloaderImpl(jit_ctx_.get(), *preloader, func),
+      jit::Result::CANNOT_SPECIALIZE);
+
+  jit::TriggerStats trigger_after = jit::triggerStatsSnapshot();
+  EXPECT_EQ(module_state->code_allocator->usedBytes(), used_before);
+  EXPECT_EQ(jit_ctx_->lookupFunc(func), nullptr);
+  EXPECT_FALSE(jit_ctx_->didCompile(func));
+  EXPECT_EQ(func->vectorcall, vectorcall_before);
+  EXPECT_EQ(
+      trigger_after.executable_alloc_calls,
+      trigger_before.executable_alloc_calls);
+  EXPECT_EQ(
+      trigger_after.executable_alloc_bytes,
+      trigger_before.executable_alloc_bytes);
+  EXPECT_EQ(
+      trigger_after.compiled_function_creations,
+      trigger_before.compiled_function_creations);
+  EXPECT_EQ(
+      trigger_after.machine_code_entries, trigger_before.machine_code_entries);
+  EXPECT_EQ(
+      trigger_after.shadow_compile_success,
+      trigger_before.shadow_compile_success);
+  EXPECT_EQ(
+      trigger_after.shadow_codegen_bytes, trigger_before.shadow_codegen_bytes);
+}
+#endif
+
 TEST_F(JITContextTest, UnwatchableBuiltins) {
+  SKIP_311_EXECUTABLE_COMPILE();
+
   // This is a C++ test rather than in test_cinderjit so we can guarantee a
   // fresh runtime state with a watchable builtins dict when the test begins.
   const char* py_src = R"(
@@ -66,7 +120,12 @@ class JITConfigTest : public RuntimeTest {};
 
 
 TEST_F(JITConfigTest, IsJitUsableAfterInit) {
+#if PY_VERSION_HEX < 0x030C0000
+  EXPECT_TRUE(jit::isJitShadow());
+  EXPECT_FALSE(jit::isJitUsable());
+#else
   EXPECT_TRUE(jit::isJitUsable());
+#endif
 }
 
 TEST_F(JITConfigTest, IsJitInitialized) {
@@ -175,10 +234,17 @@ class JITPyjitTest : public RuntimeTest {
 
 TEST_F(JITPyjitTest, IsJitUsable) {
   bool usable = jit::isJitUsable();
+#if PY_VERSION_HEX < 0x030C0000
+  EXPECT_TRUE(jit::isJitShadow());
+  EXPECT_FALSE(usable);
+#else
   EXPECT_TRUE(usable);
+#endif
 }
 
 TEST_F(JITPyjitTest, CompileAndCheckVectorcall) {
+  SKIP_311_EXECUTABLE_COMPILE();
+
   const char* py_src = R"(
 def func(a: int) -> int:
     return a + 1
@@ -202,6 +268,8 @@ def func(a: int) -> int:
 }
 
 TEST_F(JITPyjitTest, CompileTwoFunctions) {
+  SKIP_311_EXECUTABLE_COMPILE();
+
   const char* py_src = R"(
 def add(a: int, b: int) -> int:
     return a + b
@@ -236,6 +304,8 @@ def mul(a: int, b: int) -> int:
 }
 
 TEST_F(JITPyjitTest, CompiledFunctionAddrNonNull) {
+  SKIP_311_EXECUTABLE_COMPILE();
+
   const char* py_src = R"(
 def func() -> int:
     return 100
@@ -259,6 +329,8 @@ def func() -> int:
 }
 
 TEST_F(JITPyjitTest, ForgetCodeAndRecompile) {
+  SKIP_311_EXECUTABLE_COMPILE();
+
   const char* py_src = R"(
 def func() -> int:
     return 42
@@ -284,6 +356,8 @@ def func() -> int:
 }
 
 TEST_F(JITPyjitTest, AddRemoveCompiledFunc) {
+  SKIP_311_EXECUTABLE_COMPILE();
+
   const char* py_src = R"(
 def func() -> int:
     return 1
@@ -342,6 +416,8 @@ TEST_F(JITFrameTest, RuntimeFrameStateFromThreadState) {
 }
 
 TEST_F(JITFrameTest, CompileAndGetHeader) {
+  SKIP_311_EXECUTABLE_COMPILE();
+
   const char* py_src = R"(
 def func():
     return 42
@@ -366,6 +442,8 @@ def func():
 }
 
 TEST_F(JITFrameTest, ClearExceptCodeOnJitFrame) {
+  SKIP_311_EXECUTABLE_COMPILE();
+
   const char* py_src = R"(
 def func():
     return 42
@@ -383,6 +461,8 @@ def func():
 }
 
 TEST_F(JITFrameTest, AfterCompileDidCompile) {
+  SKIP_311_EXECUTABLE_COMPILE();
+
   const char* py_src = R"(
 def func():
     return 1
@@ -417,6 +497,8 @@ def func():
 }
 
 TEST_F(JITFrameTest, FrameSizeAfterCompile) {
+  SKIP_311_EXECUTABLE_COMPILE();
+
   const char* py_src = R"(
 def func(a: int, b: int) -> int:
     return a + b
@@ -438,6 +520,8 @@ def func(a: int, b: int) -> int:
 }
 
 TEST_F(JITFrameTest, CompiledCodesNotEmptyAfterCompile) {
+  SKIP_311_EXECUTABLE_COMPILE();
+
   const char* py_src = R"(
 def func():
     return 42
@@ -490,6 +574,8 @@ def func(a, b, c):
 }
 
 TEST_F(JITFrameTest, CompileAndCheckCodeRuntimeFrameState) {
+  SKIP_311_EXECUTABLE_COMPILE();
+
   const char* py_src = R"(
 def func(x):
     return x * 2
@@ -517,6 +603,8 @@ def func(x):
 }
 
 TEST_F(JITFrameTest, CompileAndRunSimpleFunc) {
+  SKIP_311_EXECUTABLE_COMPILE();
+
   const char* py_src = R"(
 def func():
     return 42
@@ -539,6 +627,8 @@ def func():
 }
 
 TEST_F(JITFrameTest, CompileAndRunFuncWithArgs) {
+  SKIP_311_EXECUTABLE_COMPILE();
+
   const char* py_src = R"(
 def add(a, b):
     return a + b
@@ -563,6 +653,8 @@ def add(a, b):
 }
 
 TEST_F(JITFrameTest, CompileAndRunGeneratorFunc) {
+  SKIP_311_EXECUTABLE_COMPILE();
+
   const char* py_src = R"(
 def gen():
     yield 10
@@ -595,6 +687,8 @@ def gen():
 }
 
 TEST_F(JITFrameTest, MultipleCompiles) {
+  SKIP_311_EXECUTABLE_COMPILE();
+
   const char* py_src = R"(
 def func_a():
     return 1
@@ -646,6 +740,8 @@ class JITPyjitApiTest : public RuntimeTest {
 
 
 TEST_F(JITPyjitApiTest, CompileFunction) {
+  SKIP_311_EXECUTABLE_COMPILE();
+
   const char* py_src = R"(
 def func():
     return 1 + 1
@@ -659,6 +755,8 @@ def func():
 }
 
 TEST_F(JITPyjitApiTest, CompileFunctionWithArgs) {
+  SKIP_311_EXECUTABLE_COMPILE();
+
   const char* py_src = R"(
 def add(a, b):
     return a + b
@@ -672,6 +770,8 @@ def add(a, b):
 }
 
 TEST_F(JITPyjitApiTest, CompileFunctionTwice) {
+  SKIP_311_EXECUTABLE_COMPILE();
+
   const char* py_src = R"(
 def func():
     return 99
@@ -688,6 +788,8 @@ def func():
 }
 
 TEST_F(JITPyjitApiTest, CompileGenerator) {
+  SKIP_311_EXECUTABLE_COMPILE();
+
   const char* py_src = R"(
 def gen():
     yield 1
@@ -760,6 +862,8 @@ def func():
 }
 
 TEST_F(JITPyjitApiTest, CompileAndCall) {
+  SKIP_311_EXECUTABLE_COMPILE();
+
   const char* py_src = R"(
 def func():
     return 42
@@ -779,6 +883,8 @@ def func():
 }
 
 TEST_F(JITPyjitApiTest, CompileAndCallWithArgs) {
+  SKIP_311_EXECUTABLE_COMPILE();
+
   const char* py_src = R"(
 def add(a, b):
     return a + b
@@ -816,6 +922,8 @@ class JITContextExtendedTest : public RuntimeTest {
 };
 
 TEST_F(JITContextExtendedTest, CompiledFuncsAfterCompile) {
+  SKIP_311_EXECUTABLE_COMPILE();
+
   const char* py_src = R"(
 def func():
     return 1
@@ -836,6 +944,8 @@ def func():
 }
 
 TEST_F(JITContextExtendedTest, LookupCode) {
+  SKIP_311_EXECUTABLE_COMPILE();
+
   const char* py_src = R"(
 def func():
     return 1
@@ -860,6 +970,8 @@ def func():
 }
 
 TEST_F(JITContextExtendedTest, CompilePublishesCodeExtraCompiledEntry) {
+  SKIP_311_EXECUTABLE_COMPILE();
+
   const char* py_src = R"(
 def func():
     return 1
@@ -888,6 +1000,8 @@ def func():
 }
 
 TEST_F(JITContextExtendedTest, ForgetCodeClearsCodeExtraCompiledEntry) {
+  SKIP_311_EXECUTABLE_COMPILE();
+
   const char* py_src = R"(
 def func():
     return 1
@@ -921,6 +1035,8 @@ def func():
 TEST_F(
     JITContextExtendedTest,
     ClearForMultithreadedCompileTestClearsCodeExtraCompiledEntry) {
+  SKIP_311_EXECUTABLE_COMPILE();
+
   const char* py_src = R"(
 def func():
     return 1
@@ -954,6 +1070,8 @@ def func():
 TEST_F(
     JITContextExtendedTest,
     ForgetCompiledFunctionClearsCodeExtraCompiledEntry) {
+  SKIP_311_EXECUTABLE_COMPILE();
+
   const char* py_src = R"(
 def func():
     return 1
@@ -997,6 +1115,8 @@ TEST_F(JITContextExtendedTest, AddCompileTime) {
 }
 
 TEST_F(JITContextExtendedTest, IfDeoptStatNotFound) {
+  SKIP_311_EXECUTABLE_COMPILE();
+
   const char* py_src = R"(
 def func():
     return 1
@@ -1126,6 +1246,8 @@ TEST_F(JITGenDataFooterTest, GenDataFooterDefaults) {
 }
 
 TEST_F(JITGenDataFooterTest, CompileGeneratorAndCheckRuntime) {
+  SKIP_311_EXECUTABLE_COMPILE();
+
   const char* py_src = R"(
 def gen():
     yield 1
@@ -1237,6 +1359,8 @@ def func():
 }
 
 TEST_F(JITCodeRuntimeExtendedTest, CompiledFunctionStackSizes) {
+  SKIP_311_EXECUTABLE_COMPILE();
+
   const char* py_src = R"(
 def func(a, b):
     return a + b
@@ -1260,6 +1384,8 @@ def func(a, b):
 }
 
 TEST_F(JITCodeRuntimeExtendedTest, CompiledFunctionCompileTime) {
+  SKIP_311_EXECUTABLE_COMPILE();
+
   const char* py_src = R"(
 def func():
     return 1
@@ -1283,6 +1409,8 @@ def func():
 }
 
 TEST_F(JITCodeRuntimeExtendedTest, CompiledFunctionAddRemoveFunction) {
+  SKIP_311_EXECUTABLE_COMPILE();
+
   const char* py_src = R"(
 def func():
     return 1
@@ -1505,6 +1633,8 @@ def func():
 }
 
 TEST_F(JITCodeRuntimeTest, CompileAndVerifyCodeRuntime) {
+  SKIP_311_EXECUTABLE_COMPILE();
+
   const char* py_src = R"(
 def func():
     return 42
@@ -1550,6 +1680,8 @@ class JITGeneratorTest : public RuntimeTest {
 };
 
 TEST_F(JITGeneratorTest, CompileGenerator) {
+  SKIP_311_EXECUTABLE_COMPILE();
+
   const char* py_src = R"(
 def gen():
     yield 1
@@ -1575,6 +1707,8 @@ def gen():
 }
 
 TEST_F(JITGeneratorTest, CompileGeneratorAndCheck) {
+  SKIP_311_EXECUTABLE_COMPILE();
+
   const char* py_src = R"(
 def gen():
     yield 1
@@ -1596,6 +1730,8 @@ def gen():
 }
 
 TEST_F(JITGeneratorTest, CompileAndRunGenerator) {
+  SKIP_311_EXECUTABLE_COMPILE();
+
   const char* py_src = R"(
 def gen():
     yield 10
@@ -1624,6 +1760,8 @@ def gen():
 }
 
 TEST_F(JITGeneratorTest, CompileGeneratorWithArg) {
+  SKIP_311_EXECUTABLE_COMPILE();
+
   const char* py_src = R"(
 def gen(n: int):
     for i in range(n):
@@ -1661,6 +1799,8 @@ def gen(n: int):
 
 
 TEST_F(JITGeneratorTest, CompileGeneratorForgetCode) {
+  SKIP_311_EXECUTABLE_COMPILE();
+
   const char* py_src = R"(
 def gen():
     yield 42
@@ -1682,6 +1822,8 @@ def gen():
 }
 
 TEST_F(JITGeneratorTest, CompileAndIterateGenerator) {
+  SKIP_311_EXECUTABLE_COMPILE();
+
   const char* py_src = R"(
 def gen():
     yield 1
@@ -1718,6 +1860,8 @@ def gen():
 
 
 TEST_F(JITGeneratorTest, CompileCoroutine) {
+  SKIP_311_EXECUTABLE_COMPILE();
+
   const char* py_src = R"(
 async def coro():
     return 42
@@ -1764,6 +1908,8 @@ def gen():
 
 
 TEST_F(JITGeneratorTest, GeneratorRuntimeIsGen) {
+  SKIP_311_EXECUTABLE_COMPILE();
+
   const char* py_src = R"(
 def gen():
     yield 1
@@ -1788,6 +1934,8 @@ def gen():
 }
 
 TEST_F(JITGeneratorTest, NormalFuncRuntimeIsNotGen) {
+  SKIP_311_EXECUTABLE_COMPILE();
+
   const char* py_src = R"(
 def func():
     return 1
@@ -2134,6 +2282,8 @@ class RaisingIndex:
 }
 
 TEST_F(JITJitRtCoverageTest, CompiledListPrefixReverseAssignFastPathSemantics) {
+  SKIP_311_EXECUTABLE_COMPILE();
+
   const char* py_src = R"(
 def target(seq, k):
     seq[: k + 1] = seq[k::-1]
@@ -2189,6 +2339,8 @@ def target(seq, k):
 }
 
 TEST_F(JITJitRtCoverageTest, CompiledListPrefixReverseAssignExceptionSideEffects) {
+  SKIP_311_EXECUTABLE_COMPILE();
+
   const char* py_src = R"(
 class GetError(Exception):
     pass
@@ -2283,6 +2435,8 @@ def target(seq, k):
 }
 
 TEST_F(JITJitRtCoverageTest, CompiledArithmeticUnaryModAndPower) {
+  SKIP_311_EXECUTABLE_COMPILE();
+
   const char* py_src = R"(
 def kernel(a, b):
     return (not bool(a), a % b, a ** b, pow(a, b))
@@ -2306,6 +2460,8 @@ def driver():
 }
 
 TEST_F(JITJitRtCoverageTest, CompiledGlobalNameLoad) {
+  SKIP_311_EXECUTABLE_COMPILE();
+
   const char* py_src = R"(
 ANSWER = 321
 
@@ -2328,6 +2484,8 @@ def run():
 }
 
 TEST_F(JITJitRtCoverageTest, CompiledGeneratorSendAndYieldFrom) {
+  SKIP_311_EXECUTABLE_COMPILE();
+
   const char* py_src = R"(
 def inner():
     received = yield 1
@@ -2360,6 +2518,8 @@ def drive():
 }
 
 TEST_F(JITJitRtCoverageTest, CompiledVectorcallEntry) {
+  SKIP_311_EXECUTABLE_COMPILE();
+
   const char* py_src = R"(
 def callee(a, b, c):
     return a + b + c
@@ -2380,6 +2540,8 @@ def caller():
 }
 
 TEST_F(JITJitRtCoverageTest, CompiledContainersComparisonsAndBitOps) {
+  SKIP_311_EXECUTABLE_COMPILE();
+
   const char* py_src = R"(
 def mix(a, b):
     bits = ((a & b) | (a ^ b)) << 1
@@ -2409,6 +2571,8 @@ def driver():
 }
 
 TEST_F(JITJitRtCoverageTest, CompiledAttributesMethodsAndLoops) {
+  SKIP_311_EXECUTABLE_COMPILE();
+
   const char* py_src = R"(
 class Box:
     def __init__(self, value):
@@ -2445,6 +2609,8 @@ def driver():
 }
 
 TEST_F(JITJitRtCoverageTest, CompiledBroadOpcodeShapes) {
+  SKIP_311_EXECUTABLE_COMPILE();
+
   const char* py_src = R"(
 class Base:
     def value(self):
@@ -2517,6 +2683,8 @@ def driver():
 class JITPyjitApiCoverageTest : public RuntimeTest {};
 
 TEST_F(JITPyjitApiCoverageTest, EnableDisableAndQueryState) {
+  SKIP_311_EXECUTABLE_COMPILE();
+
   auto mod = importCinderJitModule();
   callJitNoArgs(mod, "enable");
   auto enabled = callJitNoArgs(mod, "is_enabled");
@@ -2530,6 +2698,8 @@ TEST_F(JITPyjitApiCoverageTest, EnableDisableAndQueryState) {
 }
 
 TEST_F(JITPyjitApiCoverageTest, CompileLazyForceAndUncompile) {
+  SKIP_311_EXECUTABLE_COMPILE();
+
   const char* py_src = R"(
 def sample(x):
     return x + 7
@@ -2556,6 +2726,8 @@ def sample(x):
 }
 
 TEST_F(JITPyjitApiCoverageTest, JitListDisassembleAndSuppress) {
+  SKIP_311_EXECUTABLE_COMPILE();
+
   runStockCode(R"(
 import cinderx.jit as jit
 import os
@@ -2589,6 +2761,8 @@ jit.force_uncompile(listed_fn)
 }
 
 TEST_F(JITPyjitApiCoverageTest, AutoCompileAfterNCallsAndStats) {
+  SKIP_311_EXECUTABLE_COMPILE();
+
   runStockCode(R"(
 import cinderx.jit as jit
 
@@ -2624,6 +2798,8 @@ TEST_F(JITContextP0CoverageTest, GlobalContextStrBuildClassAndDeoptedFuncs) {
 }
 
 TEST_F(JITContextP0CoverageTest, GlobalContextForgetCodeAndReferences) {
+  SKIP_311_EXECUTABLE_COMPILE();
+
   const char* py_src = R"(
 def forget_me():
     return 88
@@ -2648,10 +2824,20 @@ def forget_me():
 class JITStaticJitRtCoverageTest : public RuntimeTest {
  public:
   JITStaticJitRtCoverageTest()
-      : RuntimeTest(static_cast<Flags>(kJit | kStaticCompiler)) {}
+#if PY_VERSION_HEX < 0x030C0000
+      // Static Python is not built on 3.11; skip in the test body instead of
+      // requesting strict globals that MakeGlobalsStrict() rejects.
+      : RuntimeTest(kJit) {
+  }
+#else
+      : RuntimeTest(static_cast<Flags>(kJit | kStaticCompiler)) {
+  }
+#endif
 };
 
 TEST_F(JITStaticJitRtCoverageTest, StaticPrimitiveBoxUnboxModPow) {
+  SKIP_311_EXECUTABLE_COMPILE();
+
   const char* py_src = R"(
 from __static__ import int32, int64, uint32, uint64
 
@@ -2682,6 +2868,8 @@ def run() -> int64:
 }
 
 TEST_F(JITStaticJitRtCoverageTest, StaticArrayFieldsAndInvoke) {
+  SKIP_311_EXECUTABLE_COMPILE();
+
   const char* py_src = R"(
 from __static__ import Array, box, clen, int64
 

@@ -12,14 +12,17 @@ CopyGraphTest
 CopyPropagationTest
 DataFlowTest
 FuncTypeCheckTest
+HIRBuildTest
 InstrusiveListTest
 IntrusiveListTest
+JITConfigTest
 LIRTargetSelectOperandTest
 LIRTest
 LIRTypeTest
 LinearScanAllocatorTest
 RemoveTrampolineBlocksTest
 RemoveUnreachableBlocks
+ShadowCompileTest
 SlabArenaTest
 SortedVecMapTest
 SplitCriticalEdgesTest
