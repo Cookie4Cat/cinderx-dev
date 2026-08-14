@@ -134,6 +134,116 @@ print(json.dumps({
         self.assertFalse(payload["compiled"])
         self.assertEqual(payload["value"], 45)
 
+    def test_shadow_compiles_without_installing_or_entering_code(self) -> None:
+        payload = run_child(
+            PREAMBLE
+            + """\
+def shadow_add(a, b):
+    return a + b
+
+for i in range(@T@):
+    if shadow_add(i, 2) != i + 2:
+        raise SystemExit("wrong shadow result")
+
+events = [
+    event for event in _cinderx._get_observe_stats()["events"]
+    if event["qualname"] == "shadow_add"
+]
+print(json.dumps({
+    "events": events,
+    "trigger": _cinderx._get_trigger_stats(),
+    "value": shadow_add(40, 2),
+}))
+""",
+            CINDERX_JIT_MODE="shadow",
+        )
+        self.assertEqual(payload["value"], 42)
+        self.assertEqual(len(payload["events"]), 1)
+        self.assertEqual(payload["events"][0]["result"], "compiled")
+        trigger = payload["trigger"]
+        self.assertGreater(trigger["shadow_compile_success"], 0)
+        self.assertGreater(trigger["shadow_codegen_bytes"], 0)
+        self.assertEqual(trigger["executable_alloc_calls"], 0)
+        self.assertEqual(trigger["compiled_function_creations"], 0)
+        self.assertEqual(trigger["machine_code_entries"], 0)
+
+    def test_shadow_warm_path_consumes_specialized_bytecode(self) -> None:
+        threshold = 64
+        payload = run_child(
+            PREAMBLE
+            + """\
+import dis
+
+def shadow_warm_add(a, b):
+    return a + b
+
+for i in range(32):
+    if shadow_warm_add(i, 2) != i + 2:
+        raise SystemExit("wrong warm-up result")
+adaptive = dis.Bytecode(shadow_warm_add, adaptive=True).dis()
+for i in range(32):
+    if shadow_warm_add(i, 3) != i + 3:
+        raise SystemExit("wrong post-warm result")
+events = [
+    event for event in _cinderx._get_observe_stats()["events"]
+    if event["qualname"] == "shadow_warm_add"
+]
+print(json.dumps({
+    "adaptive": adaptive,
+    "events": events,
+    "trigger": _cinderx._get_trigger_stats(),
+}))
+""",
+            CINDERX_JIT_MODE="shadow",
+            PYTHONJITAUTO=str(threshold),
+        )
+        self.assertIn("BINARY_OP_ADD_INT", payload["adaptive"])
+        self.assertEqual(len(payload["events"]), 1)
+        self.assertEqual(payload["events"][0]["count"], threshold)
+        self.assertEqual(payload["events"][0]["result"], "compiled")
+        self.assertGreater(
+            payload["trigger"]["shadow_specialized_opcodes_consumed"],
+            0,
+        )
+
+    def test_shadow_refuses_static_code_with_stable_shape_reason(self) -> None:
+        payload = run_child(
+            PREAMBLE
+            + """\
+from cinderx.compiler.consts import CI_CO_STATICALLY_COMPILED
+
+def static_shaped(value):
+    return value + 1
+
+static_shaped.__code__ = static_shaped.__code__.replace(
+    co_flags=static_shaped.__code__.co_flags | CI_CO_STATICALLY_COMPILED
+)
+success_before = _cinderx._get_trigger_stats()["shadow_compile_success"]
+for i in range(@T@):
+    if static_shaped(i) != i + 1:
+        raise SystemExit("wrong static-shaped result")
+
+events = [
+    event for event in _cinderx._get_observe_stats()["events"]
+    if event["qualname"] == "static_shaped"
+]
+print(json.dumps({
+    "events": events,
+    "success_delta": (
+        _cinderx._get_trigger_stats()["shadow_compile_success"]
+        - success_before
+    ),
+}))
+""",
+            CINDERX_JIT_MODE="shadow",
+        )
+        self.assertEqual(len(payload["events"]), 1)
+        self.assertEqual(
+            payload["events"][0]["result"],
+            "REFUSE_SHAPE_STATIC_RUNTIME_CACHE",
+        )
+        self.assertEqual(payload["success_delta"], 0)
+
     def test_off_mode_observes_nothing(self) -> None:
         payload = run_child(
             PREAMBLE
