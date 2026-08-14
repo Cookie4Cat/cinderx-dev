@@ -42,7 +42,8 @@ extract_diagnostic() {  # $1: log, $2: Suite.Test -> normalized failure section
   ' "$1" \
     | sed -E 's/0x[0-9a-fA-F]+/0xADDR/g; s/[0-9]+ ms/N ms/g;
               s#(/[^/ ]+)+/([^/ ]+)#<path>/\2#g;
-              s/([A-Za-z0-9_.<>-]+\.(cpp|cc|h|hpp)):[0-9]+/\1:LINE/g'
+              s/([A-Za-z0-9_.<>-]+\.(cpp|cc|h|hpp)):[0-9]+/\1:LINE/g;
+              s/([A-Za-z0-9_.<>-]+\.(cpp|cc|h|hpp))",[[:space:]]*[0-9]+/\1", LINE/g'
 }
 
 compare_run_logs() {  # $1: base log, $2: head log, $3: allowlist file
@@ -72,6 +73,7 @@ compare_run_logs() {  # $1: base log, $2: head log, $3: allowlist file
   # the normalized diagnostic section must be identical on both sides
   # (dev plan section 3.5).  Source LOCATIONS (file:line) normalize away
   # -- unrelated edits shift line numbers without changing behavior --
+  # both `file:line` and gtest's `file", line` AssertionHelper form --
   # while assertion text and semantic markers (the OSR interruption
   # point, expected/actual values) stay and must match.
   while IFS= read -r name; do
@@ -94,6 +96,18 @@ if [ "${1:-}" = "--verify-logs" ]; then
     "${4:-$REPO_ROOT/ci_pipeline/jit311/data/rt314_env_allowed_failures.txt}"
   exit $?
 fi
+if [ "${1:-}" = "--verify-allowlist-growth" ]; then
+  # $2: grown names; $3: names that failed on both sides.
+  UNJUSTIFIED=$(comm -23 <(grep -Ev '^[[:space:]]*(#|$)' "${2:?grown}" | sort -u) \
+                         <(grep -Ev '^[[:space:]]*(#|$)' "${3:?symmetric}" | sort -u))
+  if [ -n "$UNJUSTIFIED" ]; then
+    echo "rt314-differential: NON-ZERO -- environment allowlist grew with"
+    echo "names that did not fail identically on both sides:"
+    echo "$UNJUSTIFIED"
+    exit 1
+  fi
+  exit 0
+fi
 
 BASE_REF=${1:?usage: rt314_differential.sh <base-ref> <work-dir>}
 WORK=${2:?usage: rt314_differential.sh <base-ref> <work-dir>}
@@ -109,6 +123,9 @@ from cmake_options import cmake_feature_options
 opts = cmake_feature_options(py_version="3.14")
 print(" ".join(f"-D{k}={v}" for k, v in sorted(opts.items())))
 ')
+if [ -n "${CINDERX_LOCAL_DEPS_DIR:-}${CINDERX_LOCAL_DEPS:-}" ]; then
+  FLAGS="$FLAGS -DCINDERX_LOCAL_DEPS_DIR=${CINDERX_LOCAL_DEPS_DIR:-$CINDERX_LOCAL_DEPS}"
+fi
 
 build_and_run() {
   local tree=$1 tag=$2
@@ -166,6 +183,17 @@ build_and_run() {
 mkdir -p "$WORK/base-tree"
 git -C "$REPO_ROOT" archive "$BASE_REF" | tar -x -C "$WORK/base-tree"
 
+# openeuler/cinderx#176 (e40be55): googletest is resolved by tag, not by a
+# mirror-specific SHA.  The 3.14 reference line may still pin 262727f0
+# from !174; that object exists only in curated github.com mirrors and is
+# absent from public upstream v1.17.0 (52eb8108...).  Rewrite the archived
+# base pin to the tag so both trees configure.  RuntimeTests sources and
+# hir_tests goldens are untouched.
+_gtest_cmake="$WORK/base-tree/cinderx/RuntimeTests/CMakeLists.txt"
+if [ -f "$_gtest_cmake" ]; then
+  sed -i -E 's/[0-9a-f]{40}[[:space:]]+# tag (v[0-9.]+)/\1/' "$_gtest_cmake"
+fi
+
 # Golden texts first (cheap, fail-fast): hir_test golden output IS observed
 # behavior, and a change that also updates the goldens keeps both failure
 # sets equal -- the differential is structurally blind to it.  Any golden
@@ -179,18 +207,17 @@ if ! diff -r "$WORK/base-tree/cinderx/RuntimeTests/hir_tests" \
   exit 1
 fi
 
-# The environment allowlist may only shrink within an MR: growing it in
-# the same change that introduces a failure would wash the failure green.
+# The environment allowlist may grow only by registering failures that
+# already fail identically on both sides (documenting a reference-line
+# environment fact).  Growing it with a name that is not a symmetric
+# failure would wash a HEAD-only regression or pad the list.
 BASE_ALLOWLIST="$WORK/base-tree/ci_pipeline/jit311/data/rt314_env_allowed_failures.txt"
 HEAD_ALLOWLIST="$REPO_ROOT/ci_pipeline/jit311/data/rt314_env_allowed_failures.txt"
+: > "$WORK/allowlist-grown.txt"
 if [ -f "$BASE_ALLOWLIST" ]; then
-  GROWN=$(comm -13 <(grep -Ev '^[[:space:]]*(#|$)' "$BASE_ALLOWLIST" | sort -u) \
-                   <(grep -Ev '^[[:space:]]*(#|$)' "$HEAD_ALLOWLIST" | sort -u))
-  if [ -n "$GROWN" ]; then
-    echo "rt314-differential: NON-ZERO -- environment allowlist grew:"
-    echo "$GROWN"
-    exit 1
-  fi
+  comm -13 <(grep -Ev '^[[:space:]]*(#|$)' "$BASE_ALLOWLIST" | sort -u) \
+           <(grep -Ev '^[[:space:]]*(#|$)' "$HEAD_ALLOWLIST" | sort -u) \
+    > "$WORK/allowlist-grown.txt" || true
 else
   # Bootstrap window: while the allowlist does not exist at the base, the
   # committed list must byte-match the audited pin (the plan's four known
@@ -223,6 +250,17 @@ fi
 if ! diff "$WORK/base-ran.txt" "$WORK/head-ran.txt"; then
   echo "rt314-differential: NON-ZERO -- total test count changed"
   exit 1
+fi
+if [ -s "$WORK/allowlist-grown.txt" ]; then
+  comm -12 "$WORK/base-failed.txt" "$WORK/head-failed.txt" \
+    > "$WORK/symmetric-failed.txt"
+  UNJUSTIFIED=$(comm -23 "$WORK/allowlist-grown.txt" "$WORK/symmetric-failed.txt")
+  if [ -n "$UNJUSTIFIED" ]; then
+    echo "rt314-differential: NON-ZERO -- environment allowlist grew with"
+    echo "names that did not fail identically on both sides:"
+    echo "$UNJUSTIFIED"
+    exit 1
+  fi
 fi
 compare_run_logs "$WORK/base-tests.log" "$WORK/head-tests.log" \
   "$REPO_ROOT/ci_pipeline/jit311/data/rt314_env_allowed_failures.txt" || exit 1
