@@ -46,7 +46,7 @@ static inline Ref<> runInInterpreterViaReify(
   PyThreadState* tstate = PyThreadState_Get();
   BorrowedRef<PyCodeObject> code = PyFunction_GetCode(func);
   _PyInterpreterFrame* interp_frame =
-      Cix_PyThreadState_PushFrame(tstate, code->co_framesize);
+      Cix_PyThreadState_PushFrame(tstate, frameSlotsForCodeObject(code));
   jit::jitFrameInit(
       tstate,
       interp_frame,

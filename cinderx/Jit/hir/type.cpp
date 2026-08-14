@@ -422,8 +422,16 @@ Type Type::fromTypeExact(PyTypeObject* type) {
 Type Type::fromObject(PyObject* obj) {
   if (obj == Py_None) {
     // There's only one value of type NoneType, so we don't need the result to
-    // be specialized and it's always immortal.
-    return TImmortalNoneType;
+    // be specialized.  Stock CPython 3.11 does not make None immortal, so keep
+    // its lifetime accurate for refcount insertion.
+    return _Py_IsImmortal(obj) ? TImmortalNoneType : TMortalNoneType;
+  }
+  if (obj == Py_True || obj == Py_False) {
+    // True and False are process-lifetime singletons even on stock CPython
+    // 3.11, where they are not tagged as immortal objects.  Keep the object
+    // specialization for the concrete value, but avoid generating refcount
+    // traffic that could deallocate a bool singleton.
+    return Type{fromTypeExact(Py_TYPE(obj)).bits_, kLifetimeImmortal, obj};
   }
 
   bits_t lifetime = [&]() {

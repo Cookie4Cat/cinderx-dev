@@ -8,6 +8,7 @@
 #include "internal/pycore_pyerrors.h"
 #include "internal/pycore_pystate.h"
 
+#include "cinderx/Common/dict.h"
 #include "cinderx/Common/log.h"
 #include "cinderx/Common/py-portability.h"
 #include "cinderx/Common/ref.h"
@@ -598,8 +599,15 @@ static PyThreadState* allocate_and_link_interpreter_frame(
   PyThreadState* tstate = PyThreadState_GET();
   JIT_DCHECK(tstate != nullptr, "thread state cannot be null");
 
+#if PY_VERSION_HEX >= 0x030C0000
   _PyInterpreterFrame* frame =
       Cix_PyThreadState_PushFrame(tstate, co->co_framesize);
+#else
+  // 3.11 has no co_framesize; the frame size is localsplus + stack depth plus
+  // the frame-header specials.
+  _PyInterpreterFrame* frame = Cix_PyThreadState_PushFrame(
+      tstate, co->co_nlocalsplus + co->co_stacksize + FRAME_SPECIALS_SIZE);
+#endif
   JIT_CHECK(frame != nullptr, "Failed to allocate _PyInterpreterFrame");
 
   init_and_link_interpreter_frame(
@@ -863,6 +871,47 @@ JITRT_LoadGlobal(PyObject* globals, PyObject* builtins, PyObject* name) {
   return result;
 }
 
+#if PY_VERSION_HEX < 0x030C0000
+PyObject* JITRT_LoadGlobalModuleValue(
+    PyObject* globals,
+    PyObject* name,
+    uint32_t keys_version,
+    Py_ssize_t index) {
+  if (!PyDict_CheckExact(globals) || index < 0) {
+    return nullptr;
+  }
+
+  auto dict = reinterpret_cast<PyDictObject*>(globals);
+  PyDictKeysObject* keys = dict->ma_keys;
+  if (keys->dk_version != keys_version || index >= keys->dk_nentries ||
+      dict->ma_values != nullptr || !hasOnlyUnicodeKeys(globals)) {
+    return nullptr;
+  }
+
+  PyDictUnicodeEntry* entry = &DK_UNICODE_ENTRIES(keys)[index];
+  if (entry->me_key == nullptr || entry->me_value == nullptr) {
+    return nullptr;
+  }
+  if (entry->me_key != name) {
+    int equal = PyObject_RichCompareBool(entry->me_key, name, Py_EQ);
+    if (equal < 0) {
+      PyErr_Clear();
+      return nullptr;
+    }
+    if (!equal) {
+      return nullptr;
+    }
+  }
+
+  PyObject* result = entry->me_value;
+  if (result == nullptr) {
+    return nullptr;
+  }
+  Py_INCREF(result);
+  return result;
+}
+#endif
+
 PyObject* JITRT_LoadGlobalFromThreadState(
     PyThreadState* tstate,
     PyObject* name) {
@@ -970,7 +1019,12 @@ static bool handle_periodic_activities_on_call(
     PyObject* callable) {
   JITRT_AtQuiescentState(tstate);
   return res != nullptr && !PyFunction_Check(callable) &&
-      is_eval_breaker_set(tstate) && _Py_HandlePending(tstate) != 0;
+      is_eval_breaker_set(tstate) &&
+#if PY_VERSION_HEX < 0x030C0000
+      Py_MakePendingCalls() != 0;
+#else
+      _Py_HandlePending(tstate) != 0;
+#endif
 }
 
 PyObject*
@@ -1052,6 +1106,19 @@ PyObject* JITRT_Call(
       (nargsf & PY_VECTORCALL_ARGUMENTS_OFFSET),
       "JITRT_Call must always be called as a vectorcall");
 
+#if PY_VERSION_HEX < 0x030C0000
+  // CPython 3.11 LOAD_METHOD pushes a callable followed by either the
+  // receiver or NULL.  If the second slot is NULL, call the callable without
+  // that artificial leading argument; the offset flag is dropped because the
+  // slot below the shifted args is the caller's NULL slot, not scratch the
+  // callee may claim.
+  if (args[0] == nullptr) {
+    constexpr size_t kVectorcallOffset =
+        static_cast<size_t>(PY_VECTORCALL_ARGUMENTS_OFFSET);
+    args += 1;
+    nargsf = (nargsf - 1) & ~kVectorcallOffset;
+  }
+#else
   if constexpr (PY_VERSION_HEX >= 0x030E0000) {
     // Calling a bound method leaves us with an unused first arg.
     if (args[0] == nullptr) {
@@ -1071,6 +1138,7 @@ PyObject* JITRT_Call(
       nargsf -= 1;
     }
   }
+#endif
 
   PyObject* res =
       _PyObject_VectorcallTstate(tstate, callable, args, nargsf, kwnames);
@@ -1100,6 +1168,17 @@ PyObject* JITRT_VectorcallTstate(
     return nullptr;
   }
   return res;
+}
+
+PyObject* JITRT_VectorcallPythonFunction(
+    PyThreadState*,
+    PyObject* callable,
+    PyObject* const* args,
+    size_t nargsf,
+    PyObject* kwnames) {
+  JIT_DCHECK(PyFunction_Check(callable), "expected exact Python function");
+  PyFunctionObject* func = reinterpret_cast<PyFunctionObject*>(callable);
+  return func->vectorcall(callable, args, nargsf, kwnames);
 }
 
 PyObject* JITRT_UnaryNot(PyObject* value) {
@@ -1168,6 +1247,155 @@ LoadMethodResult JITRT_LoadAttrMethodWithValues(
 }
 #endif
 
+PyObject* JITRT_LoadAttrInstanceValueOrGeneric(
+    PyObject* obj,
+    PyObject* name,
+    uint32_t type_version,
+    Py_ssize_t index) {
+#if PY_VERSION_HEX < 0x030C0000
+  PyTypeObject* type = Py_TYPE(obj);
+  if (type->tp_version_tag == type_version &&
+      PyType_HasFeature(type, Py_TPFLAGS_MANAGED_DICT)) {
+    PyDictValues* values = *_PyObject_ValuesPointer(obj);
+    if (values != nullptr) {
+      PyObject* value = values->values[index];
+      if (value != nullptr) {
+        Py_INCREF(value);
+        return value;
+      }
+    }
+  }
+#else
+  (void)type_version;
+  (void)index;
+#endif
+  return PyObject_GetAttr(obj, name);
+}
+
+#if PY_VERSION_HEX < 0x030C0000
+static PyTypeObject* supercheck_builtin(PyTypeObject* type, PyObject* obj) {
+  if (PyType_Check(obj) &&
+      PyType_IsSubtype(reinterpret_cast<PyTypeObject*>(obj), type)) {
+    Py_INCREF(obj);
+    return reinterpret_cast<PyTypeObject*>(obj);
+  }
+
+  if (PyType_IsSubtype(Py_TYPE(obj), type)) {
+    Py_INCREF(Py_TYPE(obj));
+    return Py_TYPE(obj);
+  }
+
+  PyObject* class_attr = nullptr;
+  if (_PyObject_LookupAttr(obj, &_Py_ID(__class__), &class_attr) < 0) {
+    return nullptr;
+  }
+  if (class_attr != nullptr && PyType_Check(class_attr) &&
+      reinterpret_cast<PyTypeObject*>(class_attr) != Py_TYPE(obj)) {
+    int ok =
+        PyType_IsSubtype(reinterpret_cast<PyTypeObject*>(class_attr), type);
+    if (ok) {
+      return reinterpret_cast<PyTypeObject*>(class_attr);
+    }
+  }
+  Py_XDECREF(class_attr);
+
+  PyErr_SetString(
+      PyExc_TypeError,
+      "super(type, obj): obj must be an instance or subtype of type");
+  return nullptr;
+}
+
+static PyObject* super_lookup_descr_builtin(
+    PyTypeObject* type,
+    PyTypeObject* obj_type,
+    PyObject* name) {
+  PyObject* mro = obj_type->tp_mro;
+  if (mro == nullptr) {
+    return nullptr;
+  }
+
+  JIT_DCHECK(PyTuple_Check(mro), "expected type MRO to be a tuple");
+  Py_ssize_t n = PyTuple_GET_SIZE(mro);
+  Py_ssize_t i = 0;
+  for (; i + 1 < n; i++) {
+    if (reinterpret_cast<PyObject*>(type) == PyTuple_GET_ITEM(mro, i)) {
+      break;
+    }
+  }
+  i++;
+  if (i >= n) {
+    return nullptr;
+  }
+
+  Py_INCREF(mro);
+  for (; i < n; i++) {
+    PyObject* obj = PyTuple_GET_ITEM(mro, i);
+    PyObject* dict = reinterpret_cast<PyTypeObject*>(obj)->tp_dict;
+    JIT_DCHECK(dict != nullptr && PyDict_Check(dict), "expected type dict");
+
+    PyObject* res = PyDict_GetItemWithError(dict, name);
+    if (res != nullptr) {
+      Py_INCREF(res);
+      Py_DECREF(mro);
+      return res;
+    }
+    if (PyErr_Occurred()) {
+      Py_DECREF(mro);
+      return nullptr;
+    }
+  }
+  Py_DECREF(mro);
+  return nullptr;
+}
+
+static PyObject* super_lookup_builtin(
+    PyTypeObject* type,
+    PyObject* self,
+    PyObject* name,
+    int* meth_found) {
+  if (meth_found) {
+    *meth_found = 0;
+  }
+
+  Ref<PyTypeObject> obj_type =
+      Ref<PyTypeObject>::steal(supercheck_builtin(type, self));
+  if (obj_type == nullptr) {
+    return nullptr;
+  }
+
+  PyObject* res = super_lookup_descr_builtin(type, obj_type, name);
+  if (res != nullptr) {
+    if (meth_found &&
+        (PyFunction_Check(res) ||
+         PyType_HasFeature(Py_TYPE(res), Py_TPFLAGS_METHOD_DESCRIPTOR))) {
+      *meth_found = 1;
+      return res;
+    }
+
+    descrgetfunc f = Py_TYPE(res)->tp_descr_get;
+    if (f != nullptr) {
+      PyObject* descr_res = f(
+          res,
+          self == reinterpret_cast<PyObject*>(obj_type.get()) ? nullptr : self,
+          reinterpret_cast<PyObject*>(obj_type.get()));
+      Py_DECREF(res);
+      res = descr_res;
+    }
+    return res;
+  }
+  if (PyErr_Occurred()) {
+    return nullptr;
+  }
+
+  Ref<> super_instance = Ref<>::steal(PyObject_CallFunctionObjArgs(
+      reinterpret_cast<PyObject*>(&PySuper_Type), type, self, NULL));
+  if (super_instance == nullptr) {
+    return nullptr;
+  }
+  return PyObject_GetAttr(super_instance, name);
+}
+#endif
+
 static inline PyObject* super_lookup_method_or_attr(
     PyObject* global_super,
     PyTypeObject* type,
@@ -1186,18 +1414,21 @@ static inline PyObject* super_lookup_method_or_attr(
     if (super_instance == nullptr) {
       return nullptr;
     }
-    BorrowedRef<> result = PyObject_GetAttr(super_instance, name);
     if (meth_found) {
       *meth_found = 0;
     }
-    return result;
+    return PyObject_GetAttr(super_instance, name);
   }
+#if PY_VERSION_HEX < 0x030C0000
+  return super_lookup_builtin(type, self, name, meth_found);
+#else
   // Check Py_TYPE(self) because in a class method super call
   // self can be a type. https://github.com/python/cpython/pull/106977
   if (Py_TYPE(self)->tp_getattro != PyObject_GenericGetAttr) {
     meth_found = nullptr;
   }
   return _PySuper_Lookup(type, self, name, meth_found);
+#endif
 }
 
 LoadMethodResult JITRT_GetMethodFromSuper(
@@ -2350,7 +2581,9 @@ void JITRT_AtQuiescentState([[maybe_unused]] PyThreadState* tstate) {
 
 PyObject JITRT_IterDoneSentinel = {
     _PyObject_EXTRA_INIT
-#if PY_VERSION_HEX >= 0x030E0000
+#if PY_VERSION_HEX < 0x030C0000
+    1,
+#elif PY_VERSION_HEX >= 0x030E0000
 // clang-format off
 #ifdef Py_GIL_DISABLED
     .ob_tid = _Py_UNOWNED_TID,

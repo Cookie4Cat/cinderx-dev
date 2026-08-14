@@ -5,7 +5,10 @@
 extern "C" {
 #include "internal/pycore_call.h"
 #include "internal/pycore_ceval.h"
+#include "internal/pycore_gc.h"
+#if PY_VERSION_HEX >= 0x030C0000
 #include "internal/pycore_intrinsics.h"
+#endif
 
 #if PY_VERSION_HEX >= 0x030D0000
 #include "internal/pycore_setobject.h"
@@ -13,6 +16,7 @@ extern "C" {
 
 #include "internal/pycore_import.h"
 #include "internal/pycore_interp.h"
+#include "internal/pycore_long.h"
 #include "internal/pycore_pyerrors.h"
 #if PY_VERSION_HEX >= 0x030E0000
 #include "internal/pycore_interpolation.h"
@@ -50,6 +54,7 @@ extern "C" {
 
 #include <cstring>
 #include <functional>
+#include <iterator>
 #include <sstream>
 
 // XXX: this file needs to be revisited when we optimize HIR-to-LIR translation
@@ -2410,7 +2415,69 @@ LIRGenerator::TranslatedBlock LIRGenerator::TranslateOneBasicBlock(
         } else if (src_type <= TCUInt64) {
           func = reinterpret_cast<uint64_t>(JITRT_BoxU64);
         } else if (src_type <= TCInt64) {
+#if PY_VERSION_HEX >= 0x030C0000
           func = reinterpret_cast<uint64_t>(JITRT_BoxI64);
+#else
+          // The inline small-int box fast path is part of the CPython 3.11
+          // delivery only; 3.12+ keeps the plain helper call above.
+          if (src->output()->dataType() != DataType::k64bit) {
+            src = bbb.appendInstr(
+                OutVReg{DataType::k64bit}, Instruction::kSext, src);
+          }
+
+          auto small_block = bbb.allocateBlock();
+          auto slow_block = bbb.allocateBlock();
+          auto done_block = bbb.allocateBlock();
+
+          Instruction* shifted = bbb.appendInstr(
+              OutVReg{DataType::k64bit},
+              Instruction::kAdd,
+              src,
+              Imm{_PY_NSMALLNEGINTS});
+          Instruction* is_small = bbb.appendInstr(
+              OutVReg{DataType::k8bit},
+              Instruction::kLessThanUnsigned,
+              shifted,
+              Imm{_PY_NSMALLNEGINTS + _PY_NSMALLPOSINTS});
+          bbb.appendBranch(
+              Instruction::kCondBranch, is_small, small_block, slow_block);
+
+          bbb.switchBlock(small_block);
+          Instruction* scale = bbb.appendInstr(
+              OutVReg{DataType::k64bit},
+              Instruction::kMove,
+              Imm{sizeof(PyLongObject)});
+          Instruction* base = bbb.appendInstr(
+              OutVReg{DataType::kObject},
+              Instruction::kMove,
+              Imm{reinterpret_cast<uint64_t>(&_PyLong_SMALL_INTS[0]),
+                  DataType::kObject});
+          Instruction* small_int = bbb.appendInstr(
+              OutVReg{DataType::kObject},
+              Instruction::kMulAdd,
+              shifted,
+              scale,
+              base);
+          makeIncref(bbb, small_int, false, true);
+          BasicBlock* small_pred = bbb.curBlock();
+          bbb.appendBranch(Instruction::kBranch, done_block);
+
+          bbb.switchBlock(slow_block);
+          Instruction* boxed = bbb.appendCallInstruction(
+              OutVReg{DataType::kObject}, JITRT_BoxI64, src);
+          appendGuard(bbb, InstrGuardKind::kNotZero, *instr, boxed);
+          BasicBlock* slow_pred = bbb.curBlock();
+          bbb.appendBranch(Instruction::kBranch, done_block);
+
+          bbb.switchBlock(done_block);
+          Instruction* phi =
+              bbb.appendInstr(instr->output(), Instruction::kPhi);
+          phi->allocateLabelInput(small_pred);
+          phi->allocateLinkedInput(small_int);
+          phi->allocateLabelInput(slow_pred);
+          phi->allocateLinkedInput(boxed);
+          break;
+#endif
         } else if (src_type <= TCUInt32) {
           func = reinterpret_cast<uint64_t>(JITRT_BoxU32);
         } else if (src_type <= TCInt32) {
@@ -2473,7 +2540,12 @@ LIRGenerator::TranslatedBlock LIRGenerator::TranslateOneBasicBlock(
             Instruction::kCondBranch, is_not_negative, done, check_err);
         bbb.switchBlock(check_err);
 
-        constexpr int32_t kOffset = offsetof(PyThreadState, current_exception);
+        constexpr int32_t kOffset =
+#if PY_VERSION_HEX < 0x030C0000
+            offsetof(PyThreadState, curexc_type);
+#else
+            offsetof(PyThreadState, current_exception);
+#endif
         Instruction* curexc = bbb.appendInstr(
             Instruction::kMove, OutVReg{}, Ind{env_->asm_tstate, kOffset});
 
@@ -2992,6 +3064,162 @@ LIRGenerator::TranslatedBlock LIRGenerator::TranslateOneBasicBlock(
       }
       case Opcode::kLongInPlaceOp: {
         auto instr = static_cast<const LongInPlaceOp*>(&i);
+#if PY_VERSION_HEX < 0x030C0000
+        // The compact-long in-place add/subtract fast path is part of the
+        // CPython 3.11 delivery only; 3.12+ keeps the plain helper lowering
+        // below.
+        if (instr->op() == InPlaceOpKind::kAdd ||
+            instr->op() == InPlaceOpKind::kSubtract) {
+          auto emit_is_compact_long = [&](Instruction* obj) {
+            int32_t size_offset =
+                static_cast<int32_t>(offsetof(PyLongObject, ob_base.ob_size));
+            Instruction* size = bbb.appendInstr(
+                OutVReg{DataType::k64bit},
+                Instruction::kMove,
+                Ind{obj, size_offset});
+            Instruction* shifted = bbb.appendInstr(
+                OutVReg{DataType::k64bit}, Instruction::kAdd, size, Imm{1});
+            return bbb.appendInstr(
+                OutVReg{DataType::k8bit},
+                Instruction::kLessThanUnsigned,
+                shifted,
+                Imm{3});
+          };
+
+          auto emit_compact_long_unbox = [&](Instruction* obj) {
+            int32_t size_offset =
+                static_cast<int32_t>(offsetof(PyLongObject, ob_base.ob_size));
+            int32_t digit_offset =
+                static_cast<int32_t>(offsetof(PyLongObject, ob_digit));
+            Instruction* size = bbb.appendInstr(
+                OutVReg{DataType::k64bit},
+                Instruction::kMove,
+                Ind{obj, size_offset});
+            Instruction* digit = bbb.appendInstr(
+                OutVReg{DataType::k32bit},
+                Instruction::kMove,
+                Ind{obj, digit_offset});
+            Instruction* digit64 = bbb.appendInstr(
+                OutVReg{DataType::k64bit}, Instruction::kZext, digit);
+            Instruction* neg_digit = bbb.appendInstr(
+                OutVReg{DataType::k64bit}, Instruction::kNegate, digit64);
+            Instruction* is_negative = bbb.appendInstr(
+                OutVReg{DataType::k8bit},
+                Instruction::kLessThanSigned,
+                size,
+                Imm{0});
+            Instruction* nonzero_result = bbb.appendInstr(
+                OutVReg{DataType::k64bit},
+                Instruction::kSelect,
+                is_negative,
+                neg_digit,
+                digit64);
+            Instruction* is_zero = bbb.appendInstr(
+                OutVReg{DataType::k8bit}, Instruction::kEqual, size, Imm{0});
+            return bbb.appendInstr(
+                OutVReg{DataType::k64bit},
+                Instruction::kSelect,
+                is_zero,
+                Imm{0},
+                nonzero_result);
+          };
+
+          Instruction* left = bbb.getDefInstr(instr->left());
+          Instruction* right = bbb.getDefInstr(instr->right());
+          Instruction* is_left_compact = emit_is_compact_long(left);
+          Instruction* is_right_compact = emit_is_compact_long(right);
+          Instruction* both_compact = bbb.appendInstr(
+              OutVReg{DataType::k8bit},
+              Instruction::kAnd,
+              is_left_compact,
+              is_right_compact);
+
+          BasicBlock* compact_block = bbb.allocateBlock();
+          BasicBlock* slow_block = bbb.allocateBlock();
+          BasicBlock* small_box_block = bbb.allocateBlock();
+          BasicBlock* slow_box_block = bbb.allocateBlock();
+          BasicBlock* done_block = bbb.allocateBlock();
+          bbb.appendBranch(
+              Instruction::kCondBranch,
+              both_compact,
+              compact_block,
+              slow_block);
+
+          bbb.switchBlock(compact_block);
+          Instruction* unboxed_left = emit_compact_long_unbox(left);
+          Instruction* unboxed_right = emit_compact_long_unbox(right);
+          Instruction* primitive_result = bbb.appendInstr(
+              OutVReg{DataType::k64bit},
+              instr->op() == InPlaceOpKind::kAdd ? Instruction::kAdd
+                                                 : Instruction::kSub,
+              unboxed_left,
+              unboxed_right);
+          Instruction* shifted_result = bbb.appendInstr(
+              OutVReg{DataType::k64bit},
+              Instruction::kAdd,
+              primitive_result,
+              Imm{_PY_NSMALLNEGINTS});
+          Instruction* is_small = bbb.appendInstr(
+              OutVReg{DataType::k8bit},
+              Instruction::kLessThanUnsigned,
+              shifted_result,
+              Imm{_PY_NSMALLNEGINTS + _PY_NSMALLPOSINTS});
+          bbb.appendBranch(
+              Instruction::kCondBranch,
+              is_small,
+              small_box_block,
+              slow_box_block);
+
+          bbb.switchBlock(small_box_block);
+          Instruction* scale = bbb.appendInstr(
+              OutVReg{DataType::k64bit},
+              Instruction::kMove,
+              Imm{sizeof(PyLongObject)});
+          Instruction* base = bbb.appendInstr(
+              OutVReg{DataType::kObject},
+              Instruction::kMove,
+              Imm{reinterpret_cast<uint64_t>(&_PyLong_SMALL_INTS[0]),
+                  DataType::kObject});
+          Instruction* small_int = bbb.appendInstr(
+              OutVReg{DataType::kObject},
+              Instruction::kMulAdd,
+              shifted_result,
+              scale,
+              base);
+          makeIncref(bbb, small_int, false, true);
+          BasicBlock* small_pred = bbb.curBlock();
+          bbb.appendBranch(Instruction::kBranch, done_block);
+
+          bbb.switchBlock(slow_box_block);
+          Instruction* boxed = bbb.appendCallInstruction(
+              OutVReg{DataType::kObject}, JITRT_BoxI64, primitive_result);
+          appendGuard(bbb, InstrGuardKind::kNotZero, *instr, boxed);
+          BasicBlock* slow_box_pred = bbb.curBlock();
+          bbb.appendBranch(Instruction::kBranch, done_block);
+
+          bbb.switchBlock(slow_block);
+          Instruction* fallback = bbb.appendCallInstruction(
+              OutVReg{DataType::kObject},
+              instr->slotMethod(),
+              instr->left(),
+              instr->right());
+          appendGuard(bbb, InstrGuardKind::kNotZero, *instr, fallback);
+          BasicBlock* slow_pred = bbb.curBlock();
+          bbb.appendBranch(Instruction::kBranch, done_block);
+
+          bbb.switchBlock(done_block);
+          Instruction* phi =
+              bbb.appendInstr(instr->output(), Instruction::kPhi);
+          phi->allocateLabelInput(small_pred);
+          phi->allocateLinkedInput(small_int);
+          phi->allocateLabelInput(slow_box_pred);
+          phi->allocateLinkedInput(boxed);
+          phi->allocateLabelInput(slow_pred);
+          phi->allocateLinkedInput(fallback);
+          break;
+        }
+#endif
+
         if (instr->op() == InPlaceOpKind::kPower) {
           bbb.appendCallInstruction(
               instr->output(),
@@ -3388,7 +3616,12 @@ LIRGenerator::TranslatedBlock LIRGenerator::TranslateOneBasicBlock(
       }
       case Opcode::kCheckErrOccurred: {
         const auto& instr = static_cast<const DeoptBase&>(i);
-        constexpr int32_t kOffset = offsetof(PyThreadState, current_exception);
+        constexpr int32_t kOffset =
+#if PY_VERSION_HEX < 0x030C0000
+            offsetof(PyThreadState, curexc_type);
+#else
+            offsetof(PyThreadState, current_exception);
+#endif
         Instruction* load = bbb.appendInstr(
             Instruction::kMove, OutVReg{}, Ind{env_->asm_tstate, kOffset});
         appendGuard(bbb, InstrGuardKind::kZero, instr, load);
@@ -3504,7 +3737,14 @@ LIRGenerator::TranslatedBlock LIRGenerator::TranslateOneBasicBlock(
           break;
         }
         size_t flags = 0;
+#if PY_VERSION_HEX < 0x030C0000
+        // _PyObject_VectorcallTstate is a static inline on 3.11 and cannot
+        // be materialized as a call target; the jit_rt helper wraps it.
+        uint64_t func =
+            reinterpret_cast<uint64_t>(JITRT_VectorcallPythonFunction);
+#else
         uint64_t func = reinterpret_cast<uint64_t>(_PyObject_VectorcallTstate);
+#endif
         if (!(hir_instr.func()->type() <= TFunc)) {
           // Calls to things which aren't simple Python functions will
           // need to check the eval breaker. We do this in a helper instead
@@ -3588,6 +3828,9 @@ LIRGenerator::TranslatedBlock LIRGenerator::TranslateOneBasicBlock(
         break;
       }
       case Opcode::kCallIntrinsic: {
+#if PY_VERSION_HEX < 0x030C0000
+        JIT_ABORT("CALL_INTRINSIC is not supported on Python 3.11");
+#else
         auto& hir_instr = static_cast<const CallIntrinsic&>(i);
         uint64_t func_addr;
         switch (hir_instr.NumOperands()) {
@@ -3624,6 +3867,7 @@ LIRGenerator::TranslatedBlock LIRGenerator::TranslateOneBasicBlock(
         for (hir::Register* arg : hir_instr.GetOperands()) {
           instr->addOperands(VReg{bbb.getDefInstr(arg)});
         }
+#endif
         break;
       }
       case Opcode::kCallMethod: {
@@ -4089,7 +4333,7 @@ LIRGenerator::TranslatedBlock LIRGenerator::TranslateOneBasicBlock(
             PyNumber_InPlaceXor,
         };
         JIT_CHECK(
-            static_cast<unsigned long>(instr->op()) < sizeof(helpers),
+            static_cast<size_t>(instr->op()) < std::size(helpers),
             "unsupported inplaceop");
 
         auto op_kind = static_cast<int>(instr->op());
@@ -4270,8 +4514,13 @@ LIRGenerator::TranslatedBlock LIRGenerator::TranslateOneBasicBlock(
         break;
       }
       case Opcode::kRunPeriodicTasks: {
+#if PY_VERSION_HEX < 0x030C0000
+        auto helper = Py_MakePendingCalls;
+        bbb.appendCallInstruction(i.output(), helper);
+#else
         auto helper = _Py_HandlePending;
         bbb.appendCallInstruction(i.output(), helper, env_->asm_tstate);
+#endif
         break;
       }
       case Opcode::kSnapshot: {
@@ -4532,6 +4781,40 @@ LIRGenerator::TranslatedBlock LIRGenerator::TranslateOneBasicBlock(
         break;
       }
       case Opcode::kCompactLongUnbox: {
+#if PY_VERSION_HEX < 0x030C0000
+        Instruction* obj = bbb.getDefInstr(i.GetOperand(0));
+        int32_t size_offset =
+            static_cast<int32_t>(offsetof(PyLongObject, ob_base.ob_size));
+        int32_t digit_offset =
+            static_cast<int32_t>(offsetof(PyLongObject, ob_digit));
+        Instruction* size = bbb.appendInstr(
+            OutVReg{DataType::k64bit},
+            Instruction::kMove,
+            Ind{obj, size_offset});
+        Instruction* digit = bbb.appendInstr(
+            OutVReg{DataType::k32bit},
+            Instruction::kMove,
+            Ind{obj, digit_offset});
+        Instruction* digit64 = bbb.appendInstr(
+            OutVReg{DataType::k64bit}, Instruction::kZext, digit);
+        Instruction* neg_digit = bbb.appendInstr(
+            OutVReg{DataType::k64bit}, Instruction::kNegate, digit64);
+        Instruction* is_negative = bbb.appendInstr(
+            OutVReg{DataType::k8bit},
+            Instruction::kLessThanSigned,
+            size,
+            Imm{0});
+        Instruction* nonzero_result = bbb.appendInstr(
+            OutVReg{DataType::k64bit},
+            Instruction::kSelect,
+            is_negative,
+            neg_digit,
+            digit64);
+        Instruction* is_zero = bbb.appendInstr(
+            OutVReg{DataType::k8bit}, Instruction::kEqual, size, Imm{0});
+        bbb.appendInstr(
+            i.output(), Instruction::kSelect, is_zero, Imm{0}, nonzero_result);
+#else
         // Inline _PyLong_CompactValue: sign * (Py_ssize_t)ob_digit[0]
         // where sign = 1 - (lv_tag & 3).
         Instruction* obj = bbb.getDefInstr(i.GetOperand(0));
@@ -4564,6 +4847,7 @@ LIRGenerator::TranslatedBlock LIRGenerator::TranslateOneBasicBlock(
             OutVReg{DataType::k64bit}, Instruction::kZext, digit);
         // result = sign * digit
         bbb.appendInstr(i.output(), Instruction::kMul, sign, digit64);
+#endif
         break;
       }
       case Opcode::kIsCompactLong: {
@@ -4585,6 +4869,19 @@ LIRGenerator::TranslatedBlock LIRGenerator::TranslateOneBasicBlock(
               shifted,
               Imm{2 * kMaxDigit + 1});
         } else {
+#if PY_VERSION_HEX < 0x030C0000
+          Instruction* obj = bbb.getDefInstr(i.GetOperand(0));
+          int32_t size_offset =
+              static_cast<int32_t>(offsetof(PyLongObject, ob_base.ob_size));
+          Instruction* size = bbb.appendInstr(
+              OutVReg{DataType::k64bit},
+              Instruction::kMove,
+              Ind{obj, size_offset});
+          Instruction* shifted = bbb.appendInstr(
+              OutVReg{DataType::k64bit}, Instruction::kAdd, size, Imm{1});
+          bbb.appendInstr(
+              i.output(), Instruction::kLessThanUnsigned, shifted, Imm{3});
+#else
           // Load lv_tag from PyLongObject and check < (2 << 3) i.e. < 16.
           Instruction* obj = bbb.getDefInstr(i.GetOperand(0));
           int32_t lv_tag_offset =
@@ -4598,6 +4895,7 @@ LIRGenerator::TranslatedBlock LIRGenerator::TranslateOneBasicBlock(
               Instruction::kLessThanUnsigned,
               lv_tag,
               Imm{2 << _PyLong_NON_SIZE_BITS});
+#endif
         }
         break;
       }
@@ -5021,9 +5319,30 @@ LIRGenerator::TranslatedBlock LIRGenerator::TranslateOneBasicBlock(
           auto& pb = static_cast<const PrimitiveBox&>(i);
           JIT_DCHECK(
               !(pb.value()->type() <= TCBool), "should not be able to deopt");
+#if PY_VERSION_HEX < 0x030C0000
+          // The 3.11 inline small-int box lowering guards its own slow path,
+          // so signed 64-bit boxes carry no trailing exception check there.
+          if (pb.value()->type() <= TCInt64 &&
+              !(pb.value()->type() <= TCUInt64)) {
+            break;
+          }
+#endif
           emitExceptionCheck(*db, bbb);
           break;
         }
+#if PY_VERSION_HEX < 0x030C0000
+        case Opcode::kLongInPlaceOp: {
+          // The 3.11 compact-long in-place lowering guards both of its own
+          // call sites; other in-place ops keep the generic check.
+          auto& inplace = static_cast<const LongInPlaceOp&>(i);
+          if (inplace.op() == InPlaceOpKind::kAdd ||
+              inplace.op() == InPlaceOpKind::kSubtract) {
+            break;
+          }
+          emitExceptionCheck(*db, bbb);
+          break;
+        }
+#endif
         default: {
           emitExceptionCheck(*db, bbb);
           break;
@@ -5116,7 +5435,16 @@ void LIRGenerator::resolvePhiOperands(
 
   for (auto& block : basic_blocks_) {
     block->foreachPhiInstr([&](Instruction* instr) {
-      auto hir_instr = static_cast<const Phi*>(instr->origin());
+      if (instr->getNumInputs() != 0) {
+        return;
+      }
+
+      const auto* origin = instr->origin();
+      if (origin == nullptr || !origin->IsPhi()) {
+        return;
+      }
+
+      auto hir_instr = static_cast<const Phi*>(origin);
       for (size_t i = 0; i < hir_instr->NumOperands(); ++i) {
         hir::BasicBlock* hir_block = hir_instr->basic_blocks().at(i);
         hir::Register* hir_value = hir_instr->GetOperand(i);

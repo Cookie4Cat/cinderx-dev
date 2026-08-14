@@ -744,7 +744,9 @@ static PyGetSetDef jitgen_getsetlist[] = {
     {"gi_running", nullptr, nullptr, nullptr},
     {"gi_frame", nullptr, nullptr, nullptr},
     {"gi_suspended", nullptr, nullptr, nullptr},
+#if PY_VERSION_HEX >= 0x030C0000
     {"gi_code", nullptr, nullptr, nullptr},
+#endif
 #if PY_VERSION_HEX >= 0x030F0000
     {"gi_state", nullptr, nullptr, nullptr},
 #endif
@@ -763,7 +765,9 @@ static PyGetSetDef jitcoro_getsetlist[] = {
     {"cr_running", nullptr, nullptr, nullptr},
 #endif
     {"cr_frame", nullptr, nullptr, nullptr},
+#if PY_VERSION_HEX >= 0x030C0000
     {"cr_code", nullptr, nullptr, nullptr},
+#endif
 #if PY_VERSION_HEX >= 0x030E0000 && PY_VERSION_HEX < 0x030F0000
     {"cr_suspended", (getter)Cix_cr_getsuspended, nullptr, nullptr},
 #else

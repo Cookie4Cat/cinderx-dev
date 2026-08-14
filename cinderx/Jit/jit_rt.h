@@ -142,6 +142,14 @@ JITRT_StaticCallFPReturn JITRT_ReportStaticArgTypecheckErrorsWithDoubleReturn(
 PyObject*
 JITRT_LoadGlobal(PyObject* globals, PyObject* builtins, PyObject* name);
 
+#if PY_VERSION_HEX < 0x030C0000
+PyObject* JITRT_LoadGlobalModuleValue(
+    PyObject* globals,
+    PyObject* name,
+    uint32_t keys_version,
+    Py_ssize_t index);
+#endif
+
 /*
  * Load a global value given a Python thread state.
  */
@@ -179,6 +187,12 @@ int JITRT_ListPrefixReverseAssign(PyObject* list, PyObject* index);
 PyObject*
 JITRT_CallFunctionEx(PyObject* func, PyObject* pargs, PyObject* kwargs);
 
+PyObject* JITRT_LoadAttrInstanceValueOrGeneric(
+    PyObject* obj,
+    PyObject* name,
+    uint32_t type_version,
+    Py_ssize_t index);
+
 /*
  * Perform a function or method call.
  *
@@ -206,6 +220,17 @@ PyObject* JITRT_Call(
  * eval breaker events after the call.
  */
 PyObject* JITRT_VectorcallTstate(
+    PyThreadState* tstate,
+    PyObject* callable,
+    PyObject* const* args,
+    size_t nargsf,
+    PyObject* kwnames);
+
+/*
+ * Performs a vectorcall to an exact Python function. This has the same calling
+ * convention as JITRT_VectorcallTstate but skips the generic callable dispatch.
+ */
+PyObject* JITRT_VectorcallPythonFunction(
     PyThreadState* tstate,
     PyObject* callable,
     PyObject* const* args,
