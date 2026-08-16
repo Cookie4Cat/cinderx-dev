@@ -3216,6 +3216,30 @@ def forget_me():
 // control plane publishes, and the registries these cases read are not on it.
 class JITLifecycle311Test : public RuntimeTest {};
 
+TEST_F(JITLifecycle311Test, CodeDeathIsReported) {
+  // The code-extra free function is 3.11's substitute for a code watcher:
+  // attach extra data, drop the code object, and the notification must
+  // arrive.
+  jit::TriggerStats before = jit::triggerStatsSnapshot();
+  {
+    Ref<> code = Ref<>::steal(Py_CompileString(
+        "def transient():\n    return 5\n", "<lifecycle>", Py_file_input));
+    ASSERT_NE(code, nullptr);
+    // Claiming the extra slot is what registers the free function for this
+    // code object; without it there is nothing to call.
+    ASSERT_NE(codeExtra(reinterpret_cast<PyCodeObject*>(code.get())), nullptr);
+    EXPECT_EQ(
+        jit::triggerStatsSnapshot().code_destroyed_notifications,
+        before.code_destroyed_notifications)
+        << "the notification arrived before the code object died";
+  }
+  jit::TriggerStats after = jit::triggerStatsSnapshot();
+  EXPECT_GT(
+      after.code_destroyed_notifications, before.code_destroyed_notifications)
+      << "no code-death notification; the free function is not wired to the "
+         "JIT, and code-keyed registries will keep dead keys";
+}
+
 TEST_F(JITLifecycle311Test, DefaultsUninstallTheEntry) {
   SKIP_311_EXECUTABLE_COMPILE();
 

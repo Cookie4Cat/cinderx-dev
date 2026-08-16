@@ -31,6 +31,11 @@ struct TriggerStats {
   uint64_t shadow_compile_success;
   uint64_t shadow_specialized_opcodes_consumed;
   uint64_t shadow_codegen_bytes;
+  // Death notifications delivered (code / function).  3.11 has no watchers;
+  // these prove the substitutes fire -- a leak shows as counts that stop
+  // climbing while objects keep dying.
+  uint64_t code_destroyed_notifications;
+  uint64_t function_destroyed_notifications;
 };
 
 // Increment sites.  Relaxed atomics: the counters order nothing.
@@ -40,6 +45,8 @@ void triggerStatsOnMachineCodeEntry();
 void triggerStatsOnShadowCompile(
     std::size_t code_bytes,
     uint64_t specialized_opcodes);
+void triggerStatsOnCodeDestroyed();
+void triggerStatsOnFunctionDestroyed();
 
 // Read a consistent-enough snapshot for reporting.
 TriggerStats triggerStatsSnapshot();
