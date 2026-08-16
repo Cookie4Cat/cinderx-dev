@@ -3,6 +3,8 @@
 #include "cinderx/Jit/pyjit.h"
 
 #include "internal/pycore_pystate.h"
+
+#include "cinderx/Jit/trigger_stats.h"
 #if PY_VERSION_HEX >= 0x030E0000
 #include "internal/pycore_interp_structs.h"
 #endif
@@ -4708,6 +4710,11 @@ int initialize() {
 #endif
 
 #if PY_VERSION_HEX < 0x030C0000
+  // 3.11 has no code watcher, so route the code-extra free function into the
+  // same notification a watcher would deliver.  Installed for both modes:
+  // the registries it drains are populated by shadow compilation too.
+  setCodeDestroyedHook([](PyCodeObject* code) { codeDestroyed(code); });
+
   // The 3.11 attribute-cache default is explicitly OFF until the MR-09
   // pull-based invalidation acceptance; neither shadow nor canary may walk
   // an unaccepted IC arm (dev plan MR-04).
@@ -4956,6 +4963,7 @@ void finalize() {
     }
     mod_state->jit_context.reset();
     mod_state->code_allocator.reset();
+    setCodeDestroyedHook(nullptr);
     getMutableConfig().state = State::kNotInitialized;
     return;
   }
@@ -5041,6 +5049,10 @@ void finalize() {
 
   restoreSysMonitoringRegisterCallback();
   restoreSysSetProfileAndSetTrace();
+
+  // Nothing past this point can service a code-death notification, and code
+  // objects keep dying for the rest of interpreter shutdown.
+  setCodeDestroyedHook(nullptr);
 
   getMutableConfig().state = State::kNotInitialized;
   getMutableConfig().osr_capable = false;
@@ -5358,7 +5370,17 @@ std::vector<BorrowedRef<PyFunctionObject>> preloadFuncAndDeps(
 
 void codeDestroyed(BorrowedRef<PyCodeObject> code) {
   FreeThreadedJITEntrypointGuard guard;
-  if (isJitUsable()) {
+  triggerStatsOnCodeDestroyed();
+#if PY_VERSION_HEX < 0x030C0000
+  // On this branch the notification arrives from the code-extra free
+  // function rather than from a watcher, and the registries it drains are
+  // populated in shadow mode as well as in the executing one.  The gate is
+  // therefore "initialized", not "executing".
+  const bool deliverable = isJitInitialized();
+#else
+  const bool deliverable = isJitUsable();
+#endif
+  if (deliverable) {
     auto mod_state = cinderx::getModuleState();
     if (!mod_state) {
       return;

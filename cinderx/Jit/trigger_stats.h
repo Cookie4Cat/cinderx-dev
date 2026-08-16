@@ -31,6 +31,14 @@ struct TriggerStats {
   uint64_t shadow_compile_success;
   uint64_t shadow_specialized_opcodes_consumed;
   uint64_t shadow_codegen_bytes;
+  // Number of code objects whose destruction the JIT was told about, and of
+  // functions whose destruction it was told about.  On CPython 3.11 neither
+  // notification comes from a watcher -- there are none -- so these are the
+  // proof that the substitutes fire: the code-extra free function and the
+  // weak-reference death watch.  A lifecycle leak shows up here as a count
+  // that stops climbing while objects keep dying.
+  uint64_t code_destroyed_notifications;
+  uint64_t function_destroyed_notifications;
 };
 
 // Increment sites.  Relaxed atomics: the counters order nothing.
@@ -40,6 +48,8 @@ void triggerStatsOnMachineCodeEntry();
 void triggerStatsOnShadowCompile(
     std::size_t code_bytes,
     uint64_t specialized_opcodes);
+void triggerStatsOnCodeDestroyed();
+void triggerStatsOnFunctionDestroyed();
 
 // Read a consistent-enough snapshot for reporting.
 TriggerStats triggerStatsSnapshot();

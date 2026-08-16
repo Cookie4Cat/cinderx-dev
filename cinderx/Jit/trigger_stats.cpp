@@ -15,6 +15,8 @@ std::atomic<uint64_t> s_machine_code_entries{0};
 std::atomic<uint64_t> s_shadow_compile_success{0};
 std::atomic<uint64_t> s_shadow_specialized_opcodes_consumed{0};
 std::atomic<uint64_t> s_shadow_codegen_bytes{0};
+std::atomic<uint64_t> s_code_destroyed_notifications{0};
+std::atomic<uint64_t> s_function_destroyed_notifications{0};
 
 } // namespace
 
@@ -40,6 +42,14 @@ void triggerStatsOnShadowCompile(
   s_shadow_codegen_bytes.fetch_add(code_bytes, std::memory_order_relaxed);
 }
 
+void triggerStatsOnCodeDestroyed() {
+  s_code_destroyed_notifications.fetch_add(1, std::memory_order_relaxed);
+}
+
+void triggerStatsOnFunctionDestroyed() {
+  s_function_destroyed_notifications.fetch_add(1, std::memory_order_relaxed);
+}
+
 TriggerStats triggerStatsSnapshot() {
   return TriggerStats{
       s_executable_alloc_calls.load(std::memory_order_relaxed),
@@ -49,6 +59,8 @@ TriggerStats triggerStatsSnapshot() {
       s_shadow_compile_success.load(std::memory_order_relaxed),
       s_shadow_specialized_opcodes_consumed.load(std::memory_order_relaxed),
       s_shadow_codegen_bytes.load(std::memory_order_relaxed),
+      s_code_destroyed_notifications.load(std::memory_order_relaxed),
+      s_function_destroyed_notifications.load(std::memory_order_relaxed),
   };
 }
 
