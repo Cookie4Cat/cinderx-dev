@@ -297,28 +297,42 @@ TEST_F(JITContextTest, PublicationUnwindsOnAllocationFailure) {
   // observable installation, no hidden artifact -- and a clean publish of
   // the same function afterwards, which is only possible if the unwind
   // left no residue.
-  const char* sources[5] = {
-      "def func(a, b):\n    total = a - a\n    while total < b:\n"
+  // One name per step: rebinding a shared name would kill the previous
+  // step's function in the middle of the walk, and the per-step watch
+  // arithmetic below would then measure death deliveries instead of the
+  // unwind under test.
+  const char* sources[7] = {
+      "def func1(a, b):\n    total = a - a\n    while total < b:\n"
       "        total = total + a\n    return total",
-      "def func(a, b):\n    total = a + a\n    while total < b:\n"
+      "def func2(a, b):\n    total = a + a\n    while total < b:\n"
       "        total = total + a\n    return total",
-      "def func(a, b):\n    total = b - a\n    while total < b:\n"
+      "def func3(a, b):\n    total = b - a\n    while total < b:\n"
       "        total = total + a\n    return total",
-      "def func(a, b):\n    total = b + a\n    while total < a:\n"
+      "def func4(a, b):\n    total = b + a\n    while total < a:\n"
       "        total = total + b\n    return total",
       // Step 5: the code-extra reserve -- the C-convention allocation whose
       // MemoryError used to be swallowed on the way up.
-      "def func(a, b):\n    total = b + b\n    while total < a:\n"
+      "def func5(a, b):\n    total = b + b\n    while total < a:\n"
       "        total = total + a\n    return total",
+      // Step 6: the death watch's Python allocations.  The watch is what
+      // keeps the borrowed registry entry from dangling, so failing to arm
+      // it must fail the publication, not fall back to an unwatched entry.
+      "def func6(a, b):\n    total = a - b\n    while total < b:\n"
+      "        total = total + b\n    return total",
+      // Step 7: the death-watch map slot itself.
+      "def func7(a, b):\n    total = a + b\n    while total < a:\n"
+      "        total = total + b\n    return total",
   };
-  for (int step = 1; step <= 5; step++) {
-    Ref<PyFunctionObject> func(compileAndGet(sources[step - 1], "func"));
+  for (int step = 1; step <= 7; step++) {
+    std::string name = "func" + std::to_string(step);
+    Ref<PyFunctionObject> func(compileAndGet(sources[step - 1], name.c_str()));
     ASSERT_NE(func, nullptr) << "step " << step;
     std::unique_ptr<jit::hir::Preloader> preloader(jit::hir::Preloader::make(
         func, jit::makeFrameReifier(func->func_code)));
     ASSERT_NE(preloader, nullptr) << "step " << step;
 
     vectorcallfunc vectorcall_before = func->vectorcall;
+    size_t watched_before = jit_ctx_->watchedFunctionCount();
     jit::failJitPublishStepForTest(step);
     EXPECT_EQ(
         jit::compilePreloaderImpl(jit_ctx_.get(), *preloader, func),
@@ -332,6 +346,9 @@ TEST_F(JITContextTest, PublicationUnwindsOnAllocationFailure) {
     EXPECT_FALSE(jit_ctx_->didCompile(func)) << "step " << step;
     EXPECT_EQ(jit_ctx_->lookupFunc(func), nullptr) << "step " << step;
     EXPECT_EQ(func->vectorcall, vectorcall_before) << "step " << step;
+    EXPECT_EQ(jit_ctx_->watchedFunctionCount(), watched_before)
+        << "step " << step
+        << " left a death watch armed for a function it did not publish";
     if (func->func_dict != nullptr) {
       EXPECT_EQ(
           PyDict_GetItemWithError(func->func_dict, jit::kCompiledFunctionKey),
@@ -345,6 +362,8 @@ TEST_F(JITContextTest, PublicationUnwindsOnAllocationFailure) {
         jit::Result::OK)
         << "step " << step << " left residue behind";
     EXPECT_TRUE(jit_ctx_->didCompile(func)) << "step " << step;
+    EXPECT_EQ(jit_ctx_->watchedFunctionCount(), watched_before + 1)
+        << "step " << step << " published without arming the death watch";
   }
 }
 
@@ -395,7 +414,7 @@ def replacement(a, b):
   // the swap, so the prior claim stays exactly as published.
   ASSERT_EQ(PyObject_SetAttrString(func, "__code__", donor->func_code), 0);
 
-  for (int step = 1; step <= 3; step++) {
+  for (int step : {1, 2, 3, 8}) {
     std::unique_ptr<jit::hir::Preloader> takeover(jit::hir::Preloader::make(
         func, jit::makeFrameReifier(func->func_code)));
     ASSERT_NE(takeover, nullptr) << "step " << step;
@@ -3240,6 +3259,54 @@ TEST_F(JITLifecycle311Test, CodeDeathIsReported) {
       after.code_destroyed_notifications, before.code_destroyed_notifications)
       << "no code-death notification; the free function is not wired to the "
          "JIT, and code-keyed registries will keep dead keys";
+}
+
+TEST_F(JITLifecycle311Test, FunctionDeathIsReportedFromACycle) {
+  SKIP_311_EXECUTABLE_COMPILE();
+
+  // The other half of what a watcher would deliver.  The weak reference is
+  // held by the JIT, which is why the collector runs its callback at all:
+  // it skips callbacks whose weak reference is itself unreachable, so a
+  // watch owned by the dying graph would be cleared in silence.  This puts
+  // the function in exactly that situation -- reachable only through the
+  // artifact it owns and the dictionary that owns the artifact -- and
+  // requires the notification anyway.
+  const char* py_src = R"(
+def cyclic(x):
+    return x + 1
+)";
+
+  jit::Context* ctx = jit::getContext();
+  ASSERT_NE(ctx, nullptr);
+
+  Ref<> weak;
+  jit::TriggerStats before;
+  {
+    Ref<PyFunctionObject> func(compileAndGet(py_src, "cyclic"));
+    ASSERT_NE(func, nullptr);
+    ASSERT_EQ(jit::compileFunction(func), jit::Result::OK);
+    ASSERT_EQ(ctx->watchedFunctionCount(), 1u)
+        << "the death watch was not armed when the function was registered";
+    weak = Ref<>::steal(PyWeakref_NewRef(func, nullptr));
+    ASSERT_NE(weak, nullptr);
+    before = jit::triggerStatsSnapshot();
+  }
+  runStockCode("del cyclic");
+
+  // Only the cycle is left, so nothing dies until the collector runs.
+  ASSERT_NE(PyWeakref_GetObject(weak), Py_None);
+  PyGC_Collect();
+
+  EXPECT_EQ(PyWeakref_GetObject(weak), Py_None)
+      << "the cycle was not collected";
+  jit::TriggerStats after = jit::triggerStatsSnapshot();
+  EXPECT_GT(
+      after.function_destroyed_notifications,
+      before.function_destroyed_notifications)
+      << "the function died without the JIT being told; its registry entries "
+         "are now dead keys";
+  EXPECT_EQ(ctx->watchedFunctionCount(), 0u)
+      << "the watch outlived the function it watched";
 }
 
 TEST_F(JITLifecycle311Test, DefaultsUninstallTheEntry) {

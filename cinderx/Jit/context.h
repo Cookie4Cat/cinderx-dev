@@ -151,6 +151,35 @@ class Context : public IJitContext, public CompiledFunctionOwner {
    */
   void addDeoptedFunc(BorrowedRef<PyFunctionObject> func);
 
+#if PY_VERSION_HEX < 0x030C0000
+  /*
+   * Arm the weak-reference death watch for a function, if it is not already
+   * armed.  Returns false on failure -- any allocation the arming needs, the
+   * Python objects or the map slot -- with no Python error left pending.
+   *
+   * The watch is the only thing that keeps a borrowed registry entry from
+   * dangling, so every borrowed registry treats arming as a precondition of
+   * recording the pointer, not an accessory: a caller that cannot arm must
+   * not record, and publication propagates the failure as MemoryError.
+   */
+  bool watchFunctionDeath(BorrowedRef<PyFunctionObject> func);
+
+  /*
+   * Drop the watch for a function that has died.  Called from the callback,
+   * and by publication when it unwinds an arm it created.
+   */
+  void forgetFunctionDeathWatch(PyFunctionObject* func);
+
+  /*
+   * Drop every watch.  Teardown only: after this the JIT stops being told
+   * about function deaths.
+   */
+  void clearFunctionDeathWatch();
+
+  /* Number of functions currently watched; read by tests and reports. */
+  size_t watchedFunctionCount() const;
+#endif
+
   /*
    * Removes a function from the deopted functions set.
    */
@@ -618,6 +647,24 @@ class Context : public IJitContext, public CompiledFunctionOwner {
 
   /* Set of which functions were JIT-compiled but have since been deopted. */
   UnorderedSet<BorrowedRef<PyFunctionObject>> deopted_funcs_;
+
+#if PY_VERSION_HEX < 0x030C0000
+  /*
+   * Weak references standing in for the function watcher CPython 3.11 does
+   * not have, keyed by the function they watch.
+   *
+   * Holding them here is what makes them work: the collector invokes a
+   * callback only when the weak reference itself is reachable, so a watch
+   * owned by the JIT fires even for a function that dies inside a cycle,
+   * while one owned by the dying graph would be cleared silently.
+   *
+   * The entry outlives registration deliberately.  A watch on a function the
+   * JIT no longer tracks costs one weak reference and finds nothing to
+   * erase; dropping it early would need a second source of truth for when
+   * the last registry let go.
+   */
+  UnorderedMap<PyFunctionObject*, Ref<>> func_death_watch_;
+#endif
 
   /*
    * Set of compilations that are currently active, across all threads.
