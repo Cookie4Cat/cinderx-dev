@@ -197,6 +197,45 @@ class Context : public IJitContext, public CompiledFunctionOwner {
    * that publishes again and defers more anchors extends the same drain.
    */
   void drainDeferredAnchorReleases();
+
+  /*
+   * Park a reference on the deferred-release queue, for a caller outside
+   * finalizeFunc() that must not run the reference's destructor inside
+   * its own operation.  The caller drains at its boundary.
+   */
+  void deferAnchorRelease(Ref<> anchor);
+
+  /*
+   * Whether any compilation state is attached to this function: an
+   * association (which survives parking and __code__ swaps), a parked
+   * entry, or an installation.  This is the force-uncompile predicate.
+   * It is deliberately NOT isJitCompiled(), which answers the narrower
+   * question "will the next call execute machine code" and is false in
+   * exactly the states -- parked, __code__ swapped, evaluator away --
+   * whose retained state force_uncompile() exists to remove.
+   */
+  bool hasCompilationState(BorrowedRef<PyFunctionObject> func) const;
+
+  /*
+   * The artifact the association map claims for this function, or null.
+   * The association is the authoritative answer to "which artifact":
+   * func_code is writable Python state and may point at another live
+   * function's code by the time anyone asks.
+   */
+  BorrowedRef<CompiledFunction> findAssociated(
+      BorrowedRef<PyFunctionObject> func) const;
+
+  /*
+   * Retire a compiled-code entry by ARTIFACT identity: the key is built
+   * from the artifact's own runtime (code, builtins, globals), never from
+   * the function's current code object.  force_uncompile() retires the
+   * artifact its association claimed; keying by the function's mutable
+   * func_code cleared whichever artifact currently owned that code -- a
+   * donor function's, after a __code__ swap.
+   */
+  void forgetCodeForArtifact(
+      BorrowedRef<PyFunctionObject> func,
+      BorrowedRef<CompiledFunction> compiled);
 #endif
 
   /*
@@ -299,6 +338,18 @@ class Context : public IJitContext, public CompiledFunctionOwner {
    * Remove the specified code object from the known compiled codes.
    */
   void forgetCode(BorrowedRef<PyFunctionObject> func);
+
+ private:
+  /*
+   * Shared tail of forgetCode()/forgetCodeForArtifact(): nested-list
+   * cleanup, cache and dedup-index drops, the artifact clear, and the
+   * erase of the given entry.
+   */
+  void forgetCodeEntry(
+      UnorderedMap<CompilationKey, BorrowedRef<CompiledFunction>>::iterator it,
+      BorrowedRef<PyFunctionObject> func);
+
+ public:
   /*
    * Remove the specified code object from the known compiled codes.
    */

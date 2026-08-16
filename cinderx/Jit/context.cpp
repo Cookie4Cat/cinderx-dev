@@ -1121,7 +1121,47 @@ void Context::forgetCode(BorrowedRef<PyFunctionObject> func) {
   if (it == compiled_codes_.end()) {
     return;
   }
+  forgetCodeEntry(it, func);
+}
 
+#if PY_VERSION_HEX < 0x030C0000
+BorrowedRef<CompiledFunction> Context::findAssociated(
+    BorrowedRef<PyFunctionObject> func) const {
+  auto it = associated_funcs_.find(func);
+  return it == associated_funcs_.end() ? BorrowedRef<CompiledFunction>{}
+                                       : it->second;
+}
+
+void Context::forgetCodeForArtifact(
+    BorrowedRef<PyFunctionObject> func,
+    BorrowedRef<CompiledFunction> compiled) {
+  if (compiled == nullptr) {
+    return;
+  }
+  auto it = compiled_codes_.find(CompilationKey{*compiled.get()});
+  if (it == compiled_codes_.end() || it->second.get() != compiled.get()) {
+    // Superseded or already forgotten: another artifact owns this key now,
+    // and clearing it would repeat the exact wrong-artifact retirement
+    // this entry point exists to prevent.
+    return;
+  }
+  forgetCodeEntry(it, func);
+}
+#endif
+
+void Context::forgetCodeEntry(
+    UnorderedMap<CompilationKey, BorrowedRef<CompiledFunction>>::iterator it,
+    BorrowedRef<PyFunctionObject> func) {
+  // Pin the retiring artifact and copy the key out of the iterator first:
+  // the clear() below runs arbitrary Python, which can erase this very
+  // entry (its own forgetCompiledFunction), destroy the artifact (the pin
+  // prevents that mid-call), and even publish a SUCCESSOR under the same
+  // key -- a reentrant force_compile() of the same, unswapped function.
+  // The erase at the end is therefore identity-guarded: a dying
+  // generation removes the entry only while the entry is still its own,
+  // never a successor's.
+  Ref<CompiledFunction> retiring = Ref<CompiledFunction>::create(it->second);
+  CompilationKey key = it->first;
   // Remove the CF from any outer function's nested compiled functions list.
   // When a nested function is compiled, its CF is stored both in the
   // function's own __dict__ and in the outer function's
@@ -1152,8 +1192,12 @@ void Context::forgetCode(BorrowedRef<PyFunctionObject> func) {
 
   clearCachedCompiledIfMatches(code, cf.get());
   dropDedupArtifact(code, cf);
-  it->second->clear();
-  compiled_codes_.erase(CompilationKey{func});
+  cf->clear();
+  auto current = compiled_codes_.find(key);
+  if (current != compiled_codes_.end() &&
+      current->second.get() == retiring.get()) {
+    compiled_codes_.erase(current);
+  }
 }
 
 void Context::forgetCompiledFunction(CompiledFunction& function) {
@@ -1192,7 +1236,14 @@ void Context::forgetCompiledFunction(CompiledFunction& function) {
     // otherwise the cached (borrowed) pointer would dangle.
     clearCachedCompiledIfMatches(
         reinterpret_cast<PyCodeObject*>(key.code), &function);
-    compiled_codes_.erase(key);
+    // The same only-what-it-still-owns rule as the registries above: a
+    // stale artifact dying late -- an external pin dropped after a
+    // successor was published under the same key -- must not remove the
+    // successor's entry.
+    auto entry = compiled_codes_.find(key);
+    if (entry != compiled_codes_.end() && entry->second.get() == &function) {
+      compiled_codes_.erase(entry);
+    }
   }
 }
 
@@ -1323,9 +1374,9 @@ void Context::funcDestroyed(BorrowedRef<PyFunctionObject> func) {
 #if PY_VERSION_HEX < 0x030C0000
   // Membership survives deopt on this branch, so a function that dies while
   // parked is still named by its claiming artifact's member set (a borrowed
-  // record); the installed-registry path above does not cover it.  Left in place the
-  // entry would poison the ownership oracle for whichever function the
-  // allocator hands this address to next -- and, once the claiming
+  // record); the installed-registry path above does not cover it.  Left in
+  // place the entry would poison the ownership oracle for whichever function
+  // the allocator hands this address to next -- and, once the claiming
   // artifact's own teardown runs, its member walk would write the entry
   // point of a function that no longer exists.  The claim is resolved
   // through the association map: after a __code__ swap the artifact is not
@@ -1534,6 +1585,17 @@ void Context::clearDeoptedFuncs() {
 }
 
 #if PY_VERSION_HEX < 0x030C0000
+void Context::deferAnchorRelease(Ref<> anchor) {
+  if (anchor != nullptr) {
+    deferred_anchor_releases_.emplace_back(std::move(anchor));
+  }
+}
+
+bool Context::hasCompilationState(BorrowedRef<PyFunctionObject> func) const {
+  return associated_funcs_.contains(func) || deopted_funcs_.contains(func) ||
+      compiled_funcs_.contains(func);
+}
+
 void Context::drainDeferredAnchorReleases() {
   // One reference at a time, re-reading the queue between releases: a
   // release runs arbitrary Python, which can publish again and defer more
