@@ -151,6 +151,30 @@ class Context : public IJitContext, public CompiledFunctionOwner {
    */
   void addDeoptedFunc(BorrowedRef<PyFunctionObject> func);
 
+#if PY_VERSION_HEX < 0x030C0000
+  /*
+   * Arm the death watch (idempotent); false on allocation failure, no
+   * error pending.  Arming is a precondition of recording any borrowed
+   * registry pointer.
+   */
+  bool watchFunctionDeath(BorrowedRef<PyFunctionObject> func);
+
+  /*
+   * Drop the watch for a function that has died.  Called from the callback,
+   * and by publication when it unwinds an arm it created.
+   */
+  void forgetFunctionDeathWatch(PyFunctionObject* func);
+
+  /*
+   * Drop every watch.  Teardown only: after this the JIT stops being told
+   * about function deaths.
+   */
+  void clearFunctionDeathWatch();
+
+  /* Number of functions currently watched; read by tests and reports. */
+  size_t watchedFunctionCount() const;
+#endif
+
   /*
    * Removes a function from the deopted functions set.
    */
@@ -618,6 +642,17 @@ class Context : public IJitContext, public CompiledFunctionOwner {
 
   /* Set of which functions were JIT-compiled but have since been deopted. */
   UnorderedSet<BorrowedRef<PyFunctionObject>> deopted_funcs_;
+
+#if PY_VERSION_HEX < 0x030C0000
+  /*
+   * Weak references standing in for 3.11's missing function watcher.  JIT
+   * ownership is what makes cycle deaths deliver (a watch owned by the
+   * dying graph is cleared silently); entries deliberately outlive
+   * registration -- a stale watch is one weak reference that finds
+   * nothing to erase.
+   */
+  UnorderedMap<PyFunctionObject*, Ref<>> func_death_watch_;
+#endif
 
   /*
    * Set of compilations that are currently active, across all threads.

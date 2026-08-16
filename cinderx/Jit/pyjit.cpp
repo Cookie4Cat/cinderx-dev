@@ -4215,13 +4215,8 @@ void trackEligibleCodeObjects(
     JitEligibility eligibility = JitEligibility::Eligible) {
 #if PY_VERSION_HEX < 0x030C0000
   // This table maps a code object to the function it was first seen on,
-  // and both halves are borrowed.  CPython 3.11 has no function-destroy
-  // notification, so nothing removes an entry when that function dies:
-  // hold on to the code object and the value dangles, and a later
-  // compilation of the same code would read the dead function's globals.
-  // The table exists to find nested functions for the batch paths, which
-  // the canary control plane does not publish, so on 3.11 it simply stays
-  // empty until MR-05 supplies the notification.
+  // and both halves are borrowed; its only consumer is the batch path the
+  // canary does not publish, so on 3.11 it stays empty (wired in MR-11).
   (void)func;
   (void)func_code;
   (void)eligibility;
@@ -5109,10 +5104,8 @@ bool tryAttachCachedCompiledEntry(BorrowedRef<PyFunctionObject> func) {
   }
 #if PY_VERSION_HEX < 0x030C0000
   // This path exists to hand an already-compiled artifact to a freshly
-  // created function object, which is exactly the second owner 3.11 cannot
-  // account for: it has no function-destroy notification, so the first
-  // owner's death would leave a borrowed pointer behind. Re-attachment
-  // returns with the MR-05 lifecycle.
+  // created function object.  Fresh attachment is scheduled with auto-JIT
+  // (MR-11); the path stays closed here.
   (void)func;
   return false;
 #else
@@ -5390,23 +5383,30 @@ void codeDestroyed(BorrowedRef<PyCodeObject> code) {
   }
 }
 
-void funcDestroyed(BorrowedRef<PyFunctionObject> func) {
+void funcDestroyedInContext(
+    Context* ctx,
+    BorrowedRef<PyFunctionObject> func) {
   auto mod_state = cinderx::getModuleState();
   if (!mod_state) {
     return;
   }
   FreeThreadedJITEntrypointGuard guard;
+  triggerStatsOnFunctionDestroyed();
 
   unregisterFunctionCodes(func);
 
-  // Have to check if context exists as this can fire after jit::finalize().
-  if (jitCtx()) {
-    jitCtx()->funcDestroyed(func);
-  }
-
-  if (CompilerContext<Compiler>* ctx = jitCtx()) {
+  // The registries and entry caches to clean belong to the context whose
+  // watch (or caller) delivered the event; the module-state bookkeeping
+  // above is process-wide either way.  A null context means the event
+  // arrived after jit::finalize() took the context down.
+  if (ctx != nullptr) {
+    ctx->funcDestroyed(func);
     ctx->clearFunctionEntryCache(func);
   }
+}
+
+void funcDestroyed(BorrowedRef<PyFunctionObject> func) {
+  funcDestroyedInContext(jitCtx(), func);
 }
 
 void funcModified(BorrowedRef<PyFunctionObject> func) {
