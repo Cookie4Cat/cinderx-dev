@@ -88,9 +88,17 @@ void codeDestroyed(BorrowedRef<PyCodeObject> code);
 void funcDestroyed(BorrowedRef<PyFunctionObject> func);
 
 /*
- * Context-explicit form: a death belongs to the context whose watch
+ * funcDestroyed() minus the death-notification counter: administrative
+ * unpublication (force_uncompile of a live function) must not claim a
+ * death.
+ */
+void funcUnpublished(BorrowedRef<PyFunctionObject> func);
+
+/*
+ * Context-explicit forms: a death belongs to the context whose watch
  * delivered it, never to whichever context the module currently holds.
  */
+void funcUnpublishedInContext(Context* ctx, BorrowedRef<PyFunctionObject> func);
 void funcDestroyedInContext(Context* ctx, BorrowedRef<PyFunctionObject> func);
 
 /*
@@ -99,6 +107,13 @@ void funcDestroyedInContext(Context* ctx, BorrowedRef<PyFunctionObject> func);
  * through entry points the canary does not publish.
  */
 bool registerFunctionForTest(BorrowedRef<PyFunctionObject> func);
+
+/*
+ * Test-only: invoked between force_uncompile()'s unpublication and its
+ * artifact retirement, so a native case can drop the last external
+ * reference in the middle of the operation.
+ */
+void setUncompileMidpointHookForTest(void (*hook)());
 void funcModified(BorrowedRef<PyFunctionObject> func);
 void typeDestroyed(BorrowedRef<PyTypeObject> type);
 void typeModified(BorrowedRef<PyTypeObject> type);

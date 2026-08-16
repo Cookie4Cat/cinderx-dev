@@ -2566,6 +2566,10 @@ PyObject* lazy_compile(PyObject* /* self */, PyObject* arg) {
   Py_RETURN_TRUE;
 }
 
+namespace {
+void (*s_uncompile_midpoint_hook_for_test)() = nullptr;
+} // namespace
+
 // Uncompile a function by returning it to its non-jitted version.
 PyObject* force_uncompile(PyObject* /* self */, PyObject* arg) {
   BorrowedRef<PyFunctionObject> func = get_func_arg("force_uncompile", arg);
@@ -2574,20 +2578,102 @@ PyObject* force_uncompile(PyObject* /* self */, PyObject* arg) {
   }
   FreeThreadedJITEntrypointGuard guard;
 
+#if PY_VERSION_HEX < 0x030C0000
+  // Gate on retained state, not the call predicate: isJitCompiled() is
+  // deliberately false while parked / after a __code__ swap / with the
+  // evaluator away, yet those states retain exactly what uncompile must
+  // remove -- gated on it, the artifact revived on the way back.
+  if (jitCtx() == nullptr || !jitCtx()->hasCompilationState(func)) {
+    Py_RETURN_FALSE;
+  }
+#else
   if (!isJitCompiled(func)) {
     Py_RETURN_FALSE;
   }
+#endif
+
+  // Pin the function for the duration: a last external reference dropped
+  // mid-operation must not free what the remaining steps read.
+  Ref<PyFunctionObject> keep = Ref<PyFunctionObject>::create(func);
+
+#if PY_VERSION_HEX < 0x030C0000
+  // Capture the claimed artifact BEFORE unpublication severs the
+  // association -- the association is authoritative; func_code is mutable
+  // and after a swap names another function's code (retiring by that key
+  // cleared the donor's artifact).  Doubles as the retirement pin.
+  Ref<jit::CompiledFunction> claimed;
+  {
+    BorrowedRef<jit::CompiledFunction> assoc = jitCtx()->findAssociated(func);
+    if (assoc != nullptr) {
+      claimed = Ref<jit::CompiledFunction>::create(assoc);
+    }
+  }
+#endif
 
   // Replace the function entrypoint with the interpreter entrypoint, so that it
   // can properly be called again.
   setVectorcall(func, getInterpretedVectorcall(func));
 
-  // "Destroy" the function from the perspective of the JIT, effectively erasing
-  // all traces of it from the metadata.
-  funcDestroyed(func);
+  // Unpublish the function: erase the JIT's records of it.  This is not a
+  // death and must not count as one.
+  funcUnpublished(func);
+
+  if (s_uncompile_midpoint_hook_for_test != nullptr) {
+    s_uncompile_midpoint_hook_for_test();
+  }
 
   if (jitCtx() != nullptr) {
+#if PY_VERSION_HEX < 0x030C0000
+    // Retire the dictionary anchor (what keeps the artifact resident),
+    // detained in a local pin: released in place it would run arbitrary
+    // Python mid-operation.  A local needs no allocation, so no failure.
+    Ref<> detained_anchor;
+    if (func->func_dict != nullptr) {
+      BorrowedRef<> anchored =
+          PyDict_GetItemWithError(func->func_dict, jit::kCompiledFunctionKey);
+      if (anchored == nullptr && PyErr_Occurred()) {
+        PyErr_Clear();
+      }
+      // Only the claimed artifact's own anchor is ours: the key is
+      // user-writable state, and a forged foreign value may be the last
+      // reference to ANOTHER function's artifact -- releasing it would
+      // uncompile that function.  Anything else stays as the user wrote
+      // it (retirement goes by identity, not by this key).
+      if (anchored != nullptr && claimed != nullptr &&
+          anchored.get() == reinterpret_cast<PyObject*>(claimed.get())) {
+        detained_anchor = Ref<>::create(anchored);
+        if (PyDict_DelItem(func->func_dict, jit::kCompiledFunctionKey) < 0) {
+          PyErr_Clear();
+        }
+      }
+    }
+    // Retire by artifact identity: the entry-point bookkeeping, then the
+    // compiled-codes entry of the artifact the association CLAIMED --
+    // keyed from the artifact's own runtime, never rebuilt from the
+    // function's mutable func_code.
+    deoptFuncImpl(func);
+    if (claimed != nullptr) {
+      jitCtx()->forgetCodeForArtifact(func, claimed);
+    }
+    // Settlement: every structure is consistent.  The pins release here --
+    // either can be the artifact's last reference, and whatever their
+    // destruction runs sees the finished uncompilation.  Residue from the
+    // destruction drains with it.
+    claimed.reset();
+    detained_anchor.reset();
+    jitCtx()->drainDeferredAnchorReleases();
+    // Verdict AFTER the releases: a __del__ there can reenter
+    // force_compile(), and a rebuilt compilation state is a newer decision
+    // this operation must not report over (symmetric to force_compile's
+    // post-drain re-verification).
+    if (jitCtx()->hasCompilationState(func)) {
+      PyErr_SetString(
+          PyExc_RuntimeError, "function was recompiled during force_uncompile");
+      return nullptr;
+    }
+#else
     uncompileImpl(func);
+#endif
   }
 
   Py_RETURN_TRUE;
@@ -4099,11 +4185,11 @@ PyModuleDef_Slot jit_slots[] = {
 #if PY_VERSION_HEX < 0x030C0000
 // The 3.11 canary control plane.
 //
-// The full method table is a control surface for capabilities MR-04 does
-// not have: precompile_all() and lazy_compile() install machine code
-// through the batch and re-optimization paths, force_uncompile() and the
-// jit-list mutators belong to MR-05, and the guard and specialization
-// setters can re-open exactly the speculation this milestone excludes.
+// The full method table is a control surface for capabilities this port
+// does not yet have: precompile_all() and lazy_compile() install machine
+// code through the batch and re-optimization paths, the jit-list mutators
+// belong to a later milestone, and the guard and specialization setters can
+// re-open exactly the speculation MR-04 excludes.
 // Exposing them would make the execute surface a matter of which entry a
 // caller picked.  Canary therefore publishes only what its own evidence
 // needs, and each later milestone adds back what its acceptance covers.
@@ -4125,6 +4211,15 @@ PyMethodDef jit_methods_311_canary[] = {
      force_compile,
      METH_O,
      PyDoc_STR("Force a function to be JIT compiled if it hasn't yet.")},
+    // MR-05: the inverse of force_compile, and the only published way to
+    // take a function back off machine code.  A call already inside the
+    // artifact keeps running it -- the guarded entry pins it for the
+    // duration -- so this affects subsequent calls only.
+    {"force_uncompile",
+     force_uncompile,
+     METH_O,
+     PyDoc_STR("Take a function off JIT-compiled code; later calls run in "
+               "the interpreter.")},
     {"get_compiled_functions",
      get_compiled_functions,
      METH_NOARGS,
@@ -4508,6 +4603,10 @@ void unregisterFunctionCodes(BorrowedRef<PyFunctionObject> func) {
 } // namespace
 
 namespace jit {
+
+void setUncompileMidpointHookForTest(void (*hook)()) {
+  s_uncompile_midpoint_hook_for_test = hook;
+}
 
 bool roiBackoffAllowsCompile(BorrowedRef<PyCodeObject> code) {
   if (!getConfig().roi_backoff_enabled) {
@@ -5379,7 +5478,7 @@ bool registerFunctionForTest(BorrowedRef<PyFunctionObject> func) {
   return registerFunction(func);
 }
 
-void funcDestroyedInContext(
+void funcUnpublishedInContext(
     Context* ctx,
     BorrowedRef<PyFunctionObject> func) {
   auto mod_state = cinderx::getModuleState();
@@ -5387,7 +5486,6 @@ void funcDestroyedInContext(
     return;
   }
   FreeThreadedJITEntrypointGuard guard;
-  triggerStatsOnFunctionDestroyed();
 
   unregisterFunctionCodes(func);
 
@@ -5399,6 +5497,25 @@ void funcDestroyedInContext(
     ctx->funcDestroyed(func);
     ctx->clearFunctionEntryCache(func);
   }
+}
+
+void funcUnpublished(BorrowedRef<PyFunctionObject> func) {
+  funcUnpublishedInContext(jitCtx(), func);
+}
+
+void funcDestroyedInContext(
+    Context* ctx,
+    BorrowedRef<PyFunctionObject> func) {
+  if (cinderx::getModuleState() == nullptr) {
+    return;
+  }
+  // The counter is the proof that death notifications are delivered at
+  // all, so only the real sources may move it: the function watcher on
+  // 3.12+ and the weak-reference death watch on 3.11.  Administrative
+  // unpublication goes through funcUnpublished() and manufactures no
+  // death.
+  triggerStatsOnFunctionDestroyed();
+  funcUnpublishedInContext(ctx, func);
 }
 
 void funcDestroyed(BorrowedRef<PyFunctionObject> func) {

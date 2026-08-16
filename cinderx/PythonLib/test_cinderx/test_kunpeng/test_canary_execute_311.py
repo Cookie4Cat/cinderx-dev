@@ -352,7 +352,8 @@ class CanaryExecute311Test(unittest.TestCase):
                 "force_compile", "is_jit_compiled", "is_attr_caches_enabled",
                 "get_compiled_functions", "get_and_clear_runtime_stats",
                 "is_enabled", "jit_suppress", "jit_unsuppress",
-                "disable", "enable", "_get_resident_compiled_functions",
+                "disable", "enable", "force_uncompile",
+                "_get_resident_compiled_functions",
             ]
             missing = [name for name in needed if not hasattr(cinderjit, name)]
             assert not missing, missing
@@ -597,6 +598,18 @@ class CanaryExecute311Test(unittest.TestCase):
             before = entries()
             assert donor(3, 5, 1) == 15
             assert entries() - before == 1
+
+            # And uncompiling the borrower retires the artifact its
+            # association claims -- never the artifact that owns the code
+            # the borrower's mutable __code__ happens to point at now.
+            assert cinderjit.force_uncompile(borrower) is True
+            assert cinderjit.is_jit_compiled(donor), (
+                "uncompiling the borrower retired the donor's artifact")
+            before = entries()
+            assert donor(3, 5, 1) == 15
+            assert entries() - before == 1, (
+                "the donor lost its machine entry to the borrower's "
+                "uncompile")
             print("borrowed artifact refused")
             """
         )
@@ -1373,6 +1386,177 @@ class CanaryExecute311Test(unittest.TestCase):
         self.assertIn(
             "PYTHONJITIMMORTALIZECOMPILEDFUNCTIONS", proc.stderr
         )
+
+    def test_force_uncompile_gates_on_state_not_on_the_call_predicate(self):
+        # force_uncompile() removes retained compilation state; the call
+        # predicate is_jit_compiled() is deliberately false while that
+        # state still exists (parked, __code__ swapped, evaluator away).
+        # Gated on the call predicate, uncompile was a no-op in each of
+        # those states and the artifact revived on the way back.  Three
+        # revival pins, one per state.
+        env = dict(os.environ)
+        env["CINDERX_JIT_MODE"] = "canary"
+        env["PYTHONJITAUTO"] = "1000000"
+        probe = textwrap.dedent(
+            """
+            import _cinderx, cinderx
+            cinderx.init()
+            _cinderx.install_frame_evaluator()
+            import cinderjit
+
+            def entries():
+                return _cinderx._get_trigger_stats()["machine_code_entries"]
+
+            def make(tag):
+                ns = {}
+                exec(
+                    "def f_%s(a, b):\\n"
+                    "    t = a - a\\n"
+                    "    while t < b:\\n"
+                    "        t = t + a\\n"
+                    "    return t\\n"
+                    "def g_%s(a, b):\\n"
+                    "    t = a + a\\n"
+                    "    while t < b:\\n"
+                    "        t = t + a\\n"
+                    "    return t\\n" % (tag, tag),
+                    ns,
+                )
+                return ns["f_" + tag], ns["g_" + tag]
+
+            # Pin 1: __code__ swap, uncompile, swap back -- no revival.
+            f, g = make("swap")
+            old_code = f.__code__
+            assert cinderjit.force_compile(f) is True
+            f.__code__ = g.__code__
+            assert cinderjit.force_uncompile(f) is True, (
+                "uncompile refused a function with retained state")
+            f.__code__ = old_code
+            assert not cinderjit.is_jit_compiled(f)
+            before = entries()
+            assert f(2, 5) == 6
+            assert entries() == before, "the artifact revived after swap-back"
+
+            # Pin 2: parked, uncompile, enable -- no revival, and the
+            # function is recompilable afterwards.
+            p, _ = make("park")
+            assert cinderjit.force_compile(p) is True
+            cinderjit.disable(deopt_all=True)
+            assert cinderjit.force_uncompile(p) is True, (
+                "uncompile refused a parked function")
+            cinderjit.enable()
+            assert not cinderjit.is_jit_compiled(p)
+            before = entries()
+            assert p(2, 5) == 6
+            assert entries() == before, "the artifact revived after enable"
+            assert cinderjit.force_compile(p) is True
+            assert cinderjit.is_jit_compiled(p)
+
+            # Pin 3: evaluator away, uncompile, evaluator back -- no
+            # revival.
+            e, _ = make("eval")
+            assert cinderjit.force_compile(e) is True
+            assert _cinderx.remove_frame_evaluator() is None
+            assert cinderjit.force_uncompile(e) is True, (
+                "uncompile refused while the evaluator was away")
+            _cinderx.install_frame_evaluator()
+            assert not cinderjit.is_jit_compiled(e)
+            before = entries()
+            assert e(2, 5) == 6
+            assert entries() == before, (
+                "the artifact revived after the evaluator returned")
+
+            print("no revival in any state")
+            """
+        )
+        proc = subprocess.run(
+            [sys.executable, "-c", probe],
+            capture_output=True,
+            text=True,
+            env=env,
+            timeout=300,
+        )
+        self.assertEqual(proc.returncode, 0, proc.stderr[-1500:])
+        self.assertIn("no revival in any state", proc.stdout)
+
+    def test_code_swap_is_an_identity_guard_not_an_invalidation(self):
+        # The __code__ replacement contract, stated exactly: it is a CODE
+        # IDENTITY GUARD at the entry, not a permanent invalidation of the
+        # compilation.  While the function's code differs from the one the
+        # artifact was compiled for, every call falls back to the
+        # interpreter; the association survives on purpose, so swapping
+        # the original code back re-satisfies the guard and the original
+        # machine code resumes service without recompilation -- the same
+        # designed behaviour that lets a parked function re-attach to its
+        # own artifact.  Permanent retirement is force_uncompile()'s job,
+        # and a takeover by a newly compiled successor severs the old
+        # claim; neither happens implicitly on a swap.
+        env = dict(os.environ)
+        env["CINDERX_JIT_MODE"] = "canary"
+        env["PYTHONJITAUTO"] = "1000000"
+        probe = textwrap.dedent(
+            """
+            import _cinderx, cinderx
+            cinderx.init()
+            _cinderx.install_frame_evaluator()
+            import cinderjit
+
+            def entries():
+                return _cinderx._get_trigger_stats()["machine_code_entries"]
+
+            ns = {}
+            exec(
+                "def steadfast(a, b):\\n"
+                "    t = a - a\\n"
+                "    while t < b:\\n"
+                "        t = t + a\\n"
+                "    return t\\n"
+                "def other(a, b):\\n"
+                "    t = a + a\\n"
+                "    while t < b:\\n"
+                "        t = t + a\\n"
+                "    return t\\n",
+                ns,
+            )
+            f, g = ns["steadfast"], ns["other"]
+            old_code = f.__code__
+            assert cinderjit.force_compile(f) is True
+
+            # Guard closed: mismatched identity falls back per call.
+            f.__code__ = g.__code__
+            assert not cinderjit.is_jit_compiled(f)
+            before = entries()
+            assert f(2, 5) == 6
+            assert entries() == before
+
+            # Guard re-satisfied: the original code resumes machine
+            # service without a recompile.
+            f.__code__ = old_code
+            assert cinderjit.is_jit_compiled(f)
+            before = entries()
+            assert f(2, 5) == 6
+            assert entries() == before + 1
+
+            # Permanent retirement is explicit.
+            assert cinderjit.force_uncompile(f) is True
+            f.__code__ = g.__code__
+            f.__code__ = old_code
+            assert not cinderjit.is_jit_compiled(f)
+            before = entries()
+            assert f(2, 5) == 6
+            assert entries() == before
+            print("identity guard, not invalidation")
+            """
+        )
+        proc = subprocess.run(
+            [sys.executable, "-c", probe],
+            capture_output=True,
+            text=True,
+            env=env,
+            timeout=120,
+        )
+        self.assertEqual(proc.returncode, 0, proc.stderr[-1200:])
+        self.assertIn("identity guard, not invalidation", proc.stdout)
 
     def test_instrumentation_support_config_is_refused_by_canary(self):
         # The flag patches sys.setprofile/settrace/monitoring to pause the
@@ -3016,6 +3200,58 @@ class CanaryExecute311Test(unittest.TestCase):
             stats = _cinderx._get_trigger_stats()
             assert all(v == 0 for v in stats.values()), stats
             print("auto-alone stays gated")
+            """
+        )
+        proc = subprocess.run(
+            [sys.executable, "-c", probe],
+            capture_output=True,
+            text=True,
+            env=env,
+            timeout=120,
+        )
+        self.assertEqual(proc.returncode, 0, proc.stderr[-800:])
+
+    def test_force_uncompile_does_not_manufacture_a_death(self):
+        # function_destroyed_notifications is the proof that death
+        # notifications are delivered at all, so administrative
+        # unpublication must not move it: force_uncompile of a live
+        # function leaves the counter flat, and the real death afterwards
+        # moves it exactly once.
+        env = dict(os.environ)
+        env["CINDERX_JIT_MODE"] = "canary"
+        env["PYTHONJITAUTO"] = "1000000"
+        probe = textwrap.dedent(
+            """
+            import _cinderx, cinderx
+            cinderx.init()
+            _cinderx.install_frame_evaluator()
+            import cinderjit
+
+            src = (
+                "def undead(a, b):\\n"
+                "    total = a - a\\n"
+                "    while total < b:\\n"
+                "        total = total + a\\n"
+                "    return total\\n"
+            )
+            ns = {}
+            exec(src, ns)
+            fn = ns.pop("undead")  # keep it out of a cycle with its globals
+            assert cinderjit.force_compile(fn) is True
+            assert fn(2, 6) == 6
+
+            def deaths():
+                stats = _cinderx._get_trigger_stats()
+                return stats["function_destroyed_notifications"]
+
+            before = deaths()
+            assert cinderjit.force_uncompile(fn) is True
+            assert cinderjit.is_jit_compiled(fn) is False
+            assert deaths() == before, (before, deaths())
+            assert fn(2, 6) == 6  # still callable, through the interpreter
+            assert deaths() == before, (before, deaths())
+            del fn
+            assert deaths() == before + 1, (before, deaths())
             """
         )
         proc = subprocess.run(

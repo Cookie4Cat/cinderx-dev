@@ -3635,6 +3635,156 @@ def defaulted(x):
   EXPECT_EQ(PyLong_AsLong(defaulted), 42);
 }
 
+TEST_F(JITLifecycle311Test, ReplacingCodeStopsTheOldMachineCode) {
+  SKIP_311_EXECUTABLE_COMPILE();
+
+  // 3.11 has no function watcher, so nothing announces that __code__ moved.
+  // The guarded entry notices on the next call instead: the artifact was
+  // built for the old code object and must not run for the new one.
+  const char* py_src = R"(
+def swapped(x):
+    return x + 1
+
+def replacement(x):
+    return x + 100
+)";
+
+  Ref<PyFunctionObject> func(compileAndGet(py_src, "swapped"));
+  Ref<PyFunctionObject> other(getGlobal("replacement"));
+  ASSERT_NE(func, nullptr);
+  ASSERT_NE(other, nullptr);
+  ASSERT_EQ(jit::compileFunction(func), jit::Result::OK);
+  ASSERT_TRUE(isJitCompiled(func));
+
+  auto arg = makeLong(1);
+  auto args = Ref<>::steal(PyTuple_Pack(1, arg.get()));
+  auto before = Ref<>::steal(PyObject_Call(func, args, nullptr));
+  ASSERT_NE(before, nullptr);
+  ASSERT_EQ(PyLong_AsLong(before), 2);
+
+  ASSERT_EQ(PyObject_SetAttrString(func, "__code__", other->func_code), 0);
+
+  EXPECT_FALSE(isJitCompiled(func))
+      << "the function still reports as compiled for code it no longer has";
+  EXPECT_EQ(Ci_JitShell311_InstalledArtifact(func), nullptr);
+
+  // The answer has to come from the new code, not the old machine code.
+  auto after = Ref<>::steal(PyObject_Call(func, args, nullptr));
+  ASSERT_NE(after, nullptr);
+  EXPECT_EQ(PyLong_AsLong(after), 101);
+}
+
+TEST_F(JITLifecycle311Test, ForceUncompileAffectsLaterCallsOnly) {
+  SKIP_311_EXECUTABLE_COMPILE();
+
+  const char* py_src = R"(
+def undo_me(x):
+    return x * 2
+)";
+
+  Ref<PyFunctionObject> func(compileAndGet(py_src, "undo_me"));
+  ASSERT_NE(func, nullptr);
+  auto mod = importCinderJitModule();
+  callJitOneArg(mod, "force_compile", func);
+  ASSERT_TRUE(isJitCompiled(func));
+
+  jit::Context* ctx = jit::getContext();
+  ASSERT_NE(ctx, nullptr);
+  size_t resident_before = ctx->compiledCodes().size();
+  ASSERT_GT(resident_before, 0u);
+
+  auto arg = makeLong(21);
+  auto args = Ref<>::steal(PyTuple_Pack(1, arg.get()));
+  auto compiled_result = Ref<>::steal(PyObject_Call(func, args, nullptr));
+  ASSERT_NE(compiled_result, nullptr);
+  ASSERT_EQ(PyLong_AsLong(compiled_result), 42);
+
+  callJitOneArg(mod, "force_uncompile", func);
+
+  EXPECT_FALSE(isJitCompiled(func));
+  EXPECT_EQ(Ci_JitShell311_InstalledArtifact(func), nullptr);
+  EXPECT_LT(ctx->compiledCodes().size(), resident_before)
+      << "the artifact is still resident after force_uncompile";
+
+  // Still callable, still correct, now through the interpreter.
+  auto after = Ref<>::steal(PyObject_Call(func, args, nullptr));
+  ASSERT_NE(after, nullptr);
+  EXPECT_EQ(PyLong_AsLong(after), 42);
+
+  // And compiling it again has to work rather than report "already done".
+  callJitOneArg(mod, "force_compile", func);
+  EXPECT_TRUE(isJitCompiled(func));
+  auto recompiled = Ref<>::steal(PyObject_Call(func, args, nullptr));
+  ASSERT_NE(recompiled, nullptr);
+  EXPECT_EQ(PyLong_AsLong(recompiled), 42);
+}
+
+namespace {
+// The midpoint hook takes a plain function pointer, so the reference the
+// hook drops lives at namespace scope.
+Ref<PyFunctionObject> s_uncompile_last_ref_slot;
+} // namespace
+
+TEST_F(JITLifecycle311Test, UncompileSurvivesLosingItsLastReferenceMidway) {
+  SKIP_311_EXECUTABLE_COMPILE();
+
+  // The lifecycle contract says a function cannot die in the middle of a
+  // JIT operation on it because its last reference fell.  Python callers
+  // cannot construct that state -- the call machinery owns the argument for
+  // the duration -- so this drives the raw C entry with a borrowed pointer
+  // and drops the only strong reference from the midpoint hook, exactly
+  // between force_uncompile's unpublication and its artifact retirement.
+  // The operation's own pin has to carry the function to the end; the death
+  // then lands after the operation, is reported once, and leaves nothing
+  // registered.
+  const char* py_src = R"(
+def vanishing(x):
+    return x + 7
+)";
+
+  Ref<PyFunctionObject> func(compileAndGet(py_src, "vanishing"));
+  ASSERT_NE(func, nullptr);
+  ASSERT_EQ(jit::compileFunction(func), jit::Result::OK);
+  ASSERT_TRUE(isJitCompiled(func));
+
+  // Reduce the function to a single strong reference and park it where the
+  // hook can reach it.
+  ASSERT_EQ(PyDict_DelItemString(func->func_globals, "vanishing"), 0);
+  s_uncompile_last_ref_slot = std::move(func);
+  ASSERT_EQ(
+      Py_REFCNT(reinterpret_cast<PyObject*>(s_uncompile_last_ref_slot.get())),
+      1);
+
+  // Fetch the raw C function so the call adds no argument reference.
+  auto mod = importCinderJitModule();
+  auto uncompile_obj =
+      Ref<>::steal(PyObject_GetAttrString(mod, "force_uncompile"));
+  ASSERT_NE(uncompile_obj, nullptr);
+  ASSERT_TRUE(PyCFunction_Check(uncompile_obj.get()));
+  PyCFunction raw = PyCFunction_GetFunction(uncompile_obj.get());
+  PyObject* self = PyCFunction_GetSelf(uncompile_obj.get());
+  ASSERT_NE(raw, nullptr);
+
+  uint64_t deaths_before =
+      jit::triggerStatsSnapshot().function_destroyed_notifications;
+  BorrowedRef<PyFunctionObject> borrowed = s_uncompile_last_ref_slot.get();
+  jit::setUncompileMidpointHookForTest(
+      []() { s_uncompile_last_ref_slot.reset(); });
+  auto result =
+      Ref<>::steal(raw(self, reinterpret_cast<PyObject*>(borrowed.get())));
+  jit::setUncompileMidpointHookForTest(nullptr);
+
+  ASSERT_NE(result, nullptr);
+  EXPECT_EQ(result.get(), Py_True);
+  EXPECT_EQ(s_uncompile_last_ref_slot, nullptr)
+      << "the midpoint hook did not run";
+  uint64_t deaths_after =
+      jit::triggerStatsSnapshot().function_destroyed_notifications;
+  EXPECT_EQ(deaths_after, deaths_before + 1)
+      << "the subject of force_uncompile must die exactly once, after the "
+         "operation, not in the middle of it";
+}
+
 TEST_F(JITLifecycle311Test, PausedArtifactStaysResidentAndReattaches) {
   SKIP_311_EXECUTABLE_COMPILE();
 
@@ -4060,6 +4210,302 @@ class Downer:
   auto arg_b = makeLong(5);
   auto args = Ref<>::steal(PyTuple_Pack(2, arg_a.get(), arg_b.get()));
   auto result = Ref<>::steal(PyObject_Call(alpha, args, nullptr));
+  ASSERT_NE(result, nullptr);
+  EXPECT_EQ(PyLong_AsLong(result), 6);
+}
+
+TEST_F(
+    JITLifecycle311Test,
+    ForceUncompileReportsReentrantCompileDuringRetirement) {
+  SKIP_311_EXECUTABLE_COMPILE();
+
+  // A __del__ riding the retirement's releases can reenter
+  // force_compile(); the newer decision wins and uncompile must not
+  // report success over it -- verdict after every release.
+  const char* py_src = R"(
+events = []
+
+def waverer(a, b):
+    total = a - a
+    while total < b:
+        total = total + a
+    return total
+
+def afterimage(a, b):
+    total = a + a
+    while total < b:
+        total = total + a
+    return total
+
+class Reenter:
+    def __init__(self, target):
+        self.target = target
+    def __del__(self):
+        events.append("del")
+        import cinderjit
+        try:
+            events.append(cinderjit.force_compile(self.target))
+        except Exception as exc:  # noqa: BLE001
+            events.append(type(exc).__name__)
+)";
+
+  Ref<PyFunctionObject> func(compileAndGet(py_src, "waverer"));
+  Ref<PyFunctionObject> donor(getGlobal("afterimage"));
+  ASSERT_NE(func, nullptr);
+  ASSERT_NE(donor, nullptr);
+  ASSERT_EQ(jit::compileFunction(func), jit::Result::OK);
+  ASSERT_TRUE(isJitCompiled(func));
+
+  jit::Context* ctx = jit::getContext();
+  ASSERT_NE(ctx, nullptr);
+  jit::CompiledFunction* prior_art = ctx->lookupFunc(func);
+  ASSERT_NE(prior_art, nullptr);
+  ASSERT_NE(prior_art->runtime(), nullptr);
+
+  runCode("k = Reenter(waverer)\n");
+  {
+    Ref<> trigger(getGlobal("k"));
+    ASSERT_NE(trigger, nullptr);
+    prior_art->runtime()->addReference(trigger);
+  }
+  runCode("del k\n");
+
+  // Swap to new code so the reentrant force_compile() has something fresh
+  // to compile and publish.
+  ASSERT_EQ(PyObject_SetAttrString(func, "__code__", donor->func_code), 0);
+
+  auto mod = importCinderJitModule();
+  auto failed = Ref<>::steal(
+      PyObject_CallMethod(mod, "force_uncompile", "O", func.get()));
+  EXPECT_EQ(failed, nullptr)
+      << "force_uncompile() reported success over a reentrant recompile";
+  ASSERT_TRUE(PyErr_Occurred());
+  EXPECT_TRUE(PyErr_ExceptionMatches(PyExc_RuntimeError));
+  PyErr_Clear();
+
+  // The newer decision owns the world: the reentry's publication stands.
+  EXPECT_TRUE(isJitCompiled(func));
+  Ref<> events(getGlobal("events"));
+  ASSERT_NE(events, nullptr);
+  ASSERT_EQ(PyList_GET_SIZE(events.get()), 2);
+  EXPECT_EQ(PyList_GET_ITEM(events.get(), 1), Py_True)
+      << "the reentrant compile inside the retirement did not succeed";
+
+  // With no trigger left, uncompilation completes and reports honestly.
+  auto clean = Ref<>::steal(
+      PyObject_CallMethod(mod, "force_uncompile", "O", func.get()));
+  ASSERT_NE(clean, nullptr);
+  EXPECT_EQ(clean.get(), Py_True);
+  EXPECT_FALSE(isJitCompiled(func));
+}
+
+TEST_F(JITLifecycle311Test, ForceUncompileIgnoresForgedForeignAnchor) {
+  SKIP_311_EXECUTABLE_COMPILE();
+
+  // A forged foreign value at the user-writable key can be the last
+  // reference to ANOTHER function's artifact; uncompile(f1) must not
+  // release it.  The key is touched only when it holds the claimed
+  // artifact itself.
+  const char* py_src = R"(
+def keeper(a, b):
+    total = a - a
+    while total < b:
+        total = total + a
+    return total
+
+def neighbour(a, b):
+    total = a + a
+    while total < b:
+        total = total + a
+    return total
+)";
+
+  Ref<PyFunctionObject> f1(compileAndGet(py_src, "keeper"));
+  Ref<PyFunctionObject> f2(getGlobal("neighbour"));
+  ASSERT_NE(f1, nullptr);
+  ASSERT_NE(f2, nullptr);
+  ASSERT_EQ(jit::compileFunction(f1), jit::Result::OK);
+  ASSERT_EQ(jit::compileFunction(f2), jit::Result::OK);
+
+  jit::Context* ctx = jit::getContext();
+  ASSERT_NE(ctx, nullptr);
+  jit::CompiledFunction* art_b = ctx->lookupFunc(f2);
+  ASSERT_NE(art_b, nullptr);
+
+  // Keep A alive independently, forge B into f1's anchor slot, and make
+  // that forged reference B's only strong one.
+  auto pin_a = Ref<jit::CompiledFunction>::create(ctx->lookupFunc(f1));
+  ASSERT_NE(pin_a, nullptr);
+  runCode(
+      "keeper.__dict__['__cinderx_compiled_func__'] = "
+      "neighbour.__dict__['__cinderx_compiled_func__']\n"
+      "del neighbour.__dict__['__cinderx_compiled_func__']\n");
+  ASSERT_TRUE(isJitCompiled(f2));
+
+  auto mod = importCinderJitModule();
+  {
+    auto ok = Ref<>::steal(
+        PyObject_CallMethod(mod, "force_uncompile", "O", f1.get()));
+    ASSERT_NE(ok, nullptr);
+    EXPECT_EQ(ok.get(), Py_True);
+  }
+  EXPECT_FALSE(isJitCompiled(f1));
+
+  // The neighbour's world is untouched: installed, associated, reachable,
+  // and still executing machine code.
+  EXPECT_TRUE(isJitCompiled(f2))
+      << "uncompiling f1 retired f2's artifact through a forged anchor";
+  EXPECT_EQ(ctx->lookupFunc(f2), art_b);
+  EXPECT_EQ(ctx->findAssociated(f2).get(), art_b);
+  // The forged value stays exactly where the user wrote it.
+  ASSERT_NE(f1->func_dict, nullptr);
+  EXPECT_EQ(
+      PyDict_GetItemWithError(f1->func_dict, jit::kCompiledFunctionKey),
+      reinterpret_cast<PyObject*>(art_b));
+  PyErr_Clear();
+
+  uint64_t entries_before = jit::triggerStatsSnapshot().machine_code_entries;
+  auto arg_a = makeLong(2);
+  auto arg_b = makeLong(5);
+  auto args = Ref<>::steal(PyTuple_Pack(2, arg_a.get(), arg_b.get()));
+  auto result = Ref<>::steal(PyObject_Call(f2, args, nullptr));
+  ASSERT_NE(result, nullptr);
+  EXPECT_EQ(PyLong_AsLong(result), 6);
+  EXPECT_EQ(
+      jit::triggerStatsSnapshot().machine_code_entries, entries_before + 1)
+      << "the neighbour fell back to the interpreter";
+}
+
+TEST_F(
+    JITLifecycle311Test,
+    ForceUncompilePreservesSameKeyReentrantPublication) {
+  SKIP_311_EXECUTABLE_COMPILE();
+
+  // Same-key variant: no code swap, so the reentrant successor lives
+  // under the very key the retirement erases.  Blind by-key erase left it
+  // installed-but-unreachable (lookupFunc null) and outside the
+  // destructor's pin-and-sever walk.
+  const char* py_src = R"(
+events = []
+
+def steady(a, b):
+    total = a - a
+    while total < b:
+        total = total + a
+    return total
+
+class Reenter:
+    def __init__(self, target):
+        self.target = target
+    def __del__(self):
+        events.append("del")
+        import cinderjit
+        try:
+            events.append(cinderjit.force_compile(self.target))
+        except Exception as exc:  # noqa: BLE001
+            events.append(type(exc).__name__)
+)";
+
+  Ref<PyFunctionObject> func(compileAndGet(py_src, "steady"));
+  ASSERT_NE(func, nullptr);
+  ASSERT_EQ(jit::compileFunction(func), jit::Result::OK);
+  ASSERT_TRUE(isJitCompiled(func));
+
+  jit::Context* ctx = jit::getContext();
+  ASSERT_NE(ctx, nullptr);
+  jit::CompiledFunction* prior_art = ctx->lookupFunc(func);
+  ASSERT_NE(prior_art, nullptr);
+  ASSERT_NE(prior_art->runtime(), nullptr);
+
+  runCode("k = Reenter(steady)\n");
+  {
+    Ref<> trigger(getGlobal("k"));
+    ASSERT_NE(trigger, nullptr);
+    prior_art->runtime()->addReference(trigger);
+  }
+  runCode("del k\n");
+
+  // No __code__ swap: the reentrant publication reuses the same key.
+  auto mod = importCinderJitModule();
+  auto failed = Ref<>::steal(
+      PyObject_CallMethod(mod, "force_uncompile", "O", func.get()));
+  EXPECT_EQ(failed, nullptr)
+      << "force_uncompile() reported success over a reentrant recompile";
+  ASSERT_TRUE(PyErr_Occurred());
+  EXPECT_TRUE(PyErr_ExceptionMatches(PyExc_RuntimeError));
+  PyErr_Clear();
+
+  // The successor's world is whole: installed, associated, and -- the
+  // point of this case -- still reachable through the compiled-codes map.
+  EXPECT_TRUE(isJitCompiled(func));
+  jit::CompiledFunction* successor = ctx->lookupFunc(func);
+  ASSERT_NE(successor, nullptr)
+      << "the retirement erased the successor's compiled-codes entry";
+  EXPECT_EQ(successor, ctx->findAssociated(func).get());
+
+  Ref<> events(getGlobal("events"));
+  ASSERT_NE(events, nullptr);
+  ASSERT_EQ(PyList_GET_SIZE(events.get()), 2);
+  EXPECT_EQ(PyList_GET_ITEM(events.get(), 1), Py_True);
+
+  auto arg_a = makeLong(2);
+  auto arg_b = makeLong(5);
+  auto args = Ref<>::steal(PyTuple_Pack(2, arg_a.get(), arg_b.get()));
+  auto result = Ref<>::steal(PyObject_Call(func, args, nullptr));
+  ASSERT_NE(result, nullptr);
+  EXPECT_EQ(PyLong_AsLong(result), 6);
+}
+
+TEST_F(JITLifecycle311Test, StaleArtifactDeathPreservesSameKeySuccessor) {
+  SKIP_311_EXECUTABLE_COMPILE();
+
+  // Death-path sequence pin: a pinned stale artifact dies after a
+  // same-key successor published; the successor must survive.  (Today the
+  // stale generation reaches death already cleared; the identity guard on
+  // the death-path erase is the backstop for future uncleared paths.)
+  const char* py_src = R"(
+def perennial(a, b):
+    total = a - a
+    while total < b:
+        total = total + a
+    return total
+)";
+
+  Ref<PyFunctionObject> func(compileAndGet(py_src, "perennial"));
+  ASSERT_NE(func, nullptr);
+  ASSERT_EQ(jit::compileFunction(func), jit::Result::OK);
+
+  jit::Context* ctx = jit::getContext();
+  ASSERT_NE(ctx, nullptr);
+  auto pin = Ref<jit::CompiledFunction>::create(ctx->lookupFunc(func));
+  ASSERT_NE(pin, nullptr);
+
+  auto mod = importCinderJitModule();
+  {
+    auto ok = Ref<>::steal(
+        PyObject_CallMethod(mod, "force_uncompile", "O", func.get()));
+    ASSERT_NE(ok, nullptr);
+    EXPECT_EQ(ok.get(), Py_True);
+  }
+  ASSERT_FALSE(isJitCompiled(func));
+
+  // Publish the successor under the same key, then let the stale
+  // generation die.
+  callJitOneArg(mod, "force_compile", func);
+  ASSERT_TRUE(isJitCompiled(func));
+  jit::CompiledFunction* successor = ctx->lookupFunc(func);
+  ASSERT_NE(successor, nullptr);
+  ASSERT_NE(successor, pin.get());
+
+  pin.reset();
+
+  EXPECT_TRUE(isJitCompiled(func));
+  EXPECT_EQ(ctx->lookupFunc(func), successor)
+      << "the stale generation's death erased the successor's entry";
+  auto arg_a = makeLong(2);
+  auto arg_b = makeLong(5);
+  auto args = Ref<>::steal(PyTuple_Pack(2, arg_a.get(), arg_b.get()));
+  auto result = Ref<>::steal(PyObject_Call(func, args, nullptr));
   ASSERT_NE(result, nullptr);
   EXPECT_EQ(PyLong_AsLong(result), 6);
 }
