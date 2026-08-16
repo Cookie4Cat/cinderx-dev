@@ -44,6 +44,30 @@ void clearCachedCompiledIfMatches(
     BorrowedRef<PyCodeObject> code,
     CompiledFunction* compiled);
 
+#if PY_VERSION_HEX < 0x030C0000
+// The owner half of a death-watch callback payload.  A raw Context* would
+// not be a lifetime the callback can rely on: CPython's weak-reference
+// machinery snapshots the pending callbacks -- holding strong references
+// to them -- before invoking any, so a callback that ran earlier in the
+// same batch can destroy the context and the later, already-snapshotted
+// callback still runs.  The cell travels in a capsule owned by every
+// payload that names it; ~Context nulls the cell before the context
+// becomes invalid, and the capsule's own reference count keeps the cell
+// readable for as long as any callback can still fire.  One cell per
+// context instance, so a recycled Context address cannot impersonate a
+// dead one.
+struct DeathWatchOwnerCell {
+  Context* ctx;
+};
+
+constexpr const char* kDeathWatchOwnerCapsule = "cinderx.death-watch-owner";
+
+void deathWatchOwnerCapsuleDestructor(PyObject* capsule) {
+  delete static_cast<DeathWatchOwnerCell*>(
+      PyCapsule_GetPointer(capsule, kDeathWatchOwnerCapsule));
+}
+#endif
+
 PyModuleDef* findBuiltinsModule() {
   // We want to check the exact function address, rather than relying on modules
   // which can be mutated.  First find builtins, which we have to do a search
@@ -158,12 +182,27 @@ Context::~Context() {
   // Deferred displaced anchors hold owning references whose release runs
   // Python and reaches back into the registries below (an artifact's
   // destructor erases itself from the maps); drain them first, while every
-  // map is still intact and function deaths are still being reported, so
-  // anything the drain kills is cleaned out of the registries properly.
+  // map is still intact and the owner token is still live, so a function
+  // the drain kills reports into this context and is cleaned out of the
+  // registries properly -- a dangling borrowed entry left behind here
+  // would be written through by the severing walk below.
   drainDeferredAnchorReleases();
-  // Stop being told about function deaths before the registries a
-  // notification would touch are taken apart.
-  clearFunctionDeathWatch();
+  // Then invalidate the death-watch owner token.  CPython's weak-reference
+  // machinery snapshots pending callbacks -- with strong references --
+  // before invoking them, so a callback armed by this context can still
+  // fire after this destructor: an earlier callback in the same batch may
+  // be what destroys us.  The capsule outlives the context by reference
+  // count; a nulled cell tells the late callback its owner is gone, and
+  // the process-wide death accounting still runs without us.  Deaths
+  // during the teardown below take the same ownerless path, and land
+  // after the severing walk has emptied every registry they would have
+  // touched.
+  if (death_watch_owner_token_ != nullptr) {
+    if (auto* cell = static_cast<DeathWatchOwnerCell*>(PyCapsule_GetPointer(
+            death_watch_owner_token_.get(), kDeathWatchOwnerCapsule))) {
+      cell->ctx = nullptr;
+    }
+  }
 #endif
   // The CodeExtra fast path caches a borrowed pointer to the artifact on the
   // code object, and the code object outlives this context.  clear(true)
@@ -179,10 +218,11 @@ Context::~Context() {
   // Clear all of the CompiledFunction's before we clear out the memory used for
   // the CodeRuntime allocated in the slab.
 #if PY_VERSION_HEX < 0x030C0000
-  // compiled_codes_ holds borrowed pointers, and on 3.11 an artifact owns the
-  // functions attached to it while a function's dictionary owns the artifact.
-  // Clearing one entry therefore releases references that can free a
-  // *different* entry, whose destructor calls forgetCompiledFunction() and
+  // compiled_codes_ holds borrowed pointers, and on 3.11 a function's
+  // dictionary owns its artifact (the member set is borrowed the other way).
+  // Clearing one entry therefore releases references that can reach a
+  // function and free a *different* entry's artifact through that anchor,
+  // whose destructor calls forgetCompiledFunction() and
   // erases from the map being iterated right here -- and can even free the
   // entry currently being cleared, so that clear() writes its own members
   // after they are gone.  Pin every artifact for the length of the loop.  The
@@ -193,9 +233,39 @@ Context::~Context() {
   for (auto& code : compiled_codes_) {
     pinned.emplace_back(Ref<CompiledFunction>::create(code.second));
   }
+
+  // Those same releases can run arbitrary Python -- a released reference's
+  // destructor, a collection it triggers -- and Python can kill a function
+  // this context still names by borrow.  Every artifact<->function link is
+  // therefore severed, and every borrowed registry emptied, before the
+  // first release: entry points are restored (pointer writes, and every
+  // function is still alive here because deaths have been reported right up
+  // to this instant), the artifacts forget their members, and the maps are
+  // cleared.  None of this runs Python.  A function that dies during the
+  // releases below then reports into empty registries and touches nothing.
+  //
+  // The death watch itself is dismantled last, for the same reason it
+  // exists: it is the only thing standing between a mid-teardown death and
+  // a dangling borrow.  Withdrawing it first would reopen exactly the
+  // window it closes -- a death during the releases would go unreported
+  // while borrowed pointers to the dead function were still being read.
+  for (auto& compiled : pinned) {
+    for (PyFunctionObject* func : compiled->functions()) {
+      func->vectorcall = getInterpretedVectorcall(func);
+    }
+    compiled->forgetFunctions();
+  }
+  compiled_funcs_.clear();
+  associated_funcs_.clear();
+  clearDeoptedFuncs();
+
   for (auto& compiled : pinned) {
     compiled->clear(true /* context_finalizing */);
   }
+
+  // Nothing borrowed is left for a notification to protect; drop the
+  // watches.  Dropping a weak reference runs no Python.
+  clearFunctionDeathWatch();
 #else
   for (auto& code : compiled_codes_) {
     code.second->clear(true /* context_finalizing */);
@@ -1191,11 +1261,11 @@ void Context::setCinderJitModule(Ref<> mod) {
 
 void Context::clearForMultithreadedCompileTest() {
   // Nothing here may release a reference until every artifact is pinned and
-  // both borrowed registries are empty.  On 3.11 an artifact owns its
-  // functions and a function's dictionary owns the artifact, so a release
-  // can destroy the artifact the loop is holding by borrow -- and its
-  // destructor erases from the very maps being walked.  Pin first, detach
-  // second, release last.
+  // both borrowed registries are empty.  On 3.11 a function's dictionary
+  // owns its artifact, so a release that reaches a function can destroy an
+  // artifact the loop is holding by borrow -- and its destructor erases
+  // from the very maps being walked.  Pin first, detach second, release
+  // last.
   std::vector<Ref<CompiledFunction>> pinned;
   pinned.reserve(compiled_funcs_.size());
   UnorderedSet<CompiledFunction*> seen;
@@ -1229,14 +1299,11 @@ void Context::clearForMultithreadedCompileTest() {
 
   for (auto& compiled : pinned) {
 #if PY_VERSION_HEX < 0x030C0000
-    // On 3.11 this set owns its functions, and clear() only reaches the
-    // branch that releases them while the artifact still has an owner.
-    // Detaching below would therefore take those references to the grave.
-    // Release them here, under the pin above -- releasing a function can
-    // drop the dictionary holding this artifact's last reference.  The
-    // functions keep the guarded entry, which refuses once the association
-    // is gone and sends them back to the interpreter.
-    compiled->releaseOwnedFunctions();
+    // Once detached, no function death routes back to this artifact: the
+    // death watch reports into the context registries, which are empty by
+    // now.  A retained association would be a pointer with nothing keeping
+    // it valid.
+    compiled->forgetFunctions();
 #endif
     // Disconnect from Context so clear() on eventual destruction won't call
     // back into us (e.g., forgetCompiledFunction, unwatch).
@@ -1255,16 +1322,16 @@ void Context::funcDestroyed(BorrowedRef<PyFunctionObject> func) {
   }
 #if PY_VERSION_HEX < 0x030C0000
   // Membership survives deopt on this branch, so a function that dies while
-  // parked is still named by its claiming artifact's owned-functions set;
-  // the installed-registry path above does not cover it.  Left in place the
+  // parked is still named by its claiming artifact's member set (a borrowed
+  // record); the installed-registry path above does not cover it.  Left in place the
   // entry would poison the ownership oracle for whichever function the
   // allocator hands this address to next -- and, once the claiming
   // artifact's own teardown runs, its member walk would write the entry
   // point of a function that no longer exists.  The claim is resolved
   // through the association map: after a __code__ swap the artifact is not
   // reachable through the function's current code object, so the code-extra
-  // ledger cannot answer for it.  Reachable only once a death notification
-  // exists -- while the set owns its entries nothing in it can die.
+  // ledger cannot answer for it.  Every record involved is borrowed; the
+  // death notification delivering this call is what keeps them honest.
   {
     auto assoc = associated_funcs_.find(func);
     if (assoc != associated_funcs_.end()) {
@@ -1291,7 +1358,7 @@ BorrowedRef<CompiledFunction> Context::lookupCode(
 namespace {
 
 // Weak-reference callback standing in for the function watcher this branch
-// does not have.  `self` carries the owning context and the function's
+// does not have.  `self` carries the owner token and the function's
 // address, captured when the watch was armed: the referent is already
 // cleared by the time a callback runs, so the identity has to travel with
 // the callback -- and so does the owner, because a watch belongs to the
@@ -1299,20 +1366,17 @@ namespace {
 // through the current module context instead, a death delivered for a
 // different context's watch would clean the wrong registries and leave the
 // owner holding freed pointers for its own teardown to write through.
-// The owner pointer stays valid for the life of the watch: ~Context severs
-// its registries and drops every watch before it dies, so no callback can
-// outlive the context it names.
 //
 // The addresses are registry keys.  Both delivery points -- func_dealloc
 // and the collector's weak-reference pass -- run before the function's
 // fields are cleared, which is what lets the unregistration read func_code
 // and func_module to unregister nested units.
 extern "C" PyObject* funcDeathWatch311(PyObject* self, PyObject* /*ref*/) {
-  auto* owner =
-      static_cast<Context*>(PyLong_AsVoidPtr(PyTuple_GET_ITEM(self, 0)));
+  auto* cell = static_cast<DeathWatchOwnerCell*>(
+      PyCapsule_GetPointer(PyTuple_GET_ITEM(self, 0), kDeathWatchOwnerCapsule));
   auto* func = static_cast<PyFunctionObject*>(
       PyLong_AsVoidPtr(PyTuple_GET_ITEM(self, 1)));
-  if (owner == nullptr || func == nullptr) {
+  if (cell == nullptr || func == nullptr) {
     PyErr_Clear();
     Py_RETURN_NONE;
   }
@@ -1320,8 +1384,16 @@ extern "C" PyObject* funcDeathWatch311(PyObject* self, PyObject* /*ref*/) {
   // must not leave an exception behind, nor disturb one already in flight.
   PyObject *type = nullptr, *value = nullptr, *traceback = nullptr;
   PyErr_Fetch(&type, &value, &traceback);
-  funcDestroyedInContext(owner, func);
-  owner->forgetFunctionDeathWatch(func);
+  Context* owner = cell->ctx;
+  if (owner != nullptr) {
+    funcDestroyedInContext(owner, func);
+    owner->forgetFunctionDeathWatch(func);
+  } else {
+    // The owning context died between the snapshot and this call.  Its
+    // registries are gone with it; the death is still real, so the
+    // process-wide accounting (and the notification counter) still runs.
+    funcDestroyedInContext(nullptr, func);
+  }
   PyErr_Clear();
   PyErr_Restore(type, value, traceback);
   Py_RETURN_NONE;
@@ -1361,18 +1433,26 @@ bool Context::watchFunctionDeath(BorrowedRef<PyFunctionObject> func) {
     // clears; the injection point exercises the same return path.
     return false;
   }
-  auto owner_address = Ref<>::steal(PyLong_FromVoidPtr(this));
-  if (owner_address == nullptr) {
-    PyErr_Clear();
-    return false;
+  if (death_watch_owner_token_ == nullptr) {
+    auto* cell = new (std::nothrow) DeathWatchOwnerCell{this};
+    if (cell == nullptr) {
+      return false;
+    }
+    death_watch_owner_token_ = Ref<>::steal(PyCapsule_New(
+        cell, kDeathWatchOwnerCapsule, deathWatchOwnerCapsuleDestructor));
+    if (death_watch_owner_token_ == nullptr) {
+      delete cell;
+      PyErr_Clear();
+      return false;
+    }
   }
   auto func_address = Ref<>::steal(PyLong_FromVoidPtr(func.get()));
   if (func_address == nullptr) {
     PyErr_Clear();
     return false;
   }
-  auto payload = Ref<>::steal(
-      PyTuple_Pack(2, owner_address.get(), func_address.get()));
+  auto payload = Ref<>::steal(PyTuple_Pack(
+      2, death_watch_owner_token_.get(), func_address.get()));
   if (payload == nullptr) {
     PyErr_Clear();
     return false;
@@ -1418,45 +1498,39 @@ size_t Context::watchedFunctionCount() const {
 
 void Context::addDeoptedFunc(BorrowedRef<PyFunctionObject> func) {
 #if PY_VERSION_HEX < 0x030C0000
-  // Own the reference on 3.11.  This set is walked again when the JIT is
-  // re-enabled, and nothing tells the runtime that a function died in the
-  // meantime -- there are no function watchers -- so a borrowed pointer
-  // here is a function that can be freed while paused and dereferenced on
-  // the way back.  The reference is released when the function leaves the
-  // set, which re-enabling and finalization both do.
-  if (deopted_funcs_.emplace(func).second) {
-    Py_INCREF(func.get());
+  // A borrowed entry is safe here only because the death watch removes it:
+  // 3.11 has no function watcher, so without that this set would be walked
+  // again at enable() with a pointer to a function that died while paused.
+  // The watch therefore comes first, and a function it cannot cover is not
+  // parked at all: it simply is not re-attached at enable(), which loses a
+  // convenience, where a watchless borrowed entry loses memory safety.  In
+  // practice the arm is a lookup hit -- publication armed it, and nothing
+  // between publication and a deopt disarms it.
+  if (!watchFunctionDeath(func)) {
+    JIT_DLOG(
+        "Cannot arm the death watch for {}; leaving it un-parked",
+        funcFullname(func));
+    return;
   }
-  watchFunctionDeath(func);
-#else
-  deopted_funcs_.emplace(func);
 #endif
+  deopted_funcs_.emplace(func);
 }
 
 void Context::removeDeoptedFunc(BorrowedRef<PyFunctionObject> func) {
 #if PY_VERSION_HEX < 0x030C0000
-  if (deopted_funcs_.erase(func) > 0) {
-    Py_DECREF(func.get());
-  }
+  deopted_funcs_.erase(func);
 #else
   deopted_funcs_.erase(func);
 #endif
 }
 
 void Context::clearDeoptedFuncs() {
-  // Detach before releasing.  A release here can be the last reference to a
-  // function, and destroying it runs arbitrary Python -- __del__ on anything
-  // its dictionary holds -- which can re-enter the JIT.  enable() walks this
-  // very set, so a re-entrant call during the loop below would mutate the
-  // container being iterated and release entries a second time.  Emptying it
-  // first leaves re-entry nothing to walk.
+  // Detach rather than clear in place.  The entries are borrowed now, so
+  // nothing here runs Python -- but enable() walks this same set, and a
+  // future release on this path would re-enter through a destructor.  Swap
+  // out so re-entry has nothing to walk either way.
   UnorderedSet<BorrowedRef<PyFunctionObject>> parked;
   parked.swap(deopted_funcs_);
-#if PY_VERSION_HEX < 0x030C0000
-  for (BorrowedRef<PyFunctionObject> func : parked) {
-    Py_DECREF(func.get());
-  }
-#endif
 }
 
 #if PY_VERSION_HEX < 0x030C0000
@@ -1513,8 +1587,9 @@ bool Context::removeCompiledFunc(BorrowedRef<PyFunctionObject> func) {
 #if PY_VERSION_HEX >= 0x030C0000
     in_compiled_funcs->second->removeFunction(func);
 #else
-    // Membership survives a deopt on 3.11: the artifact's owned-functions
-    // set is the ownership oracle -- the only record of "whose artifact is
+    // Membership survives a deopt on 3.11: the artifact's member set --
+    // borrowed, kept honest by death notifications -- is the ownership
+    // oracle -- the only record of "whose artifact is
     // this" that Python code cannot write to -- and the one-artifact-per-
     // code refusal consults it to let a parked function back onto its own
     // artifact.  What ends here is the installation, recorded by this

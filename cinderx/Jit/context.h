@@ -612,7 +612,7 @@ class Context : public IJitContext, public CompiledFunctionOwner {
 #if PY_VERSION_HEX < 0x030C0000
   /*
    * Which artifact claims each function: the inverse of the artifacts'
-   * owned-functions sets, and the lookup the installed registry cannot
+   * artifacts' member sets, and the lookup the installed registry cannot
    * answer.  Association identity and installation identity are distinct
    * states on this branch: compiled_funcs_ records what is installed right
    * now and empties on a deopt, while the association survives parking so
@@ -622,8 +622,8 @@ class Context : public IJitContext, public CompiledFunctionOwner {
    * needs this map, because the function is then neither installed nor
    * reachable through its current code object.
    *
-   * Entries are borrowed on both sides and maintained in lockstep with the
-   * owned-functions sets: created in finalizeFunc(), transferred by its
+   * Entries are borrowed on both sides and move together with the
+   * artifacts' member sets: created in finalizeFunc(), transferred by its
    * stale-claim severing, and erased by funcDestroyed() and by the death
    * of the claiming artifact (forgetCompiledFunction).
    */
@@ -664,6 +664,22 @@ class Context : public IJitContext, public CompiledFunctionOwner {
    * the last registry let go.
    */
   UnorderedMap<PyFunctionObject*, Ref<>> func_death_watch_;
+
+  /*
+   * The death-watch owner token: a capsule around a heap cell naming this
+   * context, shared by every watch callback this context arms.
+   *
+   * A raw Context* in the callback payload is not a lifetime the callback
+   * can rely on: CPython's weak-reference machinery snapshots the pending
+   * callbacks -- with strong references -- before invoking any of them, so
+   * an earlier callback in the same batch can destroy this context and the
+   * later, already-snapshotted callback still runs.  The token outlives
+   * the context by reference count; ~Context nulls the cell before the
+   * context becomes invalid, and a callback that reads a null cell knows
+   * its owner is gone.  The cell is per-context-instance, so a recycled
+   * Context address can never impersonate a dead one.
+   */
+  Ref<> death_watch_owner_token_;
 #endif
 
   /*
