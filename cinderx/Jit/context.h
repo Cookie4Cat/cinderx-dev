@@ -607,7 +607,7 @@ class Context : public IJitContext, public CompiledFunctionOwner {
 #if PY_VERSION_HEX < 0x030C0000
   /*
    * Which artifact claims each function: the inverse of the artifacts'
-   * owned-functions sets, and the lookup the installed registry cannot
+   * artifacts' member sets, and the lookup the installed registry cannot
    * answer.  Association identity and installation identity are distinct
    * states on this branch: compiled_funcs_ records what is installed right
    * now and empties on a deopt, while the association survives parking so
@@ -617,8 +617,8 @@ class Context : public IJitContext, public CompiledFunctionOwner {
    * needs this map, because the function is then neither installed nor
    * reachable through its current code object.
    *
-   * Entries are borrowed on both sides and maintained in lockstep with the
-   * owned-functions sets: created in finalizeFunc(), transferred by its
+   * Entries are borrowed on both sides and move together with the
+   * artifacts' member sets: created in finalizeFunc(), transferred by its
    * stale-claim severing, and erased by funcDestroyed() and by the death
    * of the claiming artifact (forgetCompiledFunction).
    */
@@ -652,6 +652,15 @@ class Context : public IJitContext, public CompiledFunctionOwner {
    * nothing to erase.
    */
   UnorderedMap<PyFunctionObject*, Ref<>> func_death_watch_;
+
+  /*
+   * Death-watch owner token: capsule-held cell naming this context, shared
+   * by every armed callback.  ClearWeakRefs snapshots callbacks before
+   * invoking any, so a raw Context* can dangle; the cell is nulled by
+   * ~Context, outlives it by refcount, and is per-instance (a recycled
+   * address cannot impersonate a dead owner).
+   */
+  Ref<> death_watch_owner_token_;
 #endif
 
   /*

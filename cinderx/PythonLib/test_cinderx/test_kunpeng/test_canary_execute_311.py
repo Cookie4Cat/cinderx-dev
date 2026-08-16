@@ -720,13 +720,12 @@ class CanaryExecute311Test(unittest.TestCase):
         self.assertEqual(proc.returncode, 0, proc.stderr[-800:])
         self.assertIn("state matches the entry", proc.stdout)
 
-    def test_pinned_artifact_keeps_its_function_alive(self):
+    def test_function_dies_independently_of_its_pinned_artifact(self):
         # The artifact is an ordinary object in the function's __dict__, so
-        # Python can hold it on its own.  With borrowed references the
-        # function could then die while the registry still pointed at it,
-        # and reading the registry dereferenced freed memory.  On 3.11 the
-        # artifact owns its function instead; the cycle is collectable, so
-        # dropping the pin still releases both.
+        # An external pin must not keep the function alive: it dies with
+        # its last reference, the watch drains the logical registries, and
+        # the machine code stays resident as long as the pin.  (Popped from
+        # globals first: CodeRuntime holds the globals dict strongly.)
         env = dict(os.environ)
         env["CINDERX_JIT_MODE"] = "canary"
         env["PYTHONJITAUTO"] = "1000000"
@@ -751,30 +750,38 @@ class CanaryExecute311Test(unittest.TestCase):
                 "    return total\\n",
                 namespace,
             )
-            victim = namespace["victim"]
+            victim = namespace.pop("victim")
             del namespace
             assert cinderjit.force_compile(victim) is True
             assert victim(3, 5, 1) == 15
 
+            def deaths():
+                stats = _cinderx._get_trigger_stats()
+                return stats["function_destroyed_notifications"]
+
             pin = victim.__dict__["__cinderx_compiled_func__"]
             alive = weakref.ref(victim)
+            before = deaths()
             del victim
             gc.collect()
-            # Churn the allocator so a freed function object would be reused.
+            # Churn the allocator so a dangling registry entry would point
+            # into poisoned memory rather than a stale-but-intact object.
             junk = [bytearray(400) for _ in range(5000)]
 
-            assert alive() is not None, "the artifact did not keep it alive"
-            listed = cinderjit.get_compiled_functions()
-            assert len(listed) == 1, listed
-            assert listed[0].__qualname__ == "victim"
-            assert listed[0](3, 5, 1) == 15
-            del listed, junk
+            assert alive() is None, (
+                "an external artifact pin must not keep the function alive")
+            assert deaths() == before + 1, (before, deaths())
+            assert cinderjit.get_compiled_functions() == []
+            # The pin owns the physical residency; the function's death
+            # does not release it.
+            assert cinderjit._get_resident_compiled_functions() == 1
+            del junk
 
             del pin
             gc.collect()
+            assert cinderjit._get_resident_compiled_functions() == 0
             assert cinderjit.get_compiled_functions() == []
-            assert alive() is None, "the cycle did not collect"
-            print("pinned artifact kept its function alive")
+            print("function died independently of its pinned artifact")
             """
         )
         proc = subprocess.run(
@@ -785,7 +792,9 @@ class CanaryExecute311Test(unittest.TestCase):
             timeout=120,
         )
         self.assertEqual(proc.returncode, 0, proc.stderr[-800:])
-        self.assertIn("pinned artifact kept its function alive", proc.stdout)
+        self.assertIn(
+            "function died independently of its pinned artifact", proc.stdout
+        )
 
     def test_suppression_and_pause_actually_stop_the_jit(self):
         # A milestone may withhold what it cannot do; it may not withhold

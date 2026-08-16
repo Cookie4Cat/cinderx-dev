@@ -88,13 +88,17 @@ void codeDestroyed(BorrowedRef<PyCodeObject> code);
 void funcDestroyed(BorrowedRef<PyFunctionObject> func);
 
 /*
- * The context-explicit form.  A death notification belongs to the context
- * whose watch delivered it -- the 3.11 weak-reference watch carries its
- * owner -- so the cleanup must land in that context's registries, not in
- * whichever context the module currently holds.  The plain form above
- * routes to the module context and remains correct for the 3.12+ watcher.
+ * Context-explicit form: a death belongs to the context whose watch
+ * delivered it, never to whichever context the module currently holds.
  */
 void funcDestroyedInContext(Context* ctx, BorrowedRef<PyFunctionObject> func);
+
+/*
+ * Test-only: drive the registration path (register a function for future
+ * compilation without compiling it), which is otherwise reachable only
+ * through entry points the canary does not publish.
+ */
+bool registerFunctionForTest(BorrowedRef<PyFunctionObject> func);
 void funcModified(BorrowedRef<PyFunctionObject> func);
 void typeDestroyed(BorrowedRef<PyTypeObject> type);
 void typeModified(BorrowedRef<PyTypeObject> type);

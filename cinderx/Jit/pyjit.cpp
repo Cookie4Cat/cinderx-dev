@@ -1888,8 +1888,24 @@ bool registerFunction(BorrowedRef<PyFunctionObject> func) {
   JIT_CHECK(
       !getThreadedCompileContext().compileRunning(),
       "Not intended for using during threaded compilation");
+#if PY_VERSION_HEX < 0x030C0000
+  // Borrowed pointer: arm the death watch BEFORE recording it (same
+  // discipline as the installed/parked registries), or a function dying
+  // registered-but-never-compiled leaves a dangling key for batch compile.
+  if (!jitCtx()->watchFunctionDeath(func)) {
+    return false;
+  }
+#endif
   auto& jit_reg_units = cinderx::getModuleState()->registered_compilation_units;
-  jit_reg_units.emplace(func.getObj());
+  try {
+    jit_reg_units.emplace(func.getObj());
+  } catch (const std::bad_alloc&) {
+    // Report not-registered rather than letting the exception cross the
+    // C API.  The watch stays armed: a watch without registry entries is
+    // a benign no-op at delivery, and disarming here could withdraw a
+    // watch an earlier publication armed.
+    return false;
+  }
 
   return true;
 }
@@ -1946,15 +1962,6 @@ bool deoptFuncImpl(BorrowedRef<PyFunctionObject> func) {
     return false;
   }
 
-#if PY_VERSION_HEX < 0x030C0000
-  // On 3.11 the artifact owns its functions, and removeCompiledFunc()
-  // releases that reference.  A function whose only other owner is its own
-  // dictionary's artifact entry dies inside that call -- the dictionary
-  // clear drops the artifact too -- and the entry install below would then
-  // write into freed memory.  Hold the function until the entry is back on
-  // the interpreter.
-  Ref<PyFunctionObject> keep{Ref<PyFunctionObject>::create(func)};
-#endif
   if (!jitCtx()->removeCompiledFunc(func)) {
     return false;
   }
@@ -1963,11 +1970,6 @@ bool deoptFuncImpl(BorrowedRef<PyFunctionObject> func) {
 }
 
 void uncompileImpl(BorrowedRef<PyFunctionObject> func) {
-#if PY_VERSION_HEX < 0x030C0000
-  // deoptFuncImpl() can release the last reference the JIT holds on this
-  // function (see the guard there); forgetCode() still reads it.
-  Ref<PyFunctionObject> keep{Ref<PyFunctionObject>::create(func)};
-#endif
   deoptFuncImpl(func);
   jitCtx()->forgetCode(func);
 }
@@ -1984,13 +1986,6 @@ void uncompile(BorrowedRef<PyFunctionObject> func) {
  * Return true if the function was previously JIT-compiled, false otherwise.
  */
 bool deoptFunc(BorrowedRef<PyFunctionObject> func) {
-#if PY_VERSION_HEX < 0x030C0000
-  // Same hazard as in deoptFuncImpl(): once the artifact's owned reference
-  // is released in there, parking below would resurrect a freed pointer.
-  // The parked set takes its own reference, so the function survives this
-  // guard's release exactly when it was parked.
-  Ref<PyFunctionObject> keep{Ref<PyFunctionObject>::create(func)};
-#endif
   if (jitCtx() && deoptFuncImpl(func)) {
     jitCtx()->addDeoptedFunc(func);
     return true;
@@ -2058,9 +2053,9 @@ static bool reattachParkedFuncs() {
   // success, and a reattachment that takes over a prior artifact queues
   // that artifact's displaced anchor -- whose eventual release runs
   // arbitrary Python that can call disable() and INSERT into the set.  The
-  // strong references also keep each entry alive across the walk: on 3.11
-  // the parked set owns its entries, so an erase can drop the last
-  // reference while the call is still using it.
+  // strong references keep entries alive across the walk (the set holds
+  // by borrow); one that dies between snapshot and visit is skipped by the
+  // still-parked check, its death having erased it from the set.
   std::vector<Ref<PyFunctionObject>> parked;
   {
     auto& funcs = jitCtx()->deoptedFuncs();
@@ -4713,11 +4708,9 @@ int initialize() {
   // pull-based invalidation acceptance; neither shadow nor canary may walk
   // an unaccepted IC arm (dev plan MR-04).
   getMutableConfig().attr_caches = false;
-  // A compiled artifact may not be shared across function objects until the
-  // MR-05 lifecycle lands: 3.11 has no function-destroy notification (the
-  // compatibility shim's PyFunction_AddWatcher registers nothing), so a
-  // second owner keeps the artifact alive past the first owner's death and
-  // leaves that dead function as a borrowed pointer in the registry.
+  // Artifact sharing across functions stays off as policy: the death
+  // watch removed the old safety hazard, but twin adoption is scheduling
+  // policy with its own acceptance, outside this milestone.
   getMutableConfig().auto_code_twin_dedup = false;
   if (!canary_requested) {
     // Shadow owns the same front-end/compiler context as the executing JIT
@@ -4754,11 +4747,10 @@ int initialize() {
   // putting a guard-and-deopt arm under machine code.
   getMutableConfig().specialized_opcodes = false;
   // Refuse, do not silently clear: an immortal artifact skips the
-  // dictionary anchor and the owned-function association, so the registry
-  // would carry a borrowed function pointer with nothing behind it and the
-  // guarded entry would refuse a function the registry calls compiled.
-  // 3.11 raises no function-destroy notification to clean any of that up.
-  // The configuration is simply incompatible with this milestone's
+  // dictionary anchor and the function association, so the guarded entry
+  // would refuse a function the registry calls compiled -- and the death
+  // watch cannot reconcile that, because an immortalized function never
+  // dies.  The configuration is simply incompatible with this milestone's
   // ownership model, and saying so beats behaving as if it were honoured.
   if (getConfig().immortalize_compiled_functions) {
     PyErr_SetString(
@@ -5014,8 +5006,8 @@ void finalize() {
   // kFinalizing, so nothing their destructors run can re-arm the JIT --
   // before the registries they reach back into are torn down.
   jitCtx()->drainDeferredAnchorReleases();
-  // The deopted set owns its functions on this branch; release them
-  // before the context goes.
+  // The deopted set holds borrowed entries on this branch; empty it
+  // before the context goes so nothing walks it during teardown.
   jitCtx()->clearDeoptedFuncs();
 #endif
 
@@ -5381,6 +5373,10 @@ void codeDestroyed(BorrowedRef<PyCodeObject> code) {
     }
     notifyUnitDeletedDuringPreload(mod_state, code.getObj());
   }
+}
+
+bool registerFunctionForTest(BorrowedRef<PyFunctionObject> func) {
+  return registerFunction(func);
 }
 
 void funcDestroyedInContext(
