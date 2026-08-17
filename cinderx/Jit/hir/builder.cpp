@@ -399,6 +399,28 @@ bool isBannedName(std::string_view name) {
   return name == "eval" || name == "exec" || name == "locals";
 }
 
+#if PY_VERSION_HEX < 0x030C0000
+// co_names entries are Unicode objects, but CodeType.replace() can legally
+// insert a lone surrogate. PyUnicode_AsUTF8 then returns NULL and sets
+// UnicodeEncodeError; constructing a string_view from that pointer is UB.
+std::string_view nameAtOrRefuse(
+    PyObject* names,
+    Py_ssize_t i,
+    const char** refuse) {
+  if (*refuse != nullptr) {
+    return {};
+  }
+  PyObject* item = PyTuple_GET_ITEM(names, i);
+  const char* utf8 = item != nullptr ? PyUnicode_AsUTF8(item) : nullptr;
+  if (utf8 == nullptr) {
+    PyErr_Clear();
+    *refuse = "REFUSE_SHAPE_INVALID_UTF8_NAME";
+    return {};
+  }
+  return std::string_view(utf8);
+}
+#endif
+
 // True if the code object contains any branch back to an earlier instruction;
 // used as a structural proxy for "this function has a loop body" when gating
 // exact-int guard emission for specialized numeric opcodes.
@@ -1161,6 +1183,17 @@ const char* unsupportedShapeReason311(BorrowedRef<PyCodeObject> code) {
   if (hasIntConstLocalBinaryAccumulator311(code)) {
     return "REFUSE_SHAPE_INT_ACCUMULATOR_POLICY";
   }
+  PyObject* names = code->co_names;
+  if (names == nullptr || !PyTuple_Check(names)) {
+    return "REFUSE_SHAPE_INVALID_UTF8_NAME";
+  }
+  for (Py_ssize_t i = 0; i < PyTuple_GET_SIZE(names); i++) {
+    PyObject* item = PyTuple_GET_ITEM(names, i);
+    if (item == nullptr || PyUnicode_AsUTF8(item) == nullptr) {
+      PyErr_Clear();
+      return "REFUSE_SHAPE_INVALID_UTF8_NAME";
+    }
+  }
 #else
   (void)code;
 #endif
@@ -1170,8 +1203,9 @@ const char* unsupportedShapeReason311(BorrowedRef<PyCodeObject> code) {
 const char* unsupportedOpcodeReason311(BorrowedRef<PyCodeObject> code) {
 #if PY_VERSION_HEX < 0x030C0000
   PyObject* names = code->co_names;
+  const char* name_refuse = nullptr;
   auto name_at = [&](Py_ssize_t i) {
-    return std::string_view(PyUnicode_AsUTF8(PyTuple_GET_ITEM(names, i)));
+    return nameAtOrRefuse(names, i, &name_refuse);
   };
   BytecodeInstructionBlock bc_instrs{code};
   for (auto bc_it = bc_instrs.begin(); bc_it != bc_instrs.end(); ++bc_it) {
@@ -1219,12 +1253,16 @@ const char* unsupportedOpcodeReason311(BorrowedRef<PyCodeObject> code) {
         }
         if (bc_it->opcode() == LOAD_GLOBAL) {
           int oparg = bc_it->oparg();
-          if ((oparg & 0x01) && name_at(oparg >> 1) == "super" &&
+          auto loaded = name_at(oparg >> 1);
+          if (name_refuse != nullptr) {
+            return name_refuse;
+          }
+          if ((oparg & 0x01) && loaded == "super" &&
               !matchLoadSuperAttrPattern311(code, bc_it, bc_instrs)
                    .has_value()) {
             return "REFUSE_SHAPE_FRONTEND_POLICY";
           }
-          if (isBannedName(name_at(oparg >> 1))) {
+          if (isBannedName(loaded)) {
             return "REFUSE_SHAPE_FRONTEND_POLICY";
           }
         }
@@ -6901,13 +6939,25 @@ BorrowedRef<> HIRBuilder::constArg(const BytecodeInstruction& bc_instr) {
 void HIRBuilder::checkTranslate() {
   PyObject* names = code_->co_names;
   std::unordered_set<Py_ssize_t> banned_name_ids;
+#if PY_VERSION_HEX < 0x030C0000
+  const char* name_refuse = nullptr;
+  auto name_at = [&](Py_ssize_t i) {
+    return nameAtOrRefuse(names, i, &name_refuse);
+  };
+#else
   auto name_at = [&](Py_ssize_t i) {
     return std::string_view(PyUnicode_AsUTF8(PyTuple_GET_ITEM(names, i)));
   };
+#endif
   for (Py_ssize_t i = 0; i < PyTuple_GET_SIZE(names); i++) {
     if (isBannedName(name_at(i))) {
       banned_name_ids.insert(i);
     }
+#if PY_VERSION_HEX < 0x030C0000
+    if (name_refuse != nullptr) {
+      throw std::runtime_error{name_refuse};
+    }
+#endif
   }
   BytecodeInstructionBlock bc_instrs{code_};
   for (auto bc_it = bc_instrs.begin(); bc_it != bc_instrs.end(); ++bc_it) {
@@ -6922,7 +6972,15 @@ void HIRBuilder::checkTranslate() {
           opcode,
           opcodeName(opcode))};
     } else if (opcode == LOAD_GLOBAL) {
+#if PY_VERSION_HEX < 0x030C0000
+      auto loaded = name_at(oparg >> 1);
+      if (name_refuse != nullptr) {
+        throw std::runtime_error{name_refuse};
+      }
+      if ((oparg & 0x01) && loaded == "super") {
+#else
       if ((oparg & 0x01) && name_at(oparg >> 1) == "super") {
+#endif
         if (!matchLoadSuperAttrPattern311(code_, bc_it, bc_instrs)
                  .has_value()) {
           // LOAD_GLOBAL NULL + super, super isn't being used with a

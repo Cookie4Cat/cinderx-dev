@@ -160,6 +160,7 @@ print(json.dumps({
         self.assertEqual(payload["value"], 42)
         self.assertEqual(len(payload["events"]), 1)
         self.assertEqual(payload["events"][0]["result"], "compiled")
+        self.assertTrue(payload["events"][0].get("filename"))
         trigger = payload["trigger"]
         self.assertGreater(trigger["shadow_compile_success"], 0)
         self.assertGreater(trigger["shadow_codegen_bytes"], 0)
@@ -243,6 +244,40 @@ print(json.dumps({
             "REFUSE_SHAPE_STATIC_RUNTIME_CACHE",
         )
         self.assertEqual(payload["success_delta"], 0)
+
+    def test_surrogate_co_names_refuses_without_crashing(self) -> None:
+        payload = run_child(
+            PREAMBLE
+            + """\
+def surrogate_named(value):
+    return value + 1
+
+surrogate_named.__code__ = surrogate_named.__code__.replace(
+    co_names=("\\ud800",)
+)
+results = []
+for i in range(@T@):
+    results.append(surrogate_named(i))
+events = [
+    event for event in _cinderx._get_observe_stats()["events"]
+    if event["qualname"] == "surrogate_named"
+]
+print(json.dumps({
+    "results": results[-1],
+    "events": events,
+    "alive": True,
+}))
+""",
+            CINDERX_JIT_MODE="shadow",
+        )
+        self.assertTrue(payload["alive"])
+        self.assertEqual(payload["results"], THRESHOLD - 1)
+        self.assertEqual(len(payload["events"]), 1)
+        self.assertEqual(
+            payload["events"][0]["result"],
+            "REFUSE_SHAPE_INVALID_UTF8_NAME",
+        )
+        self.assertIn("filename", payload["events"][0])
 
     def test_off_mode_observes_nothing(self) -> None:
         payload = run_child(

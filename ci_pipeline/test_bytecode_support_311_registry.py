@@ -31,6 +31,7 @@ def test_shape_registry_covers_mr3_eligibility_reasons():
         "REFUSE_SHAPE_INT_ACCUMULATOR_POLICY",
         "REFUSE_SHAPE_CODEGEN_SPAN",
         "REFUSE_SHAPE_STATIC_RUNTIME_CACHE",
+        "REFUSE_SHAPE_INVALID_UTF8_NAME",
     }
 
 

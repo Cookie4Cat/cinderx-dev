@@ -10,10 +10,12 @@ unknown rejects or any machine-code side effect.
 
 Tests still run on the interpreter. Shadow compile discards the artifact;
 functions the front end cannot translate (exception handlers, generators)
-stay interpreted. Pytest/regrtest assertion failures that already exist on
-the JIT-off baseline are recorded, not treated as compile-surface failures.
-Worker crashes, missing reports, unknown_rejects and non-zero executable
-counters are red.
+stay interpreted. Completeness is differential against a JIT-off run of
+the same frozen surface: pytest/regrtest failures that already exist on
+that baseline are recorded, but a new failure, collection error, empty
+suite, crash, missing report, unknown_reject or non-zero executable
+counter is red. compile_success counts only when a compiled function's
+co_filename+qualname belongs to the target, not a process-global counter.
 """
 
 from __future__ import annotations
@@ -56,8 +58,22 @@ SHADOW_ENV = {
     "PYTHONJITAUTO": "1",
 }
 
+JIT_OFF_ENV = {
+    "CINDERX_PLUGIN_ENABLE": "1",
+    "CINDERX_EVAL_MODE": "cinder",
+    "CINDERX_JIT_MODE": "off",
+}
+
+# Suite env from the official runner must not flip the surface out of
+# shadow/off. These keys stay owned by SHADOW_ENV / JIT_OFF_ENV.
+PROTECTED_SURFACE_ENV_KEYS = (
+    "CINDERX_PLUGIN_ENABLE",
+    "CINDERX_EVAL_MODE",
+    "CINDERX_JIT_MODE",
+)
+
 # Sitecustomize extras are popped before report.validate_schema.
-SURFACE_EXTRA_KEYS = ("surface_module", "surface_kind")
+SURFACE_EXTRA_KEYS = ("surface_module", "surface_kind", "compiled_functions")
 
 EXECUTED_CASE_STATES = ("pass", "failure", "error")
 
@@ -117,6 +133,18 @@ else:
         snap["evaluator_installed"] = _evaluator_installed_at_start
         snap["surface_module"] = os.environ.get("JIT311_SURFACE_MODULE")
         snap["surface_kind"] = os.environ.get("JIT311_SURFACE_KIND")
+        compiled = []
+        try:
+            observe = _cinderx._get_observe_stats() or {}
+        except Exception:
+            observe = {}
+        for event in observe.get("events") or []:
+            if event.get("result") == "compiled":
+                compiled.append({
+                    "filename": event.get("filename"),
+                    "qualname": event.get("qualname"),
+                })
+        snap["compiled_functions"] = compiled
         directory = os.environ.get("JIT311_WORKER_REPORT_DIR")
         if not directory:
             return
@@ -183,6 +211,109 @@ def _executed_case_count(cases: dict[str, str]) -> int:
     return sum(1 for state in cases.values() if state in EXECUTED_CASE_STATES)
 
 
+def _norm_path(filename: object) -> str:
+    return str(filename or "").replace("\\", "/")
+
+
+def compiled_functions_of(record: dict) -> list[dict]:
+    funcs: list[dict] = []
+    for snap in record.get("snapshots") or []:
+        funcs.extend(snap.get("compiled_functions") or [])
+    return funcs
+
+
+def compiled_belongs_to_target(
+    filename: object, qualname: object, record: dict
+) -> bool:
+    """True when this compiled function is from the judged target.
+
+    Process-global compile_success is not enough: sitecustomize or another
+    module in the same interpreter can increment the counter. Identity is
+    co_filename plus qualname belonging to the libtest module or test_cinderx
+    suite under test.
+    """
+    del qualname  # reserved for a tighter qualname match if filenames collide
+    path = _norm_path(filename)
+    if not path:
+        return False
+    name = str(record.get("name") or "")
+    kind = str(record.get("kind") or "")
+    base = path.rsplit("/", 1)[-1]
+    if kind == "libtest":
+        return base == f"{name}.py"
+    if kind == "test_cinderx" or name == "test_cinderx":
+        if "test_cinderx" not in path:
+            return False
+        if name in ("test_cinderx", "all_test_cinderx"):
+            return True
+        if path.endswith(f"/{name}.py") or f"/{name}/" in f"/{path}":
+            return True
+        return name in base
+    return False
+
+
+def attributed_compile_success(record: dict) -> int:
+    return sum(
+        1
+        for func in compiled_functions_of(record)
+        if compiled_belongs_to_target(
+            func.get("filename"), func.get("qualname"), record
+        )
+    )
+
+
+def new_case_errors(record: dict) -> list[str]:
+    """Reject failures/errors/collection exits that the JIT-off run did not have."""
+    name = record.get("name") or "<unnamed>"
+    kind = record.get("kind") or "target"
+    prefix = f"{kind} {name}"
+    if record.get("verdict") in ("skip", "crash", "no_result"):
+        return []
+    if "baseline_cases" not in record:
+        return [f"{prefix}: missing JIT-off baseline_cases"]
+    errors: list[str] = []
+    baseline = record.get("baseline_cases") or {}
+    for key, state in (record.get("cases") or {}).items():
+        if state in ("failure", "error"):
+            prior = baseline.get(key)
+            if prior not in ("failure", "error"):
+                errors.append(
+                    f"{prefix}: new {state} {key} (baseline={prior!r})"
+                )
+    rc = record.get("returncode")
+    base_rc = record.get("baseline_returncode")
+    if rc == 2 and base_rc != 2:
+        errors.append(
+            f"{prefix}: new collection/interrupt exit 2 "
+            f"(baseline_returncode={base_rc!r})"
+        )
+    return errors
+
+
+_FROZEN_CINDERX_SUITE_NAMES: tuple[str, ...] | None = None
+
+
+def frozen_cinderx_suite_names() -> tuple[str, ...]:
+    global _FROZEN_CINDERX_SUITE_NAMES
+    if _FROZEN_CINDERX_SUITE_NAMES is None:
+        _FROZEN_CINDERX_SUITE_NAMES = tuple(
+            str(suite["name"]) for suite in load_test_cinderx_suites()
+        )
+    return _FROZEN_CINDERX_SUITE_NAMES
+
+
+def apply_suite_env(env: dict[str, str], suite: dict) -> dict[str, str]:
+    """Merge the official runner's per-suite env without leaving shadow/off."""
+    merged = dict(env)
+    extra = dict(suite.get("env") or {})
+    for key in PROTECTED_SURFACE_ENV_KEYS:
+        extra.pop(key, None)
+    merged.update(extra)
+    if suite.get("allow_oss"):
+        merged["CINDERX_TEST_ALLOW_OSS_IMPORTS"] = "1"
+    return merged
+
+
 def record_errors(record: dict) -> list[str]:
     """Completeness errors for one target (libtest module or test_cinderx)."""
     errors: list[str] = []
@@ -202,13 +333,45 @@ def record_errors(record: dict) -> list[str]:
     executed = _executed_case_count(record.get("cases") or {})
     # Skip-only targets may never enter a function body. Anything that
     # actually ran tests (or reported pass/fail) must have compiled at
-    # least one function from that process, not just importlib.
+    # least one function that belongs to this target.
     needs_compile = verdict in ("pass", "fail") or executed > 0
-    if needs_compile and compile_success <= 0:
+    attributed = attributed_compile_success(record)
+    if needs_compile and attributed <= 0:
+        if compile_success <= 0:
+            errors.append(
+                f"{prefix}: compile_success={compile_success} "
+                f"verdict={verdict} executed_cases={executed}"
+            )
+        else:
+            errors.append(
+                f"{prefix}: compile_success={compile_success} is not "
+                "attributed to this target by co_filename+qualname "
+                f"verdict={verdict} executed_cases={executed}"
+            )
+    errors.extend(new_case_errors(record))
+    return errors
+
+
+def _cinderx_suite_errors(cinderx: dict) -> list[str]:
+    errors: list[str] = []
+    expected = list(frozen_cinderx_suite_names())
+    suites = list(cinderx.get("suites") or [])
+    got = [str(rec.get("name") or "") for rec in suites]
+    if got != expected:
         errors.append(
-            f"{prefix}: compile_success={compile_success} "
-            f"verdict={verdict} executed_cases={executed}"
+            "test_cinderx: suite names "
+            f"{got} != frozen {expected}"
         )
+    for rec in suites:
+        name = rec.get("name") or "<unnamed>"
+        verdict = rec.get("verdict")
+        if verdict in ("crash", "no_result"):
+            errors.append(f"test_cinderx suite {name}: verdict={verdict}")
+        case_count = int(rec.get("case_count") or 0)
+        if case_count <= 0:
+            errors.append(
+                f"test_cinderx suite {name}: case_count={case_count}"
+            )
     return errors
 
 
@@ -241,10 +404,8 @@ def judge_completeness(
         errors.append("test_cinderx completeness record is missing")
     elif cinderx:
         errors.extend(record_errors(cinderx))
-        # 0/1 = suite finished (1 = recorded failures under shadow).
-        # 2 = pytest collection errors / interrupt after a summary — the
-        # official test_cinderx runner still records those as a finished
-        # suite, not a worker crash. 5 = no tests collected.
+        if require_cinderx:
+            errors.extend(_cinderx_suite_errors(cinderx))
         rc = cinderx.get("returncode")
         if (
             rc not in (0, 1, 2, 5)
@@ -270,9 +431,10 @@ def _child_env(
     module: str,
     kind: str,
     pythonpath_extra: list[str] | None = None,
+    mode: str = "shadow",
 ) -> dict[str, str]:
     env = arm_environment(base)
-    env.update(SHADOW_ENV)
+    env.update(SHADOW_ENV if mode == "shadow" else JIT_OFF_ENV)
     env["PYTHONHASHSEED"] = "0"
     env["JIT311_REPO_ROOT"] = str(REPO_ROOT)
     env["JIT311_WORKER_REPORT_DIR"] = str(reports)
@@ -360,8 +522,9 @@ def run_libtest_module(
     startup: Path,
     timeout: int,
     base_env: dict[str, str],
+    mode: str = "shadow",
 ) -> dict:
-    work = _module_work_dir(out / "libtest", name)
+    work = _module_work_dir(out / f"libtest_{mode}", name)
     reports = work / "reports"
     junit = work / "junit.xml"
     log_path = work / "regrtest.log"
@@ -371,6 +534,7 @@ def run_libtest_module(
         reports=reports,
         module=name,
         kind="libtest",
+        mode=mode,
     )
     cmd = [
         python, "-u", "-m", "test",
@@ -461,15 +625,32 @@ def pytest_process_verdict(
     return "pass"
 
 
-def run_test_cinderx(
+def _attach_baseline(shadow: dict, baseline: dict) -> dict:
+    shadow["baseline_cases"] = baseline.get("cases") or {}
+    shadow["baseline_returncode"] = baseline.get("returncode")
+    shadow["baseline_verdict"] = baseline.get("verdict")
+    base_suites = {
+        rec.get("name"): rec for rec in (baseline.get("suites") or [])
+    }
+    for rec in shadow.get("suites") or []:
+        prior = base_suites.get(rec.get("name")) or {}
+        rec["baseline_case_count"] = prior.get("case_count")
+        rec["baseline_returncode"] = prior.get("returncode")
+        rec["baseline_verdict"] = prior.get("verdict")
+        rec["baseline_cases"] = prior.get("cases") or {}
+    return shadow
+
+
+def _run_test_cinderx_pass(
     *,
     python: str,
     out: Path,
     startup: Path,
     timeout: int,
     base_env: dict[str, str],
+    mode: str,
 ) -> dict:
-    work = _fresh_dir(out / "test_cinderx")
+    work = _fresh_dir(out / f"test_cinderx_{mode}")
     started = time.time()
     suites = load_test_cinderx_suites()
     all_cases: dict[str, str] = {}
@@ -487,18 +668,23 @@ def run_test_cinderx(
         reports.mkdir()
         junit = suite_dir / "junit.xml"
         log_path = suite_dir / "pytest.log"
-        env = _child_env(
-            base=base_env,
-            startup=startup,
-            reports=reports,
-            module=f"test_cinderx.{name}",
-            kind="test_cinderx",
-            pythonpath_extra=[str(KNOWN_SKIP_PLUGIN_DIR)],
+        env = apply_suite_env(
+            _child_env(
+                base=base_env,
+                startup=startup,
+                reports=reports,
+                module=f"test_cinderx.{name}",
+                kind="test_cinderx",
+                pythonpath_extra=[str(KNOWN_SKIP_PLUGIN_DIR)],
+                mode=mode,
+            ),
+            suite,
         )
-        if suite.get("allow_oss"):
-            env["CINDERX_TEST_ALLOW_OSS_IMPORTS"] = "1"
         cmd = [python, *suite["args"], "--junit-xml", str(junit)]
-        print(f"shadow-surface: test_cinderx suite {name}", flush=True)
+        print(
+            f"shadow-surface: test_cinderx {mode} suite {name}",
+            flush=True,
+        )
         slice_started = time.time()
         try:
             with log_path.open("w", encoding="utf-8") as sink:
@@ -525,7 +711,7 @@ def run_test_cinderx(
                 )
         cases = parse_junit(junit) if junit.is_file() else {}
         prefixed = {f"{name}::{key}": state for key, state in cases.items()}
-        snaps = _load_snapshots(reports)
+        snaps = _load_snapshots(reports) if mode == "shadow" else []
         verdict = pytest_process_verdict(returncode, cases, timed_out)
         record = {
             "name": name,
@@ -534,6 +720,7 @@ def run_test_cinderx(
             "timed_out": timed_out,
             "duration_s": round(time.time() - slice_started, 1),
             "case_count": len(cases),
+            "cases": cases,
             "compile_success": sum(
                 int(s.get("compile_success") or 0) for s in snaps
             ),
@@ -586,6 +773,33 @@ def run_test_cinderx(
     }
 
 
+def run_test_cinderx(
+    *,
+    python: str,
+    out: Path,
+    startup: Path,
+    timeout: int,
+    base_env: dict[str, str],
+) -> dict:
+    baseline = _run_test_cinderx_pass(
+        python=python,
+        out=out,
+        startup=startup,
+        timeout=timeout,
+        base_env=base_env,
+        mode="off",
+    )
+    shadow = _run_test_cinderx_pass(
+        python=python,
+        out=out,
+        startup=startup,
+        timeout=timeout,
+        base_env=base_env,
+        mode="shadow",
+    )
+    return _attach_baseline(shadow, baseline)
+
+
 def run_surface(
     *,
     python: str | None = None,
@@ -617,35 +831,46 @@ def run_surface(
     started = time.time()
     if not skip_libtest:
         workers = max(1, jobs)
-        print(
-            f"shadow-surface: libtest {len(targets)} modules jobs={workers} "
-            f"timeout={timeout}s",
-            flush=True,
-        )
-        with ThreadPoolExecutor(max_workers=workers) as pool:
-            futs = {
-                pool.submit(
-                    run_libtest_module,
-                    name,
-                    python=python,
-                    out=out,
-                    startup=startup,
-                    timeout=timeout,
-                    base_env=base_env,
-                ): name
-                for name in targets
-            }
-            for fut in as_completed(futs):
-                record = fut.result()
-                modules.append(record)
-                print(
-                    f"  {record['name']}: {record['verdict']} "
-                    f"compile_success={record['compile_success']} "
-                    f"cases={len(record['cases'])} "
-                    f"rc={record['returncode']}",
-                    flush=True,
-                )
-        modules.sort(key=lambda rec: rec["name"])
+
+        def _run_libtest_pass(mode: str) -> list[dict]:
+            print(
+                f"shadow-surface: libtest {mode} {len(targets)} modules "
+                f"jobs={workers} timeout={timeout}s",
+                flush=True,
+            )
+            records: list[dict] = []
+            with ThreadPoolExecutor(max_workers=workers) as pool:
+                futs = {
+                    pool.submit(
+                        run_libtest_module,
+                        name,
+                        python=python,
+                        out=out,
+                        startup=startup,
+                        timeout=timeout,
+                        base_env=base_env,
+                        mode=mode,
+                    ): name
+                    for name in targets
+                }
+                for fut in as_completed(futs):
+                    record = fut.result()
+                    records.append(record)
+                    print(
+                        f"  {record['name']}: {record['verdict']} "
+                        f"compile_success={record['compile_success']} "
+                        f"cases={len(record['cases'])} "
+                        f"rc={record['returncode']}",
+                        flush=True,
+                    )
+            records.sort(key=lambda rec: rec["name"])
+            return records
+
+        baseline_modules = _run_libtest_pass("off")
+        modules = _run_libtest_pass("shadow")
+        baseline_by_name = {rec["name"]: rec for rec in baseline_modules}
+        for rec in modules:
+            _attach_baseline(rec, baseline_by_name.get(rec["name"]) or {})
 
     cinderx_record = None
     if not skip_cinderx:

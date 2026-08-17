@@ -30,7 +30,8 @@ int Ci_Observe311_Configure(void);
 void Ci_Observe311_OnFrame(PyFunctionObject* func);
 
 // Snapshot dict for tests and diagnostics: enabled, threshold, codes_seen,
-// events_dropped, and the bounded event list (qualname, count, result).
+// events_dropped, and the bounded event list (qualname, filename, count,
+// result).
 PyObject* Ci_Observe311_Stats(void);
 
 // Release all observer-owned weakrefs, event references, tables and files.

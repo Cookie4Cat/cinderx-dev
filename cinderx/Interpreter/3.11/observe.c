@@ -57,6 +57,7 @@ enum {
 
 typedef struct {
   PyObject* qualname; // owned; NULL when the code object carries none
+  PyObject* filename; // owned; NULL when the code object carries none
   uint64_t count;
   const char* result; // static string from the compile entry point
 } Ci_ObserveEvent;
@@ -275,11 +276,14 @@ observe_emit(PyFunctionObject* func, PyCodeObject* code, uint64_t count) {
   PyErr_Clear();
 
   PyObject* qualname = code->co_qualname;
+  PyObject* filename = code->co_filename;
   if ((size_t)ci_observe_event_count < ci_observe_event_capacity ||
       observe_events_grow() == 0) {
     Ci_ObserveEvent* event = &ci_observe_events[ci_observe_event_count++];
     Py_XINCREF(qualname);
+    Py_XINCREF(filename);
     event->qualname = qualname;
+    event->filename = filename;
     event->count = count;
     event->result = result;
   } else {
@@ -367,7 +371,12 @@ PyObject* Ci_Observe311_Stats(void) {
     }
     int rc = PyDict_SetItemString(
         entry, "qualname", event->qualname != NULL ? event->qualname : Py_None);
-    if (rc < 0 || stats_set_uint(entry, "count", event->count) < 0 ||
+    if (rc < 0 ||
+        PyDict_SetItemString(
+            entry,
+            "filename",
+            event->filename != NULL ? event->filename : Py_None) < 0 ||
+        stats_set_uint(entry, "count", event->count) < 0 ||
         stats_set_str(entry, "result", event->result) < 0 ||
         PyList_Append(events, entry) < 0) {
       Py_DECREF(entry);
@@ -412,6 +421,7 @@ void Ci_Observe311_Finalize(void) {
 
   for (Py_ssize_t i = 0; i < ci_observe_event_count; i++) {
     Py_CLEAR(ci_observe_events[i].qualname);
+    Py_CLEAR(ci_observe_events[i].filename);
   }
   free(ci_observe_events);
   ci_observe_events = NULL;

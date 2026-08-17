@@ -9,12 +9,15 @@ passing module cannot be satisfied by a missing worker snapshot.
 
 from __future__ import annotations
 
+from pathlib import Path
+from unittest.mock import patch
+
 from ci_pipeline.jit311 import report as jit_report
 from ci_pipeline.jit311 import runners
 from ci_pipeline.jit311 import shadow_surface as surface
 
 
-def _snap(**overrides):
+def _snap(name: str = "test_placeholder", **overrides):
     snap = {field: 0 for field in jit_report.RUNTIME_FIELDS}
     snap["evaluator_installed"] = True
     snap["compile_requests"] = 2
@@ -24,28 +27,70 @@ def _snap(**overrides):
     snap["peak_rss_bytes"] = 4096
     for field in jit_report.HARNESS_FIELDS:
         snap[field] = None
+    snap["compiled_functions"] = [
+        {
+            "filename": f"/Lib/test/{name}.py",
+            "qualname": f"{name}.test_one",
+        }
+    ]
     snap.update(overrides)
     return snap
 
 
 def _module(name: str, *, verdict: str = "pass", snap=None, cases=None, **extra):
-    snap = snap if snap is not None else _snap()
+    snap = snap if snap is not None else _snap(name)
     snaps = extra.pop("snapshots", [snap] if snap else [])
+    cases = cases if cases is not None else {f"{name}.test_one": "pass"}
     record = {
         "kind": "libtest",
         "name": name,
         "verdict": verdict,
-        "returncode": 0 if verdict != "crash" else 139,
+        "returncode": extra.pop("returncode", 0 if verdict != "crash" else 139),
         "snapshots": snaps,
-        "cases": cases if cases is not None else {f"{name}.test_one": "pass"},
+        "cases": cases,
         "compile_success": sum(int(s.get("compile_success") or 0) for s in snaps),
+        "baseline_cases": extra.pop("baseline_cases", dict(cases)),
+        "baseline_returncode": extra.pop(
+            "baseline_returncode", 0 if verdict != "crash" else 139
+        ),
     }
     record.update(extra)
     return record
 
 
-def _cinderx(*, verdict: str = "fail", returncode: int = 1, snap=None, cases=None):
-    snap = snap if snap is not None else _snap()
+def _cinderx_suites():
+    return [
+        {
+            "name": name,
+            "verdict": "pass",
+            "returncode": 0,
+            "case_count": 1,
+        }
+        for name in surface.frozen_cinderx_suite_names()
+    ]
+
+
+def _cinderx(
+    *,
+    verdict: str = "fail",
+    returncode: int = 1,
+    snap=None,
+    cases=None,
+    baseline_cases=None,
+    baseline_returncode=None,
+    suites=None,
+):
+    if snap is None:
+        snap = _snap()
+        snap = dict(snap)
+        snap["compiled_functions"] = [
+            {
+                "filename": "cinderx/PythonLib/test_cinderx/test_foo.py",
+                "qualname": "TestFoo.test_bar",
+            }
+        ]
+    else:
+        snap = dict(snap)
     cases = cases if cases is not None else {
         "test_cinderx.test_foo.TestFoo.test_bar": "failure",
         "test_cinderx.test_foo.TestFoo.test_ok": "pass",
@@ -58,6 +103,11 @@ def _cinderx(*, verdict: str = "fail", returncode: int = 1, snap=None, cases=Non
         "snapshots": [snap],
         "cases": cases,
         "compile_success": snap.get("compile_success", 0),
+        "baseline_cases": dict(cases) if baseline_cases is None else baseline_cases,
+        "baseline_returncode": (
+            returncode if baseline_returncode is None else baseline_returncode
+        ),
+        "suites": _cinderx_suites() if suites is None else suites,
     }
 
 
@@ -85,6 +135,7 @@ def test_sitecustomize_is_valid_python():
     assert "JIT311_SURFACE_MODULE" in surface.SURFACE_SITECUSTOMIZE
     assert "JIT311_CINDERX_SITE" in surface.SURFACE_SITECUSTOMIZE
     assert "_evaluator_installed_at_start" in surface.SURFACE_SITECUSTOMIZE
+    assert "compiled_functions" in surface.SURFACE_SITECUSTOMIZE
 
 
 def test_stdlib_import_canary_is_still_72():
@@ -109,7 +160,13 @@ def test_import_only_style_zero_compile_on_executed_module_is_red():
     modules.append(
         _module(
             "test_int",
-            snap=_snap(compile_requests=0, compile_success=0, compile_rejected=0),
+            snap=_snap(
+                "test_int",
+                compile_requests=0,
+                compile_success=0,
+                compile_rejected=0,
+                compiled_functions=[],
+            ),
         )
     )
     errors = surface.judge_completeness(_report(modules))
@@ -123,7 +180,12 @@ def test_skip_without_compile_is_green():
             "test_windows",
             verdict="skip",
             cases={"test_windows.test_one": "skipped"},
-            snap=_snap(compile_requests=0, compile_success=0, compile_rejected=0),
+            snap=_snap(
+                compile_requests=0,
+                compile_success=0,
+                compile_rejected=0,
+                compiled_functions=[],
+            ),
         )
     )
     assert surface.judge_completeness(_report(modules)) == []
@@ -140,14 +202,18 @@ def test_crash_and_missing_snapshot_are_red():
 
 def test_unknown_rejects_and_machine_code_are_red():
     bad = _snap(
-        unknown_rejects=1, compile_rejected=1, compile_success=1, compile_requests=2
+        "test_bad",
+        unknown_rejects=1,
+        compile_rejected=1,
+        compile_success=1,
+        compile_requests=2,
     )
     modules = [_module(f"test_{i}") for i in range(439)]
     modules.append(_module("test_bad", snap=bad))
     errors = surface.judge_completeness(_report(modules))
     assert any("unknown_rejects" in err for err in errors)
 
-    leaked = _snap(machine_code_entries=1)
+    leaked = _snap("test_bad", machine_code_entries=1)
     modules[-1] = _module("test_bad", snap=leaked)
     errors = surface.judge_completeness(_report(modules))
     assert any("machine_code_entries" in err for err in errors)
@@ -166,15 +232,45 @@ def test_missing_test_cinderx_is_red():
 
 
 def test_test_cinderx_pytest_failures_are_recorded_not_red():
-    # Shadow cannot execute installed machine code; tests that assume JIT
-    # execution fail. Completeness still holds if the suite finished and
-    # compiled real test functions.
+    # Failures that already exist on the JIT-off baseline stay recorded.
     assert surface.judge_completeness(_full_surface()) == []
 
 
-def test_test_cinderx_collection_errors_are_not_abnormal_exits():
+def test_new_test_cinderx_failure_vs_jit_off_is_red():
     report = _full_surface()
-    report["test_cinderx"] = _cinderx(verdict="fail", returncode=2)
+    report["test_cinderx"] = _cinderx(
+        verdict="fail",
+        returncode=1,
+        cases={"test_cinderx.test_foo.TestFoo.test_bar": "failure"},
+        baseline_cases={"test_cinderx.test_foo.TestFoo.test_bar": "pass"},
+        baseline_returncode=0,
+    )
+    errors = surface.judge_completeness(report)
+    assert any("new failure" in err for err in errors)
+
+
+def test_new_test_cinderx_collection_error_is_red():
+    report = _full_surface()
+    report["test_cinderx"] = _cinderx(
+        verdict="fail",
+        returncode=2,
+        baseline_returncode=0,
+        cases={},
+        baseline_cases={},
+    )
+    errors = surface.judge_completeness(report)
+    assert any("new collection/interrupt exit 2" in err for err in errors)
+
+
+def test_baseline_test_cinderx_failure_is_recorded_not_red():
+    report = _full_surface()
+    report["test_cinderx"] = _cinderx(
+        verdict="fail",
+        returncode=1,
+        cases={"suite::case": "failure"},
+        baseline_cases={"suite::case": "failure"},
+        baseline_returncode=1,
+    )
     assert surface.judge_completeness(report) == []
 
 
@@ -214,6 +310,9 @@ def test_snapshot_extras_are_stripped_before_schema():
     snap = _snap()
     snap["surface_module"] = "test_int"
     snap["surface_kind"] = "libtest"
+    snap["compiled_functions"] = [
+        {"filename": "/Lib/test/test_int.py", "qualname": "test_one"}
+    ]
     assert surface.snapshot_errors(snap) == []
 
 
@@ -236,3 +335,166 @@ def test_sequential_regrtest_success_is_pass_not_no_result():
     assert (
         surface.infer_libtest_verdict("test_int", log, 0, {}, False) == "pass"
     )
+
+
+def test_unrelated_compile_success_does_not_satisfy_the_target():
+    modules = [_module(f"test_{i}") for i in range(439)]
+    modules.append(
+        _module(
+            "test_int",
+            snap=_snap(
+                "test_int",
+                compile_success=1,
+                compile_requests=1,
+                compiled_functions=[
+                    {
+                        "filename": "/tmp/sitecustomize.py",
+                        "qualname": "_jit311_surface_emit",
+                    }
+                ],
+            ),
+        )
+    )
+    errors = surface.judge_completeness(_report(modules))
+    assert any(
+        "not attributed" in err and "test_int" in err for err in errors
+    )
+
+
+def test_new_libtest_failure_vs_jit_off_is_red():
+    modules = [_module(f"test_{i}") for i in range(439)]
+    modules.append(
+        _module(
+            "test_int",
+            verdict="fail",
+            cases={"test_int.test_one": "failure"},
+            baseline_cases={"test_int.test_one": "pass"},
+            baseline_returncode=0,
+        )
+    )
+    errors = surface.judge_completeness(_report(modules))
+    assert any("new failure" in err and "test_int" in err for err in errors)
+
+
+def test_baseline_libtest_failure_is_recorded_not_red():
+    modules = [_module(f"test_{i}") for i in range(439)]
+    modules.append(
+        _module(
+            "test_int",
+            verdict="fail",
+            cases={"test_int.test_one": "failure"},
+            baseline_cases={"test_int.test_one": "failure"},
+            baseline_returncode=1,
+        )
+    )
+    assert surface.judge_completeness(_report(modules)) == []
+
+
+def test_empty_cinderx_suite_is_red_even_if_other_suites_pass():
+    report = _full_surface()
+    suites = report["test_cinderx"]["suites"]
+    suites[0]["case_count"] = 0
+    suites[0]["verdict"] = "no_result"
+    suites[0]["returncode"] = 5
+    errors = surface.judge_completeness(report)
+    assert any("case_count=0" in err or "verdict=no_result" in err for err in errors)
+
+
+def test_missing_cinderx_suite_is_red():
+    report = _full_surface()
+    report["test_cinderx"]["suites"] = report["test_cinderx"]["suites"][1:]
+    errors = surface.judge_completeness(report)
+    assert any("suite names" in err for err in errors)
+
+
+def test_apply_suite_env_cannot_leave_shadow():
+    env = surface.apply_suite_env(
+        dict(surface.SHADOW_ENV),
+        {
+            "name": "x",
+            "env": {
+                "CINDERX_JIT_MODE": "execute",
+                "PYTHONJITLIGHTWEIGHTFRAME": "1",
+            },
+        },
+    )
+    assert env["CINDERX_JIT_MODE"] == "shadow"
+    assert env["PYTHONJITLIGHTWEIGHTFRAME"] == "1"
+
+
+def test_all_official_suites_keep_shadow_and_apply_runner_env():
+    for suite in surface.load_test_cinderx_suites():
+        env = surface.apply_suite_env(dict(surface.SHADOW_ENV), suite)
+        assert env["CINDERX_JIT_MODE"] == "shadow"
+        assert env["CINDERX_EVAL_MODE"] == "cinder"
+        assert env["CINDERX_PLUGIN_ENABLE"] == "1"
+        if suite["name"] == "test_osr":
+            assert env["PYTHONJITLIGHTWEIGHTFRAME"] == "0"
+        else:
+            assert env["PYTHONJITLIGHTWEIGHTFRAME"] == "1"
+            assert env["CINDERX_OSR_ENABLED"] == "0"
+        if suite["name"] == "test_jit_support_instrumentation":
+            assert env["PYTHONJITSUPPORTINSTRUMENTATION"] == "1"
+            assert env["PYTHON_JIT"] == "0"
+        if suite.get("allow_oss"):
+            assert env["CINDERX_TEST_ALLOW_OSS_IMPORTS"] == "1"
+
+
+def test_run_test_cinderx_subprocess_env_matches_each_official_suite(tmp_path=None):
+    suites = surface.load_test_cinderx_suites()
+    captured = []
+
+    class Fake:
+        returncode = 0
+
+    def fake_run(cmd, **kwargs):
+        captured.append(kwargs["env"])
+        return Fake()
+
+    dummy_snap = _snap()
+    dummy_snap["compiled_functions"] = [
+        {
+            "filename": "cinderx/PythonLib/test_cinderx/test_foo.py",
+            "qualname": "TestFoo.test_bar",
+        }
+    ]
+    if tmp_path is None:
+        import tempfile
+        tmp_ctx = tempfile.TemporaryDirectory()
+        out = Path(tmp_ctx.name)
+    else:
+        tmp_ctx = None
+        out = Path(tmp_path)
+    try:
+        with (
+            patch.object(surface.subprocess, "run", fake_run),
+            patch.object(surface, "parse_junit", lambda path: {"c::t": "pass"}),
+            patch.object(surface, "_load_snapshots", lambda path: [dummy_snap]),
+        ):
+            surface.run_test_cinderx(
+                python="python3.11",
+                out=out,
+                startup=out / "startup",
+                timeout=60,
+                base_env={},
+            )
+    finally:
+        if tmp_ctx is not None:
+            tmp_ctx.cleanup()
+    shadow_envs = [env for env in captured if env.get("CINDERX_JIT_MODE") == "shadow"]
+    off_envs = [env for env in captured if env.get("CINDERX_JIT_MODE") == "off"]
+    assert len(shadow_envs) == len(suites)
+    assert len(off_envs) == len(suites)
+    by_name = {
+        env["JIT311_SURFACE_MODULE"].split(".", 1)[-1]: env for env in shadow_envs
+    }
+    for suite in suites:
+        env = by_name[suite["name"]]
+        assert env["CINDERX_JIT_MODE"] == "shadow"
+        assert env["CINDERX_EVAL_MODE"] == "cinder"
+        assert env["CINDERX_PLUGIN_ENABLE"] == "1"
+        for key, value in (suite.get("env") or {}).items():
+            if key not in surface.PROTECTED_SURFACE_ENV_KEYS:
+                assert env[key] == value, (suite["name"], key)
+        if suite.get("allow_oss"):
+            assert env["CINDERX_TEST_ALLOW_OSS_IMPORTS"] == "1"

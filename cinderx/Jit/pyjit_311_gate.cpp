@@ -81,12 +81,16 @@ const char* eligibilityReason(BorrowedRef<PyFunctionObject> func) {
 extern "C" const char* Ci_JitShell311_RequestCompile(
     PyFunctionObject* raw_func) {
   BorrowedRef<PyFunctionObject> func{raw_func};
-  const char* reason = eligibilityReason(func);
-  if (reason != nullptr) {
-    return reason;
-  }
-
   try {
+    // Eligibility reads Python objects (co_names, flags, namespaces) and must
+    // stay inside the same exception boundary as CompileShadow: a legal
+    // CodeType can still raise from the C-API, and that must never escape
+    // into the interpreted call.
+    const char* reason = eligibilityReason(func);
+    if (reason != nullptr) {
+      return reason;
+    }
+
     // Preloaders collect Python-object facts on this GIL-holding thread and
     // are destroyed before returning to the interpreter.
     jit::hir::IsolatedPreloaders isolated_preloaders;
@@ -106,9 +110,13 @@ extern "C" const char* Ci_JitShell311_RequestCompile(
     // stable event reason and must never perturb the interpreted call.
     PyErr_Clear();
     JIT_LOG("shadow compile failed for {}: {}", functionName(func), exc.what());
-    if (std::string_view(exc.what()).find("RelocOffsetOutOfRange") !=
-        std::string_view::npos) {
+    std::string_view what{exc.what()};
+    if (what.find("RelocOffsetOutOfRange") != std::string_view::npos) {
       return "REFUSE_SHAPE_CODEGEN_SPAN";
+    }
+    if (what.find("REFUSE_SHAPE_INVALID_UTF8_NAME") !=
+        std::string_view::npos) {
+      return "REFUSE_SHAPE_INVALID_UTF8_NAME";
     }
     return "SUPPORTED_OPCODE_FAILURE";
   } catch (...) {
