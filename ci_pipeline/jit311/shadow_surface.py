@@ -262,31 +262,64 @@ def attributed_compile_success(record: dict) -> int:
     )
 
 
+_VERDICT_RANK = {
+    "pass": 0,
+    "skip": 1,
+    "fail": 2,
+    "no_result": 3,
+    "crash": 4,
+}
+
+
 def new_case_errors(record: dict) -> list[str]:
-    """Reject failures/errors/collection exits that the JIT-off run did not have."""
+    """Reject shadow regressions against the JIT-off run of the same target.
+
+    Crash records are already red from ``record_errors``. Every other verdict
+    compares case identity, overall verdict, and return code: a pass that
+    becomes fail/skip, a baseline case that disappears, or a new non-zero
+    exit is a completeness failure even when junit is empty.
+    """
     name = record.get("name") or "<unnamed>"
     kind = record.get("kind") or "target"
     prefix = f"{kind} {name}"
-    if record.get("verdict") in ("skip", "crash", "no_result"):
+    if record.get("verdict") == "crash":
         return []
     if "baseline_cases" not in record:
         return [f"{prefix}: missing JIT-off baseline_cases"]
     errors: list[str] = []
     baseline = record.get("baseline_cases") or {}
-    for key, state in (record.get("cases") or {}).items():
+    shadow_cases = record.get("cases") or {}
+    for key, prior in baseline.items():
+        if key not in shadow_cases:
+            errors.append(
+                f"{prefix}: baseline case disappeared: {key} "
+                f"(baseline={prior!r})"
+            )
+            continue
+        state = shadow_cases[key]
+        if prior == "pass" and state != "pass":
+            errors.append(f"{prefix}: case {key} pass -> {state}")
+        elif state in ("failure", "error") and prior not in ("failure", "error"):
+            errors.append(
+                f"{prefix}: new {state} {key} (baseline={prior!r})"
+            )
+    for key, state in shadow_cases.items():
+        if key in baseline:
+            continue
         if state in ("failure", "error"):
-            prior = baseline.get(key)
-            if prior not in ("failure", "error"):
-                errors.append(
-                    f"{prefix}: new {state} {key} (baseline={prior!r})"
-                )
+            errors.append(
+                f"{prefix}: new {state} {key} (baseline=None)"
+            )
+    base_verdict = record.get("baseline_verdict")
+    verdict = record.get("verdict")
+    if base_verdict is not None and _VERDICT_RANK.get(verdict, 99) > _VERDICT_RANK.get(
+        base_verdict, 0
+    ):
+        errors.append(f"{prefix}: verdict {base_verdict} -> {verdict}")
     rc = record.get("returncode")
     base_rc = record.get("baseline_returncode")
-    if rc == 2 and base_rc != 2:
-        errors.append(
-            f"{prefix}: new collection/interrupt exit 2 "
-            f"(baseline_returncode={base_rc!r})"
-        )
+    if base_rc is not None and rc != base_rc:
+        errors.append(f"{prefix}: returncode {base_rc!r} -> {rc!r}")
     return errors
 
 

@@ -403,10 +403,8 @@ bool isBannedName(std::string_view name) {
 // co_names entries are Unicode objects, but CodeType.replace() can legally
 // insert a lone surrogate. PyUnicode_AsUTF8 then returns NULL and sets
 // UnicodeEncodeError; constructing a string_view from that pointer is UB.
-std::string_view nameAtOrRefuse(
-    PyObject* names,
-    Py_ssize_t i,
-    const char** refuse) {
+std::string_view
+nameAtOrRefuse(PyObject* names, Py_ssize_t i, const char** refuse) {
   if (*refuse != nullptr) {
     return {};
   }
@@ -6972,15 +6970,13 @@ void HIRBuilder::checkTranslate() {
           opcode,
           opcodeName(opcode))};
     } else if (opcode == LOAD_GLOBAL) {
-#if PY_VERSION_HEX < 0x030C0000
       auto loaded = name_at(oparg >> 1);
+#if PY_VERSION_HEX < 0x030C0000
       if (name_refuse != nullptr) {
         throw std::runtime_error{name_refuse};
       }
-      if ((oparg & 0x01) && loaded == "super") {
-#else
-      if ((oparg & 0x01) && name_at(oparg >> 1) == "super") {
 #endif
+      if ((oparg & 0x01) && loaded == "super") {
         if (!matchLoadSuperAttrPattern311(code_, bc_it, bc_instrs)
                  .has_value()) {
           // LOAD_GLOBAL NULL + super, super isn't being used with a

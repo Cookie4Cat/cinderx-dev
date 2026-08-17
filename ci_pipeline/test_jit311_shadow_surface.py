@@ -41,18 +41,20 @@ def _module(name: str, *, verdict: str = "pass", snap=None, cases=None, **extra)
     snap = snap if snap is not None else _snap(name)
     snaps = extra.pop("snapshots", [snap] if snap else [])
     cases = cases if cases is not None else {f"{name}.test_one": "pass"}
+    default_rc = {"pass": 0, "skip": 0, "fail": 1, "no_result": 5, "crash": 139}.get(
+        verdict, 0
+    )
     record = {
         "kind": "libtest",
         "name": name,
         "verdict": verdict,
-        "returncode": extra.pop("returncode", 0 if verdict != "crash" else 139),
+        "returncode": extra.pop("returncode", default_rc),
         "snapshots": snaps,
         "cases": cases,
         "compile_success": sum(int(s.get("compile_success") or 0) for s in snaps),
         "baseline_cases": extra.pop("baseline_cases", dict(cases)),
-        "baseline_returncode": extra.pop(
-            "baseline_returncode", 0 if verdict != "crash" else 139
-        ),
+        "baseline_returncode": extra.pop("baseline_returncode", default_rc),
+        "baseline_verdict": extra.pop("baseline_verdict", verdict),
     }
     record.update(extra)
     return record
@@ -78,6 +80,7 @@ def _cinderx(
     cases=None,
     baseline_cases=None,
     baseline_returncode=None,
+    baseline_verdict=None,
     suites=None,
 ):
     if snap is None:
@@ -107,6 +110,7 @@ def _cinderx(
         "baseline_returncode": (
             returncode if baseline_returncode is None else baseline_returncode
         ),
+        "baseline_verdict": verdict if baseline_verdict is None else baseline_verdict,
         "suites": _cinderx_suites() if suites is None else suites,
     }
 
@@ -244,9 +248,10 @@ def test_new_test_cinderx_failure_vs_jit_off_is_red():
         cases={"test_cinderx.test_foo.TestFoo.test_bar": "failure"},
         baseline_cases={"test_cinderx.test_foo.TestFoo.test_bar": "pass"},
         baseline_returncode=0,
+        baseline_verdict="pass",
     )
     errors = surface.judge_completeness(report)
-    assert any("new failure" in err for err in errors)
+    assert any("pass -> failure" in err or "new failure" in err for err in errors)
 
 
 def test_new_test_cinderx_collection_error_is_red():
@@ -255,11 +260,12 @@ def test_new_test_cinderx_collection_error_is_red():
         verdict="fail",
         returncode=2,
         baseline_returncode=0,
+        baseline_verdict="pass",
         cases={},
         baseline_cases={},
     )
     errors = surface.judge_completeness(report)
-    assert any("new collection/interrupt exit 2" in err for err in errors)
+    assert any("returncode 0 -> 2" in err for err in errors)
 
 
 def test_baseline_test_cinderx_failure_is_recorded_not_red():
@@ -370,10 +376,13 @@ def test_new_libtest_failure_vs_jit_off_is_red():
             cases={"test_int.test_one": "failure"},
             baseline_cases={"test_int.test_one": "pass"},
             baseline_returncode=0,
+            baseline_verdict="pass",
         )
     )
     errors = surface.judge_completeness(_report(modules))
-    assert any("new failure" in err and "test_int" in err for err in errors)
+    assert any(
+        "pass -> failure" in err or "new failure" in err for err in errors
+    )
 
 
 def test_baseline_libtest_failure_is_recorded_not_red():
@@ -388,6 +397,74 @@ def test_baseline_libtest_failure_is_recorded_not_red():
         )
     )
     assert surface.judge_completeness(_report(modules)) == []
+
+
+def test_empty_shadow_junit_against_passing_baseline_is_red():
+    # Reviewer PoC: baseline pass/rc=0/cases=1, shadow fail/rc=1/cases=0,
+    # with attributed compile_success, must not go green.
+    modules = [_module(f"test_{i}") for i in range(439)]
+    modules.append(
+        _module(
+            "test_int",
+            verdict="fail",
+            returncode=1,
+            cases={},
+            baseline_cases={"test_int.test_one": "pass"},
+            baseline_returncode=0,
+            baseline_verdict="pass",
+        )
+    )
+    errors = surface.judge_completeness(_report(modules))
+    joined = "\n".join(errors)
+    assert "baseline case disappeared" in joined
+    assert "verdict pass -> fail" in joined
+    assert "returncode 0 -> 1" in joined
+
+
+def test_pass_to_skip_is_red():
+    modules = [_module(f"test_{i}") for i in range(439)]
+    modules.append(
+        _module(
+            "test_int",
+            verdict="skip",
+            cases={"test_int.test_one": "skipped"},
+            baseline_cases={"test_int.test_one": "pass"},
+            baseline_returncode=0,
+            baseline_verdict="pass",
+            snap=_snap(
+                "test_int",
+                compile_requests=0,
+                compile_success=0,
+                compile_rejected=0,
+                compiled_functions=[],
+            ),
+        )
+    )
+    errors = surface.judge_completeness(_report(modules))
+    joined = "\n".join(errors)
+    assert "pass -> skipped" in joined or "verdict pass -> skip" in joined
+
+
+def test_baseline_case_disappeared_from_shadow_is_red():
+    modules = [_module(f"test_{i}") for i in range(439)]
+    modules.append(
+        _module(
+            "test_int",
+            verdict="pass",
+            cases={"test_int.test_two": "pass"},
+            baseline_cases={
+                "test_int.test_one": "pass",
+                "test_int.test_two": "pass",
+            },
+            baseline_returncode=0,
+            baseline_verdict="pass",
+        )
+    )
+    errors = surface.judge_completeness(_report(modules))
+    assert any(
+        "baseline case disappeared" in err and "test_int.test_one" in err
+        for err in errors
+    )
 
 
 def test_empty_cinderx_suite_is_red_even_if_other_suites_pass():

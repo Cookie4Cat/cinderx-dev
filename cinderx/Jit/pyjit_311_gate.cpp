@@ -114,8 +114,7 @@ extern "C" const char* Ci_JitShell311_RequestCompile(
     if (what.find("RelocOffsetOutOfRange") != std::string_view::npos) {
       return "REFUSE_SHAPE_CODEGEN_SPAN";
     }
-    if (what.find("REFUSE_SHAPE_INVALID_UTF8_NAME") !=
-        std::string_view::npos) {
+    if (what.find("REFUSE_SHAPE_INVALID_UTF8_NAME") != std::string_view::npos) {
       return "REFUSE_SHAPE_INVALID_UTF8_NAME";
     }
     return "SUPPORTED_OPCODE_FAILURE";
