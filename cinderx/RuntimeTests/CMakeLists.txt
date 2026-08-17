@@ -26,6 +26,18 @@ file(GLOB RUNTIME_TEST_SOURCES CONFIGURE_DEPENDS
   ${PROJECT_SOURCE_DIR}/RuntimeTests/testutil.cpp
 )
 
+if (${PY_VERSION} EQUAL 3.11)
+  # OSR is out of scope on CPython 3.11 (Jit/osr.cpp is excluded from the
+  # build in favour of Jit/osr_stub_311.cpp); its tests exercise the OSR
+  # C-API and 3.14 frame internals, so they are excluded with it.
+  list(FILTER RUNTIME_TEST_SOURCES EXCLUDE REGEX ".*/osr_[a-z_]*_test\\.cpp$")
+  # The sanity suite is execution-focused (it runs compiled code and the
+  # Static Python data model); the capability-gated 3.11 build executes no
+  # machine code and does not build Static Python.  Re-enabled with the
+  # execution MR, guarded per test.
+  list(FILTER RUNTIME_TEST_SOURCES EXCLUDE REGEX ".*/sanity_test\\.cpp$")
+endif()
+
 add_executable(runtime_tests ${RUNTIME_TEST_SOURCES} ${CINDERX_LIB_SOURCES})
 
 target_link_libraries(

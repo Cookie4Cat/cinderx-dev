@@ -50,12 +50,38 @@ def test_dead_module_reports_once_at_module_level_not_per_case():
     assert diff["case_regressions"] == {}
 
 
-def test_skip_is_not_a_regression():
+def test_case_pass_to_skip_is_a_regression():
+    # A case that starts skipping under the evaluator shrank coverage
+    # while staying green -- same rule as the module level.
     stock = _arm({"test_x": "pass"}, {"test.test_x.T.test_a": "pass"})
     cinderx = _arm({"test_x": "pass"}, {"test.test_x.T.test_a": "skipped"})
     diff = libtest_diff.diff_results(stock, cinderx)
-    assert diff["case_regressions"] == {}
+    assert diff["case_regressions"] == {
+        "test.test_x.T.test_a": {"stock": "pass", "cinderx": "skipped"}
+    }
     assert diff["module_regressions"] == {}
+
+
+def test_crashed_worker_keeps_a_distinct_verdict():
+    # 3.11.6 regrtest prints "<name> process crashed" (libregrtest/
+    # runtest.py); the bare form is kept for robustness.
+    log = "0:00:01 load avg: 1.0 [1/2] test_x process crashed (SIGSEGV)\n" \
+          "0:00:01 load avg: 1.0 [2/2] test_y crashed"
+    verdicts = libtest_diff.parse_regrtest_modules(log, ["test_x", "test_y"])
+    assert verdicts == {"test_x": "crash", "test_y": "crash"}
+    assert libtest_diff.crash_count(verdicts) == 2
+
+
+def test_symmetric_crash_cannot_launder_to_baseline():
+    # Two arms crashing identically must never read as green: the verdict
+    # stays "crash" (not "fail"), the arm-level crash gate fires before
+    # any diff, and an asymmetric crash is a regression in the diff too.
+    stock = _arm({"test_x": "pass"}, {})
+    cinderx = _arm({"test_x": "crash"}, {})
+    diff = libtest_diff.diff_results(stock, cinderx)
+    assert diff["module_regressions"] == {
+        "test_x": {"stock": "pass", "cinderx": "crash"}
+    }
 
 
 def test_stock_failures_are_baseline_not_regressions():
@@ -153,3 +179,86 @@ def test_package_path_cases_resolve_to_their_requested_module():
     # suppressed in favor of the module-level entry.
     assert diff["case_regressions"] == {}
     assert "test.test_pkg.test_sub" in diff["module_regressions"]
+
+
+def test_arm_environment_is_sanitized():
+    # An inherited PYTHONPATH / sitecustomize hook / CINDERX_* variable
+    # could activate machinery in BOTH arms and fake a neutral diff.
+    dirty = {
+        "PATH": "/bin",
+        "PYTHONPATH": "/somewhere/evil",
+        "PYTHONSTARTUP": "/evil.py",
+        "PYTHONHOME": "/opt/py",
+        "PYTHONHASHSEED": "random",
+        "PYTHONJITAUTO": "4",
+        "PARALLEL_GC_THRESHOLD": "9",
+        "CINDERX_DIFF_ATTEST": "/tmp/x",
+        "CINDERX_JIT_MODE": "shadow",
+    }
+    env = libtest_diff.arm_environment(dirty)
+    # The inherited random hash seed is REPLACED, not merely defaulted.
+    assert env == {"PATH": "/bin", "PYTHONHASHSEED": "0"}, env
+
+
+def test_stock_startup_attests_purity(tmp_path):
+    import subprocess
+    import sys as _sys
+
+    startup = tmp_path / "startup"
+    startup.mkdir()
+    (startup / "sitecustomize.py").write_text(libtest_diff.STOCK_SITECUSTOMIZE)
+    ledger = tmp_path / "ledger.log"
+    base_env = {
+        "PYTHONPATH": str(startup),
+        "CINDERX_STOCK_ATTEST": str(ledger),
+        "PATH": "/usr/bin:/bin",
+    }
+
+    subprocess.run([_sys.executable, "-c", "pass"], env=base_env, check=True)
+    subprocess.run(
+        [_sys.executable, "-c", "import sys; sys.modules['cinderx'] = sys"],
+        env=base_env, check=True,
+    )
+    count, clean = libtest_diff.read_stock_attest(ledger)
+    assert count == 2 and not clean
+    lines = ledger.read_text().splitlines()
+    assert lines[0] == "clean"
+    assert lines[1] == "POLLUTED:cinderx"
+
+
+def test_arm_completion_discipline():
+    log_full = (
+        "0:00:01 load avg: 1.0 [1/2] test_a passed\n"
+        "0:00:01 load avg: 1.0 [2/2] test_b passed\n"
+        "== Tests result: SUCCESS ==\n"
+    )
+    assert libtest_diff.arm_run_completed(0, log_full) is None
+    assert libtest_diff.arm_run_completed(2, log_full) is None
+    assert libtest_diff.arm_run_completed(3, log_full) is None
+    # Full per-module verdicts plus a signal death: the verdict lines must
+    # not certify a run whose main process was killed.
+    err = libtest_diff.arm_run_completed(-9, log_full)
+    assert err and "abnormally" in err
+    assert libtest_diff.arm_run_completed(130, log_full)
+    assert libtest_diff.arm_run_completed(1, log_full)
+    # A normal-looking exit code without the completion epilogue is a
+    # truncated run, not a completed one.
+    assert libtest_diff.arm_run_completed(
+        0, "0:00:01 load avg: 1.0 [1/1] test_a passed\n"
+    )
+
+
+def test_worker_thread_failure_cannot_be_certified():
+    # 3.11.6 regrtest reports an internal worker-thread death AFTER the
+    # module verdicts, then still prints a normal FAILURE epilogue and
+    # exits 2 -- verdict parsing alone would certify the run and publish
+    # worker_crashes=0.  The real output shape must be refused.
+    log = (
+        "0:00:01 load avg: 1.0 [1/2] test_a passed\n"
+        "0:00:01 load avg: 1.0 [2/2] test_b passed\n"
+        "regrtest worker thread failed: Traceback (most recent call last):\n"
+        '  File "/usr/lib64/python3.11/test/libregrtest/runtest_mp.py"\n'
+        "== Tests result: FAILURE ==\n"
+    )
+    err = libtest_diff.arm_run_completed(2, log)
+    assert err and "harness-internal" in err

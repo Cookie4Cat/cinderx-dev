@@ -263,6 +263,13 @@ class RuntimeTest : public ::testing::Test {
   }
 
   Ref<> MakeGlobalsStrict() {
+#if PY_VERSION_HEX < 0x030C0000
+    // Static Python is not built on 3.11, so no fixture ever requests
+    // strict globals there (isStaticCompiler() is never true).  Fail
+    // loudly if one does instead of linking the strict-module machinery.
+    ADD_FAILURE() << "strict globals require Static Python (3.12+)";
+    return Ref<>(nullptr);
+#else
     auto globals = Ref<>::steal(PyDict_New());
     if (globals == nullptr) {
       return globals;
@@ -298,6 +305,7 @@ class RuntimeTest : public ::testing::Test {
       return Ref<>(nullptr);
     }
     return globals;
+#endif
   }
 
   bool AddModuleWithBuiltins(BorrowedRef<> module, BorrowedRef<> globals) {

@@ -1,0 +1,54 @@
+# CPython 3.11 daily-tier arms (dev plan v2.1, MR-01 build matrix).
+#
+# Heavier legs than the PR gate: the ASAN compile leg and the full
+# RuntimeTests census.  The 3.14 reference-line differential (§3.5 of the
+# plan) needs a 3.14 toolchain and runs on the 3.14 runner via
+# ci_pipeline/scripts/rt314_differential.sh; it has no job here.
+
+fail_fast = false
+
+[target]
+python = "3.11"
+arch = "arm64"
+system = "Linux"
+
+# MR-02 acceptance item 9, wired here: the full source set compiles under
+# AddressSanitizer.  Running instrumented suites is a later leg.
+# Runner provisioning: needs the libasan runtime package (the gcc packaging
+# ships only a dangling libasan.so symlink without it).
+[[jobs]]
+name = "asan_build_311"
+command = "bash -lc 'ci_pipeline/scripts/run_asan_build_311.sh \"{run_dir}/asan-build\"'"
+
+# Full RuntimeTests census: must run to completion (a crash fails), and the
+# green baseline must hold inside the same run.
+# Baseline self-extension guard, fail-closed: the scheduler MUST pass the
+# merge-base SHA as RT311_BASELINE_BASE (the job refuses to start without
+# it, and the script refuses an unresolvable ref).  While the baseline
+# file does not yet exist at the protected base, the script pins the
+# committed baseline to the audited bootstrap digest instead.
+[[jobs]]
+name = "runtime_tests_311_census"
+command = "bash -lc ': ${{RT311_BASELINE_BASE:?RT311_BASELINE_BASE must be set to the merge-base SHA by the scheduler}} && ci_pipeline/scripts/run_rt311_green.sh \"{run_dir}/rt311-census-build\" --census'"
+
+# The full driver suite under the stage-default judges: every driver runs a
+# real child workload and the capability-gate expectations must hold.  This
+# keeps the drivers themselves regression-protected between the MRs that
+# flip their judges.
+[[jobs]]
+name = "jit311_drivers"
+command = "bash -lc 'PYTHONPATH=$(ls -d \"{run_dir}\"/venv/lib/python3.11/site-packages) python3.11 -m ci_pipeline.jit311.runners'"
+
+# Debug arm of the build matrix: assertions and -O0 compile the full set.
+[[jobs]]
+name = "debug_build_311"
+command = "bash -lc 'ci_pipeline/scripts/run_debug_build_311.sh \"{run_dir}/debug-build\"'"
+
+# Completion-oriented pyperformance leg: benchmarks must finish with zero
+# worker crashes.  The benchmark set is the committed data manifest
+# (jit311/data/pyperf_benchmarks.txt) -- growing the set is a data edit.
+# The job provisions the pinned pyperformance itself; a runner without
+# network for the pin fails loud rather than shrinking coverage silently.
+[[jobs]]
+name = "jit311_pyperf_completeness"
+command = "bash -lc '\"{run_dir}/venv/bin/pip\" install --disable-pip-version-check -q pyperformance==1.11.0 && PYTHONPATH=$(ls -d \"{run_dir}\"/venv/lib/python3.11/site-packages) python3.11 -m ci_pipeline.jit311.runners --pyperf'"

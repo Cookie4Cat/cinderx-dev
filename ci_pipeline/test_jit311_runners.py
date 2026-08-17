@@ -1,0 +1,733 @@
+# Copyright (c) Meta Platforms, Inc. and affiliates.
+"""Self-tests for the trigger-proof drivers (ci_pipeline/jit311/runners.py).
+
+The drivers' whole value is that they turn red when a claimed trigger did
+not happen.  These tests prove the red paths by fabricating each blocking
+condition from the development plan and asserting the driver fails:
+
+  * expected trigger absent  -> failure, with the missing field named;
+  * worker death             -> failure, never a skip;
+  * missing report           -> failure, counted as a crash;
+  * configuration not seen   -> failure raised inside the child;
+  * schema drift             -> failure in validate_schema.
+
+They need a CPython 3.11 interpreter with the cinderx wheel importable
+(the gate runs them on the venv the wheel job builds).
+"""
+
+import sys
+
+import pytest
+
+if sys.version_info[:2] != (3, 11):
+    pytest.skip(
+        "the 3.11 trigger-proof drivers run under CPython 3.11 only",
+        allow_module_level=True,
+    )
+
+try:
+    import _cinderx  # noqa: F401
+except ImportError:
+    pytest.skip(
+        "cinderx is not importable; run under the gate venv",
+        allow_module_level=True,
+    )
+
+from pathlib import Path
+
+sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
+
+from ci_pipeline.jit311 import report as jit_report
+from ci_pipeline.jit311 import runners
+
+
+def test_expected_trigger_missing_turns_red():
+    # An extreme threshold keeps compile_requests at zero; a judge that
+    # demands requests must therefore fail, naming the field.
+    spec = runners.auto_like_runner(
+        threshold=1_000_000,
+        iters=50,
+        judges=[runners.expect("compile_requests", ">", 0)],
+    )
+    result = runners.run(spec)
+    assert not result.ok
+    assert any("compile_requests" in err for err in result.errors)
+
+
+def test_worker_death_is_a_failure_not_a_skip():
+    spec = runners.RunnerSpec(
+        name="worker_death",
+        payload="import os\nos._exit(7)\n",
+        judges=runners.gate_holds(),
+    )
+    result = runners.run(spec)
+    assert not result.ok
+    assert result.returncode == 7
+    assert any("worker exited 7" in err for err in result.errors)
+    assert any("no report" in err for err in result.errors)
+
+
+def test_config_not_effective_turns_red():
+    # The child asserts the variable itself; the harness deliberately does
+    # not set it, modeling configuration that silently failed to apply.
+    spec = runners.RunnerSpec(
+        name="config_lost",
+        payload="pass\n",
+        env={},
+        asserted_env={"CINDERX_JIT_MODE": "observe"},
+        judges=[],
+    )
+    result = runners.run(spec)
+    assert not result.ok
+    assert any("worker exited" in err for err in result.errors)
+
+
+def test_schema_drift_is_detected():
+    snap = jit_report.snapshot()
+    assert jit_report.validate_schema(snap) == []
+
+    missing = dict(snap)
+    del missing["machine_code_entries"]
+    assert any(
+        "missing field machine_code_entries" in err
+        for err in jit_report.validate_schema(missing)
+    )
+
+    extra = dict(snap)
+    extra["surprise"] = 1
+    assert any(
+        "unknown field surprise" in err
+        for err in jit_report.validate_schema(extra)
+    )
+
+    wrong_type = dict(snap)
+    wrong_type["compile_requests"] = "0"
+    assert any(
+        "compile_requests" in err
+        for err in jit_report.validate_schema(wrong_type)
+    )
+
+
+def test_gate_defaults_pass_on_the_gated_build():
+    # Positive control: the stage-default expectations hold on the
+    # capability-gated build for a cold driver and an organic driver.
+    for spec in (runners.cold_compile_runner(), runners.auto_like_runner()):
+        result = runners.run(spec)
+        assert result.ok, result.summary()
+
+
+def test_unrelated_failure_cannot_impersonate_shadow_rejection():
+    # Same exit code as the pinned rejection, wrong reason: an unrelated
+    # RuntimeError must not pass the shadow pin (review probe
+    # unrelated_exception_passes).
+    spec = runners.RunnerSpec(
+        name="unrelated_exception",
+        payload="raise RuntimeError('unrelated')\n",
+        judges=[],
+        expect_returncode=1,
+        expect_report=False,
+        expect_stderr_contains=(
+            "CINDERX_JIT_MODE=shadow is not accepted on CPython 3.11"
+        ),
+    )
+    result = runners.run(spec)
+    assert not result.ok
+    assert any("rejection marker" in err for err in result.errors)
+
+
+def test_missing_evaluator_turns_red(monkeypatch):
+    # A preamble that silently fails to install the evaluator must fail the
+    # gate judges (review probe evaluator_false_passes).
+    broken = runners.CHILD_PREAMBLE.replace(
+        "_cinderx.install_frame_evaluator()", "pass"
+    )
+    monkeypatch.setattr(runners, "CHILD_PREAMBLE", broken)
+    result = runners.run(runners.cold_compile_runner())
+    assert not result.ok
+    assert any("evaluator_installed" in err for err in result.errors)
+
+
+def test_child_schema_violation_turns_red():
+    # A child that emits a corrupt report (and skips atexit) must be caught
+    # by the harness-side schema validation, not judged field-by-field.
+    spec = runners.RunnerSpec(
+        name="corrupt_report",
+        payload=(
+            "import json, os\n"
+            "with open(os.environ['JIT311_REPORT_PATH'], 'w') as fp:\n"
+            "    json.dump({'bogus': 1}, fp)\n"
+            "os._exit(0)\n"
+        ),
+        judges=[],
+    )
+    result = runners.run(spec)
+    assert not result.ok
+    assert any("report schema" in err for err in result.errors)
+
+
+def test_corpus_module_missing_turns_red():
+    # The completeness contract is asserted inside the child against the
+    # manifest count; a shrunken corpus (modeled by demanding one module
+    # more than exists) exits nonzero and turns red.
+    spec = runners.corpus_completeness_runner(expected_modules=10)
+    result = runners.run(spec)
+    assert not result.ok
+    assert any("worker exited" in err for err in result.errors)
+
+
+def test_refcount_matrix_harness_runs_on_a_corpus_slice(tmp_path):
+    # Consumer smoke for the migrated refcount-matrix harness: one small
+    # corpus module in interp mode must measure targets and emit JSON.
+    import json as _json
+    import subprocess as _sp
+
+    corpus_dir = Path(runners.REPO_ROOT) / "ci_pipeline" / "jit311"
+    out = tmp_path / "rcm.json"
+    proc = _sp.run(
+        [
+            sys.executable,
+            str(corpus_dir / "refcount_matrix.py"),
+            str(corpus_dir),
+            "corpus_controlflow",
+            "interp",
+            str(out),
+        ],
+        capture_output=True,
+        timeout=120,
+    )
+    assert proc.returncode == 0, proc.stderr.decode(errors="replace")[-400:]
+    data = _json.loads(out.read_text())
+    assert data, "refcount matrix measured no targets"
+
+    # Interpreted execution may not impersonate JIT evidence: on the
+    # capability-gated build, jit mode must fail loudly, never fall back.
+    proc = _sp.run(
+        [
+            sys.executable,
+            str(corpus_dir / "refcount_matrix.py"),
+            str(corpus_dir),
+            "corpus_controlflow",
+            "jit",
+            str(out),
+        ],
+        capture_output=True,
+        timeout=120,
+    )
+    assert proc.returncode == 2, (proc.returncode, proc.stderr[-300:])
+    assert b"refusing to fall back" in proc.stderr or b"force_compile refused" in proc.stderr
+
+    # diff mode: equal drift passes, unequal drift exits 1.
+    a = tmp_path / "a.json"; b = tmp_path / "b.json"
+    a.write_text('{"drift": {"case_x": {"o": 1}}}')
+    b.write_text('{"drift": {"case_x": {"o": 1}}}')
+    assert _sp.run([sys.executable, str(corpus_dir / "refcount_matrix.py"), "diff", str(a), str(b)]).returncode == 0
+    b.write_text('{"drift": {"case_x": {"o": 2}}}')
+    assert _sp.run([sys.executable, str(corpus_dir / "refcount_matrix.py"), "diff", str(a), str(b)]).returncode == 1
+
+
+GATE_REQUIRED_JOBS = {
+    "vendored_manifest", "wheel_build_import", "diff_engine_selftest",
+    "bytecode_support_gate", "dynsym_allowlist", "interpreter_and_eval_hook",
+    "trigger_stats_gate", "jit311_runner_selftests",
+    "runtime_tests_311_green", "libtest_jitoff_diff", "unified_report_gate",
+    "observe_gate",
+}
+DAILY_REQUIRED_JOBS = {
+    "asan_build_311", "debug_build_311", "runtime_tests_311_census",
+    "jit311_drivers", "jit311_pyperf_completeness",
+}
+
+
+def _suite_jobs(path):
+    import re as _re
+
+    return set(_re.findall(r'name = "([a-z0-9_]+)"', Path(path).read_text()))
+
+
+def test_suites_carry_the_required_jobs():
+    # The trigger-proof arms exist only if the suites actually run them; a
+    # merge accident that drops a job must fail here, not in review.
+    root = Path(runners.REPO_ROOT) / "ci_pipeline" / "suites"
+    assert GATE_REQUIRED_JOBS <= _suite_jobs(root / "cp311_gate.toml")
+    assert DAILY_REQUIRED_JOBS <= _suite_jobs(root / "cp311_daily.toml")
+    assert "rt314_differential" in _suite_jobs(root / "cp314_reference.toml")
+
+
+def test_shadow_mode_is_not_silently_accepted():
+    # Until shadow ships, requesting it is an explicit startup rejection
+    # (RuntimeError from the mode parser), never a silent fallback.
+    result = runners.run(runners.shadow_compile_runner())
+    assert result.ok, result.summary()
+    assert result.returncode == 1
+
+
+def _load_run_gate():
+    import importlib.util
+
+    path = Path(runners.REPO_ROOT) / "ci_pipeline" / "run_gate.py"
+    spec = importlib.util.spec_from_file_location("_run_gate_under_test", path)
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    return module
+
+
+def test_all_suite_commands_survive_formatting(tmp_path):
+    # Job commands pass through str.format() before any shell sees them:
+    # an unescaped ${VAR} dies as KeyError at dispatch, which means the job
+    # can never start.  Every command in every suite must survive the real
+    # formatting path.
+    import tomllib
+
+    rg = _load_run_gate()
+    suites = sorted(
+        (Path(runners.REPO_ROOT) / "ci_pipeline" / "suites").glob("*.toml")
+    )
+    assert suites
+    for suite in suites:
+        for job in tomllib.loads(suite.read_text()).get("jobs", []):
+            if str(job.get("kind", "command")) != "command":
+                continue
+            command = rg.command_for_job(job, tmp_path, "", {})
+            assert command.strip(), (suite.name, job.get("name"))
+
+
+def _write_fake_jit(dir_, *, refuse):
+    (dir_ / "cinderx.py").write_text("def init():\n    pass\n")
+    body = (
+        "_compiled = set()\n"
+        "def force_compile(fn):\n"
+        "    if %s or id(fn) in _compiled:\n"
+        "        return False\n"
+        "    _compiled.add(id(fn))\n"
+        "    return True\n"
+        "def is_jit_compiled(fn):\n"
+        "    return id(fn) in _compiled\n"
+    ) % ("True" if refuse else "False")
+    (dir_ / "cinderjit.py").write_text(body)
+
+
+def _run_rcm_jit(fake_dir, tmp_path):
+    import os as _os
+    import subprocess as _sp
+
+    corpus_dir = Path(runners.REPO_ROOT) / "ci_pipeline" / "jit311"
+    env = dict(_os.environ)
+    env["PYTHONPATH"] = str(fake_dir) + _os.pathsep + env.get("PYTHONPATH", "")
+    return _sp.run(
+        [
+            sys.executable,
+            str(corpus_dir / "refcount_matrix.py"),
+            str(corpus_dir),
+            "corpus_generators",
+            "jit",
+            str(tmp_path / "out.json"),
+        ],
+        capture_output=True,
+        env=env,
+        timeout=180,
+    )
+
+
+def test_rcm_tolerates_already_compiled_shared_helpers(tmp_path):
+    # Real force_compile() returns False for an already-compiled function,
+    # and corpus helpers are shared across cases (gen_acc appears twice in
+    # corpus_generators).  A fake jit with exactly那 once-semantics must
+    # pass: the truth condition is is_jit_compiled(), not the return value.
+    fake = tmp_path / "fake"
+    fake.mkdir()
+    _write_fake_jit(fake, refuse=False)
+    proc = _run_rcm_jit(fake, tmp_path)
+    assert proc.returncode == 0, proc.stderr.decode(errors="replace")[-400:]
+
+
+def test_rcm_still_refuses_when_nothing_compiles(tmp_path):
+    fake = tmp_path / "fake"
+    fake.mkdir()
+    _write_fake_jit(fake, refuse=True)
+    proc = _run_rcm_jit(fake, tmp_path)
+    assert proc.returncode == 2, (proc.returncode, proc.stderr[-300:])
+    assert b"force_compile refused" in proc.stderr
+
+
+def test_pyperf_benchmark_manifest_is_wellformed():
+    import re as _re
+
+    manifest = runners.load_pyperf_benchmarks()
+    assert manifest
+    for task, results in manifest.items():
+        assert _re.fullmatch(r"[a-z0-9_]+", task)
+        assert results
+        assert all(_re.fullmatch(r"[a-z0-9_]+", r) for r in results)
+    try:
+        import pyperformance  # noqa: F401
+    except ImportError:
+        return  # name validation against the tool runs on provisioned runners
+    import subprocess as _sp
+
+    # Only the TASK column exists in the tool's own list; result names are
+    # the manifest's frozen expectation and have no external oracle.
+    listed = _sp.run(
+        [sys.executable, "-m", "pyperformance", "list"],
+        capture_output=True, text=True, timeout=120,
+    ).stdout
+    available = set(_re.findall(r"^- (\S+)", listed, _re.M))
+    missing = set(manifest) - available
+    assert not missing, f"manifest tasks unknown to pyperformance: {missing}"
+
+
+def test_pyperf_manifest_parser_rejects_malformed(monkeypatch, tmp_path):
+    # The parser is fail-closed on every way the two-column format can rot:
+    # a missing colon, a duplicated task, a result duplicated across tasks,
+    # and a result that does not sit under its task (swapped columns).
+    cases = {
+        "no_colon": "chaos chaos\n",
+        "duplicate_task": "chaos: chaos\nchaos: chaos_2\n",
+        "duplicate_result": "pickle: pickle_dict\npickle_dict: pickle_dict\n",
+        "foreign_result": "chaos: richards\n",
+        "empty_results": "chaos:\n",
+    }
+    for name, content in cases.items():
+        bad = tmp_path / f"{name}.txt"
+        bad.write_text(content)
+        monkeypatch.setattr(runners, "PYPERF_BENCHMARKS", bad)
+        with pytest.raises(SystemExit):
+            runners.load_pyperf_benchmarks()
+
+
+def test_pyperf_completion_judge_turns_red():
+    # The judge that caught nothing catches nothing forever: prove both
+    # red directions on fabricated result sets before it judges a real run.
+    ok = runners.pyperf_completion_errors({"scimark_sor"}, {"scimark_sor"})
+    assert ok == []
+
+    missing = runners.pyperf_completion_errors(
+        {"scimark_sor", "scimark_fft"}, {"scimark_sor"}
+    )
+    assert len(missing) == 1
+    assert "scimark_fft" in missing[0] and "not reported" in missing[0]
+
+    unexpected = runners.pyperf_completion_errors(
+        {"scimark_sor"}, {"scimark_sor", "scimark_fft2"}
+    )
+    assert len(unexpected) == 1
+    assert "scimark_fft2" in unexpected[0]
+    assert "outside the manifest" in unexpected[0]
+
+    # A task name leaking into the reported set must be flagged, not
+    # silently absorbed -- this is the historical defect shape.
+    both = runners.pyperf_completion_errors(
+        {"scimark_sor"}, {"scimark"}
+    )
+    assert len(both) == 2
+
+
+def test_libtest_target_manifest_is_wellformed():
+    sys.path.insert(0, str(Path(runners.REPO_ROOT) / "ci_pipeline"))
+    import libtest_diff_311 as lt
+
+    modules = lt.load_target_manifest()
+    assert modules and len(modules) == len(set(modules))
+    assert all(m.startswith("test") for m in modules)
+    # The frozen surface is exactly the harvested 457-17=440; regenerating
+    # it is a deliberate edit that updates this pin together.
+    assert len(modules) == 440, len(modules)
+
+
+def test_unified_report_strict_validation_rejects_null_fields():
+    snap = jit_report.snapshot()
+    errors = jit_report.validate_schema(snap, strict=True)
+    assert any("target_modules_attempted" in err for err in errors)
+    for field in jit_report.HARNESS_FIELDS:
+        snap[field] = 0
+    snap["target_modules_attempted"] = 440
+    assert not jit_report.validate_schema(snap, strict=True)
+
+
+def test_unify_produces_a_fully_typed_report(tmp_path):
+    import json as _json
+
+    fields = tmp_path / "fields.json"
+    out = tmp_path / "unified.json"
+    fields.write_text(
+        '{"target_modules_attempted": 440, "worker_crashes": 0}\n'
+    )
+    rc = runners.main(["--unify", str(fields), "-o", str(out)])
+    assert rc == 0
+    data = _json.loads(out.read_text())
+    assert data["target_modules_attempted"] == 440
+    assert not jit_report.validate_schema(data, strict=True)
+
+    # A null field from the leg must be refused, not laundered.
+    fields.write_text(
+        '{"target_modules_attempted": null, "worker_crashes": 0}\n'
+    )
+    assert runners.main(["--unify", str(fields), "-o", str(out)]) == 1
+
+    # The leg owns worker_crashes: when its emission does not carry the
+    # field, the aggregator must refuse rather than default-fill zero.
+    fields.write_text('{"target_modules_attempted": 440}\n')
+    assert runners.main(["--unify", str(fields), "-o", str(out)]) == 1
+
+    # Typing is not the contract: the surface must be exactly the frozen
+    # manifest and the crash count exactly zero.
+    for bad in (
+        '{"target_modules_attempted": 439, "worker_crashes": 0}',
+        '{"target_modules_attempted": 441, "worker_crashes": 0}',
+        '{"target_modules_attempted": 440, "worker_crashes": 7}',
+        # A leg may not override the probe child's own at-exit sample.
+        '{"target_modules_attempted": 440, "worker_crashes": 0,'
+        ' "live_compiled_functions_at_exit": 5}',
+    ):
+        fields.write_text(bad + "\n")
+        assert runners.main(["--unify", str(fields), "-o", str(out)]) == 1
+
+
+def _rt_data(name):
+    path = (
+        Path(runners.REPO_ROOT) / "ci_pipeline" / "jit311" / "data" / name
+    )
+    return [
+        line.strip()
+        for line in path.read_text().splitlines()
+        if line.strip() and not line.lstrip().startswith("#")
+    ]
+
+
+def test_runtime_tests_manifests_are_consistent():
+    registered = _rt_data("rt311_registered_tests.txt")
+    known_fail = _rt_data("rt311_known_failures.txt")
+    families = _rt_data("rt311_green_families.txt")
+    assert registered and len(registered) == len(set(registered))
+    # Every known failure is a registered test, every green family has a
+    # registered population, and no green family appears in the known-fail
+    # set -- the three data files describe one and the same binary.
+    assert set(known_fail) <= set(registered)
+    suites = {entry.split(".", 1)[0] for entry in registered}
+    missing = [fam for fam in families if fam not in suites]
+    assert not missing, missing
+    failing_suites = {entry.split(".", 1)[0] for entry in known_fail}
+    overlap = failing_suites & set(families)
+    assert not overlap, overlap
+
+
+def test_registered_test_disappearance_turns_red(tmp_path):
+    import subprocess as _sp
+
+    script = (
+        Path(runners.REPO_ROOT)
+        / "ci_pipeline" / "scripts" / "run_rt311_green.sh"
+    )
+    manifest = (
+        Path(runners.REPO_ROOT)
+        / "ci_pipeline" / "jit311" / "data" / "rt311_registered_tests.txt"
+    )
+    entries = [
+        line for line in manifest.read_text().splitlines()
+        if line.strip() and not line.lstrip().startswith("#")
+    ]
+    live = tmp_path / "live.txt"
+
+    # Identical live list passes through the same code path the gate uses.
+    live.write_text("\n".join(entries) + "\n")
+    proc = _sp.run(
+        ["bash", str(script), "--verify-registered", str(live)],
+        capture_output=True, text=True, timeout=60,
+    )
+    assert proc.returncode == 0, proc.stdout[-400:]
+
+    # One deleted green case must turn red, not stay silently green.
+    live.write_text("\n".join(entries[1:]) + "\n")
+    proc = _sp.run(
+        ["bash", str(script), "--verify-registered", str(live)],
+        capture_output=True, text=True, timeout=60,
+    )
+    assert proc.returncode == 1
+    assert "identity drifted" in proc.stdout
+
+
+def test_baseline_growth_turns_red(tmp_path):
+    import subprocess as _sp
+
+    script = (
+        Path(runners.REPO_ROOT)
+        / "ci_pipeline" / "scripts" / "run_rt311_green.sh"
+    )
+    old = tmp_path / "old.txt"
+    new = tmp_path / "new.txt"
+    old.write_text("Suite.A\nSuite.B\n")
+
+    # Shrinking (a fix) passes; growing in the same change turns red.
+    new.write_text("Suite.A\n")
+    assert _sp.run(
+        ["bash", str(script), "--verify-baseline-growth", str(old), str(new)],
+        capture_output=True, timeout=60,
+    ).returncode == 0
+    new.write_text("Suite.A\nSuite.B\nSuite.C\n")
+    proc = _sp.run(
+        ["bash", str(script), "--verify-baseline-growth", str(old), str(new)],
+        capture_output=True, text=True, timeout=60,
+    )
+    assert proc.returncode == 1
+    assert "washed green" in proc.stdout
+
+
+def test_registered_verification_is_locale_proof(tmp_path):
+    import os as _os
+    import subprocess as _sp
+
+    script = (
+        Path(runners.REPO_ROOT)
+        / "ci_pipeline" / "scripts" / "run_rt311_green.sh"
+    )
+    manifest = (
+        Path(runners.REPO_ROOT)
+        / "ci_pipeline" / "jit311" / "data" / "rt311_registered_tests.txt"
+    )
+    entries = [
+        line for line in manifest.read_text().splitlines()
+        if line.strip() and not line.lstrip().startswith("#")
+    ]
+    live = tmp_path / "live.txt"
+    live.write_text("\n".join(entries) + "\n")
+    for locale_value in ("C", "en_US.UTF-8"):
+        env = dict(_os.environ)
+        env["LC_ALL"] = locale_value
+        proc = _sp.run(
+            ["bash", str(script), "--verify-registered", str(live)],
+            capture_output=True, text=True, env=env, timeout=60,
+        )
+        assert proc.returncode == 0, (locale_value, proc.stdout[-400:])
+
+
+def test_child_env_drops_external_jit_config(monkeypatch):
+    # Inherited CinderX / PYTHONJIT configuration must never reach the
+    # child: a leaked shadow-mode variable would change what every driver
+    # measures (and dies loudly on the gated build, which is exactly how
+    # a leak shows up here).
+    monkeypatch.setenv("CINDERX_JIT_MODE", "shadow")
+    monkeypatch.setenv("PYTHONJITAUTO", "4")
+    result = runners.run(runners.cold_compile_runner())
+    assert result.ok, result.errors
+
+
+def test_expected_deopt_missing_turns_red():
+    # The deopt counters are wired into the schema now; a stage that
+    # promises deopt evidence and does not produce it must fail, never
+    # skip -- same discipline as the compile triggers.
+    spec = runners.cold_compile_runner(
+        judges=runners.gate_holds()
+        + [runners.expect("forced_deopt_hits", ">", 0)]
+    )
+    result = runners.run(spec)
+    assert not result.ok
+    assert any("forced_deopt_hits" in err for err in result.errors)
+
+
+def test_green_gate_refuses_skips(tmp_path):
+    import subprocess as _sp
+
+    script = (
+        Path(runners.REPO_ROOT)
+        / "ci_pipeline" / "scripts" / "run_rt311_green.sh"
+    )
+    log = tmp_path / "green.log"
+    # The reviewer probe: one green case downgraded to GTEST_SKIP keeps
+    # exit 0 and the ran-count -- the PASSED count and the zero-skip rule
+    # must catch it.
+    log.write_text(
+        "[==========] 134 tests from 26 test suites ran. (44 ms total)\n"
+        "[  PASSED  ] 133 tests.\n"
+        "[  SKIPPED ] 1 test, listed below:\n"
+        "[  SKIPPED ] HIRBuilderTest.Foo\n"
+    )
+    proc = _sp.run(
+        ["bash", str(script), "--verify-green-log", str(log), "134"],
+        capture_output=True, text=True, timeout=60,
+    )
+    assert proc.returncode == 1
+    assert "neither a pass nor a fix" in proc.stdout
+
+    log.write_text(
+        "[==========] 134 tests from 26 test suites ran. (44 ms total)\n"
+        "[  PASSED  ] 134 tests.\n"
+    )
+    assert _sp.run(
+        ["bash", str(script), "--verify-green-log", str(log), "134"],
+        capture_output=True, timeout=60,
+    ).returncode == 0
+
+
+def _rt314_fixture_logs(tmp_path):
+    base = tmp_path / "base.log"
+    base.write_text(
+        "[ RUN      ] CmdLineTest.OSREnabledFlag\n"
+        "file.cpp:42: Failure at 0x1a2b in /home/u/src/x.cpp\n"
+        "[  FAILED  ] CmdLineTest.OSREnabledFlag (12 ms)\n"
+        "[ RUN      ] FooTest.Ok\n"
+        "[       OK ] FooTest.Ok (1 ms)\n"
+        "[==========] 2 tests from 2 test suites ran. (20 ms total)\n"
+        "[  FAILED  ] 1 test, listed below:\n"
+        "[  FAILED  ] CmdLineTest.OSREnabledFlag\n"
+    )
+    return base
+
+
+def test_rt314_log_stage_normalizes_and_compares(tmp_path):
+    import subprocess as _sp
+
+    script = (
+        Path(runners.REPO_ROOT)
+        / "ci_pipeline" / "scripts" / "rt314_differential.sh"
+    )
+    base = _rt314_fixture_logs(tmp_path)
+
+    # Same behavior, different address/path/duration: normalized equal.
+    same = tmp_path / "same.log"
+    same.write_text(
+        base.read_text()
+        .replace("0x1a2b", "0x9f8e")
+        .replace("/home/u/src", "/other/place")
+        .replace("(12 ms)", "(99 ms)")
+    )
+    assert _sp.run(
+        ["bash", str(script), "--verify-logs", str(base), str(same)],
+        capture_output=True, timeout=60,
+    ).returncode == 0
+
+    # A pure source-line shift (unrelated edits move the assertion) is
+    # NOT a behavior change and must not red the differential.
+    lineshift = tmp_path / "lineshift.log"
+    lineshift.write_text(base.read_text().replace("file.cpp:42", "file.cpp:52"))
+    assert _sp.run(
+        ["bash", str(script), "--verify-logs", str(base), str(lineshift)],
+        capture_output=True, timeout=60,
+    ).returncode == 0
+
+    # An allowlisted failure failing DIFFERENTLY is not excusable.
+    diag = tmp_path / "diag.log"
+    diag.write_text(
+        base.read_text().replace(
+            "file.cpp:42: Failure", "other.cpp:9: DIFFERENT assertion"
+        )
+    )
+    proc = _sp.run(
+        ["bash", str(script), "--verify-logs", str(base), str(diag)],
+        capture_output=True, text=True, timeout=60,
+    )
+    assert proc.returncode == 1 and "diverged" in proc.stdout
+
+    # base pass -> head skip keeps failure sets equal; the skip-set
+    # comparison must refuse it.
+    skip = tmp_path / "skip.log"
+    skip.write_text(
+        base.read_text().replace(
+            "[       OK ] FooTest.Ok (1 ms)",
+            "[  SKIPPED ] FooTest.Ok (0 ms)",
+        )
+        + "[  SKIPPED ] 1 test, listed below:\n[  SKIPPED ] FooTest.Ok\n"
+    )
+    proc = _sp.run(
+        ["bash", str(script), "--verify-logs", str(base), str(skip)],
+        capture_output=True, text=True, timeout=60,
+    )
+    assert proc.returncode == 1 and "skipped-test sets diverged" in proc.stdout
