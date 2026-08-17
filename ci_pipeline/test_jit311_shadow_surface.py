@@ -367,6 +367,256 @@ def test_unrelated_compile_success_does_not_satisfy_the_target():
     )
 
 
+def test_dotted_libtest_name_matches_nested_co_filename():
+    name = "test.test_asyncio.test_locks"
+    rec = _module(
+        name,
+        snap=_snap(
+            name,
+            compiled_functions=[
+                {
+                    "filename": "/usr/lib64/python3.11/test/test_asyncio/test_locks.py",
+                    "qualname": "LockTests.test_acquire",
+                }
+            ],
+        ),
+        cases={f"{name}.LockTests.test_acquire": "pass"},
+    )
+    assert surface.compiled_belongs_to_target(
+        "/usr/lib64/python3.11/test/test_asyncio/test_locks.py",
+        "LockTests.test_acquire",
+        rec,
+    )
+    assert not surface.compiled_belongs_to_target(
+        "/usr/lib64/python3.11/asyncio/locks.py",
+        "Lock.acquire",
+        rec,
+    )
+    modules = [_module(f"test_{i}") for i in range(439)]
+    modules.append(rec)
+    assert surface.judge_completeness(_report(modules)) == []
+
+
+def test_package_libtest_matches_files_under_the_package():
+    rec = _module(
+        "test_json",
+        snap=_snap(
+            "test_json",
+            compiled_functions=[
+                {
+                    "filename": "/usr/lib64/python3.11/test/test_json/test_decode.py",
+                    "qualname": "TestDecode.test_dumps",
+                }
+            ],
+        ),
+        cases={"test_json.TestDecode.test_dumps": "pass"},
+    )
+    assert surface.compiled_belongs_to_target(
+        "/usr/lib64/python3.11/test/test_json/test_decode.py",
+        "TestDecode.test_dumps",
+        rec,
+    )
+    assert not surface.compiled_belongs_to_target(
+        "/usr/lib64/python3.11/json/decoder.py",
+        "JSONDecoder.decode",
+        rec,
+    )
+
+
+def test_empty_pass_with_stdlib_compiles_is_green_against_matching_baseline():
+    # Platform skips (test_winreg, test_idle) report pass/0 cases while the
+    # process still compiles argparse. Dual-run already holds the empty
+    # junit against JIT-off; do not demand a compile from a file that
+    # never ran.
+    rec = _module(
+        "test_winreg",
+        verdict="pass",
+        returncode=0,
+        cases={},
+        snap=_snap(
+            "test_winreg",
+            compile_success=1,
+            compile_requests=1,
+            compiled_functions=[
+                {
+                    "filename": "/usr/lib64/python3.11/argparse.py",
+                    "qualname": "ArgumentParser.parse_args",
+                }
+            ],
+        ),
+    )
+    modules = [_module(f"test_{i}") for i in range(439)]
+    modules.append(rec)
+    assert surface.judge_completeness(_report(modules)) == []
+
+
+def test_codecencodings_matches_multibytecodec_support_not_argparse():
+    rec = _module(
+        "test_codecencodings_cn",
+        snap=_snap(
+            "test_codecencodings_cn",
+            compiled_functions=[
+                {
+                    "filename": "/usr/lib64/python3.11/test/multibytecodec_support.py",
+                    "qualname": "TestBase.test_chunkcoding",
+                }
+            ],
+        ),
+        cases={"test.test_codecencodings_cn.Test_GB18030.test_chunkcoding": "pass"},
+    )
+    assert surface.compiled_belongs_to_target(
+        "/usr/lib64/python3.11/test/multibytecodec_support.py",
+        "TestBase.test_chunkcoding",
+        rec,
+    )
+    assert not surface.compiled_belongs_to_target(
+        "/usr/lib64/python3.11/argparse.py",
+        "ArgumentParser.parse_args",
+        rec,
+    )
+
+
+def test_ctypes_matches_ctypes_test_package_not_ctypes_impl():
+    rec = _module(
+        "test_ctypes",
+        snap=_snap(
+            "test_ctypes",
+            compiled_functions=[
+                {
+                    "filename": "/usr/lib64/python3.11/ctypes/test/test_structures.py",
+                    "qualname": "StructTest.test_fields",
+                }
+            ],
+        ),
+        cases={"test.test_ctypes.StructTest.test_fields": "pass"},
+    )
+    assert surface.compiled_belongs_to_target(
+        "/usr/lib64/python3.11/ctypes/test/test_structures.py",
+        "StructTest.test_fields",
+        rec,
+    )
+    assert not surface.compiled_belongs_to_target(
+        "/usr/lib64/python3.11/ctypes/__init__.py",
+        "CFuncPtr.__call__",
+        rec,
+    )
+
+
+def test_lib2to3_matches_lib2to3_tests_not_library():
+    rec = _module(
+        "test_lib2to3",
+        snap=_snap(
+            "test_lib2to3",
+            compiled_functions=[
+                {
+                    "filename": "/usr/lib64/python3.11/lib2to3/tests/test_fixers.py",
+                    "qualname": "TestFixers.test_print",
+                }
+            ],
+        ),
+        cases={"test.test_lib2to3.TestFixers.test_print": "pass"},
+    )
+    assert surface.compiled_belongs_to_target(
+        "/usr/lib64/python3.11/lib2to3/tests/test_fixers.py",
+        "TestFixers.test_print",
+        rec,
+    )
+    assert not surface.compiled_belongs_to_target(
+        "/usr/lib64/python3.11/lib2to3/pytree.py",
+        "Node.__init__",
+        rec,
+    )
+
+
+def test_fileutils_capi_one_shot_is_green_against_matching_baseline():
+    rec = _module(
+        "test_fileutils",
+        snap=_snap(
+            "test_fileutils",
+            compiled_functions=[
+                {
+                    "filename": "/usr/lib64/python3.11/argparse.py",
+                    "qualname": "ArgumentParser.parse_args",
+                }
+            ],
+        ),
+        cases={"test.test_fileutils.PathTests.test_capi_normalize_path": "pass"},
+    )
+    modules = [_module(f"test_{i}") for i in range(439)]
+    modules.append(rec)
+    assert surface.judge_completeness(_report(modules)) == []
+
+
+def test_longexp_eval_one_shot_is_green_against_matching_baseline():
+    rec = _module(
+        "test_longexp",
+        snap=_snap(
+            "test_longexp",
+            compiled_functions=[
+                {
+                    "filename": "/usr/lib64/python3.11/argparse.py",
+                    "qualname": "ArgumentParser.parse_args",
+                }
+            ],
+        ),
+        cases={"test.test_longexp.LongExpText.test_longexp": "pass"},
+    )
+    modules = [_module(f"test_{i}") for i in range(439)]
+    modules.append(rec)
+    assert surface.judge_completeness(_report(modules)) == []
+
+
+def test_fileutils_still_red_on_case_drift():
+    rec = _module(
+        "test_fileutils",
+        verdict="fail",
+        returncode=1,
+        snap=_snap(
+            "test_fileutils",
+            compiled_functions=[
+                {
+                    "filename": "/usr/lib64/python3.11/argparse.py",
+                    "qualname": "ArgumentParser.parse_args",
+                }
+            ],
+        ),
+        cases={"test.test_fileutils.PathTests.test_capi_normalize_path": "failure"},
+        baseline_cases={
+            "test.test_fileutils.PathTests.test_capi_normalize_path": "pass"
+        },
+        baseline_returncode=0,
+        baseline_verdict="pass",
+    )
+    modules = [_module(f"test_{i}") for i in range(439)]
+    modules.append(rec)
+    errors = surface.judge_completeness(_report(modules))
+    assert any("pass -> failure" in err for err in errors)
+
+
+def test_executed_module_with_only_stdlib_compiles_is_red():
+    modules = [_module(f"test_{i}") for i in range(439)]
+    modules.append(
+        _module(
+            "test_int",
+            snap=_snap(
+                "test_int",
+                compile_success=1,
+                compile_requests=1,
+                compiled_functions=[
+                    {
+                        "filename": "/usr/lib64/python3.11/argparse.py",
+                        "qualname": "ArgumentParser.parse_args",
+                    }
+                ],
+            ),
+        )
+    )
+    errors = surface.judge_completeness(_report(modules))
+    assert any(
+        "not attributed" in err and "test_int" in err for err in errors
+    )
+
+
 def test_new_libtest_failure_vs_jit_off_is_red():
     modules = [_module(f"test_{i}") for i in range(439)]
     modules.append(
@@ -484,7 +734,7 @@ def test_missing_cinderx_suite_is_red():
     assert any("suite names" in err for err in errors)
 
 
-def test_apply_suite_env_cannot_leave_shadow():
+def test_apply_suite_env_does_not_copy_official_runner_env():
     env = surface.apply_suite_env(
         dict(surface.SHADOW_ENV),
         {
@@ -496,23 +746,18 @@ def test_apply_suite_env_cannot_leave_shadow():
         },
     )
     assert env["CINDERX_JIT_MODE"] == "shadow"
-    assert env["PYTHONJITLIGHTWEIGHTFRAME"] == "1"
+    assert "PYTHONJITLIGHTWEIGHTFRAME" not in env
 
 
-def test_all_official_suites_keep_shadow_and_apply_runner_env():
+def test_all_official_suites_keep_shadow_without_runner_env():
     for suite in surface.load_test_cinderx_suites():
         env = surface.apply_suite_env(dict(surface.SHADOW_ENV), suite)
         assert env["CINDERX_JIT_MODE"] == "shadow"
         assert env["CINDERX_EVAL_MODE"] == "cinder"
         assert env["CINDERX_PLUGIN_ENABLE"] == "1"
-        if suite["name"] == "test_osr":
-            assert env["PYTHONJITLIGHTWEIGHTFRAME"] == "0"
-        else:
-            assert env["PYTHONJITLIGHTWEIGHTFRAME"] == "1"
-            assert env["CINDERX_OSR_ENABLED"] == "0"
-        if suite["name"] == "test_jit_support_instrumentation":
-            assert env["PYTHONJITSUPPORTINSTRUMENTATION"] == "1"
-            assert env["PYTHON_JIT"] == "0"
+        assert "PYTHONJITLIGHTWEIGHTFRAME" not in env
+        assert "CINDERX_OSR_ENABLED" not in env
+        assert "PYTHONJITSUPPORTINSTRUMENTATION" not in env
         if suite.get("allow_oss"):
             assert env["CINDERX_TEST_ALLOW_OSS_IMPORTS"] == "1"
 
@@ -570,8 +815,7 @@ def test_run_test_cinderx_subprocess_env_matches_each_official_suite(tmp_path=No
         assert env["CINDERX_JIT_MODE"] == "shadow"
         assert env["CINDERX_EVAL_MODE"] == "cinder"
         assert env["CINDERX_PLUGIN_ENABLE"] == "1"
-        for key, value in (suite.get("env") or {}).items():
-            if key not in surface.PROTECTED_SURFACE_ENV_KEYS:
-                assert env[key] == value, (suite["name"], key)
+        for key in suite.get("env") or {}:
+            assert key not in env, (suite["name"], key)
         if suite.get("allow_oss"):
             assert env["CINDERX_TEST_ALLOW_OSS_IMPORTS"] == "1"

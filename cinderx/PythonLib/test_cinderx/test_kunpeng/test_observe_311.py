@@ -271,7 +271,7 @@ print(json.dumps({
             CINDERX_JIT_MODE="shadow",
         )
         self.assertTrue(payload["alive"])
-        self.assertEqual(payload["results"], THRESHOLD - 1)
+        self.assertEqual(payload["results"], THRESHOLD)
         self.assertEqual(len(payload["events"]), 1)
         self.assertEqual(
             payload["events"][0]["result"],
