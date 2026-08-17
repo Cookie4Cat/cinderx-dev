@@ -3494,6 +3494,8 @@ def forget_me():
 class JITLifecycle311Test : public RuntimeTest {};
 
 TEST_F(JITLifecycle311Test, CodeDeathIsReported) {
+  SKIP_311_EXECUTABLE_COMPILE();
+
   // 3.11 registers no code watcher, so the only signal a dying code object
   // produces is its code-extra free function.  This asserts the substitute
   // is wired: attach extra data to a code object, drop the object, and see
@@ -4581,6 +4583,183 @@ def drifter(a, b):
   EXPECT_EQ(reg.count(raw), 0u)
       << "the registry still holds the dead function's address";
   EXPECT_EQ(ctx->watchedFunctionCount(), watched_before);
+}
+
+TEST_F(JITLifecycle311Test, DeathBatchDisableLeavesNoDeadKeys) {
+  SKIP_311_EXECUTABLE_COMPILE();
+
+  // CPython clears every weak reference in a batch before invoking any
+  // callback, so a user callback runs while the JIT's registries still
+  // name the dying function and the JIT's own death callback has not.
+  // disable(deopt_all=True) from that window walks the installed registry
+  // and parks the dying function; the JIT's callback must then still
+  // remove it, leaving no dead key in any registry and exactly one death
+  // on the counter.
+  const char* py_src = R"(
+import weakref
+import cinderjit
+
+events = []
+refs = []
+
+def doomed(a, b):
+    total = a - a
+    while total < b:
+        total = total + a
+    return total
+
+def bystander(a, b):
+    total = a - a
+    while total < b:
+        total = total + b
+    return total
+
+def arm(func):
+    def on_death(ref):
+        try:
+            cinderjit.disable(deopt_all=True)
+            events.append("disabled")
+        except Exception as exc:  # noqa: BLE001
+            events.append(type(exc).__name__)
+    refs.append(weakref.ref(func, on_death))
+)";
+
+  Ref<PyFunctionObject> doomed(compileAndGet(py_src, "doomed"));
+  Ref<PyFunctionObject> bystander(getGlobal("bystander"));
+  ASSERT_NE(doomed, nullptr);
+  ASSERT_NE(bystander, nullptr);
+  ASSERT_EQ(jit::compileFunction(doomed), jit::Result::OK);
+  ASSERT_EQ(jit::compileFunction(bystander), jit::Result::OK);
+  ASSERT_TRUE(isJitCompiled(doomed));
+  ASSERT_TRUE(isJitCompiled(bystander));
+
+  jit::Context* ctx = jit::getContext();
+  ASSERT_NE(ctx, nullptr);
+
+  {
+    Ref<> arm(getGlobal("arm"));
+    ASSERT_NE(arm, nullptr);
+    auto armed = Ref<>::steal(PyObject_CallOneArg(
+        arm.get(), reinterpret_cast<PyObject*>(doomed.get())));
+    ASSERT_NE(armed, nullptr);
+  }
+
+  ASSERT_EQ(PyDict_DelItemString(doomed->func_globals, "doomed"), 0);
+  PyObject* raw = reinterpret_cast<PyObject*>(doomed.get());
+  uint64_t deaths_before =
+      jit::triggerStatsSnapshot().function_destroyed_notifications;
+  doomed.reset();
+  uint64_t deaths_after =
+      jit::triggerStatsSnapshot().function_destroyed_notifications;
+
+  EXPECT_EQ(deaths_after, deaths_before + 1)
+      << "the death was not delivered exactly once";
+  EXPECT_EQ(ctx->compiledFuncs().count(raw), 0u)
+      << "the installed registry still names the dead function";
+  EXPECT_EQ(ctx->deoptedFuncs().count(raw), 0u)
+      << "the parked registry still names the dead function";
+  EXPECT_EQ(jit::getConfig().state, jit::State::kPaused);
+  EXPECT_EQ(ctx->deoptedFuncs().count(bystander.get()), 1u)
+      << "the reentrant disable() did not park the bystander exactly once";
+
+  Ref<> events(getGlobal("events"));
+  ASSERT_NE(events, nullptr);
+  ASSERT_EQ(PyList_GET_SIZE(events.get()), 1);
+
+  auto mod = importCinderJitModule();
+  callJitNoArgs(mod, "enable");
+  EXPECT_TRUE(isJitCompiled(bystander));
+  EXPECT_EQ(ctx->deoptedFuncs().count(raw), 0u);
+}
+
+TEST_F(JITLifecycle311Test, DeathBatchDisableEnableDoesNotResurrect) {
+  SKIP_311_EXECUTABLE_COMPILE();
+
+  // The aggressive variant: the user callback pauses AND re-enables while
+  // the function's death is pending.  enable()'s reattach walk snapshots
+  // the parked set with strong references, and a strong reference to an
+  // object mid-deallocation is a resurrection; the walk must skip entries
+  // whose death is pending (their own callback removes them).  The world
+  // afterwards: exactly one death, no dead key anywhere, the bystander
+  // back on machine code, the JIT running.
+  const char* py_src = R"(
+import weakref
+import cinderjit
+
+events = []
+refs = []
+
+def doomed2(a, b):
+    total = a - a
+    while total < b:
+        total = total + a
+    return total
+
+def bystander2(a, b):
+    total = a - a
+    while total < b:
+        total = total + b
+    return total
+
+def arm(func):
+    def on_death(ref):
+        try:
+            cinderjit.disable(deopt_all=True)
+            cinderjit.enable()
+            events.append("cycled")
+        except Exception as exc:  # noqa: BLE001
+            events.append(type(exc).__name__)
+    refs.append(weakref.ref(func, on_death))
+)";
+
+  Ref<PyFunctionObject> doomed(compileAndGet(py_src, "doomed2"));
+  Ref<PyFunctionObject> bystander(getGlobal("bystander2"));
+  ASSERT_NE(doomed, nullptr);
+  ASSERT_NE(bystander, nullptr);
+  ASSERT_EQ(jit::compileFunction(doomed), jit::Result::OK);
+  ASSERT_EQ(jit::compileFunction(bystander), jit::Result::OK);
+
+  jit::Context* ctx = jit::getContext();
+  ASSERT_NE(ctx, nullptr);
+
+  {
+    Ref<> arm(getGlobal("arm"));
+    ASSERT_NE(arm, nullptr);
+    auto armed = Ref<>::steal(PyObject_CallOneArg(
+        arm.get(), reinterpret_cast<PyObject*>(doomed.get())));
+    ASSERT_NE(armed, nullptr);
+  }
+
+  ASSERT_EQ(PyDict_DelItemString(doomed->func_globals, "doomed2"), 0);
+  PyObject* raw = reinterpret_cast<PyObject*>(doomed.get());
+  uint64_t deaths_before =
+      jit::triggerStatsSnapshot().function_destroyed_notifications;
+  doomed.reset();
+  uint64_t deaths_after =
+      jit::triggerStatsSnapshot().function_destroyed_notifications;
+
+  EXPECT_EQ(deaths_after, deaths_before + 1)
+      << "the death was not delivered exactly once";
+  EXPECT_EQ(ctx->compiledFuncs().count(raw), 0u);
+  EXPECT_EQ(ctx->deoptedFuncs().count(raw), 0u)
+      << "the enable() walk resurrected or re-recorded the dying function";
+
+  Ref<> events(getGlobal("events"));
+  ASSERT_NE(events, nullptr);
+  ASSERT_EQ(PyList_GET_SIZE(events.get()), 1);
+  EXPECT_TRUE(
+      PyUnicode_CompareWithASCIIString(
+          PyList_GET_ITEM(events.get(), 0), "cycled") == 0);
+
+  EXPECT_EQ(jit::getConfig().state, jit::State::kRunning);
+  EXPECT_TRUE(isJitCompiled(bystander))
+      << "the reentrant enable() did not reattach the bystander";
+  auto arg_a = makeLong(3);
+  auto arg_b = makeLong(5);
+  auto args = Ref<>::steal(PyTuple_Pack(2, arg_a.get(), arg_b.get()));
+  auto result = Ref<>::steal(PyObject_Call(bystander, args, nullptr));
+  ASSERT_NE(result, nullptr);
+  EXPECT_EQ(PyLong_AsLong(result), 5);
 }
 
 TEST_F(JITLifecycle311Test, ParkedFunctionDeathUnparksIt) {

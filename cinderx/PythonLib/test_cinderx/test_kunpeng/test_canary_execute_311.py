@@ -320,10 +320,11 @@ class CanaryExecute311Test(unittest.TestCase):
 
     def test_canary_control_plane_is_restricted(self):
         # The full cinderjit method table is a control surface for
-        # capabilities MR-04 does not have: the batch and lazy paths install
-        # machine code without passing the execute surface, force_uncompile
-        # belongs to MR-05, and the specialization and guard setters can
-        # re-open exactly the speculation this milestone excludes.
+        # capabilities this port does not have yet: the batch and lazy
+        # paths install machine code without passing the execute surface,
+        # and the specialization and guard setters can re-open exactly the
+        # speculation MR-04 excludes.  force_uncompile left this list when
+        # MR-05 published it.
         env = dict(os.environ)
         env["CINDERX_JIT_MODE"] = "canary"
         env["PYTHONJITAUTO"] = "1000000"
@@ -337,7 +338,7 @@ class CanaryExecute311Test(unittest.TestCase):
             # Capabilities later milestones own.
             withheld = [
                 "lazy_compile", "precompile_all", "compile_all",
-                "force_uncompile", "enable_specialized_opcodes",
+                "enable_specialized_opcodes",
                 "disable_specialized_opcodes",
                 "enable_emit_type_annotation_guards",
                 "clear_runtime_stats",
@@ -2743,9 +2744,10 @@ class CanaryExecute311Test(unittest.TestCase):
 
     def test_function_dying_while_paused_survives_re_enable(self):
         # disable(deopt_all=True) parks every compiled function in the
-        # deopted set, which re-enabling walks again.  With borrowed
-        # references and no function watcher to clear them, a function that
-        # died while paused was dereferenced on the way back.
+        # deopted set, which re-enabling walks again.  The entries are
+        # borrowed, so what keeps that walk safe is the weak-reference death
+        # watch: a function that dies while paused has to leave the set
+        # before enable() reaches it.
         env = dict(os.environ)
         env["CINDERX_JIT_MODE"] = "canary"
         env["PYTHONJITAUTO"] = "1000000"
@@ -2780,14 +2782,16 @@ class CanaryExecute311Test(unittest.TestCase):
             with jit.pause(deopt_all=True):
                 del victim
                 gc.collect()
+                # Nothing holds it now, so it has to be gone -- and the
+                # parked set has to have been told, or the walk below
+                # dereferences freed memory.
+                assert alive() is None
                 junk = [bytearray(400) for _ in range(5000)]
-                # The parked function must stay valid for as long as the
-                # runtime can walk it again.
-                assert alive() is not None
                 del junk
             # Re-enabling walks the parked set; nothing here may dangle.
             gc.collect()
-            assert alive() is None or alive().__qualname__ == "victim"
+            assert alive() is None
+            assert not cinderjit.get_compiled_functions()
             print("survived re-enable")
             """
         )

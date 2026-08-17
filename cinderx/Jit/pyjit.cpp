@@ -2069,6 +2069,16 @@ static bool reattachParkedFuncs() {
     auto& funcs = jitCtx()->deoptedFuncs();
     parked.reserve(funcs.size());
     for (BorrowedRef<PyFunctionObject> func : funcs) {
+#if PY_VERSION_HEX < 0x030C0000
+      // A parked entry whose death is already pending -- its weak
+      // reference cleared, its callback batch running, this walk reached
+      // from a user callback in that batch -- must not be resurrected by
+      // the snapshot's strong reference: an INCREF here revives an object
+      // mid-deallocation.  Its own callback erases the entry; skip it.
+      if (jitCtx()->isFunctionDeathPending(func)) {
+        continue;
+      }
+#endif
       parked.emplace_back(Ref<PyFunctionObject>::create(func));
     }
   }
