@@ -171,6 +171,16 @@ class Context : public IJitContext, public CompiledFunctionOwner {
   void forgetFunctionDeathWatch(PyFunctionObject* func);
 
   /*
+   * True while the function's death is already in flight: its watch has been
+   * cleared by the collector but the callback has not landed yet.  During a
+   * cyclic collection the weak references of the doomed are cleared, and
+   * their callbacks run, before anything is untracked -- so a query from a
+   * user callback in that batch sees the function still tracked while it is
+   * already condemned.  The cleared watch is the only oracle for that state.
+   */
+  bool isFunctionDeathPending(BorrowedRef<PyFunctionObject> func) const;
+
+  /*
    * Drop every watch.  Teardown only: after this the JIT stops being told
    * about function deaths.
    */

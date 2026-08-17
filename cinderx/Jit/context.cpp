@@ -1533,6 +1533,15 @@ void Context::forgetFunctionDeathWatch(PyFunctionObject* func) {
   func_death_watch_.erase(func);
 }
 
+bool Context::isFunctionDeathPending(BorrowedRef<PyFunctionObject> func) const {
+  auto it = func_death_watch_.find(func.get());
+  if (it == func_death_watch_.end()) {
+    return false;
+  }
+  BorrowedRef<> referent = PyWeakref_GET_OBJECT(it->second.get());
+  return referent == Py_None;
+}
+
 void Context::clearFunctionDeathWatch() {
   // Detach before releasing: dropping a weak reference runs no Python, but
   // the map must not be observable half-emptied by anything a release

@@ -1485,6 +1485,65 @@ class CanaryExecute311Test(unittest.TestCase):
         self.assertEqual(proc.returncode, 0, proc.stderr[-1500:])
         self.assertIn("no revival in any state", proc.stdout)
 
+    def test_resident_count_is_physical_under_an_external_pin(self):
+        # The resident count is a physical measurement of executable
+        # memory, maintained on the buffer's real lifetime.  Registry
+        # bookkeeping must not move it: force_uncompile() removes every
+        # registry record, but an external reference still pins the
+        # artifact and its machine code -- the count holds until the pin
+        # drops, and a zero here while the buffer lives would be exactly
+        # the false negative the measurement exists to prevent.
+        env = dict(os.environ)
+        env["CINDERX_JIT_MODE"] = "canary"
+        env["PYTHONJITAUTO"] = "1000000"
+        probe = textwrap.dedent(
+            """
+            import _cinderx, cinderx
+            cinderx.init()
+            _cinderx.install_frame_evaluator()
+            import cinderjit
+
+            def resident():
+                return cinderjit._get_resident_compiled_functions()
+
+            ns = {}
+            exec(
+                "def held(a, b):\\n"
+                "    t = a - a\\n"
+                "    while t < b:\\n"
+                "        t = t + a\\n"
+                "    return t\\n",
+                ns,
+            )
+            held = ns["held"]
+            base = resident()
+            assert cinderjit.force_compile(held) is True
+            assert resident() == base + 1
+
+            pin = held.__dict__["__cinderx_compiled_func__"]
+            assert cinderjit.force_uncompile(held) is True
+            assert not cinderjit.is_jit_compiled(held)
+            assert resident() == base + 1, (
+                "the count dropped while an external pin still holds the "
+                "machine code")
+
+            del pin
+            assert resident() == base, (
+                "the count did not drop when the last reference released "
+                "the buffer")
+            print("resident count tracked the buffer")
+            """
+        )
+        proc = subprocess.run(
+            [sys.executable, "-c", probe],
+            capture_output=True,
+            text=True,
+            env=env,
+            timeout=120,
+        )
+        self.assertEqual(proc.returncode, 0, proc.stderr[-1200:])
+        self.assertIn("resident count tracked the buffer", proc.stdout)
+
     def test_code_swap_is_an_identity_guard_not_an_invalidation(self):
         # The __code__ replacement contract, stated exactly: it is a CODE
         # IDENTITY GUARD at the entry, not a permanent invalidation of the
@@ -3258,6 +3317,98 @@ class CanaryExecute311Test(unittest.TestCase):
             assert deaths() == before, (before, deaths())
             del fn
             assert deaths() == before + 1, (before, deaths())
+            """
+        )
+        proc = subprocess.run(
+            [sys.executable, "-c", probe],
+            capture_output=True,
+            text=True,
+            env=env,
+            timeout=120,
+        )
+        self.assertEqual(proc.returncode, 0, proc.stderr[-800:])
+
+    def test_collector_run_callbacks_cannot_resurrect_the_doomed(self):
+        # A cyclic collection clears the weak references of the doomed and
+        # runs the externally rooted callbacks BEFORE anything is
+        # untracked, so a user callback in that batch can query the JIT
+        # while a condemned compiled function is still GC-tracked.  The
+        # listing must not hand it out -- appending it would resurrect it
+        # from the garbage set -- in either interleaving of the user's
+        # callback with the JIT's own death watch, which is why the user
+        # weak reference is armed before the JIT's in one arm and after it
+        # in the other.
+        env = dict(os.environ)
+        env["CINDERX_JIT_MODE"] = "canary"
+        env["PYTHONJITAUTO"] = "1000000"
+        probe = textwrap.dedent(
+            """
+            import gc
+            import weakref
+            import _cinderx, cinderx
+            cinderx.init()
+            _cinderx.install_frame_evaluator()
+            import cinderjit
+
+            def make(name):
+                src = (
+                    "def %s(a, b):\\n"
+                    "    total = a - a\\n"
+                    "    while total < b:\\n"
+                    "        total = total + a\\n"
+                    "    return total\\n"
+                ) % name
+                ns = {}
+                exec(src, ns)
+                return ns.pop(name)
+
+            def deaths():
+                stats = _cinderx._get_trigger_stats()
+                return stats["function_destroyed_notifications"]
+
+            escaped = []
+            listings = []
+
+            def observe(_ref):
+                listing = [
+                    f.__qualname__ for f in cinderjit.get_compiled_functions()
+                ]
+                listings.append(listing)
+                escaped.extend(
+                    f
+                    for f in cinderjit.get_compiled_functions()
+                    if f.__qualname__.startswith("doomed_")
+                )
+
+            watches = []
+            before = deaths()
+            for i in range(8):
+                name = "doomed_%d" % i
+                if (i % 2) == 0:
+                    # User weak reference armed before the JIT's own watch.
+                    fn = make(name)
+                    watches.append(weakref.ref(fn, observe))
+                    assert cinderjit.force_compile(fn) is True
+                else:
+                    # And armed after it.
+                    fn = make(name)
+                    assert cinderjit.force_compile(fn) is True
+                    watches.append(weakref.ref(fn, observe))
+                assert fn(2, 6) == 6
+                # A cycle only the collector can take apart:
+                # func -> __dict__ -> list -> func.
+                fn.__cycle__ = [fn]
+                del fn
+                gc.collect()
+            assert len(listings) == 8, listings
+            for listing in listings:
+                assert not any(q.startswith("doomed_") for q in listing), (
+                    "a condemned function was handed out of the listing "
+                    "mid-collection: %r" % (listings,)
+                )
+            assert not escaped, escaped
+            assert deaths() == before + 8, (before, deaths())
+            assert all(w() is None for w in watches)
             """
         )
         proc = subprocess.run(

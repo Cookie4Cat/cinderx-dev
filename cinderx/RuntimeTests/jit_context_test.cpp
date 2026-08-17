@@ -4769,6 +4769,34 @@ def finalized(x):
   EXPECT_EQ(PyLong_AsLong(result), 10);
 }
 
+TEST_F(JITLifecycle311Test, FinalizeIsRepeatable) {
+  SKIP_311_EXECUTABLE_COMPILE();
+
+  // Shutdown can reach finalization more than once -- the module teardown
+  // and the interpreter teardown both drive it -- so a second pass has to
+  // be a no-op rather than a second teardown of state that is already gone.
+  const char* py_src = R"(
+def twice(x):
+    return x + 9
+)";
+
+  Ref<PyFunctionObject> func(compileAndGet(py_src, "twice"));
+  ASSERT_NE(func, nullptr);
+  ASSERT_EQ(jit::compileFunction(func), jit::Result::OK);
+
+  jit::finalize();
+  ASSERT_FALSE(jit::isJitInitialized());
+  jit::finalize();
+  jit::finalize();
+  EXPECT_FALSE(jit::isJitInitialized());
+
+  auto arg = makeLong(1);
+  auto args = Ref<>::steal(PyTuple_Pack(1, arg.get()));
+  auto result = Ref<>::steal(PyObject_Call(func, args, nullptr));
+  ASSERT_NE(result, nullptr);
+  EXPECT_EQ(PyLong_AsLong(result), 10);
+}
+
 TEST_F(JITLifecycle311Test, FinalizeEmptiesTheParkedRegistry) {
   SKIP_311_EXECUTABLE_COMPILE();
 

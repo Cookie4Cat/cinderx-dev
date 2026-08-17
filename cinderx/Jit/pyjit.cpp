@@ -3112,17 +3112,15 @@ PyObject* read_jit_list(PyObject* /* self */, PyObject* arg) {
 // the two apart is what makes a lifecycle report mean anything.
 PyObject* get_resident_compiled_functions(PyObject* /* self */, PyObject*) {
   // A physical measurement, so it must not depend on the JIT's current
-  // state: pausing does not release a code buffer, and answering None (or
-  // zero) while artifacts are still resident is exactly the false negative
-  // this exists to prevent.  Counting compiled_codes_ rather than the
-  // installed-function map also keeps deopted-but-resident artifacts
-  // visible.  An integer, because the question is "how much is still
-  // alive", not "which functions would run".
-  auto* ctx = jitCtx();
-  if (ctx == nullptr) {
-    return PyLong_FromLong(0);
-  }
-  return PyLong_FromSize_t(ctx->compiledCodes().size());
+  // state OR its registries: pausing does not release a code buffer, and
+  // neither does force_uncompile() while an external reference pins the
+  // artifact -- the registry entry is gone, the machine code is not.  The
+  // gauge is maintained on the buffer's real lifetime (acquired with the
+  // artifact, released in its destructor), so it answers "how much
+  // executable memory is still alive", not "which functions would run"
+  // and not "what does the registry remember".
+  return PyLong_FromUnsignedLongLong(
+      jit::triggerStatsSnapshot().resident_code_buffers);
 }
 
 PyObject* get_compiled_functions(PyObject* /* self */, PyObject*) {
@@ -3132,6 +3130,29 @@ PyObject* get_compiled_functions(PyObject* /* self */, PyObject*) {
   }
   for (auto func_and_compiled : jitCtx()->compiledFuncs()) {
 #if PY_VERSION_HEX < 0x030C0000
+    // Never hand out a function that is already being destroyed.  This can
+    // run from a weak-reference callback, which CPython invokes from inside
+    // func_dealloc after temporarily resurrecting the object to a reference
+    // count of one; appending it here would take that count to two, and the
+    // restore that follows the callbacks frees it anyway -- leaving this
+    // list holding freed memory.  func_dealloc untracks before it runs the
+    // callbacks, so "not tracked" is exactly "being destroyed" for a type
+    // that is otherwise always tracked.
+    if (!PyObject_GC_IsTracked(func_and_compiled.first)) {
+      continue;
+    }
+    // The untracked check catches an ordinary dealloc, where func_dealloc
+    // untracks before it runs the weak-reference callbacks.  A cyclic
+    // collection is the other way around: the collector clears the weak
+    // references of the doomed, and runs the externally rooted callbacks,
+    // before anything is untracked -- so a query from such a callback sees
+    // a condemned function still tracked, and appending it here would
+    // resurrect it out of the garbage set.  The JIT's own death watch is
+    // the oracle for that state: its weak reference is cleared, the
+    // callback has not landed, the death is already in flight.
+    if (jitCtx()->isFunctionDeathPending(func_and_compiled.first)) {
+      continue;
+    }
     // Report what is actually installed.  A function whose code, globals or
     // defaults changed since it compiled still holds a registry entry, but
     // every call to it now goes to the interpreter, so listing it here

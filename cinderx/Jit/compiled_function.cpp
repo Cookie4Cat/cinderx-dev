@@ -187,6 +187,12 @@ Ref<CompiledFunction> CompiledFunction::create(
   // Trigger-proof accounting: every compiled-function object ever created
   // is counted, regardless of how it is later installed or released.
   jit::triggerStatsOnCompiledFunctionCreate();
+  // Physical residency: the object now owns executable memory, and holds
+  // it until its destructor -- clear() and registry removal do not release
+  // the buffer, and an externally pinned artifact keeps its machine code.
+  if (cf->codeBuffer().data() != nullptr) {
+    jit::triggerStatsOnCodeBufferAcquired();
+  }
 
   // Return a stolen reference - the caller owns it.
   return Ref<CompiledFunction>::steal(cf);
@@ -195,11 +201,16 @@ Ref<CompiledFunction> CompiledFunction::create(
 CompiledFunction::~CompiledFunction() {
   clear();
 
-  auto mod_state = cinderx::getModuleState();
-  if (mod_state != nullptr && data_.code.data() != nullptr) {
-    auto code_allocator = mod_state->code_allocator.get();
-    if (code_allocator != nullptr) {
-      code_allocator->releaseCode(const_cast<std::byte*>(data_.code.data()));
+  if (data_.code.data() != nullptr) {
+    // The buffer's lifetime ends with this object (or ended with the
+    // allocator at teardown); either way it stops being resident here.
+    jit::triggerStatsOnCodeBufferReleased();
+    auto mod_state = cinderx::getModuleState();
+    if (mod_state != nullptr) {
+      auto code_allocator = mod_state->code_allocator.get();
+      if (code_allocator != nullptr) {
+        code_allocator->releaseCode(const_cast<std::byte*>(data_.code.data()));
+      }
     }
   }
 }
