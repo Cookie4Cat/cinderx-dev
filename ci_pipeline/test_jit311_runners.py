@@ -604,6 +604,49 @@ def test_runtime_tests_manifests_are_consistent():
     assert not (writeoff & set(known_fail))
 
 
+def _writeoff_rows(name):
+    """Parse a write-off table into (item, status, [evidence])."""
+    rows = []
+    for line in _rt_data(name):
+        parts = [field.strip() for field in line.split("\t")]
+        assert len(parts) == 3, (name, line)
+        item, status, evidence = parts
+        assert status in ("landed", "not-applicable"), (name, line)
+        cases = [case.strip() for case in evidence.split(";") if case.strip()]
+        assert cases, (name, line)
+        rows.append((item, status, cases))
+    return rows
+
+
+def test_mr05_lifecycle_writeoff_is_backed_by_passing_tests():
+    # The audit rows this milestone owns are closed against registered
+    # cases rather than against prose.  Reading the evidence out of the
+    # table -- instead of restating it here -- is what stops the two from
+    # drifting: a row can only be written off against a case that exists
+    # and is not in the known-failure baseline.
+    registered = set(_rt_data("rt311_registered_tests.txt"))
+    known_fail = set(_rt_data("rt311_known_failures.txt"))
+    rows = _writeoff_rows("mr05_lifecycle_writeoff.txt")
+    items = [item for item, _, _ in rows]
+    assert items == [
+        "weakref death-watch replication",
+        "co_extra minimum capacity",
+        "finalize cross-period GC re-entry UAF family",
+    ], items
+    for item, status, cases in rows:
+        assert status == "landed", (item, status)
+        missing = [case for case in cases if case not in registered]
+        assert not missing, (item, missing)
+        failing = [case for case in cases if case in known_fail]
+        assert not failing, (item, failing)
+    # Every named case has to be one the canary leg actually runs, or the
+    # write-off rests on something that is skipped in both modes.
+    allowed_skips = set(_rt_data("rt311_allowed_skips.txt"))
+    for item, _, cases in rows:
+        unrun = [case for case in cases if case not in allowed_skips]
+        assert not unrun, (item, unrun)
+
+
 def test_registered_test_disappearance_turns_red(tmp_path):
     import subprocess as _sp
 

@@ -1,0 +1,18 @@
+# MR-05 function/code-lifecycle write-off pins.
+#
+# The plan's acceptance for this milestone requires the audit rows that
+# belong to this domain to be closed against in-tree evidence, not against
+# a narrative.  Each row below names registered RuntimeTests cases; the
+# self-test in ci_pipeline/test_jit311_runners.py parses this file and
+# requires every named case to be registered and absent from
+# rt311_known_failures.txt, so a row cannot be written off against a case
+# that does not exist or does not pass.
+#
+# status values: landed | not-applicable
+#
+# Evidence is semicolon-separated.
+#
+# item	status	evidence
+weakref death-watch replication	landed	JITLifecycle311Test.FunctionDeathIsReported; JITLifecycle311Test.FunctionDeathInsideACycleIsReported; JITLifecycle311Test.ParkedFunctionDeathUnparksIt; JITContextTest.DeathReportsToTheWatchOwningContext
+co_extra minimum capacity	landed	JITLifecycle311Test.CodeExtraStaysAtOurOwnIndex; JITLifecycle311Test.CodeDeathIsReported
+finalize cross-period GC re-entry UAF family	landed	JITLifecycle311Test.FinalizeRefusesReentrantEnable; JITLifecycle311Test.FinalizeIsRepeatable; JITLifecycle311Test.FinalizeEmptiesTheInstalledRegistry; JITLifecycle311Test.FinalizeEmptiesTheParkedRegistry; JITLifecycle311Test.MultithreadedTeardownLeavesNoDeadKeys

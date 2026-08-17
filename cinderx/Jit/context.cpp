@@ -1502,8 +1502,8 @@ bool Context::watchFunctionDeath(BorrowedRef<PyFunctionObject> func) {
     PyErr_Clear();
     return false;
   }
-  auto payload = Ref<>::steal(PyTuple_Pack(
-      2, death_watch_owner_token_.get(), func_address.get()));
+  auto payload = Ref<>::steal(
+      PyTuple_Pack(2, death_watch_owner_token_.get(), func_address.get()));
   if (payload == nullptr) {
     PyErr_Clear();
     return false;

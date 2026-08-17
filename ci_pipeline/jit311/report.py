@@ -247,10 +247,14 @@ def snapshot() -> dict[str, Any]:
             trigger["shadow_specialized_opcodes_consumed"]
         ),
         "shadow_codegen_bytes": int(trigger["shadow_codegen_bytes"]),
+        # Tolerated as absent: a snapshot taken by a build from before the
+        # lifecycle counters existed has no such key, and reporting zero is
+        # the truthful answer for it -- that build delivered no
+        # notifications because it had no mechanism to deliver them.
         "code_destroyed_notifications": int(
-            trigger["code_destroyed_notifications"]),
+            trigger.get("code_destroyed_notifications", 0)),
         "function_destroyed_notifications": int(
-            trigger["function_destroyed_notifications"]),
+            trigger.get("function_destroyed_notifications", 0)),
         "peak_rss_bytes": _peak_rss_bytes(),
         "machine_code_installed": _compiled_function_count(),
         "machine_code_entries": int(trigger["machine_code_entries"]),
