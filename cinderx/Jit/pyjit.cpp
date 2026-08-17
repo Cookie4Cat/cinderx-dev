@@ -4639,6 +4639,10 @@ void setUncompileMidpointHookForTest(void (*hook)()) {
   s_uncompile_midpoint_hook_for_test = hook;
 }
 
+bool registerFunctionForTest(BorrowedRef<PyFunctionObject> func) {
+  return registerFunction(func);
+}
+
 bool roiBackoffAllowsCompile(BorrowedRef<PyCodeObject> code) {
   if (!getConfig().roi_backoff_enabled) {
     return true;
@@ -5505,10 +5509,6 @@ void codeDestroyed(BorrowedRef<PyCodeObject> code) {
   }
 }
 
-bool registerFunctionForTest(BorrowedRef<PyFunctionObject> func) {
-  return registerFunction(func);
-}
-
 void funcUnpublishedInContext(
     Context* ctx,
     BorrowedRef<PyFunctionObject> func) {
@@ -5534,9 +5534,7 @@ void funcUnpublished(BorrowedRef<PyFunctionObject> func) {
   funcUnpublishedInContext(jitCtx(), func);
 }
 
-void funcDestroyedInContext(
-    Context* ctx,
-    BorrowedRef<PyFunctionObject> func) {
+void funcDestroyedInContext(Context* ctx, BorrowedRef<PyFunctionObject> func) {
   if (cinderx::getModuleState() == nullptr) {
     return;
   }

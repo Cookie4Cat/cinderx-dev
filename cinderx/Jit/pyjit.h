@@ -102,18 +102,18 @@ void funcUnpublishedInContext(Context* ctx, BorrowedRef<PyFunctionObject> func);
 void funcDestroyedInContext(Context* ctx, BorrowedRef<PyFunctionObject> func);
 
 /*
- * Test-only: drive the registration path (register a function for future
- * compilation without compiling it), which is otherwise reachable only
- * through entry points the canary does not publish.
- */
-bool registerFunctionForTest(BorrowedRef<PyFunctionObject> func);
-
-/*
  * Test-only: invoked between force_uncompile()'s unpublication and its
  * artifact retirement, so a native case can drop the last external
  * reference in the middle of the operation.
  */
 void setUncompileMidpointHookForTest(void (*hook)());
+
+/*
+ * Test-only: drive the registration path (register a function for future
+ * compilation without compiling it), which is otherwise reachable only
+ * through entry points the canary does not publish.
+ */
+bool registerFunctionForTest(BorrowedRef<PyFunctionObject> func);
 void funcModified(BorrowedRef<PyFunctionObject> func);
 void typeDestroyed(BorrowedRef<PyTypeObject> type);
 void typeModified(BorrowedRef<PyTypeObject> type);

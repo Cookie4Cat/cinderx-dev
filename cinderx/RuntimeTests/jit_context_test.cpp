@@ -556,8 +556,8 @@ def standalone(a, b):
 
   Ref<PyFunctionObject> func(compileAndGet(py_src, "standalone"));
   ASSERT_NE(func, nullptr);
-  std::unique_ptr<jit::hir::Preloader> preloader(jit::hir::Preloader::make(
-      func, jit::makeFrameReifier(func->func_code)));
+  std::unique_ptr<jit::hir::Preloader> preloader(
+      jit::hir::Preloader::make(func, jit::makeFrameReifier(func->func_code)));
   ASSERT_NE(preloader, nullptr);
   ASSERT_EQ(
       jit::compilePreloaderImpl(jit_ctx_.get(), *preloader, func),
@@ -716,6 +716,7 @@ def arm(func):
       << "the JIT callback ran before the user callback: the owner-death "
          "window was not exercised";
 }
+
 #endif
 
 TEST_F(JITContextTest, UnwatchableBuiltins) {
@@ -3508,6 +3509,48 @@ TEST_F(JITLifecycle311Test, CodeDeathIsReported) {
       after.code_destroyed_notifications, before.code_destroyed_notifications)
       << "no code-death notification; the free function is not wired to the "
          "JIT, and code-keyed registries will keep dead keys";
+}
+
+TEST_F(JITLifecycle311Test, CodeExtraStaysAtOurOwnIndex) {
+  SKIP_311_EXECUTABLE_COMPILE();
+
+  // _PyCode_SetExtra sizes a fresh co_extra to the interpreter-wide number
+  // of registered indices, and code_dealloc then calls every registered
+  // free function below that size -- including for slots this code object
+  // never wrote.  The JIT attaches its data to broad swaths of code, so a
+  // block sized to the full index count would drag every foreign free
+  // function into the destruction of every code object the JIT ever saw.
+  // Capping the allocation at our own index is what keeps foreign indices
+  // above ours out of that path.
+  auto* state = cinderx::getModuleState();
+  ASSERT_NE(state, nullptr);
+  Py_ssize_t ours = state->code_extra_index;
+  ASSERT_GE(ours, 0);
+
+  // Claim an index above ours, the way a third party importing after
+  // CinderX would.  Its free function is never registered, so nothing here
+  // depends on it being called -- only on it not being.
+  Py_ssize_t foreign = PyUnstable_Eval_RequestCodeExtraIndex(nullptr);
+  ASSERT_GT(foreign, ours);
+
+  Ref<> code = Ref<>::steal(Py_CompileString(
+      "def capped():\n    return 1\n", "<capped>", Py_file_input));
+  ASSERT_NE(code, nullptr);
+  auto code_obj = reinterpret_cast<PyCodeObject*>(code.get());
+  ASSERT_NE(codeExtra(code_obj), nullptr);
+
+  // Read the size back through the same private layout the setter assumes.
+  struct Layout {
+    Py_ssize_t ce_size;
+    void* ce_extras[1];
+  };
+  auto* block = reinterpret_cast<Layout*>(code_obj->co_extra);
+  ASSERT_NE(block, nullptr);
+  EXPECT_EQ(block->ce_size, ours + 1)
+      << "the code-extra block is not capped at the JIT's own index";
+  EXPECT_LE(block->ce_size, foreign)
+      << "the block spans a foreign index, so that index's free function "
+         "will be called for every code object the JIT touches";
 }
 
 TEST_F(JITLifecycle311Test, FunctionDeathIsReported) {
