@@ -66,8 +66,10 @@ void finiCodeExtraIndex();
  * Installing a null hook (the default, and what finalization restores)
  * leaves the free function doing nothing but freeing the block.
  */
+#ifdef __cplusplus
 using CodeDestroyedHook = void (*)(PyCodeObject*);
 void setCodeDestroyedHook(CodeDestroyedHook hook);
+#endif
 
 // Get the extra data object associated with a code object. Lazily allocates
 // this data if this is the first access. Returns nullptr on failure with no
