@@ -17,13 +17,11 @@
 
 ARG GCC_VERSION=14.2.0
 ARG PYTHON3_NVR=3.11.6-34.oe2403sp3
-ARG PYPERFORMANCE_VERSION=1.13.0
 
 FROM openeuler/openeuler:24.03-lts-sp3
 
 ARG GCC_VERSION
 ARG PYTHON3_NVR
-ARG PYPERFORMANCE_VERSION
 
 ENV LANG=en_US.UTF-8
 
@@ -97,14 +95,12 @@ RUN rpm -q python3 | grep -F "python3-${PYTHON3_NVR}" \
 
 # --- Baked acceptance tooling (v2) -----------------------------------------
 # The CinderX build needs setuptools>=77 (pyproject license metadata) and the
-# differential engine's unit tests run under pytest; the MR-03 daily gate
-# drives the full pyperformance surface.  Pinned so image rebuilds stay
-# deterministic; versions recorded in docs/cp311-anchor.md.
+# differential engine's unit tests run under pytest.  Pinned so image
+# rebuilds stay deterministic; versions recorded in docs/cp311-anchor.md.
 # The pypi mirror matches the GCC download mirror above.
 RUN python3.11 -m pip install --no-cache-dir \
     -i https://mirrors.huaweicloud.com/repository/pypi/simple \
-    "setuptools==80.9.0" "pytest==8.4.1" \
-    "pyperformance==${PYPERFORMANCE_VERSION}"
+    "setuptools==80.9.0" "pytest==8.4.1"
 
 # Intranet git hosts commonly sit behind TLS-intercepting proxies, so
 # transport verification is off for git.  Dependency integrity is carried by
