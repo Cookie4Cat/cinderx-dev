@@ -5,6 +5,7 @@
 #include "cinderx/Common/log.h"
 #include "cinderx/Jit/codegen/code_section.h"
 #include "cinderx/Jit/config.h"
+#include "cinderx/Jit/trigger_stats.h"
 
 #ifdef WIN32
 #include <Windows.h>
@@ -32,6 +33,9 @@ constexpr size_t kAllocSize = 1024 * 1024 * 2;
 
 // Allocate memory for JIT'd code.
 uint8_t* allocPages(size_t size) {
+  // Trigger-proof accounting: every executable-memory allocation the JIT
+  // makes funnels through here.
+  triggerStatsOnExecutableAlloc(size);
 #ifndef WIN32
   void* res = mmap(
       nullptr,

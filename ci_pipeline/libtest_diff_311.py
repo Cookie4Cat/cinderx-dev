@@ -55,7 +55,8 @@ def list_tests(python: str) -> list[str]:
 #   0:00:01 load avg: 7.78 [131/440/19] test_extcall passed
 #   0:00:00 load avg: 7.78 [  6/440/1] test.test_asyncio.test_base_events failed (uncaught exception)
 RESULT_LINE = re.compile(
-    r"\[ *\d+/\d+(?:/\d+)?\] (\S+) (passed|failed|skipped|crashed)\b"
+    r"\[ *\d+/\d+(?:/\d+)?\] (\S+)(?: process)? "
+    r"(passed|failed|skipped|crashed)\b"
 )
 
 
@@ -80,9 +81,53 @@ def parse_regrtest_modules(log_text: str, requested: list[str]) -> dict[str, str
             verdicts[name] = "pass"
         elif word == "skipped":
             verdicts[name] = "skip"
+        elif word == "crashed":
+            # A crashed worker is never comparable evidence: the verdict
+            # stays distinct so it can neither launder into "fail" (where a
+            # symmetric crash would diff as baseline) nor count as a result.
+            verdicts[name] = "crash"
         else:
             verdicts[name] = "fail"
     return verdicts
+
+
+def crash_count(modules: dict[str, str]) -> int:
+    return sum(1 for verdict in modules.values() if verdict == "crash")
+
+
+# regrtest exit codes that still denote a COMPLETED run: 0 (all passed),
+# 2 (some tests failed), 3 (environment changed).  Anything else --
+# signals (negative), interrupt (130), internal error, no-tests-ran --
+# means the main process did not finish normally, and per-module verdict
+# lines cannot certify such a run.
+ACCEPTED_REGRTEST_EXITS = (0, 2, 3)
+
+# Harness-internal failures that regrtest reports WITHOUT killing the main
+# process: a worker thread that dies after its module already printed a
+# verdict still ends in a normal FAILURE epilogue with exit code 2, and
+# per-module verdicts alone would certify the run (3.11.6
+# libregrtest/runtest_mp.py).
+FATAL_HARNESS_MARKERS = ("regrtest worker thread failed",)
+
+
+def arm_run_completed(returncode: int, log_text: str) -> str | None:
+    if returncode not in ACCEPTED_REGRTEST_EXITS:
+        return (
+            f"regrtest ended abnormally (exit {returncode}); per-module "
+            f"verdicts cannot certify a run whose main process died"
+        )
+    if "== Tests result: " not in log_text:
+        return (
+            "regrtest log has no completion epilogue; the run did not "
+            "finish normally"
+        )
+    for marker in FATAL_HARNESS_MARKERS:
+        if marker in log_text:
+            return (
+                f"regrtest reported a harness-internal failure "
+                f"({marker!r}); the run cannot be certified"
+            )
+    return None
 
 
 # Startup file the gate provisions for the CinderX arm.  Every interpreter
@@ -213,14 +258,36 @@ def parse_junit(path: Path) -> dict[str, str]:
     return cases
 
 
+SANITIZED_ENV_KEYS = (
+    "PYTHONPATH", "PYTHONSTARTUP", "PYTHONHOME", "PYTHONHASHSEED",
+)
+SANITIZED_ENV_PREFIXES = ("CINDERX_", "PYTHONJIT", "PARALLEL_GC_")
+
+
+def arm_environment(base: dict) -> dict:
+    """Arms start from a sanitized environment: an inherited PYTHONPATH,
+    sitecustomize hook, or stray CINDERX_* variable could activate the
+    evaluator (or anything else) in BOTH arms and manufacture a false
+    neutral.  Each arm re-adds exactly what it declares."""
+    env = {
+        key: value
+        for key, value in base.items()
+        if key not in SANITIZED_ENV_KEYS
+        and not key.startswith(SANITIZED_ENV_PREFIXES)
+    }
+    # Unconditional: an inherited PYTHONHASHSEED=random would make the two
+    # arms diverge for reasons that have nothing to do with the evaluator.
+    env["PYTHONHASHSEED"] = "0"
+    return env
+
+
 def run_arm(args: argparse.Namespace) -> int:
     python = args.python
     out = Path(args.out)
     out.mkdir(parents=True, exist_ok=True)
     junit = out / "junit.xml"
 
-    env = dict(os.environ)
-    env.setdefault("PYTHONHASHSEED", "0")
+    env = arm_environment(dict(os.environ))
     for kv in args.env or []:
         key, _, value = kv.partition("=")
         env[key] = value
@@ -240,7 +307,7 @@ def run_arm(args: argparse.Namespace) -> int:
         os.chmod(attest_path, 0o666)
         env["CINDERX_DIFF_ATTEST"] = str(attest_path)
 
-    tests = args.tests or list_tests(python)
+    tests = args.tests or load_target_manifest()
     excluded = set(args.exclude or [])
     tests = [t for t in tests if t not in excluded]
     cmd = [
@@ -284,11 +351,22 @@ def run_arm(args: argparse.Namespace) -> int:
         "cases": cases,
     }
     (out / "result.json").write_text(json.dumps(result, indent=1, sort_keys=True))
+    completion_error = arm_run_completed(proc.returncode, log_text)
+    if completion_error:
+        print(f"arm FAILED: {completion_error}")
+        return 7
     counts = {
         s: sum(1 for v in modules.values() if v == s)
-        for s in ("pass", "fail", "skip", "no_result")
+        for s in ("pass", "fail", "skip", "crash", "no_result")
     }
     print(f"arm done: {counts} duration={result['meta']['duration_s']}s -> {out / 'result.json'}")
+    crashes = crash_count(modules)
+    if crashes:
+        print(
+            f"arm FAILED: {crashes} module worker(s) crashed; a crash is "
+            f"never comparable evidence, symmetric or not"
+        )
+        return 6
     gaps = missing_verdicts(modules)
     if gaps:
         print(
@@ -310,6 +388,28 @@ def load(path: str) -> dict:
     return json.loads(Path(path).read_text())
 
 
+TARGET_MANIFEST = (
+    Path(__file__).resolve().parent
+    / "jit311" / "data" / "libtest_target_modules.txt"
+)
+
+
+def load_target_manifest() -> list[str]:
+    """The frozen stdlib target surface.  The gate runs exactly this list:
+    a dynamically discovered surface would shrink symmetrically with the
+    environment and no one would notice."""
+    if not TARGET_MANIFEST.is_file():
+        raise SystemExit(f"target-module manifest missing: {TARGET_MANIFEST}")
+    modules = [
+        line.strip()
+        for line in TARGET_MANIFEST.read_text().splitlines()
+        if line.strip() and not line.lstrip().startswith("#")
+    ]
+    if len(modules) != len(set(modules)):
+        raise SystemExit("target-module manifest contains duplicates")
+    return modules
+
+
 def diff_results(a: dict, b: dict) -> dict:
     regressions: dict[str, dict[str, str]] = {}
     warnings: dict[str, dict[str, str]] = {}
@@ -321,7 +421,9 @@ def diff_results(a: dict, b: dict) -> dict:
         entry = {"stock": averdict, "cinderx": bverdict}
         # Regression: anything that was passing and no longer is -- a module
         # that starts *skipping* under the evaluator changed behavior too.
-        if averdict == "pass" and bverdict in ("fail", "skip", "no_result", "missing"):
+        if averdict == "pass" and bverdict in (
+            "fail", "skip", "crash", "no_result", "missing"
+        ):
             regressions[mod] = entry
         else:
             warnings[mod] = entry
@@ -334,7 +436,10 @@ def diff_results(a: dict, b: dict) -> dict:
         if astate != "pass":
             continue
         bstate = bcases.get(key, "missing")
-        if bstate in ("failure", "error"):
+        if bstate in ("failure", "error", "skipped"):
+            # A case that starts skipping under the evaluator shrank
+            # coverage while staying green -- that is a regression here,
+            # same as the module-level pass->skip rule above.
             case_regressions[key] = {"stock": astate, "cinderx": bstate}
         elif bstate == "missing":
             # A case that vanished from a module which still reported is a
@@ -365,8 +470,46 @@ def cmd_diff(args: argparse.Namespace) -> int:
     return 1 if red else 0
 
 
+STOCK_SITECUSTOMIZE = '''\
+"""Stock control arm startup: prove cinderx never activated here."""
+import atexit
+import os
+import sys
+
+
+def _attest_stock_purity():
+    path = os.environ.get("CINDERX_STOCK_ATTEST")
+    if not path:
+        return
+    polluted = [
+        name for name in ("cinderx", "_cinderx", "cinderjit")
+        if name in sys.modules
+    ]
+    with open(path, "a", encoding="utf8") as fp:
+        fp.write(("POLLUTED:" + ",".join(polluted)) if polluted else "clean")
+        fp.write("\\n")
+
+
+atexit.register(_attest_stock_purity)
+'''
+
+
+def read_stock_attest(path: Path) -> tuple[int, bool]:
+    if not path.is_file():
+        return 0, False
+    lines = [ln for ln in path.read_text().splitlines() if ln]
+    return len(lines), bool(lines) and all(ln == "clean" for ln in lines)
+
+
 def cmd_gate(args: argparse.Namespace) -> int:
     out = Path(args.out)
+    if not args.tests and args.exclude:
+        # On the frozen surface the committed manifest is the only way to
+        # shrink coverage; an --exclude here would mint a strictly valid
+        # but smaller report.
+        print("GATE: --exclude is not allowed on the frozen surface; "
+              "edit the target-module manifest deliberately")
+        return 2
     out.mkdir(parents=True, exist_ok=True)
 
     # The gate provisions its own startup for the CinderX arm: every
@@ -377,11 +520,24 @@ def cmd_gate(args: argparse.Namespace) -> int:
     (startup / "sitecustomize.py").write_text(STARTUP_SITECUSTOMIZE)
     attest = out / "cinderx" / "attest.log"
 
+    # The stock arm is a CONTROL: it gets its own startup whose only job
+    # is to attest, per process, that no cinderx module ever loaded.  A
+    # polluted control (external sitecustomize, inherited environment)
+    # would otherwise fake neutrality symmetrically.
+    stock_startup = out / "startup-stock"
+    stock_startup.mkdir(parents=True, exist_ok=True)
+    (stock_startup / "sitecustomize.py").write_text(STOCK_SITECUSTOMIZE)
+    stock_attest = out / "stock" / "attest-stock.log"
+    stock_attest.parent.mkdir(parents=True, exist_ok=True)
+    stock_attest.unlink(missing_ok=True)
+    stock_attest.touch()
+    os.chmod(stock_attest, 0o666)
+
     a = argparse.Namespace(**{
         **vars(args),
         "out": str(out / "stock"),
-        "env": [],
-        "pythonpath_prepend": [],
+        "env": [f"CINDERX_STOCK_ATTEST={stock_attest}"],
+        "pythonpath_prepend": [str(stock_startup)],
         "attest_file": None,
     })
     b = argparse.Namespace(**{
@@ -393,17 +549,66 @@ def cmd_gate(args: argparse.Namespace) -> int:
     if run_arm(a) or run_arm(b):
         return 2
 
-    # Structural stock-arm purity: it has no startup on its path, so an
-    # attestation there means the arms were misrouted.
+    # Structural stock-arm purity: it has no evaluator startup, so an
+    # evaluator attestation there means the arms were misrouted.
     stray = out / "stock" / "attest.log"
     if stray.exists():
         print(f"GATE: stock arm unexpectedly attested an evaluator: {stray}")
+        return 3
+    # Positive stock purity: every stock process must have attested that
+    # no cinderx module ever loaded.  Fewer than two records means not
+    # even the regrtest main process plus one worker reported.
+    stock_count, stock_clean = read_stock_attest(stock_attest)
+    if stock_count < 2 or not stock_clean:
+        print(
+            f"GATE: stock arm purity not attested "
+            f"({stock_count} records, clean={stock_clean}): {stock_attest}"
+        )
         return 3
 
     args2 = argparse.Namespace(a=str(out / "stock" / "result.json"),
                                b=str(out / "cinderx" / "result.json"),
                                report=str(out / "diff.json"))
-    return cmd_diff(args2)
+    rc = cmd_diff(args2)
+
+    # Trigger-proof bookkeeping: this leg IS the target-module surface of
+    # the unified report (dev plan MR-01).  On the frozen surface it must
+    # publish the attempted count, the count must equal the committed
+    # manifest, and a publication failure is red -- a silently absent
+    # field would let the aggregator downstream go hungry unnoticed.
+    # Explicit --tests slices are a development tool and do not publish.
+    if not args.tests:
+        try:
+            cinderx_result = json.loads(
+                (out / "cinderx" / "result.json").read_text()
+            )
+            attempted = len(cinderx_result["modules"])
+            frozen = len(load_target_manifest())
+            if attempted != frozen:
+                print(
+                    f"GATE: attempted {attempted} modules but the frozen "
+                    f"surface is {frozen}; the target surface shrank"
+                )
+                return 4
+            (out / "trigger_report_fields.json").write_text(
+                json.dumps(
+                    {
+                        "target_modules_attempted": attempted,
+                        # Both arms returned: any crashed worker already
+                        # failed the arm (verdict "crash", return 6), so
+                        # this is an attested zero over the frozen
+                        # surface, not a default.
+                        "worker_crashes": 0,
+                    }
+                )
+                + "\n"
+            )
+        except SystemExit:
+            raise
+        except Exception as exc:  # noqa: BLE001
+            print(f"GATE: could not publish target_modules_attempted: {exc}")
+            return 4
+    return rc
 
 
 def main(argv: list[str] | None = None) -> int:

@@ -63,6 +63,9 @@ class LIRGeneratorTest : public RuntimeTest {
     env.ctx = getContext();
 
     jit::CodeRuntime runtime{func};
+#if PY_VERSION_HEX >= 0x030E0000 && defined(ENABLE_LIGHTWEIGHT_FRAMES)
+    // Frame reifiers exist only on the lightweight-frames runtime; the 3.11
+    // materialized-frame build has no reifier to attach.
     Ref<> reifier;
     if (irfunc->reifier != nullptr) {
       runtime.setReifier(irfunc->reifier);
@@ -70,6 +73,7 @@ class LIRGeneratorTest : public RuntimeTest {
       reifier = makeFrameReifier(func->func_code);
       runtime.setReifier(reifier);
     }
+#endif
     env.code_rt = &runtime;
 
     LIRGenerator lir_gen(irfunc.get(), &env);

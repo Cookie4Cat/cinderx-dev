@@ -10,6 +10,7 @@
 #include "cinderx/Common/util.h"
 #include "cinderx/Jit/disassembler.h"
 #include "cinderx/Jit/hir/printer.h"
+#include "cinderx/Jit/trigger_stats.h"
 #include "cinderx/module_c_state.h"
 #include "cinderx/module_state.h"
 
@@ -158,6 +159,10 @@ Ref<CompiledFunction> CompiledFunction::create(
     _Py_SetImmortal(&cf->ob_base);
 #endif
   }
+
+  // Trigger-proof accounting: every compiled-function object ever created
+  // is counted, regardless of how it is later installed or released.
+  jit::triggerStatsOnCompiledFunctionCreate();
 
   // Return a stolen reference - the caller owns it.
   return Ref<CompiledFunction>::steal(cf);

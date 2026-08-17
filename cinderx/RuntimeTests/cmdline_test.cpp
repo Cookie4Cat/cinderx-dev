@@ -4,7 +4,17 @@
 
 #include "cinderx/Jit/behavior_classifier.h"
 #include "cinderx/Jit/generators_rt.h"
+#if PY_VERSION_HEX >= 0x030D0000
 #include "cinderx/Jit/osr_capi.h"
+#else
+// The OSR C-API header needs 3.13+ atomics.  The three state ints the
+// fixture saves and restores come from Jit/osr_stub_311.cpp on 3.11.
+extern "C" {
+extern int cinderx_osr_enabled;
+extern int cinderx_osr_capable;
+extern int cinderx_osr_state;
+}
+#endif
 #include "cinderx/Jit/perf_jitdump.h"
 #include "cinderx/Jit/pyjit.h"
 #include "cinderx/RuntimeTests/fixtures.h"

@@ -27,6 +27,7 @@
 #include "cinderx/Jit/perf_jitdump.h"
 #include "cinderx/Jit/pyjit.h"
 #include "cinderx/Jit/symbolizer.h"
+#include "cinderx/Jit/trigger_stats.h"
 #include "cinderx/StaticPython/_static.h"
 #include "cinderx/StaticPython/checked_dict.h"
 #include "cinderx/StaticPython/checked_list.h"
@@ -881,6 +882,24 @@ static PyObject* get_observe_stats(PyObject*, PyObject*) {
 }
 #endif
 
+// Trigger-proof counters (cinderx/Jit/trigger_stats.h).  Deliberately
+// available regardless of whether the JIT initialized: on capability-gated
+// builds the report asserts these stay zero, on execution-capable builds it
+// asserts they moved.
+static PyObject* get_trigger_stats(PyObject*, PyObject*) {
+  jit::TriggerStats stats = jit::triggerStatsSnapshot();
+  return Py_BuildValue(
+      "{s:K,s:K,s:K,s:K}",
+      "executable_alloc_calls",
+      static_cast<unsigned long long>(stats.executable_alloc_calls),
+      "executable_alloc_bytes",
+      static_cast<unsigned long long>(stats.executable_alloc_bytes),
+      "compiled_function_creations",
+      static_cast<unsigned long long>(stats.compiled_function_creations),
+      "machine_code_entries",
+      static_cast<unsigned long long>(stats.machine_code_entries));
+}
+
 PyMethodDef _cinderx_methods[] = {
 #if PY_VERSION_HEX < 0x030C0000
     {"_get_observe_stats",
@@ -888,6 +907,11 @@ PyMethodDef _cinderx_methods[] = {
      METH_NOARGS,
      PyDoc_STR("Snapshot of observe-mode counters and scheduling events.")},
 #endif
+    {"_get_trigger_stats",
+     get_trigger_stats,
+     METH_NOARGS,
+     PyDoc_STR("Monotonic trigger-proof counters: executable allocations, "
+               "compiled-function creations and machine-code entries.")},
     {"install_frame_evaluator",
      install_frame_evaluator,
      METH_NOARGS,
