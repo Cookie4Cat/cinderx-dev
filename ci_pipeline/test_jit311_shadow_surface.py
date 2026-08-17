@@ -67,6 +67,10 @@ def _cinderx_suites():
             "verdict": "pass",
             "returncode": 0,
             "case_count": 1,
+            "cases": {"c::t": "pass"},
+            "baseline_cases": {"c::t": "pass"},
+            "baseline_verdict": "pass",
+            "baseline_returncode": 0,
         }
         for name in surface.frozen_cinderx_suite_names()
     ]
@@ -693,6 +697,128 @@ def test_pass_to_skip_is_red():
     errors = surface.judge_completeness(_report(modules))
     joined = "\n".join(errors)
     assert "pass -> skipped" in joined or "verdict pass -> skip" in joined
+
+
+def test_shadow_only_extra_pass_is_red():
+    modules = [_module(f"test_{i}") for i in range(439)]
+    modules.append(
+        _module(
+            "test_int",
+            cases={"test_int.a": "pass", "test_int.b": "pass"},
+            baseline_cases={"test_int.a": "pass"},
+        )
+    )
+    errors = surface.judge_completeness(_report(modules))
+    assert any("extra case" in err and "test_int.b" in err for err in errors)
+
+
+def test_skipped_to_pass_is_red():
+    modules = [_module(f"test_{i}") for i in range(439)]
+    modules.append(
+        _module(
+            "test_int",
+            verdict="pass",
+            cases={"test_int.a": "pass"},
+            baseline_cases={"test_int.a": "skipped"},
+            baseline_verdict="skip",
+        )
+    )
+    errors = surface.judge_completeness(_report(modules))
+    joined = "\n".join(errors)
+    assert "skipped -> pass" in joined
+    assert "verdict skip -> pass" in joined
+
+
+def test_empty_junit_on_both_arms_is_red_for_test_int():
+    modules = [_module(f"test_{i}") for i in range(439)]
+    modules.append(
+        _module(
+            "test_int",
+            verdict="pass",
+            returncode=0,
+            cases={},
+            snap=_snap(
+                "test_int",
+                compiled_functions=[
+                    {
+                        "filename": "/usr/lib64/python3.11/argparse.py",
+                        "qualname": "ArgumentParser.parse_args",
+                    }
+                ],
+            ),
+        )
+    )
+    errors = surface.judge_completeness(_report(modules))
+    assert any("empty junit" in err and "test_int" in err for err in errors)
+
+
+def test_fileutils_empty_both_arms_is_red():
+    rec = _module(
+        "test_fileutils",
+        verdict="pass",
+        returncode=0,
+        cases={},
+        snap=_snap(
+            "test_fileutils",
+            compiled_functions=[
+                {
+                    "filename": "/usr/lib64/python3.11/argparse.py",
+                    "qualname": "ArgumentParser.parse_args",
+                }
+            ],
+        ),
+    )
+    modules = [_module(f"test_{i}") for i in range(439)]
+    modules.append(rec)
+    errors = surface.judge_completeness(_report(modules))
+    assert any(
+        "missing required case" in err and "test_fileutils" in err for err in errors
+    )
+
+
+def test_cinderx_suite_pass_to_fail_is_red_even_if_aggregate_stays_fail():
+    report = _full_surface()
+    suites = report["test_cinderx"]["suites"]
+    suites[0]["verdict"] = "fail"
+    suites[0]["returncode"] = 1
+    suites[0]["cases"] = {"a": "failure"}
+    suites[0]["baseline_cases"] = {"a": "failure"}
+    suites[0]["baseline_verdict"] = "fail"
+    suites[0]["baseline_returncode"] = 1
+    report["test_cinderx"]["verdict"] = "fail"
+    report["test_cinderx"]["returncode"] = 1
+    target = next(
+        rec
+        for rec in suites[1:]
+        if rec["name"] not in surface.SHADOW_N_A_SUITES
+    )
+    target["verdict"] = "fail"
+    target["returncode"] = 1
+    target["cases"] = {"b": "failure"}
+    target["baseline_cases"] = {"b": "pass"}
+    target["baseline_verdict"] = "pass"
+    target["baseline_returncode"] = 0
+    errors = surface.judge_completeness(report)
+    joined = "\n".join(errors)
+    assert target["name"] in joined
+    assert "pass -> failure" in joined
+
+
+def test_instrumentation_suite_wrapper_passes_are_na():
+    report = _full_surface()
+    for rec in report["test_cinderx"]["suites"]:
+        if rec["name"] != "test_jit_support_instrumentation":
+            continue
+        rec["verdict"] = "pass"
+        rec["returncode"] = 0
+        rec["case_count"] = 20
+        rec["cases"] = {f"w{i}": "pass" for i in range(20)}
+        rec["baseline_cases"] = {f"w{i}": "pass" for i in range(20)}
+        rec["baseline_verdict"] = "pass"
+        rec["baseline_returncode"] = 0
+        break
+    assert "test_jit_support_instrumentation" in surface.SHADOW_N_A_SUITES
+    assert surface.judge_completeness(report) == []
 
 
 def test_baseline_case_disappeared_from_shadow_is_red():

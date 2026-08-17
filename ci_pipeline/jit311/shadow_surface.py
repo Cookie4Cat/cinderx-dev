@@ -158,6 +158,18 @@ def load_frozen_modules() -> list[str]:
     return modules
 
 
+def libtest_empty_ok() -> frozenset[str]:
+    global _FROZEN_EMPTY_OK
+    if _FROZEN_EMPTY_OK is None:
+        names: list[str] = []
+        for line in LIBTEST_EMPTY_OK_FILE.read_text(encoding="utf8").splitlines():
+            line = line.strip()
+            if line and not line.startswith("#"):
+                names.append(line)
+        _FROZEN_EMPTY_OK = frozenset(names)
+    return _FROZEN_EMPTY_OK
+
+
 def strip_surface_extras(snap: dict) -> dict:
     cleaned = dict(snap)
     for key in SURFACE_EXTRA_KEYS:
@@ -236,6 +248,23 @@ LIBTEST_EXTRA_COMPILE_PATHS: dict[str, tuple[str, ...]] = {
 # (test_fileutils) and eval of a giant literal (test_longexp). Dual-run
 # case identity is the completeness bar; argparse hits stay out.
 LIBTEST_NO_OWN_PYTHON = frozenset({"test_fileutils", "test_longexp"})
+LIBTEST_REQUIRED_CASES = {
+    "test_fileutils": frozenset(
+        {"test.test_fileutils.PathTests.test_capi_normalize_path"}
+    ),
+    "test_longexp": frozenset({"test.test_longexp.LongExpText.test_longexp"}),
+}
+
+# skip_unless_jit uses passAlways when is_enabled() is false. Shadow is
+# kShadow, is_enabled() is only true for kRunning, so this suite's 20
+# "pass" results are wrappers on both arms. Do not copy instrumentation
+# env; mark the suite N/A for completeness.
+SHADOW_N_A_SUITES = frozenset({"test_jit_support_instrumentation"})
+
+LIBTEST_EMPTY_OK_FILE = (
+    REPO_ROOT / "ci_pipeline" / "jit311" / "data" / "libtest_empty_ok.txt"
+)
+_FROZEN_EMPTY_OK: frozenset[str] | None = None
 
 
 def _path_matches_extra(path: str, extra: str) -> bool:
@@ -307,22 +336,12 @@ def attributed_compile_success(record: dict) -> int:
     )
 
 
-_VERDICT_RANK = {
-    "pass": 0,
-    "skip": 1,
-    "fail": 2,
-    "no_result": 3,
-    "crash": 4,
-}
-
-
 def new_case_errors(record: dict) -> list[str]:
-    """Reject shadow regressions against the JIT-off run of the same target.
+    """Reject any shadow/JIT-off mismatch on case set, status, verdict, rc.
 
-    Crash records are already red from ``record_errors``. Every other verdict
-    compares case identity, overall verdict, and return code: a pass that
-    becomes fail/skip, a baseline case that disappears, or a new non-zero
-    exit is a completeness failure even when junit is empty.
+    Crash records are already red from ``record_errors``. Extra shadow-only
+    passes, skip->pass, and equal-rank verdict changes are completeness
+    failures even when junit is non-empty.
     """
     name = record.get("name") or "<unnamed>"
     kind = record.get("kind") or "target"
@@ -342,24 +361,16 @@ def new_case_errors(record: dict) -> list[str]:
             )
             continue
         state = shadow_cases[key]
-        if prior == "pass" and state != "pass":
-            errors.append(f"{prefix}: case {key} pass -> {state}")
-        elif state in ("failure", "error") and prior not in ("failure", "error"):
-            errors.append(
-                f"{prefix}: new {state} {key} (baseline={prior!r})"
-            )
+        if state != prior:
+            errors.append(f"{prefix}: case {key} {prior} -> {state}")
     for key, state in shadow_cases.items():
-        if key in baseline:
-            continue
-        if state in ("failure", "error"):
+        if key not in baseline:
             errors.append(
-                f"{prefix}: new {state} {key} (baseline=None)"
+                f"{prefix}: extra case {key} ({state!r}, baseline=None)"
             )
     base_verdict = record.get("baseline_verdict")
     verdict = record.get("verdict")
-    if base_verdict is not None and _VERDICT_RANK.get(verdict, 99) > _VERDICT_RANK.get(
-        base_verdict, 0
-    ):
+    if base_verdict is not None and verdict != base_verdict:
         errors.append(f"{prefix}: verdict {base_verdict} -> {verdict}")
     rc = record.get("returncode")
     base_rc = record.get("baseline_returncode")
@@ -425,6 +436,18 @@ def record_errors(record: dict) -> list[str]:
                 "attributed to this target by co_filename+qualname "
                 f"verdict={verdict} executed_cases={executed}"
             )
+    cases = record.get("cases") or {}
+    required = LIBTEST_REQUIRED_CASES.get(name, ())
+    for case_id in required:
+        if case_id not in cases:
+            errors.append(f"{prefix}: missing required case {case_id}")
+    if (
+        not cases
+        and not required
+        and name not in libtest_empty_ok()
+        and verdict not in ("skip", "crash")
+    ):
+        errors.append(f"{prefix}: empty junit")
     errors.extend(new_case_errors(record))
     return errors
 
@@ -441,6 +464,8 @@ def _cinderx_suite_errors(cinderx: dict) -> list[str]:
         )
     for rec in suites:
         name = rec.get("name") or "<unnamed>"
+        if name in SHADOW_N_A_SUITES:
+            continue
         verdict = rec.get("verdict")
         if verdict in ("crash", "no_result"):
             errors.append(f"test_cinderx suite {name}: verdict={verdict}")
@@ -449,6 +474,10 @@ def _cinderx_suite_errors(cinderx: dict) -> list[str]:
             errors.append(
                 f"test_cinderx suite {name}: case_count={case_count}"
             )
+        suite_rec = dict(rec)
+        suite_rec["kind"] = "test_cinderx suite"
+        suite_rec["name"] = name
+        errors.extend(new_case_errors(suite_rec))
     return errors
 
 
