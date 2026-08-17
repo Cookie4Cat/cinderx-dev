@@ -26,6 +26,11 @@ Field sources:
                              trigger stats: physical specialized instructions
                              consumed by successful shadow compilations
   shadow_codegen_bytes       trigger stats: discarded machine-code byte count
+  code_destroyed_notifications      lifecycle: code deaths the JIT was told
+                                    about (CPython 3.11 has no code watcher,
+                                    so this proves the substitute fires)
+  function_destroyed_notifications  lifecycle: function deaths the JIT was
+                                    told about, via the weak-reference watch
   peak_rss_bytes             process peak resident set size
   compile_installed          scheduling events answered by installing
                              machine code (canary; zero under shadow, which
@@ -121,6 +126,8 @@ RUNTIME_FIELDS = (
     "unknown_rejects",
     "specialized_opcodes_consumed",
     "shadow_codegen_bytes",
+    "code_destroyed_notifications",
+    "function_destroyed_notifications",
     "peak_rss_bytes",
     "machine_code_installed",
     "machine_code_entries",
@@ -240,6 +247,10 @@ def snapshot() -> dict[str, Any]:
             trigger["shadow_specialized_opcodes_consumed"]
         ),
         "shadow_codegen_bytes": int(trigger["shadow_codegen_bytes"]),
+        "code_destroyed_notifications": int(
+            trigger["code_destroyed_notifications"]),
+        "function_destroyed_notifications": int(
+            trigger["function_destroyed_notifications"]),
         "peak_rss_bytes": _peak_rss_bytes(),
         "machine_code_installed": _compiled_function_count(),
         "machine_code_entries": int(trigger["machine_code_entries"]),

@@ -36,6 +36,13 @@ struct TriggerStats {
   // climbing while objects keep dying.
   uint64_t code_destroyed_notifications;
   uint64_t function_destroyed_notifications;
+  // Live code buffers: incremented when a CompiledFunction takes ownership
+  // of executable memory, decremented when its destructor gives it up.  A
+  // GAUGE, not a counter: this is the physical residency measurement, and
+  // it tracks the buffer's real lifetime -- an artifact removed from every
+  // registry but kept alive by an external reference still holds its
+  // machine code, and must still count.
+  uint64_t resident_code_buffers;
 };
 
 // Increment sites.  Relaxed atomics: the counters order nothing.
@@ -47,6 +54,8 @@ void triggerStatsOnShadowCompile(
     uint64_t specialized_opcodes);
 void triggerStatsOnCodeDestroyed();
 void triggerStatsOnFunctionDestroyed();
+void triggerStatsOnCodeBufferAcquired();
+void triggerStatsOnCodeBufferReleased();
 
 // Read a consistent-enough snapshot for reporting.
 TriggerStats triggerStatsSnapshot();
