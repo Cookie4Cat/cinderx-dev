@@ -1,6 +1,9 @@
 // Copyright (c) Meta Platforms, Inc. and affiliates.
 
 #include "cinderx/Jit/lir/generator.h"
+#if PY_VERSION_HEX < 0x030C0000
+#include "cinderx/Interpreter/3.11/interpreter_contract.h"
+#endif
 
 extern "C" {
 #include "internal/pycore_call.h"
@@ -4551,8 +4554,16 @@ LIRGenerator::TranslatedBlock LIRGenerator::TranslateOneBasicBlock(
       }
       case Opcode::kRunPeriodicTasks: {
 #if PY_VERSION_HEX < 0x030C0000
-        auto helper = Py_MakePendingCalls;
-        bbb.appendCallInstruction(i.output(), helper);
+        // Py_MakePendingCalls services signals and pending calls only.  The
+        // eval breaker this back edge just observed is also raised for a
+        // GIL drop request and for PyThreadState_SetAsyncExc(), and the
+        // anchored 3.11.6 evaluator services all four in
+        // eval_frame_handle_pending() -- so a compiled loop calling the
+        // narrow helper would hold the GIL for its whole run and deliver
+        // async exceptions only at return.  Call the vendored handler
+        // itself; same contract, 0 or -1 with an exception set.
+        auto helper = Ci_EvalFrameHandlePending_311;
+        bbb.appendCallInstruction(i.output(), helper, env_->asm_tstate);
 #else
         auto helper = _Py_HandlePending;
         bbb.appendCallInstruction(i.output(), helper, env_->asm_tstate);

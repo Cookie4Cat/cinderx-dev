@@ -34,6 +34,17 @@
 #include <iostream>
 #include <sstream>
 
+#if PY_VERSION_HEX < 0x030C0000
+// Records a refusal reason the scheduling gate reports; defined in
+// Jit/pyjit_311_gate.cpp.
+extern "C" void Ci_JitShell311_SetExecuteRefusal(const char* reason);
+namespace {
+void setLast311ExecuteRefusal(const char* reason) {
+  Ci_JitShell311_SetExecuteRefusal(reason);
+}
+} // namespace
+#endif
+
 namespace jit {
 
 template <typename T>
@@ -219,6 +230,25 @@ PassConfig createConfig() {
   set(hir_opts.simplify, PassConfig::kSimplify);
   set(hir_opts.tree_iter_state_machine, PassConfig::kTreeIterStateMachine);
 
+#if PY_VERSION_HEX < 0x030C0000
+  // MR-04 excludes speculative guards, and Simplify is where they come
+  // from once quickened opcodes are already out of the picture: the
+  // compact-long comparison and arithmetic fast paths, float division and
+  // the bounds checks all install a Guard with a deopt behind it.
+  //
+  // Refusing every function that would get one would empty the execute
+  // surface -- a plain `while i < b` loop is exactly the shape that picks
+  // up the compact-long compare guard -- so the executing mode compiles
+  // without the pass instead, and the artifact scan downstream stays as
+  // the backstop for anything that still slips through.  Generated code is
+  // slower; that is the right trade for a milestone whose subject is
+  // correctness, and Simplify returns with the guard metadata in MR-07.
+  if (getConfig().state == State::kRunning) {
+    result &= ~static_cast<uint64_t>(PassConfig::kSimplify);
+    result &= ~static_cast<uint64_t>(PassConfig::kFloatAccumulatorPromotion);
+  }
+#endif
+
   return static_cast<PassConfig>(result);
 }
 
@@ -339,6 +369,50 @@ std::optional<CompiledFunctionData> Compiler::Compile(
   }
 
   hir::OpcodeCounts hir_opcode_counts = hir::count_opcodes(*irfunc);
+
+#if PY_VERSION_HEX < 0x030C0000
+  // Any reason left by an earlier attempt belongs to that attempt.
+  setLast311ExecuteRefusal(nullptr);
+  // MR-04 excludes speculative guards, and an eligibility check on the
+  // bytecode cannot see them: the optimizer introduces its own.  Simplify
+  // rewrites `x ** 2` into a float multiply behind a GuardType, for one,
+  // and that is a deopt point on an unaudited path just as much as a
+  // quickened opcode's guard would be.  So the rule is stated where it can
+  // actually be checked -- on the artifact about to be emitted -- and a
+  // violation refuses the compile rather than shipping the guard.
+  if (getConfig().state == State::kRunning) {
+    // All three of HIR's deopt guards, not just the typed ones: Simplify
+    // emits the untyped Guard directly for compact-long comparisons,
+    // float division and the in-place long paths, and that is a deopt on
+    // an unaudited path exactly like the others.
+    // Every opcode that installs a deopt exit of its own, not just the
+    // three reachable today.  Deopt and DeoptPatchpoint are currently
+    // unreachable because the whitelist excludes the opcodes that emit
+    // them and Simplify is off -- but a backstop resting on someone
+    // else's invariant is not a backstop.  Widen the surface or re-enable
+    // the pass and this still holds.
+    static constexpr hir::Opcode kSpeculativeGuards[] = {
+        hir::Opcode::kDeopt,
+        hir::Opcode::kDeoptPatchpoint,
+        hir::Opcode::kGuard,
+        hir::Opcode::kGuardIs,
+        hir::Opcode::kGuardType,
+    };
+    for (hir::Opcode op : kSpeculativeGuards) {
+      int count = hir_opcode_counts[static_cast<size_t>(op)];
+      if (count > 0) {
+        setLast311ExecuteRefusal("REFUSE_SHAPE_SPECULATIVE_GUARD");
+        JIT_DLOG(
+            "Refusing MR-04 execution for {}: optimized HIR holds {} {} "
+            "instruction(s); speculative guards are MR-07 work",
+            fullname,
+            count,
+            hir::hirOpcodeName(op));
+        return std::nullopt;
+      }
+    }
+  }
+#endif
 
   auto ngen = ngen_factory_(irfunc.get());
   if (ngen == nullptr) {
