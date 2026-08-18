@@ -204,23 +204,6 @@ CompiledFunction::~CompiledFunction() {
   }
 }
 
-#if PY_VERSION_HEX < 0x030C0000
-namespace {
-int s_publish_failpoint_for_test = 0;
-} // namespace
-
-void failJitPublishStepForTest(int step) {
-  s_publish_failpoint_for_test = step;
-}
-
-void throwIfJitPublishStepArmedForTest(int step) {
-  if (s_publish_failpoint_for_test == step) {
-    s_publish_failpoint_for_test = 0;
-    throw std::bad_alloc();
-  }
-}
-#endif
-
 bool associateFunctionWithCompiled(
     BorrowedRef<PyFunctionObject> func,
     BorrowedRef<CompiledFunction> compiled,

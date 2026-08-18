@@ -1400,7 +1400,7 @@ Ref<CompiledFunction> Context::makeCompiledFunction(
   // plane calls compiled whose every call runs interpreted, because the
   // ledger the entry reads was never written.  An empty pre-reserved block
   // is harmless if compilation fails later.
-  if (codeExtra(reinterpret_cast<PyCodeObject*>(key.code)) == nullptr) {
+  if (codeExtraOrError(reinterpret_cast<PyCodeObject*>(key.code)) == nullptr) {
     return nullptr;
   }
 #endif

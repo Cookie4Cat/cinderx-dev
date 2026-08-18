@@ -106,16 +106,6 @@ struct CompiledFunctionData {
   CompiledFunctionData() = default;
 };
 
-#if PY_VERSION_HEX < 0x030C0000
-// Arm a one-shot allocation failure inside the publication transaction,
-// for the exception-safety RuntimeTests.  Steps: 1 = the artifact's
-// owned-functions insert (inside the association), 2 = the association
-// map insert, 3 = the installed-registry insert, 4 = the compiled-codes
-// insert.  The failpoint clears when it fires.
-void failJitPublishStepForTest(int step);
-void throwIfJitPublishStepArmedForTest(int step);
-#endif
-
 // The key used to store the CompiledFunction in a function's __dict__.
 extern PyObject*
     kCompiledFunctionKey; // NOLINT(facebook-avoid-non-const-global-variables)
