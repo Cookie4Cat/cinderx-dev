@@ -4321,6 +4321,13 @@ LIRGenerator::TranslatedBlock LIRGenerator::TranslateOneBasicBlock(
               instr->GetOperand(0),
               instr->GetOperand(1),
               instr->GetOperand(2));
+        } else if constexpr (PY_VERSION_HEX < 0x030C0000) {
+          bbb.appendCallInstruction(
+              instr->output(),
+              PyDict_SetItem,
+              instr->GetOperand(0),
+              instr->GetOperand(1),
+              instr->GetOperand(2));
         } else {
           bbb.appendCallInstruction(
               instr->output(),
@@ -4494,6 +4501,12 @@ LIRGenerator::TranslatedBlock LIRGenerator::TranslateOneBasicBlock(
 
         if constexpr (kFreeThreadedBuild) {
           // TODO(T250369690): Need thread-safe checked collections
+          bbb.appendCallInstruction(
+              instr->output(),
+              PyList_Append,
+              instr->GetOperand(0),
+              instr->GetOperand(1));
+        } else if constexpr (PY_VERSION_HEX < 0x030C0000) {
           bbb.appendCallInstruction(
               instr->output(),
               PyList_Append,

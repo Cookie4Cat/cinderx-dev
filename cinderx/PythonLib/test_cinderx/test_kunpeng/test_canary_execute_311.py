@@ -81,15 +81,15 @@ class CanaryExecute311Test(unittest.TestCase):
             _cinderx.install_frame_evaluator()
             import cinderjit
 
-            def uses_call(a):
-                return len(str(a))
+            def uses_attr(a):
+                return a.foo
 
             try:
-                cinderjit.force_compile(uses_call)
+                cinderjit.force_compile(uses_attr)
             except RuntimeError as exc:
                 assert "CANNOT_SPECIALIZE" in str(exc), exc
             else:
-                raise SystemExit("execute surface failed to refuse CALL")
+                raise SystemExit("execute surface failed to refuse LOAD_ATTR")
             """
         )
         proc = subprocess.run(
@@ -101,6 +101,480 @@ class CanaryExecute311Test(unittest.TestCase):
         )
         self.assertEqual(proc.returncode, 0, proc.stderr[-800:])
 
+    def test_canary_refuses_importlib_bootstrap(self):
+        env = dict(os.environ)
+        env["CINDERX_JIT_MODE"] = "canary"
+        env["PYTHONJITAUTO"] = "1"
+        probe = textwrap.dedent(
+            """
+            import importlib
+            import sys
+            import _cinderx, cinderx
+            cinderx.init()
+            _cinderx.install_frame_evaluator()
+            import cinderjit
+
+            bootstrap = sys.modules["_frozen_importlib"]
+            try:
+                cinderjit.force_compile(bootstrap._find_and_load)
+            except RuntimeError as exc:
+                assert "CANNOT_SPECIALIZE" in str(exc), exc
+            else:
+                raise SystemExit("importlib bootstrap was compiled")
+
+            importlib.import_module("test.test_grammar")
+            frozen = (
+                "_frozen_importlib",
+                "_frozen_importlib_external",
+                "importlib._bootstrap",
+                "importlib._bootstrap_external",
+            )
+            for fn in cinderjit.get_compiled_functions():
+                assert fn.__module__ not in frozen, fn
+                assert "importlib._bootstrap" not in fn.__code__.co_filename, fn
+            """
+        )
+        proc = subprocess.run(
+            [sys.executable, "-c", probe],
+            capture_output=True,
+            text=True,
+            env=env,
+            timeout=120,
+        )
+        self.assertEqual(proc.returncode, 0, proc.stderr[-800:])
+
+    def test_canary_load_method_miss_calls_type_attribute(self):
+        env = dict(os.environ)
+        env["CINDERX_JIT_MODE"] = "canary"
+        env["PYTHONJITAUTO"] = "1000000"
+        probe = textwrap.dedent(
+            """
+            import _cinderx, cinderx
+            cinderx.init()
+            _cinderx.install_frame_evaluator()
+            import cinderjit
+
+            def uniq(items):
+                return list(dict.fromkeys(items))
+
+            expected = uniq(["a", "a", "b"])
+            assert cinderjit.force_compile(uniq) is True
+            assert cinderjit.is_jit_compiled(uniq)
+            assert uniq(["a", "a", "b"]) == expected == ["a", "b"]
+            """
+        )
+        proc = subprocess.run(
+            [sys.executable, "-c", probe],
+            capture_output=True,
+            text=True,
+            env=env,
+            timeout=120,
+        )
+        self.assertEqual(proc.returncode, 0, proc.stderr[-800:])
+
+    def test_canary_executes_call_family_with_local_callees(self):
+        env = dict(os.environ)
+        env["CINDERX_JIT_MODE"] = "canary"
+        env["PYTHONJITAUTO"] = "1000000"
+        probe = textwrap.dedent(
+            """
+            import json
+            import _cinderx, cinderx
+            cinderx.init()
+            _cinderx.install_frame_evaluator()
+            import cinderjit
+
+            def positional(fn, x):
+                return fn(x)
+
+            class Box:
+                def add(self, value):
+                    return value + 1
+
+            def method_call(obj, value):
+                return obj.add(value)
+
+            def kwargs_call(fn, a):
+                return fn(a, k=1)
+
+            def star_call(fn, args):
+                return fn(*args)
+
+            def dstar_lit(fn):
+                return fn(**{"k": 1})
+
+            def star_list(fn):
+                return fn(*[2, 3])
+
+            for func in (
+                positional, method_call, kwargs_call, star_call,
+                dstar_lit, star_list,
+            ):
+                assert cinderjit.force_compile(func) is True, func.__name__
+                assert cinderjit.is_jit_compiled(func), func.__name__
+
+            assert positional(lambda x: x + 1, 3) == 4
+            assert method_call(Box(), 3) == 4
+            assert kwargs_call(lambda a, k=0: a + k, 3) == 4
+            assert star_call(lambda a, b: a + b, (2, 3)) == 5
+            assert dstar_lit(lambda k=0: k + 3) == 4
+            assert star_list(lambda a, b: a + b) == 5
+
+            stats = _cinderx._get_trigger_stats()
+            print(json.dumps(stats))
+            """
+        )
+        proc = subprocess.run(
+            [sys.executable, "-c", probe],
+            capture_output=True,
+            text=True,
+            env=env,
+            timeout=120,
+        )
+        self.assertEqual(proc.returncode, 0, proc.stderr[-800:])
+        stats = json.loads(proc.stdout.strip().splitlines()[-1])
+        self.assertGreaterEqual(stats["compiled_function_creations"], 6)
+        self.assertGreaterEqual(stats["machine_code_entries"], 6)
+
+    def test_canary_warm_call_specialization_stays_generic(self):
+        # Warm compilation must see the interpreter's CALL_PY_* form and
+        # still compile the unspecialized CALL: the execute surface has
+        # no speculative callee guard, so a later different Python
+        # function at the same site has to keep working.
+        env = dict(os.environ)
+        env["CINDERX_JIT_MODE"] = "canary"
+        env["PYTHONJITAUTO"] = "1000000"
+        probe = textwrap.dedent(
+            """
+            import dis
+            import _cinderx, cinderx
+            cinderx.init()
+            _cinderx.install_frame_evaluator()
+            from cinderx import jit
+            import cinderjit
+
+            def add1(x):
+                return x + 1
+
+            def add10(x):
+                return x + 10
+
+            def caller(fn, x):
+                return fn(x)
+
+            for _ in range(200):
+                caller(add1, 3)
+            plain = [i.opname for i in dis.get_instructions(caller)]
+            adaptive = [
+                i.opname for i in dis.get_instructions(caller, adaptive=True)
+            ]
+            specialized = [b for a, b in zip(plain, adaptive) if a != b]
+            assert any(name.startswith("CALL_") for name in specialized), (
+                specialized)
+
+            assert jit.force_compile_warm(caller) is True
+            assert cinderjit.is_jit_compiled(caller)
+            assert caller(add1, 3) == 4
+            assert caller(add10, 3) == 13
+            print("warm call specialization stayed generic")
+            """
+        )
+        proc = subprocess.run(
+            [sys.executable, "-c", probe],
+            capture_output=True,
+            text=True,
+            env=env,
+            timeout=120,
+        )
+        self.assertEqual(proc.returncode, 0, proc.stderr[-800:])
+        self.assertIn("warm call specialization stayed generic", proc.stdout)
+
+    def test_canary_load_method_receiver_switch(self):
+        # Plan-required shape: quicken and compile one LOAD_METHOD/self
+        # form, then run the other (method hit vs attribute miss) at the
+        # same site.  Natural deopt is MR-07; canary must keep answering.
+        env = dict(os.environ)
+        env["CINDERX_JIT_MODE"] = "canary"
+        env["PYTHONJITAUTO"] = "1000000"
+        probe = textwrap.dedent(
+            """
+            import _cinderx, cinderx
+            cinderx.init()
+            _cinderx.install_frame_evaluator()
+            from cinderx import jit
+            import cinderjit
+
+            class Box:
+                def add(self, value):
+                    return value + 1
+
+            class AttrBox:
+                def __init__(self):
+                    self.add = lambda value: value + 10
+
+            def caller(obj, value):
+                return obj.add(value)
+
+            for _ in range(200):
+                caller(Box(), 3)
+            assert jit.force_compile_warm(caller) is True
+            assert cinderjit.is_jit_compiled(caller)
+            assert caller(Box(), 3) == 4
+            assert caller(AttrBox(), 3) == 13
+
+            def miss_first(obj, value):
+                return obj.add(value)
+
+            for _ in range(200):
+                miss_first(AttrBox(), 3)
+            assert jit.force_compile_warm(miss_first) is True
+            assert miss_first(AttrBox(), 3) == 13
+            assert miss_first(Box(), 3) == 4
+            print("load_method receiver switch held")
+            """
+        )
+        proc = subprocess.run(
+            [sys.executable, "-c", probe],
+            capture_output=True,
+            text=True,
+            env=env,
+            timeout=120,
+        )
+        self.assertEqual(proc.returncode, 0, proc.stderr[-800:])
+        self.assertIn("load_method receiver switch held", proc.stdout)
+
+    def test_canary_classmethod_and_staticmethod_execute(self):
+        env = dict(os.environ)
+        env["CINDERX_JIT_MODE"] = "canary"
+        env["PYTHONJITAUTO"] = "1000000"
+        probe = textwrap.dedent(
+            """
+            import _cinderx, cinderx
+            cinderx.init()
+            _cinderx.install_frame_evaluator()
+            import cinderjit
+
+            class Callee:
+                @classmethod
+                def cm(cls, x):
+                    return ("cm", cls.__name__, x)
+
+                @staticmethod
+                def sm(x, y):
+                    return ("sm", x, y)
+
+            def call_cm(x):
+                return Callee.cm(x)
+
+            def call_sm(x, y):
+                return Callee.sm(x, y)
+
+            def call_bound_cm(x):
+                return Callee().cm(x)
+
+            for func in (call_cm, call_sm, call_bound_cm):
+                assert cinderjit.force_compile(func) is True, func.__name__
+                assert cinderjit.is_jit_compiled(func), func.__name__
+
+            assert call_cm(3) == ("cm", "Callee", 3)
+            assert call_sm(2, 5) == ("sm", 2, 5)
+            assert call_bound_cm(4) == ("cm", "Callee", 4)
+            print("classmethod and staticmethod executed")
+            """
+        )
+        proc = subprocess.run(
+            [sys.executable, "-c", probe],
+            capture_output=True,
+            text=True,
+            env=env,
+            timeout=120,
+        )
+        self.assertEqual(proc.returncode, 0, proc.stderr[-800:])
+        self.assertIn("classmethod and staticmethod executed", proc.stdout)
+
+    def test_canary_call_function_churn(self):
+        env = dict(os.environ)
+        env["CINDERX_JIT_MODE"] = "canary"
+        env["PYTHONJITAUTO"] = "1000000"
+        probe = textwrap.dedent(
+            """
+            import gc
+            import _cinderx, cinderx
+            cinderx.init()
+            _cinderx.install_frame_evaluator()
+            import cinderjit
+
+            def helper(x):
+                return x + 1
+
+            compiled = 0
+            generations = 80
+            for gen in range(generations):
+                ns = {"helper": helper}
+                exec(
+                    "def churn_%d(x):\\n    return helper(x)\\n" % gen,
+                    ns,
+                )
+                fn = ns.pop("churn_%d" % gen)
+                assert cinderjit.force_compile(fn) is True, gen
+                compiled += 1
+                before = _cinderx._get_trigger_stats()["machine_code_entries"]
+                assert fn(3) == 4, gen
+                delta = (
+                    _cinderx._get_trigger_stats()["machine_code_entries"]
+                    - before
+                )
+                assert delta == 1, (gen, delta)
+                del fn
+                del ns
+                gc.collect()
+                for live in cinderjit.get_compiled_functions():
+                    assert live.__qualname__, live
+
+            assert compiled == generations
+            leftover = [
+                f.__qualname__
+                for f in cinderjit.get_compiled_functions()
+                if f.__qualname__.startswith("churn_")
+            ]
+            assert not leftover, leftover
+            print("call function churn held")
+            """
+        )
+        proc = subprocess.run(
+            [sys.executable, "-c", probe],
+            capture_output=True,
+            text=True,
+            env=env,
+            timeout=120,
+        )
+        self.assertEqual(proc.returncode, 0, proc.stderr[-800:])
+        self.assertIn("call function churn held", proc.stdout)
+
+    def test_canary_call_thresholds_install(self):
+        probe = textwrap.dedent(
+            """
+            import os
+            import _cinderx, cinderx
+            cinderx.init()
+            _cinderx.install_frame_evaluator()
+            import cinderjit
+
+            threshold = int(os.environ["PYTHONJITAUTO"])
+
+            def add1(x):
+                return x + 1
+
+            def caller(x):
+                return add1(x)
+
+            for i in range(threshold + 4):
+                assert caller(i) == i + 1
+            assert cinderjit.is_jit_compiled(caller), (
+                "threshold %s did not install" % threshold)
+            assert caller(7) == 8
+            print("threshold %s installed" % threshold)
+            """
+        )
+        for threshold in (1, 4, 30):
+            env = dict(os.environ)
+            env["CINDERX_JIT_MODE"] = "canary"
+            env["PYTHONJITAUTO"] = str(threshold)
+            proc = subprocess.run(
+                [sys.executable, "-c", probe],
+                capture_output=True,
+                text=True,
+                env=env,
+                timeout=120,
+            )
+            self.assertEqual(
+                proc.returncode, 0, (threshold, proc.stderr[-800:])
+            )
+            self.assertIn("threshold %s installed" % threshold, proc.stdout)
+
+    def test_canary_recursive_call_raises_recursion_error(self):
+        env = dict(os.environ)
+        env["CINDERX_JIT_MODE"] = "canary"
+        env["PYTHONJITAUTO"] = "1000000"
+        probe = textwrap.dedent(
+            """
+            import sys
+            import _cinderx, cinderx
+            cinderx.init()
+            _cinderx.install_frame_evaluator()
+            import cinderjit
+
+            def rec(f, n):
+                if n:
+                    return f(f, n - 1)
+                return 0
+
+            assert cinderjit.force_compile(rec) is True
+            assert rec(rec, 8) == 0
+
+            old = sys.getrecursionlimit()
+            sys.setrecursionlimit(20)
+            try:
+                rec(rec, 200)
+                raise SystemExit("expected RecursionError")
+            except RecursionError:
+                pass
+            finally:
+                sys.setrecursionlimit(old)
+
+            assert rec(rec, 4) == 0
+            assert cinderjit.is_jit_compiled(rec), (
+                "RecursionError withdrew the artifact; ROI deopt budget "
+                "should not trip on a single bounded unwind")
+            """
+        )
+        proc = subprocess.run(
+            [sys.executable, "-c", probe],
+            capture_output=True,
+            text=True,
+            env=env,
+            timeout=120,
+        )
+        self.assertEqual(proc.returncode, 0, proc.stderr[-800:])
+
+    def test_canary_deep_recursion_hits_c_stack_soft_limit(self):
+        env = dict(os.environ)
+        env["CINDERX_JIT_MODE"] = "canary"
+        env["PYTHONJITAUTO"] = "1000000"
+        probe = textwrap.dedent(
+            """
+            import sys
+            import _cinderx, cinderx
+            cinderx.init()
+            _cinderx.install_frame_evaluator()
+            import cinderjit
+
+            def rec(f, n):
+                if n:
+                    return f(f, n - 1)
+                return 0
+
+            assert cinderjit.force_compile(rec) is True
+            old = sys.getrecursionlimit()
+            sys.setrecursionlimit(10 ** 6)
+            try:
+                rec(rec, 10 ** 6)
+                raise SystemExit("expected RecursionError from C stack")
+            except RecursionError:
+                pass
+            finally:
+                sys.setrecursionlimit(old)
+            assert rec(rec, 3) == 0
+            """
+        )
+        proc = subprocess.run(
+            [sys.executable, "-c", probe],
+            capture_output=True,
+            text=True,
+            env=env,
+            timeout=120,
+        )
+        self.assertEqual(proc.returncode, 0, proc.stderr[-800:])
 
     def test_escaped_frame_stays_accessible_after_return(self):
         # MR-04 acceptance: a frame that escaped via an exception traceback
@@ -150,12 +624,10 @@ class CanaryExecute311Test(unittest.TestCase):
         )
         self.assertEqual(proc.returncode, 0, proc.stderr[-800:])
 
-    def test_execute_surface_refuses_unaudited_argument_shapes(self):
-        # Argument binding beyond exact positional arguments -- keyword-only
-        # parameters, defaults, and the variadic collectors -- carries error
-        # and fallback contracts that MR-06 owns.  A body made only of
-        # whitelisted opcodes must not be enough to let those signatures
-        # execute machine code.
+    def test_execute_surface_compiles_argument_shapes(self):
+        # MR-06: defaults, keyword-only parameters and the variadic
+        # collectors are bound by the generated vectorcall prologue.  A
+        # body made of whitelisted opcodes is enough to execute them.
         env = dict(os.environ)
         env["CINDERX_JIT_MODE"] = "canary"
         env["PYTHONJITAUTO"] = "1000000"
@@ -166,6 +638,9 @@ class CanaryExecute311Test(unittest.TestCase):
             _cinderx.install_frame_evaluator()
             import cinderjit
 
+            def entries():
+                return _cinderx._get_trigger_stats()["machine_code_entries"]
+
             def kwonly(*, x):
                 return x
             def varargs(*args):
@@ -173,27 +648,25 @@ class CanaryExecute311Test(unittest.TestCase):
             def varkw(**kwargs):
                 return kwargs
             def mixed(a, *, b=2):
-                return a
+                return a + b
             def defaulted(a, b=3):
-                return a
+                return a + b
 
             for fn in (kwonly, varargs, varkw, mixed, defaulted):
-                try:
-                    cinderjit.force_compile(fn)
-                except RuntimeError as exc:
-                    assert "CANNOT_SPECIALIZE" in str(exc), (fn, exc)
-                else:
-                    raise SystemExit(
-                        f"execute surface accepted {fn.__name__}")
-                assert not cinderjit.is_jit_compiled(fn), fn
+                assert cinderjit.force_compile(fn) is True, fn.__name__
+                assert cinderjit.is_jit_compiled(fn), fn.__name__
 
-            # The same body with plain positional parameters still compiles,
-            # so the refusal is about the signature and not the body.
-            def positional(a, b, one):
-                return a
-            assert cinderjit.force_compile(positional) is True
-            assert cinderjit.is_jit_compiled(positional)
-            print("argument shapes refused")
+            before = entries()
+            assert kwonly(x=7) == 7
+            assert varargs(1, 2) == (1, 2)
+            assert varkw(k=1) == {"k": 1}
+            assert mixed(3) == 5
+            assert mixed(3, b=4) == 7
+            assert defaulted(1) == 4
+            assert defaulted(1, 10) == 11
+            assert defaulted(a=1, b=2) == 3
+            assert entries() - before == 8, entries() - before
+            print("argument shapes compiled")
             """
         )
         proc = subprocess.run(
@@ -204,7 +677,142 @@ class CanaryExecute311Test(unittest.TestCase):
             timeout=120,
         )
         self.assertEqual(proc.returncode, 0, proc.stderr[-800:])
-        self.assertIn("argument shapes refused", proc.stdout)
+        self.assertIn("argument shapes compiled", proc.stdout)
+
+    def test_canary_binding_typeerrors_match_interpreter(self):
+        env = dict(os.environ)
+        env["CINDERX_JIT_MODE"] = "canary"
+        env["PYTHONJITAUTO"] = "1000000"
+        probe = textwrap.dedent(
+            """
+            import _cinderx, cinderx
+            cinderx.init()
+            _cinderx.install_frame_evaluator()
+            import cinderjit
+
+            def compiled(a, b):
+                return a
+            def interpreted(a, b):
+                return a
+
+            assert cinderjit.force_compile(compiled) is True
+
+            def catch(fn, *args, **kwargs):
+                try:
+                    fn(*args, **kwargs)
+                except TypeError as exc:
+                    msg = str(exc)
+                    if "()" in msg:
+                        msg = msg.split("()", 1)[1]
+                    return type(exc), msg
+                raise SystemExit("expected TypeError")
+
+            for args, kwargs in (
+                ((1,), {}),
+                ((1, 2, 3), {}),
+                ((1,), {"z": 2}),
+                ((), {"a": 1}),
+            ):
+                got = catch(compiled, *args, **kwargs)
+                want = catch(interpreted, *args, **kwargs)
+                assert got == want, (args, kwargs, got, want)
+            print("binding TypeErrors match")
+            """
+        )
+        proc = subprocess.run(
+            [sys.executable, "-c", probe],
+            capture_output=True,
+            text=True,
+            env=env,
+            timeout=120,
+        )
+        self.assertEqual(proc.returncode, 0, proc.stderr[-800:])
+        self.assertIn("binding TypeErrors match", proc.stdout)
+
+    def test_canary_load_global_builtin_without_guard(self):
+        env = dict(os.environ)
+        env["CINDERX_JIT_MODE"] = "canary"
+        env["PYTHONJITAUTO"] = "1000000"
+        probe = textwrap.dedent(
+            """
+            import _cinderx, cinderx
+            cinderx.init()
+            _cinderx.install_frame_evaluator()
+            import cinderjit
+
+            def uses_abs(x):
+                return abs(x)
+
+            assert cinderjit.force_compile(uses_abs) is True
+            assert cinderjit.is_jit_compiled(uses_abs)
+            before = _cinderx._get_trigger_stats()["machine_code_entries"]
+            assert uses_abs(-4) == 4
+            assert uses_abs(5) == 5
+            delta = _cinderx._get_trigger_stats()["machine_code_entries"] - before
+            assert delta == 2, delta
+            print("load_global builtin compiled")
+            """
+        )
+        proc = subprocess.run(
+            [sys.executable, "-c", probe],
+            capture_output=True,
+            text=True,
+            env=env,
+            timeout=120,
+        )
+        self.assertEqual(proc.returncode, 0, proc.stderr[-800:])
+        self.assertIn("load_global builtin compiled", proc.stdout)
+
+    def test_canary_tracing_falls_back_to_interpreter(self):
+        env = dict(os.environ)
+        env["CINDERX_JIT_MODE"] = "canary"
+        env["PYTHONJITAUTO"] = "1000000"
+        probe = textwrap.dedent(
+            """
+            import sys
+            import _cinderx, cinderx
+            cinderx.init()
+            _cinderx.install_frame_evaluator()
+            import cinderjit
+
+            def target(a):
+                return a + 1
+
+            assert cinderjit.force_compile(target) is True
+            assert cinderjit.is_jit_compiled(target)
+
+            events = []
+            def tracer(frame, event, arg):
+                if frame.f_code.co_name == "target":
+                    events.append(event)
+                return tracer
+
+            before = _cinderx._get_trigger_stats()["machine_code_entries"]
+            sys.settrace(tracer)
+            try:
+                assert target(3) == 4
+            finally:
+                sys.settrace(None)
+            assert "call" in events, events
+            assert "return" in events, events
+            delta = _cinderx._get_trigger_stats()["machine_code_entries"] - before
+            assert delta == 0, delta
+            assert cinderjit.is_jit_compiled(target)
+            assert target(3) == 4
+            after = _cinderx._get_trigger_stats()["machine_code_entries"] - before
+            assert after == 1, after
+            print("tracing fell back")
+            """
+        )
+        proc = subprocess.run(
+            [sys.executable, "-c", probe],
+            capture_output=True,
+            text=True,
+            env=env,
+            timeout=120,
+        )
+        self.assertEqual(proc.returncode, 0, proc.stderr[-800:])
+        self.assertIn("tracing fell back", proc.stdout)
 
     def test_compiled_artifact_is_never_shared_between_functions(self):
         # CPython 3.11 has no function-destroy notification, so a second
@@ -371,12 +979,11 @@ class CanaryExecute311Test(unittest.TestCase):
         self.assertEqual(proc.returncode, 0, proc.stderr[-800:])
         self.assertIn("control plane restricted", proc.stdout)
 
-    def test_entry_rechecks_code_identity_and_call_form(self):
-        # 3.11 has no function watchers, so nothing reports a __code__ or
-        # defaults change after compilation, and the compiled body assumes
-        # the exact positional call form the surface accepted.  The entry
-        # re-checks both on every call and hands anything else back to the
-        # interpreter.
+    def test_entry_rechecks_code_identity_and_runs_live_binding(self):
+        # 3.11 has no function watchers, so a __code__ swap after
+        # compilation must not keep running the old artifact.  Keyword
+        # calls and defaults that appear after compilation are rebound by
+        # the generated prologue and must still enter machine code.
         env = dict(os.environ)
         env["CINDERX_JIT_MODE"] = "canary"
         env["PYTHONJITAUTO"] = "1000000"
@@ -403,19 +1010,16 @@ class CanaryExecute311Test(unittest.TestCase):
             assert target(3, 5, 1) == 15
             assert entries() - before == 1, "positional call must run compiled"
 
-            # Keyword form: the compiled body never bound keywords.
             before = entries()
             assert target(a=3, b=5, one=1) == 15
-            assert entries() - before == 0, "keyword call must not run compiled"
+            assert entries() - before == 1, "keyword call must run compiled"
 
-            # Defaults appearing after compilation.
             before = entries()
             target.__defaults__ = (1,)
             assert target(3, 5) == 15
-            assert entries() - before == 0, "defaults must not run compiled"
+            assert entries() - before == 1, "live defaults must run compiled"
             target.__defaults__ = None
 
-            # A different code object behind the same function.
             def replacement(a, b, one):
                 return "replaced"
 
@@ -423,7 +1027,7 @@ class CanaryExecute311Test(unittest.TestCase):
             before = entries()
             assert target(3, 5, 1) == "replaced", "stale machine code ran"
             assert entries() - before == 0
-            print("entry rechecked identity and call form")
+            print("entry rechecked identity and ran live binding")
             """
         )
         proc = subprocess.run(
@@ -434,7 +1038,7 @@ class CanaryExecute311Test(unittest.TestCase):
             timeout=120,
         )
         self.assertEqual(proc.returncode, 0, proc.stderr[-800:])
-        self.assertIn("entry rechecked identity", proc.stdout)
+        self.assertIn("entry rechecked identity and ran live binding", proc.stdout)
 
     def test_artifacts_carry_no_speculative_guard(self):
         # Guards do not only come from quickened opcodes: Simplify installs
@@ -667,10 +1271,9 @@ class CanaryExecute311Test(unittest.TestCase):
 
     def test_compiled_state_matches_what_the_entry_will_do(self):
         # "Is this compiled?" and "will this call run machine code?" have to
-        # be the same question.  Growing defaults after compilation sends
-        # every call to the interpreter, so reporting the function as
-        # compiled -- and counting it as installed -- would describe a state
-        # the runtime is not in.
+        # be the same question for function state.  Live defaults are
+        # rebound by the prologue, so growing them after compilation must
+        # keep both answers true.  A __code__ swap still clears both.
         env = dict(os.environ)
         env["CINDERX_JIT_MODE"] = "canary"
         env["PYTHONJITAUTO"] = "1000000"
@@ -712,15 +1315,22 @@ class CanaryExecute311Test(unittest.TestCase):
                 compiled = cinderjit.is_jit_compiled(hot)
                 listed = any(f is hot
                              for f in cinderjit.get_compiled_functions())
-                assert delta == 0, delta
-                assert not compiled, "reported compiled but ran interpreted"
-                assert not listed, "listed as installed but ran interpreted"
+                assert delta == 1, delta
+                assert compiled, "live defaults cleared compiled state"
+                assert listed, "live defaults dropped the installed listing"
                 restore()
-                # Restoring the state restores the answer, both ways.
                 before = entries()
                 assert hot(3, 5, 1) == 15
                 assert entries() - before == 1
                 assert cinderjit.is_jit_compiled(hot)
+
+            def replacement(a, b, one):
+                return "replaced"
+            hot.__code__ = replacement.__code__
+            before = entries()
+            assert hot(3, 5, 1) == "replaced"
+            assert entries() - before == 0
+            assert not cinderjit.is_jit_compiled(hot)
             print("state matches the entry")
             """
         )
