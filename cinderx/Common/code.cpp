@@ -25,6 +25,70 @@ CodeExtra* codeExtraIfPresent(BorrowedRef<PyCodeObject> code) {
   return codeExtraIfExists(code);
 }
 
+#if PY_VERSION_HEX < 0x030C0000
+// Layout of PyCodeObject::co_extra, private to Objects/codeobject.c but
+// stable across 3.11: a size-prefixed inline pointer array.
+struct CodeObjectExtra311 {
+  Py_ssize_t ce_size;
+  void* ce_extras[1];
+};
+#endif
+
+// Store a code-extra value, keeping the co_extra allocation as small as the
+// target index allows.
+//
+// _PyCode_SetExtra sizes a fresh co_extra to the full number of registered
+// indices, and code_dealloc later invokes EVERY registered freefunc below
+// that size -- whether or not this code object ever stored a value in the
+// slot.  Third-party code can register a mortal freefunc (test.test_code
+// registers a ctypes closure at import time) that is already dead by the
+// time long-lived code objects reach dealloc during shutdown.  Since the
+// runtime attaches its data to broad swaths of code, cap an allocation we
+// create at exactly our own slot.
+//
+// What that buys is precise: every foreign index ABOVE ours stops being
+// walked.  A foreign index below ours still is -- the layout is a dense
+// prefix array, so storing at index N requires spanning [0, N] -- and there
+// it behaves exactly as stock CPython already does, because the capped
+// allocation is never larger than the one the stock setter would make.
+// Claiming our index during module initialization is what usually keeps
+// foreign indices above ours; it is a property of load order, not something
+// enforced here.
+int setCodeExtraCapped(PyObject* code_obj, Py_ssize_t index, void* extra) {
+#if PY_VERSION_HEX < 0x030C0000
+  auto code = reinterpret_cast<PyCodeObject*>(code_obj);
+  auto ce = reinterpret_cast<CodeObjectExtra311*>(code->co_extra);
+  // Read back the size through our own view of the layout before trusting
+  // it for arithmetic: CPython caps registered indices at MAX_CO_EXTRA_USERS
+  // (255), so anything outside that range means this declaration no longer
+  // matches the interpreter and the write must not proceed.
+  JIT_CHECK(
+      ce == nullptr || (ce->ce_size >= 0 && ce->ce_size <= 255),
+      "co_extra size {} is outside the range CPython can produce; the "
+      "private layout this build assumes no longer matches the runtime",
+      ce == nullptr ? 0 : ce->ce_size);
+  if (ce != nullptr && ce->ce_size > index) {
+    // Fits in the existing allocation; the stock path will not grow it.
+    return PyUnstable_Code_SetExtra(code_obj, index, extra);
+  }
+  Py_ssize_t old_size = ce != nullptr ? ce->ce_size : 0;
+  auto grown = reinterpret_cast<CodeObjectExtra311*>(
+      PyMem_Realloc(ce, sizeof(CodeObjectExtra311) + index * sizeof(void*)));
+  if (grown == nullptr) {
+    return -1;
+  }
+  for (Py_ssize_t i = old_size; i <= index; i++) {
+    grown->ce_extras[i] = nullptr;
+  }
+  grown->ce_size = index + 1;
+  code->co_extra = grown;
+  grown->ce_extras[index] = extra;
+  return 0;
+#else
+  return PyUnstable_Code_SetExtra(code_obj, index, extra);
+#endif
+}
+
 std::string fullnameImpl(PyObject* module, PyObject* qualname) {
   auto safe_str = [](BorrowedRef<> str) {
     if (str == nullptr || !PyUnicode_Check(str)) {
@@ -240,7 +304,7 @@ CodeExtra* codeExtra(PyCodeObject* code) {
     return nullptr;
   }
 
-  if (PyUnstable_Code_SetExtra(code_obj, extra_index, extra) < 0) {
+  if (setCodeExtraCapped(code_obj, extra_index, extra) < 0) {
     JIT_LOG("Failed to set code extra data for {}", codeName(code));
     jit::printPythonException();
     PyErr_Clear();
