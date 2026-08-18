@@ -569,6 +569,11 @@ class HIRBuilder {
 
   ExecutionBlock popBlock(CFG& cfg, TranslationContext& tc);
   void insertRunPeriodicActivitesForLoop(CFG& cfg, BasicBlock* loop_header);
+  void insertRunPeriodicActivitesForBackedge(
+      CFG& cfg,
+      BasicBlock* src,
+      BasicBlock* target,
+      const FrameState& frame);
   void insertRunPeriodicActivitesForExcept(CFG& cfg, TranslationContext& tc);
   void insertRunPeriodicActivites(
       CFG& cfg,

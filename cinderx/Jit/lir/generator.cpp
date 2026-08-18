@@ -3666,6 +3666,24 @@ LIRGenerator::TranslatedBlock LIRGenerator::TranslateOneBasicBlock(
         appendGuard(bbb, InstrGuardKind::kZero, instr, load);
         break;
       }
+      case Opcode::kCheckInstrumentation: {
+        const auto& instr = static_cast<const DeoptBase&>(i);
+        // Two independent loads and exits rather than an OR: either
+        // registration alone is the transition, and the deopt carries
+        // the complete post-instruction frame state, so nothing here
+        // depends on which one fired.
+        Instruction* trace = bbb.appendInstr(
+            Instruction::kMove,
+            OutVReg{},
+            Ind{env_->asm_tstate, offsetof(PyThreadState, c_tracefunc)});
+        appendGuard(bbb, InstrGuardKind::kZero, instr, trace);
+        Instruction* profile = bbb.appendInstr(
+            Instruction::kMove,
+            OutVReg{},
+            Ind{env_->asm_tstate, offsetof(PyThreadState, c_profilefunc)});
+        appendGuard(bbb, InstrGuardKind::kZero, instr, profile);
+        break;
+      }
       case Opcode::kCheckExc:
       case Opcode::kCheckField:
       case Opcode::kCheckFreevar:
@@ -5340,6 +5358,7 @@ LIRGenerator::TranslatedBlock LIRGenerator::TranslateOneBasicBlock(
         case Opcode::kCheckErrOccurred:
         case Opcode::kCheckExc:
         case Opcode::kCheckField:
+        case Opcode::kCheckInstrumentation:
         case Opcode::kCheckNeg:
         case Opcode::kCheckVar:
         case Opcode::kCompareBool:

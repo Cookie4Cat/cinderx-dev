@@ -539,6 +539,7 @@ Type outputType(
     case Opcode::kBranch:
     case Opcode::kCallStaticRetVoid:
     case Opcode::kCheckErrOccurred:
+    case Opcode::kCheckInstrumentation:
     case Opcode::kCondBranch:
     case Opcode::kCondBranchCheckType:
     case Opcode::kCondBranchIterNotDone:
