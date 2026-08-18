@@ -8,8 +8,9 @@
 #                                             families must stay green
 #
 # The green-family manifest is ci_pipeline/jit311/data/rt311_green_families.txt;
-# the remaining families are the known-fail set owned by the front-end MR
-# (they require JIT initialization, which the capability gate refuses).
+# HIRBuildTest is green under shadow init. Capability skips live in
+# HIRBuildDeferredTest + rt311_allowed_skips.txt. Remaining families are
+# the known-fail set owned by later MRs.
 set -euo pipefail
 # Every sort/comm/diff over the committed manifests runs in C collation:
 # the committed files are byte-ordered, and a UTF-8 runner locale would
@@ -44,6 +45,24 @@ no_skips_allowed() {
   if grep -qE '^\[  SKIPPED \]' "$1"; then
     echo "gtest reported skipped tests; a skip is neither a pass nor a fix:"
     grep -E '^\[  SKIPPED \]' "$1"
+    return 1
+  fi
+}
+
+unexpected_skips() {
+  # $1: gtest log.  Capability-gated 3.11 skips (shadow-only, generators,
+  # slots, later MRs) live in rt311_allowed_skips.txt.  Any other skip is
+  # red: it is neither a pass nor a known failure.
+  ALLOWED="$REPO_ROOT/ci_pipeline/jit311/data/rt311_allowed_skips.txt"
+  LIVE="$BUILD_DIR-census-skipped.txt"
+  { grep -E '^\[  SKIPPED \]' "$1" || true; } \
+    | sed 's/^\[  SKIPPED \] //; s/ ([0-9]* ms)$//' \
+    | { grep -E '^[A-Za-z_][A-Za-z0-9_]*\.' || true; } \
+    | sort -u > "$LIVE"
+  EXTRA=$(comm -23 "$LIVE" <(grep -Ev '^[[:space:]]*(#|$)' "$ALLOWED" | sort -u))
+  if [ -n "$EXTRA" ]; then
+    echo "census: skips outside the allowed-skip manifest:"
+    echo "$EXTRA"
     return 1
   fi
 }
@@ -83,6 +102,10 @@ if [ "${1:-}" = "--verify-registered" ]; then
 fi
 if [ "${1:-}" = "--verify-baseline-growth" ]; then
   baseline_growth "${2:?old baseline}" "${3:?new baseline}"
+  exit $?
+fi
+if [ "${1:-}" = "--verify-skip-growth" ]; then
+  baseline_growth "${2:?old skip allowlist}" "${3:?new skip allowlist}"
   exit $?
 fi
 if [ "${1:-}" = "--verify-green-log" ]; then
@@ -128,9 +151,46 @@ if [ "$MODE" = "--census" ]; then
   grep -qE '^\[==========\] .* ran\.' "$BUILD_DIR-census.log" \
     || { echo "census did not run to completion (crash?)"; exit 1; }
   grep -E '^\[==========\] .* ran\.' "$BUILD_DIR-census.log"
-  # A known failure may only leave the baseline by actually passing; a
-  # skip would otherwise read as "fixed".  No test may skip in the census.
-  no_skips_allowed "$BUILD_DIR-census.log"
+  # Capability-gated 3.11 skips are pinned in rt311_allowed_skips.txt;
+  # anything else is neither a pass nor a known failure.
+  unexpected_skips "$BUILD_DIR-census.log"
+  # Skip allowlist may only shrink silently, never grow: adding GTEST_SKIP
+  # and its allowlist row in the same change would keep census green.
+  SKIP_ALLOWLIST="$REPO_ROOT/ci_pipeline/jit311/data/rt311_allowed_skips.txt"
+  SKIP_BOOTSTRAP_COUNT=130
+  SKIP_BOOTSTRAP_SHA256=80aae121d290fc73a5bb73c05df8411c8b83368b5377ab977009e36330d32001
+  if [ -z "${RT311_BASELINE_BASE:-}" ]; then
+    echo "census: RT311_BASELINE_BASE must be set to the merge-base SHA"
+    echo "(the skip-allowlist self-extension guard refuses to run open)"
+    exit 1
+  fi
+  if ! git -C "$REPO_ROOT" rev-parse --verify --quiet \
+       "$RT311_BASELINE_BASE^{commit}" > /dev/null; then
+    echo "census: protected base $RT311_BASELINE_BASE does not resolve"
+    exit 1
+  fi
+  BASE_SKIPS="$BUILD_DIR-skips-at-base.txt"
+  if git -C "$REPO_ROOT" show \
+       "$RT311_BASELINE_BASE:ci_pipeline/jit311/data/rt311_allowed_skips.txt" \
+       > "$BASE_SKIPS" 2>/dev/null; then
+    baseline_growth "$BASE_SKIPS" "$SKIP_ALLOWLIST"
+    echo "census: skip-allowlist growth guard held against $RT311_BASELINE_BASE"
+  else
+    SKIP_NORMALIZED="$BUILD_DIR-skips-normalized.txt"
+    grep -Ev '^[[:space:]]*(#|$)' "$SKIP_ALLOWLIST" > "$SKIP_NORMALIZED"
+    SKIP_COUNT=$(wc -l < "$SKIP_NORMALIZED" | tr -d ' ')
+    SKIP_SHA=$(sha256sum "$SKIP_NORMALIZED" | awk '{print $1}')
+    if [ "$SKIP_COUNT" != "$SKIP_BOOTSTRAP_COUNT" ] \
+       || [ "$SKIP_SHA" != "$SKIP_BOOTSTRAP_SHA256" ]; then
+      echo "census: skip allowlist absent at $RT311_BASELINE_BASE and the"
+      echo "committed list does not match the audited bootstrap pin"
+      echo "($SKIP_COUNT entries, sha256 $SKIP_SHA); skip-allowlist"
+      echo "changes require their own reviewed change"
+      exit 1
+    fi
+    echo "census: bootstrap skip allowlist matches the audited pin" \
+      "($SKIP_BOOTSTRAP_COUNT entries)"
+  fi
   # The known-failure baseline may only shrink silently, never grow: a
   # failure outside the committed manifest is a regression in a non-green
   # family and turns the census red.

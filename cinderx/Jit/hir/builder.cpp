@@ -156,7 +156,9 @@ void rotateStackTop(OperandStack& stack, int count) {
 // Check that an opcode is one we know how to translate into HIR.
 bool isSupportedOpcode(int opcode) {
   switch (opcode) {
+#if PY_VERSION_HEX >= 0x030C0000
     case BEFORE_ASYNC_WITH:
+#endif
     case BEFORE_WITH:
     case BINARY_ADD:
     case BINARY_AND:
@@ -195,7 +197,9 @@ bool isSupportedOpcode(int opcode) {
     case CALL_KW:
     case CALL_METHOD:
     case CAST:
+#if PY_VERSION_HEX >= 0x030C0000
     case CHECK_EG_MATCH:
+#endif
     case CHECK_EXC_MATCH:
     case CLEANUP_THROW:
     case COMPARE_OP:
@@ -212,7 +216,9 @@ bool isSupportedOpcode(int opcode) {
     case DUP_TOP:
     case DUP_TOP_TWO:
     case EAGER_IMPORT_NAME:
+#if PY_VERSION_HEX >= 0x030C0000
     case END_ASYNC_FOR:
+#endif
     case END_FOR:
     case END_SEND:
     case EXTENDED_ARG:
@@ -222,9 +228,11 @@ bool isSupportedOpcode(int opcode) {
     case FORMAT_WITH_SPEC:
     case FOR_ITER:
     case GEN_START:
+#if PY_VERSION_HEX >= 0x030C0000
     case GET_AITER:
     case GET_ANEXT:
     case GET_AWAITABLE:
+#endif
     case GET_ITER:
     case GET_LEN:
     case GET_YIELD_FROM_ITER:
@@ -297,10 +305,12 @@ bool isSupportedOpcode(int opcode) {
     case MAKE_CELL:
     case MAKE_FUNCTION:
     case MAP_ADD:
+#if PY_VERSION_HEX >= 0x030C0000
     case MATCH_CLASS:
     case MATCH_KEYS:
     case MATCH_MAPPING:
     case MATCH_SEQUENCE:
+#endif
     case NOP:
     case NOT_TAKEN:
     case POP_BLOCK:
@@ -388,6 +398,26 @@ bool isSupportedOpcode(int opcode) {
 bool isBannedName(std::string_view name) {
   return name == "eval" || name == "exec" || name == "locals";
 }
+
+#if PY_VERSION_HEX < 0x030C0000
+// co_names entries are Unicode objects, but CodeType.replace() can legally
+// insert a lone surrogate. PyUnicode_AsUTF8 then returns NULL and sets
+// UnicodeEncodeError; constructing a string_view from that pointer is UB.
+std::string_view
+nameAtOrRefuse(PyObject* names, Py_ssize_t i, const char** refuse) {
+  if (*refuse != nullptr) {
+    return {};
+  }
+  PyObject* item = PyTuple_GET_ITEM(names, i);
+  const char* utf8 = item != nullptr ? PyUnicode_AsUTF8(item) : nullptr;
+  if (utf8 == nullptr) {
+    PyErr_Clear();
+    *refuse = "REFUSE_SHAPE_INVALID_UTF8_NAME";
+    return {};
+  }
+  return std::string_view(utf8);
+}
+#endif
 
 // True if the code object contains any branch back to an earlier instruction;
 // used as a structural proxy for "this function has a loop body" when gating
@@ -888,10 +918,11 @@ static bool should_snapshot(
     case JUMP_IF_NOT_EXC_MATCH:
     case RERAISE:
     case WITH_EXCEPT_START: {
-      JIT_THROW(
-          "Should not be compiling except blocks (opcode {}, {})\n",
-          bci.opcode(),
-          opcodeName(bci.opcode()));
+      // Exception-handler opcodes are translated when they appear on a
+      // reachable CFG edge.  Snapshotting after them is unnecessary: RERAISE
+      // terminates, and WITH_EXCEPT_START / JUMP_IF_NOT_EXC_MATCH either
+      // branch or are followed by a deopt-shaped recovery block.
+      return false;
     }
     // Take a snapshot after translating all other bytecode instructions. This
     // may generate unnecessary deoptimization metadata but will always be
@@ -1076,178 +1107,10 @@ bool HIRBuilder::isSimpleNumericLeafFunction(BorrowedRef<PyCodeObject> code) {
 static std::optional<InPlaceOpKind> getInPlaceOpKindFromOparg(int oparg);
 
 #if PY_VERSION_HEX >= 0x030B0000
-struct ExceptionTableEntry311 {
-  BCOffset start;
-  BCOffset end;
-  BCOffset target;
-};
-
-static bool parseExceptionTableVarint311(
-    const uint8_t*& cur,
-    const uint8_t* end,
-    int& value) {
-  if (cur == end) {
-    return false;
-  }
-  uint8_t byte = *cur++;
-  value = byte & 0x3f;
-  while (byte & 0x40) {
-    if (cur == end) {
-      return false;
-    }
-    value <<= 6;
-    byte = *cur++;
-    value |= byte & 0x3f;
-  }
-  return true;
-}
-
-static std::vector<ExceptionTableEntry311> parseExceptionTable311(
-    BorrowedRef<PyCodeObject> code) {
-  PyObject* table = code->co_exceptiontable;
-  JIT_CHECK(PyBytes_Check(table), "co_exceptiontable must be bytes");
-
-  const auto* cur = reinterpret_cast<const uint8_t*>(PyBytes_AS_STRING(table));
-  const auto* end = cur + PyBytes_GET_SIZE(table);
-  std::vector<ExceptionTableEntry311> entries;
-
-  while (cur != end) {
-    int start = 0;
-    int length = 0;
-    int target = 0;
-    int depth_lasti = 0;
-    if (!parseExceptionTableVarint311(cur, end, start) ||
-        !parseExceptionTableVarint311(cur, end, length) ||
-        !parseExceptionTableVarint311(cur, end, target) ||
-        !parseExceptionTableVarint311(cur, end, depth_lasti)) {
-      JIT_THROW("malformed CPython 3.11 exception table");
-    }
-    start *= sizeof(_Py_CODEUNIT);
-    length *= sizeof(_Py_CODEUNIT);
-    target *= sizeof(_Py_CODEUNIT);
-    entries.push_back(ExceptionTableEntry311{
-        BCOffset{start}, BCOffset{start + length}, BCOffset{target}});
-  }
-
-  return entries;
-}
-
-static bool hasReturningHandler311(
-    const BytecodeInstructionBlock& bc_instrs,
-    BCOffset target,
-    BCOffset end) {
-  for (const auto& instr : bc_instrs) {
-    BCOffset off = instr.baseOffset();
-    if (off < target || off >= end) {
-      continue;
-    }
-    switch (instr.opcode()) {
-      case RETURN_VALUE:
-      case RETURN_PRIMITIVE:
-      case RETURN_CONST:
-        return true;
-    }
-  }
-  return false;
-}
-
-static bool hasBackwardBranchInRange311(
-    const BytecodeInstructionBlock& bc_instrs,
-    BCOffset start,
-    BCOffset end) {
-  for (const auto& instr : bc_instrs) {
-    BCOffset off = instr.baseOffset();
-    if (off < start || off >= end) {
-      continue;
-    }
-    if (instr.isBackwardBranch()) {
-      return true;
-    }
-  }
-  return false;
-}
-
-static bool hasTryLoopReturningHandler311(BorrowedRef<PyCodeObject> code) {
-  if (PyBytes_GET_SIZE(code->co_exceptiontable) == 0) {
-    return false;
-  }
-
-  BytecodeInstructionBlock bc_instrs{code};
-  std::vector<ExceptionTableEntry311> entries = parseExceptionTable311(code);
-  std::vector<BCOffset> handler_targets;
-  handler_targets.reserve(entries.size());
-  for (const auto& entry : entries) {
-    handler_targets.push_back(entry.target);
-  }
-  std::sort(handler_targets.begin(), handler_targets.end());
-  handler_targets.erase(
-      std::unique(handler_targets.begin(), handler_targets.end()),
-      handler_targets.end());
-
-  BCOffset code_end = BCIndex{countIndices(code)}.asOffset();
-  for (const auto& entry : entries) {
-    if (!hasBackwardBranchInRange311(bc_instrs, entry.start, entry.end)) {
-      continue;
-    }
-    auto next_target = std::upper_bound(
-        handler_targets.begin(), handler_targets.end(), entry.target);
-    BCOffset handler_end =
-        next_target == handler_targets.end() ? code_end : *next_target;
-    if (hasReturningHandler311(bc_instrs, entry.target, handler_end)) {
-      return true;
-    }
-  }
-
-  return false;
-}
-#endif
-
-static bool exitsOnlyByRaising(BorrowedRef<PyCodeObject> code) {
-  bool has_raise = false;
-  for (const auto& instr : BytecodeInstructionBlock{code}) {
-    switch (instr.opcode()) {
-      case RAISE_VARARGS:
-      case RERAISE:
-        has_raise = true;
-        break;
-      case RETURN_VALUE:
-      case RETURN_PRIMITIVE:
-      case RETURN_CONST:
-      case YIELD_VALUE:
-      case YIELD_FROM:
-        return false;
-    }
-  }
-  return has_raise;
-}
-
 static bool hasIntConstLocalBinaryAccumulator311(
     BorrowedRef<PyCodeObject> code) {
   constexpr int kMaxCompactAccumulatorLocalsPlus = 8;
   BytecodeInstructionBlock bc_instrs{code};
-  bool has_disqualifying_call = false;
-  bool last_global_for_call_is_range = false;
-  for (auto instr : bc_instrs) {
-    if (instr.opcode() == LOAD_METHOD) {
-      has_disqualifying_call = true;
-      break;
-    }
-    if (instr.opcode() == LOAD_GLOBAL) {
-      BorrowedRef<> name =
-          PyTuple_GET_ITEM(code->co_names, loadGlobalIndex(instr.oparg()));
-      last_global_for_call_is_range =
-          PyUnicode_CompareWithASCIIString(name, "range") == 0;
-      continue;
-    }
-    if (instr.opcode() == CALL || instr.opcode() == CALL_FUNCTION_EX) {
-      if (!last_global_for_call_is_range) {
-        has_disqualifying_call = true;
-        break;
-      }
-      last_global_for_call_is_range = false;
-    }
-  }
-
   for (auto it = bc_instrs.begin(); it != bc_instrs.end(); ++it) {
     BytecodeInstruction load = *it;
     if (load.opcode() != LOAD_FAST) {
@@ -1293,8 +1156,7 @@ static bool hasIntConstLocalBinaryAccumulator311(
     if (store.opcode() == STORE_FAST && store.oparg() == load.oparg()) {
       if ((*inplace_op == InPlaceOpKind::kAdd ||
            *inplace_op == InPlaceOpKind::kSubtract) &&
-          numLocalsplus(code) <= kMaxCompactAccumulatorLocalsPlus &&
-          !has_disqualifying_call) {
+          numLocalsplus(code) <= kMaxCompactAccumulatorLocalsPlus) {
         continue;
       }
       return true;
@@ -1302,8 +1164,114 @@ static bool hasIntConstLocalBinaryAccumulator311(
   }
   return false;
 }
+#endif
 
 #endif
+
+const char* unsupportedShapeReason311(BorrowedRef<PyCodeObject> code) {
+#if PY_VERSION_HEX >= 0x030B0000 && PY_VERSION_HEX < 0x030C0000
+  // AArch64 cond branches are ±1MiB. test_compile.test_extended_arg builds a
+  // 150KiB co_code whose shadow machine code cannot relocate
+  // (RelocOffsetOutOfRange). 64KiB bytecode is already outside any stdlib
+  // function observed on the 440-module surface.
+  constexpr Py_ssize_t kMaxShadowBytecodeBytes311 = 65536;
+  if (_PyCode_NBYTES(code) > kMaxShadowBytecodeBytes311) {
+    return "REFUSE_SHAPE_CODEGEN_SPAN";
+  }
+  if (hasIntConstLocalBinaryAccumulator311(code)) {
+    return "REFUSE_SHAPE_INT_ACCUMULATOR_POLICY";
+  }
+  PyObject* names = code->co_names;
+  if (names == nullptr || !PyTuple_Check(names)) {
+    return "REFUSE_SHAPE_INVALID_UTF8_NAME";
+  }
+  for (Py_ssize_t i = 0; i < PyTuple_GET_SIZE(names); i++) {
+    PyObject* item = PyTuple_GET_ITEM(names, i);
+    if (item == nullptr || PyUnicode_AsUTF8(item) == nullptr) {
+      PyErr_Clear();
+      return "REFUSE_SHAPE_INVALID_UTF8_NAME";
+    }
+  }
+#else
+  (void)code;
+#endif
+  return nullptr;
+}
+
+const char* unsupportedOpcodeReason311(BorrowedRef<PyCodeObject> code) {
+#if PY_VERSION_HEX < 0x030C0000
+  PyObject* names = code->co_names;
+  const char* name_refuse = nullptr;
+  auto name_at = [&](Py_ssize_t i) {
+    return nameAtOrRefuse(names, i, &name_refuse);
+  };
+  BytecodeInstructionBlock bc_instrs{code};
+  for (auto bc_it = bc_instrs.begin(); bc_it != bc_instrs.end(); ++bc_it) {
+    switch (bc_it->opcode()) {
+      case CHECK_EG_MATCH:
+      case PREP_RERAISE_STAR:
+        return "REFUSE_EXCEPT_STAR_UNAUDITED";
+      case MATCH_CLASS:
+      case MATCH_KEYS:
+      case MATCH_MAPPING:
+      case MATCH_SEQUENCE:
+        return "REFUSE_PATTERN_MATCHING_UNAUDITED";
+      case IMPORT_FROM:
+        return "REFUSE_HELPER_UNAVAILABLE_PRE314";
+      case DELETE_DEREF:
+      case DELETE_GLOBAL:
+        return "REFUSE_UNPORTED";
+      case ASYNC_GEN_WRAP:
+      case BEFORE_ASYNC_WITH:
+      case END_ASYNC_FOR:
+      case GET_AITER:
+      case GET_ANEXT:
+      case GET_AWAITABLE:
+        // These opcodes are interpreter-only because they implement async
+        // execution. They still appear in *synchronous* factories that
+        // construct async genexpressions, so eligibility must return the
+        // registered async reason instead of SUPPORTED_OPCODE_FAILURE.
+        return "INTERP_ONLY_ASYNC_CODE";
+      case DELETE_NAME:
+      case IMPORT_STAR:
+      case LOAD_CLASSDEREF:
+      case LOAD_NAME:
+      case PRINT_EXPR:
+      case SETUP_ANNOTATIONS:
+      case STORE_NAME:
+        return "INTERP_ONLY_NON_FUNCTION_SCOPE";
+      case CACHE:
+      case DO_TRACING:
+        return "INTERP_ONLY_PSEUDO_SLOT";
+      default:
+        if (!isSupportedOpcode(bc_it->opcode())) {
+          // Reachable only for an opcode with no support-list row, or a
+          // refuse/interpreter-only row missing from this switch.
+          return "SUPPORTED_OPCODE_FAILURE";
+        }
+        if (bc_it->opcode() == LOAD_GLOBAL) {
+          int oparg = bc_it->oparg();
+          auto loaded = name_at(oparg >> 1);
+          if (name_refuse != nullptr) {
+            return name_refuse;
+          }
+          if ((oparg & 0x01) && loaded == "super" &&
+              !matchLoadSuperAttrPattern311(code, bc_it, bc_instrs)
+                   .has_value()) {
+            return "REFUSE_SHAPE_FRONTEND_POLICY";
+          }
+          if (isBannedName(loaded)) {
+            return "REFUSE_SHAPE_FRONTEND_POLICY";
+          }
+        }
+        break;
+    }
+  }
+#else
+  (void)code;
+#endif
+  return nullptr;
+}
 
 std::unique_ptr<Function> buildHIR(const Preloader& preloader) {
   return HIRBuilder{preloader}.buildHIR();
@@ -1333,22 +1301,11 @@ std::unique_ptr<Function> HIRBuilder::buildHIR() {
         preloader_.fullname());
   }
 #if PY_VERSION_HEX >= 0x030B0000
-  if (hasTryLoopReturningHandler311(code_)) {
+  const char* shape_reason = unsupportedShapeReason311(code_);
+  if (shape_reason != nullptr) {
     JIT_THROW(
-        "try-loop exception handlers that return are unsupported on CPython "
-        "3.11 in {}",
-        preloader_.fullname());
-  }
-  if (exitsOnlyByRaising(code_)) {
-    JIT_THROW(
-        "functions that only exit by raising are unsupported on CPython 3.11 "
-        "in {}",
-        preloader_.fullname());
-  }
-  if (hasIntConstLocalBinaryAccumulator311(code_)) {
-    JIT_THROW(
-        "int-constant local binary accumulator is unsupported on CPython 3.11 "
-        "in {}",
+        "code shape {} is unsupported on CPython 3.11 in {}",
+        shape_reason,
         preloader_.fullname());
   }
 #endif
@@ -1481,6 +1438,18 @@ BasicBlock* HIRBuilder::buildHIRImpl(
   if (frame_state == nullptr) {
     entry_tc.emit<LoadFrame>();
   }
+
+#if PY_VERSION_HEX < 0x030C0000
+  // CPython 3.11 localsplus start as NULL.  Arguments are defined by
+  // LoadArg above; remaining locals need an explicit reaching definition so
+  // LOAD_FAST unbound checks (and LIR Moves) do not see a missing operand
+  // after dead-branch elimination.  Must come after the Load* prologue:
+  // SSAify's verifier rejects LoadFrame after any non-LoadArg/LoadCurrentFunc/
+  // LoadFrame instruction.
+  for (int i = preloader_.numArgs(); i < numLocals(code_); ++i) {
+    entry_tc.emit<LoadConst>(entry_tc.frame.localsplus[i], TNullptr);
+  }
+#endif
 
   // "Initial Yield" has an explicit bytecode instruction in
   // "RETURN_GENERATOR" and so is emitted at the appropriate time.
@@ -2043,10 +2012,12 @@ void HIRBuilder::translate(
           rotateStackTop(tc.frame.stack, bc_instr.oparg());
           break;
         }
+#if PY_VERSION_HEX >= 0x030C0000
         case END_ASYNC_FOR: {
           emitEndAsyncFor(tc);
           break;
         }
+#endif
         case END_FOR: {
           // This instruction is only for use when FOR_ITER is specialized for a
           // generator. As we use unspecialized bytecode only, we modify
@@ -2094,6 +2065,7 @@ void HIRBuilder::translate(
           emitBuildSlice(tc, bc_instr);
           break;
         }
+#if PY_VERSION_HEX >= 0x030C0000
         case GET_AITER: {
           emitGetAIter(tc);
           break;
@@ -2102,6 +2074,7 @@ void HIRBuilder::translate(
           emitGetANext(tc);
           break;
         }
+#endif
         case GET_ITER: {
           if constexpr (PY_VERSION_HEX >= 0x030F0000) {
             if (bc_instr.oparg() > 0) {
@@ -2189,10 +2162,12 @@ void HIRBuilder::translate(
           emitPopJumpIf(tc, bc_instr);
           break;
         }
+#if PY_VERSION_HEX >= 0x030E0000 || ENABLE_LAZY_IMPORTS
         case IMPORT_FROM: {
           emitImportFrom(tc, bc_instr);
           break;
         }
+#endif
         case EAGER_IMPORT_NAME:
         case IMPORT_NAME: {
           emitImportName(tc, bc_instr);
@@ -2214,10 +2189,12 @@ void HIRBuilder::translate(
           }
           break;
         }
+#if PY_VERSION_HEX >= 0x030C0000
         case GET_AWAITABLE: {
           emitGetAwaitable(irfunc.cfg, tc, bc_instrs, bc_instr);
           break;
         }
+#endif
         case BUILD_STRING: {
           emitBuildString(tc, bc_instr);
           break;
@@ -2263,7 +2240,9 @@ void HIRBuilder::translate(
           tc.emit<LoadConst>(var, TNullptr);
           break;
         }
+#if PY_VERSION_HEX >= 0x030C0000
         case BEFORE_ASYNC_WITH:
+#endif
         case BEFORE_WITH: {
           emitBeforeWith(tc, bc_instr);
           break;
@@ -2276,6 +2255,7 @@ void HIRBuilder::translate(
           emitSetupWith(tc, bc_instr);
           break;
         }
+#if PY_VERSION_HEX >= 0x030C0000
         case MATCH_CLASS: {
           emitMatchClass(irfunc.cfg, tc, bc_instr);
           break;
@@ -2292,6 +2272,7 @@ void HIRBuilder::translate(
           emitMatchMappingSequence(irfunc.cfg, tc, Py_TPFLAGS_SEQUENCE);
           break;
         }
+#endif
         case GEN_START: {
           // In the interpreter this instruction behaves like POP_TOP because it
           // assumes a generator will always be sent a superfluous None value to
@@ -2363,10 +2344,15 @@ void HIRBuilder::translate(
           emitStoreGlobal(tc, bc_instr);
           break;
         }
+#if PY_VERSION_HEX >= 0x030C0000
         case CHECK_EG_MATCH:
+#endif
         case CHECK_EXC_MATCH:
         case CLEANUP_THROW:
+        case POP_EXCEPT:
         case PUSH_EXC_INFO:
+        case RERAISE:
+        case WITH_EXCEPT_START:
           BUILDER_THROW(
               "{} appearing outside of exception handler", opcodeName(opcode));
         default: {
@@ -3719,13 +3705,11 @@ void HIRBuilder::emitLoadAttr(
 #endif
 
   if (getConfig().specialized_opcodes) {
-    [[maybe_unused]] bool guarded_receiver_type = false;
     switch (specialized_opcode) {
       case LOAD_ATTR_MODULE: {
         Type type = Type::fromTypeExact(&PyModule_Type);
         auto guard = tc.emit<GuardType>(receiver, type, receiver, tc.frame);
         receiver = guard->output();
-        guarded_receiver_type = true;
         break;
       }
 #ifndef Py_GIL_DISABLED
@@ -3873,7 +3857,6 @@ void HIRBuilder::emitLoadAttr(
           auto guard = tc.emit<GuardType>(
               receiver, Type::fromTypeExact(owner_type), receiver, tc.frame);
           receiver = guard->output();
-          guarded_receiver_type = true;
         }
         break;
       }
@@ -3881,15 +3864,6 @@ void HIRBuilder::emitLoadAttr(
       default:
         break;
     }
-#if PY_VERSION_HEX < 0x030C0000
-    BorrowedRef<PyTypeObject> owner_type = preloader_.methodOwnerType();
-    if (!guarded_receiver_type && owner_type != nullptr &&
-        !tc.frame.localsplus.empty() && receiver == tc.frame.localsplus[0]) {
-      auto guard = tc.emit<GuardType>(
-          receiver, Type::fromTypeExact(owner_type), receiver, tc.frame);
-      receiver = guard->output();
-    }
-#endif
   }
 
   Register* result = temps_.AllocateStack();
@@ -4379,7 +4353,12 @@ void HIRBuilder::emitLoadFast(
     const jit::BytecodeInstruction& bc_instr) {
   int var_idx = bc_instr.oparg();
   Register* var = tc.frame.localsplus[var_idx];
-  if (bc_instr.opcode() == LOAD_FAST_CHECK) {
+#if PY_VERSION_HEX < 0x030C0000
+  bool needs_unbound_check = bc_instr.opcode() == LOAD_FAST;
+#else
+  bool needs_unbound_check = bc_instr.opcode() == LOAD_FAST_CHECK;
+#endif
+  if (needs_unbound_check) {
     tc.emit<CheckVar>(var, var, getVarname(code_, var_idx), tc.frame);
   }
   tc.frame.stack.push(var);
@@ -6958,13 +6937,25 @@ BorrowedRef<> HIRBuilder::constArg(const BytecodeInstruction& bc_instr) {
 void HIRBuilder::checkTranslate() {
   PyObject* names = code_->co_names;
   std::unordered_set<Py_ssize_t> banned_name_ids;
+#if PY_VERSION_HEX < 0x030C0000
+  const char* name_refuse = nullptr;
+  auto name_at = [&](Py_ssize_t i) {
+    return nameAtOrRefuse(names, i, &name_refuse);
+  };
+#else
   auto name_at = [&](Py_ssize_t i) {
     return std::string_view(PyUnicode_AsUTF8(PyTuple_GET_ITEM(names, i)));
   };
+#endif
   for (Py_ssize_t i = 0; i < PyTuple_GET_SIZE(names); i++) {
     if (isBannedName(name_at(i))) {
       banned_name_ids.insert(i);
     }
+#if PY_VERSION_HEX < 0x030C0000
+    if (name_refuse != nullptr) {
+      throw std::runtime_error{name_refuse};
+    }
+#endif
   }
   BytecodeInstructionBlock bc_instrs{code_};
   for (auto bc_it = bc_instrs.begin(); bc_it != bc_instrs.end(); ++bc_it) {
@@ -6979,7 +6970,13 @@ void HIRBuilder::checkTranslate() {
           opcode,
           opcodeName(opcode))};
     } else if (opcode == LOAD_GLOBAL) {
-      if ((oparg & 0x01) && name_at(oparg >> 1) == "super") {
+      auto loaded = name_at(oparg >> 1);
+#if PY_VERSION_HEX < 0x030C0000
+      if (name_refuse != nullptr) {
+        throw std::runtime_error{name_refuse};
+      }
+#endif
+      if ((oparg & 0x01) && loaded == "super") {
         if (!matchLoadSuperAttrPattern311(code_, bc_it, bc_instrs)
                  .has_value()) {
           // LOAD_GLOBAL NULL + super, super isn't being used with a

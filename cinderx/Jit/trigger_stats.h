@@ -26,13 +26,20 @@ struct TriggerStats {
   uint64_t compiled_function_creations;
   // Number of times control entered JIT-compiled machine code.
   uint64_t machine_code_entries;
+  // Number of complete shadow compilations, specialized bytecode operations
+  // consumed by them, and generated (but never installed) code bytes.
+  uint64_t shadow_compile_success;
+  uint64_t shadow_specialized_opcodes_consumed;
+  uint64_t shadow_codegen_bytes;
 };
 
-// Increment sites.  Relaxed atomics: the counters order nothing.  The
-// machine_code_entries counter has no increment helper yet; it lands with
-// the 3.11 entry glue and stays zero by construction until then.
+// Increment sites.  Relaxed atomics: the counters order nothing.
 void triggerStatsOnExecutableAlloc(std::size_t bytes);
 void triggerStatsOnCompiledFunctionCreate();
+void triggerStatsOnMachineCodeEntry();
+void triggerStatsOnShadowCompile(
+    std::size_t code_bytes,
+    uint64_t specialized_opcodes);
 
 // Read a consistent-enough snapshot for reporting.
 TriggerStats triggerStatsSnapshot();

@@ -125,7 +125,7 @@ class LIRGenerator {
 
   void AnalyzeCopies();
   BasicBlock* GenerateEntryBlock();
-  void GenerateExitBlocks();
+  void GenerateExitBlocks(bool has_normal_return);
 
   void appendGuardAlwaysFail(
       BasicBlockBuilder& bbb,

@@ -301,7 +301,8 @@ PyObject* cinder_is_immortal(PyObject* /* mod */, PyObject* obj) {
 }
 
 PyObject* compile_perf_trampoline_pre_fork(PyObject* mod, PyObject*) {
-#if !defined(WIN32) && (ENABLE_PERF_TRAMPOLINE || PY_VERSION_HEX >= 0x030D0000)
+#if !defined(WIN32) && PY_VERSION_HEX >= 0x030C0000 && \
+    (ENABLE_PERF_TRAMPOLINE || PY_VERSION_HEX >= 0x030D0000)
   if (!jit::perf::isPreforkCompilationEnabled()) {
     Py_RETURN_NONE;
   }
@@ -326,7 +327,7 @@ PyObject* compile_perf_trampoline_pre_fork(PyObject* mod, PyObject*) {
 }
 
 PyObject* is_compile_perf_trampoline_pre_fork_enabled(PyObject*, PyObject*) {
-#ifndef WIN32
+#if !defined(WIN32) && PY_VERSION_HEX >= 0x030C0000
   if (jit::perf::isPreforkCompilationEnabled()) {
     Py_RETURN_TRUE;
   }
@@ -420,7 +421,7 @@ int ensurePyFunctionVectorcall() {
 // compiling a perf trampoline for the Python function.
 void scheduleCompile(BorrowedRef<PyFunctionObject> func) {
   bool scheduled = jit::scheduleJitCompile(func);
-#ifndef WIN32
+#if !defined(WIN32) && PY_VERSION_HEX >= 0x030C0000
   if (!scheduled && jit::perf::isPreforkCompilationEnabled()) {
     auto& perf_trampoline_worklist =
         cinderx::getModuleState()->perf_trampoline_worklist;
@@ -783,7 +784,20 @@ void module_free(void* raw_mod) {
   // destroy the state object and return. Skip all global cleanup since it
   // belongs to the main interpreter.
   if (!state->fully_initialized) {
+    // Initialization can fail after setModuleState() and, in shadow mode,
+    // after publishing a JIT context. Clean up that owned global state before
+    // destroying the storage; a subinterpreter's local state never owns it.
+    bool owns_global_state = cinderx::getModuleState() == state;
+    if (owns_global_state) {
+      jit::finalize();
+#if PY_VERSION_HEX < 0x030C0000
+      Ci_Observe311_Finalize();
+#endif
+    }
     state->cinderx::ModuleState::~ModuleState();
+    if (owns_global_state) {
+      cinderx::removeModuleState();
+    }
     return;
   }
 
@@ -798,6 +812,10 @@ void module_free(void* raw_mod) {
   Ci_FiniFrameEvalFunc();
 
   jit::finalize();
+
+#if PY_VERSION_HEX < 0x030C0000
+  Ci_Observe311_Finalize();
+#endif
 
   jit::finiOSRCodeExtraIndex();
   finiCodeExtraIndex();
@@ -889,7 +907,7 @@ static PyObject* get_observe_stats(PyObject*, PyObject*) {
 static PyObject* get_trigger_stats(PyObject*, PyObject*) {
   jit::TriggerStats stats = jit::triggerStatsSnapshot();
   return Py_BuildValue(
-      "{s:K,s:K,s:K,s:K}",
+      "{s:K,s:K,s:K,s:K,s:K,s:K,s:K}",
       "executable_alloc_calls",
       static_cast<unsigned long long>(stats.executable_alloc_calls),
       "executable_alloc_bytes",
@@ -897,7 +915,14 @@ static PyObject* get_trigger_stats(PyObject*, PyObject*) {
       "compiled_function_creations",
       static_cast<unsigned long long>(stats.compiled_function_creations),
       "machine_code_entries",
-      static_cast<unsigned long long>(stats.machine_code_entries));
+      static_cast<unsigned long long>(stats.machine_code_entries),
+      "shadow_compile_success",
+      static_cast<unsigned long long>(stats.shadow_compile_success),
+      "shadow_specialized_opcodes_consumed",
+      static_cast<unsigned long long>(
+          stats.shadow_specialized_opcodes_consumed),
+      "shadow_codegen_bytes",
+      static_cast<unsigned long long>(stats.shadow_codegen_bytes));
 }
 
 PyMethodDef _cinderx_methods[] = {
@@ -1095,9 +1120,8 @@ int _cinderx_exec_impl(PyObject* m) {
   cinderx::setModuleState(m);
 
 #if PY_VERSION_HEX >= 0x030C0000
-  // The global cache serves JIT-compiled code only, and the 3.11 delivery
-  // ships no machine-code execution.  Its slot stays empty rather than
-  // holding an object nothing can reach.
+  // The global cache serves installed JIT code. CPython 3.11 shadow lowers
+  // globals without creating process-lifetime caches or dict watchers.
   auto cache_manager = new (std::nothrow) jit::GlobalCacheManager();
   if (cache_manager == nullptr) {
     return -1;

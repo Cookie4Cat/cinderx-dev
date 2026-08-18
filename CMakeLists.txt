@@ -595,11 +595,10 @@ target_link_libraries(static-python PRIVATE fmt::fmt asmjit::asmjit common borro
 ########################################
 # Jit/
 
-# The full JIT source set compiles on every supported version, 3.11
-# included.  On 3.11 machine-code execution has not shipped: jit::initialize()
-# returns before initializing anything, so the runtime never becomes usable
-# and every compilation entry point refuses (Jit/pyjit_311_gate.cpp carries
-# the observe-mode refusal).
+# The full JIT source set compiles on every supported version, 3.11 included.
+# On 3.11 the explicit shadow mode initializes only the compiler pipeline;
+# generated code is relocated for validation and discarded. Observe/off never
+# initialize it, and no 3.11 mode publishes or enters machine code.
 file(GLOB_RECURSE JIT_SOURCES ${PROJECT_SOURCE_DIR}/Jit/*.cpp ${PROJECT_SOURCE_DIR}/Jit/*.c)
 if (${PY_VERSION} EQUAL 3.11)
   # OSR is out of scope on 3.11: Jit/osr.cpp is 3.14 machine-code machinery

@@ -11,11 +11,22 @@ at any point without perturbing the run.
 Field sources:
 
   evaluator_installed        _cinderx.is_frame_evaluator_installed()
-  compile_requests           observe stats: scheduling events + dropped
-  compile_success            trigger stats: compiled_function_creations
+  compile_requests           observe stats: recorded scheduling events
+  compile_success            trigger stats: shadow_compile_success
   compile_rejected           observe stats: events with a refusal result
+  events_dropped             observe stats: requests omitted from the bounded
+                             event ledger (must be zero for an accepted run)
+  capability_rejects         recorded capability-gate refusals
+  opcode_rejects             registered opcode-level refusals
+  shape_rejects              registered code-shape refusals
+  supported_opcode_failures  failures after opcode and shape eligibility
   unknown_rejects            observe stats: refusal reasons outside the
                              registered set
+  specialized_opcodes_consumed
+                             trigger stats: physical specialized instructions
+                             consumed by successful shadow compilations
+  shadow_codegen_bytes       trigger stats: discarded machine-code byte count
+  peak_rss_bytes             process peak resident set size
   machine_code_installed     len(cinderjit.get_compiled_functions())
   machine_code_entries       trigger stats (incremented by the 3.11 entry
                              glue once machine-code execution ships; zero on
@@ -28,17 +39,8 @@ Field sources:
 
 Harness-owned fields (filled by runners, None until then):
 
-  target_modules_attempted   the frozen stdlib surface (the committed
-                             libtest_target_modules.txt manifest), published
-                             by the libtest gate leg and merged by the
-                             unified_report_gate aggregator
-  worker_crashes             per-run, filled by the drivers
+  target_modules_attempted, worker_crashes,
   live_compiled_functions_at_exit
-                             sampled at Python atexit, which precedes
-                             jit::finalize() in module teardown; for the
-                             gated stage zero-at-exit implies zero after
-                             finalize, and the post-finalize contract is
-                             enforced at the C level
 
 The refusal-reason registry starts with the capability-gate refusal; the
 front-end MR extends it from the bytecode support list and the shape-refusal
@@ -51,20 +53,71 @@ from __future__ import annotations
 import argparse
 import json
 import sys
+from pathlib import Path
 from typing import Any
 
-# Refusal reasons the gates recognize.  Extended by later MRs; anything else
-# is an unknown reject and blocks.
-KNOWN_REFUSAL_REASONS: frozenset[str] = frozenset({
+REPO_ROOT = Path(__file__).resolve().parent.parent.parent
+SUPPORT_LIST = REPO_ROOT / "cinderx/Interpreter/3.11/bytecode_support.toml"
+
+# Capability reasons do not describe bytecode or code-object shape, so they
+# stay local to the mode gate instead of polluting the front-end fact source.
+CAPABILITY_REFUSAL_REASONS: frozenset[str] = frozenset({
     "CINDERX311_JIT_EXEC_DISABLED",
 })
+
+
+def load_refusal_reason_registry(
+    path: Path = SUPPORT_LIST,
+) -> dict[str, frozenset[str]]:
+    """Load the closed opcode/shape reason namespaces from the support list."""
+    import tomllib
+
+    with path.open("rb") as fp:
+        doc = tomllib.load(fp)
+    raw_registry = doc.get("refusal_reasons", {})
+    return {
+        category: frozenset(reasons)
+        for category, reasons in raw_registry.items()
+        if isinstance(reasons, dict)
+    }
+
+
+REFUSAL_REASON_REGISTRY = load_refusal_reason_registry()
+KNOWN_REFUSAL_REASONS: frozenset[str] = frozenset().union(
+    CAPABILITY_REFUSAL_REASONS,
+    *REFUSAL_REASON_REGISTRY.values(),
+)
+
+
+def classify_refusal_reason(
+    reason: object,
+    registry: dict[str, frozenset[str]] = REFUSAL_REASON_REGISTRY,
+) -> str:
+    """Classify a result as capability, opcode, shape, or unknown."""
+    if not isinstance(reason, str):
+        return "unknown"
+    if reason in CAPABILITY_REFUSAL_REASONS:
+        return "capability"
+    if reason in registry.get("opcode", ()):
+        return "opcode"
+    if reason in registry.get("shape", ()):
+        return "shape"
+    return "unknown"
 
 RUNTIME_FIELDS = (
     "evaluator_installed",
     "compile_requests",
     "compile_success",
     "compile_rejected",
+    "events_dropped",
+    "capability_rejects",
+    "opcode_rejects",
+    "shape_rejects",
+    "supported_opcode_failures",
     "unknown_rejects",
+    "specialized_opcodes_consumed",
+    "shadow_codegen_bytes",
+    "peak_rss_bytes",
     "machine_code_installed",
     "machine_code_entries",
     "executable_alloc_calls",
@@ -115,38 +168,70 @@ def _compiled_function_count() -> int:
     return len(get_compiled_functions())
 
 
+def _peak_rss_bytes() -> int:
+    """Return this process's peak RSS in bytes when the platform exposes it."""
+    try:
+        import resource
+    except ImportError:
+        return 0
+
+    try:
+        peak = int(resource.getrusage(resource.RUSAGE_SELF).ru_maxrss)
+    except (OSError, ValueError):
+        return 0
+    # Darwin reports bytes; Linux and the other Unix targets used by the gate
+    # report KiB.  Keep the report schema platform-neutral.
+    return peak if sys.platform == "darwin" else peak * 1024
+
+
 def snapshot() -> dict[str, Any]:
     """Collect the runtime-derived fields from the current process."""
     trigger = _trigger_stats()
     observe = _observe_stats()
 
     compile_requests = 0
-    compile_rejected = 0
+    events_dropped = 0
+    reject_counts = {
+        "capability": 0,
+        "opcode": 0,
+        "shape": 0,
+        "unknown": 0,
+    }
+    supported_opcode_failures = 0
     unknown_rejects = 0
     if observe is not None:
         events = observe.get("events", [])
-        compile_requests = len(events) + int(observe.get("events_dropped", 0))
+        compile_requests = len(events)
+        events_dropped = int(observe.get("events_dropped", 0))
         for event in events:
             result = event.get("result")
-            if result in (None, "ok", "compiled"):
+            if result in ("ok", "compiled"):
                 continue
-            compile_rejected += 1
-            if result not in KNOWN_REFUSAL_REASONS:
+            category = classify_refusal_reason(result)
+            reject_counts[category] += 1
+            if result == "SUPPORTED_OPCODE_FAILURE":
+                supported_opcode_failures += 1
+            if category == "unknown":
                 unknown_rejects += 1
-        # Events the bounded observe buffer dropped carry no reason; what
-        # cannot be classified is counted as unknown (and as rejected, the
-        # only outcome this build has), so a lossy buffer can never launder
-        # refusals past the unknown_rejects == 0 blocking condition.
-        dropped = int(observe.get("events_dropped", 0))
-        compile_rejected += dropped
-        unknown_rejects += dropped
+
+    compile_rejected = sum(reject_counts.values())
 
     report: dict[str, Any] = {
         "evaluator_installed": _evaluator_installed(),
         "compile_requests": compile_requests,
-        "compile_success": int(trigger["compiled_function_creations"]),
+        "compile_success": int(trigger["shadow_compile_success"]),
         "compile_rejected": compile_rejected,
+        "events_dropped": events_dropped,
+        "capability_rejects": reject_counts["capability"],
+        "opcode_rejects": reject_counts["opcode"],
+        "shape_rejects": reject_counts["shape"],
+        "supported_opcode_failures": supported_opcode_failures,
         "unknown_rejects": unknown_rejects,
+        "specialized_opcodes_consumed": int(
+            trigger["shadow_specialized_opcodes_consumed"]
+        ),
+        "shadow_codegen_bytes": int(trigger["shadow_codegen_bytes"]),
+        "peak_rss_bytes": _peak_rss_bytes(),
         "machine_code_installed": _compiled_function_count(),
         "machine_code_entries": int(trigger["machine_code_entries"]),
         "executable_alloc_calls": int(trigger["executable_alloc_calls"]),
@@ -166,8 +251,7 @@ def validate_schema(report: dict[str, Any], strict: bool = False) -> list[str]:
     """Structural check used by the self-tests: every field present, no
     extras, runtime fields typed.  A child snapshot leaves harness fields
     as None for its own leg to fill; the aggregated unified report passes
-    strict=True, where every harness field must be a non-negative int --
-    a null field can no longer impersonate a filled one."""
+    strict=True, where every harness field must be a non-negative int."""
     errors = []
     for field in ALL_FIELDS:
         if field not in report:

@@ -460,9 +460,19 @@ TEST_F(CmdLineTest, JITEnable) {
           []() {
             getMutableConfig().compile_after_n_calls.reset();
             getMutableConfig().auto_classify = true;
+#if PY_VERSION_HEX < 0x030C0000
+            // Traditional execution flags do not select shadow in production;
+            // force initialization only for this config parser test.
+            getMutableConfig().force_init = true;
+#endif
           },
           []() {
+#if PY_VERSION_HEX < 0x030C0000
+            ASSERT_TRUE(isJitShadow());
+            ASSERT_FALSE(isJitUsable());
+#else
             ASSERT_TRUE(isJitUsable());
+#endif
             ASSERT_EQ(getConfig().compile_after_n_calls, 0);
             ASSERT_FALSE(getConfig().auto_classify);
             ASSERT_EQ(
@@ -852,8 +862,20 @@ TEST_F(CmdLineTest, JITList) {
       try_flag_and_envvar_effect(
           xarg,
           const_cast<char*>(("PYTHONJITLISTFILE=" + list_file).c_str()),
-          []() { getMutableConfig().asm_syntax = AsmSyntax::ATT; },
-          []() { ASSERT_TRUE(isJitUsable()); }),
+          []() {
+            getMutableConfig().asm_syntax = AsmSyntax::ATT;
+#if PY_VERSION_HEX < 0x030C0000
+            getMutableConfig().force_init = true;
+#endif
+          },
+          []() {
+#if PY_VERSION_HEX < 0x030C0000
+            ASSERT_TRUE(isJitShadow());
+            ASSERT_FALSE(isJitUsable());
+#else
+            ASSERT_TRUE(isJitUsable());
+#endif
+          }),
       0);
 
   delete[] xarg;

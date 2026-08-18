@@ -22,27 +22,9 @@
 #                    (async code, module/class/REPL bodies) or in dispatch
 #                    pseudo-slots that never appear in co_code.
 #
-# Refusal reason registry (stable identifiers, extended only with review):
-#   REFUSE_PATTERN_MATCHING_UNAUDITED  MATCH_* helper/protocol audit pending;
-#                                      the dryrun borrow fallback carried
-#                                      placeholder helpers only.
-#   REFUSE_EXCEPT_STAR_UNAUDITED       except* lowers to CHECK_EG_MATCH +
-#                                      PREP_RERAISE_STAR; the reference
-#                                      translator never carried the pair on
-#                                      3.11.
-#   REFUSE_HELPER_UNAVAILABLE_PRE314   depends on a CPython helper that only
-#                                      exists from 3.14 (_PyEval_ImportFrom).
-#   REFUSE_UNPORTED                    no reference implementation and no
-#                                      audit yet.
-#   INTERP_ONLY_ASYNC_CODE             occurs only in coroutine / iterable
-#                                      coroutine / async generator code,
-#                                      which eligibility refuses wholesale.
-#   INTERP_ONLY_NON_FUNCTION_SCOPE     occurs only in module bodies, class
-#                                      bodies or REPL statements, which are
-#                                      never eligible.
-#   INTERP_ONLY_PSEUDO_SLOT            dispatch-table slot that is never
-#                                      emitted into co_code (CACHE padding,
-#                                      DO_TRACING).
+# Refusal reasons below are stable identifiers, extended only with review.
+# Opcode reasons apply to individual rows.  Shape reasons reject an entire
+# code object during eligibility and therefore never appear on opcode rows.
 #
 # Provenance: opcode numbers, cache widths and specialization families come
 # from the anchored openEuler python3-3.11.6 opcode tables, cross-checked
@@ -56,6 +38,27 @@
 [meta]
 python = "3.11.6"
 slots = 256
+
+[refusal_reasons.opcode]
+REFUSE_PATTERN_MATCHING_UNAUDITED = "MATCH_* helper and protocol audit pending"
+REFUSE_EXCEPT_STAR_UNAUDITED = "except* translation audit pending"
+REFUSE_HELPER_UNAVAILABLE_PRE314 = "required CPython helper is unavailable before 3.14"
+REFUSE_UNPORTED = "opcode has no audited 3.11 translation"
+INTERP_ONLY_ASYNC_CODE = "opcode occurs only in async code rejected by eligibility"
+INTERP_ONLY_NON_FUNCTION_SCOPE = "opcode occurs only in module, class, or REPL code"
+INTERP_ONLY_PSEUDO_SLOT = "dispatch slot is never emitted into co_code"
+
+[refusal_reasons.shape]
+REFUSE_SHAPE_GENERATOR_RUNTIME_UNAUDITED = "generator runtime and suspension semantics are deferred to MR-10"
+REFUSE_SHAPE_ASYNC_CODE = "coroutine and async-generator execution is not eligible"
+REFUSE_SHAPE_NON_FUNCTION_SCOPE = "module, class, and REPL code is not eligible"
+REFUSE_SHAPE_NAMESPACE_UNSUPPORTED = "function globals or builtins namespace cannot be safely preloaded"
+REFUSE_SHAPE_INT_ACCUMULATOR_POLICY = "integer constant-accumulator shapes outside the audited compact add/subtract path are excluded from MR-03"
+REFUSE_SHAPE_JIT_SUPPRESSED = "the code object explicitly suppresses JIT compilation"
+REFUSE_SHAPE_FRONTEND_POLICY = "the code object uses a front-end policy pattern that is not eligible for shadow compilation"
+REFUSE_SHAPE_CODEGEN_SPAN = "shadow AArch64 relocation cannot encode the generated span (pathological EXTENDED_ARG tests, or RelocOffsetOutOfRange)"
+REFUSE_SHAPE_STATIC_RUNTIME_CACHE = "shadow codegen cannot retain the runtime cache required by a static invoke"
+REFUSE_SHAPE_INVALID_UTF8_NAME = "co_names contains a string that is not valid UTF-8, so eligibility cannot read it"
 
 [opcodes]
 ASYNC_GEN_WRAP = { num = 87, state = "interpreter-only", cache = 0, reason = "INTERP_ONLY_ASYNC_CODE" }

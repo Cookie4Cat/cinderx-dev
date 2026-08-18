@@ -1,13 +1,14 @@
 # Copyright (c) Meta Platforms, Inc. and affiliates.
 
-"""Counter-backed proof that the CPython 3.11 capability gate holds.
+"""Counter-backed proof for CPython 3.11 shadow and execution isolation.
 
 The behavioural gate tests (test_jit_unsupported_311) pin that hot code is
 never observed to run as machine code.  These tests pin the same fact from
 the other side, through the monotonic trigger counters: under load and under
 explicit compile requests, the JIT never allocates executable memory and
-never creates a CompiledFunction.  This is the counter form of the source-set
-round's acceptance items 6 and 7 (docs/cp311-jit-dev-plan.md, MR-02).
+never creates a CompiledFunction.  MR-03 additionally exposes discarded
+shadow compile, specialized-opcode and code-size counters without weakening
+that isolation.
 """
 
 import sys
@@ -38,6 +39,9 @@ class TriggerStatsGateTest(unittest.TestCase):
                 "executable_alloc_bytes",
                 "executable_alloc_calls",
                 "machine_code_entries",
+                "shadow_codegen_bytes",
+                "shadow_compile_success",
+                "shadow_specialized_opcodes_consumed",
             ],
         )
         for key, value in stats.items():

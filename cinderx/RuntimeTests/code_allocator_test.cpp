@@ -1,5 +1,7 @@
 // Copyright (c) Meta Platforms, Inc. and affiliates.
 
+#include "cinderx/python.h"
+
 #include <gtest/gtest.h>
 
 #include "cinderx/Jit/code_allocator.h"
@@ -88,5 +90,16 @@ TEST_F(CodeAllocatorTest, AddSplitCodeCopiesHotAndColdSections) {
           kColdText.size()),
       0);
 }
+
+#if PY_VERSION_HEX < 0x030C0000
+TEST(CodeAllocatorLayoutTest, AlignsAArch64ColdSectionOffset) {
+  SplitAllocationLayout layout = computeSplitAllocationLayout(4, 8);
+
+  EXPECT_GE(layout.hot_capacity, 4);
+  EXPECT_LE(layout.hot_capacity + 8, layout.chunk_size);
+  EXPECT_EQ(layout.hot_capacity, 1024 * 1024);
+  EXPECT_EQ(layout.hot_capacity % 4, 0);
+}
+#endif
 
 } // namespace
