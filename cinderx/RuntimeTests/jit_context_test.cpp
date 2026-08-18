@@ -3636,14 +3636,14 @@ self_referential.myself = self_referential
   EXPECT_EQ(ctx->watchedFunctionCount(), 0u);
 }
 
-TEST_F(JITLifecycle311Test, DefaultsUninstallTheEntry) {
+TEST_F(JITLifecycle311Test, DefaultsStayInstalledAndBindLive) {
   SKIP_311_EXECUTABLE_COMPILE();
 
-  // Adding __defaults__ moves the function out of the argument shape the
-  // artifact was compiled for.  3.11 has no function watcher to notice, so
-  // the guarded entry has to notice on the next call -- and every reporter
-  // of "is this compiled" has to agree with it, or the state is compiled to
-  // one caller and interpreted to another.
+  // Adding __defaults__ used to take the function off the MR-04 exact
+  // positional surface.  MR-06 rebinds defaults in the generated
+  // vectorcall prologue, so the artifact stays installed and both
+  // reporters of "is this compiled" stay true.  A __code__ swap still
+  // clears them -- that is a different case.
   const char* py_src = R"(
 def defaulted(x):
     return x + 1
@@ -3665,12 +3665,10 @@ def defaulted(x):
   ASSERT_NE(defaults, nullptr);
   ASSERT_EQ(PyObject_SetAttrString(func, "__defaults__", defaults), 0);
 
-  // Both reporters must move together with the entry.
-  EXPECT_EQ(Ci_JitShell311_InstalledArtifact(func), nullptr);
-  EXPECT_FALSE(isJitCompiled(func));
+  EXPECT_NE(Ci_JitShell311_InstalledArtifact(func), nullptr);
+  EXPECT_TRUE(isJitCompiled(func));
 
-  // And the call still has to produce the right answer, through the
-  // interpreter.
+  auto entries_before = jit::triggerStatsSnapshot().machine_code_entries;
   auto after = Ref<>::steal(PyObject_Call(func, args, nullptr));
   ASSERT_NE(after, nullptr);
   EXPECT_EQ(PyLong_AsLong(after), 42);
@@ -3678,6 +3676,9 @@ def defaulted(x):
   auto defaulted = Ref<>::steal(PyObject_Call(func, no_args, nullptr));
   ASSERT_NE(defaulted, nullptr);
   EXPECT_EQ(PyLong_AsLong(defaulted), 42);
+  EXPECT_EQ(
+      jit::triggerStatsSnapshot().machine_code_entries, entries_before + 2)
+      << "live defaults must still enter machine code";
 }
 
 TEST_F(JITLifecycle311Test, ReplacingCodeStopsTheOldMachineCode) {

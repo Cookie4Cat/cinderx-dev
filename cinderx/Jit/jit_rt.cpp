@@ -15,6 +15,9 @@
 #include "cinderx/Common/string.h"
 #include "cinderx/Common/util.h"
 #include "cinderx/Interpreter/interpreter.h"
+#if PY_VERSION_HEX < 0x030C0000
+#include "cinderx/Interpreter/3.11/observe.h"
+#endif
 #include "cinderx/Jit/codegen/arch.h"
 #include "cinderx/Jit/compiled_function.h"
 #include "cinderx/Jit/context.h"
@@ -197,6 +200,25 @@ static int JITRT_BindKeywordArgs(
   return 1;
 }
 
+#if PY_VERSION_HEX < 0x030C0000
+// The generated vectorcall prologue dispatches here, then re-enters the
+// compiled body at JITRT_CALL_REENTRY_OFFSET before the vectorcall entry.
+// On 3.11 func->vectorcall is Ci_JitShell311_GuardedEntry, not that
+// generated entry, so subtracting the offset from it would jump into
+// unrelated bytes.  Use the artifact's own entry instead.
+static vectorcallfunc jitrtBoundArgsReentry(PyFunctionObject* func) {
+  auto* compiled = reinterpret_cast<jit::CompiledFunction*>(
+      Ci_JitShell311_InstalledArtifact(func));
+  if (compiled != nullptr) {
+    return JITRT_GET_REENTRY(compiled->vectorcallEntry());
+  }
+  return JITRT_GET_REENTRY(func->vectorcall);
+}
+#define JITRT_BOUND_ARGS_REENTRY(func) jitrtBoundArgsReentry(func)
+#else
+#define JITRT_BOUND_ARGS_REENTRY(func) JITRT_GET_REENTRY((func)->vectorcall)
+#endif
+
 // This uses JITRT_BindKeywordArgs to get the newly bound keyword
 // arguments.   We then turn around and dispatch to the
 // JITed function with the newly packed args.
@@ -225,7 +247,7 @@ PyObject* JITRT_CallWithKeywordArgs(
           kwdict,
           varargs)) {
     size_t new_nargsf = total_args;
-    return JITRT_GET_REENTRY(func->vectorcall)(
+    return JITRT_BOUND_ARGS_REENTRY(func)(
         (PyObject*)func, arg_space.get(), new_nargsf, nullptr);
   }
 
@@ -282,7 +304,7 @@ JITRT_StaticCallFPReturn JITRT_CallWithIncorrectArgcountFPReturn(
   size_t new_nargsf = argcount;
 
   return reinterpret_cast<staticvectorcallfuncfp>(
-      JITRT_GET_REENTRY(func->vectorcall))(
+      JITRT_BOUND_ARGS_REENTRY(func))(
       (PyObject*)func,
       arg_space.get(),
       new_nargsf,
@@ -342,11 +364,11 @@ JITRT_CallWithIncorrectArgcount(
   size_t new_nargsf = argcount;
 
 #ifdef _WIN32
-  return JITRT_GET_REENTRY(func->vectorcall)(
+  return JITRT_BOUND_ARGS_REENTRY(func)(
       (PyObject*)func, arg_space.get(), new_nargsf, (PyObject*)defaulted_args);
 #else
   return reinterpret_cast<staticvectorcallfunc>(
-      JITRT_GET_REENTRY(func->vectorcall))(
+      JITRT_BOUND_ARGS_REENTRY(func))(
       (PyObject*)func,
       arg_space.get(),
       new_nargsf,
@@ -417,7 +439,7 @@ TRetType JITRT_CallStaticallyWithPrimitiveSignatureWorker(
     goto fail;
   }
 
-  return reinterpret_cast<TVectorcall>(JITRT_GET_REENTRY(func->vectorcall))(
+  return reinterpret_cast<TVectorcall>(JITRT_BOUND_ARGS_REENTRY(func))(
       (PyObject*)func, (PyObject**)arg_space.get(), nargsf, nullptr);
 
 fail:
@@ -1055,6 +1077,17 @@ JITRT_CallFunctionEx(PyObject* func, PyObject* pargs, PyObject* kwargs) {
       if (PyDict_Update(d, kwargs) != 0) {
         Py_DECREF(d);
         if (PyErr_ExceptionMatches(PyExc_AttributeError)) {
+#if PY_VERSION_HEX < 0x030C0000
+          PyObject* funcstr = _PyObject_FunctionStr(func);
+          if (funcstr != nullptr) {
+            PyErr_Format(
+                PyExc_TypeError,
+                "%U argument after ** must be a mapping, not %.200s",
+                funcstr,
+                kwargs->ob_type->tp_name);
+            Py_DECREF(funcstr);
+          }
+#else
           PyErr_Format(
               PyExc_TypeError,
               "%.200s%.200s argument after ** "
@@ -1062,6 +1095,7 @@ JITRT_CallFunctionEx(PyObject* func, PyObject* pargs, PyObject* kwargs) {
               PyEval_GetFuncName(func),
               PyEval_GetFuncDesc(func),
               kwargs->ob_type->tp_name);
+#endif
         }
         return nullptr;
       }
@@ -1072,6 +1106,19 @@ JITRT_CallFunctionEx(PyObject* func, PyObject* pargs, PyObject* kwargs) {
   }
   if (!PyTuple_CheckExact(pargs)) {
     if (pargs->ob_type->tp_iter == nullptr && !PySequence_Check(pargs)) {
+#if PY_VERSION_HEX < 0x030C0000
+      // Stock 3.11 uses _PyObject_FunctionStr so the message carries the
+      // qualified name (module.qualname) rather than co_name + "()".
+      PyObject* funcstr = _PyObject_FunctionStr(func);
+      if (funcstr != nullptr) {
+        PyErr_Format(
+            PyExc_TypeError,
+            "%U argument after * must be an iterable, not %.200s",
+            funcstr,
+            Py_TYPE(pargs)->tp_name);
+        Py_DECREF(funcstr);
+      }
+#else
       PyErr_Format(
           PyExc_TypeError,
           "%.200s%.200s argument after * "
@@ -1079,6 +1126,7 @@ JITRT_CallFunctionEx(PyObject* func, PyObject* pargs, PyObject* kwargs) {
           PyEval_GetFuncName(func),
           PyEval_GetFuncDesc(func),
           pargs->ob_type->tp_name);
+#endif
       return nullptr;
     }
     pargs = PySequence_Tuple(pargs);
@@ -1112,14 +1160,22 @@ PyObject* JITRT_Call(
       "JITRT_Call must always be called as a vectorcall");
 
 #if PY_VERSION_HEX < 0x030C0000
-  // CPython 3.11 LOAD_METHOD pushes a callable followed by either the
-  // receiver or NULL.  If the second slot is NULL, call the callable without
-  // that artificial leading argument; the offset flag is dropped because the
-  // slot below the shifted args is the caller's NULL slot, not scratch the
-  // callee may claim.
-  if (args[0] == nullptr) {
-    constexpr size_t kVectorcallOffset =
-        static_cast<size_t>(PY_VECTORCALL_ARGUMENTS_OFFSET);
+  // 3.11 CALL has two dummy slots that HIR CallMethod encodes as operands:
+  // PUSH_NULL / LOAD_GLOBAL|1 puts nullptr in the callable slot and the
+  // callable in self(); a LOAD_METHOD miss puts Py_None in the callable
+  // slot (HIR uses None, not nullptr, because nullptr means deopt) and
+  // the attribute in self().  Either dummy is an artificial vectorcall
+  // argument and must not be passed through.  Do not treat a real None
+  // in self() as a dummy -- that is a positional argument.  The offset
+  // flag is dropped because the slot below the shifted args is that
+  // dummy, not callee scratch.
+  constexpr size_t kVectorcallOffset =
+      static_cast<size_t>(PY_VECTORCALL_ARGUMENTS_OFFSET);
+  if (callable == nullptr || callable == Py_None) {
+    callable = args[0];
+    args += 1;
+    nargsf = (nargsf - 1) & ~kVectorcallOffset;
+  } else if (args[0] == nullptr) {
     args += 1;
     nargsf = (nargsf - 1) & ~kVectorcallOffset;
   }
@@ -2956,7 +3012,7 @@ PyObject* JITRT_CallWithKeywordArgsSimple(
   if (JITRT_BindKeywordArgsSimple(
           func, args, nargsf, kwnames, arg_space, total_args)) {
     size_t new_nargsf = total_args;
-    return JITRT_GET_REENTRY(func->vectorcall)(
+    return JITRT_BOUND_ARGS_REENTRY(func)(
         (PyObject*)func, arg_space, new_nargsf, nullptr);
   }
 

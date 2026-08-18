@@ -31,8 +31,13 @@
 #include "cinderx/module_c_state.h"
 #include "cinderx/module_state.h"
 
+#include <cstdint>
 #include <exception>
 #include <string_view>
+
+#if defined(__linux__)
+#include <pthread.h>
+#endif
 
 namespace {
 
@@ -50,6 +55,43 @@ constexpr int kRequiredCodeFlags = CO_OPTIMIZED | CO_NEWLOCALS;
 // initialization path, so it doubles as the execute-mode predicate.
 bool canaryMode() {
   return jit::getConfig().state == jit::State::kRunning;
+}
+
+bool unicodeEquals311(BorrowedRef<> value, std::string_view expected) {
+  if (value == nullptr || !PyUnicode_Check(value)) {
+    return false;
+  }
+  const char* text = PyUnicode_AsUTF8(value);
+  return text != nullptr && std::string_view(text) == expected;
+}
+
+// Mirrors pyjit.cpp: compiling importlib or cinderx on 3.11 is ineligible
+// in getCompilationEligibility(), but the canary observe gate does not
+// go through that function.  Once CALL is on the execute whitelist,
+// those helpers compile and the next import dies in _ImportLockContext.
+bool isCinderModule311(BorrowedRef<PyFunctionObject> func) {
+  return unicodeEquals311(func->func_module, "cinderx");
+}
+
+bool isImportlibBootstrap311(BorrowedRef<PyFunctionObject> func) {
+  if (unicodeEquals311(func->func_module, "_frozen_importlib") ||
+      unicodeEquals311(func->func_module, "_frozen_importlib_external") ||
+      unicodeEquals311(func->func_module, "importlib._bootstrap") ||
+      unicodeEquals311(
+          func->func_module, "importlib._bootstrap_external")) {
+    return true;
+  }
+  BorrowedRef<PyCodeObject> code{func->func_code};
+  if (code == nullptr || code->co_filename == nullptr ||
+      !PyUnicode_Check(code->co_filename)) {
+    return false;
+  }
+  const char* file = PyUnicode_AsUTF8(code->co_filename);
+  if (file == nullptr) {
+    return false;
+  }
+  return std::string_view(file).find("importlib._bootstrap") !=
+      std::string_view::npos;
 }
 
 const char* eligibilityReason(BorrowedRef<PyFunctionObject> func) {
@@ -83,6 +125,12 @@ const char* eligibilityReason(BorrowedRef<PyFunctionObject> func) {
       !PyDict_CheckExact(func->func_builtins)) {
     return "REFUSE_SHAPE_NAMESPACE_UNSUPPORTED";
   }
+  if (isCinderModule311(func)) {
+    return "REFUSE_SHAPE_CINDER_MODULE";
+  }
+  if (isImportlibBootstrap311(func)) {
+    return "REFUSE_SHAPE_IMPORTLIB_BOOTSTRAP";
+  }
 
   if (const char* reason = jit::hir::unsupportedShapeReason311(code)) {
     return reason;
@@ -100,22 +148,11 @@ namespace {
 // per-thread; consumed and cleared by the scheduling gate below.
 thread_local const char* t_last_execute_refusal = nullptr;
 
-// Argument binding beyond exact positional arguments is MR-06 work:
-// keyword binding, keyword-only parameters, defaults and the variadic
-// collectors each carry their own error and fallback contracts that no
-// acceptance has covered yet.  A body made only of whitelisted opcodes is
-// not enough to make those signatures safe to execute.
-const char* unsupportedArgumentShape311(BorrowedRef<PyFunctionObject> func) {
-  BorrowedRef<PyCodeObject> code{func->func_code};
-  if (code->co_flags & (CO_VARARGS | CO_VARKEYWORDS)) {
-    return "REFUSE_SHAPE_VARIADIC_ARGS_UNAUDITED";
-  }
-  if (code->co_kwonlyargcount > 0) {
-    return "REFUSE_SHAPE_KEYWORD_ARGS_UNAUDITED";
-  }
-  if (func->func_defaults != nullptr || func->func_kwdefaults != nullptr) {
-    return "REFUSE_SHAPE_ARG_DEFAULTS_UNAUDITED";
-  }
+// Argument binding for defaults, keyword-only parameters and the
+// variadic collectors is handled by the generated vectorcall prologue
+// (JITRT_CallWithKeywordArgs / JITRT_CallWithIncorrectArgcount).  A
+// body made of whitelisted opcodes is enough.
+const char* unsupportedArgumentShape311(BorrowedRef<PyFunctionObject>) {
   return nullptr;
 }
 
@@ -177,6 +214,61 @@ const char* unsupportedSharedArtifact311(BorrowedRef<PyFunctionObject> func) {
   return nullptr;
 }
 
+// CPython 3.14's c_stack_soft_limit is a PyThreadStateImpl field this
+// 3.11 tstate does not have.  Cache the same geometry per thread: hard
+// limit one margin above the OS stack base, soft limit two margins (stacks
+// grow down).
+constexpr std::uintptr_t kCStackMarginBytes311 = 16 * 1024;
+
+thread_local std::uintptr_t t_c_stack_soft_limit = 0;
+thread_local std::uintptr_t t_c_stack_hard_limit = 0;
+
+std::uintptr_t machineStackPointer311() {
+  volatile char here;
+  return reinterpret_cast<std::uintptr_t>(&here);
+}
+
+void initCStackLimits311() {
+  if (t_c_stack_soft_limit != 0) {
+    return;
+  }
+#if defined(__linux__)
+  pthread_attr_t attr;
+  if (pthread_getattr_np(pthread_self(), &attr) == 0) {
+    void* stackaddr = nullptr;
+    size_t stacksize = 0;
+    if (pthread_attr_getstack(&attr, &stackaddr, &stacksize) == 0 &&
+        stackaddr != nullptr &&
+        stacksize > 3 * kCStackMarginBytes311) {
+      auto base = reinterpret_cast<std::uintptr_t>(stackaddr);
+      t_c_stack_hard_limit = base + kCStackMarginBytes311;
+      t_c_stack_soft_limit = base + 2 * kCStackMarginBytes311;
+      pthread_attr_destroy(&attr);
+      return;
+    }
+    pthread_attr_destroy(&attr);
+  }
+#endif
+  std::uintptr_t here = machineStackPointer311();
+  constexpr std::uintptr_t kFallbackBudget = 1024 * 1024;
+  if (here > kFallbackBudget + 2 * kCStackMarginBytes311) {
+    t_c_stack_soft_limit = here - kFallbackBudget;
+    t_c_stack_hard_limit = t_c_stack_soft_limit - kCStackMarginBytes311;
+  } else {
+    t_c_stack_soft_limit = 1;
+    t_c_stack_hard_limit = 1;
+  }
+}
+
+bool cStackSoftLimitReached311() {
+  initCStackLimits311();
+  std::uintptr_t here = machineStackPointer311();
+  if (here < t_c_stack_hard_limit) {
+    Py_FatalError("Unrecoverable stack overflow");
+  }
+  return here < t_c_stack_soft_limit;
+}
+
 } // namespace
 
 // The strict MR-04 execute surface: everything the shadow eligibility
@@ -216,13 +308,11 @@ extern "C" const char* Ci_JitShell311_TakeExecuteRefusal(void) {
 // The entry point installed on 3.11 canary functions.
 //
 // CPython 3.11 has no function watchers, so nothing tells the runtime when
-// a function's code, defaults or keyword defaults change after it was
-// compiled: the compatibility shim's PyFunction_AddWatcher registers
-// nothing.  Machine code that assumed the old code object would keep
-// running against the new one -- silently wrong results at best, a frame
-// laid out for the wrong code at worst.  And the compiled body assumes the
-// exact positional call form the MR-04 surface accepted; keyword binding
-// and defaults belong to MR-06.
+// a function's code object changes after it was compiled: the compatibility
+// shim's PyFunction_AddWatcher registers nothing.  Machine code that
+// assumed the old code object would keep running against the new one.
+// Defaults and keyword names are rebound on every call by the generated
+// prologue, so they do not force a fallback here.
 //
 // So the entry re-checks, on every call, what compilation assumed, and
 // hands anything else back to the interpreter.  The artifact is looked up
@@ -231,8 +321,9 @@ extern "C" const char* Ci_JitShell311_TakeExecuteRefusal(void) {
 // stale one.
 // The function-state half of the entry's decision, shared with
 // isJitCompiled() so "is this compiled?" and "will this call run machine
-// code?" cannot answer differently.  Anything that depends on the call
-// itself -- the keyword tuple, the argument count -- stays in the entry.
+// code?" cannot answer differently.  Tracing and profiling are thread
+// state, not function state: they fall back in the entry without clearing
+// the artifact.
 extern "C" void* Ci_JitShell311_InstalledArtifact(PyFunctionObject* func) {
   // Fail closed when the frame-evaluator entry point is no longer ours.
   // Initialization installed and verified it, but the slot can change
@@ -275,9 +366,6 @@ extern "C" void* Ci_JitShell311_InstalledArtifact(PyFunctionObject* func) {
             _Py_atomic_load_ptr_acquire(&extra->jit_compiled));
   if (compiled == nullptr || extra->jit_globals != func->func_globals ||
       extra->jit_builtins != func->func_builtins ||
-      // Defaults and keyword defaults are MR-06 contracts; a function that
-      // grew either since it compiled is no longer one the entry will run.
-      func->func_defaults != nullptr || func->func_kwdefaults != nullptr ||
       // The artifact must be this function's own.
       !compiled->functions().contains(func)) {
     return nullptr;
@@ -291,13 +379,25 @@ extern "C" PyObject* Ci_JitShell311_GuardedEntry(
     size_t nargsf,
     PyObject* kwnames) {
   auto func = reinterpret_cast<PyFunctionObject*>(func_obj);
-  auto code = reinterpret_cast<PyCodeObject*>(func->func_code);
   auto* compiled = reinterpret_cast<jit::CompiledFunction*>(
       Ci_JitShell311_InstalledArtifact(func));
-  if (compiled == nullptr || kwnames != nullptr ||
-      static_cast<int>(PyVectorcall_NARGS(nargsf)) != code->co_argcount ||
-      false) {
+  PyThreadState* tstate = PyThreadState_GET();
+  if (compiled == nullptr || tstate->c_tracefunc != nullptr ||
+      tstate->c_profilefunc != nullptr) {
     return getInterpretedVectorcall(func)(func_obj, args, nargsf, kwnames);
+  }
+  // Keyword names and a mismatched positional count are the generated
+  // prologue's job (JITRT_CallWithKeywordArgs /
+  // JITRT_CallWithIncorrectArgcount).  Do not filter them here.
+  // Two-layer recursion guard (MR-06).  3.11 eval enters at start_frame;
+  // the canary vectorcall never goes through eval, so the entry does it.
+  // C-stack first so a soft-limit hit does not mutate recursion_remaining.
+  if (cStackSoftLimitReached311()) {
+    PyErr_SetString(PyExc_RecursionError, "maximum recursion depth exceeded");
+    return nullptr;
+  }
+  if (Py_EnterRecursiveCall("")) {
+    return nullptr;
   }
   // Pin the artifact for the duration of the call.  The body runs
   // arbitrary Python through operators and iteration, and that code can
@@ -306,7 +406,10 @@ extern "C" PyObject* Ci_JitShell311_GuardedEntry(
   // buffer being executed.  The reference is held until machine code has
   // returned.
   Ref<jit::CompiledFunction> pin{Ref<jit::CompiledFunction>::create(compiled)};
-  return compiled->vectorcallEntry()(func_obj, args, nargsf, kwnames);
+  PyObject* result =
+      compiled->vectorcallEntry()(func_obj, args, nargsf, kwnames);
+  Py_LeaveRecursiveCall();
+  return result;
 }
 
 extern "C" const char* Ci_JitShell311_RequestCompile(
