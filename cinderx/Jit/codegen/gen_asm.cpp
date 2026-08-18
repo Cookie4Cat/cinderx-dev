@@ -375,6 +375,24 @@ PyObject* resumeInInterpreter(
       Py_DECREF(gen_to_cleanup);
     }
 
+#if PY_VERSION_HEX < 0x030C0000
+    // Stock 3.11 leaves entry-frame ownership with the caller: eval's
+    // exit paths return without clearing or popping the frame they were
+    // entered with (is_entry), and _PyEval_Vector performs the
+    // clear-and-pop afterwards.  Do that caller duty here, mirroring
+    // _PyEvalFrameClearAndPop (including the recursion_remaining dance so
+    // destructors run under the same headroom); without it every
+    // exception deopt leaks the reified frame's references and later
+    // datastack pushes reuse the never-cleared slots.  3.12+ eval pops
+    // the entry frame itself, so this block must not exist there.
+    if (frame->owner == FRAME_OWNED_BY_THREAD) {
+      tstate->recursion_remaining--;
+      _PyFrame_Clear(frame);
+      tstate->recursion_remaining++;
+      _PyThreadState_PopFrame(tstate, frame);
+    }
+#endif
+
     frame = prev_frame;
 
     err_occurred = result == nullptr;
