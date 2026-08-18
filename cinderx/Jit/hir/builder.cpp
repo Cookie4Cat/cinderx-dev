@@ -1273,6 +1273,62 @@ const char* unsupportedOpcodeReason311(BorrowedRef<PyCodeObject> code) {
   return nullptr;
 }
 
+const char* unsupportedExecuteReason311(BorrowedRef<PyCodeObject> code) {
+#if PY_VERSION_HEX < 0x030C0000
+  // The MR-04 execute surface: machine code may only run for functions
+  // whose every instruction sits inside this audited whitelist --
+  // positional/local data flow, basic arithmetic and comparisons, control
+  // flow, and iteration over already-materialized iterables.  Everything
+  // the plan defers stays out by construction: no CALL family, no attr or
+  // subscript ICs, no LOAD_GLOBAL (3.11 has no global-cache story yet),
+  // no cells/closures, no exception table, no generators.  The decoder
+  // yields unspecialized opcodes, so quickened forms cannot slip past.
+  BytecodeInstructionBlock bc_instrs{code};
+  for (auto bc_it = bc_instrs.begin(); bc_it != bc_instrs.end(); ++bc_it) {
+    switch (bc_it->opcode()) {
+      case BINARY_OP:
+      case COMPARE_OP:
+      case CONTAINS_OP:
+      case COPY:
+      case DELETE_FAST:
+      case EXTENDED_ARG:
+      case FOR_ITER:
+      case GET_ITER:
+      case IS_OP:
+      case JUMP_BACKWARD:
+      case JUMP_BACKWARD_NO_INTERRUPT:
+      case JUMP_FORWARD:
+      case LOAD_CONST:
+      case LOAD_FAST:
+      case NOP:
+      case POP_JUMP_BACKWARD_IF_FALSE:
+      case POP_JUMP_BACKWARD_IF_NONE:
+      case POP_JUMP_BACKWARD_IF_NOT_NONE:
+      case POP_JUMP_BACKWARD_IF_TRUE:
+      case POP_JUMP_FORWARD_IF_FALSE:
+      case POP_JUMP_FORWARD_IF_NONE:
+      case POP_JUMP_FORWARD_IF_NOT_NONE:
+      case POP_JUMP_FORWARD_IF_TRUE:
+      case POP_TOP:
+      case RESUME:
+      case RETURN_VALUE:
+      case STORE_FAST:
+      case SWAP:
+      case UNARY_INVERT:
+      case UNARY_NEGATIVE:
+      case UNARY_NOT:
+      case UNARY_POSITIVE:
+        break;
+      default:
+        return "REFUSE_SHAPE_EXECUTE_SURFACE";
+    }
+  }
+#else
+  (void)code;
+#endif
+  return nullptr;
+}
+
 std::unique_ptr<Function> buildHIR(const Preloader& preloader) {
   return HIRBuilder{preloader}.buildHIR();
 }

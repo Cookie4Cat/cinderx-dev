@@ -212,6 +212,16 @@ class CompiledFunction {
     owner_ = owner;
   }
 
+#if PY_VERSION_HEX < 0x030C0000
+  /*
+   * Release the references this artifact holds on its functions and forget
+   * them.  Only for teardown paths that detach the artifact from its context
+   * before clear() can run: clear() releases them itself, but only while the
+   * owner is still set.
+   */
+  void releaseOwnedFunctions();
+#endif
+
   std::unordered_set<BorrowedRef<PyFunctionObject>>& functions() {
     return functions_;
   }

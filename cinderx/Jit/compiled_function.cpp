@@ -4,11 +4,17 @@
 
 #include "internal/pycore_object.h"
 
+#include "cinderx/Common/code.h"
+#include "cinderx/Common/code_extra.h"
 #include "cinderx/Common/dict.h"
 #include "cinderx/Common/extra-py-flags.h"
 #include "cinderx/Common/log.h"
 #include "cinderx/Common/util.h"
 #include "cinderx/Jit/disassembler.h"
+#if PY_VERSION_HEX < 0x030C0000
+// The MR-04 execute surface, defined in Jit/pyjit_311_gate.cpp.
+#include "cinderx/Interpreter/3.11/observe.h"
+#endif
 #include "cinderx/Jit/hir/printer.h"
 #include "cinderx/Jit/trigger_stats.h"
 #include "cinderx/module_c_state.h"
@@ -25,6 +31,24 @@ bool isJitCompiled(const PyFunctionObject* func) {
   if (mod_state == nullptr) {
     return false;
   }
+#if PY_VERSION_HEX < 0x030C0000
+  // On 3.11 the installed entry is the guarded one, which is ordinary
+  // extension code rather than generated code, so the allocator test below
+  // cannot see it.  The question this answers is whether a call will
+  // execute machine code, and for the guarded entry that is exactly
+  // whether the function's current code object still has a published
+  // artifact -- which is also what makes the answer go false again after a
+  // __code__ swap.
+  if (reinterpret_cast<void*>(func->vectorcall) ==
+      reinterpret_cast<void*>(Ci_JitShell311_GuardedEntry)) {
+    // Exactly the predicate the entry uses, so this cannot report a
+    // function as compiled while every call to it is handed to the
+    // interpreter -- the state after a __code__ swap, or after defaults
+    // appeared, is "not compiled" for both.
+    return Ci_JitShell311_InstalledArtifact(
+               const_cast<PyFunctionObject*>(func)) != nullptr;
+  }
+#endif
   jit::ICodeAllocator* code_allocator = mod_state->code_allocator.get();
   return code_allocator != nullptr &&
       code_allocator->contains(reinterpret_cast<const void*>(func->vectorcall));
@@ -290,12 +314,32 @@ void CompiledFunction::addFunction(BorrowedRef<PyFunctionObject> func) {
   // for removing itself via funcDestroyed() when it is deallocated.
   // We don't incref to avoid preventing garbage collection of functions
   // when multiple functions share the same CompiledFunction.
+#if PY_VERSION_HEX < 0x030C0000
+  // Except on 3.11, where that responsibility has no mechanism: there are
+  // no function watchers, so nothing calls funcDestroyed() and a dead
+  // function would stay in this set and in the context registry as a
+  // dangling pointer -- reachable from Python, because the artifact is an
+  // object in the function's __dict__ and can be kept alive on its own.
+  // Owning the reference keeps the pointer valid for as long as anything
+  // can observe it.  The resulting function <-> artifact cycle is
+  // collectable: traverse() visits the set on this branch.
+  if (functions_.insert(func.get()).second) {
+    Py_INCREF(func.get());
+  }
+#else
   functions_.insert(func.get());
+#endif
 }
 
 void CompiledFunction::removeFunction(BorrowedRef<PyFunctionObject> func) {
   // Remove the borrowed reference. No decref needed since we don't own it.
+#if PY_VERSION_HEX < 0x030C0000
+  if (functions_.erase(func.get()) > 0) {
+    Py_DECREF(func.get());
+  }
+#else
   functions_.erase(func.get());
+#endif
 }
 
 int CompiledFunction::traverse(visitproc visit, void* arg) {
@@ -303,6 +347,13 @@ int CompiledFunction::traverse(visitproc visit, void* arg) {
   // own. The functions are responsible for removing themselves via
   // funcDestroyed() when they are deallocated. Not traversing them allows
   // functions to be garbage collected independently of this CompiledFunction.
+#if PY_VERSION_HEX < 0x030C0000
+  // On 3.11 the references are owned (see addFunction), so they have to be
+  // reported or the function <-> artifact cycle would never be collected.
+  for (PyFunctionObject* func : functions_) {
+    Py_VISIT(func);
+  }
+#endif
 
   // Traverse all references held by the CodeRuntime.
   if (data_.runtime != nullptr) {
@@ -311,6 +362,15 @@ int CompiledFunction::traverse(visitproc visit, void* arg) {
 
   return 0;
 }
+
+#if PY_VERSION_HEX < 0x030C0000
+void CompiledFunction::releaseOwnedFunctions() {
+  auto owned = std::move(functions_);
+  for (PyFunctionObject* func : owned) {
+    Py_DECREF(func);
+  }
+}
+#endif
 
 void CompiledFunction::clear(bool context_finalizing) {
   // Copy function pointers before clearing the set.
@@ -335,6 +395,10 @@ void CompiledFunction::clear(bool context_finalizing) {
     // refs.
     for (PyFunctionObject* func : funcs_to_deopt) {
       func->vectorcall = getInterpretedVectorcall(func);
+#if PY_VERSION_HEX < 0x030C0000
+      // ... except on 3.11, where this set owns them.
+      Py_DECREF(func);
+#endif
     }
 
     owner_ = nullptr;

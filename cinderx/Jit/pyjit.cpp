@@ -69,6 +69,11 @@
 #include <utility>
 #include <vector>
 
+#if PY_VERSION_HEX < 0x030C0000
+// The MR-04 execute surface, defined in Jit/pyjit_311_gate.cpp.
+#include "cinderx/Interpreter/3.11/observe.h"
+#endif
+
 using namespace jit;
 
 namespace {
@@ -1383,6 +1388,15 @@ bool reoptFunc(BorrowedRef<PyFunctionObject> func) {
   jitCtx()->removeDeoptedFunc(func);
 
   if (CompiledFunction* compiled = jitCtx()->lookupFunc(func)) {
+#if PY_VERSION_HEX < 0x030C0000
+    // finalizeFunc() reports a refusal as "nothing to do", which is right
+    // for it -- nothing was installed and nothing is half-built -- but
+    // wrong to pass upward as "reopted".  Ask first, so the answer here
+    // describes what happened.
+    if (Ci_JitShell311_ExecuteRefusal(func) != nullptr) {
+      return false;
+    }
+#endif
     return jitCtx()->finalizeFunc(func, compiled);
   }
   return false;
@@ -2020,9 +2034,30 @@ bool enable_jit_impl() {
         "Trying to re-enable the JIT but the JIT context is missing");
     return false;
   }
+  // Finalization releases the registries this function walks, and it does so
+  // by dropping references -- which runs destructors, which run arbitrary
+  // Python.  A __del__ reaching enable() would re-arm the execute surface
+  // mid-teardown and iterate a container that is being emptied underneath
+  // it.  Teardown is one-way.
+  if (getConfig().state == State::kFinalizing) {
+    PyErr_SetString(
+        PyExc_RuntimeError, "Trying to enable the JIT while it is finalizing");
+    return false;
+  }
   if (isJitUsable()) {
     return true;
   }
+
+#if PY_VERSION_HEX < 0x030C0000
+  // Re-arm before re-attaching, not after.  On 3.11 the execute surface is
+  // only open while the state says kRunning, so a reopt loop that ran first
+  // was refused for every function and enable() merely drained the parked
+  // set -- pause() became a one-way door.  The flip is ordered this way
+  // only here; other versions keep the order they had.
+  setInterpreterJitFlag(true);
+  getMutableConfig().state = State::kRunning;
+  syncOSRFlags();
+#endif
 
   size_t count = 0;
   auto& funcs = jitCtx()->deoptedFuncs();
@@ -2031,6 +2066,10 @@ bool enable_jit_impl() {
     // Advance before reoptFunc() which erases func from funcs,
     // invalidating the iterator pointing to it.
     ++it;
+    // Hold the function across re-optimization: on 3.11 the deopted set
+    // owns its entries, so the erase inside reoptFunc() can drop the last
+    // reference while the call is still using it.
+    Ref<PyFunctionObject> keep{Ref<PyFunctionObject>::create(func)};
     reoptFunc(func);
     count++;
   }
@@ -2527,6 +2566,13 @@ PyObject* is_enabled(PyObject* /* self */, PyObject* /* args */) {
   return PyBool_FromLong(isJitUsable());
 }
 
+PyObject* is_attr_caches_enabled(PyObject* /* self */, PyObject* /* args */) {
+  // Read-only config export so the MR-04 acceptance ("the 3.11 default
+  // keeps inline attribute caches off until MR-09") is attested inside
+  // the child process rather than assumed.
+  return PyBool_FromLong(getConfig().attr_caches);
+}
+
 PyObject* count_interpreted_calls(PyObject* /* self */, PyObject* arg) {
   BorrowedRef<PyFunctionObject> func =
       get_func_arg("count_interpreted_calls", arg);
@@ -2815,12 +2861,41 @@ PyObject* read_jit_list(PyObject* /* self */, PyObject* arg) {
   Py_RETURN_NONE;
 }
 
+// The registry as it stands, unfiltered.  get_compiled_functions() answers
+// the logical question -- will a call run machine code -- and a function
+// that temporarily fell back (its defaults changed, say) drops out of it
+// while its artifact and code buffer are still very much resident.  Telling
+// the two apart is what makes a lifecycle report mean anything.
+PyObject* get_resident_compiled_functions(PyObject* /* self */, PyObject*) {
+  // A physical measurement, so it must not depend on the JIT's current
+  // state: pausing does not release a code buffer, and answering None (or
+  // zero) while artifacts are still resident is exactly the false negative
+  // this exists to prevent.  Counting compiled_codes_ rather than the
+  // installed-function map also keeps deopted-but-resident artifacts
+  // visible.  An integer, because the question is "how much is still
+  // alive", not "which functions would run".
+  auto* ctx = jitCtx();
+  if (ctx == nullptr) {
+    return PyLong_FromLong(0);
+  }
+  return PyLong_FromSize_t(ctx->compiledCodes().size());
+}
+
 PyObject* get_compiled_functions(PyObject* /* self */, PyObject*) {
   auto funcs = Ref<>::steal(PyList_New(0));
   if (funcs == nullptr) {
     return nullptr;
   }
   for (auto func_and_compiled : jitCtx()->compiledFuncs()) {
+#if PY_VERSION_HEX < 0x030C0000
+    // Report what is actually installed.  A function whose code, globals or
+    // defaults changed since it compiled still holds a registry entry, but
+    // every call to it now goes to the interpreter, so listing it here
+    // would contradict is_jit_compiled() and inflate the installed count.
+    if (!isJitCompiled(func_and_compiled.first)) {
+      continue;
+    }
+#endif
     if (PyList_Append(funcs, func_and_compiled.first) < 0) {
       return nullptr;
     }
@@ -3660,6 +3735,11 @@ PyMethodDef jit_methods[] = {
      METH_NOARGS,
      PyDoc_STR("Get the current number of calls needed before a function is "
                "automatically compiled.")},
+    {"is_attr_caches_enabled",
+     is_attr_caches_enabled,
+     METH_NOARGS,
+     PyDoc_STR("Whether inline attribute caches are enabled (3.11 default: "
+               "off until MR-09 acceptance).")},
     {"is_enabled",
      is_enabled,
      METH_NOARGS,
@@ -3885,6 +3965,100 @@ PyModuleDef_Slot jit_slots[] = {
     {Py_mod_exec, reinterpret_cast<void*>(jit_exec)},
     {}};
 
+#if PY_VERSION_HEX < 0x030C0000
+// The 3.11 canary control plane.
+//
+// The full method table is a control surface for capabilities MR-04 does
+// not have: precompile_all() and lazy_compile() install machine code
+// through the batch and re-optimization paths, force_uncompile() and the
+// jit-list mutators belong to MR-05, and the guard and specialization
+// setters can re-open exactly the speculation this milestone excludes.
+// Exposing them would make the execute surface a matter of which entry a
+// caller picked.  Canary therefore publishes only what its own evidence
+// needs, and each later milestone adds back what its acceptance covers.
+PyMethodDef jit_methods_311_canary[] = {
+    {"is_enabled",
+     is_enabled,
+     METH_NOARGS,
+     PyDoc_STR("Check whether the JIT is enabled and usable")},
+    {"is_attr_caches_enabled",
+     is_attr_caches_enabled,
+     METH_NOARGS,
+     PyDoc_STR("Whether inline attribute caches are enabled (3.11 default: "
+               "off until MR-09 acceptance).")},
+    {"is_jit_compiled",
+     is_jit_compiled,
+     METH_O,
+     PyDoc_STR("Check if a function is jit compiled.")},
+    {"force_compile",
+     force_compile,
+     METH_O,
+     PyDoc_STR("Force a function to be JIT compiled if it hasn't yet.")},
+    {"get_compiled_functions",
+     get_compiled_functions,
+     METH_NOARGS,
+     PyDoc_STR("Return a list of functions that are currently JIT-compiled.")},
+    {"get_and_clear_runtime_stats",
+     get_and_clear_runtime_stats,
+     METH_NOARGS,
+     PyDoc_STR("Returns information about the runtime behavior of JIT-compiled "
+               "code.")},
+    // Restrictions, not capabilities.  Withholding them is what made the
+    // cinderx.jit wrapper keep a no-op stub for @jit_suppress, so a
+    // function marked "do not compile" was compiled and executed anyway,
+    // walking around the CI_CO_SUPPRESS_JIT gate; and pause() disabled
+    // nothing.  A milestone may withhold what it cannot do, never what
+    // stops it doing something.
+    {"jit_suppress",
+     jit_suppress,
+     METH_O,
+     PyDoc_STR("Decorator to prevent the JIT from running on a function.")},
+    {"jit_unsuppress",
+     jit_unsuppress,
+     METH_O,
+     PyDoc_STR("Decorator to allow the JIT to run on a function.")},
+    {"disable",
+     reinterpret_cast<PyCFunction>(disable_jit),
+     METH_VARARGS | METH_KEYWORDS,
+     PyDoc_STR("Compile all functions that are pending compilation and then "
+               "disable the JIT.")},
+    {"enable",
+     enable_jit,
+     METH_NOARGS,
+     PyDoc_STR("Re-enable the JIT and re-attach compiled onto previously "
+               "JIT-compiled functions.")},
+    // The physical half of the lifecycle: every function the registry still
+    // holds an artifact for, whether or not a call would currently enter it.
+    {"_get_resident_compiled_functions",
+     get_resident_compiled_functions,
+     METH_NOARGS,
+     PyDoc_STR("Functions the registry still holds a compiled artifact for, "
+               "including those temporarily falling back to the "
+               "interpreter.")},
+    // Not a capability: CompiledFunction.__reduce__ looks this up by name in
+    // the cinderjit module, so pickling or deep-copying anything holding a
+    // compiled artifact needs it present.
+    {"_reconstruct_pickled_compiled_function",
+     reconstruct_pickled_compiled_function,
+     METH_NOARGS,
+     PyDoc_STR("Internal helper for unpickling a compiled function.")},
+    {nullptr, nullptr, 0, nullptr},
+};
+
+PyModuleDef jit_module_311_canary = {
+    PyModuleDef_HEAD_INIT,
+    "cinderjit", /* m_name */
+    PyDoc_STR("The CPython 3.11 canary control plane: the MR-04 execute "
+              "surface and nothing beyond it."),
+    0, /* m_size */
+    jit_methods_311_canary, /* m_methods */
+    jit_slots, /* m_slots */
+    nullptr, /* m_traverse */
+    nullptr, /* m_clear */
+    nullptr, /* m_free */
+};
+#endif
+
 PyModuleDef jit_module = {
     PyModuleDef_HEAD_INIT,
     "cinderjit", /* m_name */
@@ -3903,6 +4077,20 @@ void trackEligibleCodeObjects(
     BorrowedRef<PyFunctionObject> func,
     BorrowedRef<PyCodeObject> func_code,
     JitEligibility eligibility = JitEligibility::Eligible) {
+#if PY_VERSION_HEX < 0x030C0000
+  // This table maps a code object to the function it was first seen on,
+  // and both halves are borrowed.  CPython 3.11 has no function-destroy
+  // notification, so nothing removes an entry when that function dies:
+  // hold on to the code object and the value dangles, and a later
+  // compilation of the same code would read the dead function's globals.
+  // The table exists to find nested functions for the batch paths, which
+  // the canary control plane does not publish, so on 3.11 it simply stays
+  // empty until MR-05 supplies the notification.
+  (void)func;
+  (void)func_code;
+  (void)eligibility;
+  return;
+#endif
   // We need to maintain a mapping for all functions which are
   // eligible for compilation at some point - we track the code
   // object and their parent function. If we have a JIT list we
@@ -4338,7 +4526,10 @@ int initialize() {
   const char* runtime_mode = std::getenv("CINDERX_JIT_MODE");
   bool shadow_requested =
       runtime_mode != nullptr && std::strcmp(runtime_mode, "shadow") == 0;
-  if (!shadow_requested && force_init != std::make_optional(true)) {
+  bool canary_requested =
+      runtime_mode != nullptr && std::strcmp(runtime_mode, "canary") == 0;
+  if (!shadow_requested && !canary_requested &&
+      force_init != std::make_optional(true)) {
     return 0;
   }
 #endif
@@ -4383,20 +4574,70 @@ int initialize() {
 #endif
 
 #if PY_VERSION_HEX < 0x030C0000
-  // Shadow owns the same front-end/compiler context as the executing JIT so
-  // HIR, optimization, LIR, register allocation and target relocation all run
-  // normally. It deliberately omits CompiledFunction/cinderjit initialization,
-  // interpreter entry installation, generator types, audit hooks and OSR.
-  cinderx::ModuleState* shadow_mod_state = cinderx::getModuleState();
-  // Construct all throwing state locally and publish it only after every
-  // constructor succeeds. A failed import must not leave a half-initialized
-  // allocator or context behind while Config still says kNotInitialized.
-  std::unique_ptr<ICodeAllocator> code_allocator{CodeAllocator::make()};
-  auto jit_context = std::make_unique<CompilerContext<Compiler>>();
-  jit::codegen::initThreadStateOffset();
-  shadow_mod_state->code_allocator = std::move(code_allocator);
-  shadow_mod_state->jit_context = std::move(jit_context);
-  getMutableConfig().state = State::kShadow;
+  // The 3.11 attribute-cache default is explicitly OFF until the MR-09
+  // pull-based invalidation acceptance; neither shadow nor canary may walk
+  // an unaccepted IC arm (dev plan MR-04).
+  getMutableConfig().attr_caches = false;
+  // A compiled artifact may not be shared across function objects until the
+  // MR-05 lifecycle lands: 3.11 has no function-destroy notification (the
+  // compatibility shim's PyFunction_AddWatcher registers nothing), so a
+  // second owner keeps the artifact alive past the first owner's death and
+  // leaves that dead function as a borrowed pointer in the registry.
+  getMutableConfig().auto_code_twin_dedup = false;
+  if (!canary_requested) {
+    // Shadow owns the same front-end/compiler context as the executing JIT
+    // so HIR, optimization, LIR, register allocation and target relocation
+    // all run normally. It deliberately omits CompiledFunction/cinderjit
+    // initialization, interpreter entry installation, generator types,
+    // audit hooks and OSR.
+    cinderx::ModuleState* shadow_mod_state = cinderx::getModuleState();
+    // Construct all throwing state locally and publish it only after every
+    // constructor succeeds. A failed import must not leave a
+    // half-initialized allocator or context behind while Config still says
+    // kNotInitialized.
+    std::unique_ptr<ICodeAllocator> code_allocator{CodeAllocator::make()};
+    auto jit_context = std::make_unique<CompilerContext<Compiler>>();
+    jit::codegen::initThreadStateOffset();
+    shadow_mod_state->code_allocator = std::move(code_allocator);
+    shadow_mod_state->jit_context = std::move(jit_context);
+    getMutableConfig().state = State::kShadow;
+    return 0;
+  }
+
+  // canary (MR-04): the test-only execution mode.  Machine code compiles,
+  // installs and executes for functions inside the strict execute surface;
+  // everything the plan defers stays off -- no generator types, no OSR, no
+  // audit instrumentation, no JIT list, no automatic scheduling.  The
+  // product auto-JIT remains unavailable.
+  //
+  // Speculative type guards are MR-07 work: the plan's MR-04 eligibility
+  // excludes them, and consuming the interpreter's specialized forms is
+  // what produces them.  Only the executing mode compiles the unspecialized
+  // forms; shadow keeps its accepted MR-03 behaviour and RuntimeTests keep
+  // the build default.  Warm and organic timings still exercise real
+  // interpreter cache state -- the quickening happens either way -- without
+  // putting a guard-and-deopt arm under machine code.
+  getMutableConfig().specialized_opcodes = false;
+  if (jit::initCompiledFunctionType() < 0) {
+    return -1;
+  }
+  {
+    cinderx::ModuleState* canary_mod_state = cinderx::getModuleState();
+    std::unique_ptr<ICodeAllocator> code_allocator{CodeAllocator::make()};
+    auto jit_context = std::make_unique<CompilerContext<Compiler>>();
+    jit::codegen::initThreadStateOffset();
+    canary_mod_state->code_allocator = std::move(code_allocator);
+    canary_mod_state->jit_context = std::move(jit_context);
+  }
+  {
+    PyObject* canary_mod =
+        _Ci_CreateBuiltinModule(&jit_module_311_canary, "cinderjit");
+    if (canary_mod == nullptr) {
+      return -1;
+    }
+    jitCtx()->setCinderJitModule(Ref<>::steal(canary_mod));
+  }
+  getMutableConfig().state = State::kRunning;
   return 0;
 #endif
 
@@ -4541,10 +4782,28 @@ void finalize() {
     deoptFuncImpl(func);
   }
 
+#if PY_VERSION_HEX < 0x030C0000
+  // On 3.11 the registry must be empty once the loop above has run: a
+  // function still holding a machine-code entrypoint here would be called
+  // into freed code during the rest of shutdown.  The emptiness is not
+  // observable from Python -- the module is being torn down -- so the
+  // invariant is enforced where it is knowable.
+  JIT_CHECK(
+      jitCtx()->compiledFuncs().empty(),
+      "JIT finalized with {} function(s) still compiled",
+      jitCtx()->compiledFuncs().size());
+#endif
+
   // Always release references from Context objects: C++ clients may have
   // invoked the JIT directly without initializing a full jit::Context.
   jitCtx()->clearDeoptStats();
   jitCtx()->releaseReferences();
+
+#if PY_VERSION_HEX < 0x030C0000
+  // The deopted set owns its functions on this branch; release them
+  // before the context goes.
+  jitCtx()->clearDeoptedFuncs();
+#endif
 
   deleteJitList();
 
@@ -4626,6 +4885,15 @@ bool tryAttachCachedCompiledEntry(BorrowedRef<PyFunctionObject> func) {
   if (jitCtx() == nullptr) {
     return false;
   }
+#if PY_VERSION_HEX < 0x030C0000
+  // This path exists to hand an already-compiled artifact to a freshly
+  // created function object, which is exactly the second owner 3.11 cannot
+  // account for: it has no function-destroy notification, so the first
+  // owner's death would leave a borrowed pointer behind. Re-attachment
+  // returns with the MR-05 lifecycle.
+  (void)func;
+  return false;
+#else
   // When an explicit JIT list is active, eligibility is per-function: it
   // depends on the function's (possibly renamed) module/qualname, not just its
   // code object (see getCompilationEligibility -> jit_list->lookupFunc). The
@@ -4662,6 +4930,7 @@ bool tryAttachCachedCompiledEntry(BorrowedRef<PyFunctionObject> func) {
   // CompiledFunction function set, func_dict strong ref, vectorcall + static
   // entry), so deopt and GC behave identically to the slow path.
   return jitCtx()->finalizeFunc(func, compiled);
+#endif
 }
 
 bool scheduleJitCompile(BorrowedRef<PyFunctionObject> func) {
@@ -4735,6 +5004,15 @@ Result compileFunction(BorrowedRef<PyFunctionObject> func) {
   if (!isJitInitialized()) {
     return Result::NOT_INITIALIZED;
   }
+#if PY_VERSION_HEX < 0x030C0000
+  // Every 3.11 compile-and-install request funnels through the execute
+  // surface: force_compile and the observe dispatch obey the same strict
+  // eligibility, so nothing outside the MR-04 surface can reach machine
+  // code no matter which door it came in.
+  if (Ci_JitShell311_ExecuteRefusal(func) != nullptr) {
+    return Result::CANNOT_SPECIALIZE;
+  }
+#endif
   if (isJitPaused()) {
     return Result::PAUSED;
   }
@@ -4939,10 +5217,14 @@ Result compilePreloaderImpl(
     const hir::Preloader& preloader,
     BorrowedRef<PyFunctionObject> func) {
 #if PY_VERSION_HEX < 0x030C0000
-  // CPython 3.11 only supports the explicit CompileShadow() path.  Refuse
-  // internal execution-mode callers before they can allocate or install a
-  // CompiledFunction.
-  return Result::CANNOT_SPECIALIZE;
+  // CPython 3.11 execution goes through the canary mode only (MR-04):
+  // outside it -- shadow, observe, or an internal caller sneaking past the
+  // mode plumbing -- refuse before anything can allocate or install a
+  // CompiledFunction.  The canary requests themselves have already passed
+  // the execute-surface choke in compileFunction().
+  if (getConfig().state != State::kRunning) {
+    return Result::CANNOT_SPECIALIZE;
+  }
 #endif
 
   // We are compiling the code stored in the preloader. Includes an optional
@@ -4995,6 +5277,13 @@ Result compilePreloaderImpl(
       // The code is already compiled and we have a CompiledFunction object.
       // Just finalize the code.
       if (func != nullptr) {
+#if PY_VERSION_HEX < 0x030C0000
+        // Same reason as reoptFunc(): a refusal here must not come back as
+        // Result::OK, which the caller would report as installed.
+        if (Ci_JitShell311_ExecuteRefusal(func) != nullptr) {
+          return Result::CANNOT_SPECIALIZE;
+        }
+#endif
         if (getThreadedCompileContext().compileRunning()) {
           // Can't call finalizeFunc on a worker thread - it does Python
           // allocations (PyDict_New, etc.) which require the GIL. Defer

@@ -24,9 +24,23 @@
 #include <sys/mman.h>
 #endif
 
+#include <utility>
+#include <vector>
+
+#if PY_VERSION_HEX < 0x030C0000
+// The MR-04 execute surface, defined in Jit/pyjit_311_gate.cpp.
+#include "cinderx/Interpreter/3.11/observe.h"
+#endif
+
 namespace jit {
 
 namespace {
+
+// Defined further down, next to the publisher it mirrors; declared here so
+// the Context destructor can drop the cache before anything is torn down.
+void clearCachedCompiledIfMatches(
+    BorrowedRef<PyCodeObject> code,
+    CompiledFunction* compiled);
 
 PyModuleDef* findBuiltinsModule() {
   // We want to check the exact function address, rather than relying on modules
@@ -138,11 +152,42 @@ Context::Context()
 }
 
 Context::~Context() {
+  // The CodeExtra fast path caches a borrowed pointer to the artifact on the
+  // code object, and the code object outlives this context.  clear(true)
+  // below deliberately skips forgetCompiledFunction() -- the map is going
+  // away anyway -- and that is the only path that drops the cache, so every
+  // compiled code object would be left naming an artifact that dies with the
+  // last pin.  Drop the cache here, before anything is cleared.
+  for (auto& code : compiled_codes_) {
+    clearCachedCompiledIfMatches(
+        reinterpret_cast<PyCodeObject*>(code.first.code), code.second.get());
+  }
+
   // Clear all of the CompiledFunction's before we clear out the memory used for
   // the CodeRuntime allocated in the slab.
+#if PY_VERSION_HEX < 0x030C0000
+  // compiled_codes_ holds borrowed pointers, and on 3.11 an artifact owns the
+  // functions attached to it while a function's dictionary owns the artifact.
+  // Clearing one entry therefore releases references that can free a
+  // *different* entry, whose destructor calls forgetCompiledFunction() and
+  // erases from the map being iterated right here -- and can even free the
+  // entry currently being cleared, so that clear() writes its own members
+  // after they are gone.  Pin every artifact for the length of the loop.  The
+  // pins are dropped afterwards, by which point each artifact has lost its
+  // owner and will not reach back into this context.
+  std::vector<Ref<CompiledFunction>> pinned;
+  pinned.reserve(compiled_codes_.size());
+  for (auto& code : compiled_codes_) {
+    pinned.emplace_back(Ref<CompiledFunction>::create(code.second));
+  }
+  for (auto& compiled : pinned) {
+    compiled->clear(true /* context_finalizing */);
+  }
+#else
   for (auto& code : compiled_codes_) {
     code.second->clear(true /* context_finalizing */);
   }
+#endif
 }
 
 void Context::mlockProfilerDependencies() {
@@ -459,8 +504,36 @@ void Context::finalizeMultiThreadedCompile() {
 bool Context::finalizeFunc(
     BorrowedRef<PyFunctionObject> func,
     BorrowedRef<CompiledFunction> compiled) {
+#if PY_VERSION_HEX < 0x030C0000
+  // Every path that gives a function a machine-code entry point arrives
+  // here: the direct compile, the batch and lazy paths, re-optimization of
+  // a previously deopted function, and any re-attachment of an existing
+  // artifact.  The MR-04 execute surface is therefore enforced here rather
+  // than at the compile entry alone, where the batch and reopt paths
+  // walked around it.  A refusal is not an error; the function simply
+  // stays interpreted.
+  if (Ci_JitShell311_ExecuteRefusal(func) != nullptr) {
+    return true;
+  }
+#endif
   compiled->setOwner(this);
 
+#if PY_VERSION_HEX < 0x030C0000
+  // A function whose __code__ was replaced still carries the association
+  // to the artifact of its previous code.  Left in place, addCompiledFunc()
+  // below would report "already compiled" and the freshly built artifact
+  // would never be attached, while force_compile() reported success.  Drop
+  // the stale association first; the artifact itself is owned by the
+  // function's dictionary and dies with it.
+  {
+    auto existing = compiled_funcs_.find(func);
+    if (existing != compiled_funcs_.end() &&
+        existing->second.get() != compiled.get()) {
+      existing->second->removeFunction(func);
+      compiled_funcs_.erase(func);
+    }
+  }
+#endif
   if (!addCompiledFunc(func, compiled)) {
     // Someone else compiled the function between when our caller checked and
     // called us.
@@ -470,7 +543,14 @@ bool Context::finalizeFunc(
   // In case the function had previously been deopted.
   removeDeoptedFunc(func);
 
+#if PY_VERSION_HEX < 0x030C0000
+  // Route 3.11 calls through the guarded entry, which re-checks the code
+  // identity and the call form that compilation assumed before entering
+  // machine code (see Jit/pyjit_311_gate.cpp).
+  setVectorcall(func, Ci_JitShell311_GuardedEntry);
+#else
   setVectorcall(func, compiled->vectorcallEntry());
+#endif
   if (hasFunctionEntryCache(func)) {
     void** indirect = findFunctionEntryCache(func);
     *indirect = compiled->staticEntry();
@@ -886,22 +966,57 @@ void Context::setCinderJitModule(Ref<> mod) {
 }
 
 void Context::clearForMultithreadedCompileTest() {
+  // Nothing here may release a reference until every artifact is pinned and
+  // both borrowed registries are empty.  On 3.11 an artifact owns its
+  // functions and a function's dictionary owns the artifact, so a release
+  // can destroy the artifact the loop is holding by borrow -- and its
+  // destructor erases from the very maps being walked.  Pin first, detach
+  // second, release last.
+  std::vector<Ref<CompiledFunction>> pinned;
+  pinned.reserve(compiled_funcs_.size());
+  UnorderedSet<CompiledFunction*> seen;
   for (auto& func_entry : compiled_funcs_) {
     BorrowedRef<CompiledFunction> compiled = func_entry.second;
+    // One artifact can serve several functions; orphan each one once.
+    if (seen.emplace(compiled.get()).second) {
+      pinned.emplace_back(Ref<CompiledFunction>::create(compiled));
+    }
+  }
+
+  // The CodeExtra cache names artifacts by borrow, and the key it is looked
+  // up under comes from the runtime, so this has to run before anything is
+  // detached or released.
+  for (auto& compiled : pinned) {
     if (compiled->runtime() != nullptr) {
       CompilationKey key{*compiled.get()};
       clearCachedCompiledIfMatches(
           reinterpret_cast<PyCodeObject*>(key.code), compiled.get());
     }
+  }
+
+  // Empty the borrowed registries before any release can run Python: an
+  // artifact destroyed below would otherwise call back in to erase from
+  // them.
+  compiled_codes_.clear();
+  compiled_funcs_.clear();
+
+  for (auto& compiled : pinned) {
+#if PY_VERSION_HEX < 0x030C0000
+    // On 3.11 this set owns its functions, and clear() only reaches the
+    // branch that releases them while the artifact still has an owner.
+    // Detaching below would therefore take those references to the grave.
+    // Release them here, under the pin above -- releasing a function can
+    // drop the dictionary holding this artifact's last reference.  The
+    // functions keep the guarded entry, which refuses once the association
+    // is gone and sends them back to the interpreter.
+    compiled->releaseOwnedFunctions();
+#endif
     // Disconnect from Context so clear() on eventual destruction won't call
     // back into us (e.g., forgetCompiledFunction, unwatch).
     compiled->setOwner(nullptr);
     // Keep the old CompiledFunction alive via a strong reference.
-    orphaned_compiled_codes_.emplace_back(
-        Ref<CompiledFunction>::create(compiled));
+    orphaned_compiled_codes_.emplace_back(std::move(compiled));
   }
-  compiled_codes_.clear();
-  compiled_funcs_.clear();
 }
 
 void Context::funcDestroyed(BorrowedRef<PyFunctionObject> func) {
@@ -911,7 +1026,7 @@ void Context::funcDestroyed(BorrowedRef<PyFunctionObject> func) {
     it->second->removeFunction(func);
     compiled_funcs_.erase(func);
   }
-  deopted_funcs_.erase(func);
+  removeDeoptedFunc(func);
   // This doesn't modify compiled_codes_, so if this is a nested function it can
   // easily be reopted later.
 }
@@ -926,11 +1041,45 @@ BorrowedRef<CompiledFunction> Context::lookupCode(
 }
 
 void Context::addDeoptedFunc(BorrowedRef<PyFunctionObject> func) {
+#if PY_VERSION_HEX < 0x030C0000
+  // Own the reference on 3.11.  This set is walked again when the JIT is
+  // re-enabled, and nothing tells the runtime that a function died in the
+  // meantime -- there are no function watchers -- so a borrowed pointer
+  // here is a function that can be freed while paused and dereferenced on
+  // the way back.  The reference is released when the function leaves the
+  // set, which re-enabling and finalization both do.
+  if (deopted_funcs_.emplace(func).second) {
+    Py_INCREF(func.get());
+  }
+#else
   deopted_funcs_.emplace(func);
+#endif
 }
 
 void Context::removeDeoptedFunc(BorrowedRef<PyFunctionObject> func) {
+#if PY_VERSION_HEX < 0x030C0000
+  if (deopted_funcs_.erase(func) > 0) {
+    Py_DECREF(func.get());
+  }
+#else
   deopted_funcs_.erase(func);
+#endif
+}
+
+void Context::clearDeoptedFuncs() {
+  // Detach before releasing.  A release here can be the last reference to a
+  // function, and destroying it runs arbitrary Python -- __del__ on anything
+  // its dictionary holds -- which can re-enter the JIT.  enable() walks this
+  // very set, so a re-entrant call during the loop below would mutate the
+  // container being iterated and release entries a second time.  Emptying it
+  // first leaves re-entry nothing to walk.
+  UnorderedSet<BorrowedRef<PyFunctionObject>> parked;
+  parked.swap(deopted_funcs_);
+#if PY_VERSION_HEX < 0x030C0000
+  for (BorrowedRef<PyFunctionObject> func : parked) {
+    Py_DECREF(func.get());
+  }
+#endif
 }
 
 bool Context::addCompiledFunc(
@@ -982,6 +1131,16 @@ Ref<CompiledFunction> Context::makeCompiledFunction(
     return nullptr;
   }
 
+#if PY_VERSION_HEX < 0x030C0000
+  // finalizeFunc() reports a refusal as "nothing to do", which is right
+  // for the re-attachment paths but wrong here: publishing below would
+  // leave compiled_codes_ and the code-extra cache pointing at an artifact
+  // whose only strong reference is the local one about to expire.  Refuse
+  // before anything is published.
+  if (func != nullptr && Ci_JitShell311_ExecuteRefusal(func) != nullptr) {
+    return nullptr;
+  }
+#endif
   if (func != nullptr && !finalizeFunc(func, compiled)) {
     return nullptr;
   }

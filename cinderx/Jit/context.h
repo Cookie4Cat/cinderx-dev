@@ -156,6 +156,9 @@ class Context : public IJitContext, public CompiledFunctionOwner {
    */
   void removeDeoptedFunc(BorrowedRef<PyFunctionObject> func);
 
+  /* Empty the deopted set, releasing whatever it owns. */
+  void clearDeoptedFuncs();
+
   /*
    * Fully remove all effects of compilation from a function.
    */
