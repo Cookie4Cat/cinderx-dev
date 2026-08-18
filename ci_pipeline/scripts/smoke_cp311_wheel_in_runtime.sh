@@ -56,6 +56,7 @@ cd /smoke
 python3 -m unittest -v \
     test_cinderx.test_kunpeng.test_interpreter_311 \
     test_cinderx.test_kunpeng.test_jit_unsupported_311 \
-    test_cinderx.test_kunpeng.test_observe_311
+    test_cinderx.test_kunpeng.test_observe_311 \
+    test_cinderx.test_kunpeng.test_canary_execute_311
 
 echo "[cp311-smoke] PASS"
