@@ -102,6 +102,21 @@ void funcUnpublishedInContext(Context* ctx, BorrowedRef<PyFunctionObject> func);
 void funcDestroyedInContext(Context* ctx, BorrowedRef<PyFunctionObject> func);
 
 /*
+ * Record that a unit-deletion notification may have been lost (the record's
+ * allocation failed inside a death callback, where nothing may throw).  The
+ * batch-compile entry points consume the mark and fail conservatively: a
+ * batch whose deleted-units view is incomplete must not compile.
+ */
+void poisonUnitDeletionTracking();
+
+/*
+ * Read and clear the poison mark.  The batch-compile entry points call this
+ * before trusting their deleted-units view; fault-injection tests call it to
+ * assert containment happened.
+ */
+bool consumeUnitDeletionTrackingPoison();
+
+/*
  * Test-only: invoked between force_uncompile()'s unpublication and its
  * artifact retirement, so a native case can drop the last external
  * reference in the middle of the operation.

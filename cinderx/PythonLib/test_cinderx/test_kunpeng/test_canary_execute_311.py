@@ -3418,6 +3418,116 @@ class CanaryExecute311Test(unittest.TestCase):
         )
         self.assertEqual(proc.returncode, 0, proc.stderr[-800:])
 
+    def test_death_callback_disable_enable_cannot_resurrect_the_dying(self):
+        # CPython clears every weak reference of a dying function BEFORE it
+        # runs any callback (newest first), so a user callback armed after
+        # the JIT's watch runs while the JIT's own callback is pending.  A
+        # disable(deopt_all=True) in that window used to hit the watch's
+        # corpse-replacement path: the cleared watch was erased, a fresh
+        # weak reference was hung on the refcount-zero function, the parked
+        # set took the raw pointer, and enable() -- its death-pending check
+        # blinded by the fresh watch -- resurrected the function with an
+        # INCREF from zero.  Both death paths (last DECREF and cyclic
+        # collection) must survive the full disable/enable round trip.
+        env = dict(os.environ)
+        env["CINDERX_JIT_MODE"] = "canary"
+        env["PYTHONJITAUTO"] = "1000000"
+        env["PYTHONMALLOC"] = "debug"
+        probe = textwrap.dedent(
+            """
+            import gc
+            import weakref
+            import _cinderx, cinderx
+            cinderx.init()
+            _cinderx.install_frame_evaluator()
+            import cinderjit
+
+            def make(name):
+                src = (
+                    "def %s(a, b):\\n"
+                    "    total = a - a\\n"
+                    "    while total < b:\\n"
+                    "        total = total + a\\n"
+                    "    return total\\n"
+                ) % name
+                ns = {}
+                exec(src, ns)
+                return ns.pop(name)
+
+            def deaths():
+                stats = _cinderx._get_trigger_stats()
+                return stats["function_destroyed_notifications"]
+
+            # A healthy sibling: the disable/enable round trip inside the
+            # callback must park and re-publish it without loss.
+            keeper = make("keeper")
+            assert cinderjit.force_compile(keeper) is True
+            assert keeper(2, 6) == 6
+
+            def run_arm(name, cyclic):
+                fn = make(name)
+                assert cinderjit.force_compile(fn) is True
+                assert fn(2, 6) == 6
+                before = deaths()
+                seen = {}
+
+                def on_death(_ref):
+                    # Recording the counter proves the ordering: the JIT's
+                    # callback has not delivered this death yet.
+                    seen["deaths_at_callback"] = deaths()
+                    cinderjit.disable(deopt_all=True)
+                    seen["listed_mid"] = [
+                        f.__qualname__
+                        for f in cinderjit.get_compiled_functions()
+                    ]
+                    cinderjit.enable()
+                    seen["listed_after"] = [
+                        f.__qualname__
+                        for f in cinderjit.get_compiled_functions()
+                    ]
+
+                # Armed after force_compile's watch, so it runs first.
+                w = weakref.ref(fn, on_death)
+                if cyclic:
+                    fn.__cycle__ = [fn]
+                    del fn
+                    gc.collect()
+                else:
+                    del fn
+                assert "deaths_at_callback" in seen, (
+                    "the user callback never ran (%s)" % name
+                )
+                assert seen["deaths_at_callback"] == before, (
+                    "the JIT callback ran before the user callback: the "
+                    "death-in-flight window was not exercised (%s)" % name
+                )
+                assert deaths() == before + 1, (name, before, deaths())
+                assert w() is None, name
+                assert name not in seen["listed_mid"], seen
+                assert name not in seen["listed_after"], seen
+
+            run_arm("dying_decref", False)
+            run_arm("dying_cycle", True)
+
+            # The sibling made both round trips; fresh work still compiles.
+            assert cinderjit.is_jit_compiled(keeper)
+            assert keeper(2, 6) == 6
+            fresh = make("fresh_after")
+            assert cinderjit.force_compile(fresh) is True
+            assert fresh(2, 6) == 6
+            print("survived death-window round trips")
+            """
+        )
+        proc = subprocess.run(
+            [sys.executable, "-c", probe],
+            capture_output=True,
+            text=True,
+            env=env,
+            timeout=120,
+        )
+        self.assertEqual(proc.returncode, 0, proc.stderr[-2000:])
+        self.assertIn("survived death-window round trips", proc.stdout)
+
 
 if __name__ == "__main__":
     unittest.main()

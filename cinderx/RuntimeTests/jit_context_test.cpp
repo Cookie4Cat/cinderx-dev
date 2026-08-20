@@ -717,6 +717,246 @@ def arm(func):
          "window was not exercised";
 }
 
+namespace {
+
+// Probe invoked from a user weak-reference callback while the watched
+// function is mid-death: its weak references are already cleared, the JIT's
+// own callback has not run.  Everything here reads through borrowed
+// pointers; taking a strong reference would itself resurrect the referent.
+struct DeathInFlightProbe {
+  jit::CompilerContext<jit::Compiler>* ctx{nullptr};
+  PyFunctionObject* func{nullptr};
+  bool ran{false};
+  bool pending_before{false};
+  bool watch_refused{false};
+  bool pending_after{false};
+  bool parked{true};
+  size_t watch_count_delta{~0u};
+};
+
+DeathInFlightProbe* g_death_in_flight_probe{nullptr};
+
+extern "C" PyObject* probeDeathInFlightForTest(PyObject*, PyObject*) {
+  DeathInFlightProbe* probe = g_death_in_flight_probe;
+  if (probe != nullptr && probe->ctx != nullptr && probe->func != nullptr) {
+    BorrowedRef<PyFunctionObject> func{probe->func};
+    size_t count_before = probe->ctx->watchedFunctionCount();
+    probe->ran = true;
+    probe->pending_before = probe->ctx->isFunctionDeathPending(func);
+    probe->watch_refused = !probe->ctx->watchFunctionDeath(func);
+    probe->pending_after = probe->ctx->isFunctionDeathPending(func);
+    probe->watch_count_delta =
+        probe->ctx->watchedFunctionCount() - count_before;
+    probe->ctx->addDeoptedFunc(func);
+    probe->parked = probe->ctx->deoptedFuncs().count(func) != 0;
+  }
+  Py_RETURN_NONE;
+}
+
+PyMethodDef kProbeDeathInFlight = {
+    "probe_death_in_flight",
+    probeDeathInFlightForTest,
+    METH_O,
+    nullptr,
+};
+
+} // namespace
+
+TEST_F(JITContextTest, DeathInFlightWatchIsATombstone) {
+  SKIP_311_EXECUTABLE_COMPILE();
+
+  // CPython clears every weak reference of a dying function before it runs
+  // any callback, newest callback first.  A user callback therefore sees
+  // the JIT's watch already cleared while the JIT's own callback is still
+  // pending -- and that cleared entry must behave as a tombstone: it keeps
+  // answering isFunctionDeathPending(), it cannot be replaced, and the
+  // park/publication paths it gates refuse the dying function.  Replacing
+  // it would hang a fresh weak reference on an object mid-teardown --
+  // outside the callback snapshot -- and enable() would then resurrect the
+  // function from a reference count of zero.
+  const char* py_src = R"(
+import weakref
+
+refs = []
+
+def lone(a, b):
+    total = a - a
+    while total < b:
+        total = total + a
+    return total
+
+def arm(func):
+    def on_death(ref):
+        probe_death_in_flight(None)
+    refs.append(weakref.ref(func, on_death))
+)";
+
+  Ref<PyFunctionObject> func(compileAndGet(py_src, "lone"));
+  ASSERT_NE(func, nullptr);
+  std::unique_ptr<jit::hir::Preloader> preloader(
+      jit::hir::Preloader::make(func, jit::makeFrameReifier(func->func_code)));
+  ASSERT_NE(preloader, nullptr);
+  ASSERT_EQ(
+      jit::compilePreloaderImpl(jit_ctx_.get(), *preloader, func),
+      jit::Result::OK);
+  ASSERT_EQ(jit_ctx_->watchedFunctionCount(), 1u);
+
+  DeathInFlightProbe probe;
+  probe.ctx = jit_ctx_.get();
+  probe.func = func.get();
+  g_death_in_flight_probe = &probe;
+
+  {
+    auto probe_fn =
+        Ref<>::steal(PyCFunction_New(&kProbeDeathInFlight, nullptr));
+    ASSERT_NE(probe_fn, nullptr);
+    ASSERT_EQ(
+        PyDict_SetItemString(
+            func->func_globals, "probe_death_in_flight", probe_fn.get()),
+        0);
+  }
+  {
+    // Armed after the JIT's watch, so the user callback runs first.
+    Ref<> arm(getGlobal("arm"));
+    ASSERT_NE(arm, nullptr);
+    auto armed = Ref<>::steal(PyObject_CallOneArg(
+        arm.get(), reinterpret_cast<PyObject*>(func.get())));
+    ASSERT_NE(armed, nullptr);
+  }
+
+  ASSERT_EQ(PyDict_DelItemString(func->func_globals, "lone"), 0);
+  uint64_t deaths_before =
+      jit::triggerStatsSnapshot().function_destroyed_notifications;
+  func.reset();
+  uint64_t deaths_after =
+      jit::triggerStatsSnapshot().function_destroyed_notifications;
+  g_death_in_flight_probe = nullptr;
+
+  ASSERT_TRUE(probe.ran) << "the user callback never ran";
+  EXPECT_TRUE(probe.pending_before)
+      << "the watch was not cleared when the user callback ran: the "
+         "death-in-flight window was not exercised";
+  EXPECT_TRUE(probe.watch_refused)
+      << "watchFunctionDeath() re-armed over a death in flight";
+  EXPECT_TRUE(probe.pending_after)
+      << "the death-in-flight tombstone was replaced";
+  EXPECT_EQ(probe.watch_count_delta, 0u)
+      << "the watch map changed size under a death in flight";
+  EXPECT_FALSE(probe.parked)
+      << "a function mid-death was parked as a borrowed pointer";
+  EXPECT_EQ(deaths_after, deaths_before + 1) << "the death was not delivered";
+  EXPECT_EQ(jit_ctx_->watchedFunctionCount(), 0u)
+      << "the tombstone outlived its own delivery";
+}
+
+TEST_F(JITContextTest, FunctionDeathCallbackContainsBookkeepingFailure) {
+  SKIP_311_EXECUTABLE_COMPILE();
+
+  // The death callback runs on a C destructor stack: a C++ exception must
+  // not cross it, the watch must still come down, and the failure must be
+  // recorded (poison) rather than swallowed.  The injected fault sits at
+  // the boundary's edge, after the interior cleanup has run.
+  const char* py_src = R"(
+def lone(a, b):
+    total = a - a
+    while total < b:
+        total = total + a
+    return total
+)";
+
+  Ref<PyFunctionObject> func(compileAndGet(py_src, "lone"));
+  ASSERT_NE(func, nullptr);
+  std::unique_ptr<jit::hir::Preloader> preloader(
+      jit::hir::Preloader::make(func, jit::makeFrameReifier(func->func_code)));
+  ASSERT_NE(preloader, nullptr);
+  ASSERT_EQ(
+      jit::compilePreloaderImpl(jit_ctx_.get(), *preloader, func),
+      jit::Result::OK);
+  ASSERT_EQ(jit_ctx_->watchedFunctionCount(), 1u);
+
+  ASSERT_EQ(PyDict_DelItemString(func->func_globals, "lone"), 0);
+  ASSERT_FALSE(jit::consumeUnitDeletionTrackingPoison());
+
+  jit::failJitPublishStepForTest(10);
+  uint64_t deaths_before =
+      jit::triggerStatsSnapshot().function_destroyed_notifications;
+  func.reset();
+  uint64_t deaths_after =
+      jit::triggerStatsSnapshot().function_destroyed_notifications;
+  jit::failJitPublishStepForTest(0);
+
+  EXPECT_EQ(deaths_after, deaths_before + 1)
+      << "cleanup did not run before the boundary fault";
+  EXPECT_EQ(jit_ctx_->watchedFunctionCount(), 0u)
+      << "the watch survived its own delivery";
+  EXPECT_TRUE(jit::consumeUnitDeletionTrackingPoison())
+      << "the contained failure was swallowed without a record";
+  EXPECT_FALSE(jit::consumeUnitDeletionTrackingPoison());
+  EXPECT_EQ(PyErr_Occurred(), nullptr);
+}
+
+TEST_F(JITContextTest, PoisonedDeletionTrackingFailsTheNextBatchOnce) {
+  SKIP_311_EXECUTABLE_COMPILE();
+
+  // A contained death-callback failure means a deletion notification may
+  // have been lost, and the mark it leaves has a consumer: the next batch
+  // preload must refuse conservatively -- an untrustworthy deleted-units
+  // view could keep a dead function -- and exactly once, so the machinery
+  // recovers.  The mark is planted through the real delivery path (a
+  // watched function dying with the boundary fault armed), not by calling
+  // the poison setter directly.  (3.11 plain-code preload runs no Python
+  // and takes no tracked allocation, so a mid-window death cannot be
+  // staged organically here; the shared batch sinks have their own
+  // fault-injection coverage where preload does run Python.)
+  const char* py_src = R"(
+def lone(a, b):
+    total = a - a
+    while total < b:
+        total = total + a
+    return total
+
+def other(a, b):
+    total = a - a
+    while total < b:
+        total = total + b
+    return total
+)";
+
+  Ref<PyFunctionObject> func(compileAndGet(py_src, "lone"));
+  ASSERT_NE(func, nullptr);
+  Ref<PyFunctionObject> other(getGlobal("other"));
+  ASSERT_NE(other, nullptr);
+  std::unique_ptr<jit::hir::Preloader> preloader(
+      jit::hir::Preloader::make(func, jit::makeFrameReifier(func->func_code)));
+  ASSERT_NE(preloader, nullptr);
+  ASSERT_EQ(
+      jit::compilePreloaderImpl(jit_ctx_.get(), *preloader, func),
+      jit::Result::OK);
+
+  ASSERT_EQ(PyDict_DelItemString(func->func_globals, "lone"), 0);
+  ASSERT_FALSE(jit::consumeUnitDeletionTrackingPoison());
+  jit::failJitPublishStepForTest(10);
+  func.reset();
+  jit::failJitPublishStepForTest(0);
+
+  // The batch consumer sees the mark exactly once.
+  std::vector<BorrowedRef<PyFunctionObject>> refused =
+      jit::preloadFuncAndDeps(other);
+  bool memory_error = PyErr_ExceptionMatches(PyExc_MemoryError);
+  PyErr_Clear();
+  EXPECT_TRUE(refused.empty())
+      << "a batch after a lost deletion record was allowed to proceed";
+  EXPECT_TRUE(memory_error)
+      << "the conservative failure did not report as a MemoryError";
+
+  std::vector<BorrowedRef<PyFunctionObject>> recovered =
+      jit::preloadFuncAndDeps(other);
+  EXPECT_FALSE(recovered.empty())
+      << "the poison mark was not consumed by the refused batch";
+  EXPECT_EQ(PyErr_Occurred(), nullptr);
+  jit::hir::preloaderManager().clear();
+}
+
 #endif
 
 TEST_F(JITContextTest, UnwatchableBuiltins) {
@@ -3509,6 +3749,34 @@ TEST_F(JITLifecycle311Test, CodeDeathIsReported) {
       after.code_destroyed_notifications, before.code_destroyed_notifications)
       << "no code-death notification; the free function is not wired to the "
          "JIT, and code-keyed registries will keep dead keys";
+}
+
+TEST_F(JITLifecycle311Test, CodeExtraFreeContainsHookFailure) {
+  SKIP_311_EXECUTABLE_COMPILE();
+
+  // The code-extra free function runs from inside code_dealloc: a C++
+  // exception must not cross it, the block must still be freed, and the
+  // failure must be recorded (poison) rather than swallowed.  The injected
+  // fault sits at the hook boundary's edge, after the notification's own
+  // bookkeeping has run.
+  ASSERT_FALSE(jit::consumeUnitDeletionTrackingPoison());
+  jit::TriggerStats before = jit::triggerStatsSnapshot();
+  {
+    Ref<> code = Ref<>::steal(Py_CompileString(
+        "def transient():\n    return 7\n", "<lifecycle>", Py_file_input));
+    ASSERT_NE(code, nullptr);
+    ASSERT_NE(codeExtra(reinterpret_cast<PyCodeObject*>(code.get())), nullptr);
+    jit::failJitPublishStepForTest(11);
+  }
+  jit::failJitPublishStepForTest(0);
+  jit::TriggerStats after = jit::triggerStatsSnapshot();
+  EXPECT_GT(
+      after.code_destroyed_notifications, before.code_destroyed_notifications)
+      << "cleanup did not run before the boundary fault";
+  EXPECT_TRUE(jit::consumeUnitDeletionTrackingPoison())
+      << "the contained failure was swallowed without a record";
+  EXPECT_FALSE(jit::consumeUnitDeletionTrackingPoison());
+  EXPECT_EQ(PyErr_Occurred(), nullptr);
 }
 
 TEST_F(JITLifecycle311Test, CodeExtraStaysAtOurOwnIndex) {

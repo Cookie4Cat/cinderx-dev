@@ -86,7 +86,10 @@ namespace jit {
 // insert, 4 = the compiled-codes insert, 5 = the code-extra reserve, where
 // the armed step models setCodeExtraCapped() failing with its MemoryError
 // set -- so the fault travels the reserve's real preserve-or-clear branch.
-// The failpoint clears when it fires.
+// Steps 9-11 model failures on the death-notification side: 9 = the batch
+// deleted-units record, 10 = the function death callback's bookkeeping,
+// 11 = the code-destroyed hook's bookkeeping.  The failpoint clears when
+// it fires.
 void failJitPublishStepForTest(int step);
 void throwIfJitPublishStepArmedForTest(int step);
 bool consumeJitPublishStepForTest(int step);

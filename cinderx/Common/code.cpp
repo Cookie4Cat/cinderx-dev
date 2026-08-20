@@ -63,8 +63,14 @@ void codeExtraFree(void* extra) {
   OwnedCodeExtra311* block = ownedBlockOf(extra);
   PyCodeObject* owner = block->owner;
   if (owner != nullptr && g_code_destroyed_hook != nullptr) {
-    // Key only.  code_dealloc is already tearing the object down.
-    g_code_destroyed_hook(owner);
+    // Key only.  code_dealloc is already tearing the object down, so no
+    // C++ exception may cross this boundary and the block must be freed
+    // on every path.  The hook contains its own failures; this arm is the
+    // last line of defense for a hook that does not.
+    try {
+      g_code_destroyed_hook(owner);
+    } catch (...) {
+    }
   }
   PyMem_Free(block);
 #else

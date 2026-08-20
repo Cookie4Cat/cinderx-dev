@@ -1667,6 +1667,10 @@ bool compile_all(size_t workers = 0) {
     std::vector<BorrowedRef<>> compilation_units;
     // units that were deleted during preloading
     std::unordered_set<BorrowedRef<>> deleted_units;
+    // The deletion record is taken inside a death callback, where nothing
+    // may throw; a failed record means the deleted-units view is
+    // incomplete and this batch cannot be trusted.
+    bool deletion_record_lost = false;
 
     auto& jit_reg_units =
         cinderx::getModuleState()->registered_compilation_units;
@@ -1688,13 +1692,26 @@ bool compile_all(size_t workers = 0) {
         }
         hir::Preloader* preloader = preloadWithUnitDeletedCallback(
             unit, [&](BorrowedRef<> deleted_unit) {
-              deleted_units.emplace(deleted_unit);
+              try {
+                throwIfJitPublishStepArmedForTest(9);
+                deleted_units.emplace(deleted_unit);
+              } catch (const std::bad_alloc&) {
+                deletion_record_lost = true;
+              }
             });
         if (!preloader) {
           return false;
         }
         compilation_units.push_back(unit);
       }
+    }
+
+    if (deletion_record_lost || consumeUnitDeletionTrackingPoison()) {
+      // A unit died during preloading and its record was lost; any entry
+      // below may be dead.  Refuse the whole batch rather than execute a
+      // guess.
+      PyErr_NoMemory();
+      return false;
     }
 
     // Filter out any units that were deleted as a side effect of preloading.
@@ -2008,6 +2025,15 @@ void disable_jit_impl(bool deopt_all) {
       // Advance before deoptFunc() which erases func from funcs,
       // invalidating the iterator pointing to it.
       ++it;
+#if PY_VERSION_HEX < 0x030C0000
+      // This walk is reachable from a user weak-reference callback while
+      // the function it watches is mid-death (weak references clear before
+      // the JIT's own callback runs).  Deopting would park a pointer whose
+      // owner is already being destroyed; its callback owns the cleanup.
+      if (jitCtx()->isFunctionDeathPending(func)) {
+        continue;
+      }
+#endif
       if (deoptFunc(func)) {
         success++;
       } else {
@@ -4611,23 +4637,36 @@ void unregisterFunctionCodes(BorrowedRef<PyFunctionObject> func) {
   auto& jit_code_outer_funcs = jitCtx()->codeOuterFunctions();
 
   BorrowedRef<PyCodeObject> top_code{func->func_code};
+  // The unconditional erases come first: this often runs under a C
+  // destructor, and erasing cannot fail while the nested walk below
+  // allocates.
+  jit_reg_units.erase(func);
+  jit_reg_units.erase(top_code);
+
   auto it = jit_code_outer_funcs.find(top_code);
   if (it != jit_code_outer_funcs.end() && it->second == func) {
     jit_code_outer_funcs.erase(it);
     PyObject* module = func->func_module;
     BorrowedRef<> top_consts{top_code->co_consts};
-    for (BorrowedRef<PyCodeObject> code : findNestedCodes(module, top_consts)) {
-      jit_reg_units.erase(code);
-      auto existing = jit_code_outer_funcs.find(code);
-      if (existing != jit_code_outer_funcs.end() && existing->second == func) {
-        jit_code_outer_funcs.erase(code);
+    try {
+      for (BorrowedRef<PyCodeObject> code :
+           findNestedCodes(module, top_consts)) {
+        jit_reg_units.erase(code);
+        auto existing = jit_code_outer_funcs.find(code);
+        if (existing != jit_code_outer_funcs.end() &&
+            existing->second == func) {
+          jit_code_outer_funcs.erase(code);
+        }
+        notifyUnitDeletedDuringPreload(mod_state, code.getObj());
       }
-      notifyUnitDeletedDuringPreload(mod_state, code.getObj());
+    } catch (const std::bad_alloc&) {
+      // The nested registrations could not be enumerated: some may remain,
+      // and their deletions were never announced, so no batch may trust
+      // its deleted-units view.
+      jit::poisonUnitDeletionTracking();
     }
   }
 
-  jit_reg_units.erase(func);
-  jit_reg_units.erase(top_code);
   notifyUnitDeletedDuringPreload(mod_state, func.getObj());
 }
 
@@ -4641,6 +4680,21 @@ void setUncompileMidpointHookForTest(void (*hook)()) {
 
 bool registerFunctionForTest(BorrowedRef<PyFunctionObject> func) {
   return registerFunction(func);
+}
+
+void poisonUnitDeletionTracking() {
+  if (auto* state = cinderx::getModuleState()) {
+    state->unit_deletion_tracking_failed = true;
+  }
+}
+
+bool consumeUnitDeletionTrackingPoison() {
+  auto* state = cinderx::getModuleState();
+  if (state == nullptr || !state->unit_deletion_tracking_failed) {
+    return false;
+  }
+  state->unit_deletion_tracking_failed = false;
+  return true;
 }
 
 bool roiBackoffAllowsCompile(BorrowedRef<PyCodeObject> code) {
@@ -4836,7 +4890,18 @@ int initialize() {
 #if PY_VERSION_HEX < 0x030C0000
   // 3.11 has no code watcher: the code-extra free function delivers the
   // watcher-equivalent notification (both modes; shadow populates too).
-  setCodeDestroyedHook([](PyCodeObject* code) { codeDestroyed(code); });
+  // The hook is invoked from inside code_dealloc, so no C++ exception may
+  // cross it; a caught failure means a deletion may have gone unrecorded.
+  setCodeDestroyedHook([](PyCodeObject* code) {
+    try {
+      codeDestroyed(code);
+      // The bookkeeping above is no-throw by construction; the injection
+      // models a fault at the boundary's edge, after cleanup has run.
+      throwIfJitPublishStepArmedForTest(11);
+    } catch (...) {
+      poisonUnitDeletionTracking();
+    }
+  });
 
   // The 3.11 attribute-cache default is explicitly OFF until the MR-09
   // pull-based invalidation acceptance; neither shadow nor canary may walk
@@ -5422,6 +5487,9 @@ std::vector<BorrowedRef<PyFunctionObject>> preloadFuncAndDeps(
 
   // Track units that are deleted while preloading.
   std::unordered_set<PyObject*> deleted_units;
+  // The deletion record is taken inside a death callback, where nothing may
+  // throw; losing one makes the pruning below unsound.
+  bool deletion_record_lost = false;
 
   worklist.push_back(func);
 
@@ -5437,7 +5505,12 @@ std::vector<BorrowedRef<PyFunctionObject>> preloadFuncAndDeps(
 
     hir::Preloader* preloader =
         preloadWithUnitDeletedCallback(f, [&](BorrowedRef<> deleted_unit) {
-          deleted_units.emplace(deleted_unit);
+          try {
+            throwIfJitPublishStepArmedForTest(9);
+            deleted_units.emplace(deleted_unit);
+          } catch (const std::bad_alloc&) {
+            deletion_record_lost = true;
+          }
         });
 
     if (preloader == nullptr) {
@@ -5468,6 +5541,15 @@ std::vector<BorrowedRef<PyFunctionObject>> preloadFuncAndDeps(
         worklist.push_back(target_func);
       }
     }
+  }
+
+  if (deletion_record_lost || consumeUnitDeletionTrackingPoison()) {
+    // A unit died during preloading and its record was lost; the pruning
+    // below could keep a dead function.  Fail the whole preload
+    // conservatively -- the caller's contract is an empty result with a
+    // Python error set.
+    PyErr_NoMemory();
+    return {};
   }
 
   // Prune out all functions that are no longer alive / allocated.

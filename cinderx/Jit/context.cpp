@@ -1394,14 +1394,25 @@ extern "C" PyObject* funcDeathWatch311(PyObject* self, PyObject* /*ref*/) {
   PyObject *type = nullptr, *value = nullptr, *traceback = nullptr;
   PyErr_Fetch(&type, &value, &traceback);
   Context* owner = cell->ctx;
-  if (owner != nullptr) {
+  // CPython invokes this from a C destructor stack (func_dealloc or the
+  // collector's weakref pass); a C++ exception must not cross it.  The
+  // interior bookkeeping is no-throw by construction; this arm is the
+  // boundary itself, and a caught failure means a deletion may have gone
+  // unrecorded -- poison the batch machinery rather than swallow it.
+  try {
+    // A null owner means the owning context died between the snapshot and
+    // this call.  Its registries are gone with it; the death is still
+    // real, so the process-wide accounting still runs.
     funcDestroyedInContext(owner, func);
+    // The bookkeeping above is no-throw by construction (erase-only, with
+    // its allocating walks contained at their sites); the injection models
+    // a fault at the boundary's edge, after cleanup has run.
+    throwIfJitPublishStepArmedForTest(10);
+  } catch (...) {
+    poisonUnitDeletionTracking();
+  }
+  if (owner != nullptr) {
     owner->forgetFunctionDeathWatch(func);
-  } else {
-    // The owning context died between the snapshot and this call.  Its
-    // registries are gone with it; the death is still real, so the
-    // process-wide accounting (and the notification counter) still runs.
-    funcDestroyedInContext(nullptr, func);
   }
   PyErr_Clear();
   PyErr_Restore(type, value, traceback);
@@ -1426,10 +1437,16 @@ bool Context::watchFunctionDeath(BorrowedRef<PyFunctionObject> func) {
         reinterpret_cast<PyObject*>(func.get())) {
       return true;
     }
-    // A corpse (cleared weak reference, delivery never ran) would satisfy
-    // the lookup for this address's next tenant and read as a death in
-    // flight; replace it defensively.
-    func_death_watch_.erase(it);
+    // A cleared referent is a death in flight, never a stale corpse: the
+    // map's strong reference to the weakref guarantees delivery on both
+    // death paths (dealloc batches every cleared callback, and a cyclic
+    // collection invokes externally rooted callbacks), and delivery is
+    // what erases this entry.  Replacing it would blind
+    // isFunctionDeathPending() and hang a fresh weak reference on an
+    // object mid-teardown -- outside the callback snapshot, so enable()
+    // would resurrect the referent from a reference count of zero.
+    // Refuse instead; the entry is a tombstone its own callback removes.
+    return false;
   }
   if (consumeJitPublishStepForTest(6)) {
     // Model the Python side of arming failing out of memory.  The real
