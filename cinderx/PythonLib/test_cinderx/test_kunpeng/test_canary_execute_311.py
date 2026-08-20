@@ -38,8 +38,8 @@ CHILD = textwrap.dedent(
     _cinderx.install_frame_evaluator()
     import cinderjit
 
-    assert cinderjit.is_attr_caches_enabled() is False, (
-        "3.11 attribute caches must default off until MR-09")
+    assert cinderjit.is_attr_caches_enabled() is True, (
+        "3.11 attribute caches default on since the MR-09 acceptance")
 
     def hot(a, b, one):
         total = a - a
@@ -96,15 +96,16 @@ class CanaryExecute311Test(unittest.TestCase):
             _cinderx.install_frame_evaluator()
             import cinderjit
 
-            def uses_attr(a):
-                return a.foo
+            def uses_subscr(a):
+                return a[0]
 
             try:
-                cinderjit.force_compile(uses_attr)
+                cinderjit.force_compile(uses_subscr)
             except RuntimeError as exc:
                 assert "CANNOT_SPECIALIZE" in str(exc), exc
             else:
-                raise SystemExit("execute surface failed to refuse LOAD_ATTR")
+                raise SystemExit(
+                    "execute surface failed to refuse BINARY_SUBSCR")
             """
         )
         proc = subprocess.run(
@@ -5666,6 +5667,517 @@ class CanaryExecute311Test(unittest.TestCase):
         )
         self.assertEqual(proc.returncode, 0, proc.stderr[-2000:])
         self.assertIn("injection sweep matched", proc.stdout)
+
+
+    # ------------------------------------------------------------------
+    # MR-09: pull-validated attribute caches.  3.11 has no dict/type
+    # watchers, so every cache entry proves its own validity at use time
+    # (captured tp_version_tag, keys versions, module dict version).
+    # These tests hold mutation visibility, object-protocol ordering,
+    # reentrancy and the observability contract with the caches on --
+    # and the off arm equal to the on arm.
+
+    def test_attr_cache_off_arm_matches_the_on_arm(self):
+        # -X jit-attr-caches / PYTHONJITATTRCACHES=0 is the comparison
+        # arm: identical answers with the caches off, and the tallies
+        # prove the off arm really ran uncached.
+        base = textwrap.dedent(
+            """
+            import json
+            import _cinderx, cinderx
+            cinderx.init()
+            _cinderx.install_frame_evaluator()
+            import cinderjit
+
+            class P:
+                def __init__(self, x):
+                    self.x = x
+
+                def ping(self):
+                    return self.x * 2
+
+            def work(p, v):
+                p.x = v
+                return p.ping() + p.x
+
+            ps = [P(i) for i in range(4)]
+            for _ in range(40):
+                for p in ps:
+                    work(p, p.x)
+            assert cinderjit.force_compile(work) is True
+            out = [work(p, i) for i, p in enumerate(ps)]
+            P.ping = lambda self: -self.x
+            out += [work(p, i + 10) for i, p in enumerate(ps)]
+            stats = cinderjit.get_attr_cache_stats()
+            total = sum(sum(cls.values()) for cls in stats.values())
+            print("JOURNAL " + json.dumps(
+                {"out": out, "cached": total, "enabled":
+                 cinderjit.is_attr_caches_enabled()}))
+            """
+        )
+
+        def run_arm(env_extra):
+            env = dict(os.environ)
+            env["CINDERX_JIT_MODE"] = "canary"
+            env["PYTHONJITAUTO"] = "1000000"
+            env.update(env_extra)
+            proc = subprocess.run(
+                [sys.executable, "-c", base],
+                capture_output=True,
+                text=True,
+                env=env,
+                timeout=120,
+            )
+            self.assertEqual(proc.returncode, 0, proc.stderr[-2000:])
+            for line in proc.stdout.splitlines():
+                if line.startswith("JOURNAL "):
+                    return json.loads(line[len("JOURNAL "):])
+            self.fail(f"no JOURNAL line: {proc.stdout!r}")
+
+        on = run_arm({})
+        off = run_arm({"PYTHONJITATTRCACHES": "0"})
+        self.assertEqual(on["out"], off["out"])
+        self.assertTrue(on["enabled"])
+        self.assertFalse(off["enabled"])
+        self.assertGreater(on["cached"], 0)
+        self.assertEqual(off["cached"], 0, "the off arm walked a cache")
+
+    def test_class_and_descriptor_mutation_matches_the_interpreter_arm(self):
+        # Every mutation must be visible on the very next call: method
+        # redefinition, a data descriptor (property) appearing over a
+        # plain method, its removal, and a non-data descriptor being
+        # shadowed -- with the caches retiring entries by pull.
+        probe = self._DUAL_ARM_PREAMBLE + textwrap.dedent(
+            """
+            class P:
+                def __init__(self, x):
+                    self.x = x
+
+                def ping(self):
+                    return ("method", self.x)
+
+            def read(p):
+                return p.ping()
+
+            def read_attr(p):
+                return p.x
+
+            ps = [P(i) for i in range(3)]
+            for _ in range(40):
+                for p in ps:
+                    read(p)
+                    read_attr(p)
+            compile_all(read, read_attr)
+            journal = []
+            journal.append([read(p) for p in ps])
+
+            P.ping = lambda self: ("redefined", self.x)
+            journal.append([read(p) for p in ps])
+
+            # The property returns a callable so read()'s p.ping() call
+            # goes through the descriptor and then invokes its result.
+            P.ping = property(
+                lambda self: (lambda: ("property", self.x)))
+            journal.append([read(p) for p in ps])
+
+            del P.ping
+            def late_ping(self):
+                return ("late", self.x)
+            P.ping = late_ping
+            journal.append([read(p) for p in ps])
+
+            # Data descriptor over the instance attribute: the property
+            # must win over any instance shadow.
+            ps[0].__dict__["y"] = "shadow"
+            P.y = property(lambda self: "descr")
+            def read_y(p):
+                return p.y
+            compile_all(read_y)
+            journal.append([read_y(p) for p in ps])
+            del P.y
+            journal.append([getattr(ps[0], "y", None),
+                            getattr(ps[1], "y", None)])
+
+            still_compiled(read, read_attr, read_y)
+            print("JOURNAL " + json.dumps(journal))
+            """
+        )
+        interp, jit = self._dual_arm(probe)
+        self.assertEqual(interp, jit)
+
+    def test_instance_shadow_and_dict_migration_matches_interp(self):
+        # Instance dict transitions: live inline values, a shadow added
+        # and deleted, vars() materializing the dict mid-stream, and new
+        # attributes growing the shared keys -- reads must track stock
+        # through every transition.
+        probe = self._DUAL_ARM_PREAMBLE + textwrap.dedent(
+            """
+            class P:
+                def __init__(self, x):
+                    self.x = x
+
+                def ping(self):
+                    return self.x
+
+            def read(p):
+                return (p.ping(), p.x)
+
+            ps = [P(i) for i in range(4)]
+            for _ in range(40):
+                for p in ps:
+                    read(p)
+            compile_all(read)
+            journal = [[read(p) for p in ps]]
+
+            ps[0].ping = lambda: "inst"
+            journal.append(read(ps[0]))
+            del ps[0].ping
+            journal.append(read(ps[0]))
+
+            # vars() materializes the managed dict; the cache must follow.
+            vars(ps[1])["x"] = 77
+            journal.append(read(ps[1]))
+            ps[1].x = 78
+            journal.append(read(ps[1]))
+
+            # Grow the instance storage attribute by attribute.
+            for i in range(24):
+                setattr(ps[2], "extra_%d" % i, i)
+            journal.append(read(ps[2]))
+            journal.append(sorted(vars(ps[2]).items())[:3])
+
+            still_compiled(read)
+            print("JOURNAL " + json.dumps(journal))
+            """
+        )
+        interp, jit = self._dual_arm(probe)
+        self.assertEqual(interp, jit)
+
+    def test_module_attr_mutation_matches_the_interpreter_arm(self):
+        # Module attribute loads and method calls are version-validated
+        # against the module dict; set, delete and restore must all be
+        # visible immediately.
+        probe = self._DUAL_ARM_PREAMBLE + textwrap.dedent(
+            """
+            import types
+
+            mod = types.ModuleType("mr9_mod")
+            mod.value = 1
+            mod.get = lambda: "get-1"
+
+            def read(m):
+                return (m.value, m.get())
+
+            for _ in range(40):
+                read(mod)
+            compile_all(read)
+            journal = [read(mod)]
+            mod.value = 2
+            journal.append(read(mod))
+            mod.get = lambda: "get-2"
+            journal.append(read(mod))
+            del mod.value
+            try:
+                read(mod)
+            except AttributeError as exc:
+                journal.append(str(exc))
+            mod.value = 3
+            journal.append(read(mod))
+            still_compiled(read)
+            print("JOURNAL " + json.dumps(journal))
+            """
+        )
+        interp, jit = self._dual_arm(probe)
+        self.assertEqual(interp, jit)
+
+    def test_getattr_hook_and_ordering_match_the_interpreter_arm(self):
+        # __getattr__ fires only when normal lookup fails; a non-data
+        # descriptor loses to an instance shadow; both must survive the
+        # cached path and its refills.
+        probe = self._DUAL_ARM_PREAMBLE + textwrap.dedent(
+            """
+            class NonData:
+                def __get__(self, obj, objtype=None):
+                    return "descr"
+
+            class P:
+                nd = NonData()
+
+                def __init__(self, x):
+                    self.x = x
+
+                def __getattr__(self, name):
+                    return ("getattr", name)
+
+            def read_missing(p):
+                return p.absent
+
+            def read_nd(p):
+                return p.nd
+
+            ps = [P(i) for i in range(3)]
+            for _ in range(40):
+                for p in ps:
+                    read_missing(p)
+                    read_nd(p)
+            compile_all(read_missing, read_nd)
+            journal = [[read_missing(p) for p in ps],
+                       [read_nd(p) for p in ps]]
+
+            ps[0].absent = "present-now"
+            journal.append(read_missing(ps[0]))
+            del ps[0].absent
+            journal.append(read_missing(ps[0]))
+
+            ps[1].nd = "shadowed"
+            journal.append([read_nd(p) for p in ps])
+
+            still_compiled(read_missing, read_nd)
+            print("JOURNAL " + json.dumps(journal))
+            """
+        )
+        interp, jit = self._dual_arm(probe)
+        self.assertEqual(interp, jit)
+
+    def test_reentrant_mutation_during_cached_access_is_safe(self):
+        # A __del__ fired by a cached store, mutating the class mid-store,
+        # must neither crash nor leave a stale entry serving the old
+        # layout.
+        env = dict(os.environ)
+        env["CINDERX_JIT_MODE"] = "canary"
+        env["PYTHONJITAUTO"] = "1000000"
+        env["PYTHONMALLOC"] = "debug"
+        probe = textwrap.dedent(
+            """
+            import _cinderx, cinderx
+            cinderx.init()
+            _cinderx.install_frame_evaluator()
+            import cinderjit
+
+            class P:
+                def __init__(self):
+                    self.slot = None
+
+                def ping(self):
+                    return "orig"
+
+            class Bomb:
+                def __del__(self):
+                    P.ping = lambda self: "mutated-by-del"
+
+            def store(p, v):
+                p.slot = v
+                return p.ping()
+
+            ps = [P() for _ in range(4)]
+            for _ in range(40):
+                for p in ps:
+                    store(p, object())
+            assert cinderjit.force_compile(store) is True
+
+            for p in ps:
+                p.slot = Bomb()
+            results = [store(p, None) for p in ps]
+            assert results[0] in ("orig", "mutated-by-del"), results
+            assert results[-1] == "mutated-by-del", results
+            assert store(ps[0], 1) == "mutated-by-del"
+            assert cinderjit.is_jit_compiled(store)
+            print("reentrant mutation safe")
+            """
+        )
+        proc = subprocess.run(
+            [sys.executable, "-c", probe],
+            capture_output=True,
+            text=True,
+            env=env,
+            timeout=120,
+        )
+        self.assertEqual(proc.returncode, 0, proc.stderr[-2000:])
+        self.assertIn("reentrant mutation safe", proc.stdout)
+
+    def test_mutation_hammer_stays_correct_over_100_rounds(self):
+        # 100 rounds of class mutation, instance shadowing and deletion
+        # interleaved with compiled access: values stay right, the
+        # artifact stays installed, and the pull checks keep retiring
+        # entries.
+        env = dict(os.environ)
+        env["CINDERX_JIT_MODE"] = "canary"
+        env["PYTHONJITAUTO"] = "1000000"
+        env["PYTHONMALLOC"] = "debug"
+        probe = textwrap.dedent(
+            """
+            import _cinderx, cinderx
+            cinderx.init()
+            _cinderx.install_frame_evaluator()
+            import cinderjit
+
+            class P:
+                def __init__(self, x):
+                    self.x = x
+
+                def ping(self):
+                    return ("gen", 0, self.x)
+
+            def read(p):
+                return p.ping()
+
+            def write(p, v):
+                p.x = v
+
+            ps = [P(i) for i in range(4)]
+            for _ in range(40):
+                for p in ps:
+                    read(p)
+                    write(p, p.x)
+            assert cinderjit.force_compile(read) is True
+            assert cinderjit.force_compile(write) is True
+
+            before = cinderjit.get_attr_cache_stats()
+            for round_no in range(100):
+                def make(round_no=round_no):
+                    def ping(self):
+                        return ("gen", round_no, self.x)
+                    return ping
+                P.ping = make()
+                for i, p in enumerate(ps):
+                    write(p, round_no * 10 + i)
+                    assert read(p) == ("gen", round_no, round_no * 10 + i)
+                shadowed = ps[round_no % 4]
+                shadowed.ping = lambda r=round_no: ("shadow", r)
+                assert read(shadowed) == ("shadow", round_no)
+                del shadowed.ping
+                assert read(shadowed)[0] == "gen"
+            after = cinderjit.get_attr_cache_stats()
+            assert cinderjit.is_jit_compiled(read)
+            assert cinderjit.is_jit_compiled(write)
+            inv = sum(
+                after[c]["invalidations"] - before[c]["invalidations"]
+                for c in after)
+            assert inv >= 100, ("mutations did not retire entries", inv)
+            print("mutation hammer survived")
+            """
+        )
+        proc = subprocess.run(
+            [sys.executable, "-c", probe],
+            capture_output=True,
+            text=True,
+            env=env,
+            timeout=300,
+        )
+        self.assertEqual(proc.returncode, 0, proc.stderr[-2000:])
+        self.assertIn("mutation hammer survived", proc.stdout)
+
+    def test_attr_cache_stats_cover_every_cache_class(self):
+        # The acceptance requires per-class fill/hit/miss/invalidation
+        # reporting; drive one workload through each class and require
+        # fills and hits to move where they must.
+        env = dict(os.environ)
+        env["CINDERX_JIT_MODE"] = "canary"
+        env["PYTHONJITAUTO"] = "1000000"
+        probe = textwrap.dedent(
+            """
+            import math
+            import _cinderx, cinderx
+            cinderx.init()
+            _cinderx.install_frame_evaluator()
+            import cinderjit
+
+            class P:
+                def __init__(self, x):
+                    self.x = x
+
+                def ping(self):
+                    return self.x
+
+                @staticmethod
+                def make():
+                    return "made"
+
+            # Cold compiles keep LOAD_ATTR unspecialized, so the loads go
+            # through the helper caches rather than the quickened guarded
+            # fast path.
+            ns = {"P": P, "math": math}
+            exec(
+                "def load(p):\\n"
+                "    return p.x\\n"
+                "def store(p, v):\\n"
+                "    p.x = v\\n"
+                "def method(p):\\n"
+                "    return p.ping()\\n"
+                "def type_method():\\n"
+                "    return P.make()\\n"
+                "def module_attr():\\n"
+                "    return math.pi\\n"
+                # A global receiver compiles as LOAD_ATTR + CALL (served
+                # by the module *attr* cache); the module *method* cache
+                # needs a LOAD_METHOD site, which an argument receiver
+                # quickened to LOAD_METHOD_MODULE provides.
+                "def module_method(m, v):\\n"
+                "    return m.sqrt(v)\\n",
+                ns,
+            )
+            fns = {k: ns[k] for k in (
+                "load", "store", "method", "type_method",
+                "module_attr", "module_method")}
+            # The module caches need the receiver proven to be a module,
+            # which the quickened LOAD_ATTR_MODULE / LOAD_METHOD_MODULE
+            # guard provides -- warm only those two; the instance-facing
+            # functions stay cold so their unspecialized loads drive the
+            # helper caches.
+            for _ in range(40):
+                fns["module_attr"]()
+                fns["module_method"](math, 16.0)
+            for fn in fns.values():
+                assert cinderjit.force_compile(fn) is True
+
+            p = P(4)
+            before = cinderjit.get_attr_cache_stats()
+            for _ in range(32):
+                assert fns["load"](p) == p.x
+                fns["store"](p, 4)
+                assert fns["method"](p) == 4
+                assert fns["type_method"]() == "made"
+                assert fns["module_attr"]() == math.pi
+                assert fns["module_method"](math, 16.0) == 4.0
+            after = cinderjit.get_attr_cache_stats()
+
+            expectations = {
+                "load_attr": True,
+                "store_attr": True,
+                "load_method": True,
+                # A 3.11 canary receiver never carries a static Type fact
+                # (globals are guarded loads, not baked constants), so the
+                # type-method cache is structurally unreachable; its
+                # pull-validated arm stays dormant and type-receiver
+                # method loads take the generic slow path instead.
+                "load_type_method": False,
+                "load_module_attr": True,
+                "load_module_method": True,
+            }
+            for cls, must_move in expectations.items():
+                delta_hits = after[cls]["hits"] - before[cls]["hits"]
+                delta_fills = after[cls]["fills"] - before[cls]["fills"]
+                if must_move:
+                    assert delta_hits > 0 or delta_fills > 0, (
+                        cls, before[cls], after[cls])
+                else:
+                    assert sum(after[cls].values()) == 0, (cls, after[cls])
+            # The type-receiver fixture still ran -- through the generic
+            # method path, counted as misses.
+            assert after["load_method"]["misses"] > (
+                before["load_method"]["misses"])
+            print("stats cover every class")
+            """
+        )
+        proc = subprocess.run(
+            [sys.executable, "-c", probe],
+            capture_output=True,
+            text=True,
+            env=env,
+            timeout=120,
+        )
+        self.assertEqual(proc.returncode, 0, proc.stderr[-2000:])
+        self.assertIn("stats cover every class", proc.stdout)
 
 
 if __name__ == "__main__":

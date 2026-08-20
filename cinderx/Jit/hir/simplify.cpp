@@ -2093,6 +2093,16 @@ Register* simplifyLoadAttrGenericDescriptor(Env& env, const DescrInfo& info) {
 Register* simplifyLoadAttrInstanceReceiver(
     Env& env,
     const LoadAttr* load_attr) {
+#if PY_VERSION_HEX < 0x030C0000
+  // The receiver specializations below bake type facts into machine code
+  // and lean on DeoptPatchpoint/TypeDeoptPatcher -- push invalidation a
+  // watcherless 3.11 can never deliver (and the running mode structurally
+  // refuses patchpoint-bearing artifacts).  3.11 attribute access goes
+  // through the pull-validated helper caches instead.
+  (void)env;
+  (void)load_attr;
+  return nullptr;
+#else
   Register* receiver = load_attr->GetOperand(0);
   Type type = receiver->type();
   BorrowedRef<PyTypeObject> py_type{type.runtimePyType()};
@@ -2135,6 +2145,7 @@ Register* simplifyLoadAttrInstanceReceiver(
     }
   }
   return nullptr;
+#endif
 }
 
 Register* simplifyLoadAttrTypeReceiver(Env& env, const LoadAttr* load_attr) {
@@ -2142,6 +2153,14 @@ Register* simplifyLoadAttrTypeReceiver(Env& env, const LoadAttr* load_attr) {
   if (!receiver->isA(TType)) {
     return nullptr;
   }
+
+#if PY_VERSION_HEX < 0x030C0000
+  // LoadTypeAttrCache's hit path is inline machine code (raw type/value
+  // reads); a watcherless 3.11 cannot retire its entries and the helper
+  // is only reached on a pointer mismatch, so there is no seam for a pull
+  // check.  Type-receiver attribute loads stay on the generic path.
+  return nullptr;
+#endif
 
   const int cache_id = env.func.env.allocateLoadTypeAttrCache();
   env.emit<UseType>(receiver, TType);
@@ -2240,6 +2259,13 @@ Register* simplifyIsNegativeAndErrOccurred(
 }
 
 bool simplifyStoreAttrInstanceReceiver(Env& env, const StoreAttr* store_attr) {
+#if PY_VERSION_HEX < 0x030C0000
+  // Baked member-descriptor stores have no pull seam either; see
+  // simplifyLoadAttrInstanceReceiver.
+  (void)env;
+  (void)store_attr;
+  return false;
+#endif
   Register* receiver = store_attr->GetOperand(0);
   Type type = receiver->type();
   BorrowedRef<PyTypeObject> py_type{type.runtimePyType()};

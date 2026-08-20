@@ -172,6 +172,17 @@ class AttributeMutator {
         offsetof(AttributeMutator, split_));
   }
 
+#if PY_VERSION_HEX < 0x030C0000
+  // Pull-based validity on 3.11 (no type watchers exist there): the
+  // receiver type's tp_version_tag captured at fill time.  A hit requires
+  // the live receiver's tag to equal this; PyType_Modified zeroes the tag
+  // and reassignment draws a fresh number from a monotonic global stream,
+  // so a stale -- or dead-and-reallocated -- type can never revalidate.
+  bool typeVersionMatches(PyTypeObject* live_type) const {
+    return live_type->tp_version_tag == type_version_;
+  }
+#endif
+
  private:
   void set_type(PyTypeObject* type, Kind kind);
   Kind get_kind() const {
@@ -181,6 +192,9 @@ class AttributeMutator {
   uintptr_t type_; // This value stores both a PyTypeObject* for the type object
                    // and the Kind enum value which are bitpacked together to
                    // reduce memory consumption
+#if PY_VERSION_HEX < 0x030C0000
+  uint32_t type_version_{0};
+#endif
   union {
     SplitMutator split_;
     CombinedMutator combined_;
@@ -330,6 +344,10 @@ class LoadMethodCache {
     BorrowedRef<PyTypeObject> type;
     BorrowedRef<> value;
     uint32_t keys_version;
+#if PY_VERSION_HEX < 0x030C0000
+    // Pull-based validity (see AttributeMutator::typeVersionMatches).
+    uint32_t type_version{0};
+#endif
 
     bool isValidKeysVersion(BorrowedRef<> obj);
   };
@@ -401,6 +419,15 @@ class LoadTypeMethodCache {
   BorrowedRef<> value_;
   std::unique_ptr<CacheStats> cache_stats_;
   bool is_unbound_meth_;
+#if PY_VERSION_HEX < 0x030C0000
+  // Pull-based validity: the receiver type's tag at fill time, plus the
+  // attribute name so a stale fast-path hit (getValueHelper receives only
+  // the receiver) can re-run the full lookup.  The name is borrowed from
+  // co_names of the code object whose site owns this cache; the owning
+  // CodeRuntime keeps that code alive.
+  uint32_t type_version_{0};
+  BorrowedRef<> name_;
+#endif
 };
 
 // A cache for an individual LoadModuleAttrCached instruction.
@@ -460,6 +487,31 @@ class LoadModuleMethodCache {
 
 // Invalidate all load/store attr caches for type
 void notifyICsTypeChanged(BorrowedRef<PyTypeObject> type);
+
+#if PY_VERSION_HEX < 0x030C0000
+// MR-09 observability: per-class cache tallies for the pull-validated 3.11
+// arms.  A hit consumed a validated entry; a miss took the slow path with
+// no usable entry; a fill wrote an entry; an invalidation is a pull check
+// retiring a stale entry.  Monotonic counters, read through
+// cinderjit.get_attr_cache_stats().
+struct AttrCacheClassStats {
+  uint64_t fills{0};
+  uint64_t hits{0};
+  uint64_t misses{0};
+  uint64_t invalidations{0};
+};
+
+struct AttrCacheStats311 {
+  AttrCacheClassStats load_attr;
+  AttrCacheClassStats store_attr;
+  AttrCacheClassStats load_method;
+  AttrCacheClassStats load_type_method;
+  AttrCacheClassStats load_module_attr;
+  AttrCacheClassStats load_module_method;
+};
+
+AttrCacheStats311& attrCacheStats311();
+#endif
 
 } // namespace jit
 
