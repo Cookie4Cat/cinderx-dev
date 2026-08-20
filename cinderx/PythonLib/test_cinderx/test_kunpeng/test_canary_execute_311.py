@@ -801,6 +801,92 @@ class CanaryExecute311Test(unittest.TestCase):
         self.assertEqual(proc.returncode, 0, proc.stderr[-800:])
         self.assertIn("binding TypeErrors match", proc.stdout)
 
+    def test_canary_keyword_binding_snapshot_and_exceptions(self):
+        # Binding can run arbitrary Python.  The invocation that already
+        # entered GuardedEntry must keep its pinned artifact: tracing or a
+        # __code__ swap in K.__eq__ must not retarget this call, and a
+        # pending exception from __eq__ must not be replayed.
+        env = dict(os.environ)
+        env["CINDERX_JIT_MODE"] = "canary"
+        env["PYTHONJITAUTO"] = "1000000"
+        probe = textwrap.dedent(
+            """
+            import sys
+            import _cinderx, cinderx
+            cinderx.init()
+            _cinderx.install_frame_evaluator()
+            import cinderjit
+
+            def entries():
+                return _cinderx._get_trigger_stats()["machine_code_entries"]
+
+            def traced(*, x):
+                return x
+            assert cinderjit.force_compile(traced) is True
+
+            class TraceKey(str):
+                __hash__ = str.__hash__
+                def __eq__(self, other):
+                    sys.settrace(lambda *a: None)
+                    return str.__eq__(self, other)
+
+            try:
+                assert traced(**{TraceKey("x"): 7}) == 7
+            finally:
+                sys.settrace(None)
+
+            calls = 0
+            class BoomKey(str):
+                __hash__ = str.__hash__
+                def __eq__(self, other):
+                    global calls
+                    calls += 1
+                    raise ValueError("boom")
+
+            def boom(*, x):
+                return x
+            assert cinderjit.force_compile(boom) is True
+            try:
+                boom(**{BoomKey("x"): 1})
+            except ValueError as exc:
+                assert str(exc) == "boom"
+            else:
+                raise SystemExit("expected ValueError")
+            assert calls == 1, calls
+
+            def old(*, x):
+                return x + 1
+            def new(*, x):
+                return x + 100
+            assert cinderjit.force_compile(old) is True
+
+            class SwapKey(str):
+                __hash__ = str.__hash__
+                def __eq__(self, other):
+                    old.__code__ = new.__code__
+                    return str.__eq__(self, other)
+
+            assert old(**{SwapKey("x"): 1}) == 2
+
+            def variadic(*args, **kwargs):
+                return (args, kwargs)
+            assert cinderjit.force_compile(variadic) is True
+            before = entries()
+            assert variadic(args=1) == ((), {"args": 1})
+            assert entries() - before == 1, entries() - before
+            print("keyword binding snapshot ok")
+            """
+        )
+        proc = subprocess.run(
+            [sys.executable, "-c", probe],
+            capture_output=True,
+            text=True,
+            env=env,
+            timeout=120,
+        )
+        self.assertEqual(proc.returncode, 0, proc.stderr[-800:])
+        self.assertIn("keyword binding snapshot ok", proc.stdout)
+
     def test_canary_load_global_builtin_without_guard(self):
         env = dict(os.environ)
         env["CINDERX_JIT_MODE"] = "canary"

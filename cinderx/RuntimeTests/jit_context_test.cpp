@@ -22,6 +22,10 @@
 #include <stdexcept>
 #include <string>
 
+#if defined(__linux__)
+#include <pthread.h>
+#endif
+
 #if PY_VERSION_HEX < 0x030C0000
 // A mode gate, not a version gate.  These cases compile and install
 // machine code, which on 3.11 the executing (canary) mode does and the
@@ -3681,6 +3685,82 @@ def defaulted(x):
       jit::triggerStatsSnapshot().machine_code_entries, entries_before + 2)
       << "live defaults must still enter machine code";
 }
+
+TEST_F(JITLifecycle311Test, ExecuteRefusalDoesNotLeaveUtf8Exception) {
+  SKIP_311_EXECUTABLE_COMPILE();
+
+  // A lone surrogate is a legal Python str and an illegal UTF-8 C string.
+  // The execute-refusal helpers must not convert through UTF-8, or a
+  // pending UnicodeEncodeError leaks into compileFunction / finalize.
+  const char* py_src = R"(
+def victim():
+    return 1
+)";
+  Ref<PyFunctionObject> func(compileAndGet(py_src, "victim"));
+  ASSERT_NE(func, nullptr);
+  auto bad = Ref<>::steal(PyUnicode_FromOrdinal(0xD800));
+  ASSERT_NE(bad, nullptr);
+  ASSERT_EQ(PyObject_SetAttrString(func, "__module__", bad), 0);
+  PyErr_Clear();
+  const char* reason = Ci_JitShell311_ExecuteRefusal(func);
+  EXPECT_EQ(PyErr_Occurred(), nullptr)
+      << "execute refusal left a UTF-8 conversion exception";
+  (void)reason;
+}
+
+#if defined(__linux__)
+TEST_F(JITLifecycle311Test, CStackLargeGuardRaisesRecursionError) {
+  SKIP_311_EXECUTABLE_COMPILE();
+
+  // CPython's usable stack base is pthread stack_addr + guard_size.
+  // A thread with a large guard region must still raise RecursionError
+  // rather than SIGSEGV into the guard page.
+  struct Payload {
+    int rc = 1;
+  } payload;
+
+  auto worker = +[](void* raw) -> void* {
+    auto* p = static_cast<Payload*>(raw);
+    PyGILState_STATE gstate = PyGILState_Ensure();
+    p->rc = PyRun_SimpleString(R"PY(
+import sys
+import cinderjit
+
+def rec(f, n):
+    if n:
+        return f(f, n - 1)
+    return 0
+
+assert cinderjit.force_compile(rec) is True
+old = sys.getrecursionlimit()
+sys.setrecursionlimit(10 ** 6)
+try:
+    rec(rec, 100000)
+    raise SystemExit("expected RecursionError")
+except RecursionError:
+    pass
+finally:
+    sys.setrecursionlimit(old)
+)PY");
+    PyGILState_Release(gstate);
+    return nullptr;
+  };
+
+  pthread_attr_t attr;
+  ASSERT_EQ(pthread_attr_init(&attr), 0);
+  ASSERT_EQ(pthread_attr_setguardsize(&attr, 64 * 1024), 0);
+  ASSERT_EQ(pthread_attr_setstacksize(&attr, 2 * 1024 * 1024), 0);
+  pthread_t thread;
+  ASSERT_EQ(pthread_create(&thread, &attr, worker, &payload), 0);
+  pthread_attr_destroy(&attr);
+  int join_rc;
+  Py_BEGIN_ALLOW_THREADS
+  join_rc = pthread_join(thread, nullptr);
+  Py_END_ALLOW_THREADS
+  ASSERT_EQ(join_rc, 0);
+  EXPECT_EQ(payload.rc, 0);
+}
+#endif
 
 TEST_F(JITLifecycle311Test, ReplacingCodeStopsTheOldMachineCode) {
   SKIP_311_EXECUTABLE_COMPILE();

@@ -57,12 +57,30 @@ bool canaryMode() {
   return jit::getConfig().state == jit::State::kRunning;
 }
 
-bool unicodeEquals311(BorrowedRef<> value, std::string_view expected) {
+bool unicodeEquals311(BorrowedRef<> value, const char* expected) {
   if (value == nullptr || !PyUnicode_Check(value)) {
     return false;
   }
-  const char* text = PyUnicode_AsUTF8(value);
-  return text != nullptr && std::string_view(text) == expected;
+  // ASCII compare: no UTF-8 conversion, so a lone surrogate cannot leave
+  // a pending exception on a refusal path.
+  return PyUnicode_EqualToUTF8(value, expected);
+}
+
+bool unicodeContainsAscii311(BorrowedRef<> value, const char* needle) {
+  if (value == nullptr || !PyUnicode_Check(value)) {
+    return false;
+  }
+  Ref<> needle_u = Ref<>::steal(PyUnicode_FromString(needle));
+  if (needle_u == nullptr) {
+    PyErr_Clear();
+    return true;
+  }
+  int rc = PyUnicode_Contains(value, needle_u);
+  if (rc < 0) {
+    PyErr_Clear();
+    return true;
+  }
+  return rc == 1;
 }
 
 // Mirrors pyjit.cpp: compiling importlib or cinderx on 3.11 is ineligible
@@ -81,16 +99,10 @@ bool isImportlibBootstrap311(BorrowedRef<PyFunctionObject> func) {
     return true;
   }
   BorrowedRef<PyCodeObject> code{func->func_code};
-  if (code == nullptr || code->co_filename == nullptr ||
-      !PyUnicode_Check(code->co_filename)) {
+  if (code == nullptr) {
     return false;
   }
-  const char* file = PyUnicode_AsUTF8(code->co_filename);
-  if (file == nullptr) {
-    return false;
-  }
-  return std::string_view(file).find("importlib._bootstrap") !=
-      std::string_view::npos;
+  return unicodeContainsAscii311(code->co_filename, "importlib._bootstrap");
 }
 
 const char* eligibilityReason(BorrowedRef<PyFunctionObject> func) {
@@ -214,17 +226,60 @@ const char* unsupportedSharedArtifact311(BorrowedRef<PyFunctionObject> func) {
 }
 
 // CPython 3.14's c_stack_soft_limit is a PyThreadStateImpl field this
-// 3.11 tstate does not have.  Cache the same geometry per thread: hard
-// limit one margin above the OS stack base, soft limit two margins (stacks
-// grow down).
+// 3.11 tstate does not have.  Cache the same geometry per thread: usable
+// base is the pthread stack address plus the guard region, then hard
+// limit one margin above that base and soft limit two margins (stacks
+// grow down).  Sanitizer builds use a 32 KiB margin, matching
+// _PyOS_STACK_MARGIN_BYTES.
+#if defined(__SANITIZE_ADDRESS__) || defined(__SANITIZE_THREAD__)
+constexpr std::uintptr_t kCStackMarginBytes311 = 32 * 1024;
+#elif defined(__has_feature)
+#if __has_feature(address_sanitizer) || __has_feature(thread_sanitizer)
+constexpr std::uintptr_t kCStackMarginBytes311 = 32 * 1024;
+#else
 constexpr std::uintptr_t kCStackMarginBytes311 = 16 * 1024;
+#endif
+#else
+constexpr std::uintptr_t kCStackMarginBytes311 = 16 * 1024;
+#endif
 
 thread_local std::uintptr_t t_c_stack_soft_limit = 0;
 thread_local std::uintptr_t t_c_stack_hard_limit = 0;
+thread_local jit::CompiledFunction* t_invocation_artifact = nullptr;
+
+class InvocationArtifactScope {
+ public:
+  explicit InvocationArtifactScope(jit::CompiledFunction* compiled)
+      : prev_(t_invocation_artifact) {
+    t_invocation_artifact = compiled;
+  }
+  ~InvocationArtifactScope() {
+    t_invocation_artifact = prev_;
+  }
+  InvocationArtifactScope(const InvocationArtifactScope&) = delete;
+  InvocationArtifactScope& operator=(const InvocationArtifactScope&) = delete;
+
+ private:
+  jit::CompiledFunction* prev_;
+};
 
 std::uintptr_t machineStackPointer311() {
+  // pthread_getattr_np reports the OS thread stack.  A C local's address
+  // is the ASAN fake stack and sits in a different mapping; using it
+  // here trips the hard margin on the first deep canary RuntimeTest that
+  // actually enters machine code.
+#if defined(__aarch64__)
+  std::uintptr_t sp;
+  __asm__ volatile("mov %0, sp" : "=r"(sp));
+  return sp;
+#elif defined(__x86_64__)
+  std::uintptr_t sp;
+  __asm__ volatile("movq %%rsp, %0" : "=r"(sp));
+  return sp;
+#else
   volatile char here;
   return reinterpret_cast<std::uintptr_t>(&here);
+#endif
 }
 
 void initCStackLimits311() {
@@ -236,15 +291,20 @@ void initCStackLimits311() {
   if (pthread_getattr_np(pthread_self(), &attr) == 0) {
     void* stackaddr = nullptr;
     size_t stacksize = 0;
-    if (pthread_attr_getstack(&attr, &stackaddr, &stacksize) == 0 &&
-        stackaddr != nullptr && stacksize > 3 * kCStackMarginBytes311) {
-      auto base = reinterpret_cast<std::uintptr_t>(stackaddr);
-      t_c_stack_hard_limit = base + kCStackMarginBytes311;
-      t_c_stack_soft_limit = base + 2 * kCStackMarginBytes311;
-      pthread_attr_destroy(&attr);
-      return;
-    }
+    size_t guard_size = 0;
+    int err = pthread_attr_getstack(&attr, &stackaddr, &stacksize);
+    err |= pthread_attr_getguardsize(&attr, &guard_size);
     pthread_attr_destroy(&attr);
+    if (err == 0 && stackaddr != nullptr) {
+      auto raw = reinterpret_cast<std::uintptr_t>(stackaddr);
+      auto base = raw + guard_size;
+      auto top = raw + stacksize;
+      if (top > base + 3 * kCStackMarginBytes311) {
+        t_c_stack_hard_limit = base + kCStackMarginBytes311;
+        t_c_stack_soft_limit = base + 2 * kCStackMarginBytes311;
+        return;
+      }
+    }
   }
 #endif
   std::uintptr_t here = machineStackPointer311();
@@ -371,6 +431,10 @@ extern "C" void* Ci_JitShell311_InstalledArtifact(PyFunctionObject* func) {
   return compiled;
 }
 
+extern "C" void* Ci_JitShell311_InvocationArtifact(void) {
+  return t_invocation_artifact;
+}
+
 extern "C" PyObject* Ci_JitShell311_GuardedEntry(
     PyObject* func_obj,
     PyObject* const* args,
@@ -402,8 +466,12 @@ extern "C" PyObject* Ci_JitShell311_GuardedEntry(
   // drop the artifact's last reference -- clearing the function's __dict__
   // is a documented way to uncompile -- which would free the very code
   // buffer being executed.  The reference is held until machine code has
-  // returned.
+  // returned.  The same pin is the invocation snapshot for argument
+  // binding: keyword equality can run user Python that enables tracing,
+  // disables the JIT or swaps __code__, and that must not retarget this
+  // call onto a different artifact or the interpreter's vectorcall layout.
   Ref<jit::CompiledFunction> pin{Ref<jit::CompiledFunction>::create(compiled)};
+  InvocationArtifactScope invocation(compiled);
   PyObject* result =
       compiled->vectorcallEntry()(func_obj, args, nargsf, kwnames);
   Py_LeaveRecursiveCall();
