@@ -157,6 +157,24 @@ static void reifyLocalsplus(
 
   BorrowedRef<PyCodeObject> code = frameCode(frame);
   int free_offset = numLocalsplus(code) - numFreevars(code);
+#if PY_VERSION_HEX < 0x030C0000
+  // The executing mode writes locals through to the frame for observers
+  // (MR-08 frame observability), so these slots may hold owned
+  // references that the reified value replaces.
+  for (std::size_t i = 0; i < free_offset && i < frame_meta.localsplus.size();
+       i++) {
+    const LiveValue* value = meta.getLocalValue(i, frame_meta);
+    PyObject* prev = *localsplus;
+    if (value == nullptr) {
+      // Value is dead
+      *localsplus = nullptr;
+    } else {
+      *localsplus = mem.readOwned(*value).release();
+    }
+    Py_XDECREF(prev);
+    localsplus++;
+  }
+#else
   // Local variables are not initialized in the frame
   for (std::size_t i = 0; i < free_offset && i < frame_meta.localsplus.size();
        i++) {
@@ -170,6 +188,7 @@ static void reifyLocalsplus(
     }
     localsplus++;
   }
+#endif
 
   // Free variables are initialized
   for (std::size_t i = free_offset; i < frame_meta.localsplus.size(); i++) {

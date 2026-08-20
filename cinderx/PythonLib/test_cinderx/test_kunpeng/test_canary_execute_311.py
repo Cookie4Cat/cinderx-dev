@@ -15,6 +15,21 @@ import sys
 import textwrap
 import unittest
 
+def _capability_clean_env():
+    """A child environment with every JIT-capability variable removed.
+
+    Dual-arm oracles must fail closed: an interp/stock arm that inherits
+    CINDERX_JIT_MODE=canary from the parent would silently compare the jit
+    arm against itself.  Mirrors the prefix scrub the jit311 runners apply
+    to their children.
+    """
+    return {
+        key: value
+        for key, value in os.environ.items()
+        if not key.startswith(("PYTHONJIT", "CINDERX_", "PARALLEL_GC_"))
+    }
+
+
 CHILD = textwrap.dedent(
     """
     import json
@@ -2772,7 +2787,7 @@ class CanaryExecute311Test(unittest.TestCase):
         )
 
         def run_arm(mode):
-            env = dict(os.environ)
+            env = _capability_clean_env()
             if mode == "jit":
                 env["CINDERX_JIT_MODE"] = "canary"
                 env["PYTHONJITAUTO"] = "1000000"
@@ -5071,7 +5086,7 @@ class CanaryExecute311Test(unittest.TestCase):
         return the two stdout JOURNAL payloads."""
 
         def run_arm(mode):
-            env = dict(os.environ)
+            env = _capability_clean_env()
             if mode == "jit":
                 env["CINDERX_JIT_MODE"] = "canary"
                 env["PYTHONJITAUTO"] = "1000000"
@@ -5452,68 +5467,52 @@ class CanaryExecute311Test(unittest.TestCase):
         self.assertEqual(proc.returncode, 0, proc.stderr[-2000:])
         self.assertIn("operand stack released", proc.stdout)
 
-    def test_getframe_from_a_callee_sees_a_consistent_jit_frame(self):
-        # A callee inspecting the running machine-code frame sees a
-        # consistent frame: the right code object, a line-accurate
-        # f_lineno (the UpdatePrevInstr pass stores prev_instr at line
-        # transitions), a walkable f_back chain and a readable f_locals.
-        # Live locals are the one non-stock corner: values live in
-        # registers until a deopt boundary reifies them, so mid-flight
-        # f_locals is empty rather than showing the arguments; the
-        # handler-frame-state test pins the reified side.
-        env = dict(os.environ)
-        env["CINDERX_JIT_MODE"] = "canary"
-        env["PYTHONJITAUTO"] = "1000000"
-        probe = textwrap.dedent(
+    def test_getframe_from_a_callee_matches_the_interpreter_arm(self):
+        # A callee inspecting the running machine-code frame must see what
+        # stock shows: the exact f_locals content (arguments, rebound
+        # values, locals assigned so far, deletions), the call line, and
+        # the frame chain.  The executing mode writes every local store
+        # through to the materialized frame for exactly this reason.
+        probe = self._DUAL_ARM_PREAMBLE + textwrap.dedent(
             """
-            import sys
             import traceback
-            import _cinderx, cinderx
-            cinderx.init()
-            _cinderx.install_frame_evaluator()
-            import cinderjit
-
-            seen = {}
 
             def peek():
                 fr = sys._getframe(1)
-                seen["name"] = fr.f_code.co_name
-                seen["locals"] = dict(fr.f_locals)
-                seen["back"] = fr.f_back.f_code.co_name
-                seen["lineno"] = fr.f_lineno
-                seen["firstlineno"] = fr.f_code.co_firstlineno
-                seen["stack_names"] = [
-                    entry.name for entry in traceback.extract_stack(fr)
-                ][-2:]
-                return 0
+                return {
+                    "name": fr.f_code.co_name,
+                    "locals": {
+                        k: v
+                        for k, v in fr.f_locals.items()
+                        if k not in ("cb",)
+                    },
+                    "cb_present": "cb" in fr.f_locals,
+                    "back": fr.f_back.f_code.co_name,
+                    "line_delta": fr.f_lineno - fr.f_code.co_firstlineno,
+                    "stack_tail": [
+                        entry.name for entry in traceback.extract_stack(fr)
+                    ][-2:],
+                }
 
             def caller(n, cb):
-                return cb() + n
+                n = n + 1
+                m = n * 2
+                snap = cb()
+                del m
+                snap2 = cb()
+                return (snap, snap2, n)
 
             def driver():
                 return caller(7, peek)
 
-            assert cinderjit.force_compile(caller) is True
-            assert driver() == 7
-            assert cinderjit.is_jit_compiled(caller)
-            assert seen["name"] == "caller", seen
-            assert isinstance(seen["locals"], dict), seen
-            assert seen["back"] == "driver", seen
-            assert seen["lineno"] == seen["firstlineno"] + 1, (
-                "the running frame must name the call line", seen)
-            assert seen["stack_names"][-1] == "caller", seen
-            print("callee observation consistent")
+            compile_all(caller)
+            journal = driver()
+            still_compiled(caller)
+            print("JOURNAL " + json.dumps(journal))
             """
         )
-        proc = subprocess.run(
-            [sys.executable, "-c", probe],
-            capture_output=True,
-            text=True,
-            env=env,
-            timeout=120,
-        )
-        self.assertEqual(proc.returncode, 0, proc.stderr[-2000:])
-        self.assertIn("callee observation consistent", proc.stdout)
+        interp, jit = self._dual_arm(probe)
+        self.assertEqual(interp, jit)
 
     def test_current_frames_from_another_thread_sees_the_running_loop(self):
         # sys._current_frames() from a second thread must observe the
@@ -5563,7 +5562,7 @@ class CanaryExecute311Test(unittest.TestCase):
                     while fr is not None:
                         if fr.f_code.co_name == "spin":
                             observed.append(
-                                (fr.f_code.co_name, fr.f_lasti))
+                                (fr.f_lasti, dict(fr.f_locals)))
                             break
                         fr = fr.f_back
                     if observed:
@@ -5574,9 +5573,15 @@ class CanaryExecute311Test(unittest.TestCase):
             t.join(60)
             assert not t.is_alive(), "the loop never honored the stop flag"
             assert observed, "the running compiled loop was never observed"
-            name, lasti = observed[0]
-            assert name == "spin"
+            lasti, frame_locals = observed[0]
             assert isinstance(lasti, int)
+            # Observable frame state, not just survival: the sampled frame
+            # must show the same locals stock would -- the arguments and
+            # the loop counter written through as it advances.
+            assert frame_locals.get("limit") == 2_000_000_000, frame_locals
+            assert frame_locals.get("one") == 1, frame_locals
+            assert callable(frame_locals.get("stop")), frame_locals
+            assert isinstance(frame_locals.get("i"), int), frame_locals
             print("current_frames observed the loop")
             """
         )
@@ -5726,6 +5731,60 @@ class CanaryExecute311Test(unittest.TestCase):
         )
         self.assertEqual(proc.returncode, 0, proc.stderr[-2000:])
         self.assertIn("signal interrupted the compiled loop", proc.stdout)
+
+    def test_handler_only_opcodes_do_not_refuse_the_function(self):
+        # The execute whitelist is scoped to normal-flow-reachable
+        # instructions: an opcode that occurs solely inside an
+        # exception-handler region runs in the interpreter after the
+        # deopt regardless of what it is, so STORE_DEREF or a subscript
+        # in a handler must not refuse a function whose normal path this
+        # milestone fully supports.  A normal-flow subscript still
+        # refuses.
+        probe = self._DUAL_ARM_PREAMBLE + textwrap.dedent(
+            """
+            def make_counter():
+                count = 0
+
+                def bump(a, b):
+                    nonlocal count
+                    try:
+                        return a // b
+                    except ZeroDivisionError:
+                        count = count + 1
+                        return -count
+
+                return bump
+
+            def pick(d, k, z):
+                try:
+                    return 10 // z
+                except ZeroDivisionError:
+                    return d[k]
+
+            bump = make_counter()
+            compile_all(bump, pick)
+            journal = [
+                bump(6, 2), bump(6, 0), bump(6, 0),
+                pick({"k": "v"}, "k", 2), pick({"k": "v"}, "k", 0),
+            ]
+            if mode == "jit":
+                def normal_flow_subscr(d, k):
+                    return d[k]
+
+                try:
+                    cinderjit.force_compile(normal_flow_subscr)
+                except RuntimeError as exc:
+                    assert "CANNOT_SPECIALIZE" in str(exc), exc
+                else:
+                    raise SystemExit(
+                        "a normal-flow subscript compiled; the reachability "
+                        "scope leaks")
+            still_compiled(bump, pick)
+            print("JOURNAL " + json.dumps(journal))
+            """
+        )
+        interp, jit = self._dual_arm(probe)
+        self.assertEqual(interp, jit)
 
     def test_except_star_shapes_stay_refused(self):
         # The MR-08 audit keeps except* refused: PREP_RERAISE_STAR has no
