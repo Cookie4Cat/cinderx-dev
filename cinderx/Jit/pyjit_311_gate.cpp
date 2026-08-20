@@ -77,8 +77,7 @@ bool isImportlibBootstrap311(BorrowedRef<PyFunctionObject> func) {
   if (unicodeEquals311(func->func_module, "_frozen_importlib") ||
       unicodeEquals311(func->func_module, "_frozen_importlib_external") ||
       unicodeEquals311(func->func_module, "importlib._bootstrap") ||
-      unicodeEquals311(
-          func->func_module, "importlib._bootstrap_external")) {
+      unicodeEquals311(func->func_module, "importlib._bootstrap_external")) {
     return true;
   }
   BorrowedRef<PyCodeObject> code{func->func_code};
@@ -238,8 +237,7 @@ void initCStackLimits311() {
     void* stackaddr = nullptr;
     size_t stacksize = 0;
     if (pthread_attr_getstack(&attr, &stackaddr, &stacksize) == 0 &&
-        stackaddr != nullptr &&
-        stacksize > 3 * kCStackMarginBytes311) {
+        stackaddr != nullptr && stacksize > 3 * kCStackMarginBytes311) {
       auto base = reinterpret_cast<std::uintptr_t>(stackaddr);
       t_c_stack_hard_limit = base + kCStackMarginBytes311;
       t_c_stack_soft_limit = base + 2 * kCStackMarginBytes311;
