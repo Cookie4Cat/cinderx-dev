@@ -172,6 +172,78 @@ class CanaryExecute311Test(unittest.TestCase):
         )
         self.assertEqual(proc.returncode, 0, proc.stderr[-800:])
 
+    def test_canary_calling_none_raises_typeerror(self):
+        env = dict(os.environ)
+        env["CINDERX_JIT_MODE"] = "canary"
+        env["PYTHONJITAUTO"] = "1000000"
+        probe = textwrap.dedent(
+            """
+            import _cinderx, cinderx
+            cinderx.init()
+            _cinderx.install_frame_evaluator()
+            import cinderjit
+
+            def call_local(x):
+                return x()
+
+            def call_const():
+                return None()
+
+            class Box:
+                x = None
+
+            def call_attr(obj):
+                return obj.x()
+
+            def star_kw(fn, kw):
+                return fn(**kw)
+
+            def star_args(fn, args):
+                return fn(*args)
+
+            for func in (
+                call_local, call_const, call_attr, star_kw, star_args,
+            ):
+                assert cinderjit.force_compile(func) is True, func.__name__
+
+            def expect_typeerror(fn, *args):
+                try:
+                    fn(*args)
+                except TypeError as exc:
+                    return type(exc), str(exc)
+                raise SystemExit("expected TypeError from %s" % fn.__name__)
+
+            for fn, args in (
+                (call_local, (None,)),
+                (call_const, ()),
+                (call_attr, (Box(),)),
+            ):
+                exc_t, msg = expect_typeerror(fn, *args)
+                assert exc_t is TypeError, (fn.__name__, exc_t, msg)
+                assert "NoneType" in msg and "not callable" in msg, (
+                    fn.__name__, msg)
+
+            exc_t, msg = expect_typeerror(star_kw, lambda **k: k, 1)
+            assert exc_t is TypeError, (exc_t, msg)
+            assert "mapping" in msg, msg
+
+            exc_t, msg = expect_typeerror(star_args, lambda *a: a, 1)
+            assert exc_t is TypeError, (exc_t, msg)
+            assert "iterable" in msg, msg
+
+            print("calling None and CallEx TypeErrors held")
+            """
+        )
+        proc = subprocess.run(
+            [sys.executable, "-c", probe],
+            capture_output=True,
+            text=True,
+            env=env,
+            timeout=120,
+        )
+        self.assertEqual(proc.returncode, 0, proc.stderr[-800:])
+        self.assertIn("calling None and CallEx TypeErrors held", proc.stdout)
+
     def test_canary_executes_call_family_with_local_callees(self):
         env = dict(os.environ)
         env["CINDERX_JIT_MODE"] = "canary"

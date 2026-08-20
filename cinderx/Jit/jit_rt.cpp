@@ -205,14 +205,16 @@ static int JITRT_BindKeywordArgs(
 // compiled body at JITRT_CALL_REENTRY_OFFSET before the vectorcall entry.
 // On 3.11 func->vectorcall is Ci_JitShell311_GuardedEntry, not that
 // generated entry, so subtracting the offset from it would jump into
-// unrelated bytes.  Use the artifact's own entry instead.
+// unrelated bytes.  Use the artifact's own entry instead.  If the
+// artifact is gone, interpret: GET_REENTRY(GuardedEntry) is the bug
+// this helper exists to avoid.
 static vectorcallfunc jitrtBoundArgsReentry(PyFunctionObject* func) {
   auto* compiled = reinterpret_cast<jit::CompiledFunction*>(
       Ci_JitShell311_InstalledArtifact(func));
   if (compiled != nullptr) {
     return JITRT_GET_REENTRY(compiled->vectorcallEntry());
   }
-  return JITRT_GET_REENTRY(func->vectorcall);
+  return getInterpretedVectorcall(func);
 }
 #define JITRT_BOUND_ARGS_REENTRY(func) jitrtBoundArgsReentry(func)
 #else
@@ -1078,6 +1080,9 @@ JITRT_CallFunctionEx(PyObject* func, PyObject* pargs, PyObject* kwargs) {
         Py_DECREF(d);
         if (PyErr_ExceptionMatches(PyExc_AttributeError)) {
 #if PY_VERSION_HEX < 0x030C0000
+          // ceval format_kwargs_error clears first: FunctionStr is not
+          // safe with AttributeError still set.
+          PyErr_Clear();
           PyObject* funcstr = _PyObject_FunctionStr(func);
           if (funcstr != nullptr) {
             PyErr_Format(
@@ -1109,6 +1114,9 @@ JITRT_CallFunctionEx(PyObject* func, PyObject* pargs, PyObject* kwargs) {
 #if PY_VERSION_HEX < 0x030C0000
       // Stock 3.11 uses _PyObject_FunctionStr so the message carries the
       // qualified name (module.qualname) rather than co_name + "()".
+      // Clear first: ceval check_args_iterable may run with a live
+      // exception, and FunctionStr is not exception-safe.
+      PyErr_Clear();
       PyObject* funcstr = _PyObject_FunctionStr(func);
       if (funcstr != nullptr) {
         PyErr_Format(
@@ -1164,14 +1172,15 @@ PyObject* JITRT_Call(
   // PUSH_NULL / LOAD_GLOBAL|1 puts nullptr in the callable slot and the
   // callable in self(); a LOAD_METHOD miss puts Py_None in the callable
   // slot (HIR uses None, not nullptr, because nullptr means deopt) and
-  // the attribute in self().  Either dummy is an artificial vectorcall
-  // argument and must not be passed through.  Do not treat a real None
-  // in self() as a dummy -- that is a positional argument.  The offset
-  // flag is dropped because the slot below the shifted args is that
-  // dummy, not callee scratch.
+  // the attribute in self().  Calling a real None uses LOAD_FAST /
+  // LOAD_CONST then PUSH_NULL, so callable is None and self is nullptr
+  // -- that is not a miss, and shifting would vectorcall a null
+  // pointer.  Only treat Py_None as a dummy when self is present.
+  // The offset flag is dropped because the slot below the shifted args
+  // is that dummy, not callee scratch.
   constexpr size_t kVectorcallOffset =
       static_cast<size_t>(PY_VECTORCALL_ARGUMENTS_OFFSET);
-  if (callable == nullptr || callable == Py_None) {
+  if (callable == nullptr || (callable == Py_None && args[0] != nullptr)) {
     callable = args[0];
     args += 1;
     nargsf = (nargsf - 1) & ~kVectorcallOffset;
