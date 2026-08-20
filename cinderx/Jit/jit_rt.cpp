@@ -313,14 +313,11 @@ static PyObject* setArgcountBindTypeError(
     PyFunctionObject* func,
     Py_ssize_t nargs,
     int argcount) {
-  PyObject* name = func->func_qualname != nullptr
-      ? func->func_qualname
-      : func->func_name;
+  PyObject* name =
+      func->func_qualname != nullptr ? func->func_qualname : func->func_name;
   if (nargs < argcount) {
     PyErr_Format(
-        PyExc_TypeError,
-        "%U() missing a required positional argument",
-        name);
+        PyExc_TypeError, "%U() missing a required positional argument", name);
   } else {
     PyErr_Format(
         PyExc_TypeError,
@@ -354,8 +351,8 @@ PyObject* JITRT_CallWithKeywordArgs(
   const Py_ssize_t total_args = co->co_argcount + co->co_kwonlyargcount +
       ((co->co_flags & CO_VARKEYWORDS) ? 1 : 0) +
       ((co->co_flags & CO_VARARGS) ? 1 : 0);
-  auto arg_space = allocateBindArray<PyObject*>(
-      static_cast<size_t>(total_args));
+  auto arg_space =
+      allocateBindArray<PyObject*>(static_cast<size_t>(total_args));
   if (arg_space == nullptr) {
     return nullptr;
   }
@@ -415,10 +412,7 @@ JITRT_StaticCallFPReturn JITRT_CallWithIncorrectArgcountFPReturn(
     // Function has no defaults; there's nothing we can do.
 #if PY_VERSION_HEX < 0x030C0000
     if (bindFailureAtRecursionLimit()) {
-      setArgcountBindTypeError(
-          func,
-          PyVectorcall_NARGS(nargsf),
-          argcount);
+      setArgcountBindTypeError(func, PyVectorcall_NARGS(nargsf), argcount);
       return {0.0, 0.0};
     }
 #endif
@@ -430,8 +424,7 @@ JITRT_StaticCallFPReturn JITRT_CallWithIncorrectArgcountFPReturn(
   }
   Py_ssize_t defcount = PyTuple_GET_SIZE(defaults);
   Py_ssize_t nargs = PyVectorcall_NARGS(nargsf);
-  auto arg_space = allocateBindArray<PyObject*>(
-      static_cast<size_t>(argcount));
+  auto arg_space = allocateBindArray<PyObject*>(static_cast<size_t>(argcount));
   if (arg_space == nullptr) {
     return {0.0, 0.0};
   }
@@ -496,10 +489,7 @@ JITRT_CallWithIncorrectArgcount(
     // to produce an appropriate exception.
 #if PY_VERSION_HEX < 0x030C0000
     if (bindFailureAtRecursionLimit()) {
-      setArgcountBindTypeError(
-          func,
-          PyVectorcall_NARGS(nargsf),
-          argcount);
+      setArgcountBindTypeError(func, PyVectorcall_NARGS(nargsf), argcount);
 #ifdef _WIN32
       return nullptr;
 #else
@@ -516,8 +506,7 @@ JITRT_CallWithIncorrectArgcount(
   }
   Py_ssize_t defcount = PyTuple_GET_SIZE(defaults);
   Py_ssize_t nargs = PyVectorcall_NARGS(nargsf);
-  auto arg_space = allocateBindArray<PyObject*>(
-      static_cast<size_t>(argcount));
+  auto arg_space = allocateBindArray<PyObject*>(static_cast<size_t>(argcount));
   if (arg_space == nullptr) {
 #ifdef _WIN32
     return nullptr;
@@ -696,8 +685,8 @@ TRetType JITRT_CallStaticallyWithPrimitiveSignatureTemplate(
     const Py_ssize_t total_args = co->co_argcount + co->co_kwonlyargcount +
         ((co->co_flags & CO_VARKEYWORDS) ? 1 : 0) +
         ((co->co_flags & CO_VARARGS) ? 1 : 0);
-    auto arg_space = allocateBindArray<PyObject*>(
-        static_cast<size_t>(total_args));
+    auto arg_space =
+        allocateBindArray<PyObject*>(static_cast<size_t>(total_args));
     if (arg_space == nullptr) {
       return TRetType();
     }
