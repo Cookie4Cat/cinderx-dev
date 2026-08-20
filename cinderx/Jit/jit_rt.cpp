@@ -45,12 +45,19 @@
 #include <cstdlib>
 #include <limits>
 
+// Argument binding is not a pure function: keyword equality and
+// kwdefaults lookup can run arbitrary Python.  The binder therefore
+// distinguishes three outcomes so a pending exception is never replayed
+// through CPython's vectorcall, and so a successful bind re-enters the
+// snapshot captured before any of that Python ran.
+enum class BindKwStatus { Error, Fallback, Bound };
+
 // This is mostly taken from ceval.c _PyEval_EvalCodeWithName
 // We use the same logic to turn **args, nargsf, and kwnames into
 // **args / nargsf.
 // One significant difference is we don't need to incref the args
 // in the new array.
-static int JITRT_BindKeywordArgs(
+static BindKwStatus JITRT_BindKeywordArgs(
     PyFunctionObject* func,
     PyObject** args,
     size_t nargsf,
@@ -61,6 +68,7 @@ static int JITRT_BindKeywordArgs(
     Ref<PyObject>& varargs) {
   PyCodeObject* co = (PyCodeObject*)func->func_code;
   Py_ssize_t argcount = PyVectorcall_NARGS(nargsf);
+  const Py_ssize_t named_args = co->co_argcount + co->co_kwonlyargcount;
 
   for (int i = 0; i < total_args; i++) {
     arg_space[i] = nullptr;
@@ -70,7 +78,7 @@ static int JITRT_BindKeywordArgs(
   if (co->co_flags & CO_VARKEYWORDS) {
     kwdict = Ref<>::steal(PyDict_New());
     if (kwdict == nullptr) {
-      return 0;
+      return BindKwStatus::Error;
     }
     arg_space[total_args - 1] = kwdict;
   }
@@ -85,7 +93,7 @@ static int JITRT_BindKeywordArgs(
   if (co->co_flags & CO_VARARGS) {
     varargs = Ref<>::steal(Cix_PyTuple_FromArray(args + n, argcount - n));
     if (varargs == nullptr) {
-      return 0;
+      return BindKwStatus::Error;
     }
 
     Py_ssize_t i = total_args - 1;
@@ -103,12 +111,12 @@ static int JITRT_BindKeywordArgs(
       Py_ssize_t j;
 
       if (keyword == nullptr || !PyUnicode_Check(keyword)) {
-        return 0;
+        return BindKwStatus::Fallback;
       }
 
       // Speed hack: do raw pointer compares. As names are
       //    normally interned this should almost always hit.
-      for (j = co->co_posonlyargcount; j < total_args; j++) {
+      for (j = co->co_posonlyargcount; j < named_args; j++) {
         PyObject* name = jit::getVarname(co, j);
         if (name == keyword) {
           goto kw_found;
@@ -116,24 +124,27 @@ static int JITRT_BindKeywordArgs(
       }
 
       // Slow fallback, just in case
-      for (j = co->co_posonlyargcount; j < total_args; j++) {
+      for (j = co->co_posonlyargcount; j < named_args; j++) {
         PyObject* name = jit::getVarname(co, j);
         int cmp = PyObject_RichCompareBool(keyword, name, Py_EQ);
         if (cmp > 0) {
           goto kw_found;
         } else if (cmp < 0) {
-          return 0;
+          return BindKwStatus::Error;
         }
       }
 
-      if (kwdict == nullptr || PyDict_SetItem(kwdict, keyword, value) == -1) {
-        return 0;
+      if (kwdict == nullptr) {
+        return BindKwStatus::Fallback;
+      }
+      if (PyDict_SetItem(kwdict, keyword, value) == -1) {
+        return BindKwStatus::Error;
       }
       continue;
 
     kw_found:
       if (arg_space[j] != nullptr) {
-        return 0;
+        return BindKwStatus::Fallback;
       }
       arg_space[j] = value;
     }
@@ -141,7 +152,7 @@ static int JITRT_BindKeywordArgs(
 
   // Check the number of positional arguments
   if ((argcount > co->co_argcount) && !(co->co_flags & CO_VARARGS)) {
-    return 0;
+    return BindKwStatus::Fallback;
   }
 
   // Add missing positional arguments (copy default values from defs)
@@ -154,7 +165,7 @@ static int JITRT_BindKeywordArgs(
     // a required positional argument.
     for (Py_ssize_t i = argcount; i < first_default_arg; i++) {
       if (arg_space[i] == nullptr) {
-        return 0;
+        return BindKwStatus::Fallback;
       }
     }
 
@@ -175,7 +186,7 @@ static int JITRT_BindKeywordArgs(
   if (co->co_kwonlyargcount > 0) {
     Py_ssize_t missing = 0;
     PyObject* kwdefs = func->func_kwdefaults;
-    for (Py_ssize_t i = co->co_argcount; i < total_args; i++) {
+    for (Py_ssize_t i = co->co_argcount; i < named_args; i++) {
       PyObject* name;
       if (arg_space[i] != nullptr) {
         continue;
@@ -187,17 +198,17 @@ static int JITRT_BindKeywordArgs(
           arg_space[i] = def;
           continue;
         } else if (_PyErr_Occurred(_PyThreadState_GET())) {
-          return 0;
+          return BindKwStatus::Error;
         }
       }
       missing++;
     }
     if (missing) {
-      return 0;
+      return BindKwStatus::Fallback;
     }
   }
 
-  return 1;
+  return BindKwStatus::Bound;
 }
 
 #if PY_VERSION_HEX < 0x030C0000
@@ -205,33 +216,41 @@ static int JITRT_BindKeywordArgs(
 // compiled body at JITRT_CALL_REENTRY_OFFSET before the vectorcall entry.
 // On 3.11 func->vectorcall is Ci_JitShell311_GuardedEntry, not that
 // generated entry, so subtracting the offset from it would jump into
-// unrelated bytes.  Use the artifact's own entry instead.  If the
-// artifact is gone, interpret: GET_REENTRY(GuardedEntry) is the bug
-// this helper exists to avoid.
+// unrelated bytes.  Use the invocation snapshot first: GuardedEntry pins
+// the CompiledFunction for this call, and binding must not re-query
+// function state after keyword equality has run.  InstalledArtifact is
+// only the fallback when this helper is entered without a snapshot.
 static vectorcallfunc jitrtBoundArgsReentry(PyFunctionObject* func) {
   auto* compiled = reinterpret_cast<jit::CompiledFunction*>(
-      Ci_JitShell311_InstalledArtifact(func));
+      Ci_JitShell311_InvocationArtifact());
+  if (compiled == nullptr) {
+    compiled = reinterpret_cast<jit::CompiledFunction*>(
+        Ci_JitShell311_InstalledArtifact(func));
+  }
   if (compiled != nullptr) {
     return JITRT_GET_REENTRY(compiled->vectorcallEntry());
   }
   return getInterpretedVectorcall(func);
 }
-#define JITRT_BOUND_ARGS_REENTRY(func) jitrtBoundArgsReentry(func)
+#define JITRT_CAPTURE_REENTRY(func) jitrtBoundArgsReentry(func)
 #else
-#define JITRT_BOUND_ARGS_REENTRY(func) JITRT_GET_REENTRY((func)->vectorcall)
+#define JITRT_CAPTURE_REENTRY(func) JITRT_GET_REENTRY((func)->vectorcall)
 #endif
 
 // This uses JITRT_BindKeywordArgs to get the newly bound keyword
 // arguments.   We then turn around and dispatch to the
 // JITed function with the newly packed args.
-// Rather than copying over all of the error reporting we instead
-// just dispatch to the normal _PyFunction_Vectorcall if anything
-// goes wrong which is indicated by JITRT_BindKeywordArgs returning 0.
+// Capture the reentry target before binding: the binder can run
+// arbitrary Python.  Only CPython TypeError construction (missing /
+// duplicate / unexpected keyword) falls back to the interpreter with
+// the original vectorcall layout.  A pending exception is returned
+// immediately and is never replayed.
 PyObject* JITRT_CallWithKeywordArgs(
     PyFunctionObject* func,
     PyObject** args,
     size_t nargsf,
     PyObject* kwnames) {
+  vectorcallfunc reentry = JITRT_CAPTURE_REENTRY(func);
   PyCodeObject* co = (PyCodeObject*)func->func_code;
   const Py_ssize_t total_args = co->co_argcount + co->co_kwonlyargcount +
       ((co->co_flags & CO_VARKEYWORDS) ? 1 : 0) +
@@ -239,18 +258,23 @@ PyObject* JITRT_CallWithKeywordArgs(
   auto arg_space = std::make_unique<PyObject*[]>(total_args);
   Ref<PyObject> kwdict, varargs;
 
-  if (JITRT_BindKeywordArgs(
-          func,
-          args,
-          nargsf,
-          kwnames,
-          arg_space.get(),
-          total_args,
-          kwdict,
-          varargs)) {
-    size_t new_nargsf = total_args;
-    return JITRT_BOUND_ARGS_REENTRY(func)(
-        (PyObject*)func, arg_space.get(), new_nargsf, nullptr);
+  switch (JITRT_BindKeywordArgs(
+      func,
+      args,
+      nargsf,
+      kwnames,
+      arg_space.get(),
+      total_args,
+      kwdict,
+      varargs)) {
+    case BindKwStatus::Bound: {
+      size_t new_nargsf = total_args;
+      return reentry((PyObject*)func, arg_space.get(), new_nargsf, nullptr);
+    }
+    case BindKwStatus::Error:
+      return nullptr;
+    case BindKwStatus::Fallback:
+      break;
   }
 
   return Ci_PyFunction_Vectorcall((PyObject*)func, args, nargsf, kwnames);
@@ -273,6 +297,7 @@ JITRT_StaticCallFPReturn JITRT_CallWithIncorrectArgcountFPReturn(
     PyObject** args,
     size_t nargsf,
     int argcount) {
+  vectorcallfunc reentry = JITRT_CAPTURE_REENTRY(func);
   PyObject* defaults = func->func_defaults;
   if (defaults == nullptr) {
     // Function has no defaults; there's nothing we can do.
@@ -305,8 +330,7 @@ JITRT_StaticCallFPReturn JITRT_CallWithIncorrectArgcountFPReturn(
 
   size_t new_nargsf = argcount;
 
-  return reinterpret_cast<staticvectorcallfuncfp>(
-      JITRT_BOUND_ARGS_REENTRY(func))(
+  return reinterpret_cast<staticvectorcallfuncfp>(reentry)(
       (PyObject*)func,
       arg_space.get(),
       new_nargsf,
@@ -325,6 +349,7 @@ JITRT_CallWithIncorrectArgcount(
     PyObject** args,
     size_t nargsf,
     int argcount) {
+  vectorcallfunc reentry = JITRT_CAPTURE_REENTRY(func);
   PyObject* defaults = func->func_defaults;
   if (defaults == nullptr) {
     // Function has no defaults; there's nothing we can do.
@@ -366,10 +391,10 @@ JITRT_CallWithIncorrectArgcount(
   size_t new_nargsf = argcount;
 
 #ifdef _WIN32
-  return JITRT_BOUND_ARGS_REENTRY(func)(
+  return reentry(
       (PyObject*)func, arg_space.get(), new_nargsf, (PyObject*)defaulted_args);
 #else
-  return reinterpret_cast<staticvectorcallfunc>(JITRT_BOUND_ARGS_REENTRY(func))(
+  return reinterpret_cast<staticvectorcallfunc>(reentry)(
       (PyObject*)func,
       arg_space.get(),
       new_nargsf,
@@ -434,13 +459,14 @@ TRetType JITRT_CallStaticallyWithPrimitiveSignatureWorker(
     PyObject** args,
     size_t nargsf,
     _PyTypedArgsInfo* arg_info) {
+  vectorcallfunc reentry = JITRT_CAPTURE_REENTRY(func);
   Py_ssize_t nargs = PyVectorcall_NARGS(nargsf);
   auto arg_space = std::make_unique<void*[]>(nargs);
   if (JITRT_PackStaticArgs(args, arg_info, arg_space.get(), nargs)) {
     goto fail;
   }
 
-  return reinterpret_cast<TVectorcall>(JITRT_BOUND_ARGS_REENTRY(func))(
+  return reinterpret_cast<TVectorcall>(reentry)(
       (PyObject*)func, (PyObject**)arg_space.get(), nargsf, nullptr);
 
 fail:
@@ -479,22 +505,27 @@ TRetType JITRT_CallStaticallyWithPrimitiveSignatureTemplate(
     auto arg_space = std::make_unique<PyObject*[]>(total_args);
     Ref<PyObject> kwdict, varargs;
 
-    if (JITRT_BindKeywordArgs(
+    switch (JITRT_BindKeywordArgs(
+        func,
+        args,
+        nargsf,
+        kwnames,
+        arg_space.get(),
+        total_args,
+        kwdict,
+        varargs)) {
+      case BindKwStatus::Bound:
+        return JITRT_CallStaticallyWithPrimitiveSignatureWorker<
+            TRetType,
+            TVectorcall>(
             func,
-            args,
-            nargsf,
-            kwnames,
             arg_space.get(),
-            total_args,
-            kwdict,
-            varargs)) {
-      return JITRT_CallStaticallyWithPrimitiveSignatureWorker<
-          TRetType,
-          TVectorcall>(
-          func,
-          arg_space.get(),
-          total_args | vectorcall_flags(nargsf),
-          arg_info);
+            total_args | vectorcall_flags(nargsf),
+            arg_info);
+      case BindKwStatus::Error:
+        return TRetType();
+      case BindKwStatus::Fallback:
+        break;
     }
 
     auto interpVectorcall = getInterpretedVectorcall(func);
@@ -2905,7 +2936,7 @@ void JITRT_ClearTreeIterState(jit::GenDataFooter* footer) {
   jit::clearTreeIterState(footer);
 }
 
-static int JITRT_BindKeywordArgsSimple(
+static BindKwStatus JITRT_BindKeywordArgsSimple(
     PyFunctionObject* func,
     PyObject** args,
     size_t nargsf,
@@ -2915,7 +2946,7 @@ static int JITRT_BindKeywordArgsSimple(
   PyCodeObject* co = (PyCodeObject*)func->func_code;
   Py_ssize_t argcount = PyVectorcall_NARGS(nargsf);
   if (argcount > co->co_argcount) {
-    return 0;
+    return BindKwStatus::Fallback;
   }
 
   for (int i = 0; i < total_args; i++) {
@@ -2936,7 +2967,7 @@ static int JITRT_BindKeywordArgsSimple(
       Py_ssize_t j;
 
       if (keyword == nullptr || !PyUnicode_Check(keyword)) {
-        return 0;
+        return BindKwStatus::Fallback;
       }
 
       // Speed hack: do raw pointer compares.
@@ -2954,15 +2985,15 @@ static int JITRT_BindKeywordArgsSimple(
         if (cmp > 0) {
           goto kw_found;
         } else if (cmp < 0) {
-          return 0;
+          return BindKwStatus::Error;
         }
       }
 
-      return 0;
+      return BindKwStatus::Fallback;
 
     kw_found:
       if (arg_space[j] != nullptr) {
-        return 0;
+        return BindKwStatus::Fallback;
       }
       arg_space[j] = value;
     }
@@ -2970,7 +3001,7 @@ static int JITRT_BindKeywordArgsSimple(
 
   // Check number of positional arguments
   if ((argcount > co->co_argcount) && kwnames == nullptr) {
-    return 0;
+    return BindKwStatus::Fallback;
   }
 
   // Add missing positional arguments (copy default values from defs)
@@ -2981,7 +3012,7 @@ static int JITRT_BindKeywordArgsSimple(
 
     for (Py_ssize_t i = argcount; i < first_default_arg; i++) {
       if (arg_space[i] == nullptr) {
-        return 0;
+        return BindKwStatus::Fallback;
       }
     }
 
@@ -2997,7 +3028,7 @@ static int JITRT_BindKeywordArgsSimple(
     }
   }
 
-  return 1;
+  return BindKwStatus::Bound;
 }
 
 PyObject* JITRT_CallWithKeywordArgsSimple(
@@ -3005,6 +3036,7 @@ PyObject* JITRT_CallWithKeywordArgsSimple(
     PyObject** args,
     size_t nargsf,
     PyObject* kwnames) {
+  vectorcallfunc reentry = JITRT_CAPTURE_REENTRY(func);
   PyCodeObject* co = (PyCodeObject*)func->func_code;
   JIT_DCHECK(
       !(co->co_flags & (CO_VARARGS | CO_VARKEYWORDS)),
@@ -3017,12 +3049,18 @@ PyObject* JITRT_CallWithKeywordArgsSimple(
   // stack allocate
   auto arg_space = (PyObject**)alloca(total_args * sizeof(PyObject*));
 
-  if (JITRT_BindKeywordArgsSimple(
-          func, args, nargsf, kwnames, arg_space, total_args)) {
-    size_t new_nargsf = total_args;
-    return JITRT_BOUND_ARGS_REENTRY(func)(
-        (PyObject*)func, arg_space, new_nargsf, nullptr);
+  switch (JITRT_BindKeywordArgsSimple(
+      func, args, nargsf, kwnames, arg_space, total_args)) {
+    case BindKwStatus::Bound: {
+      size_t new_nargsf = total_args;
+      return reentry((PyObject*)func, arg_space, new_nargsf, nullptr);
+    }
+    case BindKwStatus::Error:
+      return nullptr;
+    case BindKwStatus::Fallback:
+      break;
   }
 
   return Ci_PyFunction_Vectorcall((PyObject*)func, args, nargsf, kwnames);
 }
+
