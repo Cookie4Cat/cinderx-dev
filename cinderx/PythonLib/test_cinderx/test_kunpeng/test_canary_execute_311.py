@@ -2769,11 +2769,11 @@ class CanaryExecute311Test(unittest.TestCase):
     def test_instrumentation_support_config_is_refused_by_canary(self):
         # The flag patches sys.setprofile/settrace/monitoring to pause the
         # whole JIT while instrumentation is active.  This mode delivers
-        # tracing correctness through the bytecode-boundary polls and the
-        # guarded entry instead, and the toggle's disable arm has no
-        # audited 3.11 story -- so the canary refuses the configuration by
-        # name rather than running an unaudited pause-the-world path
-        # alongside the audited polling one.
+        # tracing correctness through the guarded entry and the RFC
+        # 3.3.4.5 exemption (running frames finish natively) instead, and
+        # the toggle's disable arm has no audited 3.11 story -- so the
+        # canary refuses the configuration by name rather than running an
+        # unaudited pause-the-world path alongside the audited one.
         env = dict(os.environ)
         env["CINDERX_JIT_MODE"] = "canary"
         env["PYTHONJITAUTO"] = "1000000"
@@ -2868,17 +2868,13 @@ class CanaryExecute311Test(unittest.TestCase):
         self.assertIn("traced through the interpreter", proc.stdout)
         self.assertIn("machine entry restored", proc.stdout)
 
-    def test_profile_enabled_inside_binary_op_reaches_the_running_frame(self):
-        # The entry check answers "is instrumentation active NOW"; the body
-        # can change the answer.  BINARY_OP on the execute surface runs
-        # arbitrary protocol code, and stock 3.11 reacts to a mid-frame
-        # sys.setprofile immediately: the frame that is currently executing
-        # delivers its remaining events, above all PyTrace_RETURN on exit.
-        # A compiled frame must therefore leave machine code at the first
-        # safe point after the transition and hand the rest of the frame to
-        # the interpreter -- running natively to the end swallows the
-        # return event and is an observable differential.  No threads and
-        # no timing: the transition happens synchronously inside __add__.
+    def test_profile_enabled_inside_binary_op_follows_the_rfc_exemption(self):
+        # RFC 3.3.4.5: a sys.setprofile from inside the running compiled
+        # frame (here: synchronously inside __add__) does NOT interrupt
+        # that frame -- it keeps running natively to its natural return
+        # and its remaining events, including PyTrace_RETURN, are not
+        # delivered.  Only new calls observe the activation: the guarded
+        # entry falls back and the interpreted run is fully profiled.
         env = dict(os.environ)
         env["CINDERX_JIT_MODE"] = "canary"
         env["PYTHONJITAUTO"] = "1000000"
@@ -2924,18 +2920,29 @@ class CanaryExecute311Test(unittest.TestCase):
             assert cinderjit.force_compile(hot) is True
             before = _cinderx._get_trigger_stats()["machine_code_entries"]
             result = hot(Num(2), Num(10), Num(1))
-            assert _cinderx._get_trigger_stats()["machine_code_entries"] \\
-                - before == 1, "the probe call must start in machine code"
-            sys.setprofile(None)
+            entered = _cinderx._get_trigger_stats()["machine_code_entries"] \\
+                - before
+            assert entered == 1, "the probe call must start in machine code"
             assert result.n == 20, result.n
+            assert not [e for e in events if e[0] == "hot"], (
+                "the running compiled frame must not deliver events "
+                "(RFC 3.3.4.5 items 2-3): %r" % (events,)
+            )
 
-            returned = [e for e in events if e == ("hot", "return")]
-            assert returned, (
-                "sys.setprofile() from inside the compiled loop's BINARY_OP"
-                " never produced PyTrace_RETURN for the running frame: %r"
+            # A new call under the active profiler: interpreted, and
+            # fully profiled.
+            events.clear()
+            before = _cinderx._get_trigger_stats()["machine_code_entries"]
+            follow = hot(Num(2), Num(10), Num(1))
+            assert _cinderx._get_trigger_stats()["machine_code_entries"] \\
+                == before, "a new call under profiling entered machine code"
+            sys.setprofile(None)
+            assert follow.n == 20, follow.n
+            assert ("hot", "call") in events and ("hot", "return") in events, (
+                "the interpreted follow-up call was not profiled: %r"
                 % (events,)
             )
-            print("mid-frame profile reached the running frame")
+            print("mid-frame profile followed the RFC exemption")
             """
         )
         proc = subprocess.run(
@@ -2946,17 +2953,16 @@ class CanaryExecute311Test(unittest.TestCase):
             timeout=120,
         )
         self.assertEqual(proc.returncode, 0, proc.stderr[-800:])
-        self.assertIn("mid-frame profile reached the running frame", proc.stdout)
+        self.assertIn("mid-frame profile followed the RFC exemption", proc.stdout)
 
-    def test_profile_enabled_by_pending_call_reaches_the_running_frame(self):
+    def test_profile_enabled_by_pending_call_follows_the_rfc_exemption(self):
         # The same transition through the other door: Py_AddPendingCall()
         # runs its callback on this thread at the compiled loop's back
-        # edge -- the eval-breaker service this port wired to the vendored
-        # eval_frame_handle_pending() -- and the callback enables
-        # profiling via the C API surface (sys.setprofile is the same
-        # call).  Stock updates the running frame's tracing state at that
-        # instant and delivers PyTrace_RETURN when the frame exits; the
-        # compiled frame must not run to completion unaware.
+        # edge (the eval-breaker service stays wired per RFC -- signals,
+        # pending calls and GIL periodic tasks are delivered), and the
+        # callback enables profiling.  RFC 3.3.4.5: the running compiled
+        # frame still finishes natively with no events; only new calls
+        # observe the activation.
         env = dict(os.environ)
         env["CINDERX_JIT_MODE"] = "canary"
         env["PYTHONJITAUTO"] = "1000000"
@@ -3013,21 +3019,32 @@ class CanaryExecute311Test(unittest.TestCase):
             before = _cinderx._get_trigger_stats()["machine_code_entries"]
             result = hot(1, 60_000_000, 1)
             worker.join()
-            sys.setprofile(None)
             assert result == 60_000_000, result
             assert _cinderx._get_trigger_stats()["machine_code_entries"] \\
                 - before == 1, (
                 "the pending call landed before the loop entered machine"
                 " code; the mid-frame transition was not exercised"
             )
-
-            returned = [e for e in events if e == ("hot", "return")]
-            assert returned, (
-                "the pending call enabled profiling on the running thread"
-                " and the compiled frame still returned without"
-                " PyTrace_RETURN: %r" % (events[:10],)
+            assert sys.getprofile() is prof, (
+                "the pending call never ran on the loop thread")
+            assert not [e for e in events if e[0] == "hot"], (
+                "RFC 3.3.4.5 items 2-3: the running compiled frame must "
+                "keep running natively and deliver no events: %r"
+                % (events[:10],)
             )
-            print("pending-call profile reached the running frame")
+
+            events.clear()
+            before = _cinderx._get_trigger_stats()["machine_code_entries"]
+            follow = hot(1, 10, 1)
+            assert _cinderx._get_trigger_stats()["machine_code_entries"] \\
+                == before, "a new call under profiling entered machine code"
+            sys.setprofile(None)
+            assert follow == 10, follow
+            assert ("hot", "call") in events and ("hot", "return") in events, (
+                "the interpreted follow-up call was not profiled: %r"
+                % (events[:10],)
+            )
+            print("pending-call profile followed the RFC exemption")
             """
         )
         proc = subprocess.run(
@@ -3039,7 +3056,7 @@ class CanaryExecute311Test(unittest.TestCase):
         )
         self.assertEqual(proc.returncode, 0, proc.stderr[-800:])
         self.assertIn(
-            "pending-call profile reached the running frame", proc.stdout)
+            "pending-call profile followed the RFC exemption", proc.stdout)
 
     def _run_transition_probe(self, body):
         env = dict(os.environ)
@@ -3069,23 +3086,22 @@ class CanaryExecute311Test(unittest.TestCase):
             timeout=120,
         )
         self.assertEqual(proc.returncode, 0, proc.stderr[-800:])
-        self.assertIn("transition reached the running frame", proc.stdout)
+        self.assertIn("transition followed the RFC exemption", proc.stdout)
 
-    def test_profile_enabled_inside_for_iter_next_reaches_the_frame(self):
-        # The transition consumed by a terminator: FOR_ITER lowers to an
-        # iterator-next whose consumer is the branch that ends the block,
-        # so there is no later point in the SAME block to poll -- the
-        # first resumable boundary after __next__ runs is the successor's
-        # entry.  A poll keyed to "reentrant instruction, then a snapshot
-        # in this block" misses it, and the frame returns natively with
-        # the profiler never hearing from it.
+    def test_profile_enabled_inside_for_iter_next_follows_the_exemption(self):
+        # Activation from inside an iterator's __next__ mid-frame: RFC
+        # 3.3.4.5 -- the running compiled frame finishes natively with no
+        # events; the follow-up call is interpreted and fully profiled.
         self._run_transition_probe(
             """
             class It:
+                def __init__(self, arm):
+                    self.arm = arm
                 def __iter__(self):
                     return self
                 def __next__(self):
-                    sys.setprofile(prof)
+                    if self.arm:
+                        sys.setprofile(prof)
                     raise StopIteration
 
             ns = {}
@@ -3101,25 +3117,33 @@ class CanaryExecute311Test(unittest.TestCase):
 
             assert cinderjit.force_compile(hot) is True
             before = entries()
-            result = hot(It())
+            result = hot(It(True))
             assert entries() - before == 1, "must start in machine code"
-            sys.setprofile(None)
             assert result == 42, result
+            assert not [e for e in events if e[0] == "hot"], events
+            events.clear()
+            before = entries()
+            follow = hot(It(False))
+            assert entries() == before, "new call entered machine code"
+            sys.setprofile(None)
+            assert follow == 42, follow
+            assert ("hot", "call") in events, events
             assert ("hot", "return") in events, events
-            print("transition reached the running frame")
+            print("transition followed the RFC exemption")
             """
         )
 
-    def test_profile_enabled_inside_bool_reaches_the_frame(self):
-        # The same terminator shape through truthiness: a conditional jump
-        # asks the operand for __bool__, and the answer feeds the branch
-        # directly.  The transition must be observed at the successor's
-        # entry boundary.
+    def test_profile_enabled_inside_bool_follows_the_exemption(self):
+        # Activation from inside __bool__ feeding a conditional jump:
+        # same RFC exemption oracle.
         self._run_transition_probe(
             """
             class Flag:
+                def __init__(self, arm):
+                    self.arm = arm
                 def __bool__(self):
-                    sys.setprofile(prof)
+                    if self.arm:
+                        sys.setprofile(prof)
                     return False
 
             ns = {}
@@ -3135,12 +3159,19 @@ class CanaryExecute311Test(unittest.TestCase):
 
             assert cinderjit.force_compile(hot) is True
             before = entries()
-            result = hot(Flag())
+            result = hot(Flag(True))
             assert entries() - before == 1, "must start in machine code"
-            sys.setprofile(None)
             assert result == 2, result
+            assert not [e for e in events if e[0] == "hot"], events
+            events.clear()
+            before = entries()
+            follow = hot(Flag(False))
+            assert entries() == before, "new call entered machine code"
+            sys.setprofile(None)
+            assert follow == 2, follow
+            assert ("hot", "call") in events, events
             assert ("hot", "return") in events, events
-            print("transition reached the running frame")
+            print("transition followed the RFC exemption")
             """
         )
 
@@ -3477,23 +3508,23 @@ class CanaryExecute311Test(unittest.TestCase):
         self.assertEqual(proc.returncode, 0, proc.stderr[-800:])
         self.assertIn("mid-frame takeover stayed out of the deopt", proc.stdout)
 
-    def test_profile_enabled_inside_del_reaches_the_frame(self):
-        # The transition the bytecode never shows: reference counting is
-        # arbitrary execution too.  The poll after BINARY_OP runs with the
-        # profiler still off; POP_TOP's DECREF then frees the operand and
-        # its __del__ makes the switch.  The refcount instructions are
-        # generated by a later pass than any bytecode-keyed scan can see,
-        # which is why the poll has to be a boundary invariant rather than
-        # an enumeration of reentrant instructions.
+    def test_profile_enabled_inside_del_follows_the_exemption(self):
+        # Activation from a DECREF's __del__ -- the transition the
+        # bytecode never shows: same RFC exemption oracle.
         self._run_transition_probe(
             """
             class Temp:
+                def __init__(self, arm):
+                    self.arm = arm
                 def __del__(self):
-                    sys.setprofile(prof)
+                    if self.arm:
+                        sys.setprofile(prof)
 
             class Num:
+                def __init__(self, arm):
+                    self.arm = arm
                 def __add__(self, other):
-                    return Temp()
+                    return Temp(self.arm)
 
             ns = {}
             exec(
@@ -3507,12 +3538,19 @@ class CanaryExecute311Test(unittest.TestCase):
 
             assert cinderjit.force_compile(hot) is True
             before = entries()
-            result = hot(Num(), Num())
+            result = hot(Num(True), Num(True))
             assert entries() - before == 1, "must start in machine code"
-            sys.setprofile(None)
             assert result == 42, result
+            assert not [e for e in events if e[0] == "hot"], events
+            events.clear()
+            before = entries()
+            follow = hot(Num(False), Num(False))
+            assert entries() == before, "new call entered machine code"
+            sys.setprofile(None)
+            assert follow == 42, follow
+            assert ("hot", "call") in events, events
             assert ("hot", "return") in events, events
-            print("transition reached the running frame")
+            print("transition followed the RFC exemption")
             """
         )
 
@@ -5210,10 +5248,11 @@ class CanaryExecute311Test(unittest.TestCase):
         # sys.settrace installed by a callee while the caller runs in
         # machine code: stock 3.11 delivers no line/return events to the
         # already-running frame (its f_trace was never populated by a
-        # 'call' event), and frame.f_trace stays None.  The JIT arm exits
-        # through the instrumentation poll and must land in exactly that
-        # behavior -- neither missing events stock sends, nor inventing
-        # events stock does not.
+        # 'call' event), and frame.f_trace stays None.  Under the RFC
+        # 3.3.4.5 exemption the JIT arm lands in exactly that behavior --
+        # neither missing events stock sends, nor inventing events stock
+        # does not.  (No item-7 restoration applies here: the tracer is
+        # not yet installed at the moment the call site delegates.)
         probe = self._DUAL_ARM_PREAMBLE + textwrap.dedent(
             """
             events = []
@@ -5284,6 +5323,107 @@ class CanaryExecute311Test(unittest.TestCase):
         )
         interp, jit = self._dual_arm(probe)
         self.assertEqual(interp, jit)
+
+    def test_ordinary_deopt_with_tracing_active_restores_f_trace(self):
+        # RFC 3.3.4.5 item 7: tracing activation alone never deopts a
+        # running frame, but when that frame later deopts for an ORDINARY
+        # reason (here: a fresh global key clears dk_version and fails the
+        # guarded load), the mid-function resume skips the entry RESUME --
+        # so f_trace and f_trace_lines are set explicitly and the
+        # interpreted remainder is traced.  This is the versioned
+        # compatibility exemption's own oracle: stock would deliver
+        # nothing for this frame.
+        #
+        # Fixture discipline: the transition must ride an operator dunder
+        # (a Python call bytecode delegates per-call and would deopt
+        # before the tracer exists), and the post-compile driver must run
+        # in a function scope -- any new module-level name inserted after
+        # force_compile clears the module dict's dk_version and fires the
+        # FIRST guarded load before sys.settrace has run.
+        env = dict(os.environ)
+        env["CINDERX_JIT_MODE"] = "canary"
+        env["PYTHONJITAUTO"] = "1000000"
+        probe = textwrap.dedent(
+            """
+            import sys
+            import _cinderx, cinderx
+            cinderx.init()
+            _cinderx.install_frame_evaluator()
+            import cinderjit
+
+            events = []
+
+            def tracer(frame, event, arg):
+                if frame.f_code.co_name == "workload":
+                    events.append(
+                        [event, frame.f_lineno - frame.f_code.co_firstlineno])
+                return tracer
+
+            G = 5
+            armed = False
+
+            class Flipper:
+                def __add__(self, other):
+                    if armed:
+                        sys.settrace(tracer)
+                        # Inserting a new global key clears dk_version, so
+                        # the next guarded LOAD_GLOBAL fails organically --
+                        # with the tracer already active.
+                        globals()["G_shadow"] = 1
+                    return 100
+
+            src = (
+                "def workload(x):\\n"
+                "    a = G\\n"
+                "    b = x + 1\\n"
+                "    c = G\\n"
+                "    return a + b + c\\n"
+            )
+            exec(src, globals())
+
+            def main():
+                global armed
+                f = Flipper()
+                for _ in range(40):
+                    assert workload(f) == 110
+                assert cinderjit.force_compile(workload) is True
+
+                organic_before = _cinderx._get_trigger_stats()[
+                    "organic_deopt_hits"]
+                armed = True
+                result = workload(f)
+                organic_after = _cinderx._get_trigger_stats()[
+                    "organic_deopt_hits"]
+                sys.settrace(None)
+                assert result == 110, result
+                assert organic_after > organic_before, (
+                    "the fresh global key never deopted the guarded load; "
+                    "the item-7 path was not exercised")
+                # The machine-code prefix (a = G, b = x + 1) stays silent
+                # per the RFC; the interpreted remainder resumes at the
+                # faulting load and is fully traced.
+                assert events == [
+                    ["line", 3],
+                    ["line", 4],
+                    ["return", 4],
+                ], (
+                    "the traced interpreted remainder after the ordinary "
+                    "deopt did not produce the expected event stream; "
+                    "f_trace was not restored: %r" % (events,))
+                print("item-7 f_trace restoration held")
+
+            main()
+            """
+        )
+        proc = subprocess.run(
+            [sys.executable, "-c", probe],
+            capture_output=True,
+            text=True,
+            env=env,
+            timeout=120,
+        )
+        self.assertEqual(proc.returncode, 0, proc.stderr[-2000:])
+        self.assertIn("item-7 f_trace restoration held", proc.stdout)
 
     def test_signal_handler_exception_interrupts_the_compiled_loop(self):
         # A signal arriving in a tight compiled loop is delivered at the
