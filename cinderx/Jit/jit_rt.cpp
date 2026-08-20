@@ -47,6 +47,7 @@
 #include <limits>
 #include <memory>
 #include <new>
+#include <vector>
 
 // Argument binding is not a pure function: keyword equality and
 // kwdefaults lookup can run arbitrary Python.  The binder therefore
@@ -65,11 +66,20 @@ std::unique_ptr<T[]> allocateBindArray(size_t n) {
   }
 }
 
+// Caller-provided args stay borrowed.  Defaults / kwdefaults are owned
+// until reentry returns: __defaults__ and __kwdefaults__ can be rebound
+// while the compiled body is running.
+static void bindOwnedDefault(
+    std::vector<Ref<PyObject>>& owned_defaults,
+    PyObject** slot,
+    PyObject* def) {
+  owned_defaults.emplace_back(Ref<>::create(def));
+  *slot = owned_defaults.back().get();
+}
+
 // This is mostly taken from ceval.c _PyEval_EvalCodeWithName
 // We use the same logic to turn **args, nargsf, and kwnames into
 // **args / nargsf.
-// One significant difference is we don't need to incref the args
-// in the new array.
 static BindKwStatus JITRT_BindKeywordArgs(
     PyFunctionObject* func,
     PyObject** args,
@@ -78,7 +88,8 @@ static BindKwStatus JITRT_BindKeywordArgs(
     PyObject** arg_space,
     Py_ssize_t total_args,
     Ref<PyObject>& kwdict,
-    Ref<PyObject>& varargs) {
+    Ref<PyObject>& varargs,
+    std::vector<Ref<PyObject>>& owned_defaults) {
   PyCodeObject* co = (PyCodeObject*)func->func_code;
   Py_ssize_t argcount = PyVectorcall_NARGS(nargsf);
   const Py_ssize_t named_args = co->co_argcount + co->co_kwonlyargcount;
@@ -123,10 +134,16 @@ static BindKwStatus JITRT_BindKeywordArgs(
       PyObject* value = args[argcount + i];
       Py_ssize_t j;
 
-      // Exact str only.  A str subclass with __eq__ must not be
+      // 3.11: exact str only.  A str subclass with __eq__ must not be
       // rich-compared here: a miss would Fallback and CPython would
-      // run __eq__ again.  Subclasses go to CPython once.
+      // run __eq__ again.  3.12+ Static Python primitive prologues
+      // treat Fallback as a TypeError sentinel, so they keep
+      // PyUnicode_Check and still accept str subclasses.
+#if PY_VERSION_HEX < 0x030C0000
       if (keyword == nullptr || !PyUnicode_CheckExact(keyword)) {
+#else
+      if (keyword == nullptr || !PyUnicode_Check(keyword)) {
+#endif
         return BindKwStatus::Fallback;
       }
 
@@ -192,7 +209,8 @@ static BindKwStatus JITRT_BindKeywordArgs(
       for (; arg_index < co->co_argcount; arg_index++) {
         if (arg_space[arg_index] == nullptr) {
           Py_ssize_t def_index = arg_index - first_default_arg;
-          arg_space[arg_index] = defs[def_index];
+          bindOwnedDefault(
+              owned_defaults, &arg_space[arg_index], defs[def_index]);
         }
       }
     }
@@ -211,7 +229,7 @@ static BindKwStatus JITRT_BindKeywordArgs(
       if (kwdefs != nullptr) {
         PyObject* def = PyDict_GetItemWithError(kwdefs, name);
         if (def) {
-          arg_space[i] = def;
+          bindOwnedDefault(owned_defaults, &arg_space[i], def);
           continue;
         } else if (_PyErr_Occurred(_PyThreadState_GET())) {
           return BindKwStatus::Error;
@@ -300,35 +318,6 @@ PyObject* JITRT_ReenterAfterBind(
       nullptr);
 }
 
-// Falling back to the interpreter to format a bind TypeError can itself
-// Enter (frame push / _PyErr_Format).  At recursion_remaining == 0 that
-// turns a missing-argument failure into RecursionError.  Raise TypeError
-// here so bind still precedes the recursion slot.
-static bool bindFailureAtRecursionLimit() {
-  PyThreadState* tstate = PyThreadState_GET();
-  return tstate != nullptr && tstate->recursion_remaining <= 0;
-}
-
-static PyObject* setArgcountBindTypeError(
-    PyFunctionObject* func,
-    Py_ssize_t nargs,
-    int argcount) {
-  PyObject* name =
-      func->func_qualname != nullptr ? func->func_qualname : func->func_name;
-  if (nargs < argcount) {
-    PyErr_Format(
-        PyExc_TypeError, "%U() missing a required positional argument", name);
-  } else {
-    PyErr_Format(
-        PyExc_TypeError,
-        "%U() takes %d positional argument%s but %zd were given",
-        name,
-        argcount,
-        argcount == 1 ? "" : "s",
-        nargs);
-  }
-  return nullptr;
-}
 #else
 #define JITRT_CAPTURE_REENTRY(func) JITRT_GET_REENTRY((func)->vectorcall)
 #endif
@@ -357,6 +346,7 @@ PyObject* JITRT_CallWithKeywordArgs(
     return nullptr;
   }
   Ref<PyObject> kwdict, varargs;
+  std::vector<Ref<PyObject>> owned_defaults;
 
   switch (JITRT_BindKeywordArgs(
       func,
@@ -366,7 +356,8 @@ PyObject* JITRT_CallWithKeywordArgs(
       arg_space.get(),
       total_args,
       kwdict,
-      varargs)) {
+      varargs,
+      owned_defaults)) {
     case BindKwStatus::Bound: {
       size_t new_nargsf = total_args;
 #if PY_VERSION_HEX < 0x030C0000
@@ -410,12 +401,6 @@ JITRT_StaticCallFPReturn JITRT_CallWithIncorrectArgcountFPReturn(
   PyObject* defaults = func->func_defaults;
   if (defaults == nullptr) {
     // Function has no defaults; there's nothing we can do.
-#if PY_VERSION_HEX < 0x030C0000
-    if (bindFailureAtRecursionLimit()) {
-      setArgcountBindTypeError(func, PyVectorcall_NARGS(nargsf), argcount);
-      return {0.0, 0.0};
-    }
-#endif
     // Fallback to the default _PyFunction_Vectorcall implementation
     // to produce an appropriate exception.
     auto interpVectorcall = getInterpretedVectorcall(func);
@@ -432,12 +417,6 @@ JITRT_StaticCallFPReturn JITRT_CallWithIncorrectArgcountFPReturn(
 
   if (nargs + defcount < argcount || nargs > argcount) {
     // Not enough args with defaults, or too many args without defaults.
-#if PY_VERSION_HEX < 0x030C0000
-    if (bindFailureAtRecursionLimit()) {
-      setArgcountBindTypeError(func, nargs, argcount);
-      return {0.0, 0.0};
-    }
-#endif
     auto interpVectorcall = getInterpretedVectorcall(func);
     interpVectorcall((PyObject*)func, args, nargsf, nullptr);
     return {0.0, 0.0};
@@ -448,10 +427,11 @@ JITRT_StaticCallFPReturn JITRT_CallWithIncorrectArgcountFPReturn(
     arg_space[i] = *args++;
   }
 
+  std::vector<Ref<PyObject>> owned_defaults;
   PyObject** def_items =
       &((PyTupleObject*)defaults)->ob_item[defcount - defaulted_args];
   for (; i < argcount; i++) {
-    arg_space[i] = *def_items++;
+    bindOwnedDefault(owned_defaults, &arg_space[i], *def_items++);
   }
 
   size_t new_nargsf = argcount;
@@ -487,16 +467,6 @@ JITRT_CallWithIncorrectArgcount(
     // Function has no defaults; there's nothing we can do.
     // Fallback to the default _PyFunction_Vectorcall implementation
     // to produce an appropriate exception.
-#if PY_VERSION_HEX < 0x030C0000
-    if (bindFailureAtRecursionLimit()) {
-      setArgcountBindTypeError(func, PyVectorcall_NARGS(nargsf), argcount);
-#ifdef _WIN32
-      return nullptr;
-#else
-      return {nullptr, nullptr};
-#endif
-    }
-#endif
     auto interpVectorcall = getInterpretedVectorcall(func);
 #ifdef _WIN32
     return interpVectorcall((PyObject*)func, args, nargsf, nullptr);
@@ -518,16 +488,6 @@ JITRT_CallWithIncorrectArgcount(
 
   if (nargs + defcount < argcount || nargs > argcount) {
     // Not enough args with defaults, or too many args without defaults.
-#if PY_VERSION_HEX < 0x030C0000
-    if (bindFailureAtRecursionLimit()) {
-      setArgcountBindTypeError(func, nargs, argcount);
-#ifdef _WIN32
-      return nullptr;
-#else
-      return {nullptr, nullptr};
-#endif
-    }
-#endif
     auto interpVectorcall = getInterpretedVectorcall(func);
 #ifdef _WIN32
     return interpVectorcall((PyObject*)func, args, nargsf, nullptr);
@@ -541,10 +501,11 @@ JITRT_CallWithIncorrectArgcount(
     arg_space[i] = *args++;
   }
 
+  std::vector<Ref<PyObject>> owned_defaults;
   PyObject** def_items =
       &((PyTupleObject*)defaults)->ob_item[defcount - defaulted_args];
   for (; i < argcount; i++) {
-    arg_space[i] = *def_items++;
+    bindOwnedDefault(owned_defaults, &arg_space[i], *def_items++);
   }
 
   size_t new_nargsf = argcount;
@@ -691,6 +652,7 @@ TRetType JITRT_CallStaticallyWithPrimitiveSignatureTemplate(
       return TRetType();
     }
     Ref<PyObject> kwdict, varargs;
+    std::vector<Ref<PyObject>> owned_defaults;
 
     switch (JITRT_BindKeywordArgs(
         func,
@@ -700,7 +662,8 @@ TRetType JITRT_CallStaticallyWithPrimitiveSignatureTemplate(
         arg_space.get(),
         total_args,
         kwdict,
-        varargs)) {
+        varargs,
+        owned_defaults)) {
       case BindKwStatus::Bound:
         return JITRT_CallStaticallyWithPrimitiveSignatureWorker<
             TRetType,
@@ -1277,6 +1240,19 @@ static bool handle_periodic_activities_on_call(
 #endif
 }
 
+// CALL_FUNCTION_EX always CHECK_EVAL_BREAKER after do_call_core,
+// including when the callee is a Python function.
+static bool handle_periodic_activities_on_call_ex(
+    PyThreadState* tstate, PyObject* res) {
+  JITRT_AtQuiescentState(tstate);
+  return res != nullptr && is_eval_breaker_set(tstate) &&
+#if PY_VERSION_HEX < 0x030C0000
+      Ci_EvalFrameHandlePending_311(tstate) != 0;
+#else
+      _Py_HandlePending(tstate) != 0;
+#endif
+}
+
 PyObject*
 JITRT_CallFunctionEx(PyObject* func, PyObject* pargs, PyObject* kwargs) {
   // Normalize p + kw args to tuple and dict types exactly.
@@ -1371,7 +1347,7 @@ JITRT_CallFunctionEx(PyObject* func, PyObject* pargs, PyObject* kwargs) {
   // In 3.12 calls to non-Python functions will check for the eval breaker
   // We handle that here rather than bloat every function call w/ an extra
   // check.
-  if (handle_periodic_activities_on_call(tstate, res, func)) {
+  if (handle_periodic_activities_on_call_ex(tstate, res)) {
     Py_DECREF(res);
     return nullptr;
   }
@@ -3133,7 +3109,8 @@ static BindKwStatus JITRT_BindKeywordArgsSimple(
     size_t nargsf,
     PyObject* kwnames,
     PyObject** arg_space,
-    Py_ssize_t total_args) {
+    Py_ssize_t total_args,
+    std::vector<Ref<PyObject>>& owned_defaults) {
   PyCodeObject* co = (PyCodeObject*)func->func_code;
   Py_ssize_t argcount = PyVectorcall_NARGS(nargsf);
   if (argcount > co->co_argcount) {
@@ -3214,7 +3191,8 @@ static BindKwStatus JITRT_BindKeywordArgsSimple(
       for (; arg_index < co->co_argcount; arg_index++) {
         if (arg_space[arg_index] == nullptr) {
           Py_ssize_t def_index = arg_index - first_default_arg;
-          arg_space[arg_index] = defs[def_index];
+          bindOwnedDefault(
+              owned_defaults, &arg_space[arg_index], defs[def_index]);
         }
       }
     }
@@ -3240,9 +3218,10 @@ PyObject* JITRT_CallWithKeywordArgsSimple(
 
   // stack allocate
   auto arg_space = (PyObject**)alloca(total_args * sizeof(PyObject*));
+  std::vector<Ref<PyObject>> owned_defaults;
 
   switch (JITRT_BindKeywordArgsSimple(
-      func, args, nargsf, kwnames, arg_space, total_args)) {
+      func, args, nargsf, kwnames, arg_space, total_args, owned_defaults)) {
     case BindKwStatus::Bound: {
       size_t new_nargsf = total_args;
 #if PY_VERSION_HEX < 0x030C0000

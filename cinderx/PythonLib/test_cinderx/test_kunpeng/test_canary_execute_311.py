@@ -801,6 +801,74 @@ class CanaryExecute311Test(unittest.TestCase):
         self.assertEqual(proc.returncode, 0, proc.stderr[-800:])
         self.assertIn("binding TypeErrors match", proc.stdout)
 
+    def test_canary_default_survives_defaults_rebind(self):
+        env = dict(os.environ)
+        env["CINDERX_JIT_MODE"] = "canary"
+        env["PYTHONJITAUTO"] = "1000000"
+        probe = textwrap.dedent(
+            """
+            import _cinderx, cinderx
+            cinderx.init()
+            _cinderx.install_frame_evaluator()
+            import cinderjit
+
+            class Boom:
+                pass
+
+            def victim(x=Boom()):
+                victim.__defaults__ = ()
+                return x
+
+            assert cinderjit.force_compile(victim) is True
+            got = victim()
+            assert type(got).__name__ == "Boom", type(got)
+            print("default survived rebind")
+            """
+        )
+        proc = subprocess.run(
+            [sys.executable, "-c", probe],
+            capture_output=True,
+            text=True,
+            env=env,
+            timeout=120,
+        )
+        self.assertEqual(proc.returncode, 0, proc.stderr[-800:])
+        self.assertIn("default survived rebind", proc.stdout)
+
+    def test_canary_kwonly_default_survives_kwdefaults_clear(self):
+        env = dict(os.environ)
+        env["CINDERX_JIT_MODE"] = "canary"
+        env["PYTHONJITAUTO"] = "1000000"
+        probe = textwrap.dedent(
+            """
+            import _cinderx, cinderx
+            cinderx.init()
+            _cinderx.install_frame_evaluator()
+            import cinderjit
+
+            class Boom:
+                pass
+
+            def victim(*, x=Boom()):
+                victim.__kwdefaults__.clear()
+                return x
+
+            assert cinderjit.force_compile(victim) is True
+            got = victim()
+            assert type(got).__name__ == "Boom", type(got)
+            print("kwonly default survived clear")
+            """
+        )
+        proc = subprocess.run(
+            [sys.executable, "-c", probe],
+            capture_output=True,
+            text=True,
+            env=env,
+            timeout=120,
+        )
+        self.assertEqual(proc.returncode, 0, proc.stderr[-800:])
+        self.assertIn("kwonly default survived clear", proc.stdout)
+
     def test_canary_keyword_binding_snapshot_and_exceptions(self):
         # Binding can run arbitrary Python.  The invocation that already
         # entered GuardedEntry must keep its pinned artifact: tracing or a
@@ -2022,6 +2090,72 @@ class CanaryExecute311Test(unittest.TestCase):
         )
         self.assertEqual(proc.returncode, 0, proc.stderr[-800:])
         self.assertIn("async exception delivered at c call", proc.stdout)
+
+    def test_async_exception_on_star_call_to_python_stops_before_next_stmt(
+        self,
+    ):
+        # CALL_FUNCTION_EX checks the eval breaker after a Python callee
+        # returns.  Arm SetAsyncExc from a helper thread during sleep
+        # inside that callee.
+        env = dict(os.environ)
+        env["CINDERX_JIT_MODE"] = "canary"
+        env["PYTHONJITAUTO"] = "1000000"
+        probe = textwrap.dedent(
+            """
+            import ctypes
+            import threading
+            import time
+            import _cinderx, cinderx
+            cinderx.init()
+            _cinderx.install_frame_evaluator()
+            import cinderjit
+
+            class Interrupted(Exception):
+                pass
+
+            def callee(*x):
+                x[0](0.3)
+
+            def drive(callee, sleeper, box):
+                callee(*[sleeper])
+                box.append(1)
+                return box
+
+            assert cinderjit.force_compile(drive) is True
+            tid = threading.get_ident()
+            started = threading.Event()
+
+            def shooter():
+                started.wait(30)
+                time.sleep(0.05)
+                ctypes.pythonapi.PyThreadState_SetAsyncExc(
+                    ctypes.c_ulong(tid),
+                    ctypes.py_object(Interrupted))
+
+            t = threading.Thread(target=shooter)
+            t.start()
+            box = []
+            started.set()
+            try:
+                drive(callee, time.sleep, box)
+            except Interrupted:
+                pass
+            else:
+                raise SystemExit("expected Interrupted")
+            t.join(30)
+            assert box == [], box
+            print("async exception delivered at star call")
+            """
+        )
+        proc = subprocess.run(
+            [sys.executable, "-c", probe],
+            capture_output=True,
+            text=True,
+            env=env,
+            timeout=120,
+        )
+        self.assertEqual(proc.returncode, 0, proc.stderr[-800:])
+        self.assertIn("async exception delivered at star call", proc.stdout)
 
     def test_async_exception_position_matches_stock_at_the_backedge(self):
         # Where the async exception lands, oracled by stock CPython itself.
