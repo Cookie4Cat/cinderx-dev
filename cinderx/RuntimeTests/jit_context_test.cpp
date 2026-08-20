@@ -3976,6 +3976,45 @@ def victim():
   (void)reason;
 }
 
+TEST_F(JITLifecycle311Test, BindFailureAtRecursionLimitIsTypeError) {
+  SKIP_311_EXECUTABLE_COMPILE();
+
+  // CPython 3.11 binds before start_frame's recursive-call check.
+  // GuardedEntry used to Enter first, so a missing argument at
+  // recursion_remaining == 0 raised RecursionError instead of TypeError.
+  const char* py_src = R"(
+def needed(a):
+    return a
+)";
+  Ref<PyFunctionObject> func(compileAndGet(py_src, "needed"));
+  ASSERT_NE(func, nullptr);
+  ASSERT_EQ(jit::compileFunction(func), jit::Result::OK);
+  ASSERT_TRUE(isJitCompiled(func));
+
+  PyThreadState* tstate = PyThreadState_GET();
+  ASSERT_NE(tstate, nullptr);
+  int saved = tstate->recursion_remaining;
+  tstate->recursion_remaining = 0;
+
+  auto no_args = Ref<>::steal(PyTuple_New(0));
+  auto missing = Ref<>::steal(PyObject_Call(func, no_args, nullptr));
+  tstate->recursion_remaining = saved;
+  EXPECT_EQ(missing, nullptr);
+  EXPECT_TRUE(PyErr_ExceptionMatches(PyExc_TypeError))
+      << "bind failure at the recursion limit must stay TypeError";
+  PyErr_Clear();
+
+  tstate->recursion_remaining = 0;
+  auto one = makeLong(1);
+  auto args = Ref<>::steal(PyTuple_Pack(1, one.get()));
+  auto ok = Ref<>::steal(PyObject_Call(func, args, nullptr));
+  tstate->recursion_remaining = saved;
+  EXPECT_EQ(ok, nullptr);
+  EXPECT_TRUE(PyErr_ExceptionMatches(PyExc_RecursionError))
+      << "a successful bind must still consume a recursion slot";
+  PyErr_Clear();
+}
+
 #if defined(__linux__)
 TEST_F(JITLifecycle311Test, CStackLargeGuardRaisesRecursionError) {
   SKIP_311_EXECUTABLE_COMPILE();

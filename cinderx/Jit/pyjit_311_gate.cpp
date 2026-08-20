@@ -451,14 +451,12 @@ extern "C" PyObject* Ci_JitShell311_GuardedEntry(
   // Keyword names and a mismatched positional count are the generated
   // prologue's job (JITRT_CallWithKeywordArgs /
   // JITRT_CallWithIncorrectArgcount).  Do not filter them here.
-  // Two-layer recursion guard (MR-06).  3.11 eval enters at start_frame;
-  // the canary vectorcall never goes through eval, so the entry does it.
   // C-stack first so a soft-limit hit does not mutate recursion_remaining.
+  // Py_EnterRecursiveCall waits until bind succeeds (body reentry), matching
+  // CPython 3.11 initialize_locals then start_frame.  A bind TypeError at
+  // recursion_remaining == 0 must stay TypeError, not RecursionError.
   if (cStackSoftLimitReached311()) {
     PyErr_SetString(PyExc_RecursionError, "maximum recursion depth exceeded");
-    return nullptr;
-  }
-  if (Py_EnterRecursiveCall("")) {
     return nullptr;
   }
   // Pin the artifact for the duration of the call.  The body runs
@@ -472,10 +470,7 @@ extern "C" PyObject* Ci_JitShell311_GuardedEntry(
   // call onto a different artifact or the interpreter's vectorcall layout.
   Ref<jit::CompiledFunction> pin{Ref<jit::CompiledFunction>::create(compiled)};
   InvocationArtifactScope invocation(compiled);
-  PyObject* result =
-      compiled->vectorcallEntry()(func_obj, args, nargsf, kwnames);
-  Py_LeaveRecursiveCall();
-  return result;
+  return compiled->vectorcallEntry()(func_obj, args, nargsf, kwnames);
 }
 
 extern "C" const char* Ci_JitShell311_RequestCompile(

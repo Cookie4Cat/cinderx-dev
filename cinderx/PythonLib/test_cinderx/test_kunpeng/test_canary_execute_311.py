@@ -854,6 +854,25 @@ class CanaryExecute311Test(unittest.TestCase):
                 raise SystemExit("expected ValueError")
             assert calls == 1, calls
 
+            calls = 0
+            class FalseKey(str):
+                __hash__ = str.__hash__
+                def __eq__(self, other):
+                    global calls
+                    calls += 1
+                    return False
+
+            def missing(*, x):
+                return x
+            assert cinderjit.force_compile(missing) is True
+            try:
+                missing(**{FalseKey("wrong"): 1})
+            except TypeError:
+                pass
+            else:
+                raise SystemExit("expected TypeError")
+            assert calls == 1, calls
+
             def old(*, x):
                 return x + 1
             def new(*, x):

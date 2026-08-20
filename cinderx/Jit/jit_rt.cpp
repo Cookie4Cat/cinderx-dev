@@ -110,7 +110,10 @@ static BindKwStatus JITRT_BindKeywordArgs(
       PyObject* value = args[argcount + i];
       Py_ssize_t j;
 
-      if (keyword == nullptr || !PyUnicode_Check(keyword)) {
+      // Exact str only.  A str subclass with __eq__ must not be
+      // rich-compared here: a miss would Fallback and CPython would
+      // run __eq__ again.  Subclasses go to CPython once.
+      if (keyword == nullptr || !PyUnicode_CheckExact(keyword)) {
         return BindKwStatus::Fallback;
       }
 
@@ -233,6 +236,57 @@ static vectorcallfunc jitrtBoundArgsReentry(PyFunctionObject* func) {
   return getInterpretedVectorcall(func);
 }
 #define JITRT_CAPTURE_REENTRY(func) jitrtBoundArgsReentry(func)
+
+// CPython 3.11 binds in initialize_locals, then consumes a recursion
+// slot at start_frame.  The canary vectorcall never goes through eval,
+// so the same order is: bind in the generated prologue / these helpers,
+// then Enter at body reentry.  GuardedEntry only does the C-stack check.
+class RecursiveCallAfterBind {
+ public:
+  RecursiveCallAfterBind()
+      : entered_(Py_EnterRecursiveCall("") == 0) {}
+  ~RecursiveCallAfterBind() {
+    if (entered_) {
+      Py_LeaveRecursiveCall();
+    }
+  }
+  RecursiveCallAfterBind(const RecursiveCallAfterBind&) = delete;
+  RecursiveCallAfterBind& operator=(const RecursiveCallAfterBind&) = delete;
+  bool entered() const {
+    return entered_;
+  }
+
+ private:
+  bool entered_{false};
+};
+
+static PyObject* jitrtReenterAfterBind(
+    vectorcallfunc reentry,
+    PyObject* func,
+    PyObject** args,
+    size_t nargsf,
+    PyObject* kwnames) {
+  RecursiveCallAfterBind rec;
+  if (!rec.entered()) {
+    return nullptr;
+  }
+  return reentry(func, args, nargsf, kwnames);
+}
+
+// Equal-argcount positional path: the prologue has already bound by
+// matching nargs.  kwnames is unused; reentry always sees nullptr.
+PyObject* JITRT_ReenterAfterBind(
+    PyFunctionObject* func,
+    PyObject** args,
+    size_t nargsf,
+    PyObject* /*kwnames*/) {
+  return jitrtReenterAfterBind(
+      JITRT_CAPTURE_REENTRY(func),
+      reinterpret_cast<PyObject*>(func),
+      args,
+      nargsf,
+      nullptr);
+}
 #else
 #define JITRT_CAPTURE_REENTRY(func) JITRT_GET_REENTRY((func)->vectorcall)
 #endif
@@ -269,7 +323,16 @@ PyObject* JITRT_CallWithKeywordArgs(
       varargs)) {
     case BindKwStatus::Bound: {
       size_t new_nargsf = total_args;
+#if PY_VERSION_HEX < 0x030C0000
+      return jitrtReenterAfterBind(
+          reentry,
+          reinterpret_cast<PyObject*>(func),
+          arg_space.get(),
+          new_nargsf,
+          nullptr);
+#else
       return reentry((PyObject*)func, arg_space.get(), new_nargsf, nullptr);
+#endif
     }
     case BindKwStatus::Error:
       return nullptr;
@@ -330,6 +393,12 @@ JITRT_StaticCallFPReturn JITRT_CallWithIncorrectArgcountFPReturn(
 
   size_t new_nargsf = argcount;
 
+#if PY_VERSION_HEX < 0x030C0000
+  RecursiveCallAfterBind rec;
+  if (!rec.entered()) {
+    return {0.0, 0.0};
+  }
+#endif
   return reinterpret_cast<staticvectorcallfuncfp>(reentry)(
       (PyObject*)func,
       arg_space.get(),
@@ -390,6 +459,16 @@ JITRT_CallWithIncorrectArgcount(
 
   size_t new_nargsf = argcount;
 
+#if PY_VERSION_HEX < 0x030C0000
+  RecursiveCallAfterBind rec;
+  if (!rec.entered()) {
+#ifdef _WIN32
+    return nullptr;
+#else
+    return {nullptr, nullptr};
+#endif
+  }
+#endif
 #ifdef _WIN32
   return reentry(
       (PyObject*)func, arg_space.get(), new_nargsf, (PyObject*)defaulted_args);
@@ -466,8 +545,19 @@ TRetType JITRT_CallStaticallyWithPrimitiveSignatureWorker(
     goto fail;
   }
 
+#if PY_VERSION_HEX < 0x030C0000
+  {
+    RecursiveCallAfterBind rec;
+    if (!rec.entered()) {
+      return TRetType();
+    }
+    return reinterpret_cast<TVectorcall>(reentry)(
+        (PyObject*)func, (PyObject**)arg_space.get(), nargsf, nullptr);
+  }
+#else
   return reinterpret_cast<TVectorcall>(reentry)(
       (PyObject*)func, (PyObject**)arg_space.get(), nargsf, nullptr);
+#endif
 
 fail:
   auto interpVectorcall = getInterpretedVectorcall(func);
@@ -2966,7 +3056,8 @@ static BindKwStatus JITRT_BindKeywordArgsSimple(
       PyObject* value = args[argcount + i];
       Py_ssize_t j;
 
-      if (keyword == nullptr || !PyUnicode_Check(keyword)) {
+      // Exact str only; subclass __eq__ is CPython's once, not twice.
+      if (keyword == nullptr || !PyUnicode_CheckExact(keyword)) {
         return BindKwStatus::Fallback;
       }
 
@@ -3053,7 +3144,16 @@ PyObject* JITRT_CallWithKeywordArgsSimple(
       func, args, nargsf, kwnames, arg_space, total_args)) {
     case BindKwStatus::Bound: {
       size_t new_nargsf = total_args;
+#if PY_VERSION_HEX < 0x030C0000
+      return jitrtReenterAfterBind(
+          reentry,
+          reinterpret_cast<PyObject*>(func),
+          arg_space,
+          new_nargsf,
+          nullptr);
+#else
       return reentry((PyObject*)func, arg_space, new_nargsf, nullptr);
+#endif
     }
     case BindKwStatus::Error:
       return nullptr;
