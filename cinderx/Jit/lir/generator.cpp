@@ -963,8 +963,7 @@ void GenerateArgcountCheckBlocks(
           Instruction::kBranch, nullptr, AsmLbl{prologue_exit});
 
       emitAnnotation(wrong_count, "Fill defaults or fallback");
-      auto helper =
-          reinterpret_cast<uint64_t>(JITRT_CallWithIncorrectArgcount);
+      auto helper = reinterpret_cast<uint64_t>(JITRT_CallWithIncorrectArgcount);
       wrong_count->allocateInstr(Instruction::kCall, nullptr, Imm{helper});
       wrong_count->allocateInstr(
           Instruction::kBranch, nullptr, AsmLbl{prologue_exit});

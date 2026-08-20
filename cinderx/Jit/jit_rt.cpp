@@ -243,8 +243,7 @@ static vectorcallfunc jitrtBoundArgsReentry(PyFunctionObject* func) {
 // then Enter at body reentry.  GuardedEntry only does the C-stack check.
 class RecursiveCallAfterBind {
  public:
-  RecursiveCallAfterBind()
-      : entered_(Py_EnterRecursiveCall("") == 0) {}
+  RecursiveCallAfterBind() : entered_(Py_EnterRecursiveCall("") == 0) {}
   ~RecursiveCallAfterBind() {
     if (entered_) {
       Py_LeaveRecursiveCall();
