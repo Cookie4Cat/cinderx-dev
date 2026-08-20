@@ -871,18 +871,20 @@ static bool should_snapshot(
   }
 
 #if PY_VERSION_HEX < 0x030C0000
-  // The executing mode snapshots every non-terminator boundary.  The skip
-  // list below is a metadata-size optimization: replay-safe instructions
-  // do not need a resume point of their own.  The instrumentation polls
-  // change the calculus -- they live on boundaries, and a boundary without
-  // a snapshot is a boundary the poll pass cannot guard.  The gap is not
-  // theoretical: a value released at such a boundary (POP_TOP's operand,
-  // a STORE_FAST's previous value) runs its __del__ AFTER the last polled
-  // boundary, and a profile function registered there would never hear
-  // from the running frame again.  Metadata size is the wrong thing to
-  // save in a milestone whose subject is correctness.
+  // The executing mode writes local mutations through to the observable
+  // frame (JITRT_StoreFrameLocal311).  Releasing the slot's previous value
+  // can run arbitrary __del__ code, so the store is not replayable and its
+  // boundary needs its own resume point -- without one, bindGuards finds
+  // no dominating FrameState for a following guard.
   if (getConfig().state == State::kRunning) {
-    return true;
+    switch (bci.opcode()) {
+      case STORE_FAST:
+      case STORE_FAST_LOAD_FAST:
+      case STORE_FAST_STORE_FAST:
+        return true;
+      default:
+        break;
+    }
   }
 #endif
 
@@ -1765,13 +1767,17 @@ void HIRBuilder::translate(
         JIT_DCHECK(
             tc.frame.stack.isEmpty(),
             "entry guards inserted with non-empty operand stack");
-        if (tc.frame.stack.isEmpty()) {
-          emitted_entry_guards = emitTypeAnnotationGuards(tc);
-        }
         // Entry setup is done: arguments are bound and the cell slots
         // hold their cells, so this is where the frame's observable
         // localsplus gets its entry snapshot (executing mode, 3.11).
+        // This must precede the annotation guards: their Snapshot is the
+        // dominating FrameState for the instructions that follow, and the
+        // write-through calls are not replayable, so placing them after
+        // the guards would leave that stretch with no resume point.
         emitLocalsplusWriteback311(tc);
+        if (tc.frame.stack.isEmpty()) {
+          emitted_entry_guards = emitTypeAnnotationGuards(tc);
+        }
         entry_guards_emitted = true;
         in_entry_setup = false;
       }
@@ -5648,6 +5654,7 @@ void HIRBuilder::emitLocalsplusWriteback311(
   if (getConfig().state != State::kRunning) {
     return;
   }
+  bool emitted = false;
   for (std::size_t i = 0; i < tc.frame.localsplus.size(); i++) {
     Register* value = tc.frame.localsplus[i];
     if (value == nullptr || value->isA(TNullptr)) {
@@ -5655,6 +5662,15 @@ void HIRBuilder::emitLocalsplusWriteback311(
       continue;
     }
     emitStoreFrameLocal311(tc, static_cast<int>(i), value);
+    emitted = true;
+  }
+  if (emitted) {
+    // The write-through calls are not replayable, so any Snapshot before
+    // them no longer dominates what follows; re-establish the resume
+    // point here.  The boundary logic reuses a trailing Snapshot in
+    // place, which would otherwise leave the stretch up to the next
+    // boundary with no FrameState for bindGuards to bind.
+    tc.emitSnapshot();
   }
 #endif
 }

@@ -313,17 +313,17 @@ DeoptResult prepareForDeopt(
 // frames. CPython normally sets these during the RESUME opcode at function
 // entry, but deopted frames resume mid-function and skip RESUME.
 //
-// On 3.11 this must NOT happen: stock 3.11 dispatches every event to the
-// global c_tracefunc, and the Python-level sys.settrace trampoline routes
-// line/return/exception events through frame->f_trace, which only a
-// 'call' event populates.  A frame that was already running when settrace
-// was installed therefore reports no events and a None f_trace in stock;
-// forcing f_trace here would make the deopted frame trace lines stock
-// never traces.
+// On 3.11 this is the RFC's versioned compatibility semantics (3.3.4.5
+// item 7): a frame that deopts mid-function for an ordinary reason while
+// tracing is already active never re-runs the entry RESUME, so the
+// CPython-expected state is set here explicitly.  This intentionally
+// diverges from stock 3.11 -- where a mid-flight settrace leaves the
+// running frame's f_trace unset and its remaining events undelivered --
+// and is pinned by dedicated event-stream oracles rather than a stock
+// differential.
 void setupTraceForDeoptedFrame(
-    [[maybe_unused]] _PyInterpreterFrame* frame,
-    [[maybe_unused]] PyThreadState* tstate) {
-#if PY_VERSION_HEX >= 0x030C0000
+    _PyInterpreterFrame* frame,
+    PyThreadState* tstate) {
   if (tstate->c_tracefunc != nullptr &&
       frame->owner != FRAME_OWNED_BY_GENERATOR) {
     PyFrameObject* fobj = _PyFrame_GetFrameObject(frame);
@@ -334,7 +334,6 @@ void setupTraceForDeoptedFrame(
       }
     }
   }
-#endif
 }
 
 PyObject* resumeInInterpreter(
