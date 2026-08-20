@@ -618,6 +618,34 @@ def _writeoff_rows(name):
     return rows
 
 
+def _canary_population(tests_dir=None):
+    """The canary population by the runner's own derivation.
+
+    The run_rt311_green.sh gate scans the SKIP_311_EXECUTABLE_COMPILE()
+    sites to decide what the canary leg executes; anything that claims a
+    case "runs in canary" has to consume that same scan, not a committed
+    manifest that merely permits a skip.
+    """
+    import subprocess as _sp
+
+    script = (
+        Path(runners.REPO_ROOT)
+        / "ci_pipeline" / "scripts" / "run_rt311_green.sh"
+    )
+    cmd = ["bash", str(script), "--verify-canary-population"]
+    if tests_dir is not None:
+        cmd.append(str(tests_dir))
+    proc = _sp.run(cmd, capture_output=True, text=True, timeout=60)
+    assert proc.returncode == 0, (proc.returncode, proc.stdout[-400:])
+    return {line.strip() for line in proc.stdout.splitlines() if line.strip()}
+
+
+def _assert_writeoff_evidence_runs_in_canary(rows, population):
+    for item, _, cases in rows:
+        unrun = [case for case in cases if case not in population]
+        assert not unrun, (item, unrun)
+
+
 def test_mr05_lifecycle_writeoff_is_backed_by_passing_tests():
     # The audit rows this milestone owns are closed against registered
     # cases rather than against prose.  Reading the evidence out of the
@@ -640,11 +668,48 @@ def test_mr05_lifecycle_writeoff_is_backed_by_passing_tests():
         failing = [case for case in cases if case in known_fail]
         assert not failing, (item, failing)
     # Every named case has to be one the canary leg actually runs, or the
-    # write-off rests on something that is skipped in both modes.
-    allowed_skips = set(_rt_data("rt311_allowed_skips.txt"))
-    for item, _, cases in rows:
-        unrun = [case for case in cases if case not in allowed_skips]
-        assert not unrun, (item, unrun)
+    # write-off rests on something that is skipped in both modes.  The
+    # population comes from the runner's macro scan -- the allowed-skip
+    # manifest only proves the normal mode may skip, and a case whose gate
+    # macro is removed or relocated keeps its manifest rows while dropping
+    # out of the canary run.
+    _assert_writeoff_evidence_runs_in_canary(rows, _canary_population())
+
+
+def test_mr05_writeoff_case_leaving_the_canary_population_turns_red():
+    # A write-off evidence case that falls out of the derived canary
+    # population -- its mode-gate macro deleted, renamed, or moved -- must
+    # turn the verifier red, whatever the committed manifests still say.
+    rows = _writeoff_rows("mr05_lifecycle_writeoff.txt")
+    population = _canary_population()
+    victim = rows[0][2][0]
+    assert victim in population
+    with pytest.raises(AssertionError):
+        _assert_writeoff_evidence_runs_in_canary(rows, population - {victim})
+
+
+def test_canary_population_counts_only_gate_sites_inside_the_case(tmp_path):
+    # The scan attributes a SKIP_311_EXECUTABLE_COMPILE() line to the
+    # TEST_F body it appears in.  A macro moved into a helper still skips
+    # at runtime, but it is no longer a gate site the scan can attribute --
+    # such a case leaves the canary population, and with it any write-off
+    # that named it (the previous test pins that side).
+    src = tmp_path / "doctored_test.cpp"
+    src.write_text(
+        "TEST_F(DoctoredTest, GatedInBody) {\n"
+        "  SKIP_311_EXECUTABLE_COMPILE();\n"
+        "  helperGate();\n"
+        "}\n"
+        "static void helperGate() {\n"
+        "  SKIP_311_EXECUTABLE_COMPILE();\n"
+        "}\n"
+        "TEST_F(DoctoredTest, GatedViaHelper) {\n"
+        "  helperGate();\n"
+        "}\n"
+    )
+    population = _canary_population(tmp_path)
+    assert "DoctoredTest.GatedInBody" in population
+    assert "DoctoredTest.GatedViaHelper" not in population
 
 
 def test_registered_test_disappearance_turns_red(tmp_path):
