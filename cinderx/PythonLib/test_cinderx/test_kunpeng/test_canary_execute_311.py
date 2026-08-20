@@ -6246,6 +6246,301 @@ class CanaryExecute311Test(unittest.TestCase):
         interp, jit = self._dual_arm(probe)
         self.assertEqual(interp, jit)
 
+    def test_descriptor_class_swap_matches_the_interpreter_arm(self):
+        # d.__class__ = D2 swaps the descriptor's type without touching
+        # the receiver OR D1's version: only a pointer guard on
+        # Py_TYPE(descr) can see it.  After the swap to a get-only type
+        # the planted instance shadows win loads and stores land in the
+        # instance dict (a stale kDataDescr dispatch would call D2's NULL
+        # tp_descr_set); swapping to another data-descriptor type must
+        # re-route through its slots.
+        probe = self._DUAL_ARM_PREAMBLE + textwrap.dedent(
+            """
+            class D1:
+                def __get__(self, obj, objtype=None):
+                    return ("d1-get", obj.tag)
+
+                def __set__(self, obj, value):
+                    obj.__dict__["log"] = ("d1-set", value)
+
+            class D2:
+                def __get__(self, obj, objtype=None):
+                    return ("d2-get", obj.tag)
+
+            class D3:
+                def __get__(self, obj, objtype=None):
+                    return ("d3-get", obj.tag)
+
+                def __set__(self, obj, value):
+                    obj.__dict__["log"] = ("d3-set", value)
+
+            class C:
+                x = D1()
+
+                def __init__(self, tag):
+                    self.tag = tag
+
+            def read(c):
+                return c.x
+
+            def write(c, v):
+                c.x = v
+
+            cs = [C(i) for i in range(3)]
+            for c in cs:
+                c.__dict__["x"] = ("shadow", c.tag)
+            for _ in range(40):
+                for c in cs:
+                    read(c)
+                    write(c, 1)
+            compile_all(read, write)
+            for _ in range(3):
+                for c in cs:
+                    read(c)
+                    write(c, 2)
+
+            journal = []
+            journal.append([read(c) for c in cs])
+
+            d = C.__dict__["x"]
+            d.__class__ = D2
+            # Demoted by instance mutation alone: shadows win, stores go
+            # to the instance dict.
+            journal.append([read(c) for c in cs])
+            for c in cs:
+                write(c, 9)
+            journal.append([c.__dict__["x"] for c in cs])
+            journal.append([read(c) for c in cs])
+
+            d.__class__ = D3
+            # Data descriptor again, through the NEW type's slots.
+            journal.append([read(c) for c in cs])
+            for c in cs:
+                write(c, 11)
+            journal.append([c.__dict__.get("log") for c in cs])
+
+            still_compiled(read, write)
+            print("JOURNAL " + json.dumps(journal))
+            """
+        )
+        interp, jit = self._dual_arm(probe)
+        self.assertEqual(interp, jit)
+
+    def test_attribute_error_from_eq_follows_the_hook_protocol(self):
+        # Stock's slot_tp_getattr_hook runs the generic lookup
+        # UNSUPPRESSED and clears any escaping AttributeError into
+        # __getattr__ -- whether the colliding key's __eq__ raised on an
+        # absent OR a present name; on receivers WITHOUT __getattr__ it
+        # propagates like any error.  The cached paths must reproduce
+        # all three outcomes.
+        probe = self._DUAL_ARM_PREAMBLE + textwrap.dedent(
+            """
+            class KAttr:
+                def __init__(self, target):
+                    self.target = target
+
+                def __hash__(self):
+                    return hash(self.target)
+
+                def __eq__(self, other):
+                    raise AttributeError("eq attr boom")
+
+            journal = []
+
+            def observe(fn, *args):
+                try:
+                    return ["value", fn(*args)]
+                except Exception as exc:
+                    return [type(exc).__name__, str(exc)]
+
+            class H:
+                def __getattr__(self, name):
+                    return ["hooked", name]
+
+                def x(self):
+                    return "method"
+
+            def read_missing(h):
+                return h.missing
+
+            def read_x(h):
+                return h.x
+
+            hs = [H() for _ in range(3)]
+            for _ in range(40):
+                for h in hs:
+                    read_missing(h)
+                    read_x(h)
+            compile_all(read_missing, read_x)
+            for _ in range(3):
+                for h in hs:
+                    read_missing(h)
+                    read_x(h)
+
+            hb = H()
+            hb.__dict__[KAttr("missing")] = 1
+            # Absent name: suppressed and routed to __getattr__.
+            journal.append(observe(read_missing, hb))
+
+            hb2 = H()
+            hb2.__dict__[KAttr("x")] = 1
+            # Present name: 3.11's hook runs the generic part
+            # unsuppressed and clears ANY escaping AttributeError into
+            # __getattr__ -- the probe's error wins over the descriptor.
+            got = observe(read_x, hb2)
+            journal.append([got[0], callable(got[1])])
+
+            class E(Exception):
+                pass
+
+            def read_attr(e):
+                return e.attr
+
+            es = []
+            for _ in range(3):
+                e = E()
+                e.attr = "v"
+                es.append(e)
+            for _ in range(40):
+                for e in es:
+                    read_attr(e)
+            compile_all(read_attr)
+            for _ in range(3):
+                for e in es:
+                    read_attr(e)
+            eb = E()
+            eb.__dict__[KAttr("attr")] = 1
+            # No hook: the AttributeError propagates.
+            journal.append(observe(read_attr, eb))
+
+            still_compiled(read_missing, read_x, read_attr)
+            print("JOURNAL " + json.dumps(journal))
+            """
+        )
+        interp, jit = self._dual_arm(probe)
+        self.assertEqual(interp, jit)
+
+    def test_hook_unpublished_during_lookup_uses_the_pinned_hook(self):
+        # Stock INCREFs the __getattr__ it will use BEFORE the generic
+        # part runs: a colliding key's __eq__ that deletes P.__getattr__
+        # mid-probe neither changes which hook answers THIS call nor
+        # leaves the cached borrowed pointer dangling (the deleted
+        # function's only other reference was the class dict).
+        probe = self._DUAL_ARM_PREAMBLE + textwrap.dedent(
+            """
+            class P:
+                pass
+
+            def old_hook(self, name):
+                return ["old-hook", name]
+
+            P.__getattr__ = old_hook
+
+            class Killer:
+                def __init__(self, target):
+                    self.target = target
+
+                def __hash__(self):
+                    return hash(self.target)
+
+                def __eq__(self, other):
+                    del P.__getattr__
+                    return False
+
+            def read_missing(p):
+                return p.missing
+
+            ps = [P() for _ in range(3)]
+            for _ in range(40):
+                for p in ps:
+                    read_missing(p)
+            compile_all(read_missing)
+            for _ in range(3):
+                for p in ps:
+                    read_missing(p)
+
+            del old_hook
+            pb = P()
+            pb.__dict__[Killer("missing")] = 1
+            result = read_missing(pb)
+            journal = [result]
+            # The hook is gone for FUTURE calls on both arms.
+            try:
+                read_missing(P())
+                journal.append("no-raise")
+            except AttributeError:
+                journal.append("AttributeError")
+            still_compiled(read_missing)
+            print("JOURNAL " + json.dumps(journal))
+            """
+        )
+        interp, jit = self._dual_arm(probe)
+        self.assertEqual(interp, jit)
+
+    def test_type_receiver_method_stays_on_the_generic_path(self):
+        # RFC 3.3.5.2 scope note: type-receiver caches are fail-closed on
+        # 3.11.  simplifyVectorCall's type(obj) optimization produces a
+        # TType that would otherwise feed LoadTypeMethodCache -- whose
+        # pull validation covers the receiver version but none of the
+        # metaclass facts -- so the version gate must hold and a
+        # metaclass data descriptor must win on the very next call.
+        env = dict(os.environ)
+        env["CINDERX_JIT_MODE"] = "canary"
+        env["PYTHONJITAUTO"] = "1000000"
+        probe = textwrap.dedent(
+            """
+            import _cinderx, cinderx
+            cinderx.init()
+            _cinderx.install_frame_evaluator()
+            import cinderjit
+
+            class Meta(type):
+                pass
+
+            class T(metaclass=Meta):
+                @classmethod
+                def cm(cls):
+                    return "class-cm"
+
+            def call_tm(o):
+                return type(o).cm()
+
+            def main():
+                t = T()
+                for _ in range(40):
+                    assert call_tm(t) == "class-cm"
+                assert cinderjit.force_compile(call_tm) is True
+                for _ in range(3):
+                    assert call_tm(t) == "class-cm"
+
+                # A metaclass data descriptor takes precedence over the
+                # class-dict classmethod; the receiver class version does
+                # not change, so only the generic path answers this
+                # correctly.
+                Meta.cm = property(
+                    lambda cls: (lambda: "meta-descr"))
+                assert call_tm(t) == "meta-descr", call_tm(t)
+
+                stats = cinderjit.get_attr_cache_stats()["load_type_method"]
+                assert stats["fills"] == 0 and stats["hits"] == 0, (
+                    "the 3.11 fail-closed gate leaked a type-method "
+                    "cache: %r" % (stats,))
+                assert cinderjit.is_jit_compiled(call_tm)
+                print("type receiver stayed generic")
+
+            main()
+            """
+        )
+        proc = subprocess.run(
+            [sys.executable, "-c", probe],
+            capture_output=True,
+            text=True,
+            env=env,
+            timeout=120,
+        )
+        self.assertEqual(proc.returncode, 0, proc.stderr[-2000:])
+        self.assertIn("type receiver stayed generic", proc.stdout)
+
     def test_mutation_hammer_stays_correct_over_100_rounds(self):
         # 100 rounds of class mutation, instance shadowing and deletion
         # interleaved with compiled access: values stay right, the
@@ -6396,11 +6691,13 @@ class CanaryExecute311Test(unittest.TestCase):
                 "load_attr": True,
                 "store_attr": True,
                 "load_method": True,
-                # A 3.11 canary receiver never carries a static Type fact
-                # (globals are guarded loads, not baked constants), so the
-                # type-method cache is structurally unreachable; its
-                # pull-validated arm stays dormant and type-receiver
-                # method loads take the generic slow path instead.
+                # Type-receiver caches are fail-closed on 3.11 by an
+                # explicit version gate in simplifyLoadMethod (RFC
+                # 3.3.5.2 scope note): "usually unreachable" was not a
+                # safety boundary -- simplifyVectorCall's type(obj)
+                # optimization produces a TType that reaches this path --
+                # so type-receiver method loads take the generic slow
+                # path and these counters must stay zero.
                 "load_type_method": False,
                 "load_module_attr": True,
                 "load_module_method": True,

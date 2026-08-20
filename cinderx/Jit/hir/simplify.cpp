@@ -742,7 +742,18 @@ Register* simplifyLoadMethod(Env& env, const LoadMethod* load_meth) {
   Register* receiver = load_meth->GetOperand(0);
   Type ty = receiver->type();
   if (receiver->isA(TType)) {
+#if PY_VERSION_HEX < 0x030C0000
+    // Type-receiver caches are fail-closed on 3.11 (RFC 3.3.5.2 scope
+    // note): LoadTypeMethodCache's pull validation covers the receiver
+    // type's version only, not the metaclass facts the cache class
+    // requires.  "The type propagation rarely gets here" is not a
+    // safety boundary -- simplifyVectorCall's type(obj) optimization
+    // produces a TType that feeds exactly this path -- so it is gated
+    // by version, and the generic path carries correctness.
+    return nullptr;
+#else
     return simplifyLoadTypeMethodCached(env, load_meth);
+#endif
   }
   BorrowedRef<PyTypeObject> type{ty.runtimePyType()};
   if (type == &PyModule_Type || type == &Ci_StrictModule_Type) {

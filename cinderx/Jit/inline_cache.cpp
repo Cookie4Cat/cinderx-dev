@@ -302,6 +302,52 @@ PyObject* callGetAttr(
   return PyObject_CallOneArg(getattr_method, name);
 }
 
+#if PY_VERSION_HEX < 0x030C0000
+// The slot_tp_getattr_hook protocol, replicated for cached lookups on
+// 3.11 hook receivers (tp_getattro == Ci_tp_getattr_hook wrapping the
+// generic lookup).  Stock pins the __getattr__ this call will use with a
+// Py_INCREF BEFORE the generic part runs any user code, executes the
+// generic part with AttributeError suppression, and invokes the pinned
+// hook when the generic part comes up empty.  The pin is load-bearing:
+// user code inside the lookup (a dict key's __eq__, a descriptor slot)
+// can unpublish the hook, and the borrowed cached pointer would dangle.
+// Receivers without the hook run unsuppressed: every error propagates,
+// AttributeError included.
+class GetAttrHookSnapshot311 {
+ public:
+  // Snapshot from the receiver (kinds that do not cache the hook).
+  explicit GetAttrHookSnapshot311(PyObject* obj)
+      : hook_{Ref<>::create(getGetAttrForCaching(Py_TYPE(obj)).get())} {}
+  // Snapshot from a hook cached at fill time; the receiver-version hit
+  // check already proved it equals the entry-time lookup.
+  explicit GetAttrHookSnapshot311(BorrowedRef<> known_hook)
+      : hook_{Ref<>::create(known_hook.get())} {}
+
+  bool active() const {
+    return hook_ != nullptr;
+  }
+
+  // Handle an exception raised inside the generic part: under the hook
+  // an AttributeError is suppressed (the caller then continues or
+  // finishes the generic part); anything else -- or any error without
+  // the hook -- propagates.  Returns true when the error was cleared.
+  bool suppressAttributeError() const {
+    if (hook_ == nullptr || !PyErr_ExceptionMatches(PyExc_AttributeError)) {
+      return false;
+    }
+    PyErr_Clear();
+    return true;
+  }
+
+  PyObject* call(PyObject* obj, PyObject* name) const {
+    return callGetAttr(hook_, obj, name);
+  }
+
+ private:
+  Ref<> hook_;
+};
+#endif
+
 // Try __getattr__ fallback for split/combined dict lookups where the value is
 // missing. If the type has __getattr__ (tp_getattro == Ci_tp_getattr_hook),
 // look it up and call it. Otherwise, raise AttributeError as usual.
@@ -708,17 +754,27 @@ PyObject* CombinedMutator::getAttr(PyObject* obj, PyObject* name) {
     return getAttrFallback(obj, name);
   }
 #if PY_VERSION_HEX < 0x030C0000
-  // Stock GenericGetAttr reads the instance dict with
-  // PyDict_GetItemWithError: a non-unicode key's raising __eq__ must
-  // propagate, never be folded into "attribute absent".  The result is
+  // slot_tp_getattr_hook protocol: the hook this call will use is
+  // pinned BEFORE the lookup runs user code (a non-unicode key's __eq__
+  // can unpublish it), a raised AttributeError is suppressed under the
+  // hook and routes to it (no descriptor exists for this kind, so
+  // continuing the generic lookup is "not found"), and any other error
+  // -- or any error without the hook -- propagates.  The result is
   // strengthened while `dict` still holds its strong reference.
+  GetAttrHookSnapshot311 hook(getattr_method);
   PyObject* result =
       PyDict_GetItemWithError(reinterpret_cast<PyObject*>(dict.get()), name);
   if (result == nullptr) {
     if (PyErr_Occurred()) {
-      return nullptr;
+      if (!hook.suppressAttributeError()) {
+        return nullptr;
+      }
+      return hook.call(obj, name);
     }
-    return getAttrFallback(obj, name);
+    if (hook.active()) {
+      return hook.call(obj, name);
+    }
+    return raise_attribute_error(obj, name);
   }
 #else
   PyObject* result = PyDict_GetItem(dict, name);
@@ -782,16 +838,24 @@ PyObject* DictMutator::getAttr(PyObject* obj, PyObject* name) {
     return getAttrFallback(obj, name);
   }
   auto strong_ref = Ref<>::create(dict);
-  // Error-preserving, and the result is strengthened while strong_ref
-  // still pins the dict (a raising or dict-swapping __eq__ runs inside
-  // this lookup).
+  // Same pinned-hook protocol as CombinedMutator: error-preserving
+  // lookup, AttributeError suppressed under the hook and routed to it,
+  // and the result strengthened while strong_ref still pins the dict (a
+  // raising or dict-swapping __eq__ runs inside this lookup).
+  GetAttrHookSnapshot311 hook(getattr_method);
   PyObject* result =
       PyDict_GetItemWithError(reinterpret_cast<PyObject*>(dict.get()), name);
   if (result == nullptr) {
     if (PyErr_Occurred()) {
-      return nullptr;
+      if (!hook.suppressAttributeError()) {
+        return nullptr;
+      }
+      return hook.call(obj, name);
     }
-    return getAttrFallback(obj, name);
+    if (hook.active()) {
+      return hook.call(obj, name);
+    }
+    return raise_attribute_error(obj, name);
   }
   return Py_NewRef(result);
 }
@@ -827,10 +891,20 @@ PyObject* DictMutator::getAttr(PyObject* obj, PyObject* name) {
 #endif
 
 int DataDescrMutator::setAttr(PyObject* obj, PyObject* value) {
+  // Stock GenericSetAttr strengthens the descriptor across the slot call:
+  // the slot runs arbitrary code and can drop the descriptor's last
+  // reference (e.g. delete itself from the owner class) while its own
+  // C frame is still executing.  The caller's strong reference is what
+  // keeps `self` alive in stock; mirror it.
+  auto descr_guard = Ref<>::create(descr);
   return Py_TYPE(descr)->tp_descr_set(descr, obj, value);
 }
 
 PyObject* DataDescrMutator::getAttr(PyObject* obj) {
+  // Same ownership as stock GenericGetAttr: hold the descriptor across
+  // the slot call.  The __getattr__ routing for a raising slot lives in
+  // the dispatch layer, which pins the hook before this runs.
+  auto descr_guard = Ref<>::create(descr);
   return Py_TYPE(descr)->tp_descr_get(descr, obj, (PyObject*)Py_TYPE(obj));
 }
 
@@ -892,8 +966,11 @@ PyObject* DescrOrClassVarMutator::getAttr(PyObject* obj, PyObject* name) {
   // Check the instance storage for a shadowing attribute without
   // materializing: a matching nonzero keys version proves the name is
   // absent, anything else is peeked in place.  A raising lookup (a
-  // non-unicode key's __eq__) propagates, exactly as stock's
-  // PyDict_GetItemWithError does.
+  // non-unicode key's __eq__) aborts the generic part with the error in
+  // place, exactly like stock's unsuppressed PyObject_GenericGetAttr
+  // inside slot_tp_getattr_hook: on a hook receiver the DISPATCH layer
+  // then clears an AttributeError and calls the pinned __getattr__; on
+  // a plain receiver it propagates.
   if (keys_version == 0 || !isValidKeysVersion(keys_version, obj)) {
     PyObject* shadow = nullptr;
     int found = peekInstanceAttr311(obj, name, &shadow);
@@ -1058,11 +1135,24 @@ inline PyObject* AttributeMutator::getAttr(PyObject* obj, PyObject* name) {
     case AttributeMutator::Kind::kDict:
       return dict_.getAttr(obj, name);
     case AttributeMutator::Kind::kDataDescr: {
+#if PY_VERSION_HEX < 0x030C0000
+      // slot_tp_getattr_hook pins the __getattr__ it will use BEFORE the
+      // generic part runs any user code; the descriptor slot below can
+      // unpublish the hook, so a post-hoc live lookup is the wrong hook
+      // -- or a dangling one.
+      GetAttrHookSnapshot311 hook(obj);
+      PyObject* result = data_descr_.getAttr(obj);
+      if (result == nullptr && hook.suppressAttributeError()) {
+        result = hook.call(obj, name);
+      }
+      return result;
+#else
       PyObject* result = data_descr_.getAttr(obj);
       if (result == nullptr) {
         result = tryGetAttrFallback(type(), nullptr, obj, name);
       }
       return result;
+#endif
     }
     case AttributeMutator::Kind::kMemberDescr: {
       PyObject* result = member_descr_.getAttr(obj);
@@ -1073,11 +1163,26 @@ inline PyObject* AttributeMutator::getAttr(PyObject* obj, PyObject* name) {
       return result;
     }
     case AttributeMutator::Kind::kDescrOrClassVar: {
+#if PY_VERSION_HEX < 0x030C0000
+      // Same pinned-hook protocol as kDataDescr: the mutator's probe and
+      // descriptor slots run user code, so the hook this call uses is
+      // captured first.  Stock's hook runs the generic part UNSUPPRESSED
+      // and treats any escaping AttributeError -- probe __eq__,
+      // descriptor slot, or not-found -- the same way: clear it and call
+      // the pinned __getattr__.
+      GetAttrHookSnapshot311 hook(obj);
+      PyObject* result = descr_or_cvar_.getAttr(obj, name);
+      if (result == nullptr && hook.suppressAttributeError()) {
+        result = hook.call(obj, name);
+      }
+      return result;
+#else
       PyObject* result = descr_or_cvar_.getAttr(obj, name);
       if (result == nullptr) {
         result = tryGetAttrFallback(type(), nullptr, obj, name);
       }
       return result;
+#endif
     }
     case AttributeMutator::Kind::kGetAttr:
       return getattr_.getAttr(obj, name);
@@ -1604,17 +1709,23 @@ PyObject* GetAttrMutator::getAttr(PyObject* obj, PyObject* name) {
     // 3.11: peek the instance storage without materializing -- live inline
     // values are scanned through the cached keys, a real dict is read in
     // place.  _PyObject_GetDictPtr would convert values into a dict here.
-    // A raising lookup propagates; only a proven absence dispatches to
-    // __getattr__.
+    // The hook is pinned before the peek (its __eq__ window can
+    // unpublish it); a peek-raised AttributeError is suppressed and --
+    // the name being absent from the pinned type -- lands on the hook,
+    // like every other empty-handed outcome.  Other errors propagate.
+    GetAttrHookSnapshot311 hook(getattr_method);
     PyObject* res = nullptr;
     int found = peekInstanceAttr311(obj, name, &res);
     if (found < 0) {
-      return nullptr;
+      if (!hook.suppressAttributeError()) {
+        return nullptr;
+      }
+      return hook.call(obj, name);
     }
     if (found != 0) {
       return res;
     }
-    return callGetAttr(getattr_method, obj, name);
+    return hook.call(obj, name);
 #else
     // On 3.12 the managed-dict slot may hold a tagged inline-values pointer
     // rather than a real dict. We must check for inline values *before*
