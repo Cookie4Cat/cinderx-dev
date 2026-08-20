@@ -815,11 +815,15 @@ class CanaryExecute311Test(unittest.TestCase):
             class Boom:
                 pass
 
-            def victim(x=Boom()):
+            def rebind():
                 victim.__defaults__ = ()
+
+            def victim(x=Boom()):
+                rebind()
                 return x
 
             assert cinderjit.force_compile(victim) is True
+            assert cinderjit.is_jit_compiled(rebind) is False
             got = victim()
             assert type(got).__name__ == "Boom", type(got)
             print("default survived rebind")
@@ -849,11 +853,15 @@ class CanaryExecute311Test(unittest.TestCase):
             class Boom:
                 pass
 
-            def victim(*, x=Boom()):
+            def clear_kw():
                 victim.__kwdefaults__.clear()
+
+            def victim(*, x=Boom()):
+                clear_kw()
                 return x
 
             assert cinderjit.force_compile(victim) is True
+            assert cinderjit.is_jit_compiled(clear_kw) is False
             got = victim()
             assert type(got).__name__ == "Boom", type(got)
             print("kwonly default survived clear")

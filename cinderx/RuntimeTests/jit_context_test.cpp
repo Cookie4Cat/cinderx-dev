@@ -3934,20 +3934,27 @@ self_referential.myself = self_referential
 TEST_F(JITLifecycle311Test, DefaultArgSurvivesDefaultsRebind) {
   SKIP_311_EXECUTABLE_COMPILE();
 
-  // Stock INCREFs the default at bind.  Rebinding __defaults__ in the
-  // body must not free the value the compiled frame still holds.
+  // Stock INCREFs the default at bind.  Rebinding __defaults__ after
+  // bind must not free the value the compiled frame still holds.
+  // STORE_ATTR is off the execute whitelist, so the mutation lives in
+  // an interpreted helper reached by CALL.
   const char* py_src = R"(
 class Boom:
     pass
 
-def victim(x=Boom()):
+def rebind():
     victim.__defaults__ = ()
+
+def victim(x=Boom()):
+    rebind()
     return x
 )";
   Ref<PyFunctionObject> func(compileAndGet(py_src, "victim"));
+  Ref<PyFunctionObject> rebind(getGlobal("rebind"));
   ASSERT_NE(func, nullptr);
   ASSERT_EQ(jit::compileFunction(func), jit::Result::OK);
   ASSERT_TRUE(isJitCompiled(func));
+  ASSERT_FALSE(isJitCompiled(rebind));
 
   auto no_args = Ref<>::steal(PyTuple_New(0));
   auto got = Ref<>::steal(PyObject_Call(func, no_args, nullptr));
@@ -3959,19 +3966,25 @@ TEST_F(JITLifecycle311Test, KwOnlyDefaultSurvivesKwdefaultsClear) {
   SKIP_311_EXECUTABLE_COMPILE();
 
   // __kwdefaults__ is a live dict.  Clearing it after bind must not
-  // free the value sitting in arg_space.
+  // free the value sitting in arg_space.  LOAD_METHOD is off the
+  // execute whitelist, so the clear lives in an interpreted helper.
   const char* py_src = R"(
 class Boom:
     pass
 
-def victim(*, x=Boom()):
+def clear_kw():
     victim.__kwdefaults__.clear()
+
+def victim(*, x=Boom()):
+    clear_kw()
     return x
 )";
   Ref<PyFunctionObject> func(compileAndGet(py_src, "victim"));
+  Ref<PyFunctionObject> clear_kw(getGlobal("clear_kw"));
   ASSERT_NE(func, nullptr);
   ASSERT_EQ(jit::compileFunction(func), jit::Result::OK);
   ASSERT_TRUE(isJitCompiled(func));
+  ASSERT_FALSE(isJitCompiled(clear_kw));
 
   auto no_args = Ref<>::steal(PyTuple_New(0));
   auto got = Ref<>::steal(PyObject_Call(func, no_args, nullptr));
@@ -4057,28 +4070,15 @@ TEST_F(JITLifecycle311Test, BindFailureAtRecursionLimitMatchesStock) {
   const char* py_src = R"(
 def needed(a):
     return a
-def needed_interp(a):
-    return a
 def none():
-    return 1
-def none_interp():
     return 1
 def with_def(a, b=1):
     return a
-def with_def_interp(a, b=1):
-    return a
 )";
   Ref<PyFunctionObject> needed(compileAndGet(py_src, "needed"));
-  Ref<PyFunctionObject> needed_interp(getGlobal("needed_interp"));
   Ref<PyFunctionObject> none(getGlobal("none"));
-  Ref<PyFunctionObject> none_interp(getGlobal("none_interp"));
   Ref<PyFunctionObject> with_def(getGlobal("with_def"));
-  Ref<PyFunctionObject> with_def_interp(getGlobal("with_def_interp"));
-  ASSERT_EQ(jit::compileFunction(needed), jit::Result::OK);
-  ASSERT_EQ(jit::compileFunction(none), jit::Result::OK);
-  ASSERT_EQ(jit::compileFunction(with_def), jit::Result::OK);
-  ASSERT_TRUE(isJitCompiled(needed));
-  ASSERT_FALSE(isJitCompiled(needed_interp));
+  ASSERT_NE(needed, nullptr);
 
   auto callAtLimit = [](PyObject* fn, PyObject* args) {
     PyThreadState* tstate = PyThreadState_GET();
@@ -4117,17 +4117,21 @@ def with_def_interp(a, b=1):
   auto three_args =
       Ref<>::steal(PyTuple_Pack(3, one.get(), two.get(), three.get()));
 
+  auto missing_interp = callAtLimit(needed, no_args);
+  auto extra_interp = callAtLimit(none, extra);
+  auto def_interp = callAtLimit(with_def, three_args);
+
+  ASSERT_EQ(jit::compileFunction(needed), jit::Result::OK);
+  ASSERT_EQ(jit::compileFunction(none), jit::Result::OK);
+  ASSERT_EQ(jit::compileFunction(with_def), jit::Result::OK);
+  ASSERT_TRUE(isJitCompiled(needed));
+
   auto missing_jit = callAtLimit(needed, no_args);
-  auto missing_interp = callAtLimit(needed_interp, no_args);
+  auto extra_jit = callAtLimit(none, extra);
+  auto def_jit = callAtLimit(with_def, three_args);
   EXPECT_EQ(missing_jit, missing_interp);
   EXPECT_EQ(missing_jit.first, "RecursionError");
-
-  auto extra_jit = callAtLimit(none, extra);
-  auto extra_interp = callAtLimit(none_interp, extra);
   EXPECT_EQ(extra_jit, extra_interp);
-
-  auto def_jit = callAtLimit(with_def, three_args);
-  auto def_interp = callAtLimit(with_def_interp, three_args);
   EXPECT_EQ(def_jit, def_interp);
 
   PyThreadState* tstate = PyThreadState_GET();
