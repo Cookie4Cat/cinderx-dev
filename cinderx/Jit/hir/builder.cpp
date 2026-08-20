@@ -41,6 +41,7 @@ extern "C" {
 #include <memory>
 #include <optional>
 #include <set>
+#include <unordered_map>
 #include <unordered_set>
 #include <utility>
 #include <vector>
@@ -1289,6 +1290,55 @@ const char* unsupportedOpcodeReason311(BorrowedRef<PyCodeObject> code) {
   return nullptr;
 }
 
+#if PY_VERSION_HEX < 0x030C0000
+namespace {
+// Instruction indices reachable from entry through normal control flow
+// only -- exactly the set buildHIR will translate.  Exception-handler
+// regions are reachable solely through the exception table, never enter
+// machine code (a raise exits through the UnhandledException deopt and
+// the anchored evaluator runs the handler), and therefore must not be
+// held to the machine-code whitelist.  Returns false if a jump targets
+// something that is not an instruction start (fail closed).
+bool collectNormalFlowReachable311(
+    BorrowedRef<PyCodeObject> code,
+    std::set<int>& reachable) {
+  BytecodeInstructionBlock bc_instrs{code};
+  std::unordered_map<int, BytecodeInstruction> at_index;
+  for (const auto& instr : bc_instrs) {
+    at_index.emplace(instr.baseIndex().value(), instr);
+  }
+  std::vector<int> worklist{0};
+  while (!worklist.empty()) {
+    int index = worklist.back();
+    worklist.pop_back();
+    if (!reachable.insert(index).second) {
+      continue;
+    }
+    auto it = at_index.find(index);
+    if (it == at_index.end()) {
+      return false;
+    }
+    const BytecodeInstruction& instr = it->second;
+    if (instr.isBranch()) {
+      worklist.push_back(instr.getJumpTarget().asIndex().value());
+    }
+    bool falls_through = !instr.isReturn() &&
+        instr.opcode() != RAISE_VARARGS && instr.opcode() != RERAISE &&
+        instr.opcode() != JUMP_FORWARD && instr.opcode() != JUMP_BACKWARD &&
+        instr.opcode() != JUMP_BACKWARD_NO_INTERRUPT &&
+        instr.opcode() != JUMP_ABSOLUTE;
+    if (falls_through) {
+      int next = instr.nextInstrOffset().asIndex().value();
+      if (at_index.contains(next)) {
+        worklist.push_back(next);
+      }
+    }
+  }
+  return true;
+}
+} // namespace
+#endif
+
 const char* unsupportedExecuteReason311(BorrowedRef<PyCodeObject> code) {
 #if PY_VERSION_HEX < 0x030C0000
   // The execute whitelist: MR-04 leaf data flow plus the MR-06 CALL
@@ -1298,16 +1348,26 @@ const char* unsupportedExecuteReason311(BorrowedRef<PyCodeObject> code) {
   // for nested-function cells) plus the MR-08 exception family.  The
   // handler-body opcodes (PUSH_EXC_INFO, CHECK_EXC_MATCH, POP_EXCEPT,
   // RERAISE, WITH_EXCEPT_START) are reachable only through the exception
-  // table, which HIR never translates: a raise inside machine code exits
-  // through the UnhandledException deopt and the anchored evaluator's
-  // exception_unwind runs the handler, so admitting them admits no new
-  // machine code.  RAISE_VARARGS, LOAD_ASSERTION_ERROR and BEFORE_WITH
-  // do run in normal flow and have translations.  Still out: attr or
+  // table, which HIR never translates.  RAISE_VARARGS,
+  // LOAD_ASSERTION_ERROR and BEFORE_WITH do run in normal flow and have
+  // translations.  Only normal-flow-reachable instructions are checked:
+  // an opcode that occurs solely inside a handler region executes in the
+  // interpreter after the deopt regardless of what it is, so holding it
+  // to the machine-code whitelist would refuse functions this milestone
+  // fully supports.  Still out (on the reachable surface): attr or
   // subscript ICs, STORE_DEREF, generator *bodies*, except* and pattern
-  // matching (refused earlier by the translate scan).  The decoder
-  // yields unspecialized opcodes, so quickened forms cannot slip past.
+  // matching (the latter two refused earlier by the whole-code translate
+  // scan, keeping their audited refusals).  The decoder yields
+  // unspecialized opcodes, so quickened forms cannot slip past.
+  std::set<int> reachable;
+  if (!collectNormalFlowReachable311(code, reachable)) {
+    return "REFUSE_SHAPE_EXECUTE_SURFACE";
+  }
   BytecodeInstructionBlock bc_instrs{code};
   for (auto bc_it = bc_instrs.begin(); bc_it != bc_instrs.end(); ++bc_it) {
+    if (!reachable.contains(bc_it->baseIndex().value())) {
+      continue;
+    }
     switch (bc_it->opcode()) {
       case BEFORE_WITH:
       case BINARY_OP:
@@ -1708,6 +1768,10 @@ void HIRBuilder::translate(
         if (tc.frame.stack.isEmpty()) {
           emitted_entry_guards = emitTypeAnnotationGuards(tc);
         }
+        // Entry setup is done: arguments are bound and the cell slots
+        // hold their cells, so this is where the frame's observable
+        // localsplus gets its entry snapshot (executing mode, 3.11).
+        emitLocalsplusWriteback311(tc);
         entry_guards_emitted = true;
         in_entry_setup = false;
       }
@@ -2386,6 +2450,7 @@ void HIRBuilder::translate(
           Register* var = tc.frame.localsplus[var_idx];
           moveOverwrittenStackRegisters(tc, var);
           tc.emit<LoadConst>(var, TNullptr);
+          emitStoreFrameLocal311(tc, var_idx, var);
           break;
         }
 #if PY_VERSION_HEX >= 0x030C0000
@@ -5549,6 +5614,51 @@ void HIRBuilder::moveOverwrittenStackRegisters(
     }
   }
 }
+// MR-08 frame observability (3.11, executing mode): the materialized
+// _PyInterpreterFrame is what sys._getframe() / frame.f_locals /
+// sys._current_frames() readers see while machine code runs.  Stock 3.11
+// keeps localsplus current at every store, so mirror that: seed the frame
+// with the entry bindings (arguments and cells) once the entry setup is
+// done, and write every STORE_FAST / DELETE_FAST through.  Values keep
+// living in registers for computation; the frame's copy is for observers,
+// owned by the frame and released by the existing clear paths
+// (JITRT_UnlinkFrame, deopt reification, _PyFrame_Clear).
+void HIRBuilder::emitStoreFrameLocal311(
+    [[maybe_unused]] TranslationContext& tc,
+    [[maybe_unused]] int idx,
+    [[maybe_unused]] Register* value) {
+#if PY_VERSION_HEX < 0x030C0000
+  if (getConfig().state != State::kRunning) {
+    return;
+  }
+  Register* idx_reg = temps_.AllocateNonStack();
+  tc.emit<LoadConst>(
+      idx_reg, Type::fromCUInt(static_cast<uint64_t>(idx), TCUInt64));
+  Register* out = temps_.AllocateNonStack();
+  auto call = tc.emit<CallStatic>(
+      2, out, reinterpret_cast<void*>(JITRT_StoreFrameLocal311), TCUInt64);
+  call->SetOperand(0, idx_reg);
+  call->SetOperand(1, value);
+#endif
+}
+
+void HIRBuilder::emitLocalsplusWriteback311(
+    [[maybe_unused]] TranslationContext& tc) {
+#if PY_VERSION_HEX < 0x030C0000
+  if (getConfig().state != State::kRunning) {
+    return;
+  }
+  for (std::size_t i = 0; i < tc.frame.localsplus.size(); i++) {
+    Register* value = tc.frame.localsplus[i];
+    if (value == nullptr || value->isA(TNullptr)) {
+      // Unbound slots are already null in the frame.
+      continue;
+    }
+    emitStoreFrameLocal311(tc, static_cast<int>(i), value);
+  }
+#endif
+}
+
 void HIRBuilder::emitStoreFast(
     TranslationContext& tc,
     const jit::BytecodeInstruction& bc_instr) {
@@ -5557,6 +5667,7 @@ void HIRBuilder::emitStoreFast(
   JIT_DCHECK(dst != nullptr, "no register");
   moveOverwrittenStackRegisters(tc, dst);
   tc.emit<Assign>(dst, src);
+  emitStoreFrameLocal311(tc, bc_instr.oparg(), dst);
 }
 
 void HIRBuilder::emitStoreFastStoreFast(
