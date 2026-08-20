@@ -153,11 +153,12 @@ TEST_F(JITContextTest, CodeCompiledReportsPublicationRefusal) {
   // artifact allocation, the code-extra reservation, and the post-compile
   // execute refusal all live below it.  Its answer is what lets the
   // compile entry stop reporting OK for a function that was never
-  // installed.  A keyword-only signature is a deterministic publication
-  // refusal, and an empty data block exercises the same early-return
-  // paths an allocation failure would take.
+  // installed.  LOAD_ATTR is still off the execute whitelist (keyword-only
+  // signatures are rebound by the generated prologue and are no longer a
+  // refusal).  An empty data block exercises the same early-return paths
+  // an allocation failure would take.
   Ref<PyFunctionObject> func(
-      compileAndGet("def func(*, flag=None): return flag", "func"));
+      compileAndGet("def func(obj): return obj.attr", "func"));
   ASSERT_NE(func, nullptr);
 
   vectorcallfunc vectorcall_before = func->vectorcall;
