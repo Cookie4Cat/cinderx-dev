@@ -2847,12 +2847,12 @@ void JITRT_AtQuiescentState([[maybe_unused]] PyThreadState* tstate) {
 #endif
 }
 
+// clang-format off
 PyObject JITRT_IterDoneSentinel = {
     _PyObject_EXTRA_INIT
 #if PY_VERSION_HEX < 0x030C0000
     1,
 #elif PY_VERSION_HEX >= 0x030E0000
-// clang-format off
 #ifdef Py_GIL_DISABLED
     .ob_tid = _Py_UNOWNED_TID,
     .ob_flags = _Py_STATICALLY_ALLOCATED_FLAG,
@@ -2864,13 +2864,11 @@ PyObject JITRT_IterDoneSentinel = {
     {.ob_refcnt = _Py_IMMORTAL_INITIAL_REFCNT,
      .ob_flags = _Py_STATIC_FLAG_BITS},
 #endif
-// clang-format on
-
 #else
     {.ob_refcnt = _Py_IMMORTAL_REFCNT},
 #endif
-    nullptr
-};
+    nullptr};
+// clang-format on
 
 PyObject* JITRT_InvokeIterNext(PyObject* iterator) {
   iternextfunc iternext_f = Py_TYPE(iterator)->tp_iternext;
