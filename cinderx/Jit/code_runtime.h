@@ -74,6 +74,10 @@ class alignas(16) CodeRuntime {
   // Get all deopt metadatas for the given CodeRuntime.
   const std::vector<DeoptMetadata>& deoptMetadatas() const;
 
+  // Arm the RFC site-deopt trigger on every metadata row with `site_id`.
+  // `n` is the 1-based visit count; `at_or_after` keeps forcing after N.
+  bool armForcedDeopt(uint64_t site_id, int n, bool at_or_after);
+
   // Add OSR metadata for a loop-header secondary entry point.
   // Returns the index of the newly added metadata.
   std::size_t addOSRMetadata(OSRMetadata&& osr_meta);

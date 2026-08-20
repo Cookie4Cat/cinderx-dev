@@ -648,7 +648,9 @@ for expected in (
 def execute_holds() -> list[Judge]:
     """The canary (MR-04) contract: machine code genuinely compiled,
     installed and entered, with the ledger closed -- and none of the
-    shadow counters moving, because canary does not shadow-compile."""
+    shadow counters moving, because canary does not shadow-compile.
+    Organic deopt is allowed once Simplify ships guards; tests must not
+    arm site-deopt on these runners."""
     return [
         expect("evaluator_installed", "==", True),
         expect("machine_code_entries", ">", 0),
@@ -660,7 +662,6 @@ def execute_holds() -> list[Judge]:
         expect("unknown_rejects", "==", 0),
         expect("events_dropped", "==", 0),
         expect("forced_deopt_hits", "==", 0),
-        expect("organic_deopt_hits", "==", 0),
         # In the schema the shadow-success counter surfaces as
         # compile_success; canary must not move it (no shadow compiles).
         expect("compile_success", "==", 0),
@@ -1343,7 +1344,6 @@ def canary_churn_runner(*, judges: list[Judge] | None = None) -> RunnerSpec:
         expect("unknown_rejects", "==", 0),
         expect("events_dropped", "==", 0),
         expect("forced_deopt_hits", "==", 0),
-        expect("organic_deopt_hits", "==", 0),
         expect("compile_success", "==", 0),
         expect("shadow_codegen_bytes", "==", 0),
     ]
@@ -1772,7 +1772,7 @@ def pyperformance_completeness_runner(
         # canary driver-process contract: the driver's own target is
         # surface-clean and crosses the threshold, so machine code must
         # genuinely be entered here; the ledger closes, no shadow counter
-        # moves, and nothing deopts.
+        # moves.  Organic deopt is allowed once guards ship.
         mode_judges = [
             expect("evaluator_installed", "==", True),
             expect("machine_code_entries", ">", 0),
@@ -1781,7 +1781,6 @@ def pyperformance_completeness_runner(
             expect("unknown_rejects", "==", 0),
             expect("events_dropped", "==", 0),
             expect("forced_deopt_hits", "==", 0),
-            expect("organic_deopt_hits", "==", 0),
             expect("compile_success", "==", 0),
             expect("shadow_codegen_bytes", "==", 0),
         ]

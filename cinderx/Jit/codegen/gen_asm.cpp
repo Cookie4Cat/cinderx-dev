@@ -4,6 +4,7 @@
 #if PY_VERSION_HEX < 0x030C0000
 #include "cinderx/Interpreter/3.11/interpreter_contract.h"
 #endif
+#include "cinderx/Jit/trigger_stats.h"
 
 #include "internal/pycore_ceval.h"
 #include "internal/pycore_pystate.h"
@@ -158,7 +159,15 @@ DeoptResult prepareForDeopt(
     CodeRuntime* code_runtime,
     std::size_t deopt_idx) {
   JIT_CHECK(deopt_idx != -1ull, "deopt_idx must be valid");
-  const DeoptMetadata& deopt_meta = code_runtime->getDeoptMetadata(deopt_idx);
+  DeoptMetadata& deopt_meta = code_runtime->getDeoptMetadata(deopt_idx);
+#if PY_VERSION_HEX < 0x030C0000
+  if (deopt_meta.consumed_forced) {
+    deopt_meta.consumed_forced = false;
+    triggerStatsOnForcedDeopt();
+  } else {
+    triggerStatsOnOrganicDeopt();
+  }
+#endif
   PyThreadState* tstate = _PyThreadState_UncheckedGet();
   bool is_patched_instrumentation = false;
   _PyInterpreterFrame* frame = interpFrameFromThreadState(tstate);
