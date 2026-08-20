@@ -4022,10 +4022,8 @@ finally:
   ASSERT_EQ(pthread_create(&thread, &attr, worker, &payload), 0);
   pthread_attr_destroy(&attr);
   int join_rc;
-  Py_BEGIN_ALLOW_THREADS
-  join_rc = pthread_join(thread, nullptr);
-  Py_END_ALLOW_THREADS
-  ASSERT_EQ(join_rc, 0);
+  Py_BEGIN_ALLOW_THREADS join_rc = pthread_join(thread, nullptr);
+  Py_END_ALLOW_THREADS ASSERT_EQ(join_rc, 0);
   EXPECT_EQ(payload.rc, 0);
 }
 #endif
