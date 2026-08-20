@@ -5051,5 +5051,812 @@ class CanaryExecute311Test(unittest.TestCase):
         self.assertIn("survived death-window round trips", proc.stdout)
 
 
+    # ------------------------------------------------------------------
+    # MR-08: the exception surface.  A raise inside machine code exits
+    # through the UnhandledException deopt and the anchored evaluator's
+    # exception_unwind runs the handler; these tests hold the whole
+    # observable contract of that route -- results, tracebacks, frame
+    # state, tracing and eval-breaker interplay.
+    #
+    # Dual-arm oracles compare against the JIT-off arm of the same build
+    # (evaluator installed, canary off).  That arm is this project's
+    # baseline: libtest_jitoff_diff pins it to stock over the full test
+    # corpus, and it shares the vendored evaluator's CALL dispatch, so
+    # positions agree by construction rather than by accident of pure
+    # CPython's inlined-call fast path (structurally disabled under an
+    # installed PEP 523 evaluator).
+
+    def _dual_arm(self, probe, timeout=120):
+        """Run `probe` in the interp (JIT-off) and jit (canary) arms and
+        return the two stdout JOURNAL payloads."""
+
+        def run_arm(mode):
+            env = dict(os.environ)
+            if mode == "jit":
+                env["CINDERX_JIT_MODE"] = "canary"
+                env["PYTHONJITAUTO"] = "1000000"
+            proc = subprocess.run(
+                [sys.executable, "-c", probe, mode],
+                capture_output=True,
+                text=True,
+                env=env,
+                timeout=timeout,
+            )
+            self.assertEqual(proc.returncode, 0, (mode, proc.stderr[-2000:]))
+            for line in proc.stdout.splitlines():
+                if line.startswith("JOURNAL "):
+                    return json.loads(line[len("JOURNAL "):])
+            self.fail(f"{mode} arm produced no JOURNAL line: {proc.stdout!r}")
+
+        return run_arm("interp"), run_arm("jit")
+
+    _DUAL_ARM_PREAMBLE = textwrap.dedent(
+        """
+        import json
+        import sys
+        import _cinderx, cinderx
+        cinderx.init()
+        _cinderx.install_frame_evaluator()
+        mode = sys.argv[1]
+        if mode == "jit":
+            import cinderjit
+
+        def compile_all(*fns):
+            if mode == "jit":
+                for fn in fns:
+                    assert cinderjit.force_compile(fn) is True, fn
+                    assert cinderjit.is_jit_compiled(fn), fn
+
+        def still_compiled(*fns):
+            if mode == "jit":
+                for fn in fns:
+                    assert cinderjit.is_jit_compiled(fn), (
+                        "an exception must not uninstall", fn)
+
+        def tb_entries(exc, names):
+            out = []
+            tb = exc.__traceback__
+            while tb is not None:
+                code = tb.tb_frame.f_code
+                if code.co_name in names:
+                    out.append([code.co_name, tb.tb_lasti, tb.tb_lineno])
+                tb = tb.tb_next
+            return out
+        """
+    )
+
+    def test_try_except_executes_and_deopts_organically(self):
+        # The non-raising path stays in machine code; the raising path
+        # exits through an organic UnhandledException deopt, the anchored
+        # evaluator runs the handler, and the artifact survives to serve
+        # the next call.
+        env = dict(os.environ)
+        env["CINDERX_JIT_MODE"] = "canary"
+        env["PYTHONJITAUTO"] = "1000000"
+        probe = textwrap.dedent(
+            """
+            import _cinderx, cinderx
+            cinderx.init()
+            _cinderx.install_frame_evaluator()
+            import cinderjit
+
+            def guard(a, b):
+                try:
+                    return a // b
+                except ZeroDivisionError:
+                    return -1
+
+            assert guard(6, 2) == 3
+            assert guard(6, 0) == -1
+            assert cinderjit.force_compile(guard) is True
+            assert cinderjit.is_jit_compiled(guard)
+
+            def organic():
+                return _cinderx._get_trigger_stats()["organic_deopt_hits"]
+
+            entries = _cinderx._get_trigger_stats()["machine_code_entries"]
+            base = organic()
+            assert guard(6, 2) == 3
+            assert organic() == base, "the happy path must not deopt"
+
+            assert guard(6, 0) == -1
+            after_first = organic()
+            assert after_first > base, "the raise must deopt organically"
+            assert cinderjit.is_jit_compiled(guard)
+
+            assert guard(6, 0) == -1
+            assert organic() > after_first, (
+                "the deopt is per-activation; the next call re-enters "
+                "machine code and deopts again")
+            assert _cinderx._get_trigger_stats()["machine_code_entries"] > (
+                entries), "the raising calls entered machine code"
+            print("exception surface holds")
+            """
+        )
+        proc = subprocess.run(
+            [sys.executable, "-c", probe],
+            capture_output=True,
+            text=True,
+            env=env,
+            timeout=120,
+        )
+        self.assertEqual(proc.returncode, 0, proc.stderr[-2000:])
+        self.assertIn("exception surface holds", proc.stdout)
+
+    def test_exception_tracebacks_match_the_interpreter_arm(self):
+        # Full (co_name, tb_lasti, tb_lineno) chains, not just lines: a
+        # raising BINARY_OP carries an inline cache, a raising callee
+        # exits the caller at its CALL, and a raise statement re-executes
+        # in the interpreter.  All three must attribute the exception to
+        # the same bytecode unit as the JIT-off arm.
+        probe = self._DUAL_ARM_PREAMBLE + textwrap.dedent(
+            """
+            def div(a, b):
+                return a // b
+
+            def raiser(x):
+                raise ValueError(x)
+
+            def outer(f, x):
+                return f(x) + 1
+
+            def boomcb(x):
+                raise KeyError(x)
+
+            compile_all(div, raiser, outer)
+            names = {"div", "raiser", "outer", "boomcb"}
+            journal = {}
+            for label, thunk in (
+                ("binary_op", lambda: div(1, 0)),
+                ("raise_stmt", lambda: raiser("zz")),
+                ("callee", lambda: outer(boomcb, 3)),
+            ):
+                try:
+                    thunk()
+                except Exception as exc:
+                    journal[label] = [
+                        type(exc).__name__,
+                        tb_entries(exc, names),
+                    ]
+                else:
+                    raise SystemExit(label + " did not raise")
+            still_compiled(div, raiser, outer)
+            print("JOURNAL " + json.dumps(journal))
+            """
+        )
+        interp, jit = self._dual_arm(probe)
+        self.assertEqual(interp, jit)
+
+    def test_finally_and_with_blocks_match_the_interpreter_arm(self):
+        # finally runs on both exits, __exit__ sees the exception triple,
+        # suppression resumes after the with block, and a non-manager
+        # raises stock's TypeError out of BEFORE_WITH.
+        probe = self._DUAL_ARM_PREAMBLE + textwrap.dedent(
+            """
+            def fin(a, b, log):
+                try:
+                    return a // b
+                finally:
+                    log.append("fin")
+
+            class CM:
+                def __init__(self, log, suppress):
+                    self.log = log
+                    self.suppress = suppress
+
+                def __enter__(self):
+                    self.log.append("enter")
+                    return self
+
+                def __exit__(self, t, v, tb):
+                    self.log.append(
+                        "exit-" + ("none" if t is None else t.__name__))
+                    return self.suppress
+
+            def use(cm, log, z):
+                with cm:
+                    log.append("body")
+                    return 10 // z
+                return -1
+
+            compile_all(fin, use)
+            journal = {}
+
+            log = []
+            journal["fin_return"] = [fin(9, 3, log), log]
+            log = []
+            try:
+                fin(9, 0, log)
+            except ZeroDivisionError:
+                log.append("caught")
+            journal["fin_raise"] = log
+
+            log = []
+            journal["with_return"] = [use(CM(log, False), log, 2), log]
+            log = []
+            journal["with_suppressed"] = [use(CM(log, True), log, 0), log]
+            log = []
+            try:
+                use(CM(log, False), log, 0)
+            except ZeroDivisionError:
+                log.append("caught")
+            journal["with_propagates"] = log
+
+            log = []
+            try:
+                use(42, log, 1)
+            except TypeError as exc:
+                journal["not_a_manager"] = [str(exc), log]
+            still_compiled(fin, use)
+            print("JOURNAL " + json.dumps(journal))
+            """
+        )
+        interp, jit = self._dual_arm(probe)
+        self.assertEqual(interp, jit)
+
+    def test_exception_chaining_matches_the_interpreter_arm(self):
+        # raise-from sets __cause__ and __suppress_context__; a raise
+        # inside the handler (which runs interpreted after the deopt)
+        # chains __context__ implicitly.
+        probe = self._DUAL_ARM_PREAMBLE + textwrap.dedent(
+            """
+            def chained(mk_cause):
+                try:
+                    raise ValueError("primary") from mk_cause("root")
+                except ValueError:
+                    raise RuntimeError("secondary")
+
+            compile_all(chained)
+            try:
+                chained(KeyError)
+            except RuntimeError as exc:
+                ctx = exc.__context__
+                journal = [
+                    type(exc).__name__,
+                    str(exc),
+                    exc.__cause__ is None,
+                    type(ctx).__name__,
+                    str(ctx),
+                    ctx.__suppress_context__,
+                    type(ctx.__cause__).__name__,
+                ]
+            else:
+                raise SystemExit("chained did not raise")
+            still_compiled(chained)
+            print("JOURNAL " + json.dumps(journal))
+            """
+        )
+        interp, jit = self._dual_arm(probe)
+        self.assertEqual(interp, jit)
+
+    def test_assert_and_bare_reraise_match_the_interpreter_arm(self):
+        # assert exercises LOAD_ASSERTION_ERROR + RAISE_VARARGS; a bare
+        # raise in the handler re-raises the original exception with its
+        # traceback extended, not replaced.
+        probe = self._DUAL_ARM_PREAMBLE + textwrap.dedent(
+            """
+            def check(x):
+                assert x > 0, "must be positive"
+                return x
+
+            def rethrow(a, b):
+                try:
+                    return a // b
+                except ZeroDivisionError:
+                    raise
+
+            compile_all(check, rethrow)
+            names = {"check", "rethrow"}
+            journal = {"ok": check(3)}
+            try:
+                check(0)
+            except AssertionError as exc:
+                journal["assert"] = [str(exc), tb_entries(exc, names)]
+            try:
+                rethrow(5, 0)
+            except ZeroDivisionError as exc:
+                journal["reraise"] = [str(exc), tb_entries(exc, names)]
+            still_compiled(check, rethrow)
+            print("JOURNAL " + json.dumps(journal))
+            """
+        )
+        interp, jit = self._dual_arm(probe)
+        self.assertEqual(interp, jit)
+
+    def test_handler_frame_state_matches_the_interpreter_arm(self):
+        # The deopt reifies locals before the evaluator dispatches to the
+        # handler: a helper called from the handler must see the same
+        # f_locals, f_lasti and f_lineno in the raising frame as the
+        # JIT-off arm.
+        probe = self._DUAL_ARM_PREAMBLE + textwrap.dedent(
+            """
+            def snap(n, grab):
+                a = n + 1
+                b = a * 2
+                try:
+                    return a // (n - n)
+                except ZeroDivisionError:
+                    return grab()
+
+            def grab_impl():
+                fr = sys._getframe(1)
+                return {
+                    "locals": {
+                        k: v
+                        for k, v in fr.f_locals.items()
+                        if k in ("a", "b", "n")
+                    },
+                    "lasti": fr.f_lasti,
+                    "lineno": fr.f_lineno,
+                }
+
+            compile_all(snap)
+            journal = snap(4, grab_impl)
+            still_compiled(snap)
+            print("JOURNAL " + json.dumps(journal))
+            """
+        )
+        interp, jit = self._dual_arm(probe)
+        self.assertEqual(interp, jit)
+
+    def test_exception_deopt_releases_operand_stack_references(self):
+        # A value sitting on the operand stack when the raise happens (the
+        # pending BUILD_TUPLE element) is owned by the reified frame and
+        # released by the evaluator's unwind -- not leaked, not
+        # double-freed.
+        env = dict(os.environ)
+        env["CINDERX_JIT_MODE"] = "canary"
+        env["PYTHONJITAUTO"] = "1000000"
+        env["PYTHONMALLOC"] = "debug"
+        probe = textwrap.dedent(
+            """
+            import gc
+            import weakref
+            import _cinderx, cinderx
+            cinderx.init()
+            _cinderx.install_frame_evaluator()
+            import cinderjit
+
+            class Probe:
+                pass
+
+            def build(p, z):
+                return (p, 1 // z)
+
+            assert cinderjit.force_compile(build) is True
+            p = Probe()
+            wr = weakref.ref(p)
+            ok = build(p, 1)
+            assert ok[0] is p
+            del ok
+            try:
+                build(p, 0)
+            except ZeroDivisionError:
+                pass
+            else:
+                raise SystemExit("build did not raise")
+            assert cinderjit.is_jit_compiled(build)
+            del p
+            gc.collect()
+            assert wr() is None, "the exception deopt leaked a stack slot"
+            print("operand stack released")
+            """
+        )
+        proc = subprocess.run(
+            [sys.executable, "-c", probe],
+            capture_output=True,
+            text=True,
+            env=env,
+            timeout=120,
+        )
+        self.assertEqual(proc.returncode, 0, proc.stderr[-2000:])
+        self.assertIn("operand stack released", proc.stdout)
+
+    def test_getframe_from_a_callee_sees_a_consistent_jit_frame(self):
+        # A callee inspecting the running machine-code frame sees a
+        # consistent frame: the right code object, a line-accurate
+        # f_lineno (the UpdatePrevInstr pass stores prev_instr at line
+        # transitions), a walkable f_back chain and a readable f_locals.
+        # Live locals are the one non-stock corner: values live in
+        # registers until a deopt boundary reifies them, so mid-flight
+        # f_locals is empty rather than showing the arguments; the
+        # handler-frame-state test pins the reified side.
+        env = dict(os.environ)
+        env["CINDERX_JIT_MODE"] = "canary"
+        env["PYTHONJITAUTO"] = "1000000"
+        probe = textwrap.dedent(
+            """
+            import sys
+            import traceback
+            import _cinderx, cinderx
+            cinderx.init()
+            _cinderx.install_frame_evaluator()
+            import cinderjit
+
+            seen = {}
+
+            def peek():
+                fr = sys._getframe(1)
+                seen["name"] = fr.f_code.co_name
+                seen["locals"] = dict(fr.f_locals)
+                seen["back"] = fr.f_back.f_code.co_name
+                seen["lineno"] = fr.f_lineno
+                seen["firstlineno"] = fr.f_code.co_firstlineno
+                seen["stack_names"] = [
+                    entry.name for entry in traceback.extract_stack(fr)
+                ][-2:]
+                return 0
+
+            def caller(n, cb):
+                return cb() + n
+
+            def driver():
+                return caller(7, peek)
+
+            assert cinderjit.force_compile(caller) is True
+            assert driver() == 7
+            assert cinderjit.is_jit_compiled(caller)
+            assert seen["name"] == "caller", seen
+            assert isinstance(seen["locals"], dict), seen
+            assert seen["back"] == "driver", seen
+            assert seen["lineno"] == seen["firstlineno"] + 1, (
+                "the running frame must name the call line", seen)
+            assert seen["stack_names"][-1] == "caller", seen
+            print("callee observation consistent")
+            """
+        )
+        proc = subprocess.run(
+            [sys.executable, "-c", probe],
+            capture_output=True,
+            text=True,
+            env=env,
+            timeout=120,
+        )
+        self.assertEqual(proc.returncode, 0, proc.stderr[-2000:])
+        self.assertIn("callee observation consistent", proc.stdout)
+
+    def test_current_frames_from_another_thread_sees_the_running_loop(self):
+        # sys._current_frames() from a second thread must observe the
+        # machine-code frame mid-flight without tearing: right code
+        # object, sane f_lasti, walkable chain.
+        env = dict(os.environ)
+        env["CINDERX_JIT_MODE"] = "canary"
+        env["PYTHONJITAUTO"] = "1000000"
+        probe = textwrap.dedent(
+            """
+            import sys
+            import threading
+            import time
+            import _cinderx, cinderx
+            cinderx.init()
+            _cinderx.install_frame_evaluator()
+            import cinderjit
+
+            def spin(limit, one, stop):
+                i = limit - limit
+                while i < limit:
+                    i = i + one
+                    if stop():
+                        return i
+                return i
+
+            assert cinderjit.force_compile(spin) is True
+            assert spin(100, 1, bool) == 100
+
+            done = threading.Event()
+            tid_box = {}
+            started = threading.Event()
+
+            def victim():
+                tid_box["tid"] = threading.get_ident()
+                started.set()
+                spin(2_000_000_000, 1, done.is_set)
+
+            t = threading.Thread(target=victim)
+            t.start()
+            started.wait(30)
+            observed = []
+            try:
+                for _ in range(400):
+                    frames = sys._current_frames()
+                    fr = frames.get(tid_box["tid"])
+                    while fr is not None:
+                        if fr.f_code.co_name == "spin":
+                            observed.append(
+                                (fr.f_code.co_name, fr.f_lasti))
+                            break
+                        fr = fr.f_back
+                    if observed:
+                        break
+                    time.sleep(0.005)
+            finally:
+                done.set()
+            t.join(60)
+            assert not t.is_alive(), "the loop never honored the stop flag"
+            assert observed, "the running compiled loop was never observed"
+            name, lasti = observed[0]
+            assert name == "spin"
+            assert isinstance(lasti, int)
+            print("current_frames observed the loop")
+            """
+        )
+        proc = subprocess.run(
+            [sys.executable, "-c", probe],
+            capture_output=True,
+            text=True,
+            env=env,
+            timeout=300,
+        )
+        self.assertEqual(proc.returncode, 0, proc.stderr[-2000:])
+        self.assertIn("current_frames observed the loop", proc.stdout)
+
+    def test_settrace_mid_flight_matches_the_interpreter_arm(self):
+        # sys.settrace installed by a callee while the caller runs in
+        # machine code: stock 3.11 delivers no line/return events to the
+        # already-running frame (its f_trace was never populated by a
+        # 'call' event), and frame.f_trace stays None.  The JIT arm exits
+        # through the instrumentation poll and must land in exactly that
+        # behavior -- neither missing events stock sends, nor inventing
+        # events stock does not.
+        probe = self._DUAL_ARM_PREAMBLE + textwrap.dedent(
+            """
+            events = []
+            watched = ("workload", "probe_ftrace", "activate")
+
+            def tracer(frame, event, arg):
+                if frame.f_code.co_name in watched:
+                    events.append([event, frame.f_code.co_name])
+                return None
+
+            def activate():
+                sys.settrace(tracer)
+                return 1
+
+            def probe_ftrace():
+                return sys._getframe(1).f_trace is None
+
+            def workload(n, activate, probe):
+                acc = n - n
+                acc = acc + activate()
+                acc = acc + n
+                acc = acc * 2
+                journal.append(["caller_f_trace_none", probe()])
+                return acc
+
+            journal = []
+            compile_all(workload)
+            result = workload(5, activate, probe_ftrace)
+            sys.settrace(None)
+            journal.append(["result", result])
+            journal.append(["events", events])
+            print("JOURNAL " + json.dumps(journal))
+            """
+        )
+        interp, jit = self._dual_arm(probe)
+        self.assertEqual(interp, jit)
+
+    def test_settrace_before_the_call_traces_the_whole_frame(self):
+        # With the tracer active before the call, the guarded entry falls
+        # back and the whole frame runs interpreted: the full stock event
+        # stream -- call, lines, the exception event in the handler, and
+        # return -- must be identical across arms.
+        probe = self._DUAL_ARM_PREAMBLE + textwrap.dedent(
+            """
+            events = []
+
+            def tracer(frame, event, arg):
+                if frame.f_code.co_name == "traced_target":
+                    what = event
+                    if event == "exception":
+                        what = "exception-" + arg[0].__name__
+                    events.append(
+                        [what, frame.f_lineno - frame.f_code.co_firstlineno])
+                return tracer
+
+            def traced_target(n):
+                try:
+                    return n // (n - n)
+                except ZeroDivisionError:
+                    return -n
+
+            compile_all(traced_target)
+            sys.settrace(tracer)
+            result = traced_target(6)
+            sys.settrace(None)
+            print("JOURNAL " + json.dumps([result, events]))
+            """
+        )
+        interp, jit = self._dual_arm(probe)
+        self.assertEqual(interp, jit)
+
+    def test_signal_handler_exception_interrupts_the_compiled_loop(self):
+        # A signal arriving in a tight compiled loop is delivered at the
+        # back-edge poll; the handler's exception unwinds out of the
+        # machine-code frame with a traceback naming the loop.
+        env = dict(os.environ)
+        env["CINDERX_JIT_MODE"] = "canary"
+        env["PYTHONJITAUTO"] = "1000000"
+        probe = textwrap.dedent(
+            """
+            import signal
+            import _cinderx, cinderx
+            cinderx.init()
+            _cinderx.install_frame_evaluator()
+            import cinderjit
+
+            class Boom(Exception):
+                pass
+
+            def on_alarm(signum, frame):
+                raise Boom()
+
+            def spin(limit, one):
+                i = limit - limit
+                while i < limit:
+                    i = i + one
+                return i
+
+            assert cinderjit.force_compile(spin) is True
+            assert spin(100, 1) == 100
+
+            signal.signal(signal.SIGALRM, on_alarm)
+            signal.setitimer(signal.ITIMER_REAL, 0.2)
+            try:
+                spin(2_000_000_000, 1)
+                raise SystemExit("the signal never interrupted the loop")
+            except Boom as exc:
+                tb = exc.__traceback__
+                names = []
+                while tb is not None:
+                    names.append(tb.tb_frame.f_code.co_name)
+                    tb = tb.tb_next
+                assert "spin" in names, names
+            finally:
+                signal.setitimer(signal.ITIMER_REAL, 0)
+                signal.signal(signal.SIGALRM, signal.SIG_DFL)
+            print("signal interrupted the compiled loop")
+            """
+        )
+        proc = subprocess.run(
+            [sys.executable, "-c", probe],
+            capture_output=True,
+            text=True,
+            env=env,
+            timeout=300,
+        )
+        self.assertEqual(proc.returncode, 0, proc.stderr[-2000:])
+        self.assertIn("signal interrupted the compiled loop", proc.stdout)
+
+    def test_except_star_shapes_stay_refused(self):
+        # The MR-08 audit keeps except* refused: PREP_RERAISE_STAR has no
+        # reference implementation.  The refusal must be stable across
+        # attempts and the function must keep its interpreted behavior.
+        env = dict(os.environ)
+        env["CINDERX_JIT_MODE"] = "canary"
+        env["PYTHONJITAUTO"] = "1000000"
+        probe = textwrap.dedent(
+            """
+            import _cinderx, cinderx
+            cinderx.init()
+            _cinderx.install_frame_evaluator()
+            import cinderjit
+
+            def star(fail):
+                out = "ok"
+                try:
+                    if fail:
+                        raise ValueError("x")
+                except* ValueError:
+                    out = "star"
+                return out
+
+            for attempt in range(2):
+                try:
+                    cinderjit.force_compile(star)
+                except RuntimeError as exc:
+                    assert "CANNOT_SPECIALIZE" in str(exc), (attempt, exc)
+                else:
+                    raise SystemExit("except* was compiled")
+            assert not cinderjit.is_jit_compiled(star)
+            assert star(True) == "star"
+            assert star(False) == "ok"
+            print("except* stays refused")
+            """
+        )
+        proc = subprocess.run(
+            [sys.executable, "-c", probe],
+            capture_output=True,
+            text=True,
+            env=env,
+            timeout=120,
+        )
+        self.assertEqual(proc.returncode, 0, proc.stderr[-2000:])
+        self.assertIn("except* stays refused", proc.stdout)
+
+    def test_exception_injection_sweep_matches_the_interpreter(self):
+        # The injection sweep moves the raising checkpoint across the
+        # whole composed body -- loop iterations inside a with inside a
+        # try/finally -- and every swept answer must equal the answer the
+        # interpreter gave before any machine code existed.
+        env = dict(os.environ)
+        env["CINDERX_JIT_MODE"] = "canary"
+        env["PYTHONJITAUTO"] = "1000000"
+        env["PYTHONMALLOC"] = "debug"
+        probe = textwrap.dedent(
+            """
+            import _cinderx, cinderx
+            cinderx.init()
+            _cinderx.install_frame_evaluator()
+            import cinderjit
+
+            class Erratic:
+                def __init__(self, fail_at):
+                    self.fail_at = fail_at
+                    self.count = 0
+
+                def tick(self):
+                    self.count = self.count + 1
+                    if self.count == self.fail_at:
+                        raise RuntimeError("inj-%d" % self.fail_at)
+                    return 1
+
+            class Guard:
+                def __init__(self, log):
+                    self.log = log
+
+                def __enter__(self):
+                    self.log.append("enter")
+                    return self
+
+                def __exit__(self, t, v, tb):
+                    self.log.append(
+                        "exit-" + ("none" if t is None else t.__name__))
+                    return False
+
+            def target(e, n, log):
+                acc = n - n
+                try:
+                    with Guard(log):
+                        i = acc
+                        while i < n:
+                            acc = acc + e.tick()
+                            i = i + 1
+                except RuntimeError:
+                    log.append("caught")
+                    return -acc
+                finally:
+                    log.append("fin")
+                return acc
+
+            def run_target(fail_at, n):
+                log = []
+                result = target(Erratic(fail_at), n, log)
+                return (result, log)
+
+            N = 6
+            sweep = list(range(1, N + 2)) + [0]
+            expected = {k: run_target(k, N) for k in sweep}
+            assert cinderjit.force_compile(target) is True
+            base = _cinderx._get_trigger_stats()["organic_deopt_hits"]
+            for k in sweep:
+                got = run_target(k, N)
+                assert got == expected[k], (k, got, expected[k])
+                assert cinderjit.is_jit_compiled(target), k
+            assert _cinderx._get_trigger_stats()["organic_deopt_hits"] > (
+                base), "the injected raises never deopted"
+            print("injection sweep matched")
+            """
+        )
+        proc = subprocess.run(
+            [sys.executable, "-c", probe],
+            capture_output=True,
+            text=True,
+            env=env,
+            timeout=120,
+        )
+        self.assertEqual(proc.returncode, 0, proc.stderr[-2000:])
+        self.assertIn("injection sweep matched", proc.stdout)
+
+
 if __name__ == "__main__":
     unittest.main()

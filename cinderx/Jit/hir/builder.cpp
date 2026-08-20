@@ -1295,12 +1295,21 @@ const char* unsupportedExecuteReason311(BorrowedRef<PyCodeObject> code) {
   // family (including LOAD_GLOBAL without a speculative cache Guard,
   // container builders used by CALL_FUNCTION_EX, MAKE_FUNCTION for
   // genexp call sites, LOAD_DEREF/LOAD_CLOSURE/COPY_FREE_VARS/MAKE_CELL
-  // for nested-function cells).  Still out: attr or subscript ICs,
-  // STORE_DEREF, the exception table, generator *bodies*.  The decoder
+  // for nested-function cells) plus the MR-08 exception family.  The
+  // handler-body opcodes (PUSH_EXC_INFO, CHECK_EXC_MATCH, POP_EXCEPT,
+  // RERAISE, WITH_EXCEPT_START) are reachable only through the exception
+  // table, which HIR never translates: a raise inside machine code exits
+  // through the UnhandledException deopt and the anchored evaluator's
+  // exception_unwind runs the handler, so admitting them admits no new
+  // machine code.  RAISE_VARARGS, LOAD_ASSERTION_ERROR and BEFORE_WITH
+  // do run in normal flow and have translations.  Still out: attr or
+  // subscript ICs, STORE_DEREF, generator *bodies*, except* and pattern
+  // matching (refused earlier by the translate scan).  The decoder
   // yields unspecialized opcodes, so quickened forms cannot slip past.
   BytecodeInstructionBlock bc_instrs{code};
   for (auto bc_it = bc_instrs.begin(); bc_it != bc_instrs.end(); ++bc_it) {
     switch (bc_it->opcode()) {
+      case BEFORE_WITH:
       case BINARY_OP:
       case BUILD_CONST_KEY_MAP:
       case BUILD_LIST:
@@ -1309,6 +1318,7 @@ const char* unsupportedExecuteReason311(BorrowedRef<PyCodeObject> code) {
       case BUILD_TUPLE:
       case CALL:
       case CALL_FUNCTION_EX:
+      case CHECK_EXC_MATCH:
       case COMPARE_OP:
       case CONTAINS_OP:
       case COPY:
@@ -1327,6 +1337,7 @@ const char* unsupportedExecuteReason311(BorrowedRef<PyCodeObject> code) {
       case LIST_APPEND:
       case LIST_EXTEND:
       case LIST_TO_TUPLE:
+      case LOAD_ASSERTION_ERROR:
       case LOAD_CLOSURE:
       case LOAD_CONST:
       case LOAD_DEREF:
@@ -1343,11 +1354,15 @@ const char* unsupportedExecuteReason311(BorrowedRef<PyCodeObject> code) {
       case POP_JUMP_BACKWARD_IF_TRUE:
       case POP_JUMP_FORWARD_IF_FALSE:
       case POP_JUMP_FORWARD_IF_NONE:
+      case POP_EXCEPT:
       case POP_JUMP_FORWARD_IF_NOT_NONE:
       case POP_JUMP_FORWARD_IF_TRUE:
       case POP_TOP:
       case PRECALL:
+      case PUSH_EXC_INFO:
       case PUSH_NULL:
+      case RAISE_VARARGS:
+      case RERAISE:
       case RESUME:
       case RETURN_VALUE:
       case SET_ADD:
@@ -1359,6 +1374,7 @@ const char* unsupportedExecuteReason311(BorrowedRef<PyCodeObject> code) {
       case UNARY_POSITIVE:
       case UNPACK_EX:
       case UNPACK_SEQUENCE:
+      case WITH_EXCEPT_START:
         break;
       default:
         return "REFUSE_SHAPE_EXECUTE_SURFACE";
