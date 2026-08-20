@@ -67,6 +67,14 @@ struct DataDescrMutator {
 
   BorrowedRef<> descr;
   BorrowedRef<PyTypeObject> descr_type;
+#if PY_VERSION_HEX < 0x030C0000
+  // The descriptor type's tp_version_tag captured at fill.  The kind
+  // selection baked descr_type's tp_descr_get/tp_descr_set into the
+  // dispatch, and mutating the DESCRIPTOR's type (del D.__set__) never
+  // touches the receiver type's version -- so a hit must pull-validate
+  // this tag as well (see AttributeMutator::descrVersionMatches).
+  uint32_t descr_type_version{0};
+#endif
 };
 
 // Mutator for a member descriptor
@@ -180,6 +188,25 @@ class AttributeMutator {
   // so a stale -- or dead-and-reallocated -- type can never revalidate.
   bool typeVersionMatches(PyTypeObject* live_type) const {
     return live_type->tp_version_tag == type_version_;
+  }
+
+  // Second half of the 3.11 pull validation, for the one kind whose
+  // dispatch bakes in another type's protocol: kDataDescr captured
+  // descr_type's tp_descr_get/tp_descr_set at fill, and deleting
+  // D.__set__ mutates D -- not the receiver -- so the receiver-version
+  // gate cannot see it.  The stale entry would misroute precedence
+  // (an instance shadow must win once the descriptor stops being a data
+  // descriptor) or call a now-NULL slot.  Only valid to call after
+  // typeVersionMatches passed: an unchanged receiver type still holds
+  // the descriptor reference that keeps descr_type alive.  Other kinds
+  // need no tag: kDescrOrClassVar re-reads the slots on every call, and
+  // kMemberDescr only ever captures the immutable PyMemberDescr_Type.
+  bool descrVersionMatches() const {
+    if (get_kind() != Kind::kDataDescr) {
+      return true;
+    }
+    return data_descr_.descr_type->tp_version_tag ==
+        data_descr_.descr_type_version;
   }
 #endif
 

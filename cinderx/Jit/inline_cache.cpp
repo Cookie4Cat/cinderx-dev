@@ -103,8 +103,18 @@ inline Ref<PyDictObject> get_dict(PyObject* obj, Py_ssize_t dictoffset) {
 // a materialized managed dict and a plain tp_dictoffset dict are read
 // directly.  _PyObject_GetDictPtr is unusable for reads on 3.11 -- for a
 // managed-dict object with live values it converts them into a real dict.
-// Returns a borrowed reference or nullptr (attribute absent; no error).
-PyObject* peekInstanceAttr311(PyObject* obj, PyObject* name) {
+//
+// Returns 1 with *out set to a NEW reference when the attribute is found,
+// 0 when it is absent, and -1 with the exception left in place when the
+// lookup itself raised (a non-unicode key's __eq__ runs arbitrary code;
+// stock GenericGetAttr propagates it via PyDict_GetItemWithError, and so
+// must every cached path).  The found value is strengthened BEFORE the
+// storage's temporary reference is released: an __eq__ that swaps
+// obj.__dict__ mid-lookup leaves the old dict alive only through that
+// temporary, and stock's ordering (incref the value, then drop the dict)
+// is the only one that cannot dangle.
+int peekInstanceAttr311(PyObject* obj, PyObject* name, PyObject** out) {
+  *out = nullptr;
   PyTypeObject* tp = Py_TYPE(obj);
   if (PyType_HasFeature(tp, Py_TPFLAGS_MANAGED_DICT)) {
     PyDictValues* values = *_PyObject_ValuesPointer(obj);
@@ -112,33 +122,49 @@ PyObject* peekInstanceAttr311(PyObject* obj, PyObject* name) {
       PyDictKeysObject* keys =
           reinterpret_cast<PyHeapTypeObject*>(tp)->ht_cached_keys;
       if (keys == nullptr) {
-        return nullptr;
+        return 0;
       }
       Py_ssize_t index = getDictKeysIndex(keys, name);
       if (index < 0 || index >= keys->dk_nentries) {
-        return nullptr;
+        return 0;
       }
-      return values->values[index];
+      PyObject* value = values->values[index];
+      if (value == nullptr) {
+        return 0;
+      }
+      // The cached-keys scan compares interned unicode keys only -- no
+      // user code ran, the value is strengthened in place.
+      *out = Py_NewRef(value);
+      return 1;
     }
     PyDictObject* dict =
         reinterpret_cast<PyDictObject*>(*_PyObject_ManagedDictPointer(obj));
     if (dict == nullptr) {
-      return nullptr;
+      return 0;
     }
-    // A non-unicode key's __eq__ can run inside the lookup and drop the
-    // dict; keep it alive for the duration.
     auto strong_ref = Ref<>::create(reinterpret_cast<PyObject*>(dict));
-    return PyDict_GetItem(reinterpret_cast<PyObject*>(dict), name);
+    PyObject* value =
+        PyDict_GetItemWithError(reinterpret_cast<PyObject*>(dict), name);
+    if (value == nullptr) {
+      return PyErr_Occurred() ? -1 : 0;
+    }
+    *out = Py_NewRef(value);
+    return 1;
   }
   // Non-managed receivers: _PyObject_GetDictPtr only materializes for
   // managed-dict objects with live values, so it is side-effect free here
   // and handles negative tp_dictoffset correctly.
   PyObject** dictptr = _PyObject_GetDictPtr(obj);
   if (dictptr == nullptr || *dictptr == nullptr) {
-    return nullptr;
+    return 0;
   }
   auto strong_ref = Ref<>::create(*dictptr);
-  return PyDict_GetItem(strong_ref, name);
+  PyObject* value = PyDict_GetItemWithError(strong_ref, name);
+  if (value == nullptr) {
+    return PyErr_Occurred() ? -1 : 0;
+  }
+  *out = Py_NewRef(value);
+  return 1;
 }
 #endif
 
@@ -681,10 +707,25 @@ PyObject* CombinedMutator::getAttr(PyObject* obj, PyObject* name) {
   if (dict == nullptr) {
     return getAttrFallback(obj, name);
   }
+#if PY_VERSION_HEX < 0x030C0000
+  // Stock GenericGetAttr reads the instance dict with
+  // PyDict_GetItemWithError: a non-unicode key's raising __eq__ must
+  // propagate, never be folded into "attribute absent".  The result is
+  // strengthened while `dict` still holds its strong reference.
+  PyObject* result =
+      PyDict_GetItemWithError(reinterpret_cast<PyObject*>(dict.get()), name);
+  if (result == nullptr) {
+    if (PyErr_Occurred()) {
+      return nullptr;
+    }
+    return getAttrFallback(obj, name);
+  }
+#else
   PyObject* result = PyDict_GetItem(dict, name);
   if (result == nullptr) {
     return getAttrFallback(obj, name);
   }
+#endif
   Py_INCREF(result);
   return result;
 }
@@ -741,8 +782,15 @@ PyObject* DictMutator::getAttr(PyObject* obj, PyObject* name) {
     return getAttrFallback(obj, name);
   }
   auto strong_ref = Ref<>::create(dict);
-  PyObject* result = PyDict_GetItem(dict, name);
+  // Error-preserving, and the result is strengthened while strong_ref
+  // still pins the dict (a raising or dict-swapping __eq__ runs inside
+  // this lookup).
+  PyObject* result =
+      PyDict_GetItemWithError(reinterpret_cast<PyObject*>(dict.get()), name);
   if (result == nullptr) {
+    if (PyErr_Occurred()) {
+      return nullptr;
+    }
     return getAttrFallback(obj, name);
   }
   return Py_NewRef(result);
@@ -843,11 +891,17 @@ PyObject* DescrOrClassVarMutator::getAttr(PyObject* obj, PyObject* name) {
 #if PY_VERSION_HEX < 0x030C0000
   // Check the instance storage for a shadowing attribute without
   // materializing: a matching nonzero keys version proves the name is
-  // absent, anything else is peeked in place.
+  // absent, anything else is peeked in place.  A raising lookup (a
+  // non-unicode key's __eq__) propagates, exactly as stock's
+  // PyDict_GetItemWithError does.
   if (keys_version == 0 || !isValidKeysVersion(keys_version, obj)) {
-    PyObject* shadow = peekInstanceAttr311(obj, name);
-    if (shadow != nullptr) {
-      return Py_NewRef(shadow);
+    PyObject* shadow = nullptr;
+    int found = peekInstanceAttr311(obj, name, &shadow);
+    if (found < 0) {
+      return nullptr;
+    }
+    if (found != 0) {
+      return shadow;
     }
   }
 #else
@@ -903,6 +957,11 @@ void AttributeMutator::set_data_descr(PyTypeObject* type, PyObject* descr) {
   set_type(type, Kind::kDataDescr);
   data_descr_.descr = descr;
   data_descr_.descr_type = Py_TYPE(descr);
+#if PY_VERSION_HEX < 0x030C0000
+  // fill() ran ensureVersionTag(descr_type) before selecting this kind,
+  // so the tag is valid here; a hit revalidates it (descrVersionMatches).
+  data_descr_.descr_type_version = Py_TYPE(descr)->tp_version_tag;
+#endif
 }
 
 void AttributeMutator::set_member_descr(PyTypeObject* type, PyObject* descr) {
@@ -1190,6 +1249,9 @@ void AttributeCache::fill(
         }
         // If someone modifies descr_type (e.g., deletes __set__), it may no
         // longer be a data descriptor, and the cache kind has to change.
+        // On 3.12+ this watcher retires the entry; on 3.11 watch() is a
+        // no-op and the hit path pull-validates the tag captured by
+        // set_data_descr instead (descrVersionMatches).
         ac_descr_watcher.watch(descr_type, this);
         mut->set_data_descr(type, descr);
       }
@@ -1287,8 +1349,11 @@ int StoreAttrCache::doInvoke(PyObject* obj, PyObject* name, PyObject* value) {
     if (entry.type() == tp) {
 #if PY_VERSION_HEX < 0x030C0000
       // Pull-based invalidation: no watcher retires entries on 3.11, so a
-      // hit must prove the receiver type is unchanged since fill.
-      if (!entry.typeVersionMatches(tp)) {
+      // hit must prove the receiver type is unchanged since fill -- and,
+      // for kDataDescr, that the descriptor's own type still carries the
+      // protocol the kind selection baked in (del D.__set__ would
+      // otherwise reach a stale or NULL tp_descr_set).
+      if (!entry.typeVersionMatches(tp) || !entry.descrVersionMatches()) {
         entry.reset();
         attrCacheStats311().store_attr.invalidations++;
         break;
@@ -1329,8 +1394,12 @@ PyObject* LoadAttrCache::doInvoke(PyObject* obj, PyObject* name) {
     if (entry.type() == tp) {
 #if PY_VERSION_HEX < 0x030C0000
       // Pull-based invalidation: no watcher retires entries on 3.11, so a
-      // hit must prove the receiver type is unchanged since fill.
-      if (!entry.typeVersionMatches(tp)) {
+      // hit must prove the receiver type is unchanged since fill -- and,
+      // for kDataDescr, that the descriptor's own type still carries the
+      // protocol the kind selection baked in (a descriptor demoted to
+      // non-data must yield to an instance shadow, which requires the
+      // full lookup, not this dispatch).
+      if (!entry.typeVersionMatches(tp) || !entry.descrVersionMatches()) {
         entry.reset();
         attrCacheStats311().load_attr.invalidations++;
         break;
@@ -1535,9 +1604,15 @@ PyObject* GetAttrMutator::getAttr(PyObject* obj, PyObject* name) {
     // 3.11: peek the instance storage without materializing -- live inline
     // values are scanned through the cached keys, a real dict is read in
     // place.  _PyObject_GetDictPtr would convert values into a dict here.
-    PyObject* res = peekInstanceAttr311(obj, name);
-    if (res != nullptr) {
-      return Py_NewRef(res);
+    // A raising lookup propagates; only a proven absence dispatches to
+    // __getattr__.
+    PyObject* res = nullptr;
+    int found = peekInstanceAttr311(obj, name, &res);
+    if (found < 0) {
+      return nullptr;
+    }
+    if (found != 0) {
+      return res;
     }
     return callGetAttr(getattr_method, obj, name);
 #else
@@ -1678,15 +1753,22 @@ LoadMethodResult __attribute__((noinline)) LoadMethodCache::lookupSlowPath(
 #if PY_VERSION_HEX < 0x030C0000
   // Do not use _PyObject_GetDictPtr here: a cache miss must not
   // materialize the instance dict (it converts live inline values on
-  // 3.11).  The peek reads values or the dict in place.
-  attr = peekInstanceAttr311(obj, name);
-  if (attr != nullptr) {
-    maybeCollectCacheStats(
-        cache_stats_, tp, name, CacheMissReason::kUncategorized);
-    Py_INCREF(attr);
-    Py_XDECREF(descr);
-    Py_INCREF(Py_None);
-    return {Py_None, attr};
+  // 3.11).  The peek reads values or the dict in place; a raising lookup
+  // propagates as the pair-of-nullptrs error shape.
+  attr = nullptr;
+  {
+    int found = peekInstanceAttr311(obj, name, &attr);
+    if (found < 0) {
+      Py_XDECREF(descr);
+      return {nullptr, nullptr};
+    }
+    if (found != 0) {
+      maybeCollectCacheStats(
+          cache_stats_, tp, name, CacheMissReason::kUncategorized);
+      Py_XDECREF(descr);
+      Py_INCREF(Py_None);
+      return {Py_None, attr};
+    }
   }
 #else
   PyObject **dictptr, *dict;
@@ -2168,13 +2250,16 @@ LoadModuleMethodCache::lookupSlowPath(BorrowedRef<> obj, BorrowedRef<> name) {
 #endif
 #endif
     }
-    // PyDict_GetItemWithError returns a borrowed reference, so
-    // we need to increment it before returning.
-    return {Py_None, Py_NewRef(res)};
+    // Both halves are owned by the caller (LoadMethodResult contract),
+    // and 3.11's None is mortal: the value half is strengthened from the
+    // borrowed dict entry, and None must be owned exactly like the hit
+    // arm above -- a borrowed None here leaks a decref per slow-path
+    // call.  On 3.12+ None is immortal and the NewRef is free.
+    return {Py_NewRef(Py_None), Py_NewRef(res)};
   }
   auto generic_res = Ref<>::steal(PyObject_GetAttr(obj, name));
   if (generic_res != nullptr) {
-    return {Py_None, generic_res.release()};
+    return {Py_NewRef(Py_None), generic_res.release()};
   }
   return {nullptr, nullptr};
 }

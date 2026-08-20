@@ -190,25 +190,89 @@ TEST_F(AttrCache311Test, ModuleMethodHitOwnsBothResultHalves) {
   ASSERT_EQ(PyObject_SetAttrString(mod, "f", abs_fn), 0);
   auto name = Ref<>::steal(PyUnicode_InternFromString("f"));
 
-  jit::LoadModuleMethodCache cache;
-  // Prime: slow path fills the version-validated entry.  On 3.11 the
-  // result maps {none_or_callable, inst_or_callable} onto
-  // {callable, self_or_null} directly.
-  auto first = cache.lookupHelper(&cache, mod, name);
-  ASSERT_NE(first.self_or_null, nullptr);
-  Py_XDECREF(first.callable);
-  Py_XDECREF(first.self_or_null);
+  // 3.11's None is mortal: any arm that returned a borrowed None would
+  // decrement it to death over enough iterations, so every arm -- cold
+  // slow path, hit, non-function value, generic fallback -- runs 64
+  // rounds against a refcount baseline.
+  //
+  // Absolute refcount baselines are order-sensitive in a full-suite run:
+  // GC of prior tests' garbage and one-time lazy initialization inside
+  // the first lookup of a given shape both move the count for reasons
+  // that are not per-call ownership bugs.  So: GC is drained and held
+  // off (RAII so a failing ASSERT cannot leak the disabled state), and
+  // each measured block runs ONE priming round before its baseline --
+  // a per-call borrow still shows up as a full -64.
+  struct GcOff {
+    GcOff() {
+      PyGC_Collect();
+      PyGC_Disable();
+    }
+    ~GcOff() {
+      PyGC_Enable();
+    }
+  } gc_off;
 
-  // 3.11's None is mortal: a hit that returned a borrowed None would
-  // decrement it to death over enough iterations.  Both halves of the
-  // result must be owned.
+  auto run_round = [&](BorrowedRef<> lookup_name,
+                       PyObject* expected_value) {
+    jit::LoadModuleMethodCache cold;
+    auto res = cold.lookupHelper(&cold, mod, lookup_name);
+    ASSERT_EQ(res.callable, Py_None);
+    if (expected_value != nullptr) {
+      ASSERT_EQ(res.self_or_null, expected_value);
+    } else {
+      ASSERT_NE(res.self_or_null, nullptr);
+    }
+    Py_DECREF(res.callable);
+    Py_DECREF(res.self_or_null);
+  };
+
+  {
+    // Cold fill plus hits on one cache: prime, baseline, then measure
+    // the slow-path fill and 64 hits together.
+    jit::LoadModuleMethodCache prime;
+    auto first = prime.lookupHelper(&prime, mod, name);
+    ASSERT_EQ(first.callable, Py_None);
+    ASSERT_EQ(first.self_or_null, abs_fn.get());
+    Py_DECREF(first.callable);
+    Py_DECREF(first.self_or_null);
+
+    Py_ssize_t none_refcount = Py_REFCNT(Py_None);
+    jit::LoadModuleMethodCache cache;
+    for (int i = 0; i < 64; i++) {
+      auto hit = cache.lookupHelper(&cache, mod, name);
+      ASSERT_EQ(hit.callable, Py_None);
+      ASSERT_EQ(hit.self_or_null, abs_fn.get());
+      Py_DECREF(hit.callable);
+      Py_DECREF(hit.self_or_null);
+    }
+    // Fresh caches per round keep every iteration on the cold slow path.
+    for (int i = 0; i < 64; i++) {
+      run_round(name, abs_fn.get());
+    }
+    EXPECT_EQ(Py_REFCNT(Py_None), none_refcount);
+  }
+
+  // A non-function value in the module dict returns through the same
+  // slow-path arm without filling the cache; its None half must be owned
+  // as well.
+  auto value = Ref<>::steal(PyLong_FromLong(7));
+  ASSERT_EQ(PyObject_SetAttrString(mod, "v", value), 0);
+  auto vname = Ref<>::steal(PyUnicode_InternFromString("v"));
+  run_round(vname, value.get());
   Py_ssize_t none_refcount = Py_REFCNT(Py_None);
   for (int i = 0; i < 64; i++) {
-    auto hit = cache.lookupHelper(&cache, mod, name);
-    ASSERT_EQ(hit.callable, Py_None);
-    ASSERT_EQ(hit.self_or_null, abs_fn.get());
-    Py_DECREF(hit.callable);
-    Py_DECREF(hit.self_or_null);
+    run_round(vname, value.get());
+  }
+  EXPECT_EQ(Py_REFCNT(Py_None), none_refcount);
+
+  // A name absent from the module dict resolves through the
+  // PyObject_GetAttr generic arm (here: a type attribute); that return
+  // must own its None half too.
+  auto sname = Ref<>::steal(PyUnicode_InternFromString("__str__"));
+  run_round(sname, nullptr);
+  none_refcount = Py_REFCNT(Py_None);
+  for (int i = 0; i < 64; i++) {
+    run_round(sname, nullptr);
   }
   EXPECT_EQ(Py_REFCNT(Py_None), none_refcount);
 }
