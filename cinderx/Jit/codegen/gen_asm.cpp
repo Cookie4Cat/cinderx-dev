@@ -309,9 +309,18 @@ DeoptResult prepareForDeopt(
 // Set up f_trace/f_trace_lines for sys.settrace compatibility on deopted
 // frames. CPython normally sets these during the RESUME opcode at function
 // entry, but deopted frames resume mid-function and skip RESUME.
+//
+// On 3.11 this must NOT happen: stock 3.11 dispatches every event to the
+// global c_tracefunc, and the Python-level sys.settrace trampoline routes
+// line/return/exception events through frame->f_trace, which only a
+// 'call' event populates.  A frame that was already running when settrace
+// was installed therefore reports no events and a None f_trace in stock;
+// forcing f_trace here would make the deopted frame trace lines stock
+// never traces.
 void setupTraceForDeoptedFrame(
-    _PyInterpreterFrame* frame,
-    PyThreadState* tstate) {
+    [[maybe_unused]] _PyInterpreterFrame* frame,
+    [[maybe_unused]] PyThreadState* tstate) {
+#if PY_VERSION_HEX >= 0x030C0000
   if (tstate->c_tracefunc != nullptr &&
       frame->owner != FRAME_OWNED_BY_GENERATOR) {
     PyFrameObject* fobj = _PyFrame_GetFrameObject(frame);
@@ -322,6 +331,7 @@ void setupTraceForDeoptedFrame(
       }
     }
   }
+#endif
 }
 
 PyObject* resumeInInterpreter(
@@ -334,6 +344,24 @@ PyObject* resumeInInterpreter(
   PyThreadState* tstate = PyThreadState_Get();
 
   const DeoptMetadata& deopt_meta = code_runtime->getDeoptMetadata(deopt_idx);
+
+#if PY_VERSION_HEX < 0x030C0000
+  // 3.11 structurally forbids lightweight frames, so the patched
+  // instrumentation flavor cannot occur and prepareForDeopt's combined
+  // bit reduces to the polled predicate.  The trampoline forwards that
+  // bit through ARGUMENT_REGS[3]; this recomputation turns a
+  // mis-assembled fourth argument (historically a register residue
+  // behind a >= 3.12 gate) into a deterministic failure on every deopt
+  // instead of a build-dependent misroute.  A hard check, not a DCHECK:
+  // the deopt path is already slow, and a corrupt trampoline argument
+  // means the generated shim itself is wrong.
+  JIT_CHECK(
+      is_instrumentation_deopt ==
+          (deopt_meta.reason == DeoptReason::kInstrumentation),
+      "deopt trampoline forwarded a corrupt is_instrumentation_deopt for "
+      "reason {}",
+      deoptReasonName(deopt_meta.reason));
+#endif
 
   // For instrumentation deopts, only enter error handler if actually excepted.
   int err_occurred;

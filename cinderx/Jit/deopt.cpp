@@ -293,17 +293,17 @@ static BCIndex getDeoptResumeIndex(
         // the backward jump (see insertRunPeriodicActivitesForBackedge),
         // and stock 3.11 raises the asynchronous exception after the jump
         // has executed -- its eval-breaker check runs inside the
-        // backward-jump handler, so tb_lasti names the jump.  The default
-        // advance below reproduces that exactly: the reified frame reads
-        // "the jump just executed", and the pending exception is raised
-        // before anything at the advanced position runs.
+        // backward-jump handler, so tb_lasti names the jump.  The
+        // error-resume position below reproduces that exactly: the
+        // reified frame reads "the jump just executed", and the pending
+        // exception is raised before anything at that position runs.
         meta.reason == DeoptReason::kInstrumentation)) ||
       forced_deopt) {
     return frame.cause_instr_idx;
   }
 
-#if PY_VERSION_HEX >= 0x030E0000
   if (PyErr_Occurred() && is_innermost) {
+#if PY_VERSION_HEX >= 0x030E0000
     // On 3.14+ the traceback is going to be generated based on instr_ptr
     // and then we'll dispatch to the error handler. We're never going to
     // execute the instruction but we need the instr_ptr to point at the
@@ -312,8 +312,22 @@ static BCIndex getDeoptResumeIndex(
                .nextInstrOffset()
                .asIndex() -
         1;
-  }
+#elif PY_VERSION_HEX < 0x030C0000
+    // On 3.11 the error resume enters the anchored evaluator at
+    // resume_with_error, which reads prev_instr for both the traceback
+    // entry (PyTraceBack_Here) and the exception-table lookup
+    // (INSTR_OFFSET()-1).  Stock leaves prev_instr at the faulting
+    // instruction's opcode unit: every raising opcode on the execute
+    // surface reaches `goto error` before its inline-cache JUMPBY, and a
+    // callee-raised error stops at the CALL unit too because the inlined
+    // fast path is structurally disabled under an installed PEP 523
+    // evaluator.  The default advance would park prev_instr on the last
+    // cache unit instead -- same handler and line, wrong tb_lasti.
+    return BytecodeInstruction(frame.code, frame.cause_instr_idx)
+               .opcodeIndex() +
+        1;
 #endif
+  }
   return BytecodeInstruction(frame.code, frame.cause_instr_idx)
       .nextInstrOffset();
 }
