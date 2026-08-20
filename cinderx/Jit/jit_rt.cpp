@@ -369,8 +369,7 @@ JITRT_CallWithIncorrectArgcount(
   return JITRT_BOUND_ARGS_REENTRY(func)(
       (PyObject*)func, arg_space.get(), new_nargsf, (PyObject*)defaulted_args);
 #else
-  return reinterpret_cast<staticvectorcallfunc>(
-      JITRT_BOUND_ARGS_REENTRY(func))(
+  return reinterpret_cast<staticvectorcallfunc>(JITRT_BOUND_ARGS_REENTRY(func))(
       (PyObject*)func,
       arg_space.get(),
       new_nargsf,
