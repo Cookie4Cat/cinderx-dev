@@ -1243,7 +1243,8 @@ static bool handle_periodic_activities_on_call(
 // CALL_FUNCTION_EX always CHECK_EVAL_BREAKER after do_call_core,
 // including when the callee is a Python function.
 static bool handle_periodic_activities_on_call_ex(
-    PyThreadState* tstate, PyObject* res) {
+    PyThreadState* tstate,
+    PyObject* res) {
   JITRT_AtQuiescentState(tstate);
   return res != nullptr && is_eval_breaker_set(tstate) &&
 #if PY_VERSION_HEX < 0x030C0000
@@ -2868,7 +2869,8 @@ PyObject JITRT_IterDoneSentinel = {
 #else
     {.ob_refcnt = _Py_IMMORTAL_REFCNT},
 #endif
-    nullptr};
+    nullptr
+};
 
 PyObject* JITRT_InvokeIterNext(PyObject* iterator) {
   iternextfunc iternext_f = Py_TYPE(iterator)->tp_iternext;
