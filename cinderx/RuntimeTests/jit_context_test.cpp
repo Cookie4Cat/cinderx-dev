@@ -3728,6 +3728,27 @@ def forget_me():
 // Python.  Each of these was reported against a build where the Python-level
 // suite was already green: the Python surface can only see what the canary
 // control plane publishes, and the registries these cases read are not on it.
+
+namespace {
+
+PyObject* setAsyncExcThenNone(PyObject* /*self*/, PyObject* /*unused*/) {
+  unsigned long ident = PyThread_get_thread_ident();
+  int n = PyThreadState_SetAsyncExc(ident, PyExc_RuntimeError);
+  if (n < 0) {
+    return nullptr;
+  }
+  Py_RETURN_NONE;
+}
+
+PyMethodDef kSetAsyncExcThenNone = {
+    "set_async_exc_then_none",
+    setAsyncExcThenNone,
+    METH_NOARGS,
+    nullptr,
+};
+
+} // namespace
+
 class JITLifecycle311Test : public RuntimeTest {};
 
 TEST_F(JITLifecycle311Test, CodeDeathIsReported) {
@@ -4013,6 +4034,38 @@ def needed(a):
   EXPECT_TRUE(PyErr_ExceptionMatches(PyExc_RecursionError))
       << "a successful bind must still consume a recursion slot";
   PyErr_Clear();
+}
+
+TEST_F(JITLifecycle311Test, CallDeliversAsyncExcBeforeNextStatement) {
+  SKIP_311_EXECUTABLE_COMPILE();
+
+  // CPython 3.11 CALL runs CHECK_EVAL_BREAKER after a C callable
+  // returns.  A successful helper that armed SetAsyncExc must raise
+  // before the next Python statement, matching stock.
+  const char* py_src = R"(
+def drive(helper, box):
+    helper()
+    box.append(1)
+    return box
+)";
+  Ref<PyFunctionObject> func(compileAndGet(py_src, "drive"));
+  ASSERT_NE(func, nullptr);
+  ASSERT_EQ(jit::compileFunction(func), jit::Result::OK);
+  ASSERT_TRUE(isJitCompiled(func));
+
+  auto helper = Ref<>::steal(PyCFunction_New(&kSetAsyncExcThenNone, nullptr));
+  ASSERT_NE(helper, nullptr);
+  auto box = Ref<>::steal(PyList_New(0));
+  ASSERT_NE(box, nullptr);
+  auto args = Ref<>::steal(PyTuple_Pack(2, helper.get(), box.get()));
+  ASSERT_NE(args, nullptr);
+  auto result = Ref<>::steal(PyObject_Call(func, args, nullptr));
+  EXPECT_EQ(result, nullptr);
+  EXPECT_TRUE(PyErr_ExceptionMatches(PyExc_RuntimeError))
+      << "async exception must be delivered at the CALL boundary";
+  PyErr_Clear();
+  EXPECT_EQ(PyList_GET_SIZE(box), 0)
+      << "CALL-after mutation ran; eval breaker was deferred";
 }
 
 #if defined(__linux__)

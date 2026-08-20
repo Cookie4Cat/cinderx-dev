@@ -1961,6 +1961,59 @@ class CanaryExecute311Test(unittest.TestCase):
         self.assertEqual(proc.returncode, 0, proc.stderr[-1200:])
         self.assertIn("async exception delivered on the backedge", proc.stdout)
 
+    def test_async_exception_on_c_call_stops_before_next_stmt(self):
+        # CPython 3.11 CALL runs CHECK_EVAL_BREAKER after a C callable
+        # returns.  SetAsyncExc armed inside that callable must raise
+        # before the next Python statement.
+        env = dict(os.environ)
+        env["CINDERX_JIT_MODE"] = "canary"
+        env["PYTHONJITAUTO"] = "1000000"
+        probe = textwrap.dedent(
+            """
+            import ctypes
+            import threading
+            import _cinderx, cinderx
+            cinderx.init()
+            _cinderx.install_frame_evaluator()
+            import cinderjit
+
+            class Interrupted(Exception):
+                pass
+
+            @ctypes.CFUNCTYPE(ctypes.c_int)
+            def fire():
+                ctypes.pythonapi.PyThreadState_SetAsyncExc(
+                    ctypes.c_ulong(threading.get_ident()),
+                    ctypes.py_object(Interrupted))
+                return 0
+
+            def drive(box):
+                fire()
+                box.append(1)
+                return box
+
+            assert cinderjit.force_compile(drive) is True
+            box = []
+            try:
+                drive(box)
+            except Interrupted:
+                pass
+            else:
+                raise SystemExit("expected Interrupted")
+            assert box == [], box
+            print("async exception delivered at c call")
+            """
+        )
+        proc = subprocess.run(
+            [sys.executable, "-c", probe],
+            capture_output=True,
+            text=True,
+            env=env,
+            timeout=120,
+        )
+        self.assertEqual(proc.returncode, 0, proc.stderr[-800:])
+        self.assertIn("async exception delivered at c call", proc.stdout)
+
     def test_async_exception_position_matches_stock_at_the_backedge(self):
         # Where the async exception lands, oracled by stock CPython itself.
         # The back-edge polls are per edge and carry the frame state AT the

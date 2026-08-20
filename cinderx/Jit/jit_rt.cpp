@@ -16,6 +16,7 @@
 #include "cinderx/Common/util.h"
 #include "cinderx/Interpreter/interpreter.h"
 #if PY_VERSION_HEX < 0x030C0000
+#include "cinderx/Interpreter/3.11/interpreter_contract.h"
 #include "cinderx/Interpreter/3.11/observe.h"
 #endif
 #include "cinderx/Jit/codegen/arch.h"
@@ -44,6 +45,8 @@
 #include <cmath>
 #include <cstdlib>
 #include <limits>
+#include <memory>
+#include <new>
 
 // Argument binding is not a pure function: keyword equality and
 // kwdefaults lookup can run arbitrary Python.  The binder therefore
@@ -51,6 +54,16 @@
 // through CPython's vectorcall, and so a successful bind re-enters the
 // snapshot captured before any of that Python ran.
 enum class BindKwStatus { Error, Fallback, Bound };
+
+template <typename T>
+std::unique_ptr<T[]> allocateBindArray(size_t n) {
+  try {
+    return std::make_unique<T[]>(n);
+  } catch (const std::bad_alloc&) {
+    PyErr_NoMemory();
+    return nullptr;
+  }
+}
 
 // This is mostly taken from ceval.c _PyEval_EvalCodeWithName
 // We use the same logic to turn **args, nargsf, and kwnames into
@@ -308,7 +321,11 @@ PyObject* JITRT_CallWithKeywordArgs(
   const Py_ssize_t total_args = co->co_argcount + co->co_kwonlyargcount +
       ((co->co_flags & CO_VARKEYWORDS) ? 1 : 0) +
       ((co->co_flags & CO_VARARGS) ? 1 : 0);
-  auto arg_space = std::make_unique<PyObject*[]>(total_args);
+  auto arg_space = allocateBindArray<PyObject*>(
+      static_cast<size_t>(total_args));
+  if (arg_space == nullptr) {
+    return nullptr;
+  }
   Ref<PyObject> kwdict, varargs;
 
   switch (JITRT_BindKeywordArgs(
@@ -369,7 +386,11 @@ JITRT_StaticCallFPReturn JITRT_CallWithIncorrectArgcountFPReturn(
   }
   Py_ssize_t defcount = PyTuple_GET_SIZE(defaults);
   Py_ssize_t nargs = PyVectorcall_NARGS(nargsf);
-  auto arg_space = std::make_unique<PyObject*[]>(argcount);
+  auto arg_space = allocateBindArray<PyObject*>(
+      static_cast<size_t>(argcount));
+  if (arg_space == nullptr) {
+    return {0.0, 0.0};
+  }
   Py_ssize_t defaulted_args = argcount - nargs;
 
   if (nargs + defcount < argcount || nargs > argcount) {
@@ -432,7 +453,15 @@ JITRT_CallWithIncorrectArgcount(
   }
   Py_ssize_t defcount = PyTuple_GET_SIZE(defaults);
   Py_ssize_t nargs = PyVectorcall_NARGS(nargsf);
-  auto arg_space = std::make_unique<PyObject*[]>(argcount);
+  auto arg_space = allocateBindArray<PyObject*>(
+      static_cast<size_t>(argcount));
+  if (arg_space == nullptr) {
+#ifdef _WIN32
+    return nullptr;
+#else
+    return {nullptr, nullptr};
+#endif
+  }
   Py_ssize_t defaulted_args = argcount - nargs;
 
   if (nargs + defcount < argcount || nargs > argcount) {
@@ -539,7 +568,10 @@ TRetType JITRT_CallStaticallyWithPrimitiveSignatureWorker(
     _PyTypedArgsInfo* arg_info) {
   vectorcallfunc reentry = JITRT_CAPTURE_REENTRY(func);
   Py_ssize_t nargs = PyVectorcall_NARGS(nargsf);
-  auto arg_space = std::make_unique<void*[]>(nargs);
+  auto arg_space = allocateBindArray<void*>(static_cast<size_t>(nargs));
+  if (arg_space == nullptr) {
+    return TRetType();
+  }
   if (JITRT_PackStaticArgs(args, arg_info, arg_space.get(), nargs)) {
     goto fail;
   }
@@ -591,7 +623,11 @@ TRetType JITRT_CallStaticallyWithPrimitiveSignatureTemplate(
     const Py_ssize_t total_args = co->co_argcount + co->co_kwonlyargcount +
         ((co->co_flags & CO_VARKEYWORDS) ? 1 : 0) +
         ((co->co_flags & CO_VARARGS) ? 1 : 0);
-    auto arg_space = std::make_unique<PyObject*[]>(total_args);
+    auto arg_space = allocateBindArray<PyObject*>(
+        static_cast<size_t>(total_args));
+    if (arg_space == nullptr) {
+      return TRetType();
+    }
     Ref<PyObject> kwdict, varargs;
 
     switch (JITRT_BindKeywordArgs(
@@ -1161,6 +1197,10 @@ static bool is_eval_breaker_set(PyThreadState* tstate) {
   return value->load(std::memory_order_relaxed);
 }
 
+// 3.12 CALL checks the eval breaker after a non-Python callable
+// returns.  3.11 CALL does the same via CHECK_EVAL_BREAKER /
+// eval_frame_handle_pending (signals, pending calls, GIL drop,
+// async exceptions).  Py_MakePendingCalls covers only the first two.
 static bool handle_periodic_activities_on_call(
     PyThreadState* tstate,
     PyObject* res,
@@ -1169,7 +1209,7 @@ static bool handle_periodic_activities_on_call(
   return res != nullptr && !PyFunction_Check(callable) &&
       is_eval_breaker_set(tstate) &&
 #if PY_VERSION_HEX < 0x030C0000
-      Py_MakePendingCalls() != 0;
+      Ci_EvalFrameHandlePending_311(tstate) != 0;
 #else
       _Py_HandlePending(tstate) != 0;
 #endif
