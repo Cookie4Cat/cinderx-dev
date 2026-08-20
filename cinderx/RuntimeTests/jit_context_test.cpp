@@ -4022,7 +4022,10 @@ def needed(a):
   tstate->recursion_remaining = saved;
   EXPECT_EQ(missing, nullptr);
   EXPECT_TRUE(PyErr_ExceptionMatches(PyExc_TypeError))
-      << "bind failure at the recursion limit must stay TypeError";
+      << "bind failure at the recursion limit must stay TypeError, got "
+      << (PyErr_Occurred() != nullptr
+              ? reinterpret_cast<PyTypeObject*>(PyErr_Occurred())->tp_name
+              : "no-exc");
   PyErr_Clear();
 
   tstate->recursion_remaining = 0;

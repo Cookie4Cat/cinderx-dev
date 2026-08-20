@@ -1963,8 +1963,9 @@ class CanaryExecute311Test(unittest.TestCase):
 
     def test_async_exception_on_c_call_stops_before_next_stmt(self):
         # CPython 3.11 CALL runs CHECK_EVAL_BREAKER after a C callable
-        # returns.  SetAsyncExc armed inside that callable must raise
-        # before the next Python statement.
+        # returns.  ctypes callbacks swallow SetAsyncExc on the same
+        # thread ("Exception ignored"), so arm it from a helper thread
+        # and use time.sleep as the C CALL.
         env = dict(os.environ)
         env["CINDERX_JIT_MODE"] = "canary"
         env["PYTHONJITAUTO"] = "1000000"
@@ -1972,6 +1973,7 @@ class CanaryExecute311Test(unittest.TestCase):
             """
             import ctypes
             import threading
+            import time
             import _cinderx, cinderx
             cinderx.init()
             _cinderx.install_frame_evaluator()
@@ -1980,26 +1982,33 @@ class CanaryExecute311Test(unittest.TestCase):
             class Interrupted(Exception):
                 pass
 
-            @ctypes.CFUNCTYPE(ctypes.c_int)
-            def fire():
-                ctypes.pythonapi.PyThreadState_SetAsyncExc(
-                    ctypes.c_ulong(threading.get_ident()),
-                    ctypes.py_object(Interrupted))
-                return 0
-
-            def drive(box):
-                fire()
+            def drive(sleeper, box):
+                sleeper(0.3)
                 box.append(1)
                 return box
 
             assert cinderjit.force_compile(drive) is True
+            tid = threading.get_ident()
+            started = threading.Event()
+
+            def shooter():
+                started.wait(30)
+                time.sleep(0.05)
+                ctypes.pythonapi.PyThreadState_SetAsyncExc(
+                    ctypes.c_ulong(tid),
+                    ctypes.py_object(Interrupted))
+
+            t = threading.Thread(target=shooter)
+            t.start()
             box = []
+            started.set()
             try:
-                drive(box)
+                drive(time.sleep, box)
             except Interrupted:
                 pass
             else:
                 raise SystemExit("expected Interrupted")
+            t.join(30)
             assert box == [], box
             print("async exception delivered at c call")
             """

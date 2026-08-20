@@ -1914,6 +1914,26 @@ def main(argv: list[str] | None = None) -> int:
         result = run(spec)
         print(result.summary())
         return 0 if result.ok else 1
+    if "--stdlib-canary" in argv:
+        result = run(stdlib_canary_runner())
+        print(result.summary())
+        if result.report is not None:
+            keys = (
+                "compile_requests",
+                "compile_installed",
+                "compile_rejected",
+                "machine_code_entries",
+                "machine_code_installed",
+                "compiled_function_creations",
+                "unknown_rejects",
+                "organic_deopt_hits",
+                "forced_deopt_hits",
+                "target_modules_attempted",
+                "live_compiled_functions_at_exit",
+            )
+            for key in keys:
+                print("%s=%r" % (key, result.report.get(key)))
+        return 0 if result.ok else 1
     if "--pyperf-canary" in argv:
         # The canary leg runs the committed tranche, not the full applicable
         # set the shadow daily covers: every benchmark here compiles and

@@ -299,6 +299,39 @@ PyObject* JITRT_ReenterAfterBind(
       nargsf,
       nullptr);
 }
+
+// Falling back to the interpreter to format a bind TypeError can itself
+// Enter (frame push / _PyErr_Format).  At recursion_remaining == 0 that
+// turns a missing-argument failure into RecursionError.  Raise TypeError
+// here so bind still precedes the recursion slot.
+static bool bindFailureAtRecursionLimit() {
+  PyThreadState* tstate = PyThreadState_GET();
+  return tstate != nullptr && tstate->recursion_remaining <= 0;
+}
+
+static PyObject* setArgcountBindTypeError(
+    PyFunctionObject* func,
+    Py_ssize_t nargs,
+    int argcount) {
+  PyObject* name = func->func_qualname != nullptr
+      ? func->func_qualname
+      : func->func_name;
+  if (nargs < argcount) {
+    PyErr_Format(
+        PyExc_TypeError,
+        "%U() missing a required positional argument",
+        name);
+  } else {
+    PyErr_Format(
+        PyExc_TypeError,
+        "%U() takes %d positional argument%s but %zd were given",
+        name,
+        argcount,
+        argcount == 1 ? "" : "s",
+        nargs);
+  }
+  return nullptr;
+}
 #else
 #define JITRT_CAPTURE_REENTRY(func) JITRT_GET_REENTRY((func)->vectorcall)
 #endif
@@ -380,6 +413,17 @@ JITRT_StaticCallFPReturn JITRT_CallWithIncorrectArgcountFPReturn(
   PyObject* defaults = func->func_defaults;
   if (defaults == nullptr) {
     // Function has no defaults; there's nothing we can do.
+#if PY_VERSION_HEX < 0x030C0000
+    if (bindFailureAtRecursionLimit()) {
+      setArgcountBindTypeError(
+          func,
+          PyVectorcall_NARGS(nargsf),
+          argcount);
+      return {0.0, 0.0};
+    }
+#endif
+    // Fallback to the default _PyFunction_Vectorcall implementation
+    // to produce an appropriate exception.
     auto interpVectorcall = getInterpretedVectorcall(func);
     interpVectorcall((PyObject*)func, args, nargsf, nullptr);
     return {0.0, 0.0};
@@ -395,6 +439,12 @@ JITRT_StaticCallFPReturn JITRT_CallWithIncorrectArgcountFPReturn(
 
   if (nargs + defcount < argcount || nargs > argcount) {
     // Not enough args with defaults, or too many args without defaults.
+#if PY_VERSION_HEX < 0x030C0000
+    if (bindFailureAtRecursionLimit()) {
+      setArgcountBindTypeError(func, nargs, argcount);
+      return {0.0, 0.0};
+    }
+#endif
     auto interpVectorcall = getInterpretedVectorcall(func);
     interpVectorcall((PyObject*)func, args, nargsf, nullptr);
     return {0.0, 0.0};
@@ -444,6 +494,19 @@ JITRT_CallWithIncorrectArgcount(
     // Function has no defaults; there's nothing we can do.
     // Fallback to the default _PyFunction_Vectorcall implementation
     // to produce an appropriate exception.
+#if PY_VERSION_HEX < 0x030C0000
+    if (bindFailureAtRecursionLimit()) {
+      setArgcountBindTypeError(
+          func,
+          PyVectorcall_NARGS(nargsf),
+          argcount);
+#ifdef _WIN32
+      return nullptr;
+#else
+      return {nullptr, nullptr};
+#endif
+    }
+#endif
     auto interpVectorcall = getInterpretedVectorcall(func);
 #ifdef _WIN32
     return interpVectorcall((PyObject*)func, args, nargsf, nullptr);
@@ -466,6 +529,16 @@ JITRT_CallWithIncorrectArgcount(
 
   if (nargs + defcount < argcount || nargs > argcount) {
     // Not enough args with defaults, or too many args without defaults.
+#if PY_VERSION_HEX < 0x030C0000
+    if (bindFailureAtRecursionLimit()) {
+      setArgcountBindTypeError(func, nargs, argcount);
+#ifdef _WIN32
+      return nullptr;
+#else
+      return {nullptr, nullptr};
+#endif
+    }
+#endif
     auto interpVectorcall = getInterpretedVectorcall(func);
 #ifdef _WIN32
     return interpVectorcall((PyObject*)func, args, nargsf, nullptr);
