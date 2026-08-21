@@ -263,8 +263,8 @@ def snapshot() -> dict[str, Any]:
         "compiled_function_creations": int(
             trigger["compiled_function_creations"]
         ),
-        "forced_deopt_hits": int(trigger.get("forced_deopt_hits", 0)),
-        "organic_deopt_hits": int(trigger.get("organic_deopt_hits", 0)),
+        "forced_deopt_hits": int(trigger["forced_deopt_hits"]),
+        "organic_deopt_hits": int(trigger["organic_deopt_hits"]),
     }
     for field in HARNESS_FIELDS:
         report[field] = None
