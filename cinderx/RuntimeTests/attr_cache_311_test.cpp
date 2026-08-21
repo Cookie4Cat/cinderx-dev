@@ -34,6 +34,81 @@ std::unique_ptr<jit::LoadAttrCache, CacheDeleter> makeLoadAttrCache() {
       new (mem) jit::LoadAttrCache()};
 }
 
+struct StoreCacheDeleter {
+  void operator()(jit::StoreAttrCache* cache) const {
+    cache->~StoreAttrCache();
+    PyMem_Free(cache);
+  }
+};
+
+std::unique_ptr<jit::StoreAttrCache, StoreCacheDeleter> makeStoreAttrCache() {
+  void* mem = PyMem_Calloc(1, jit::AttributeCacheSizeTrait::size());
+  JIT_CHECK(mem != nullptr, "Failed to allocate store attr cache");
+  return std::unique_ptr<jit::StoreAttrCache, StoreCacheDeleter>{
+      new (mem) jit::StoreAttrCache()};
+}
+
+// A data descriptor whose slots delete the descriptor from its owner
+// class mid-call (dropping what may be its last reference) and then keep
+// using their own storage.  Stock survives this because
+// GenericGetAttr/GenericSetAttr hold a strong reference across the slot
+// call; the cached dispatch must provide the same ownership.  The
+// "armed" latch lets the priming call fill the cache before the
+// self-deleting call runs, and died_mid_slot turns the use-after-free
+// into a Release-visible verdict (the ASAN leg gives the memory one).
+struct SelfDeletingDescr {
+  PyObject_HEAD
+  long payload;
+};
+
+long sdd_dealloc_count = 0;
+bool sdd_died_mid_slot = false;
+bool sdd_armed = false;
+PyObject* sdd_owner = nullptr; // borrowed: the owner class
+
+void sdd_dealloc(PyObject* self) {
+  sdd_dealloc_count++;
+  PyObject_Free(self);
+}
+
+PyObject* sdd_descr_get(PyObject* self, PyObject*, PyObject*) {
+  if (sdd_armed) {
+    long before = sdd_dealloc_count;
+    if (PyObject_DelAttrString(sdd_owner, "x") < 0) {
+      return nullptr;
+    }
+    if (sdd_dealloc_count != before) {
+      // `self` is already dead; touching payload would be the UAF.
+      sdd_died_mid_slot = true;
+      Py_RETURN_NONE;
+    }
+  }
+  return PyLong_FromLong(reinterpret_cast<SelfDeletingDescr*>(self)->payload);
+}
+
+int sdd_descr_set(PyObject* self, PyObject*, PyObject* value) {
+  if (value == nullptr) {
+    PyErr_SetString(PyExc_AttributeError, "cannot delete");
+    return -1;
+  }
+  if (sdd_armed) {
+    long before = sdd_dealloc_count;
+    if (PyObject_DelAttrString(sdd_owner, "x") < 0) {
+      return -1;
+    }
+    if (sdd_dealloc_count != before) {
+      sdd_died_mid_slot = true;
+      return 0;
+    }
+  }
+  reinterpret_cast<SelfDeletingDescr*>(self)->payload += 1;
+  return 0;
+}
+
+PyTypeObject SelfDeletingDescr_Type = {
+    PyVarObject_HEAD_INIT(nullptr, 0) //
+};
+
 } // namespace
 
 class AttrCache311Test : public RuntimeTest {};
@@ -275,6 +350,106 @@ TEST_F(AttrCache311Test, ModuleMethodHitOwnsBothResultHalves) {
     run_round(sname, nullptr);
   }
   EXPECT_EQ(Py_REFCNT(Py_None), none_refcount);
+}
+
+TEST_F(AttrCache311Test, DescriptorSurvivesDeletingItselfMidSlot) {
+  if (SelfDeletingDescr_Type.tp_name == nullptr) {
+    SelfDeletingDescr_Type.tp_name = "SelfDeletingDescr";
+    SelfDeletingDescr_Type.tp_basicsize = sizeof(SelfDeletingDescr);
+    SelfDeletingDescr_Type.tp_dealloc = sdd_dealloc;
+    SelfDeletingDescr_Type.tp_flags = Py_TPFLAGS_DEFAULT;
+    SelfDeletingDescr_Type.tp_descr_get = sdd_descr_get;
+    SelfDeletingDescr_Type.tp_descr_set = sdd_descr_set;
+    ASSERT_GE(PyType_Ready(&SelfDeletingDescr_Type), 0);
+  }
+
+  auto run_arm = [&](bool is_store) {
+    const char* src = R"(
+class C:
+    pass
+
+inst = C()
+)";
+    Ref<PyObject> globals(MakeGlobals());
+    ASSERT_NE(globals, nullptr);
+    auto result =
+        Ref<>::steal(PyRun_String(src, Py_file_input, globals, globals));
+    ASSERT_NE(result, nullptr);
+    BorrowedRef<> klass = PyDict_GetItemString(globals, "C");
+    BorrowedRef<> inst = PyDict_GetItemString(globals, "inst");
+    ASSERT_NE(klass, nullptr);
+    ASSERT_NE(inst, nullptr);
+
+    SelfDeletingDescr* descr =
+        PyObject_New(SelfDeletingDescr, &SelfDeletingDescr_Type);
+    ASSERT_NE(descr, nullptr);
+    descr->payload = 42;
+    // The 3.11 fill refuses descriptor types without a valid version tag
+    // (the JIT never assigns one itself); an ordinary attribute lookup
+    // through the type makes CPython assign it, exactly as organic use
+    // would have.
+    {
+      auto warmed = Ref<>::steal(PyObject_GetAttrString(
+          reinterpret_cast<PyObject*>(descr), "__class__"));
+      ASSERT_NE(warmed, nullptr);
+    }
+    ASSERT_EQ(
+        PyObject_SetAttrString(klass, "x", reinterpret_cast<PyObject*>(descr)),
+        0);
+    // The class dict now holds the ONLY reference.
+    Py_DECREF(descr);
+
+    sdd_owner = klass;
+    sdd_armed = false;
+    sdd_died_mid_slot = false;
+    sdd_dealloc_count = 0;
+    auto name = Ref<>::steal(PyUnicode_InternFromString("x"));
+    auto value = Ref<>::steal(PyLong_FromLong(7));
+    const jit::AttrCacheStats311& stats = jit::attrCacheStats311();
+
+    if (is_store) {
+      auto cache = makeStoreAttrCache();
+      // Prime: fills the kDataDescr entry through the working slot.  The
+      // stats assertions make a vacuous pass impossible: a refused fill
+      // would leave every call on the stock-protected slow path and the
+      // test would prove nothing.
+      uint64_t fills = stats.store_attr.fills;
+      ASSERT_EQ(jit::StoreAttrCache::invoke(cache.get(), inst, name, value), 0);
+      ASSERT_EQ(stats.store_attr.fills, fills + 1);
+      sdd_armed = true;
+      // Hit: the slot deletes the descriptor's only other reference
+      // mid-call; the dispatch's strong hold must keep it alive.
+      uint64_t hits = stats.store_attr.hits;
+      ASSERT_EQ(jit::StoreAttrCache::invoke(cache.get(), inst, name, value), 0);
+      ASSERT_EQ(stats.store_attr.hits, hits + 1);
+    } else {
+      auto cache = makeLoadAttrCache();
+      uint64_t fills = stats.load_attr.fills;
+      auto first =
+          Ref<>::steal(jit::LoadAttrCache::invoke(cache.get(), inst, name));
+      ASSERT_NE(first, nullptr);
+      EXPECT_EQ(PyLong_AsLong(first), 42);
+      ASSERT_EQ(stats.load_attr.fills, fills + 1);
+      sdd_armed = true;
+      uint64_t hits = stats.load_attr.hits;
+      auto second =
+          Ref<>::steal(jit::LoadAttrCache::invoke(cache.get(), inst, name));
+      ASSERT_NE(second, nullptr);
+      EXPECT_EQ(PyLong_AsLong(second), 42);
+      ASSERT_EQ(stats.load_attr.hits, hits + 1);
+    }
+
+    EXPECT_FALSE(sdd_died_mid_slot)
+        << "the descriptor was deallocated while its own slot was running";
+    // The dispatch guard was the last reference: the descriptor died
+    // exactly once, after the slot returned.
+    EXPECT_EQ(sdd_dealloc_count, 1);
+    sdd_armed = false;
+    sdd_owner = nullptr;
+  };
+
+  run_arm(/*is_store=*/false);
+  run_arm(/*is_store=*/true);
 }
 
 #endif

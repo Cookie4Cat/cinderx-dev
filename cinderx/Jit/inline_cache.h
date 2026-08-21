@@ -196,17 +196,25 @@ class AttributeMutator {
   // D.__set__ mutates D -- not the receiver -- so the receiver-version
   // gate cannot see it.  The stale entry would misroute precedence
   // (an instance shadow must win once the descriptor stops being a data
-  // descriptor) or call a now-NULL slot.  Only valid to call after
-  // typeVersionMatches passed: an unchanged receiver type still holds
-  // the descriptor reference that keeps descr_type alive.  Other kinds
-  // need no tag: kDescrOrClassVar re-reads the slots on every call, and
-  // kMemberDescr only ever captures the immutable PyMemberDescr_Type.
+  // descriptor) or call a now-NULL slot.
+  //
+  // The POINTER comparison comes first and gates the version load:
+  // d.__class__ = D2 swaps the descriptor's type without touching the
+  // receiver or D1's version -- and can leave the captured descr_type
+  // pointing at a dead type if the swap dropped D1's last reference.
+  // Py_TYPE(descr) is safe to read (typeVersionMatches passing means the
+  // receiver still holds the descriptor), the captured pointer is only
+  // compared, and the version is loaded through Py_TYPE(descr) itself
+  // only after they are proven identical.  Other kinds need no tag:
+  // kDescrOrClassVar re-reads the slots on every call, and kMemberDescr
+  // only ever captures the immutable PyMemberDescr_Type.
   bool descrVersionMatches() const {
     if (get_kind() != Kind::kDataDescr) {
       return true;
     }
-    return data_descr_.descr_type->tp_version_tag ==
-        data_descr_.descr_type_version;
+    PyTypeObject* live_descr_type = Py_TYPE(data_descr_.descr.get());
+    return live_descr_type == data_descr_.descr_type &&
+        live_descr_type->tp_version_tag == data_descr_.descr_type_version;
   }
 #endif
 
