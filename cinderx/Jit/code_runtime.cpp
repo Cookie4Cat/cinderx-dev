@@ -109,7 +109,7 @@ std::size_t CodeRuntime::addDeoptMetadata(DeoptMetadata&& deopt_meta) {
     }
     deopt_meta.site_id = computeDeoptSiteId(
         deopt_meta.code(),
-        deopt_meta.innermostFrame().cause_instr_idx,
+        deopt_meta.innermostFrame().cause_instr_idx.asOffset(),
         deopt_meta.reason,
         deopt_meta.inline_depth(),
         seq);

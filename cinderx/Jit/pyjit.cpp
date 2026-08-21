@@ -2757,7 +2757,7 @@ PyObject* deopt_sites(PyObject* /* self */, PyObject* arg) {
         "kind",
         jit::deoptReasonName(meta.reason),
         "bc_offset",
-        meta.innermostFrame().cause_instr_idx.value(),
+        meta.innermostFrame().cause_instr_idx.asOffset().value(),
         "inline_path",
         "",
         "nonce",

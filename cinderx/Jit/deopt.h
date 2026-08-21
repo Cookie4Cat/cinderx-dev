@@ -244,7 +244,7 @@ struct DeoptMetadata {
 // disambiguates two sites that share code, offset, kind and inline depth.
 uint64_t computeDeoptSiteId(
     BorrowedRef<PyCodeObject> code,
-    BCIndex bc_offset,
+    BCOffset bc_offset,
     DeoptReason reason,
     size_t inline_depth,
     uint32_t seq);

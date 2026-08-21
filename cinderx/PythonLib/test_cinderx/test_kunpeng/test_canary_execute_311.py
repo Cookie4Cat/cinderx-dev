@@ -1302,6 +1302,7 @@ class CanaryExecute311Test(unittest.TestCase):
         env["PYTHONJITAUTO"] = "1000000"
         probe = textwrap.dedent(
             """
+            import dis
             import _cinderx, cinderx
             cinderx.init()
             _cinderx.install_frame_evaluator()
@@ -1320,6 +1321,12 @@ class CanaryExecute311Test(unittest.TestCase):
             assert cinderjit.force_compile(loop) is True
             sites = cinderjit.deopt_sites(loop)
             assert sites, sites
+            instruction_offsets = {
+                instr.offset for instr in dis.get_instructions(loop)
+            }
+            assert all(s["bc_offset"] in instruction_offsets for s in sites), (
+                sites, sorted(instruction_offsets)
+            )
             ids = [s["id"] for s in sites]
             assert len(ids) == len(set(ids)), ids
             kinds = {s["kind"] for s in sites}

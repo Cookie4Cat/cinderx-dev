@@ -967,9 +967,9 @@ def test():
   ASSERT_NE(func, nullptr);
   BorrowedRef<PyCodeObject> code{func->func_code};
   uint64_t first = jit::computeDeoptSiteId(
-      code, BCIndex{0}, jit::DeoptReason::kGuardFailure, 0, 0);
+      code, BCOffset{0}, jit::DeoptReason::kGuardFailure, 0, 0);
   uint64_t second = jit::computeDeoptSiteId(
-      code, BCIndex{0}, jit::DeoptReason::kGuardFailure, 0, 0);
+      code, BCOffset{0}, jit::DeoptReason::kGuardFailure, 0, 0);
   EXPECT_EQ(first, second);
 }
 
@@ -998,12 +998,12 @@ def test():
   ASSERT_NE(func, nullptr);
   BorrowedRef<PyCodeObject> code{func->func_code};
   uint64_t empty_path = jit::computeDeoptSiteId(
-      code, BCIndex{4}, jit::DeoptReason::kGuardFailure, 0, 0);
+      code, BCOffset{8}, jit::DeoptReason::kGuardFailure, 0, 0);
   uint64_t inlined = jit::computeDeoptSiteId(
-      code, BCIndex{4}, jit::DeoptReason::kGuardFailure, 1, 0);
+      code, BCOffset{8}, jit::DeoptReason::kGuardFailure, 1, 0);
   EXPECT_NE(empty_path, inlined);
   uint64_t other_kind =
-      jit::computeDeoptSiteId(code, BCIndex{4}, jit::DeoptReason::kRaise, 0, 0);
+      jit::computeDeoptSiteId(code, BCOffset{8}, jit::DeoptReason::kRaise, 0, 0);
   EXPECT_NE(empty_path, other_kind);
 }
 #endif

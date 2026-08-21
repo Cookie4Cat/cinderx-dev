@@ -609,7 +609,7 @@ DeoptMetadata DeoptMetadata::fromInstr(const jit::hir::DeoptBase& instr) {
 
 uint64_t computeDeoptSiteId(
     BorrowedRef<PyCodeObject> code,
-    BCIndex bc_offset,
+    BCOffset bc_offset,
     DeoptReason reason,
     size_t inline_depth,
     uint32_t seq) {
