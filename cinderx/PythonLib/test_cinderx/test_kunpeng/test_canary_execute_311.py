@@ -6587,6 +6587,257 @@ class CanaryExecute311Test(unittest.TestCase):
         self.assertEqual(proc.returncode, 0, proc.stderr[-2000:])
         self.assertIn("reentrant mutation safe", proc.stdout)
 
+    def test_descriptor_type_demotion_matches_the_interpreter_arm(self):
+        # Deleting D.__set__ mutates the DESCRIPTOR's type, not the
+        # receiver, so the receiver-version guard alone cannot see it:
+        # the cache must pull-validate the descriptor type as well.
+        # After demotion an instance shadow wins (non-data precedence)
+        # and stores land in the instance dict instead of the vanished
+        # tp_descr_set; a get-side deletion must likewise never reach a
+        # NULL tp_descr_get.  Re-adding __set__ promotes it back.
+        probe = self._DUAL_ARM_PREAMBLE + textwrap.dedent(
+            """
+            class D:
+                def __get__(self, obj, objtype=None):
+                    return ("data", obj.tag)
+
+                def __set__(self, obj, value):
+                    obj.__dict__["log"] = ("descr-set", value)
+
+            class C:
+                x = D()
+
+                def __init__(self, tag):
+                    self.tag = tag
+
+            def read(c):
+                return c.x
+
+            def write(c, v):
+                c.x = v
+
+            cs = [C(i) for i in range(3)]
+            for c in cs:
+                # Plant instance shadows while the descriptor is data:
+                # they stay invisible until the demotion flips precedence.
+                c.__dict__["x"] = ("shadow", c.tag)
+            for _ in range(40):
+                for c in cs:
+                    read(c)
+                    write(c, 1)
+            compile_all(read, write)
+
+            journal = []
+            journal.append([read(c) for c in cs])
+            journal.append([c.__dict__.get("log") for c in cs])
+
+            del D.__set__
+            # Demoted: the planted shadows win the very next load, and
+            # tp_descr_set is NULL -- a stale kDataDescr dispatch would
+            # call it.
+            journal.append([read(c) for c in cs])
+            for c in cs:
+                write(c, 9)
+            journal.append([c.__dict__["x"] for c in cs])
+            journal.append([read(c) for c in cs])
+
+            D.__set__ = lambda self, obj, value: obj.__dict__.__setitem__(
+                "log", ("re-promoted-set", value))
+            # Promoted back to a data descriptor: it wins over the
+            # instance entries again, for loads and stores alike.
+            journal.append([read(c) for c in cs])
+            for c in cs:
+                write(c, 11)
+            journal.append([c.__dict__.get("log") for c in cs])
+
+            class G:
+                def __get__(self, obj, objtype=None):
+                    return "get-side"
+
+                def __set__(self, obj, value):
+                    obj.__dict__["glog"] = value
+
+            class H:
+                y = G()
+
+            def read_y(h):
+                return h.y
+
+            hs = [H() for _ in range(3)]
+            for _ in range(40):
+                for h in hs:
+                    read_y(h)
+            compile_all(read_y)
+            journal.append([read_y(h) for h in hs])
+            del G.__get__
+            # tp_descr_get is NULL now; the descriptor object itself is
+            # returned by the full lookup (set-only descriptors have no
+            # instance shadow here).
+            journal.append(
+                [type(read_y(h)).__name__ for h in hs])
+
+            still_compiled(read, write, read_y)
+            print("JOURNAL " + json.dumps(journal))
+            """
+        )
+        interp, jit = self._dual_arm(probe)
+        self.assertEqual(interp, jit)
+
+    def test_raising_dict_key_eq_propagates_from_cached_loads(self):
+        # PyDict_GetItem swallows exceptions; stock's GenericGetAttr uses
+        # PyDict_GetItemWithError and PROPAGATES a raising __eq__ from a
+        # hash-colliding non-unicode instance-dict key.  Every cached
+        # load path must do the same instead of folding the error into
+        # "attribute absent" and running descriptor/__getattr__ logic.
+        probe = self._DUAL_ARM_PREAMBLE + textwrap.dedent(
+            """
+            class K:
+                def __init__(self, target):
+                    self.target = target
+
+                def __hash__(self):
+                    return hash(self.target)
+
+                def __eq__(self, other):
+                    raise RuntimeError("eq boom")
+
+            journal = []
+
+            def observe(fn, *args):
+                try:
+                    return ["value", fn(*args)]
+                except Exception as exc:
+                    return [type(exc).__name__, str(exc)]
+
+            # Managed receiver, non-data descriptor: the shadow peek runs
+            # the dict lookup that trips K.__eq__.
+            class P:
+                def x(self):
+                    return "method"
+
+            def read(p):
+                return p.x
+
+            ps = [P() for _ in range(3)]
+            for _ in range(40):
+                for p in ps:
+                    read(p)
+            compile_all(read)
+            for _ in range(3):
+                # Post-compile calls FILL the per-site cache and then hit
+                # it; without these the bomb below only meets the cold
+                # slow path (PyObject_GetAttr), which was never broken.
+                for p in ps:
+                    read(p)
+            bomb = P()
+            bomb.__dict__[K("x")] = 1
+            journal.append(observe(read, bomb))
+
+            # Non-managed receiver (tp_dictoffset): the combined-dict
+            # cached load runs the same lookup.
+            class E(Exception):
+                pass
+
+            def read_attr(e):
+                return e.attr
+
+            es = []
+            for _ in range(3):
+                e = E()
+                e.attr = "v"
+                es.append(e)
+            for _ in range(40):
+                for e in es:
+                    read_attr(e)
+            compile_all(read_attr)
+            for _ in range(3):
+                for e in es:
+                    read_attr(e)
+            eb = E()
+            eb.__dict__[K("attr")] = 1
+            journal.append(observe(read_attr, eb))
+
+            # The caches must still serve clean receivers afterwards.
+            journal.append([read(p) is P.x.__get__(p, P) or "bound"
+                            for p in ps][:1])
+            journal.append([read_attr(e) for e in es])
+            still_compiled(read, read_attr)
+            print("JOURNAL " + json.dumps(journal))
+            """
+        )
+        interp, jit = self._dual_arm(probe)
+        self.assertEqual(interp, jit)
+
+    def test_dict_swapping_eq_keeps_the_found_value_alive(self):
+        # A hash-colliding key whose __eq__ replaces obj.__dict__ leaves
+        # the OLD dict alive only through the lookup's temporary
+        # reference.  Stock strengthens the found value BEFORE dropping
+        # the dict; the cached peek must use the same ordering or the
+        # returned pointer dangles (the ASAN leg turns a regression here
+        # into a hard failure).
+        probe = self._DUAL_ARM_PREAMBLE + textwrap.dedent(
+            """
+            class Swapper:
+                def __init__(self, target, holder):
+                    self.target = target
+                    self.holder = holder
+
+                def __hash__(self):
+                    return hash(self.target)
+
+                def __eq__(self, other):
+                    self.holder["obj"].__dict__ = {}
+                    return other == self.target
+
+            class P:
+                def x(self):
+                    return "method"
+
+            def read(p):
+                return p.x
+
+            ps = [P() for _ in range(3)]
+            for _ in range(40):
+                for p in ps:
+                    read(p)
+            compile_all(read)
+            for _ in range(3):
+                # Fill the per-site cache post-compile so the swapper
+                # exercises the cached hit path, not the cold slow path.
+                for p in ps:
+                    read(p)
+
+            class Canary:
+                deleted = False
+
+                def __del__(self):
+                    Canary.deleted = True
+
+            holder = {}
+            victim = P()
+            holder["obj"] = victim
+            # The dict holds the ONLY reference to the canary: after the
+            # swap, the old dict lives solely through the lookup's
+            # temporary, and dropping it before strengthening the found
+            # value destroys the canary mid-lookup.  Stock's ordering
+            # keeps it alive.
+            victim.__dict__[Swapper("x", holder)] = Canary()
+            got = read(victim)
+            journal = [
+                type(got).__name__,
+                Canary.deleted,
+                victim.__dict__ == {},
+            ]
+            del got
+            journal.append(Canary.deleted)
+            journal.append([callable(read(p)) for p in ps])
+            still_compiled(read)
+            print("JOURNAL " + json.dumps(journal))
+            """
+        )
+        interp, jit = self._dual_arm(probe)
+        self.assertEqual(interp, jit)
+
     def test_mutation_hammer_stays_correct_over_100_rounds(self):
         # 100 rounds of class mutation, instance shadowing and deletion
         # interleaved with compiled access: values stay right, the
