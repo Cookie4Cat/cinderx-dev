@@ -1671,6 +1671,7 @@ def pyperformance_completeness_runner(
         "        (str(_root), _nested_env.get('PYTHONPATH', '')))\n"
         "    _seen = set()\n"
         "    _worker_entries = 0\n"
+        "    _worker_organic_deopts = 0\n"
         "    _worker_requests = 0\n"
         "    for name in _benchmarks:\n"
         "        proc = subprocess.run(\n"
@@ -1704,8 +1705,14 @@ def pyperformance_completeness_runner(
             "                       for s in _workers)\n"
             "        _requested = sum(s['compile_requests'] for s in _workers)\n"
             "        _refused = sum(s['compile_rejected'] for s in _workers)\n"
+            "        _organic = sum(s['organic_deopt_hits']\n"
+            "                       for s in _workers)\n"
             "        _worker_entries += _entered\n"
+            "        _worker_organic_deopts += _organic\n"
             "        _worker_requests += _requested\n"
+            "        assert _organic <= _entered, (\n"
+            "            'worker deopts exceed machine-code entries',\n"
+            "            name, _organic, _entered)\n"
             "        assert _entered > 0 or (_requested > 0\n"
             "                                and _requested == _refused), (\n"
             "            'workers neither executed machine code nor refused',\n"
@@ -1765,8 +1772,13 @@ def pyperformance_completeness_runner(
             "    assert _worker_entries > 0, (\n"
             "        'no benchmark worker entered machine code across the "
             "whole tranche', _worker_requests)\n"
-            "    print('jit311 canary workers: entries=%d requests=%d'\n"
-            "          % (_worker_entries, _worker_requests))\n"
+            "    assert _worker_organic_deopts < _worker_entries, (\n"
+            "        'every benchmark machine-code entry deoptimized',\n"
+            "        _worker_organic_deopts, _worker_entries)\n"
+            "    print('jit311 canary workers: entries=%d organic=%d "
+            "requests=%d'\n"
+            "          % (_worker_entries, _worker_organic_deopts,\n"
+            "             _worker_requests))\n"
         )
     )
     if mode == "shadow":
@@ -1775,7 +1787,7 @@ def pyperformance_completeness_runner(
         # canary driver-process contract: the driver's own target is
         # surface-clean and crosses the threshold, so machine code must
         # genuinely be entered here; the ledger closes, no shadow counter
-        # moves.  Organic deopt is allowed once guards ship.
+        # or deopt counter moves.
         mode_judges = [
             expect("evaluator_installed", "==", True),
             expect("machine_code_entries", ">", 0),
@@ -1784,6 +1796,7 @@ def pyperformance_completeness_runner(
             expect("unknown_rejects", "==", 0),
             expect("events_dropped", "==", 0),
             expect("forced_deopt_hits", "==", 0),
+            expect("organic_deopt_hits", "==", 0),
             expect("compile_success", "==", 0),
             expect("shadow_codegen_bytes", "==", 0),
         ]
