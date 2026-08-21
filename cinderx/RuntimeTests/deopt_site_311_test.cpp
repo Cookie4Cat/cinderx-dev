@@ -166,7 +166,8 @@ def loop(a, b, one):
   config.roi_deopt_budget_base = 1;
   config.roi_backoff_max_rounds = 1;
 
-  CodeExtra* extra = codeExtra(func->func_code);
+  CodeExtra* extra =
+      codeExtra(reinterpret_cast<PyCodeObject*>(func->func_code));
   ASSERT_NE(extra, nullptr);
   Ci_code_extra_store_roi_deopt_count_relaxed(extra, 0);
   Ci_code_extra_store_roi_ctl_release(extra, 0);
