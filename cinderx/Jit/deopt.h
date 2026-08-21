@@ -165,10 +165,11 @@ struct DeoptMetadata {
   // Whether generated code consumes force_countdown before this site.
   bool forceable{false};
 
-  // Stable site identity: code identity + bytecode offset + site kind +
-  // inline path.  The inline-path dimension is hashed even while the
-  // inliner is closed (always depth 0 this MR) so opening it later does
-  // not change how existing sites are named.
+  // Process-local stable site identity: code identity + bytecode offset +
+  // site kind + inline path.  It is stable across recompilation of the same
+  // code object, not across processes.  The inline-path dimension is hashed
+  // even while the inliner is closed (always depth 0 this MR) so opening it
+  // later does not change how existing sites are named.
   uint64_t site_id{0};
 
   // Test-only force-deopt arming.  force_mode is 0 when idle, 1 for the

@@ -2,18 +2,21 @@
 
 # pyre-strict
 
+import sys
+
 from collections.abc import AsyncGenerator, Callable, Coroutine, Generator
 from typing import TypedDict, TypeVar
 
 FuncAny = Callable[..., object]
 
-class DeoptSite(TypedDict):
-    id: int
-    kind: str
-    bc_offset: int
-    inline_path: str
-    nonce: int
-    forceable: bool
+if sys.version_info < (3, 12):
+    class DeoptSite(TypedDict):
+        id: int
+        kind: str
+        bc_offset: int
+        inline_path: str
+        nonce: int
+        forceable: bool
 
 TDeoptGenYield = TypeVar("TDeoptGenYield")
 TDeoptGenSend = TypeVar("TDeoptGenSend")
@@ -43,10 +46,11 @@ def enable_hir_inliner() -> None: ...
 def enable_specialized_opcodes() -> None: ...
 def force_compile(func: FuncAny) -> bool: ...
 def force_uncompile(func: FuncAny) -> bool: ...
-def deopt_sites(func: FuncAny) -> list[DeoptSite]: ...
-def force_deopt(
-    func: FuncAny, site_id: int, n: int = 1, at_or_after: bool = False
-) -> bool: ...
+if sys.version_info < (3, 12):
+    def deopt_sites(func: FuncAny) -> list[DeoptSite]: ...
+    def force_deopt(
+        func: FuncAny, site_id: int, n: int = 1, at_or_after: bool = False
+    ) -> bool: ...
 def get_allocator_stats() -> dict[str, int]: ...
 def get_and_clear_inline_cache_stats() -> dict[str, object]: ...
 def get_and_clear_runtime_stats() -> dict[str, object]: ...

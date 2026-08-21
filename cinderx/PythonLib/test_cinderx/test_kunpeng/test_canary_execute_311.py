@@ -1403,6 +1403,102 @@ class CanaryExecute311Test(unittest.TestCase):
         self.assertEqual(proc.returncode, 0, proc.stderr[-800:])
         self.assertIn("unhandled exception site not forceable", proc.stdout)
 
+    def test_repeated_forced_and_organic_deopts_preserve_ownership(self):
+        # Alternate forced and organic restores while a user object is live
+        # across every exit.  Each call must release exactly its own argument
+        # reference after resuming; a duplicate steal or a missing decref is
+        # exposed by the weakrefs and the exact destruction count.
+        env = dict(os.environ)
+        env["CINDERX_JIT_MODE"] = "canary"
+        env["PYTHONJITAUTO"] = "1000000"
+        env["CINDERX_AUTOJIT_ROI_BACKOFF"] = "0"
+        env["PYTHONMALLOC"] = "debug"
+        probe = textwrap.dedent(
+            """
+            import gc
+            import weakref
+            import _cinderx, cinderx
+            cinderx.init()
+            _cinderx.install_frame_evaluator()
+            import cinderjit
+
+            created = 0
+            destroyed = 0
+
+            class Probe:
+                __slots__ = ("__weakref__",)
+
+                def __init__(self):
+                    global created
+                    created += 1
+
+                def __del__(self):
+                    global destroyed
+                    destroyed += 1
+
+            def hot(obj, a, b, one):
+                total = a - a
+                i = total
+                while i < b:
+                    total = total + a
+                    i = i + one
+                if obj is None:
+                    return -1
+                return total
+
+            warm = Probe()
+            for _ in range(200):
+                assert hot(warm, 3, 5, 1) == 15
+            assert cinderjit.force_compile(hot) is True
+            del warm
+            gc.collect()
+            created = destroyed = 0
+
+            forceable = [s for s in cinderjit.deopt_sites(hot)
+                         if s["forceable"]]
+            assert forceable, cinderjit.deopt_sites(hot)
+            site = max(forceable, key=lambda s: s["bc_offset"])
+            refs = []
+            before = _cinderx._get_trigger_stats()
+            calls = 2000
+            for index in range(calls):
+                obj = Probe()
+                refs.append(weakref.ref(obj))
+                if index % 2 == 0:
+                    assert cinderjit.force_deopt(
+                        hot, site["id"], n=1) is True
+                    assert hot(obj, 3, 5, 1) == 15
+                else:
+                    assert hot(obj, 3.0, 5.0, 1.0) == 15.0
+                del obj
+                if index % 100 == 99:
+                    gc.collect()
+
+            gc.collect()
+            after = _cinderx._get_trigger_stats()
+            assert created == calls, (created, calls)
+            assert destroyed == calls, (destroyed, calls)
+            assert all(ref() is None for ref in refs)
+            assert (after["forced_deopt_hits"] ==
+                    before["forced_deopt_hits"] + calls // 2), (before, after)
+            assert (after["organic_deopt_hits"] >=
+                    before["organic_deopt_hits"] + calls // 2), (before, after)
+            assert cinderjit.is_jit_compiled(hot)
+            print("repeated forced and organic ownership held")
+            """
+        )
+        proc = subprocess.run(
+            [sys.executable, "-c", probe],
+            capture_output=True,
+            text=True,
+            env=env,
+            timeout=300,
+        )
+        self.assertEqual(proc.returncode, 0, proc.stderr[-800:])
+        self.assertIn(
+            "repeated forced and organic ownership held", proc.stdout
+        )
+
     def test_deopt_sites_pins_artifact_across_reentrant_uncompile(self):
         env = dict(os.environ)
         env["CINDERX_JIT_MODE"] = "canary"

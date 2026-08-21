@@ -159,9 +159,11 @@ DeoptResult prepareForDeopt(
     std::size_t deopt_idx) {
   JIT_CHECK(deopt_idx != -1ull, "deopt_idx must be valid");
   DeoptMetadata& deopt_meta = code_runtime->getDeoptMetadata(deopt_idx);
+  bool is_forced_deopt = false;
 #if PY_VERSION_HEX < 0x030C0000
-  if (deopt_meta.consumed_forced) {
-    deopt_meta.consumed_forced = false;
+  is_forced_deopt = deopt_meta.consumed_forced;
+  deopt_meta.consumed_forced = false;
+  if (is_forced_deopt) {
     triggerStatsOnForcedDeopt();
   } else {
     triggerStatsOnOrganicDeopt();
@@ -272,7 +274,7 @@ DeoptResult prepareForDeopt(
       deopt_jit_gen_object_only(gen);
     }
   }
-  if (!PyErr_Occurred() && !is_instrumentation_deopt) {
+  if (!PyErr_Occurred() && !is_instrumentation_deopt && !is_forced_deopt) {
     auto reason = deopt_meta.reason;
     switch (reason) {
       case DeoptReason::kGuardFailure: {
@@ -300,8 +302,10 @@ DeoptResult prepareForDeopt(
         JIT_ABORT("Lost exception when raising static exception");
     }
   }
-  jit::recordDeoptForRoiBackoff(
-      code_runtime, deopt_meta.reason, is_instrumentation_deopt);
+  if (!is_forced_deopt) {
+    jit::recordDeoptForRoiBackoff(
+        code_runtime, deopt_meta.reason, is_instrumentation_deopt);
+  }
   return {frame, is_instrumentation_deopt};
 }
 

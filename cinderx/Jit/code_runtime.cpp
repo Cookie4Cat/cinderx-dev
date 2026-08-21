@@ -147,7 +147,38 @@ bool CodeRuntime::armForcedDeopt(uint64_t site_id, int n, bool at_or_after) {
     meta.consumed_forced = false;
     armed = true;
   }
+  if (armed) {
+    forced_deopt_armed_ = 1;
+  }
   return armed;
+}
+
+bool CodeRuntime::consumeForcedDeopt(std::size_t deopt_id) {
+  if (deopt_id >= deopt_metadatas_.size()) {
+    return false;
+  }
+  DeoptMetadata& meta = deopt_metadatas_[deopt_id];
+  if (meta.force_mode == 0) {
+    return false;
+  }
+  if (meta.force_countdown > 0) {
+    --meta.force_countdown;
+  }
+  if (meta.force_countdown > 0) {
+    return false;
+  }
+  if (meta.force_mode == 1) {
+    meta.force_mode = 0;
+    forced_deopt_armed_ = 0;
+    for (const DeoptMetadata& other : deopt_metadatas_) {
+      if (other.force_mode != 0) {
+        forced_deopt_armed_ = 1;
+        break;
+      }
+    }
+  }
+  meta.consumed_forced = true;
+  return true;
 }
 
 std::size_t CodeRuntime::addOSRMetadata(OSRMetadata&& osr_meta) {

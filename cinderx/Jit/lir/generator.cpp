@@ -1580,6 +1580,16 @@ void LIRGenerator::appendForcedDeoptCheck(
   }
   forced_deopt_check_for_ = &hir_instr;
   auto deopt_id = bbb.makeDeoptMetadata();
+
+  Instruction* armed = bbb.appendInstr(
+      OutVReg{DataType::k64bit},
+      Instruction::kMove,
+      MemImm{env_->code_rt->forcedDeoptArmedAddress()});
+  BasicBlock* slow = bbb.allocateBlock();
+  BasicBlock* cont = bbb.allocateBlock();
+  bbb.appendBranch(Instruction::kCondBranch, armed, slow, cont);
+
+  bbb.switchBlock(slow);
   Instruction* flag = bbb.appendCallInstruction(
       OutVReg{DataType::k64bit},
       JITRT_ConsumeForcedDeopt,
@@ -1595,6 +1605,8 @@ void LIRGenerator::appendForcedDeoptCheck(
       VReg{flag},
       Imm{0});
   addLiveRegOperands(bbb, instr, hir_instr);
+  bbb.appendBranch(Instruction::kBranch, cont);
+  bbb.switchBlock(cont);
 }
 #endif
 

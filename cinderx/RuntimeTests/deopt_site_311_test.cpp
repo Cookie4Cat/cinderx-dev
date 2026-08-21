@@ -2,7 +2,9 @@
 
 #include <gtest/gtest.h>
 
+#include "cinderx/Common/code.h"
 #include "cinderx/Common/ref.h"
+#include "cinderx/Common/util.h"
 #include "cinderx/Jit/compiled_function.h"
 #include "cinderx/Jit/config.h"
 #include "cinderx/Jit/deopt.h"
@@ -130,6 +132,7 @@ def loop(a, b, one):
     }
   }
   ASSERT_TRUE(found) << "warm loop compiled with no forceable guard site";
+  EXPECT_EQ(*rt->forcedDeoptArmedAddress(), 0);
 
   for (const jit::DeoptMetadata& meta : rt->deoptMetadatas()) {
     if (meta.reason == jit::DeoptReason::kUnhandledException &&
@@ -140,14 +143,34 @@ def loop(a, b, one):
 
   EXPECT_FALSE(rt->armForcedDeopt(guard_site, 0, false));
   ASSERT_TRUE(rt->armForcedDeopt(guard_site, 2, false));
+  EXPECT_EQ(*rt->forcedDeoptArmedAddress(), 1);
   EXPECT_EQ(JITRT_ConsumeForcedDeopt(rt, guard_deopt_id), 0);
+  EXPECT_EQ(*rt->forcedDeoptArmedAddress(), 1);
   EXPECT_EQ(JITRT_ConsumeForcedDeopt(rt, guard_deopt_id), 1);
+  EXPECT_EQ(*rt->forcedDeoptArmedAddress(), 0);
   EXPECT_EQ(JITRT_ConsumeForcedDeopt(rt, guard_deopt_id), 0);
+  EXPECT_EQ(*rt->forcedDeoptArmedAddress(), 0);
 
   ASSERT_TRUE(rt->armForcedDeopt(guard_site, 2, true));
+  EXPECT_EQ(*rt->forcedDeoptArmedAddress(), 1);
   EXPECT_EQ(JITRT_ConsumeForcedDeopt(rt, guard_deopt_id), 0);
   EXPECT_EQ(JITRT_ConsumeForcedDeopt(rt, guard_deopt_id), 1);
   EXPECT_EQ(JITRT_ConsumeForcedDeopt(rt, guard_deopt_id), 1);
+  EXPECT_EQ(*rt->forcedDeoptArmedAddress(), 1);
+
+  auto saved_config = jit::getConfig();
+  SCOPE_EXIT(jit::getMutableConfig() = saved_config);
+  auto& config = jit::getMutableConfig();
+  config.compile_after_n_calls = 1;
+  config.roi_backoff_enabled = true;
+  config.roi_deopt_budget_base = 1;
+  config.roi_backoff_max_rounds = 1;
+
+  CodeExtra* extra = codeExtra(func->func_code);
+  ASSERT_NE(extra, nullptr);
+  Ci_code_extra_store_roi_deopt_count_relaxed(extra, 0);
+  Ci_code_extra_store_roi_ctl_release(extra, 0);
+  Ci_code_extra_store_roi_recompile_floor_release(extra, 0);
 
   jit::TriggerStats before = jit::triggerStatsSnapshot();
   ASSERT_TRUE(rt->armForcedDeopt(guard_site, 1, false));
@@ -157,6 +180,9 @@ def loop(a, b, one):
   jit::TriggerStats after_forced = jit::triggerStatsSnapshot();
   EXPECT_EQ(after_forced.forced_deopt_hits, before.forced_deopt_hits + 1);
   EXPECT_EQ(after_forced.organic_deopt_hits, before.organic_deopt_hits);
+  EXPECT_EQ(extra->roi_deopt_count, 0);
+  EXPECT_EQ(*rt->forcedDeoptArmedAddress(), 0);
+  EXPECT_EQ(Ci_JitShell311_InstalledArtifact(func), compiled);
 
   auto fthree = Ref<>::steal(PyFloat_FromDouble(3.0));
   auto ffive = Ref<>::steal(PyFloat_FromDouble(5.0));
@@ -169,6 +195,7 @@ def loop(a, b, one):
   jit::TriggerStats after_organic = jit::triggerStatsSnapshot();
   EXPECT_EQ(after_organic.forced_deopt_hits, after_forced.forced_deopt_hits);
   EXPECT_GT(after_organic.organic_deopt_hits, after_forced.organic_deopt_hits);
+  EXPECT_EQ(Ci_JitShell311_InstalledArtifact(func), nullptr);
 }
 
 TEST_F(DeoptSite311Test, UnconditionalDeoptIsNotForceable) {

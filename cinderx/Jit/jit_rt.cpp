@@ -1085,25 +1085,7 @@ int64_t JITRT_ConsumeForcedDeopt(jit::CodeRuntime* code_rt, uint64_t deopt_id) {
   if (code_rt == nullptr) {
     return 0;
   }
-  if (deopt_id >= code_rt->deoptMetadatas().size()) {
-    return 0;
-  }
-  jit::DeoptMetadata& meta =
-      code_rt->getDeoptMetadata(static_cast<std::size_t>(deopt_id));
-  if (meta.force_mode == 0) {
-    return 0;
-  }
-  if (meta.force_countdown > 0) {
-    --meta.force_countdown;
-  }
-  if (meta.force_countdown > 0) {
-    return 0;
-  }
-  if (meta.force_mode == 1) {
-    meta.force_mode = 0;
-  }
-  meta.consumed_forced = true;
-  return 1;
+  return code_rt->consumeForcedDeopt(static_cast<std::size_t>(deopt_id));
 }
 
 PyObject* JITRT_LoadGlobalModuleValue(

@@ -4381,8 +4381,8 @@ PyMethodDef jit_methods_311_canary[] = {
     {"deopt_sites",
      deopt_sites,
      METH_O,
-     PyDoc_STR("Enumerate stable deopt site ids for a JIT-compiled "
-               "function.")},
+     PyDoc_STR("Enumerate process-local deopt site ids that stay stable across "
+               "recompilation of the same code object.")},
     {"force_deopt",
      reinterpret_cast<PyCFunction>(force_deopt),
      METH_VARARGS | METH_KEYWORDS,
