@@ -6,6 +6,7 @@
 #include "cinderx/Jit/compiled_function.h"
 #include "cinderx/Jit/config.h"
 #include "cinderx/Jit/deopt.h"
+#include "cinderx/Jit/jit_rt.h"
 #include "cinderx/Jit/pyjit.h"
 #include "cinderx/Jit/trigger_stats.h"
 #include "cinderx/RuntimeTests/fixtures.h"
@@ -116,11 +117,14 @@ def loop(a, b, one):
   ASSERT_NE(rt, nullptr);
 
   uint64_t guard_site = 0;
+  std::size_t guard_deopt_id = 0;
   bool found = false;
-  for (const jit::DeoptMetadata& meta : rt->deoptMetadatas()) {
+  for (std::size_t i = 0; i < rt->deoptMetadatas().size(); ++i) {
+    const jit::DeoptMetadata& meta = rt->deoptMetadatas()[i];
     if (meta.reason == jit::DeoptReason::kGuardFailure &&
         !meta.frame_meta.empty()) {
       guard_site = meta.site_id;
+      guard_deopt_id = i;
       found = true;
       break;
     }
@@ -133,6 +137,17 @@ def loop(a, b, one):
       EXPECT_FALSE(rt->armForcedDeopt(meta.site_id, 1, false));
     }
   }
+
+  EXPECT_FALSE(rt->armForcedDeopt(guard_site, 0, false));
+  ASSERT_TRUE(rt->armForcedDeopt(guard_site, 2, false));
+  EXPECT_EQ(JITRT_ConsumeForcedDeopt(rt, guard_deopt_id), 0);
+  EXPECT_EQ(JITRT_ConsumeForcedDeopt(rt, guard_deopt_id), 1);
+  EXPECT_EQ(JITRT_ConsumeForcedDeopt(rt, guard_deopt_id), 0);
+
+  ASSERT_TRUE(rt->armForcedDeopt(guard_site, 2, true));
+  EXPECT_EQ(JITRT_ConsumeForcedDeopt(rt, guard_deopt_id), 0);
+  EXPECT_EQ(JITRT_ConsumeForcedDeopt(rt, guard_deopt_id), 1);
+  EXPECT_EQ(JITRT_ConsumeForcedDeopt(rt, guard_deopt_id), 1);
 
   jit::TriggerStats before = jit::triggerStatsSnapshot();
   ASSERT_TRUE(rt->armForcedDeopt(guard_site, 1, false));
