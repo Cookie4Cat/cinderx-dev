@@ -1,6 +1,5 @@
 // Copyright (c) Meta Platforms, Inc. and affiliates.
 
-#include <cstring>
 #include <gtest/gtest.h>
 
 #include "cinderx/Common/ref.h"
@@ -11,6 +10,8 @@
 #include "cinderx/Jit/pyjit.h"
 #include "cinderx/Jit/trigger_stats.h"
 #include "cinderx/RuntimeTests/fixtures.h"
+
+#include <cstring>
 
 #if PY_VERSION_HEX < 0x030C0000
 #include "cinderx/Interpreter/3.11/observe.h"

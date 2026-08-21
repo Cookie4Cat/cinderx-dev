@@ -1089,8 +1089,7 @@ uint64_t JITRT_StoreFrameLocal311(uint64_t idx, PyObject* value) {
   // computation keeps using registers.  The old value's release can run
   // __del__, which observes the frame already holding the new value,
   // exactly like stock SETLOCAL.
-  _PyInterpreterFrame* frame =
-      interpFrameFromThreadState(_PyThreadState_GET());
+  _PyInterpreterFrame* frame = interpFrameFromThreadState(_PyThreadState_GET());
   PyObject* old = frame->localsplus[idx];
   frame->localsplus[idx] = Py_XNewRef(value);
   Py_XDECREF(old);

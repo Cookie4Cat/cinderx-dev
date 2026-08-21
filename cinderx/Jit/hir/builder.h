@@ -202,10 +202,7 @@ class HIRBuilder {
       const jit::BytecodeInstruction& bc_instr,
       Register* receiver,
       int name_idx);
-  void emitStoreFrameLocal311(
-      TranslationContext& tc,
-      int idx,
-      Register* value);
+  void emitStoreFrameLocal311(TranslationContext& tc, int idx, Register* value);
   void emitLocalsplusWriteback311(TranslationContext& tc);
   void emitLoadMethod(TranslationContext& tc, int name_idx);
   void emitLoadMethod(

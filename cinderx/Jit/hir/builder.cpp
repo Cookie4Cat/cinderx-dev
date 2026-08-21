@@ -1324,9 +1324,9 @@ bool collectNormalFlowReachable311(
     if (instr.isBranch()) {
       worklist.push_back(instr.getJumpTarget().asIndex().value());
     }
-    bool falls_through = !instr.isReturn() &&
-        instr.opcode() != RAISE_VARARGS && instr.opcode() != RERAISE &&
-        instr.opcode() != JUMP_FORWARD && instr.opcode() != JUMP_BACKWARD &&
+    bool falls_through = !instr.isReturn() && instr.opcode() != RAISE_VARARGS &&
+        instr.opcode() != RERAISE && instr.opcode() != JUMP_FORWARD &&
+        instr.opcode() != JUMP_BACKWARD &&
         instr.opcode() != JUMP_BACKWARD_NO_INTERRUPT &&
         instr.opcode() != JUMP_ABSOLUTE;
     if (falls_through) {
