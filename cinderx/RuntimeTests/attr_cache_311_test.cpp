@@ -1,8 +1,8 @@
 // Copyright (c) Meta Platforms, Inc. and affiliates.
 
-#include <gtest/gtest.h>
-
 #include "cinderx/python.h"
+
+#include <gtest/gtest.h>
 
 #if PY_VERSION_HEX < 0x030B0000 || PY_VERSION_HEX >= 0x030C0000
 // The pull-validated cache arms under test exist only on CPython 3.11.
@@ -57,8 +57,7 @@ std::unique_ptr<jit::StoreAttrCache, StoreCacheDeleter> makeStoreAttrCache() {
 // self-deleting call runs, and died_mid_slot turns the use-after-free
 // into a Release-visible verdict (the ASAN leg gives the memory one).
 struct SelfDeletingDescr {
-  PyObject_HEAD
-  long payload;
+  PyObject_HEAD long payload;
 };
 
 long sdd_dealloc_count = 0;
@@ -195,12 +194,12 @@ inst = P(7)
   // against live inline values; none of them may convert the values into
   // a real dict.
   for (int i = 0; i < 4; i++) {
-    auto x = Ref<>::steal(
-        jit::LoadAttrCache::invoke(cache_x.get(), inst, x_name));
+    auto x =
+        Ref<>::steal(jit::LoadAttrCache::invoke(cache_x.get(), inst, x_name));
     ASSERT_NE(x, nullptr);
     EXPECT_EQ(PyLong_AsLong(x), 7);
-    auto cv = Ref<>::steal(
-        jit::LoadAttrCache::invoke(cache_cv.get(), inst, cv_name));
+    auto cv =
+        Ref<>::steal(jit::LoadAttrCache::invoke(cache_cv.get(), inst, cv_name));
     ASSERT_NE(cv, nullptr);
     EXPECT_EQ(PyUnicode_CompareWithASCIIString(cv, "classvar"), 0);
   }
@@ -287,8 +286,7 @@ TEST_F(AttrCache311Test, ModuleMethodHitOwnsBothResultHalves) {
     }
   } gc_off;
 
-  auto run_round = [&](BorrowedRef<> lookup_name,
-                       PyObject* expected_value) {
+  auto run_round = [&](BorrowedRef<> lookup_name, PyObject* expected_value) {
     jit::LoadModuleMethodCache cold;
     auto res = cold.lookupHelper(&cold, mod, lookup_name);
     ASSERT_EQ(res.callable, Py_None);
