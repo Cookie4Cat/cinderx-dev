@@ -263,6 +263,13 @@ int main(int argc, char* argv[]) {
   register_test("native_calls_test.txt", RuntimeTest::kStaticCompiler);
   register_test("static_array_item_test.txt", RuntimeTest::kStaticCompiler);
 
+  PyPreConfig preconfig;
+  PyPreConfig_InitPythonConfig(&preconfig);
+  PyStatus preinit_status = Py_PreInitialize(&preconfig);
+  if (PyStatus_Exception(preinit_status)) {
+    Py_ExitStatusException(preinit_status);
+  }
+
   wchar_t* argv0 = Py_DecodeLocale(argv[0], nullptr);
   if (argv0 == nullptr) {
     std::cerr << "Py_DecodeLocale() failed to allocate\n";

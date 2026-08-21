@@ -176,6 +176,40 @@ def test_corpus_module_missing_turns_red():
     assert any("worker exited" in err for err in result.errors)
 
 
+def test_generator_churn_runner_carries_the_mr10_contract():
+    spec = runners.generator_churn_runner()
+    assert spec.name == "generator_churn"
+    assert spec.env == {
+        "CINDERX_JIT_MODE": "canary",
+        "PYTHONJITAUTO": "1000000",
+        "PYTHONJITGENERATOR": "1",
+        "PYTHONMALLOC": "debug",
+    }
+    assert spec.asserted_env["PYTHONJITGENERATOR"] == "1"
+    for required_probe in (
+        "force_compile",
+        "force_uncompile",
+        ".send(",
+        ".throw(",
+        ".close(",
+        "weakref.ref",
+        "gc.collect",
+    ):
+        assert required_probe in spec.payload
+
+
+def test_run_all_registers_generator_churn(monkeypatch):
+    seen = []
+
+    def fake_run(spec, python=None):
+        seen.append(spec.name)
+        return None
+
+    monkeypatch.setattr(runners, "run", fake_run)
+    runners.run_all(python=sys.executable)
+    assert seen.count("generator_churn") == 1
+
+
 def test_refcount_matrix_harness_runs_on_a_corpus_slice(tmp_path):
     # Consumer smoke for the migrated refcount-matrix harness: one small
     # corpus module in interp mode must measure targets and emit JSON.
@@ -253,6 +287,7 @@ GATE_REQUIRED_JOBS = {
     "trigger_stats_gate", "jit311_runner_selftests",
     "runtime_tests_311_green", "libtest_jitoff_diff", "unified_report_gate",
     "observe_gate", "shadow_compile_gate", "release_canary_execute",
+    "generator_corpus_canary",
 }
 DAILY_REQUIRED_JOBS = {
     "asan_build_311", "debug_build_311", "runtime_tests_311_census",
