@@ -69,6 +69,8 @@ def loop(n):
   ASSERT_EQ(jit::compileFunction(func), jit::Result::OK);
   std::vector<uint64_t> first = siteIdsOf(func);
   ASSERT_FALSE(first.empty()) << "warm loop compiled with no deopt sites";
+  EXPECT_EQ(std::adjacent_find(first.begin(), first.end()), first.end())
+      << "two deopt sites share one stable id";
 
   auto jit_mod = Ref<>::steal(PyImport_ImportModule("cinderjit"));
   ASSERT_NE(jit_mod, nullptr);
@@ -78,6 +80,8 @@ def loop(n):
 
   ASSERT_EQ(jit::compileFunction(func), jit::Result::OK);
   std::vector<uint64_t> second = siteIdsOf(func);
+  EXPECT_EQ(std::adjacent_find(second.begin(), second.end()), second.end())
+      << "recompile produced duplicate deopt site ids";
   EXPECT_EQ(first, second);
 }
 

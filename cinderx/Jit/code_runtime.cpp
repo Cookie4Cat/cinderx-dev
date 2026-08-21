@@ -136,7 +136,7 @@ bool CodeRuntime::armForcedDeopt(uint64_t site_id, int n, bool at_or_after) {
   }
   bool armed = false;
   for (DeoptMetadata& meta : deopt_metadatas_) {
-    if (meta.site_id != site_id) {
+    if (meta.frame_meta.empty() || meta.site_id != site_id) {
       continue;
     }
     if (!isForceableDeoptReason(meta.reason)) {

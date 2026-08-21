@@ -973,6 +973,21 @@ def test():
   EXPECT_EQ(first, second);
 }
 
+TEST_F(DeoptSiteIdTest, EmptyMetadataIsNotForceable) {
+  const char* src = R"(
+def test():
+    return 1
+)";
+  Ref<PyFunctionObject> func(compileAndGet(src, "test"));
+  ASSERT_NE(func, nullptr);
+  jit::CodeRuntime rt(func);
+  jit::DeoptMetadata empty;
+  empty.reason = jit::DeoptReason::kGuardFailure;
+  ASSERT_TRUE(empty.frame_meta.empty());
+  rt.addDeoptMetadata(std::move(empty));
+  EXPECT_FALSE(rt.armForcedDeopt(0, 1, false));
+}
+
 TEST_F(DeoptSiteIdTest, InlinePathDimensionChangesTheId) {
   const char* src = R"(
 def test():

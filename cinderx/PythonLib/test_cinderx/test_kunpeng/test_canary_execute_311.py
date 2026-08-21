@@ -1321,6 +1321,7 @@ class CanaryExecute311Test(unittest.TestCase):
             sites = cinderjit.deopt_sites(loop)
             assert sites, sites
             ids = [s["id"] for s in sites]
+            assert len(ids) == len(set(ids)), ids
             kinds = {s["kind"] for s in sites}
             assert all(s["inline_path"] == "" for s in sites)
             assert "GuardFailure" in kinds, kinds
