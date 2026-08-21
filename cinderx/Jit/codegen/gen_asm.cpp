@@ -325,21 +325,27 @@ DeoptResult prepareForDeopt(
 // the user installed explicitly on the frame object is preserved as-is,
 // and an absent f_trace stays absent -- which also matches stock, where
 // the remaining events of an already-running frame are not delivered.
-void setupTraceForDeoptedFrame(
+// Returns false when materializing the frame object failed (the
+// exception -- a MemoryError -- is left in place for the caller to route
+// into the interpreter's error path; resuming "normally" with a live
+// exception would hand the evaluator a stale PyErr on a non-error path).
+bool setupTraceForDeoptedFrame(
     _PyInterpreterFrame* frame,
     PyThreadState* tstate) {
   if (tstate->c_tracefunc != nullptr &&
       frame->owner != FRAME_OWNED_BY_GENERATOR) {
     PyFrameObject* fobj = _PyFrame_GetFrameObject(frame);
-    if (fobj != nullptr) {
-      fobj->f_trace_lines = 1;
-#if PY_VERSION_HEX >= 0x030C0000
-      if (fobj->f_trace == nullptr && tstate->c_traceobj != nullptr) {
-        fobj->f_trace = Py_NewRef(tstate->c_traceobj);
-      }
-#endif
+    if (fobj == nullptr) {
+      return false;
     }
+    fobj->f_trace_lines = 1;
+#if PY_VERSION_HEX >= 0x030C0000
+    if (fobj->f_trace == nullptr && tstate->c_traceobj != nullptr) {
+      fobj->f_trace = Py_NewRef(tstate->c_traceobj);
+    }
+#endif
   }
+  return true;
 }
 
 PyObject* resumeInInterpreter(
@@ -433,7 +439,24 @@ PyObject* resumeInInterpreter(
       }
     }
 
-    setupTraceForDeoptedFrame(frame, tstate);
+#if PY_VERSION_HEX < 0x030C0000
+    if (err_occurred == 0) {
+      if (!setupTraceForDeoptedFrame(frame, tstate)) {
+        // Frame-object materialization failed: the MemoryError it left
+        // becomes THIS resume's live exception, entering the evaluator
+        // on the error path at the deopt boundary instead of leaking a
+        // stale PyErr into a normal-path opcode.
+        err_occurred = 1;
+      }
+    }
+    // When the resume already carries an exception (err_occurred == 1),
+    // the setup is skipped outright: running a fallible materialization
+    // on top of a live PyErr could clobber the in-flight exception, and
+    // the no-forge tracing model needs nothing set for the unwind.
+#else
+    // 3.12+ keeps its existing unconditional shape.
+    (void)setupTraceForDeoptedFrame(frame, tstate);
+#endif
 
 #if PY_VERSION_HEX < 0x030C0000
     // Pin the continuation to the evaluator that started this frame.

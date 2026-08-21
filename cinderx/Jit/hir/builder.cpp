@@ -5713,11 +5713,16 @@ void HIRBuilder::emitStoreFastStoreFast(
   Register* dst = tc.frame.localsplus[var_idx1];
   moveOverwrittenStackRegisters(tc, dst);
   tc.emit<Assign>(dst, src);
+  // Stock executes the fused superinstruction as two SETLOCALs in order:
+  // the first slot's write-through (and its old-value release, which can
+  // run reentrant code) completes before the second store begins.
+  emitStoreFrameLocal311(tc, var_idx1, dst);
 
   src = tc.frame.stack.pop();
   dst = tc.frame.localsplus[var_idx2];
   moveOverwrittenStackRegisters(tc, dst);
   tc.emit<Assign>(dst, src);
+  emitStoreFrameLocal311(tc, var_idx2, dst);
 }
 
 void HIRBuilder::emitStoreFastLoadFast(
@@ -5737,6 +5742,10 @@ void HIRBuilder::emitStoreFastLoadFast(
   Register* dst = tc.frame.localsplus[var_idx1];
   moveOverwrittenStackRegisters(tc, dst);
   tc.emit<Assign>(dst, src);
+  // The fused store's write-through (and old-value release) completes
+  // before the load half runs, matching stock's SETLOCAL-then-GETLOCAL
+  // order.
+  emitStoreFrameLocal311(tc, var_idx1, dst);
 
   Register* var = tc.frame.localsplus[var_idx2];
   tc.frame.stack.push(var);

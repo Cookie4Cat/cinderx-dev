@@ -5760,6 +5760,76 @@ class CanaryExecute311Test(unittest.TestCase):
         interp, jit = self._dual_arm(probe)
         self.assertEqual(interp, jit)
 
+    def test_fused_store_fast_writes_through_matches_interp(self):
+        # The 3.11 superinstructions execute their SETLOCALs in opcode
+        # order, each immediately visible in localsplus.  The oracle must
+        # dodge two masks: a call-shaped observation deopts the frame and
+        # reification rewrites every slot, and a type-guard deopt (mixed
+        # warmup types) does the same -- so the fused stores run in a
+        # CALL-FREE hot loop and another thread samples the running frame
+        # via sys._current_frames() mid-loop.  The loop bound is sized
+        # per arm (the sampled values do not depend on it, and only they
+        # are journaled); the probe asserts the quickened code really
+        # carries a fused store so the oracle cannot pass vacuously.
+        probe = self._DUAL_ARM_PREAMBLE + textwrap.dedent(
+            """
+            import dis
+            import threading
+
+            def fused_loop(a, b, n):
+                i = 0
+                x = None
+                y = None
+                while i < n:
+                    x = a
+                    y = b
+                    i = i + 1
+                return i, x, y
+
+            for _ in range(40):
+                fused_loop(1, 2, 5)
+            ops = [i.opname for i in
+                   dis.get_instructions(fused_loop, adaptive=True)]
+            fused_ops = [o for o in ops if o.startswith("STORE_FAST__")]
+            assert fused_ops, (
+                "quickening no longer produces a fused store; the "
+                "oracle would be vacuous", ops)
+            compile_all(fused_loop)
+            for _ in range(3):
+                fused_loop(1, 2, 5)
+
+            main_tid = threading.get_ident()
+            out = {}
+
+            def sampler():
+                for _ in range(200000):
+                    fr = sys._current_frames().get(main_tid)
+                    if fr is not None and fr.f_code.co_name == "fused_loop":
+                        fl = fr.f_locals
+                        if fl.get("i", 0) > 0:
+                            out["x"] = fl.get("x")
+                            out["y"] = fl.get("y")
+                            return
+
+            n = (1 << 29) if mode == "jit" else 5000000
+            # The sampler can miss a short window; retry the whole run a
+            # few times -- the sampled VALUES are timing-independent.
+            for _ in range(5):
+                out.clear()
+                t = threading.Thread(target=sampler)
+                t.start()
+                result = fused_loop(7, 8, n)
+                t.join(60)
+                if "x" in out:
+                    break
+            journal = [out.get("x"), out.get("y"), result[1], result[2]]
+            still_compiled(fused_loop)
+            print("JOURNAL " + json.dumps(journal))
+            """
+        )
+        interp, jit = self._dual_arm(probe)
+        self.assertEqual(interp, jit)
+
     def test_mid_flight_tracer_protocol_matches_the_interpreter_arm(self):
         # RFC 3.3.4.5 item 7, refined: after an ordinary mid-function
         # deopt with tracing active, f_trace_lines is made explicit and a
