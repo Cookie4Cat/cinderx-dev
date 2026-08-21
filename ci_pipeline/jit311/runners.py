@@ -369,8 +369,8 @@ def hot(a, b, one):
 
 CANARY_ATTEST = """\
 import cinderjit
-assert cinderjit.is_attr_caches_enabled() is False, (
-    'the 3.11 attribute-cache default must stay off until MR-09')
+assert cinderjit.is_attr_caches_enabled() is True, (
+    'the 3.11 attribute-cache default is on since the MR-09 acceptance')
 """
 
 CHURN = """\
