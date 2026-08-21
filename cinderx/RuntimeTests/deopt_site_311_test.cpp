@@ -182,7 +182,10 @@ def unpack(seq):
   Ref<PyFunctionObject> func(compileAndGet(src, "unpack"));
   ASSERT_NE(func, nullptr);
   ASSERT_EQ(jit::compileFunction(func), jit::Result::OK);
-  jit::CodeRuntime* rt = codeRuntimeOf(func);
+  auto* compiled = reinterpret_cast<jit::CompiledFunction*>(
+      Ci_JitShell311_InstalledArtifact(func));
+  ASSERT_NE(compiled, nullptr);
+  jit::CodeRuntime* rt = compiled->runtime();
   ASSERT_NE(rt, nullptr);
 
   bool found = false;
