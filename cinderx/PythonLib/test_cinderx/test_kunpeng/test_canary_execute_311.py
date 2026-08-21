@@ -7152,12 +7152,13 @@ class CanaryExecute311Test(unittest.TestCase):
         self.assertEqual(interp, jit)
 
     def test_type_receiver_method_stays_on_the_generic_path(self):
-        # RFC 3.3.5.2 scope note: type-receiver caches are fail-closed on
-        # 3.11.  simplifyVectorCall's type(obj) optimization produces a
-        # TType that would otherwise feed LoadTypeMethodCache -- whose
-        # pull validation covers the receiver version but none of the
-        # metaclass facts -- so the version gate must hold and a
-        # metaclass data descriptor must win on the very next call.
+        # Type-receiver loads must stay correct under a metaclass
+        # takeover.  The type caches are pull-validated for exactly this
+        # (owner version + metaclass identity/version), and on 3.11 no IR
+        # shape reaches them anyway -- guarded global/builtin loads carry
+        # no object spec, so type(obj) never yields a static TType.  Both
+        # facts are asserted: the metaclass descriptor wins on the very
+        # next call, and the type-cache counters stay at zero.
         env = dict(os.environ)
         env["CINDERX_JIT_MODE"] = "canary"
         env["PYTHONJITAUTO"] = "1000000"
@@ -7365,14 +7366,17 @@ class CanaryExecute311Test(unittest.TestCase):
                 "load_attr": True,
                 "store_attr": True,
                 "load_method": True,
-                # Type-receiver caches are fail-closed on 3.11 by an
-                # explicit version gate in simplifyLoadMethod (RFC
-                # 3.3.5.2 scope note): "usually unreachable" was not a
-                # safety boundary -- simplifyVectorCall's type(obj)
-                # optimization produces a TType that reaches this path --
-                # so type-receiver method loads take the generic slow
-                # path and these counters must stay zero.
+                # The type-receiver caches ARE implemented and
+                # pull-validated (owner version + metaclass identity and
+                # version; see AttrCache311Test), but no 3.11 IR shape
+                # hands them a statically-typed receiver: guarded global
+                # and builtin loads carry no object spec, so the
+                # type(obj) / isinstance / len specializations that would
+                # produce a TType never fire.  Zero traffic is therefore
+                # the honest expectation here, and it is a reachability
+                # fact, not a correctness gate.
                 "load_type_method": False,
+                "load_type_attr": False,
                 "load_module_attr": True,
                 "load_module_method": True,
             }

@@ -17,6 +17,7 @@
 
 #include <memory>
 #include <new>
+#include <string>
 
 namespace {
 
@@ -448,6 +449,191 @@ inst = C()
 
   run_arm(/*is_store=*/false);
   run_arm(/*is_store=*/true);
+}
+
+// --- Type-receiver caches -------------------------------------------------
+//
+// The 3.11 IR does not currently hand these caches a statically-typed
+// receiver (no global or builtin load carries an object spec, so the
+// type(obj) / isinstance / len specializations never fire), which is why
+// the Python-level coverage test still sees zero traffic.  The caches
+// themselves are real, pull-validated code, and these tests drive their
+// helpers directly so the guards are proven rather than assumed.
+
+namespace {
+
+// Build `class Meta(type): pass` / `class T(metaclass=Meta): ...` and hand
+// back the pieces the tests need.
+struct TypeFixture {
+  Ref<PyObject> globals;
+  BorrowedRef<PyTypeObject> meta;
+  BorrowedRef<PyTypeObject> type;
+};
+
+TypeFixture makeTypeFixture(PyObject* globals, const char* extra_body) {
+  std::string src =
+      "class Meta(type):\n"
+      "    pass\n"
+      "class T(metaclass=Meta):\n";
+  src += extra_body;
+  TypeFixture f;
+  f.globals = Ref<PyObject>::create(globals);
+  JIT_CHECK(f.globals != nullptr, "no globals");
+  auto result = Ref<>::steal(
+      PyRun_String(src.c_str(), Py_file_input, f.globals, f.globals));
+  JIT_CHECK(result != nullptr, "fixture source failed");
+  f.meta =
+      reinterpret_cast<PyTypeObject*>(PyDict_GetItemString(f.globals, "Meta"));
+  f.type =
+      reinterpret_cast<PyTypeObject*>(PyDict_GetItemString(f.globals, "T"));
+  return f;
+}
+
+} // namespace
+
+TEST_F(AttrCache311Test, TypeAttrCacheRetiresOnOwnerAndMetaclassMutation) {
+  Ref<PyObject> g(MakeGlobals());
+  auto f = makeTypeFixture(g, "    CONST = 41\n");
+  ASSERT_NE(f.type, nullptr);
+  ASSERT_NE(f.meta, nullptr);
+  auto name = Ref<>::steal(PyUnicode_InternFromString("CONST"));
+  auto recv = reinterpret_cast<PyObject*>(f.type.get());
+
+  jit::LoadTypeAttrCache cache;
+  const jit::AttrCacheStats311& stats = jit::attrCacheStats311();
+
+  // Fill, then hit.
+  uint64_t fills = stats.load_type_attr.fills;
+  auto first = Ref<>::steal(jit::LoadTypeAttrCache::invoke(&cache, recv, name));
+  ASSERT_NE(first, nullptr);
+  EXPECT_EQ(PyLong_AsLong(first), 41);
+  ASSERT_EQ(stats.load_type_attr.fills, fills + 1)
+      << "the type-attr cache never filled; the rest is vacuous";
+  uint64_t hits = stats.load_type_attr.hits;
+  auto again = Ref<>::steal(jit::LoadTypeAttrCache::invoke(&cache, recv, name));
+  ASSERT_NE(again, nullptr);
+  EXPECT_EQ(PyLong_AsLong(again), 41);
+  ASSERT_EQ(stats.load_type_attr.hits, hits + 1);
+
+  // Owner mutation: the class dict changes, the version tag moves.
+  auto updated = Ref<>::steal(PyLong_FromLong(99));
+  ASSERT_EQ(PyObject_SetAttrString(recv, "CONST", updated), 0);
+  auto after_owner =
+      Ref<>::steal(jit::LoadTypeAttrCache::invoke(&cache, recv, name));
+  ASSERT_NE(after_owner, nullptr);
+  EXPECT_EQ(PyLong_AsLong(after_owner), 99)
+      << "a stale owner-version entry served the old class attribute";
+
+  // Metaclass mutation: a same-named DATA descriptor on the metaclass wins
+  // over the class dict in stock type_getattro, and mutating the metaclass
+  // never bumps the owner's version tag -- only the metaclass guard sees it.
+  const char* meta_src = "Meta.CONST = property(lambda cls: 'meta-descr')\n";
+  auto meta_result =
+      Ref<>::steal(PyRun_String(meta_src, Py_file_input, f.globals, f.globals));
+  ASSERT_NE(meta_result, nullptr);
+  auto after_meta =
+      Ref<>::steal(jit::LoadTypeAttrCache::invoke(&cache, recv, name));
+  ASSERT_NE(after_meta, nullptr);
+  EXPECT_TRUE(PyUnicode_Check(after_meta.get()))
+      << "the metaclass data descriptor did not take over";
+  EXPECT_EQ(PyUnicode_CompareWithASCIIString(after_meta, "meta-descr"), 0);
+}
+
+TEST_F(AttrCache311Test, TypeAttrCacheRetiresWhenValueTypeGainsDescriptor) {
+  // A plain class attribute is cachable only because ITS type has no
+  // tp_descr_get today.  When that heap type later grows __get__, stock
+  // routes the load through the descriptor; the value-type guard is what
+  // makes the cached entry step aside.
+  // Everything is defined in one pass: assigning to T after the fact would
+  // run PyType_Modified and strip the owner's version tag, and the fill
+  // legitimately refuses a type it cannot pin.
+  Ref<PyObject> globals(MakeGlobals());
+  const char* src =
+      "class Box:\n"
+      "    pass\n"
+      "class Meta(type):\n"
+      "    pass\n"
+      "class T(metaclass=Meta):\n"
+      "    V = Box()\n";
+  auto result =
+      Ref<>::steal(PyRun_String(src, Py_file_input, globals, globals));
+  ASSERT_NE(result, nullptr);
+  BorrowedRef<PyTypeObject> type{PyDict_GetItemString(globals, "T")};
+  ASSERT_NE(type, nullptr);
+  auto name = Ref<>::steal(PyUnicode_InternFromString("V"));
+  auto recv = reinterpret_cast<PyObject*>(type.get());
+
+  jit::LoadTypeAttrCache cache;
+  const jit::AttrCacheStats311& stats = jit::attrCacheStats311();
+  uint64_t fills = stats.load_type_attr.fills;
+  auto first = Ref<>::steal(jit::LoadTypeAttrCache::invoke(&cache, recv, name));
+  ASSERT_NE(first, nullptr);
+  ASSERT_EQ(stats.load_type_attr.fills, fills + 1)
+      << "the plain class attribute never cached; the rest is vacuous";
+  auto again = Ref<>::steal(jit::LoadTypeAttrCache::invoke(&cache, recv, name));
+  ASSERT_EQ(again, first);
+
+  const char* grow =
+      "Box.__get__ = lambda self, obj, objtype=None: 'now-descr'\n";
+  auto grown =
+      Ref<>::steal(PyRun_String(grow, Py_file_input, globals, globals));
+  ASSERT_NE(grown, nullptr);
+  auto after = Ref<>::steal(jit::LoadTypeAttrCache::invoke(&cache, recv, name));
+  ASSERT_NE(after, nullptr);
+  EXPECT_TRUE(PyUnicode_Check(after.get()))
+      << "the value's new __get__ was not honored by the cached load";
+  EXPECT_EQ(PyUnicode_CompareWithASCIIString(after, "now-descr"), 0);
+}
+
+TEST_F(AttrCache311Test, TypeMethodCacheRetiresOnMetaclassDataDescriptor) {
+  Ref<PyObject> g(MakeGlobals());
+  auto f = makeTypeFixture(
+      g,
+      "    @classmethod\n"
+      "    def cm(cls):\n"
+      "        return 'class-cm'\n");
+  auto name = Ref<>::steal(PyUnicode_InternFromString("cm"));
+
+  jit::LoadTypeMethodCache cache;
+  const jit::AttrCacheStats311& stats = jit::attrCacheStats311();
+
+  uint64_t fills = stats.load_type_method.fills;
+  auto filled = jit::LoadTypeMethodCache::lookupHelper(&cache, f.type, name);
+  ASSERT_NE(filled.callable, nullptr);
+  Py_XDECREF(filled.callable);
+  Py_XDECREF(filled.self_or_null);
+  ASSERT_EQ(stats.load_type_method.fills, fills + 1)
+      << "the classmethod never cached; the rest is vacuous";
+
+  // Fast-path hit through the helper the inline arm calls.
+  uint64_t hits = stats.load_type_method.hits;
+  auto hit = jit::LoadTypeMethodCache::getValueHelper(
+      &cache, reinterpret_cast<PyObject*>(f.type.get()));
+  ASSERT_NE(hit.callable, nullptr);
+  Py_XDECREF(hit.callable);
+  Py_XDECREF(hit.self_or_null);
+  ASSERT_EQ(stats.load_type_method.hits, hits + 1);
+
+  // The metaclass grows a same-named data descriptor.  The owner class is
+  // untouched, so only the metaclass guard can catch this.
+  const char* meta_src =
+      "Meta.cm = property(lambda cls: (lambda: 'meta-cm'))\n";
+  auto meta_result =
+      Ref<>::steal(PyRun_String(meta_src, Py_file_input, f.globals, f.globals));
+  ASSERT_NE(meta_result, nullptr);
+
+  uint64_t invalidations = stats.load_type_method.invalidations;
+  auto after = jit::LoadTypeMethodCache::getValueHelper(
+      &cache, reinterpret_cast<PyObject*>(f.type.get()));
+  EXPECT_EQ(stats.load_type_method.invalidations, invalidations + 1)
+      << "the stale entry was served after the metaclass gained a data "
+         "descriptor";
+  ASSERT_NE(after.self_or_null, nullptr);
+  auto produced = Ref<>::steal(PyObject_CallNoArgs(after.self_or_null));
+  Py_XDECREF(after.callable);
+  Py_XDECREF(after.self_or_null);
+  ASSERT_NE(produced, nullptr);
+  EXPECT_EQ(PyUnicode_CompareWithASCIIString(produced, "meta-cm"), 0);
 }
 
 #endif

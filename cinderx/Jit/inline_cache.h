@@ -340,13 +340,52 @@ class LoadTypeAttrCache {
  private:
   PyObject* invokeSlowPath(BorrowedRef<> obj, BorrowedRef<> name);
 
-  void fill(BorrowedRef<PyTypeObject> type, BorrowedRef<> value);
+  // `metatype` and `value_guard_type` carry the 3.11 pull-validation facts
+  // (see the members below); both are ignored on 3.12+, where the type
+  // watcher retires entries instead.
+  void fill(
+      BorrowedRef<PyTypeObject> type,
+      BorrowedRef<> value,
+      [[maybe_unused]] BorrowedRef<PyTypeObject> metatype,
+      [[maybe_unused]] BorrowedRef<PyTypeObject> value_guard_type);
   void reset();
 
   // Cached type and value, stored as raw pointers so codegen can access them by
   // address.
   PyTypeObject* type_;
   PyObject* value_;
+
+#if PY_VERSION_HEX < 0x030C0000
+ public:
+  // Pull-based validity on 3.11, which has no type watcher to retire this
+  // entry.  type_getattro's cached answer rests on three mutable facts, and
+  // a hit must re-prove all of them:
+  //
+  //   * the OWNER type's MRO still resolves the name the same way
+  //     (type_version_);
+  //   * the METATYPE still routes through type_getattro and still has no
+  //     data descriptor of this name (metatype_ + metatype_version_) --
+  //     mutating the metaclass never touches the owner's version;
+  //   * the cached value is still a non-descriptor, when that is what made
+  //     it cachable (value_guard_type_ + value_guard_version_); a heap type
+  //     that later gains __get__ turns the plain value into a descriptor.
+  //
+  // Entries whose facts cannot all be pinned (a type without a valid
+  // version tag) are simply not filled, so the site keeps using the
+  // generic path rather than a half-guarded cache.
+  bool hitIsValid311(BorrowedRef<PyTypeObject> receiver) const;
+
+ private:
+  uint32_t type_version_{0};
+  PyTypeObject* metatype_{nullptr};
+  uint32_t metatype_version_{0};
+  // nullptr when the cachability decision did not depend on a mutable
+  // descriptor protocol (plain functions and staticmethods are pinned to
+  // static builtin types that cannot gain __get__ from Python).
+  PyTypeObject* value_guard_type_{nullptr};
+  uint32_t value_guard_version_{0};
+  bool pull_valid_{false};
+#endif
 };
 
 #define FOREACH_CACHE_MISS_REASON(V) \
@@ -460,8 +499,17 @@ class LoadTypeMethodCache {
   // the receiver) can re-run the full lookup.  The name is borrowed from
   // co_names of the code object whose site owns this cache; the owning
   // CodeRuntime keeps that code alive.
+  //
+  // The METATYPE is guarded too: every fill below happened only because
+  // the metatype routes through type_getattro and holds no data descriptor
+  // of this name, and mutating a metaclass never bumps the owner class's
+  // own version tag.  Without this pair, adding a same-named data
+  // descriptor to the metaclass would leave the class-dict method cached
+  // and winning, while stock hands the metaclass descriptor the call.
   uint32_t type_version_{0};
   BorrowedRef<> name_;
+  PyTypeObject* metatype_{nullptr};
+  uint32_t metatype_version_{0};
 #endif
 };
 
@@ -540,6 +588,7 @@ struct AttrCacheStats311 {
   AttrCacheClassStats load_attr;
   AttrCacheClassStats store_attr;
   AttrCacheClassStats load_method;
+  AttrCacheClassStats load_type_attr;
   AttrCacheClassStats load_type_method;
   AttrCacheClassStats load_module_attr;
   AttrCacheClassStats load_module_method;

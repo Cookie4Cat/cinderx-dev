@@ -2946,13 +2946,15 @@ PyObject* get_attr_cache_stats(PyObject* /* self */, PyObject* /* args */) {
   };
   const jit::AttrCacheStats311& stats = jit::attrCacheStats311();
   return Py_BuildValue(
-      "{s:N,s:N,s:N,s:N,s:N,s:N}",
+      "{s:N,s:N,s:N,s:N,s:N,s:N,s:N}",
       "load_attr",
       make_class(stats.load_attr),
       "store_attr",
       make_class(stats.store_attr),
       "load_method",
       make_class(stats.load_method),
+      "load_type_attr",
+      make_class(stats.load_type_attr),
       "load_type_method",
       make_class(stats.load_type_method),
       "load_module_attr",

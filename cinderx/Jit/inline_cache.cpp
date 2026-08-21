@@ -1564,11 +1564,59 @@ LoadTypeAttrCache::~LoadTypeAttrCache() {
   ltac_watcher.unwatch(type_, this);
 }
 
+#if PY_VERSION_HEX < 0x030C0000
+bool LoadTypeAttrCache::hitIsValid311(
+    BorrowedRef<PyTypeObject> receiver) const {
+  if (!pull_valid_ || type_ != receiver) {
+    return false;
+  }
+  // Owner MRO era.  A stale-and-reallocated type cannot revalidate: the
+  // version stream is global and monotonic, so a fresh type at a recycled
+  // address never carries the captured number.
+  if (receiver->tp_version_tag != type_version_) {
+    return false;
+  }
+  // Metaclass era.  Read through the LIVE metatype: the captured pointer
+  // is only compared, never dereferenced, so a dead metatype cannot be
+  // touched here.
+  BorrowedRef<PyTypeObject> live_metatype{Py_TYPE(receiver.get())};
+  if (live_metatype != metatype_ ||
+      live_metatype->tp_version_tag != metatype_version_) {
+    return false;
+  }
+  // Descriptor era, when the cachability decision depended on one.
+  if (value_guard_type_ != nullptr) {
+    if (value_ == nullptr || Py_TYPE(value_) != value_guard_type_ ||
+        value_guard_type_->tp_version_tag != value_guard_version_) {
+      return false;
+    }
+  }
+  return true;
+}
+#endif
+
 PyObject* LoadTypeAttrCache::invoke(
     LoadTypeAttrCache* cache,
     PyObject* obj,
     PyObject* name) {
-  // The fast path is handled by direct memory access via valueAddr().
+#if PY_VERSION_HEX < 0x030C0000
+  // 3.11 has no inline fast path for this cache (simplify routes every
+  // type-receiver load through this helper), so the pull check lives here
+  // and a hit is a plain owned return of the cached value.
+  if (PyType_Check(obj)) {
+    BorrowedRef<PyTypeObject> receiver{obj};
+    if (cache->hitIsValid311(receiver)) {
+      attrCacheStats311().load_type_attr.hits++;
+      return Py_NewRef(cache->value_);
+    }
+    if (cache->pull_valid_ && cache->type_ == receiver) {
+      cache->reset();
+      attrCacheStats311().load_type_attr.invalidations++;
+    }
+  }
+  attrCacheStats311().load_type_attr.misses++;
+#endif
+  // The 3.12+ fast path is handled by direct memory access via valueAddr().
   return cache->invokeSlowPath(obj, name);
 }
 
@@ -1616,13 +1664,21 @@ PyObject* LoadTypeAttrCache::invokeSlowPath(
     meta_attribute.reset();
 
     bool is_cachable = local_get == nullptr;
+    // The type whose descriptor protocol the cachability decision rested
+    // on, when that type is user-mutable.  A plain value is cachable only
+    // because ITS type has no tp_descr_get today; functions and
+    // staticmethods are decided by identity against static builtin types,
+    // which cannot gain __get__ from Python, so they need no guard.
+    BorrowedRef<PyTypeObject> value_guard_type{Py_TYPE(attribute)};
     if (PyFunction_Check(attribute)) {
       // Loading a function from a type returns the type
       is_cachable = true;
+      value_guard_type = nullptr;
     } else if (Py_TYPE(attribute) == &PyStaticMethod_Type) {
       // static method returns the underlying object
       attribute = Ref<>::create(Ci_PyStaticMethod_GetFunc(attribute));
       is_cachable = true;
+      value_guard_type = nullptr;
     }
     if (!is_cachable) {
       // nullptr 2nd argument indicates the descriptor was found on the target
@@ -1630,7 +1686,7 @@ PyObject* LoadTypeAttrCache::invokeSlowPath(
       return local_get(attribute, nullptr, type);
     }
 
-    fill(type, attribute);
+    fill(type, attribute, metatype, value_guard_type);
     return attribute.release();
   }
 
@@ -1658,17 +1714,40 @@ void LoadTypeAttrCache::typeChanged(
 
 void LoadTypeAttrCache::fill(
     BorrowedRef<PyTypeObject> type,
-    BorrowedRef<> value) {
+    BorrowedRef<> value,
+    [[maybe_unused]] BorrowedRef<PyTypeObject> metatype,
+    [[maybe_unused]] BorrowedRef<PyTypeObject> value_guard_type) {
   if (!Ci_Type_HasValidVersionTag(type)) {
     // The type must have a valid version tag in order for us to be able to
     // invalidate the cache when the type is modified. See the comment at
     // the top of `PyType_Modified` for more details.
     return;
   }
+#if PY_VERSION_HEX < 0x030C0000
+  // Every fact the hit re-proves must be pinnable, or the entry is not
+  // filled at all: a half-guarded entry is worse than the generic path.
+  // Version tags are assigned lazily, so ask for one (as the instance
+  // caches do for descriptor types) instead of walking away from a type
+  // that simply has not been looked up yet.
+  if (!ensureVersionTag(metatype) ||
+      (value_guard_type != nullptr && !ensureVersionTag(value_guard_type))) {
+    return;
+  }
+#endif
 
   ltac_watcher.unwatch(type_, this);
   type_ = type;
   value_ = value;
+#if PY_VERSION_HEX < 0x030C0000
+  type_version_ = type->tp_version_tag;
+  metatype_ = metatype;
+  metatype_version_ = metatype->tp_version_tag;
+  value_guard_type_ = value_guard_type;
+  value_guard_version_ =
+      value_guard_type != nullptr ? value_guard_type->tp_version_tag : 0;
+  pull_valid_ = true;
+  attrCacheStats311().load_type_attr.fills++;
+#endif
   ltac_watcher.watch(type_, this);
 }
 
@@ -1677,6 +1756,14 @@ void LoadTypeAttrCache::reset() {
   // refcounting operations work correctly.
   type_ = &s_empty_type_attr_cache;
   value_ = nullptr;
+#if PY_VERSION_HEX < 0x030C0000
+  pull_valid_ = false;
+  type_version_ = 0;
+  metatype_ = nullptr;
+  metatype_version_ = 0;
+  value_guard_type_ = nullptr;
+  value_guard_version_ = 0;
+#endif
 }
 
 std::string_view kCacheMissReasons[] = {
@@ -2004,9 +2091,19 @@ LoadMethodResult LoadTypeMethodCache::getValueHelper(
   // the name, so the stale path re-runs the full lookup with the per-site
   // name captured at fill.
   BorrowedRef<PyTypeObject> receiver{obj};
-  if (receiver->tp_version_tag != cache->type_version_) {
+  // Owner MRO era, then metaclass era: the fill below only happened
+  // because the metatype routes through type_getattro and holds no data
+  // descriptor of this name, and mutating the metaclass never bumps the
+  // owner's own version tag.  The captured metatype pointer is compared,
+  // never dereferenced, so a dead metaclass cannot be touched here.
+  BorrowedRef<PyTypeObject> live_metatype{Py_TYPE(receiver.get())};
+  if (receiver->tp_version_tag != cache->type_version_ ||
+      live_metatype != cache->metatype_ ||
+      live_metatype->tp_version_tag != cache->metatype_version_) {
     cache->type_ = nullptr;
     cache->value_.reset();
+    cache->metatype_ = nullptr;
+    cache->metatype_version_ = 0;
     attrCacheStats311().load_type_method.invalidations++;
     return cache->lookup(receiver, cache->name_);
   }
@@ -2191,6 +2288,14 @@ void LoadTypeMethodCache::fill(
     BorrowedRef<PyTypeObject> type,
     BorrowedRef<> value,
     bool is_unbound_meth) {
+#if PY_VERSION_HEX < 0x030C0000
+  // The metaclass fact must be pinnable too, or the entry is not filled:
+  // a half-guarded entry is worse than the generic path.  Tags are lazy,
+  // so ask for one rather than refusing a merely-unvisited metaclass.
+  if (!ensureVersionTag(Py_TYPE(type.get()))) {
+    return;
+  }
+#endif
   if (!Ci_Type_HasValidVersionTag(type)) {
     // The type must have a valid version tag in order for us to be able to
     // invalidate the cache when the type is modified. See the comment at
@@ -2204,6 +2309,8 @@ void LoadTypeMethodCache::fill(
   is_unbound_meth_ = is_unbound_meth;
 #if PY_VERSION_HEX < 0x030C0000
   type_version_ = type->tp_version_tag;
+  metatype_ = Py_TYPE(type.get());
+  metatype_version_ = metatype_->tp_version_tag;
   attrCacheStats311().load_type_method.fills++;
 #endif
   ltm_watcher.watch(type_, this);
@@ -2274,9 +2381,8 @@ static std::pair<ci_dict_version_tag_t, PyObject*> getModuleAttribute(
   return {0, nullptr};
 }
 
-PyObject* __attribute__((noinline)) LoadModuleAttrCache::lookupSlowPath(
-    BorrowedRef<> object,
-    BorrowedRef<> name) {
+PyObject* __attribute__((noinline))
+LoadModuleAttrCache::lookupSlowPath(BorrowedRef<> object, BorrowedRef<> name) {
 #if PY_VERSION_HEX < 0x030C0000
   attrCacheStats311().load_module_attr.misses++;
 #endif

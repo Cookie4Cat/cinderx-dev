@@ -742,18 +742,10 @@ Register* simplifyLoadMethod(Env& env, const LoadMethod* load_meth) {
   Register* receiver = load_meth->GetOperand(0);
   Type ty = receiver->type();
   if (receiver->isA(TType)) {
-#if PY_VERSION_HEX < 0x030C0000
-    // Type-receiver caches are fail-closed on 3.11 (RFC 3.3.5.2 scope
-    // note): LoadTypeMethodCache's pull validation covers the receiver
-    // type's version only, not the metaclass facts the cache class
-    // requires.  "The type propagation rarely gets here" is not a
-    // safety boundary -- simplifyVectorCall's type(obj) optimization
-    // produces a TType that feeds exactly this path -- so it is gated
-    // by version, and the generic path carries correctness.
-    return nullptr;
-#else
+    // On 3.11 the entry is pull-validated in getValueHelper against the
+    // owner type's version AND the metaclass identity/version, so the
+    // inline "type pointer matches" arm cannot serve a stale answer.
     return simplifyLoadTypeMethodCached(env, load_meth);
-#endif
   }
   BorrowedRef<PyTypeObject> type{ty.runtimePyType()};
   if (type == &PyModule_Type || type == &Ci_StrictModule_Type) {
@@ -2166,11 +2158,19 @@ Register* simplifyLoadAttrTypeReceiver(Env& env, const LoadAttr* load_attr) {
   }
 
 #if PY_VERSION_HEX < 0x030C0000
-  // LoadTypeAttrCache's hit path is inline machine code (raw type/value
-  // reads); a watcherless 3.11 cannot retire its entries and the helper
-  // is only reached on a pointer mismatch, so there is no seam for a pull
-  // check.  Type-receiver attribute loads stay on the generic path.
-  return nullptr;
+  // 3.11 has no type watcher, so the inline "cached type pointer matches"
+  // fast path below would serve stale answers: the pointer still matches
+  // after the class, its metaclass or the value's type is mutated.  The
+  // helper IS the seam -- LoadTypeAttrCache::invoke re-proves the owner,
+  // metaclass and descriptor facts on every call and only then returns the
+  // cached value -- so the site is lowered as a plain helper call with no
+  // inline arm.  The saving is the MRO walk, not a memory load.
+  {
+    const int cache_id = env.func.env.allocateLoadTypeAttrCache();
+    env.emit<UseType>(receiver, TType);
+    return env.emit<FillTypeAttrCache>(
+        receiver, load_attr->name_idx(), cache_id, *load_attr->frameState());
+  }
 #endif
 
   const int cache_id = env.func.env.allocateLoadTypeAttrCache();
