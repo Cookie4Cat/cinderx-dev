@@ -544,7 +544,10 @@ def stdlib_canary_runner(*, judges: list[Judge] | None = None) -> RunnerSpec:
         "      '%d silent' % (len(_covered), len(_targets), len(_silent)))\n"
         "assert not _silent, _silent\n"
     )
-    default = execute_holds(expected_organic_deopts=5) + [
+    # Six organic deopts: five from the MR-07 era, plus one newly compiled
+    # exception path in the stdlib sweep once MR-08 opens the exception
+    # opcode family (verified deterministic across reruns).
+    default = execute_holds(expected_organic_deopts=6) + [
         expect("compile_requests", ">", 0),
         expect("target_modules_attempted", "==", 72),
     ]
@@ -764,7 +767,15 @@ def canary_execute_runner(
         "assert hot(4, 5, 1) == 20\n"
         "assert hot(6, 5, 1) == 25\n"
     )
-    default = execute_holds() + [expect("compile_requests", ">", 0)]
+    # Two organic deopts, both from the child preamble's import machinery:
+    # with the MR-08 exception surface open, importlib/os helpers that the
+    # auto threshold compiles no longer refuse over their exception
+    # opcodes, and their EAFP raise paths deopt once each by design.
+    # Verified deterministic and preamble-attributed (payload-free child
+    # reproduces exactly 2).
+    default = execute_holds(expected_organic_deopts=2) + [
+        expect("compile_requests", ">", 0)
+    ]
     return RunnerSpec(
         name="canary_execute",
         payload=payload,
@@ -850,7 +861,11 @@ def exception_semantics_runner(*, judges: list[Judge] | None = None) -> RunnerSp
         "    assert cinderjit.is_jit_compiled(target), (\n"
         "        'a handled exception must not uninstall the artifact')\n"
     )
-    default = execute_holds() + [expect("organic_deopt_hits", ">", 0)]
+    # Eight organic deopts: the corpus raises through compiled code by
+    # design, and each raising form deopts exactly once (kUnhandledException
+    # delegation).  The exact pin replaces the old ">0" judge so a deopt
+    # storm cannot wash green.
+    default = execute_holds(expected_organic_deopts=8)
     return RunnerSpec(
         name="exception_semantics",
         payload=payload,
