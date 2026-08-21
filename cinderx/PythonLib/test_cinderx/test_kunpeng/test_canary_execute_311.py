@@ -6964,10 +6964,25 @@ class CanaryExecute311Test(unittest.TestCase):
                     read_missing(h)
                     read_x(h)
             compile_all(read_missing, read_x)
+            if mode == "jit":
+                stats_before = cinderjit.get_attr_cache_stats()["load_attr"]
             for _ in range(3):
                 for h in hs:
                     read_missing(h)
                     read_x(h)
+            if mode == "jit":
+                # The hook cache family must actually serve these calls:
+                # a silently-disabled family (object_getattribute once
+                # went uninitialized on 3.11 and every hook fill bailed)
+                # would leave this test green-but-vacuous on the stock
+                # slow path.
+                stats_after = cinderjit.get_attr_cache_stats()["load_attr"]
+                assert stats_after["fills"] > stats_before["fills"], (
+                    "hook-receiver loads never filled the cache",
+                    stats_before, stats_after)
+                assert stats_after["hits"] > stats_before["hits"], (
+                    "hook-receiver loads never hit the cache",
+                    stats_before, stats_after)
 
             hb = H()
             hb.__dict__[KAttr("missing")] = 1
@@ -7063,6 +7078,73 @@ class CanaryExecute311Test(unittest.TestCase):
             except AttributeError:
                 journal.append("AttributeError")
             still_compiled(read_missing)
+            print("JOURNAL " + json.dumps(journal))
+            """
+        )
+        interp, jit = self._dual_arm(probe)
+        self.assertEqual(interp, jit)
+
+    def test_audited_member_read_raises_the_event_on_every_access(self):
+        # Stock member_get() raises the object.__getattr__ audit event
+        # for PY_AUDIT_READ members (traceback.tb_frame) BEFORE
+        # PyMember_GetOne; a cached hit would silently drop it.  Audited
+        # member reads are therefore fail-closed -- never filled, every
+        # access runs the stock path -- while a plain member on the SAME
+        # receiver (tb_lasti) still fills and hits.
+        probe = self._DUAL_ARM_PREAMBLE + textwrap.dedent(
+            """
+            def read_frame(tb):
+                return tb.tb_frame
+
+            def read_lasti(tb):
+                return tb.tb_lasti
+
+            def make_tb():
+                try:
+                    raise ValueError("boom")
+                except ValueError as exc:
+                    return exc.__traceback__
+
+            tbs = [make_tb() for _ in range(3)]
+            for _ in range(40):
+                for tb in tbs:
+                    read_frame(tb)
+                    read_lasti(tb)
+            compile_all(read_frame, read_lasti)
+
+            if mode == "jit":
+                b = cinderjit.get_attr_cache_stats()["load_attr"]
+            for _ in range(3):
+                for tb in tbs:
+                    read_lasti(tb)
+            if mode == "jit":
+                # The un-audited member on the same receiver type caches:
+                # the audit gate must be narrow, not a blanket member ban.
+                a = cinderjit.get_attr_cache_stats()["load_attr"]
+                assert a["hits"] > b["hits"], ("tb_lasti never cached", b, a)
+
+                # The audited member never fills or hits.
+                b2 = cinderjit.get_attr_cache_stats()["load_attr"]
+                for _ in range(4):
+                    read_frame(tbs[0])
+                a2 = cinderjit.get_attr_cache_stats()["load_attr"]
+                assert a2["fills"] == b2["fills"], ("tb_frame filled", b2, a2)
+                assert a2["hits"] == b2["hits"], ("tb_frame hit", b2, a2)
+
+            events = []
+
+            def hook(event, args):
+                if event == "object.__getattr__" and args[1] == "tb_frame":
+                    events.append(args[1])
+
+            sys.addaudithook(hook)
+            results = [read_frame(tbs[0]) is tbs[0].tb_frame
+                       for _ in range(4)]
+            # Each compiled read fires one event; the `is` comparison's
+            # own tb_frame read fires another -- eight total, every
+            # access audited, none swallowed by a cache hit.
+            journal = [len(events), results]
+            still_compiled(read_frame, read_lasti)
             print("JOURNAL " + json.dumps(journal))
             """
         )

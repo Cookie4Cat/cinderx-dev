@@ -15,6 +15,12 @@
 #include "cinderx/UpstreamBorrow/borrowed.h"
 #include "cinderx/module_state.h"
 
+#if PY_VERSION_HEX < 0x030C0000
+// PY_AUDIT_READ for the 3.11 member-descriptor fill gate (the modern
+// Py_AUDIT_READ spelling only exists from 3.12).
+#include <structmember.h>
+#endif
+
 #include <algorithm>
 #include <memory>
 
@@ -1347,6 +1353,21 @@ void AttributeCache::fill(
         descr_type->tp_descr_set != nullptr) {
       // Data descriptor
       if (descr_type == &PyMemberDescr_Type) {
+#if PY_VERSION_HEX < 0x030C0000
+        // Stock member_get() raises the object.__getattr__ audit event
+        // for PY_AUDIT_READ members (traceback.tb_frame, frame.f_locals
+        // era fields) BEFORE PyMember_GetOne, which itself never audits.
+        // A cached hit would silently drop that user-visible side effect,
+        // and replicating member_get() here would import the audit
+        // hook's own reentrancy windows -- so reads of audited members
+        // are fail-closed: never filled, every access runs the stock
+        // path that owns the audit semantics.  Stores have no audit
+        // (member_set is a plain PyMember_SetOne).
+        auto* md = reinterpret_cast<PyMemberDescrObject*>(descr.get());
+        if (!is_set && (md->d_member->flags & PY_AUDIT_READ)) {
+          return;
+        }
+#endif
         mut->set_member_descr(type, descr);
       } else {
         if (!ensureVersionTag(descr_type)) {
