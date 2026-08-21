@@ -1002,8 +1002,8 @@ def test():
   uint64_t inlined = jit::computeDeoptSiteId(
       code, BCOffset{8}, jit::DeoptReason::kGuardFailure, 1, 0);
   EXPECT_NE(empty_path, inlined);
-  uint64_t other_kind =
-      jit::computeDeoptSiteId(code, BCOffset{8}, jit::DeoptReason::kRaise, 0, 0);
+  uint64_t other_kind = jit::computeDeoptSiteId(
+      code, BCOffset{8}, jit::DeoptReason::kRaise, 0, 0);
   EXPECT_NE(empty_path, other_kind);
 }
 #endif
