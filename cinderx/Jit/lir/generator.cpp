@@ -1575,7 +1575,7 @@ void LIRGenerator::appendForcedDeoptCheck(
   if (forced_deopt_check_for_ == &hir_instr) {
     return;
   }
-  if (!isForceableDeoptReason(deoptReasonFor(hir_instr))) {
+  if (!isForceableDeoptInstr(hir_instr)) {
     return;
   }
   forced_deopt_check_for_ = &hir_instr;

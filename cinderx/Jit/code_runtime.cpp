@@ -139,7 +139,7 @@ bool CodeRuntime::armForcedDeopt(uint64_t site_id, int n, bool at_or_after) {
     if (meta.frame_meta.empty() || meta.site_id != site_id) {
       continue;
     }
-    if (!isForceableDeoptReason(meta.reason)) {
+    if (!meta.forceable) {
       continue;
     }
     meta.force_mode = at_or_after ? 2 : 1;

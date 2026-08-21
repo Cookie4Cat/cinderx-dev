@@ -122,14 +122,14 @@ def loop(a, b, one):
   for (std::size_t i = 0; i < rt->deoptMetadatas().size(); ++i) {
     const jit::DeoptMetadata& meta = rt->deoptMetadatas()[i];
     if (meta.reason == jit::DeoptReason::kGuardFailure &&
-        !meta.frame_meta.empty()) {
+        meta.forceable && !meta.frame_meta.empty()) {
       guard_site = meta.site_id;
       guard_deopt_id = i;
       found = true;
       break;
     }
   }
-  ASSERT_TRUE(found) << "warm loop compiled with no GuardFailure site";
+  ASSERT_TRUE(found) << "warm loop compiled with no forceable guard site";
 
   for (const jit::DeoptMetadata& meta : rt->deoptMetadatas()) {
     if (meta.reason == jit::DeoptReason::kUnhandledException &&
@@ -169,6 +169,33 @@ def loop(a, b, one):
   jit::TriggerStats after_organic = jit::triggerStatsSnapshot();
   EXPECT_EQ(after_organic.forced_deopt_hits, after_forced.forced_deopt_hits);
   EXPECT_GT(after_organic.organic_deopt_hits, after_forced.organic_deopt_hits);
+}
+
+TEST_F(DeoptSite311Test, UnconditionalDeoptIsNotForceable) {
+  SKIP_311_EXECUTABLE_COMPILE();
+
+  const char* src = R"(
+def unpack(seq):
+    left, right = seq
+    return left + right
+)";
+  Ref<PyFunctionObject> func(compileAndGet(src, "unpack"));
+  ASSERT_NE(func, nullptr);
+  ASSERT_EQ(jit::compileFunction(func), jit::Result::OK);
+  jit::CodeRuntime* rt = codeRuntimeOf(func);
+  ASSERT_NE(rt, nullptr);
+
+  bool found = false;
+  for (const jit::DeoptMetadata& meta : rt->deoptMetadatas()) {
+    if (!meta.frame_meta.empty() && meta.descr != nullptr &&
+        std::strcmp(meta.descr, "UNPACK_SEQUENCE") == 0) {
+      EXPECT_EQ(meta.reason, jit::DeoptReason::kGuardFailure);
+      EXPECT_FALSE(meta.forceable);
+      EXPECT_FALSE(rt->armForcedDeopt(meta.site_id, 1, false));
+      found = true;
+    }
+  }
+  EXPECT_TRUE(found) << "UNPACK_SEQUENCE compiled with no unconditional deopt";
 }
 
 TEST_F(DeoptSite311Test, LoadGlobalReexecDoesNotDoublePushNull) {

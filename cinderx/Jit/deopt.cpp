@@ -468,6 +468,17 @@ DeoptReason deoptReasonFor(const jit::hir::DeoptBase& instr) {
   }
 }
 
+bool isForceableDeoptInstr(const jit::hir::DeoptBase& instr) {
+  switch (instr.opcode()) {
+    case jit::hir::Opcode::kGuard:
+    case jit::hir::Opcode::kGuardIs:
+    case jit::hir::Opcode::kGuardType:
+      return true;
+    default:
+      return false;
+  }
+}
+
 LiveValue::Source getLiveValueSource(jit::hir::Register* reg) {
   reg = hir::modelReg(reg);
   auto instr = reg->instr();
@@ -575,6 +586,7 @@ DeoptMetadata DeoptMetadata::fromInstr(const jit::hir::DeoptBase& instr) {
 
   meta.nonce = instr.nonce();
   meta.reason = deoptReasonFor(instr);
+  meta.forceable = isForceableDeoptInstr(instr);
   JIT_CHECK(
       meta.reason != DeoptReason::kUnhandledNullField ||
           meta.guilty_value != -1,

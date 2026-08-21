@@ -983,6 +983,7 @@ def test():
   jit::CodeRuntime rt(func);
   jit::DeoptMetadata empty;
   empty.reason = jit::DeoptReason::kGuardFailure;
+  empty.forceable = true;
   ASSERT_TRUE(empty.frame_meta.empty());
   rt.addDeoptMetadata(std::move(empty));
   EXPECT_FALSE(rt.armForcedDeopt(0, 1, false));

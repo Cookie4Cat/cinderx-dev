@@ -1324,6 +1324,7 @@ class CanaryExecute311Test(unittest.TestCase):
             assert len(ids) == len(set(ids)), ids
             kinds = {s["kind"] for s in sites}
             assert all(s["inline_path"] == "" for s in sites)
+            assert all(isinstance(s["forceable"], bool) for s in sites)
             assert "GuardFailure" in kinds, kinds
 
             cinderjit.force_uncompile(loop)
@@ -1332,7 +1333,7 @@ class CanaryExecute311Test(unittest.TestCase):
             assert again == ids, (ids, again)
 
             site = next(s for s in cinderjit.deopt_sites(loop)
-                        if s["kind"] == "GuardFailure")
+                        if s["forceable"])
             before = _cinderx._get_trigger_stats()
             assert cinderjit.force_deopt(loop, site["id"], n=1) is True
             assert loop(3, 5, 1) == 15
@@ -1380,6 +1381,7 @@ class CanaryExecute311Test(unittest.TestCase):
             sites = cinderjit.deopt_sites(loop)
             exc = [s for s in sites if s["kind"] == "UnhandledException"]
             assert exc, sites
+            assert all(not s["forceable"] for s in exc), exc
             raised = False
             try:
                 cinderjit.force_deopt(loop, exc[0]["id"], n=1)

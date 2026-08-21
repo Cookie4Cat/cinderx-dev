@@ -109,14 +109,10 @@ const char* deoptReasonName(DeoptReason reason);
 
 DeoptReason deoptReasonFor(const hir::DeoptBase& instr);
 
-// Forced deopt is a GuardFailure restore without a live error.
-// UnhandledException and the other error-handler reasons abort in
-// prepareForDeopt if no exception is set.  Instrumentation polls sit on
-// every bytecode boundary; emitting a helper call there doubles the C
-// stack of every compiled frame and trips the 3.11 soft limit under ASAN.
-inline bool isForceableDeoptReason(DeoptReason reason) {
-  return reason == DeoptReason::kGuardFailure;
-}
+// True only for conditional guards that receive a force-deopt helper in LIR.
+// Deopt and DeoptPatchpoint also use kGuardFailure, but cannot implement an
+// Nth-visit trigger and therefore must not be armed by the test API.
+bool isForceableDeoptInstr(const hir::DeoptBase& instr);
 
 // Deopt metadata that is specific to a particular frame whose code may have
 // been inlined.
@@ -165,6 +161,9 @@ struct DeoptMetadata {
 
   // Why we are de-opting
   DeoptReason reason{DeoptReason::kUnhandledException};
+
+  // Whether generated code consumes force_countdown before this site.
+  bool forceable{false};
 
   // Stable site identity: code identity + bytecode offset + site kind +
   // inline path.  The inline-path dimension is hashed even while the

@@ -2751,7 +2751,7 @@ PyObject* deopt_sites(PyObject* /* self */, PyObject* arg) {
       continue;
     }
     auto site = Ref<>::steal(Py_BuildValue(
-        "{s:K,s:s,s:i,s:s,s:i}",
+        "{s:K,s:s,s:i,s:s,s:i,s:O}",
         "id",
         static_cast<unsigned long long>(meta.site_id),
         "kind",
@@ -2761,7 +2761,9 @@ PyObject* deopt_sites(PyObject* /* self */, PyObject* arg) {
         "inline_path",
         "",
         "nonce",
-        meta.nonce));
+        meta.nonce,
+        "forceable",
+        meta.forceable ? Py_True : Py_False));
     if (site == nullptr) {
       return nullptr;
     }

@@ -3,9 +3,17 @@
 # pyre-strict
 
 from collections.abc import AsyncGenerator, Callable, Coroutine, Generator
-from typing import TypeVar
+from typing import TypedDict, TypeVar
 
 FuncAny = Callable[..., object]
+
+class DeoptSite(TypedDict):
+    id: int
+    kind: str
+    bc_offset: int
+    inline_path: str
+    nonce: int
+    forceable: bool
 
 TDeoptGenYield = TypeVar("TDeoptGenYield")
 TDeoptGenSend = TypeVar("TDeoptGenSend")
@@ -35,7 +43,7 @@ def enable_hir_inliner() -> None: ...
 def enable_specialized_opcodes() -> None: ...
 def force_compile(func: FuncAny) -> bool: ...
 def force_uncompile(func: FuncAny) -> bool: ...
-def deopt_sites(func: FuncAny) -> list[dict[str, object]]: ...
+def deopt_sites(func: FuncAny) -> list[DeoptSite]: ...
 def force_deopt(
     func: FuncAny, site_id: int, n: int = 1, at_or_after: bool = False
 ) -> bool: ...
