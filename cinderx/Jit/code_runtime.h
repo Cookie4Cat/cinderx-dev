@@ -83,7 +83,7 @@ class alignas(16) CodeRuntime {
   // armed.
   bool consumeForcedDeopt(std::size_t deopt_id);
 
-  const uint64_t* forcedDeoptArmedAddress() const {
+  uint64_t* forcedDeoptArmedAddress() {
     return &forced_deopt_armed_;
   }
 
