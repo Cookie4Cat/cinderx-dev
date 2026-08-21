@@ -2717,14 +2717,14 @@ PyObject* force_uncompile(PyObject* /* self */, PyObject* arg) {
 }
 
 #if PY_VERSION_HEX < 0x030C0000
-static jit::CodeRuntime* codeRuntimeForCompiled311(
+static Ref<jit::CompiledFunction> compiledArtifactFor311(
     BorrowedRef<PyFunctionObject> func) {
   auto* compiled = reinterpret_cast<jit::CompiledFunction*>(
       Ci_JitShell311_InstalledArtifact(func));
   if (compiled == nullptr) {
-    return nullptr;
+    return {};
   }
-  return compiled->runtime();
+  return Ref<jit::CompiledFunction>::create(compiled);
 }
 
 PyObject* deopt_sites(PyObject* /* self */, PyObject* arg) {
@@ -2732,7 +2732,11 @@ PyObject* deopt_sites(PyObject* /* self */, PyObject* arg) {
   if (func == nullptr) {
     return nullptr;
   }
-  jit::CodeRuntime* rt = codeRuntimeForCompiled311(func);
+  // Building the result allocates Python containers and can run a finalizer
+  // that reenters force_uncompile(func).  Pin the artifact so its runtime
+  // remains valid until enumeration is complete.
+  Ref<jit::CompiledFunction> compiled = compiledArtifactFor311(func);
+  jit::CodeRuntime* rt = compiled == nullptr ? nullptr : compiled->runtime();
   if (rt == nullptr) {
     PyErr_SetString(
         PyExc_RuntimeError, "deopt_sites requires a JIT-compiled function");
@@ -2794,7 +2798,8 @@ PyObject* force_deopt(PyObject* /* self */, PyObject* args, PyObject* kwargs) {
     PyErr_SetString(PyExc_ValueError, "force_deopt n must be >= 1");
     return nullptr;
   }
-  jit::CodeRuntime* rt = codeRuntimeForCompiled311(func);
+  Ref<jit::CompiledFunction> compiled = compiledArtifactFor311(func);
+  jit::CodeRuntime* rt = compiled == nullptr ? nullptr : compiled->runtime();
   if (rt == nullptr) {
     PyErr_SetString(
         PyExc_RuntimeError, "force_deopt requires a JIT-compiled function");

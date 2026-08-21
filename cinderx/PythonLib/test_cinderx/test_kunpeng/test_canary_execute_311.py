@@ -1400,6 +1400,66 @@ class CanaryExecute311Test(unittest.TestCase):
         self.assertEqual(proc.returncode, 0, proc.stderr[-800:])
         self.assertIn("unhandled exception site not forceable", proc.stdout)
 
+    def test_deopt_sites_pins_artifact_across_reentrant_uncompile(self):
+        env = dict(os.environ)
+        env["CINDERX_JIT_MODE"] = "canary"
+        env["PYTHONJITAUTO"] = "1000000"
+        probe = textwrap.dedent(
+            """
+            import gc
+            import _cinderx, cinderx
+            cinderx.init()
+            _cinderx.install_frame_evaluator()
+            import cinderjit
+
+            def loop(a, b, one):
+                total = a - a
+                i = total
+                while i < b:
+                    total = total + a
+                    i = i + one
+                return total
+
+            for _ in range(200):
+                loop(3, 5, 1)
+            assert cinderjit.force_compile(loop) is True
+
+            finalized = []
+
+            class Killer:
+                def __init__(self):
+                    self.cycle = self
+
+                def __del__(self):
+                    finalized.append(True)
+                    cinderjit.force_uncompile(loop)
+
+            killer = Killer()
+            del killer
+            old_threshold = gc.get_threshold()
+            gc.set_threshold(1, 1, 1)
+            try:
+                sites = cinderjit.deopt_sites(loop)
+            finally:
+                gc.set_threshold(*old_threshold)
+            assert finalized, "deopt_sites allocation did not run finalizer"
+            assert sites, sites
+            assert cinderjit.is_jit_compiled(loop) is False
+            print("deopt_sites pinned artifact across uncompile")
+            """
+        )
+        proc = subprocess.run(
+            [sys.executable, "-c", probe],
+            capture_output=True,
+            text=True,
+            env=env,
+            timeout=120,
+        )
+        self.assertEqual(proc.returncode, 0, proc.stderr[-800:])
+        self.assertIn(
+            "deopt_sites pinned artifact across uncompile", proc.stdout
+        )
+
     def test_load_global_force_deopt_does_not_double_push_null(self):
         env = dict(os.environ)
         env["CINDERX_JIT_MODE"] = "canary"
