@@ -541,7 +541,7 @@ CPython 3.11 不具备 3.12+ 的 type/dict/function watcher 通知能力。兼�
 | `LOAD_GLOBAL` | globals 和 builtins 的查找顺序、值版本、删除/遮蔽语义 |
 | 调用入口缓存 | 函数/code 生命周期、入口 generation、tracing/失效状态 |
 
-本期 3.11 交付口径：类型属性/类型方法缓存显式 fail-closed。`LoadTypeAttrCache` 的命中快路径将守卫内联进机器码，没有可插入拉式校验的缝隙；`LoadTypeMethodCache` 依赖静态类型信息，在本适配面结构性不可达。两类缓存在 3.11 一律不激活，类型接收者的属性与方法读写正确性由通用查找路径保证，其余缓存种类不受影响。上表"类型属性/类型方法"行所列守卫事实自后续专项开启该缓存时生效，并作为该专项的独立验收条件，不计入本期 IC 验收。
+本期 3.11 交付口径：类型属性/类型方法缓存显式 fail-closed。`LoadTypeAttrCache` 的命中快路径将守卫内联进机器码，没有可插入拉式校验的缝隙；`LoadTypeMethodCache` 存在可达的 IR 形态——`simplifyVectorCall` 对 `type(obj)` 的优化会产生静态 `TType` 并喂入方法装载——故其关断不是"通常到不了"的巧合，而是 `simplifyLoadMethod` 中按版本显式设闸。两类缓存在 3.11 一律不激活，类型接收者的属性与方法读写正确性由通用查找路径保证，其余缓存种类不受影响。上表"类型属性/类型方法"行所列守卫事实自后续专项开启该缓存时生效，并作为该专项的独立验收条件，不计入本期 IC 验收。
 
 #### 3.3.5.3 CPython 3.11 的关键差异
 
