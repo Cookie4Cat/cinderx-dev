@@ -849,6 +849,24 @@ def test_expected_deopt_missing_turns_red():
     assert any("forced_deopt_hits" in err for err in result.errors)
 
 
+def test_unexpected_organic_deopt_turns_red():
+    errors = [
+        error
+        for judge in runners.execute_holds()
+        for error in judge({"organic_deopt_hits": 1})
+    ]
+    assert any("organic_deopt_hits == 0" in error for error in errors)
+
+
+def test_stdlib_organic_deopt_count_drift_turns_red():
+    errors = [
+        error
+        for judge in runners.stdlib_canary_runner().judges
+        for error in judge({"organic_deopt_hits": 6})
+    ]
+    assert any("organic_deopt_hits == 5" in error for error in errors)
+
+
 def test_green_gate_refuses_skips(tmp_path):
     import subprocess as _sp
 

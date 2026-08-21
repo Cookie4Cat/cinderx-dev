@@ -544,7 +544,7 @@ def stdlib_canary_runner(*, judges: list[Judge] | None = None) -> RunnerSpec:
         "      '%d silent' % (len(_covered), len(_targets), len(_silent)))\n"
         "assert not _silent, _silent\n"
     )
-    default = execute_holds() + [
+    default = execute_holds(expected_organic_deopts=5) + [
         expect("compile_requests", ">", 0),
         expect("target_modules_attempted", "==", 72),
     ]
@@ -645,12 +645,13 @@ for expected in (
 # --------------------------------------------------------------------------
 # Stage-appropriate drivers; later MRs extend the execution-specific judges.
 
-def execute_holds() -> list[Judge]:
+def execute_holds(*, expected_organic_deopts: int = 0) -> list[Judge]:
     """The canary (MR-04) contract: machine code genuinely compiled,
     installed and entered, with the ledger closed -- and none of the
     shadow counters moving, because canary does not shadow-compile.
-    Organic deopt is allowed once Simplify ships guards; tests must not
-    arm site-deopt on these runners."""
+    Simplify can make organic deopt legitimate, but every deterministic
+    runner pins its expected count so a deopt storm cannot wash green.
+    Tests must not arm site-deopt on these runners."""
     return [
         expect("evaluator_installed", "==", True),
         expect("machine_code_entries", ">", 0),
@@ -662,6 +663,7 @@ def execute_holds() -> list[Judge]:
         expect("unknown_rejects", "==", 0),
         expect("events_dropped", "==", 0),
         expect("forced_deopt_hits", "==", 0),
+        expect("organic_deopt_hits", "==", expected_organic_deopts),
         # In the schema the shadow-success counter surfaces as
         # compile_success; canary must not move it (no shadow compiles).
         expect("compile_success", "==", 0),
@@ -1344,6 +1346,7 @@ def canary_churn_runner(*, judges: list[Judge] | None = None) -> RunnerSpec:
         expect("unknown_rejects", "==", 0),
         expect("events_dropped", "==", 0),
         expect("forced_deopt_hits", "==", 0),
+        expect("organic_deopt_hits", "==", 0),
         expect("compile_success", "==", 0),
         expect("shadow_codegen_bytes", "==", 0),
     ]
