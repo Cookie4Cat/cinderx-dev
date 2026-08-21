@@ -30,6 +30,7 @@
 #include "cinderx/Jit/config.h"
 #include "cinderx/Jit/containers.h"
 #include "cinderx/Jit/context.h"
+#include "cinderx/Jit/deopt.h"
 #include "cinderx/Jit/elf/reader.h"
 #include "cinderx/Jit/elf/writer.h"
 #include "cinderx/Jit/frame.h"
@@ -2715,6 +2716,99 @@ PyObject* force_uncompile(PyObject* /* self */, PyObject* arg) {
   Py_RETURN_TRUE;
 }
 
+#if PY_VERSION_HEX < 0x030C0000
+static jit::CodeRuntime* codeRuntimeForCompiled311(
+    BorrowedRef<PyFunctionObject> func) {
+  auto* compiled = reinterpret_cast<jit::CompiledFunction*>(
+      Ci_JitShell311_InstalledArtifact(func));
+  if (compiled == nullptr) {
+    return nullptr;
+  }
+  return compiled->runtime();
+}
+
+PyObject* deopt_sites(PyObject* /* self */, PyObject* arg) {
+  BorrowedRef<PyFunctionObject> func = get_func_arg("deopt_sites", arg);
+  if (func == nullptr) {
+    return nullptr;
+  }
+  jit::CodeRuntime* rt = codeRuntimeForCompiled311(func);
+  if (rt == nullptr) {
+    PyErr_SetString(
+        PyExc_RuntimeError, "deopt_sites requires a JIT-compiled function");
+    return nullptr;
+  }
+  auto list = Ref<>::steal(PyList_New(0));
+  if (list == nullptr) {
+    return nullptr;
+  }
+  for (const jit::DeoptMetadata& meta : rt->deoptMetadatas()) {
+    if (meta.frame_meta.empty()) {
+      continue;
+    }
+    auto site = Ref<>::steal(Py_BuildValue(
+        "{s:K,s:s,s:i,s:s,s:i}",
+        "id",
+        static_cast<unsigned long long>(meta.site_id),
+        "kind",
+        jit::deoptReasonName(meta.reason),
+        "bc_offset",
+        meta.innermostFrame().cause_instr_idx.value(),
+        "inline_path",
+        "",
+        "nonce",
+        meta.nonce));
+    if (site == nullptr) {
+      return nullptr;
+    }
+    if (PyList_Append(list, site) < 0) {
+      return nullptr;
+    }
+  }
+  return list.release();
+}
+
+PyObject* force_deopt(PyObject* /* self */, PyObject* args, PyObject* kwargs) {
+  static const char* keywords[] = {
+      "func", "site_id", "n", "at_or_after", nullptr};
+  PyObject* func_obj = nullptr;
+  unsigned long long site_id = 0;
+  int n = 1;
+  int at_or_after = 0;
+  if (!PyArg_ParseTupleAndKeywords(
+          args,
+          kwargs,
+          "OK|ip",
+          const_cast<char**>(keywords),
+          &func_obj,
+          &site_id,
+          &n,
+          &at_or_after)) {
+    return nullptr;
+  }
+  BorrowedRef<PyFunctionObject> func = get_func_arg("force_deopt", func_obj);
+  if (func == nullptr) {
+    return nullptr;
+  }
+  if (n < 1) {
+    PyErr_SetString(PyExc_ValueError, "force_deopt n must be >= 1");
+    return nullptr;
+  }
+  jit::CodeRuntime* rt = codeRuntimeForCompiled311(func);
+  if (rt == nullptr) {
+    PyErr_SetString(
+        PyExc_RuntimeError, "force_deopt requires a JIT-compiled function");
+    return nullptr;
+  }
+  if (!rt->armForcedDeopt(site_id, n, at_or_after != 0)) {
+    PyErr_Format(
+        PyExc_ValueError, "no forceable deopt site with id %llu", site_id);
+    return nullptr;
+  }
+  Py_RETURN_TRUE;
+}
+#endif
+
 int aot_func_visitor(PyObject* obj, void* arg) {
   constexpr int kGcVisitContinue = 1;
 
@@ -4277,6 +4371,16 @@ PyMethodDef jit_methods_311_canary[] = {
      METH_O,
      PyDoc_STR("Take a function off JIT-compiled code; later calls run in "
                "the interpreter.")},
+    {"deopt_sites",
+     deopt_sites,
+     METH_O,
+     PyDoc_STR("Enumerate stable deopt site ids for a JIT-compiled "
+               "function.")},
+    {"force_deopt",
+     reinterpret_cast<PyCFunction>(force_deopt),
+     METH_VARARGS | METH_KEYWORDS,
+     PyDoc_STR("Arm a deopt site so the Nth visit (or at-or-after N) "
+               "enters the real guard-failure restore.")},
     {"get_compiled_functions",
      get_compiled_functions,
      METH_NOARGS,
@@ -4931,20 +5035,12 @@ int initialize() {
     return 0;
   }
 
-  // canary (MR-04): the test-only execution mode.  Machine code compiles,
-  // installs and executes for functions inside the strict execute surface;
-  // everything the plan defers stays off -- no generator types, no OSR, no
-  // audit instrumentation, no JIT list, no automatic scheduling.  The
-  // product auto-JIT remains unavailable.
-  //
-  // Speculative type guards are MR-07 work: the plan's MR-04 eligibility
-  // excludes them, and consuming the interpreter's specialized forms is
-  // what produces them.  Only the executing mode compiles the unspecialized
-  // forms; shadow keeps its accepted MR-03 behaviour and RuntimeTests keep
-  // the build default.  Warm and organic timings still exercise real
-  // interpreter cache state -- the quickening happens either way -- without
-  // putting a guard-and-deopt arm under machine code.
-  getMutableConfig().specialized_opcodes = false;
+  // canary (MR-04 execute surface, MR-07 deopt): machine code compiles,
+  // installs and executes for functions inside the execute whitelist.
+  // Simplify ships Guard metadata, and specialized opcode consumption is
+  // on so organic type-change deopt is real.  Generator types, OSR, audit
+  // instrumentation, the JIT list and product auto-JIT stay off.
+  getMutableConfig().specialized_opcodes = true;
   // Refuse, do not silently clear: an immortal artifact skips the
   // dictionary anchor and the function association, so the guarded entry
   // would refuse a function the registry calls compiled -- and the death

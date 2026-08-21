@@ -1126,11 +1126,10 @@ class CanaryExecute311Test(unittest.TestCase):
         self.assertEqual(proc.returncode, 0, proc.stderr[-800:])
         self.assertIn("artifact ownership stayed exclusive", proc.stdout)
 
-    def test_specialized_bytecode_does_not_become_a_speculative_guard(self):
-        # Warm compilation reads the interpreter's quickened forms.  Turning
-        # those into type guards is MR-07 work, so canary compiles the
-        # unspecialized forms: a warm function must keep answering
-        # correctly when the argument type changes, with no deopt.
+    def test_specialized_bytecode_deopts_organically_on_type_change(self):
+        # Warm compilation plus Simplify install compact-long / float
+        # guards.  Passing a different type must take the real deopt
+        # restore and still answer correctly, remaining compiled.
         env = dict(os.environ)
         env["CINDERX_JIT_MODE"] = "canary"
         env["PYTHONJITAUTO"] = "1000000"
@@ -1160,13 +1159,13 @@ class CanaryExecute311Test(unittest.TestCase):
             assert specialized, "the interpreter never specialized the target"
 
             assert cinderjit.force_compile(arith) is True
-            cinderjit.get_and_clear_runtime_stats()
+            before = _cinderx._get_trigger_stats()["organic_deopt_hits"]
             assert arith(3, 5, 1) == 15
             assert arith(3.0, 5.0, 1.0) == 15.0
             assert cinderjit.is_jit_compiled(arith)
-            deopts = cinderjit.get_and_clear_runtime_stats().get("deopt", [])
-            assert not deopts, deopts
-            print("no speculative guard on the execute surface")
+            after = _cinderx._get_trigger_stats()["organic_deopt_hits"]
+            assert after > before, (before, after)
+            print("organic deopt on type change")
             """
         )
         proc = subprocess.run(
@@ -1177,7 +1176,7 @@ class CanaryExecute311Test(unittest.TestCase):
             timeout=120,
         )
         self.assertEqual(proc.returncode, 0, proc.stderr[-800:])
-        self.assertIn("no speculative guard", proc.stdout)
+        self.assertIn("organic deopt on type change", proc.stdout)
 
     def test_canary_control_plane_is_restricted(self):
         # The full cinderjit method table is a control surface for
@@ -1215,6 +1214,7 @@ class CanaryExecute311Test(unittest.TestCase):
                 "get_compiled_functions", "get_and_clear_runtime_stats",
                 "is_enabled", "jit_suppress", "jit_unsuppress",
                 "disable", "enable", "force_uncompile",
+                "deopt_sites", "force_deopt",
                 "_get_resident_compiled_functions",
             ]
             missing = [name for name in needed if not hasattr(cinderjit, name)]
@@ -1293,15 +1293,10 @@ class CanaryExecute311Test(unittest.TestCase):
         self.assertEqual(proc.returncode, 0, proc.stderr[-800:])
         self.assertIn("entry rechecked identity and ran live binding", proc.stdout)
 
-    def test_artifacts_carry_no_speculative_guard(self):
-        # Guards do not only come from quickened opcodes: Simplify installs
-        # its own for `x ** 2`, for compact-long comparisons and for float
-        # division, each with a deopt behind it.  The executing mode
-        # therefore compiles without that pass, and the optimized artifact
-        # is scanned so anything that still carries a guard is refused
-        # rather than shipped.  What this test holds is the observable
-        # consequence: shapes that would have been guarded now execute for
-        # any argument type, with no deopt at all.
+    def test_deopt_sites_are_stable_and_force_hits_the_real_restore(self):
+        # Site ids are code + offset + kind + empty inline path.  Arming
+        # one must enter the same restore as an organic guard miss, leave
+        # the function compiled, and bump only the forced counter.
         env = dict(os.environ)
         env["CINDERX_JIT_MODE"] = "canary"
         env["PYTHONJITAUTO"] = "1000000"
@@ -1312,9 +1307,6 @@ class CanaryExecute311Test(unittest.TestCase):
             _cinderx.install_frame_evaluator()
             import cinderjit
 
-            def square(x):
-                return x ** 2
-
             def loop(a, b, one):
                 total = a - a
                 i = total
@@ -1323,26 +1315,31 @@ class CanaryExecute311Test(unittest.TestCase):
                     i = i + one
                 return total
 
-            assert cinderjit.force_compile(square) is True
+            for _ in range(200):
+                loop(3, 5, 1)
             assert cinderjit.force_compile(loop) is True
-            assert cinderjit.is_jit_compiled(square)
-            assert cinderjit.is_jit_compiled(loop)
+            sites = cinderjit.deopt_sites(loop)
+            assert sites, sites
+            ids = [s["id"] for s in sites]
+            kinds = {s["kind"] for s in sites}
+            assert all(s["inline_path"] == "" for s in sites)
+            assert "GuardFailure" in kinds, kinds
 
-            def entries():
-                return _cinderx._get_trigger_stats()["machine_code_entries"]
+            cinderjit.force_uncompile(loop)
+            assert cinderjit.force_compile(loop) is True
+            again = [s["id"] for s in cinderjit.deopt_sites(loop)]
+            assert again == ids, (ids, again)
 
-            cinderjit.get_and_clear_runtime_stats()
-            before = entries()
-            # Both argument types, on both shapes: a speculative guard would
-            # deopt on whichever type it did not bake in.
-            assert square(3.0) == 9.0
-            assert square(3) == 9
+            site = next(s for s in cinderjit.deopt_sites(loop)
+                        if s["kind"] == "GuardFailure")
+            before = _cinderx._get_trigger_stats()
+            assert cinderjit.force_deopt(loop, site["id"], n=1) is True
             assert loop(3, 5, 1) == 15
-            assert loop(3.0, 5.0, 1.0) == 15.0
-            assert entries() - before == 4, entries() - before
-            deopts = cinderjit.get_and_clear_runtime_stats().get("deopt", [])
-            assert not deopts, deopts
-            print("artifacts carry no speculative guard")
+            after = _cinderx._get_trigger_stats()
+            assert after["forced_deopt_hits"] == before["forced_deopt_hits"] + 1
+            assert after["organic_deopt_hits"] == before["organic_deopt_hits"]
+            assert cinderjit.is_jit_compiled(loop)
+            print("forced deopt used the real restore")
             """
         )
         proc = subprocess.run(
@@ -1353,7 +1350,375 @@ class CanaryExecute311Test(unittest.TestCase):
             timeout=120,
         )
         self.assertEqual(proc.returncode, 0, proc.stderr[-800:])
-        self.assertIn("artifacts carry no speculative guard", proc.stdout)
+        self.assertIn("forced deopt used the real restore", proc.stdout)
+
+    def test_force_deopt_rejects_unhandled_exception_sites(self):
+        # CheckExc sites exist on the execute surface and used to abort
+        # with "unhandled exception without error set" when armed.
+        env = dict(os.environ)
+        env["CINDERX_JIT_MODE"] = "canary"
+        env["PYTHONJITAUTO"] = "1000000"
+        probe = textwrap.dedent(
+            """
+            import _cinderx, cinderx
+            cinderx.init()
+            _cinderx.install_frame_evaluator()
+            import cinderjit
+
+            def loop(a, b, one):
+                total = a - a
+                i = total
+                while i < b:
+                    total = total + a
+                    i = i + one
+                return total
+
+            for _ in range(200):
+                loop(3, 5, 1)
+            assert cinderjit.force_compile(loop) is True
+            sites = cinderjit.deopt_sites(loop)
+            exc = [s for s in sites if s["kind"] == "UnhandledException"]
+            assert exc, sites
+            raised = False
+            try:
+                cinderjit.force_deopt(loop, exc[0]["id"], n=1)
+            except ValueError as err:
+                raised = True
+                assert "forceable" in str(err), err
+            assert raised
+            assert loop(3, 5, 1) == 15
+            print("unhandled exception site not forceable")
+            """
+        )
+        proc = subprocess.run(
+            [sys.executable, "-c", probe],
+            capture_output=True,
+            text=True,
+            env=env,
+            timeout=120,
+        )
+        self.assertEqual(proc.returncode, 0, proc.stderr[-800:])
+        self.assertIn("unhandled exception site not forceable", proc.stdout)
+
+    def test_load_global_force_deopt_does_not_double_push_null(self):
+        env = dict(os.environ)
+        env["CINDERX_JIT_MODE"] = "canary"
+        env["PYTHONJITAUTO"] = "1000000"
+        probe = textwrap.dedent(
+            """
+            import _cinderx, cinderx
+            cinderx.init()
+            _cinderx.install_frame_evaluator()
+            import cinderjit
+
+            def _g():
+                return 7
+
+            G = _g
+
+            def read():
+                return G()
+
+            for _ in range(64):
+                assert read() == 7
+            assert cinderjit.force_compile(read) is True
+            sites = [s for s in cinderjit.deopt_sites(read)
+                     if s["kind"] == "GuardFailure"]
+            assert sites, cinderjit.deopt_sites(read)
+            cinderjit.force_deopt(read, sites[0]["id"], n=1)
+            assert read() == 7
+            print("load_global reexec ok")
+            """
+        )
+        proc = subprocess.run(
+            [sys.executable, "-c", probe],
+            capture_output=True,
+            text=True,
+            env=env,
+            timeout=120,
+        )
+        self.assertEqual(proc.returncode, 0, proc.stderr[-800:])
+        self.assertIn("load_global reexec ok", proc.stdout)
+
+    def test_auto_like_organic_deopt_on_type_change(self):
+        # Acceptance 11: organic deopt must happen after the call threshold
+        # installs machine code, with no force_compile in the process.
+        env = dict(os.environ)
+        env["CINDERX_JIT_MODE"] = "canary"
+        env["PYTHONJITAUTO"] = "32"
+        probe = textwrap.dedent(
+            """
+            import _cinderx, cinderx
+            cinderx.init()
+            _cinderx.install_frame_evaluator()
+            import cinderjit
+
+            def arith(a, b, one):
+                total = a - a
+                i = total
+                while i < b:
+                    total = total + a
+                    i = i + one
+                return total
+
+            for _ in range(40):
+                assert arith(3, 5, 1) == 15
+            assert cinderjit.is_jit_compiled(arith), (
+                "PYTHONJITAUTO=32 never installed")
+            before = _cinderx._get_trigger_stats()["organic_deopt_hits"]
+            assert arith(3.0, 5.0, 1.0) == 15.0
+            after = _cinderx._get_trigger_stats()["organic_deopt_hits"]
+            assert after > before, (before, after)
+            assert cinderjit.is_jit_compiled(arith)
+            print("auto-like organic deopt", before, after)
+            """
+        )
+        proc = subprocess.run(
+            [sys.executable, "-c", probe],
+            capture_output=True,
+            text=True,
+            env=env,
+            timeout=120,
+        )
+        self.assertEqual(proc.returncode, 0, proc.stderr[-800:])
+        self.assertIn("auto-like organic deopt", proc.stdout)
+
+    def test_organic_deopt_restores_load_method_pair(self):
+        # Acceptance 6: a LOAD_METHOD pair stays live on the stack while a
+        # later GuardFailure restores.  obj.m(a + b) keeps the pair under
+        # the BINARY_OP guard; a type change must still bind and call.
+        env = dict(os.environ)
+        env["CINDERX_JIT_MODE"] = "canary"
+        env["PYTHONJITAUTO"] = "1000000"
+        probe = textwrap.dedent(
+            """
+            import _cinderx, cinderx
+            cinderx.init()
+            _cinderx.install_frame_evaluator()
+            import cinderjit
+
+            class Box:
+                def m(self, x):
+                    return x
+
+            def caller(obj, a, b):
+                return obj.m(a + b)
+
+            box = Box()
+            for _ in range(200):
+                assert caller(box, 3, 5) == 8
+            assert cinderjit.force_compile(caller) is True
+            before = _cinderx._get_trigger_stats()["organic_deopt_hits"]
+            assert caller(box, 3.0, 5.0) == 8.0
+            after = _cinderx._get_trigger_stats()["organic_deopt_hits"]
+            assert after > before, (before, after)
+            assert cinderjit.is_jit_compiled(caller)
+            print("load_method pair restored")
+            """
+        )
+        proc = subprocess.run(
+            [sys.executable, "-c", probe],
+            capture_output=True,
+            text=True,
+            env=env,
+            timeout=120,
+        )
+        self.assertEqual(proc.returncode, 0, proc.stderr[-800:])
+        self.assertIn("load_method pair restored", proc.stdout)
+
+    def test_organic_deopt_on_load_global_keys_version(self):
+        # Organic LOAD_GLOBAL miss: inserting a global key bumps dk_version
+        # so the module-value guard fails and re-executes without a second
+        # PUSH_NULL.
+        env = dict(os.environ)
+        env["CINDERX_JIT_MODE"] = "canary"
+        env["PYTHONJITAUTO"] = "1000000"
+        probe = textwrap.dedent(
+            """
+            import _cinderx, cinderx
+            cinderx.init()
+            _cinderx.install_frame_evaluator()
+            import cinderjit
+
+            def _g():
+                return 7
+
+            G = _g
+
+            def read():
+                return G()
+
+            for _ in range(64):
+                assert read() == 7
+            assert cinderjit.force_compile(read) is True
+            before = _cinderx._get_trigger_stats()["organic_deopt_hits"]
+            read.__globals__["_mr7_scratch"] = 1
+            assert read() == 7
+            after = _cinderx._get_trigger_stats()["organic_deopt_hits"]
+            assert after > before, (before, after, cinderjit.deopt_sites(read))
+            print("load_global organic miss")
+            """
+        )
+        proc = subprocess.run(
+            [sys.executable, "-c", probe],
+            capture_output=True,
+            text=True,
+            env=env,
+            timeout=120,
+        )
+        self.assertEqual(proc.returncode, 0, proc.stderr[-800:])
+        self.assertIn("load_global organic miss", proc.stdout)
+
+    def test_continue_site_does_not_reexecute_a_raising_call(self):
+        # Acceptance 4 continue-type: CALL + CheckExc means the opcode
+        # completed (the callee ran) and resume is the next instruction.
+        # Re-executing CALL would bump the hit counter twice.
+        env = dict(os.environ)
+        env["CINDERX_JIT_MODE"] = "canary"
+        env["PYTHONJITAUTO"] = "1000000"
+        probe = textwrap.dedent(
+            """
+            import _cinderx, cinderx
+            cinderx.init()
+            _cinderx.install_frame_evaluator()
+            import cinderjit
+
+            hits = 0
+
+            def inner():
+                global hits
+                hits += 1
+                raise ValueError("boom")
+
+            def outer():
+                return inner()
+
+            assert cinderjit.force_compile(outer) is True
+            try:
+                outer()
+            except ValueError:
+                pass
+            else:
+                raise SystemExit("ValueError did not propagate")
+            assert hits == 1, hits
+            print("continue site did not reexecute")
+            """
+        )
+        proc = subprocess.run(
+            [sys.executable, "-c", probe],
+            capture_output=True,
+            text=True,
+            env=env,
+            timeout=120,
+        )
+        self.assertEqual(proc.returncode, 0, proc.stderr[-800:])
+        self.assertIn("continue site did not reexecute", proc.stdout)
+
+    def test_dead_local_is_not_kept_alive_across_organic_deopt(self):
+        # Acceptance 5: a local that is dead at the deopt site restores as
+        # NULL and must not extend the object's lifetime.
+        env = dict(os.environ)
+        env["CINDERX_JIT_MODE"] = "canary"
+        env["PYTHONJITAUTO"] = "1000000"
+        probe = textwrap.dedent(
+            """
+            import gc
+            import weakref
+            import _cinderx, cinderx
+            cinderx.init()
+            _cinderx.install_frame_evaluator()
+            import cinderjit
+
+            wr = []
+
+            class Box:
+                pass
+
+            def make_probe():
+                return Box()
+
+            def capture(obj):
+                wr.append(weakref.ref(obj))
+
+            def arith(a, b, one):
+                probe = make_probe()
+                capture(probe)
+                total = a - a
+                i = total
+                while i < b:
+                    total = total + a
+                    i = i + one
+                return total
+
+            for _ in range(200):
+                wr.clear()
+                assert arith(3, 5, 1) == 15
+            gc.collect()
+            assert wr[-1]() is None, "interpreter path leaked the probe"
+            assert cinderjit.force_compile(arith) is True
+            wr.clear()
+            assert arith(3.0, 5.0, 1.0) == 15.0
+            gc.collect()
+            assert wr[-1]() is None, wr[-1]()
+            print("dead local not extended")
+            """
+        )
+        proc = subprocess.run(
+            [sys.executable, "-c", probe],
+            capture_output=True,
+            text=True,
+            env=env,
+            timeout=120,
+        )
+        self.assertEqual(proc.returncode, 0, proc.stderr[-800:])
+        self.assertIn("dead local not extended", proc.stdout)
+
+    def test_organic_deopt_in_recursion_does_not_leak_the_depth_counter(self):
+        # Acceptance 8/9: deopt from a recursive compiled frame must leave
+        # prev_instr/stacktop usable and the recursion ledger balanced, so
+        # a later deep call still succeeds instead of raising RecursionError
+        # at a tiny depth.
+        env = dict(os.environ)
+        env["CINDERX_JIT_MODE"] = "canary"
+        env["PYTHONJITAUTO"] = "1000000"
+        probe = textwrap.dedent(
+            """
+            import sys
+            import _cinderx, cinderx
+            cinderx.init()
+            _cinderx.install_frame_evaluator()
+            import cinderjit
+
+            def rec(n, a, b):
+                if n:
+                    return rec(n - 1, a, b)
+                return a + b
+
+            for _ in range(64):
+                assert rec(8, 3, 5) == 8
+            assert cinderjit.force_compile(rec) is True
+            before = _cinderx._get_trigger_stats()["organic_deopt_hits"]
+            assert rec(8, 3.0, 5.0) == 8.0
+            after = _cinderx._get_trigger_stats()["organic_deopt_hits"]
+            assert after > before, (before, after)
+            old = sys.getrecursionlimit()
+            sys.setrecursionlimit(200)
+            try:
+                assert rec(40, 1, 2) == 3
+            finally:
+                sys.setrecursionlimit(old)
+            print("recursive deopt ledger held")
+            """
+        )
+        proc = subprocess.run(
+            [sys.executable, "-c", probe],
+            capture_output=True,
+            text=True,
+            env=env,
+            timeout=120,
+        )
+        self.assertEqual(proc.returncode, 0, proc.stderr[-800:])
+        self.assertIn("recursive deopt ledger held", proc.stdout)
 
     def test_entry_survives_the_artifact_being_dropped_mid_call(self):
         # The body runs arbitrary Python through its operators, and that
