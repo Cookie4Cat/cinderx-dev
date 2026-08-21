@@ -5713,22 +5713,179 @@ class CanaryExecute311Test(unittest.TestCase):
         interp, jit = self._dual_arm(probe)
         self.assertEqual(interp, jit)
 
-    def test_ordinary_deopt_with_tracing_active_restores_f_trace(self):
-        # RFC 3.3.4.5 item 7: tracing activation alone never deopts a
-        # running frame, but when that frame later deopts for an ORDINARY
-        # reason (here: a fresh global key clears dk_version and fails the
-        # guarded load), the mid-function resume skips the entry RESUME --
-        # so f_trace and f_trace_lines are set explicitly and the
-        # interpreted remainder is traced.  This is the versioned
-        # compatibility exemption's own oracle: stock would deliver
-        # nothing for this frame.
-        #
-        # Fixture discipline: the transition must ride an operator dunder
-        # (a Python call bytecode delegates per-call and would deopt
-        # before the tracer exists), and the post-compile driver must run
-        # in a function scope -- any new module-level name inserted after
-        # force_compile clears the module dict's dk_version and fires the
-        # FIRST guarded load before sys.settrace has run.
+    def test_delete_fast_unbound_matches_the_interpreter_arm(self):
+        # Stock DELETE_FAST raises UnboundLocalError when the slot is
+        # already empty; the compiled form must not silently clear an
+        # unbound local (the uninitialized-local TNullptr reaching
+        # definition makes that shape compilable).  Covers the always-
+        # unbound form, the conditionally-bound form on both paths, and
+        # an in-frame handler catching the error through this frame's
+        # exception table.
+        probe = self._DUAL_ARM_PREAMBLE + textwrap.dedent(
+            """
+            def observe(fn, *args):
+                try:
+                    return ["value", fn(*args)]
+                except Exception as exc:
+                    return [type(exc).__name__, str(exc)]
+
+            def f():
+                del x
+                return 1
+
+            def g(flag):
+                if flag:
+                    x = 1
+                del x
+                return "deleted"
+
+            def h():
+                try:
+                    del x
+                except UnboundLocalError:
+                    return "caught"
+                return "not-raised"
+
+            compile_all(f, g, h)
+            journal = [
+                observe(f),
+                observe(g, True),
+                observe(g, False),
+                observe(h),
+            ]
+            still_compiled(f, g, h)
+            print("JOURNAL " + json.dumps(journal))
+            """
+        )
+        interp, jit = self._dual_arm(probe)
+        self.assertEqual(interp, jit)
+
+    def test_mid_flight_tracer_protocol_matches_the_interpreter_arm(self):
+        # RFC 3.3.4.5 item 7, refined: after an ordinary mid-function
+        # deopt with tracing active, f_trace_lines is made explicit and a
+        # user-installed f_trace is preserved -- but an ABSENT f_trace is
+        # never forged from the GLOBAL tracer (tstate->c_traceobj).  The
+        # local tracer is only ever installed by a 'call' event's return
+        # value, and a mid-flight frame never had that event, so stock
+        # delivers nothing for it.  Four tracer shapes pin the protocol:
+        # the classic self-returning global, a two-level global-only-
+        # accepts-call tracer, a global returning None, and an explicit
+        # frame-level f_trace planted before the deopt.
+        probe = self._DUAL_ARM_PREAMBLE + textwrap.dedent(
+            """
+            journal = []
+
+            def scenario(name, make_tracer, plant_local=None):
+                # Fresh globals per scenario so each guarded load has its
+                # own dk_version story; everything else stays in function
+                # scope (a new module-level name after compile would fire
+                # the first guarded load before the tracer exists).
+                gname = "G_" + name
+                kname = "K_" + name
+                globals()[gname] = 5
+                armed = {"on": False}
+                events = []
+
+                class Flip:
+                    def __add__(self, other):
+                        if armed["on"]:
+                            if plant_local is not None:
+                                sys._getframe(1).f_trace = plant_local(
+                                    events)
+                            sys.settrace(make_tracer(events))
+                            globals()[kname] = 1
+                        return 100
+
+                src = (
+                    "def workload(x):\\n"
+                    "    a = " + gname + "\\n"
+                    "    b = x + 1\\n"
+                    "    c = " + gname + "\\n"
+                    "    return a + b + c\\n"
+                )
+                exec(src, globals())
+                wl = globals().pop("workload")
+                f = Flip()
+                for _ in range(40):
+                    assert wl(f) == 110
+                compile_all(wl)
+                for _ in range(3):
+                    assert wl(f) == 110
+                armed["on"] = True
+                result = wl(f)
+                # A follow-up NEW call observes the activation at entry
+                # and runs interpreted under the full protocol.
+                follow = wl(f)
+                sys.settrace(None)
+                journal.append([name, result, follow, events])
+
+            # 1. Classic self-returning global tracer: the running frame
+            # has no local tracer, so it stays silent (stock parity).
+            def classic(events):
+                def tracer(frame, event, arg):
+                    if frame.f_code.co_name == "workload":
+                        events.append(["g", event])
+                    return tracer
+                return tracer
+
+            scenario("classic", classic)
+
+            # 2. Two-level protocol: the global tracer ONLY accepts
+            # 'call' and returns a distinct local tracer.  A forged
+            # f_trace would hand it a 'line' event and blow the
+            # assertion.
+            def two_level(events):
+                def local(frame, event, arg):
+                    if frame.f_code.co_name == "workload":
+                        events.append(["l", event])
+                    return local
+
+                def tracer(frame, event, arg):
+                    assert event == "call", (
+                        "global tracer must only see call events", event)
+                    if frame.f_code.co_name == "workload":
+                        events.append(["g", event])
+                    return local
+                return tracer
+
+            scenario("twolevel", two_level)
+
+            # 3. Global tracer returning None: no local tracing at all.
+            def none_returning(events):
+                def tracer(frame, event, arg):
+                    if frame.f_code.co_name == "workload":
+                        events.append(["g", event])
+                    return None
+                return tracer
+
+            scenario("noneret", none_returning)
+
+            # 4. An f_trace the user planted on the frame object BEFORE
+            # the deopt is preserved and receives the interpreted
+            # remainder's events.
+            def planted_local(events):
+                def local(frame, event, arg):
+                    if frame.f_code.co_name == "workload":
+                        events.append(["planted", event])
+                    return local
+                return local
+
+            scenario("planted", classic, plant_local=planted_local)
+
+            print("JOURNAL " + json.dumps(journal))
+            """
+        )
+        interp, jit = self._dual_arm(probe)
+        self.assertEqual(interp, jit)
+        # The jit arm must have taken the organic deopt path in every
+        # scenario -- otherwise the mid-flight half of the protocol was
+        # never exercised.  The interp arm has no machine code, so the
+        # assertion lives here rather than inside the probe.
+
+    def test_ordinary_deopt_with_tracing_is_organic_on_the_jit_arm(self):
+        # Companion to the protocol test: prove the jit arm actually
+        # deopts mid-frame on the guarded load (the dual-arm probe cannot
+        # assert jit-only counters without breaking arm symmetry).
         env = dict(os.environ)
         env["CINDERX_JIT_MODE"] = "canary"
         env["PYTHONJITAUTO"] = "1000000"
@@ -5740,66 +5897,43 @@ class CanaryExecute311Test(unittest.TestCase):
             _cinderx.install_frame_evaluator()
             import cinderjit
 
-            events = []
+            G_probe = 5
+            armed = {"on": False}
 
             def tracer(frame, event, arg):
-                if frame.f_code.co_name == "workload":
-                    events.append(
-                        [event, frame.f_lineno - frame.f_code.co_firstlineno])
                 return tracer
 
-            G = 5
-            armed = False
-
-            class Flipper:
+            class Flip:
                 def __add__(self, other):
-                    if armed:
+                    if armed["on"]:
                         sys.settrace(tracer)
-                        # Inserting a new global key clears dk_version, so
-                        # the next guarded LOAD_GLOBAL fails organically --
-                        # with the tracer already active.
-                        globals()["G_shadow"] = 1
+                        globals()["K_probe"] = 1
                     return 100
 
-            src = (
-                "def workload(x):\\n"
-                "    a = G\\n"
-                "    b = x + 1\\n"
-                "    c = G\\n"
-                "    return a + b + c\\n"
-            )
-            exec(src, globals())
+            def workload(x):
+                a = G_probe
+                b = x + 1
+                c = G_probe
+                return a + b + c
 
             def main():
-                global armed
-                f = Flipper()
+                f = Flip()
                 for _ in range(40):
                     assert workload(f) == 110
                 assert cinderjit.force_compile(workload) is True
-
-                organic_before = _cinderx._get_trigger_stats()[
+                for _ in range(3):
+                    assert workload(f) == 110
+                before = _cinderx._get_trigger_stats()[
                     "organic_deopt_hits"]
-                armed = True
-                result = workload(f)
-                organic_after = _cinderx._get_trigger_stats()[
+                armed["on"] = True
+                assert workload(f) == 110
+                after = _cinderx._get_trigger_stats()[
                     "organic_deopt_hits"]
                 sys.settrace(None)
-                assert result == 110, result
-                assert organic_after > organic_before, (
-                    "the fresh global key never deopted the guarded load; "
-                    "the item-7 path was not exercised")
-                # The machine-code prefix (a = G, b = x + 1) stays silent
-                # per the RFC; the interpreted remainder resumes at the
-                # faulting load and is fully traced.
-                assert events == [
-                    ["line", 3],
-                    ["line", 4],
-                    ["return", 4],
-                ], (
-                    "the traced interpreted remainder after the ordinary "
-                    "deopt did not produce the expected event stream; "
-                    "f_trace was not restored: %r" % (events,))
-                print("item-7 f_trace restoration held")
+                assert after > before, (
+                    "the guarded load never deopted; the mid-flight "
+                    "protocol was not exercised", before, after)
+                print("mid-flight deopt is organic")
 
             main()
             """
@@ -5812,8 +5946,7 @@ class CanaryExecute311Test(unittest.TestCase):
             timeout=120,
         )
         self.assertEqual(proc.returncode, 0, proc.stderr[-2000:])
-        self.assertIn("item-7 f_trace restoration held", proc.stdout)
-
+        self.assertIn("mid-flight deopt is organic", proc.stdout)
     def test_signal_handler_exception_interrupts_the_compiled_loop(self):
         # A signal arriving in a tight compiled loop is delivered at the
         # back-edge poll; the handler's exception unwinds out of the

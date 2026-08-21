@@ -510,7 +510,7 @@ CPython 3.11 的 `sys._getframe()`、`f_locals`、traceback、pdb 等 stock 代�
 4. 清除 tracing/profile 后，函数在入口状态校验通过时可重新进入 JIT；
 5. 上述差异作为 CPython 3.11 JIT 的版本化兼容豁免，必须由 `test_sys_settrace`、`test_sys_setprofile` 和专用事件流用例钉住；
 6. 已挂起的同步 JIT Generator 后续 resume 属于同一版本化兼容语义：tracing 激活后不创建新的 JIT Generator，但不强制把既有挂起 Generator 转换为解释器 Frame；其剩余事件差异由专用用例钉住；
-7. 帧级 deopt 在函数中部恢复且当前 tracing 已激活时，因为恢复跳过函数入口的 `RESUME`，必须显式补设 `f_trace`、`f_trace_lines` 等 CPython 期望状态；
+7. 帧级 deopt 在函数中部恢复且当前 tracing 已激活时，因为恢复跳过函数入口的 `RESUME`，必须显式补设 `f_trace_lines` 等 CPython 期望状态，并原样保留用户已显式设置的 `f_trace`；`f_trace` 缺失时不得以全局 tracer（`tstate->c_traceobj`）填充——局部 tracer 只能由 'call' 事件的返回值安装（`trace_trampoline` 将所有非 call 事件派发给 `f_trace`），中部恢复的帧不存在该事件，其局部 tracer 合法缺失，这也与 stock 对运行中帧不补发事件的行为一致；
 8. tracing 分流不得破坏递归账、异常状态和 `f_back` 链。
 
 本次适配不实现 safepoint 栈级去优化，也不把该能力作为验收条件。
