@@ -121,8 +121,8 @@ def loop(a, b, one):
   bool found = false;
   for (std::size_t i = 0; i < rt->deoptMetadatas().size(); ++i) {
     const jit::DeoptMetadata& meta = rt->deoptMetadatas()[i];
-    if (meta.reason == jit::DeoptReason::kGuardFailure &&
-        meta.forceable && !meta.frame_meta.empty()) {
+    if (meta.reason == jit::DeoptReason::kGuardFailure && meta.forceable &&
+        !meta.frame_meta.empty()) {
       guard_site = meta.site_id;
       guard_deopt_id = i;
       found = true;
