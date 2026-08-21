@@ -313,14 +313,18 @@ DeoptResult prepareForDeopt(
 // frames. CPython normally sets these during the RESUME opcode at function
 // entry, but deopted frames resume mid-function and skip RESUME.
 //
-// On 3.11 this is the RFC's versioned compatibility semantics (3.3.4.5
-// item 7): a frame that deopts mid-function for an ordinary reason while
-// tracing is already active never re-runs the entry RESUME, so the
-// CPython-expected state is set here explicitly.  This intentionally
-// diverges from stock 3.11 -- where a mid-flight settrace leaves the
-// running frame's f_trace unset and its remaining events undelivered --
-// and is pinned by dedicated event-stream oracles rather than a stock
-// differential.
+// On 3.11 (RFC 3.3.4.5 item 7) the frame's tracing state is made explicit
+// without FORGING any of it: tstate->c_traceobj is the GLOBAL tracer, and
+// frame->f_trace is the LOCAL tracer that only a 'call' event's return
+// value installs (trace_trampoline dispatches every non-call event to
+// f_trace).  A mid-flight frame never had its 'call' event under the new
+// tracer, so its local tracer is legitimately absent -- copying the
+// global tracer in would hand 'line' events to a callable that may only
+// accept 'call' (a global tracer returning a distinct local tracer, or
+// returning None, is fully legal).  So: f_trace_lines is set, an f_trace
+// the user installed explicitly on the frame object is preserved as-is,
+// and an absent f_trace stays absent -- which also matches stock, where
+// the remaining events of an already-running frame are not delivered.
 void setupTraceForDeoptedFrame(
     _PyInterpreterFrame* frame,
     PyThreadState* tstate) {
@@ -329,9 +333,11 @@ void setupTraceForDeoptedFrame(
     PyFrameObject* fobj = _PyFrame_GetFrameObject(frame);
     if (fobj != nullptr) {
       fobj->f_trace_lines = 1;
+#if PY_VERSION_HEX >= 0x030C0000
       if (fobj->f_trace == nullptr && tstate->c_traceobj != nullptr) {
         fobj->f_trace = Py_NewRef(tstate->c_traceobj);
       }
+#endif
     }
   }
 }

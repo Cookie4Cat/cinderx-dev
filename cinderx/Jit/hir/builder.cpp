@@ -2454,6 +2454,16 @@ void HIRBuilder::translate(
         case DELETE_FAST: {
           int var_idx = bc_instr.oparg();
           Register* var = tc.frame.localsplus[var_idx];
+#if PY_VERSION_HEX < 0x030C0000
+          // Stock raises UnboundLocalError when the slot is already
+          // empty (the interpreter's DELETE_FAST checks before
+          // clearing); the uninitialized-local TNullptr reaching
+          // definition makes this branch compilable, so without the
+          // check a `del x` on an unbound local would silently succeed.
+          // Gated to 3.11: the 3.12+ translation keeps its existing
+          // shape for reference-line neutrality.
+          tc.emit<CheckVar>(var, var, getVarname(code_, var_idx), tc.frame);
+#endif
           moveOverwrittenStackRegisters(tc, var);
           tc.emit<LoadConst>(var, TNullptr);
           emitStoreFrameLocal311(tc, var_idx, var);
