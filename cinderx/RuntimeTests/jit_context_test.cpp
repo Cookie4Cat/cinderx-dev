@@ -231,6 +231,32 @@ TEST_F(JITContextTest, PublicationFailureIsNotReportedAsCompiled) {
 #endif
 
 #if PY_VERSION_HEX < 0x030C0000
+TEST_F(JITContextTest, A1EntryLedgerAttributesExactCodeObject) {
+  SKIP_311_EXECUTABLE_COMPILE();
+
+  Ref<PyFunctionObject> func(
+      compileAndGet("def func(value):\n    return value + 1", "func"));
+  ASSERT_NE(func, nullptr);
+  jit::a1EntryLedgerReset();
+  auto* code = reinterpret_cast<PyCodeObject*>(func->func_code);
+  jit::triggerStatsOnMachineCodeEntry(code);
+  jit::triggerStatsOnMachineCodeEntry(code);
+  Ref<> snapshot = Ref<>::steal(jit::a1EntryLedgerSnapshot());
+  ASSERT_NE(snapshot, nullptr);
+  BorrowedRef<> entries = PyDict_GetItemString(snapshot, "entries");
+  BorrowedRef<> dropped = PyDict_GetItemString(snapshot, "dropped");
+  ASSERT_NE(entries, nullptr);
+  ASSERT_NE(dropped, nullptr);
+  ASSERT_TRUE(PyList_Check(entries));
+  ASSERT_EQ(PyList_GET_SIZE(entries), 1);
+  BorrowedRef<> row = PyList_GET_ITEM(entries.get(), 0);
+  BorrowedRef<> count = PyDict_GetItemString(row, "entries");
+  ASSERT_NE(count, nullptr);
+  EXPECT_EQ(PyLong_AsLongLong(count), 2);
+  EXPECT_EQ(PyLong_AsLongLong(dropped), 0);
+  jit::a1EntryLedgerDisable();
+}
+
 TEST_F(JITContextTest, DecrefsPrecedeTheNextBoundaryPoll) {
   SKIP_311_EXECUTABLE_COMPILE();
 

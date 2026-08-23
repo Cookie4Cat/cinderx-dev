@@ -1,4 +1,4 @@
-"""A1 T1-T7 tracing/profile fallback acceptance probe for CPython 3.11."""
+"""A1 T1-T8 tracing/profile fallback acceptance probe for CPython 3.11."""
 
 from __future__ import annotations
 
@@ -6,6 +6,7 @@ import argparse
 import json
 from pathlib import Path
 import sys
+import threading
 import unittest
 
 
@@ -102,6 +103,64 @@ def run() -> dict:
     exact = unittest.TestResult()
     suite.run(exact)
 
+    def multithreaded_transition(second_kind: str) -> dict:
+        active = [threading.Event(), threading.Event()]
+        release = [threading.Event(), threading.Event()]
+        cleared = [threading.Event(), threading.Event()]
+
+        def trace_callback(frame, event, arg):
+            return trace_callback
+
+        def profile_callback(frame, event, arg):
+            return None
+
+        def worker(index: int, kind: str) -> None:
+            if kind == "trace":
+                sys.settrace(trace_callback)
+            else:
+                sys.setprofile(profile_callback)
+            active[index].set()
+            release[index].wait(30)
+            if kind == "trace":
+                sys.settrace(None)
+            else:
+                sys.setprofile(None)
+            cleared[index].set()
+
+        threads = [
+            threading.Thread(target=worker, args=(0, "trace")),
+            threading.Thread(target=worker, args=(1, second_kind)),
+        ]
+        for thread in threads:
+            thread.start()
+        if not active[0].wait(30) or not active[1].wait(30):
+            raise AssertionError("instrumented worker did not become active")
+        paused_with_both = not cinderjit.is_enabled()
+        release[0].set()
+        if not cleared[0].wait(30):
+            raise AssertionError("first instrumented worker did not clear")
+        paused_after_first_clear = not cinderjit.is_enabled()
+        release[1].set()
+        if not cleared[1].wait(30):
+            raise AssertionError("second instrumented worker did not clear")
+        for thread in threads:
+            thread.join(30)
+            if thread.is_alive():
+                raise AssertionError("instrumented worker did not exit")
+        enabled_after_final_clear = cinderjit.is_enabled()
+        return {
+            "second_kind": second_kind,
+            "paused_with_both": paused_with_both,
+            "paused_after_first_clear": paused_after_first_clear,
+            "enabled_after_final_clear": enabled_after_final_clear,
+            "pass": paused_with_both
+            and paused_after_first_clear
+            and enabled_after_final_clear,
+        }
+
+    t8_trace_trace = multithreaded_transition("trace")
+    t8_trace_profile = multithreaded_transition("profile")
+
     exact_failures = [
         {"test": str(test), "diagnostic": diagnostic}
         for test, diagnostic in exact.failures
@@ -129,6 +188,8 @@ def run() -> dict:
         and profile_resume_delta > 0
         and fresh_after_trace_diag["compiled"]
         and fresh_entry_delta > 0,
+        "T8_multithread_final_callback": t8_trace_trace["pass"]
+        and t8_trace_profile["pass"],
     }
     return {
         "result": "PASS" if all(checks.values()) else "FAIL",
@@ -156,6 +217,10 @@ def run() -> dict:
             "errors": exact_errors,
         },
         "compile_diagnostics": compile_diagnostics,
+        "multithreaded": {
+            "trace_trace": t8_trace_trace,
+            "trace_profile": t8_trace_profile,
+        },
     }
 
 

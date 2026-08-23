@@ -36,6 +36,7 @@
 #include "cinderx/Jit/frame.h"
 #include "cinderx/Jit/generators_rt.h"
 #include "cinderx/Jit/hir/annotation_index.h"
+#include "cinderx/Jit/hir/builder.h"
 #include "cinderx/Jit/hir/preload.h"
 #include "cinderx/Jit/inline_cache.h"
 #include "cinderx/Jit/jit_flag_processor.h"
@@ -2309,8 +2310,19 @@ bool hasRegisteredMonitoringCallbacks() {
 // Check if sys.setprofile or sys.settrace have active callbacks registered.
 bool hasActiveLegacyTracing() {
 #if PY_VERSION_HEX < 0x030C0000
-  PyThreadState* tstate = PyThreadState_Get();
-  return tstate->c_profilefunc != nullptr || tstate->c_tracefunc != nullptr;
+  // The JIT state is interpreter-global, while sys.settrace/setprofile are
+  // per-thread.  Re-enable only after the final instrumented thread clears
+  // its callback; looking solely at the thread making this call lets thread A
+  // re-enable machine code while thread B is still traced.
+  PyInterpreterState* interp = PyInterpreterState_Get();
+  for (PyThreadState* tstate = PyInterpreterState_ThreadHead(interp);
+       tstate != nullptr;
+       tstate = PyThreadState_Next(tstate)) {
+    if (tstate->c_profilefunc != nullptr || tstate->c_tracefunc != nullptr) {
+      return true;
+    }
+  }
+  return false;
 #else
   auto is = PyInterpreterState_Get();
   return is->sys_profiling_threads > 0 || is->sys_tracing_threads > 0;
@@ -2513,6 +2525,8 @@ PyObject* jit311_compile_diagnostic(PyObject* /* self */, PyObject* arg) {
   const char* phase = "compiler";
   const char* reason = nullptr;
   bool eligible = true;
+  int refusal_opcode = -1;
+  int refusal_offset = -1;
   PyThreadState* tstate = PyThreadState_Get();
   if (tstate == nullptr) {
     phase = "runtime";
@@ -2532,6 +2546,8 @@ PyObject* jit311_compile_diagnostic(PyObject* /* self */, PyObject* arg) {
   } else if ((reason = Ci_JitShell311_ExecuteRefusal(func)) != nullptr) {
     eligible = false;
     phase = "preflight";
+    Ci_JitShell311_GetExecuteRefusalDetail(
+        &refusal_opcode, &refusal_offset);
   } else if (!isJitCompiled(func)) {
     if (Ci_InitFrameEvalFunc() < 0) {
       return nullptr;
@@ -2595,16 +2611,51 @@ PyObject* jit311_compile_diagnostic(PyObject* /* self */, PyObject* arg) {
   Ref<> reason_obj = reason == nullptr
       ? Ref<>::create(Py_None)
       : Ref<>::steal(PyUnicode_FromString(reason));
+  Ref<> opcode_obj = refusal_opcode < 0
+      ? Ref<>::create(Py_None)
+      : Ref<>::steal(PyLong_FromLong(refusal_opcode));
+  Ref<> offset_obj = refusal_offset < 0
+      ? Ref<>::create(Py_None)
+      : Ref<>::steal(PyLong_FromLong(refusal_offset));
   if (result == nullptr || phase_obj == nullptr || reason_obj == nullptr ||
+      opcode_obj == nullptr || offset_obj == nullptr ||
       PyDict_SetItemString(
           result, "eligible", eligible ? Py_True : Py_False) < 0 ||
       PyDict_SetItemString(
           result, "compiled", isJitCompiled(func) ? Py_True : Py_False) < 0 ||
       PyDict_SetItemString(result, "phase", phase_obj) < 0 ||
-      PyDict_SetItemString(result, "reason", reason_obj) < 0) {
+      PyDict_SetItemString(result, "reason", reason_obj) < 0 ||
+      PyDict_SetItemString(result, "opcode", opcode_obj) < 0 ||
+      PyDict_SetItemString(result, "offset", offset_obj) < 0) {
     return nullptr;
   }
   return result.release();
+}
+
+PyObject* jit311_execute_surface(PyObject* /* self */, PyObject* /* arg */) {
+  Ref<> result = Ref<>::steal(PyList_New(0));
+  if (result == nullptr) {
+    return nullptr;
+  }
+  for (int opcode = 0; opcode <= std::numeric_limits<uint8_t>::max(); opcode++) {
+    if (!jit::hir::isExecuteOpcodeSupported311(opcode)) {
+      continue;
+    }
+    Ref<> item = Ref<>::steal(PyLong_FromLong(opcode));
+    if (item == nullptr || PyList_Append(result, item) < 0) {
+      return nullptr;
+    }
+  }
+  return result.release();
+}
+
+PyObject* jit311_reset_entry_ledger(PyObject* /* self */, PyObject* /* arg */) {
+  jit::a1EntryLedgerReset();
+  Py_RETURN_NONE;
+}
+
+PyObject* jit311_entry_ledger(PyObject* /* self */, PyObject* /* arg */) {
+  return jit::a1EntryLedgerSnapshot();
 }
 #endif
 
@@ -4607,6 +4658,21 @@ PyMethodDef jit_methods_311_canary[] = {
      METH_O,
      PyDoc_STR("Attempt CPython 3.11 compilation and return a private, typed "
                "compile/refusal classification for a Python function.")},
+    {"_jit311_execute_surface",
+     jit311_execute_surface,
+     METH_NOARGS,
+     PyDoc_STR("Return the frozen-input numeric opcode whitelist used by the "
+               "private CPython 3.11 A1 gate.")},
+    {"_jit311_reset_entry_ledger",
+     jit311_reset_entry_ledger,
+     METH_NOARGS,
+     PyDoc_STR("Reset and enable the private CPython 3.11 per-code machine "
+               "entry ledger.")},
+    {"_jit311_entry_ledger",
+     jit311_entry_ledger,
+     METH_NOARGS,
+     PyDoc_STR("Return exact code-object machine-entry counts and the dropped "
+               "evidence count for CPython 3.11 A1.")},
     // MR-05: the inverse of force_compile, and the only published way to
     // take a function back off machine code.  A call already inside the
     // artifact keeps running it -- the guarded entry pins it for the
@@ -5595,6 +5661,7 @@ void finalize() {
 
   if (isJitShadow()) {
     getMutableConfig().state = State::kFinalizing;
+    jit::a1EntryLedgerDisable();
 
     auto mod_state = cinderx::getModuleState();
     auto* context = static_cast<Context*>(mod_state->jit_context.get());
@@ -5625,6 +5692,7 @@ void finalize() {
   getMutableConfig().state = State::kFinalizing;
   setInterpreterJitFlag(false);
   syncOSRFlags();
+  jit::a1EntryLedgerDisable();
 
   // Deopt all JIT generators, since JIT generators reference code and other
   // metadata that we will be freeing later in this function.
@@ -6066,7 +6134,7 @@ std::vector<BorrowedRef<PyFunctionObject>> preloadFuncAndDeps(
 
 void codeDestroyed(BorrowedRef<PyCodeObject> code) {
   FreeThreadedJITEntrypointGuard guard;
-  triggerStatsOnCodeDestroyed();
+  triggerStatsOnCodeDestroyed(code.get());
 #if PY_VERSION_HEX < 0x030C0000
   // The notification comes from the code-extra free function (no watcher)
   // and shadow populates the registries too: gate on "initialized".

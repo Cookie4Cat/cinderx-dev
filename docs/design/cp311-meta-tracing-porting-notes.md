@@ -12,8 +12,8 @@ The 3.11 execute mode follows the upstream CinderX integration policy:
    bytecode boundary and deoptimized into the vendored 3.11 interpreter;
 6. suspended JIT generators deopt on their next send while instrumentation is
    active;
-7. removing the final callback re-enables the JIT and reattaches parked
-   artifacts.
+7. removing the final callback across all interpreter threads re-enables the
+   JIT and reattaches parked artifacts.
 
 The JIT does not implement the Python tracing event protocol in machine code.
 The interpreter owns event and error delivery after fallback.
@@ -35,8 +35,11 @@ destructors inserted by the refcount pass.  The native RuntimeTest
 
 ## Acceptance mapping
 
-`a1_tracing_probe.py` owns T1-T7: entry-time trace fallback, compile stop,
+`a1_tracing_probe.py` owns T1-T8: entry-time trace fallback, compile stop,
 mid-flight return, mid-flight raise, C trace-error delivery, profile fallback,
-and recovery after removal.  The mid-flight cases execute the exact CPython
-`test_sys_settrace` cases in all three tracing variants.  Missing return events,
-extra call events, and delayed C-trace exceptions are never baseline entries.
+recovery after removal, and interpreter-wide final-callback ownership. T8
+covers trace+trace and trace+profile on two threads: clearing the first thread
+must leave the global JIT paused, and clearing the second must restore it. The
+mid-flight cases execute the exact CPython `test_sys_settrace` cases in all
+three tracing variants. Missing return events, extra call events, and delayed
+C-trace exceptions are never baseline entries.

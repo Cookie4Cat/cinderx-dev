@@ -18,6 +18,14 @@ import zipfile
 PASS_STATES = {"PASS", "PASS_WITH_APPROVED_DEVIATIONS"}
 
 
+def require_matching_source_sha(embedded_sha: object, source_sha: str) -> None:
+    if embedded_sha != source_sha:
+        raise RuntimeError(
+            "wheel/source provenance mismatch: "
+            f"wheel={embedded_sha!r}, source={source_sha!r}"
+        )
+
+
 class A1Runner:
     def __init__(
         self,
@@ -28,7 +36,6 @@ class A1Runner:
         lanes: set[str],
         jobs: int,
         timeout: int,
-        source_sha: str | None,
     ) -> None:
         self.wheel = wheel.resolve()
         self.source = source.resolve()
@@ -36,7 +43,6 @@ class A1Runner:
         self.lanes = lanes
         self.jobs = jobs
         self.timeout = timeout
-        self.source_sha = source_sha
         self.stage = self.output / "harness"
         self.venv = self.output / "venv"
         self.python = self.venv / "bin" / "python"
@@ -161,16 +167,23 @@ class A1Runner:
             embedded = json.loads(
                 archive.read("cinderx/_native/build_info_311.json").decode("utf-8")
             )
-        if self.source_sha is not None:
-            source_sha = self.source_sha
-        else:
-            source_sha = subprocess.run(
-                ["git", "rev-parse", "HEAD"],
-                cwd=self.source,
-                check=True,
-                capture_output=True,
-                text=True,
-            ).stdout.strip()
+        source_sha = subprocess.run(
+            ["git", "rev-parse", "HEAD"],
+            cwd=self.source,
+            check=True,
+            capture_output=True,
+            text=True,
+        ).stdout.strip()
+        for command in (
+            ["git", "diff", "--quiet"],
+            ["git", "diff", "--cached", "--quiet"],
+        ):
+            if subprocess.run(command, cwd=self.source).returncode != 0:
+                raise RuntimeError(
+                    "official A1 acceptance requires a clean tracked source tree"
+                )
+        embedded_sha = embedded.get("git_sha")
+        require_matching_source_sha(embedded_sha, source_sha)
         runtime_probe = subprocess.run(
             [
                 str(self.python),
@@ -201,6 +214,7 @@ class A1Runner:
             "cinderx_file": runtime["cinderx"],
             "_cinderx_file": runtime["_cinderx"],
             "harness_manifest": manifest,
+            "wheel_source_sha_match": True,
         }
         (self.output / "provenance.json").write_text(
             json.dumps(provenance, indent=2, sort_keys=True) + "\n", encoding="utf-8"
@@ -338,7 +352,7 @@ class A1Runner:
         )
         tracing = directory / "tracing.json"
         rc_tracing = self._run(
-            "26-C-tracing-T1-T7",
+            "26-C-tracing-T1-T8",
             [str(self.python), "-m", "ci_pipeline.jit311.a1_tracing_probe", "--out", str(tracing)],
             env=self._product_env(),
         )
@@ -348,18 +362,26 @@ class A1Runner:
             [str(self.python), "-m", "ci_pipeline.jit311.a1_generator_probe", "--out", str(generator)],
             env=self._product_env(),
         )
+        dis_probe = directory / "dis-deviation-probe.json"
+        rc_dis_probe = self._run(
+            "28-C-dis-deviation-probe",
+            [str(self.python), "-m", "ci_pipeline.jit311.a1_dis_deviation_probe", "--out", str(dis_probe)],
+            env=self._product_env(),
+        )
         c0c1_report = self._json(c0c1)
         c1c2_report = self._json(c1c2)
         classification_report = self._json(classification)
         tracing_report = self._json(tracing)
         generator_report = self._json(generator)
+        dis_probe_report = self._json(dis_probe)
         good = (
-            all(code == 0 for code in (rc0, rc1, rc2, rc_c0c1, rc_c1c2, rc_classify, rc_tracing, rc_generator))
+            all(code == 0 for code in (rc0, rc1, rc2, rc_c0c1, rc_c1c2, rc_classify, rc_tracing, rc_generator, rc_dis_probe))
             and (c0c1_report or {}).get("result") == "PASS"
             and (c1c2_report or {}).get("result") in PASS_STATES
             and (classification_report or {}).get("result") == "PASS"
             and (tracing_report or {}).get("result") == "PASS"
             and (generator_report or {}).get("result") == "PASS"
+            and (dis_probe_report or {}).get("result") == "PASS"
         )
         result = {
             "result": (
@@ -372,6 +394,7 @@ class A1Runner:
             "classification": classification_report,
             "tracing": tracing_report,
             "generator": generator_report,
+            "dis_deviation_probe": dis_probe_report,
         }
         (directory / "result.json").write_text(json.dumps(result, indent=2, sort_keys=True) + "\n")
         return result
@@ -421,6 +444,7 @@ class A1Runner:
             f"- Wheel SHA256: `{provenance['wheel_sha256']}`",
             f"- Embedded git SHA: `{provenance['wheel_embedded'].get('git_sha')}`",
             f"- Source git SHA: `{provenance['source_git_sha']}`",
+            f"- Wheel/source SHA match: `{provenance['wheel_source_sha_match']}`",
             f"- `cinderx`: `{provenance['cinderx_file']}`",
             f"- `_cinderx`: `{provenance['_cinderx_file']}`",
             "",
@@ -441,6 +465,8 @@ class A1Runner:
                 f"- EXPECTED_SAFE_REFUSAL: {module_counts.get('EXPECTED_SAFE_REFUSAL', 0)}",
                 f"- RUNTIME_FALLBACK: {module_counts.get('RUNTIME_FALLBACK', 0)}",
                 f"- UNCOVERED: {module_counts.get('UNCOVERED', 0)}",
+                f"- Exact own-code entry ledger dropped: {classification.get('entry_ledger_dropped', 0)}",
+                f"- Execute-surface drift errors: {len(classification.get('execute_surface_errors', []))}",
                 f"- Functions discovered/attempted: {function_counts.get('discovered', 0)}/{function_counts.get('attempted', 0)}",
                 f"- Functions compiled/entered: {function_counts.get('compiled', 0)}/{function_counts.get('entered', 0)}",
                 f"- Expected refusal: {function_counts.get('expected_refusal', 0)}",
@@ -478,8 +504,9 @@ class A1Runner:
             + "- 72-module classification: "
             + f"{sum(module_counts.values())}/72; uncovered {module_counts.get('UNCOVERED', 0)}\n"
             + f"- UNKNOWN_REFUSAL: {function_counts.get('unknown_refusal', 0)}\n"
-            + f"- Tracing T1-T7: {(c.get('tracing') or {}).get('result', 'NOT_RUN')}\n"
+            + f"- Tracing T1-T8: {(c.get('tracing') or {}).get('result', 'NOT_RUN')}\n"
             + f"- Generator signal/yield-from: {(c.get('generator') or {}).get('result', 'NOT_RUN')}\n"
+            + f"- test_dis adaptive-only probe: {(c.get('dis_deviation_probe') or {}).get('result', 'NOT_RUN')}\n"
             + f"- W families: {w_counts.get('families', 0)}/17\n"
             + f"- Approved deviations: {len(deviations)}\n"
             + f"- Unexpected differences: {len(unexpected)}\n"
@@ -506,10 +533,6 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--lane", choices=("S", "C", "W"), action="append")
     parser.add_argument("--jobs", type=int, default=min(16, os.cpu_count() or 8))
     parser.add_argument("--timeout", type=int, default=1200)
-    parser.add_argument(
-        "--source-sha",
-        help="explicit source HEAD when a mounted git-worktree pointer is not resolvable",
-    )
     args = parser.parse_args(argv)
     timestamp = datetime.now().strftime("%Y%m%d-%H%M%S")
     output = args.out or Path.cwd() / f"cp311-a1-{timestamp}"
@@ -520,7 +543,6 @@ def main(argv: list[str] | None = None) -> int:
         lanes=set(args.lane or ("S", "C", "W")),
         jobs=args.jobs,
         timeout=args.timeout,
-        source_sha=args.source_sha,
     )
     try:
         final = runner.run()

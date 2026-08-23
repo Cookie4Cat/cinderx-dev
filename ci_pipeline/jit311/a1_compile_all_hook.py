@@ -8,6 +8,7 @@ return a typed refusal, and records test/doctest execution windows as JSONL.
 from __future__ import annotations
 
 import atexit
+import dis
 import doctest
 import functools
 import json
@@ -137,6 +138,12 @@ def _compile(module_name: str, function) -> dict:
             }
         else:
             result = dict(diagnostic)
+            opcode = diagnostic.get("opcode")
+            result["opcode_name"] = (
+                dis.opname[opcode]
+                if isinstance(opcode, int) and 0 <= opcode < len(dis.opname)
+                else None
+            )
             if diagnostic["compiled"]:
                 result["status"] = "compiled"
             elif diagnostic["phase"] == "runtime":
@@ -152,7 +159,7 @@ def _compile(module_name: str, function) -> dict:
             "type": "compile",
             "module": module_name,
             "qualname": function.__qualname__,
-            "filename": function.__code__.co_filename,
+            "filename": os.path.realpath(function.__code__.co_filename),
             "firstlineno": function.__code__.co_firstlineno,
             **result,
         }
@@ -179,6 +186,7 @@ def _scan(module_name: str) -> None:
         {
             "type": "module-scan",
             "module": module_name,
+            "filename": _target_file(module) if module is not None else None,
             "discovered": len(candidates),
             "statuses": statuses,
             "reasons": reasons,
@@ -195,6 +203,15 @@ def _entries() -> int:
 
 
 _ORIGINAL_CALL_TEST_METHOD = unittest.TestCase._callTestMethod
+_ORIGINAL_LOAD_TESTS_FROM_MODULE = unittest.TestLoader.loadTestsFromModule
+
+
+def _patched_load_tests_from_module(self, module, *args, **kwargs):
+    # unittest calls an optional module-level load_tests() inside the original
+    # method.  Scan before delegating so that function's own first invocation
+    # can enter machine code and be attributed by the exact per-code ledger.
+    _scan(module.__name__)
+    return _ORIGINAL_LOAD_TESTS_FROM_MODULE(self, module, *args, **kwargs)
 
 
 def _patched_call_test_method(self, method):
@@ -218,7 +235,9 @@ def _patched_call_test_method(self, method):
                 "target_module": target_module,
                 "test": self.id(),
                 "method_qualname": getattr(function, "__qualname__", repr(function)),
-                "filename": getattr(getattr(function, "__code__", None), "co_filename", None),
+                "filename": os.path.realpath(function.__code__.co_filename)
+                if hasattr(function, "__code__")
+                else None,
                 "firstlineno": getattr(getattr(function, "__code__", None), "co_firstlineno", -1),
                 "compile_status": compile_result["status"],
                 "compile_reason": compile_result.get("reason"),
@@ -279,6 +298,22 @@ def _install_generator_capi_adapter() -> None:
     _write({"type": "generator-capi-adapter-installed"})
 
 
+def _initialize_runtime_evidence() -> None:
+    if _MODE != "jit":
+        return
+    import cinderjit
+
+    cinderjit._jit311_reset_entry_ledger()
+    numeric = list(cinderjit._jit311_execute_surface())
+    _write(
+        {
+            "type": "execute-surface",
+            "opcodes": numeric,
+            "opcode_names": [dis.opname[opcode] for opcode in numeric],
+        }
+    )
+
+
 def _summary() -> None:
     payload = {
         "type": "process-summary",
@@ -288,11 +323,22 @@ def _summary() -> None:
     if _MODE == "jit":
         try:
             import _cinderx
+            import cinderjit
 
             stats = _cinderx._get_trigger_stats()
+            ledger = cinderjit._jit311_entry_ledger()
+            rows = [
+                {
+                    **row,
+                    "filename": os.path.realpath(row["filename"]),
+                }
+                for row in ledger["entries"]
+            ]
             payload.update(
                 machine_code_entries=stats["machine_code_entries"],
                 compiled_function_creations=stats["compiled_function_creations"],
+                entry_ledger=rows,
+                entry_ledger_dropped=ledger["dropped"],
             )
         except BaseException as exc:
             payload["summary_error"] = f"{type(exc).__name__}: {exc}"
@@ -300,7 +346,9 @@ def _summary() -> None:
 
 
 unittest.TestCase._callTestMethod = _patched_call_test_method
+unittest.TestLoader.loadTestsFromModule = _patched_load_tests_from_module
 doctest.DocTestRunner.run = _patched_doctest_run
+_initialize_runtime_evidence()
 _install_generator_capi_adapter()
 atexit.register(_summary)
 _write({"type": "hook-installed", "target_module": _worker_target_module()})

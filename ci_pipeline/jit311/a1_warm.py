@@ -155,10 +155,18 @@ def run(manifest_path: Path) -> dict:
             )
             outcome = "W-JIT" if passed else "UNCLASSIFIED"
         else:
+            refusal_opcode = diagnostic.get("opcode")
+            refusal_opcode_name = (
+                dis.opname[refusal_opcode]
+                if isinstance(refusal_opcode, int)
+                and 0 <= refusal_opcode < len(dis.opname)
+                else None
+            )
             passed = (
                 specialized_proven
                 and not diagnostic["compiled"]
                 and diagnostic["reason"] == family["expected_reason"]
+                and refusal_opcode_name == family["name"]
                 and entry_delta == 0
                 and semantic_result == expected
             )

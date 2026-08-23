@@ -11,7 +11,18 @@
       "rfc_or_issue": "cp311_jit_A1_four_work_packages.md WP4.1",
       "owner": "CinderX JIT",
       "reviewer": "A1 RFC approved capability decision",
-      "scope": "C lane only; adaptive disassembly observable only"
+      "scope": "C lane only; adaptive disassembly observable only",
+      "execute_diagnostic": {
+        "required_substrings": [
+          "AssertionError",
+          "RESUME_QUICK",
+          "BINARY_OP_ADAPTIVE",
+          "LOAD_GLOBAL_MODULE",
+          "PRECALL_PYFUNC",
+          "CALL_PY_WITH_DEFAULTS",
+          "JUMP_BACKWARD_QUICK"
+        ]
+      }
     },
     {
       "id": "A1-C-DIS-002",
@@ -23,7 +34,16 @@
       "rfc_or_issue": "cp311_jit_A1_four_work_packages.md WP4.1",
       "owner": "CinderX JIT",
       "reviewer": "A1 RFC approved capability decision",
-      "scope": "C lane only; adaptive disassembly observable only"
+      "scope": "C lane only; adaptive disassembly observable only",
+      "execute_diagnostic": {
+        "required_substrings": [
+          "AssertionError",
+          "RESUME_QUICK",
+          "LOAD_FAST__LOAD_FAST",
+          "STORE_FAST__STORE_FAST",
+          "STORE_FAST__LOAD_FAST"
+        ]
+      }
     },
     {
       "id": "A1-C-DIS-003",
@@ -35,7 +55,18 @@
       "rfc_or_issue": "cp311_jit_A1_four_work_packages.md WP4.1",
       "owner": "CinderX JIT",
       "reviewer": "A1 RFC approved capability decision",
-      "scope": "C lane only; adaptive disassembly observable only"
+      "scope": "C lane only; adaptive disassembly observable only",
+      "execute_diagnostic": {
+        "required_substrings": [
+          "AssertionError",
+          "RESUME_QUICK",
+          "BINARY_OP_ADAPTIVE",
+          "LOAD_GLOBAL_MODULE",
+          "PRECALL_PYFUNC",
+          "CALL_PY_WITH_DEFAULTS",
+          "JUMP_BACKWARD_QUICK"
+        ]
+      }
     },
     {
       "id": "A1-C-DIS-004",
@@ -47,7 +78,16 @@
       "rfc_or_issue": "cp311_jit_A1_four_work_packages.md WP4.1",
       "owner": "CinderX JIT",
       "reviewer": "A1 RFC approved capability decision",
-      "scope": "C lane only; adaptive disassembly observable only"
+      "scope": "C lane only; adaptive disassembly observable only",
+      "execute_diagnostic": {
+        "required_substrings": [
+          "AssertionError",
+          "RESUME_QUICK",
+          "LOAD_FAST__LOAD_FAST",
+          "STORE_FAST__STORE_FAST",
+          "STORE_FAST__LOAD_FAST"
+        ]
+      }
     }
   ]
 }

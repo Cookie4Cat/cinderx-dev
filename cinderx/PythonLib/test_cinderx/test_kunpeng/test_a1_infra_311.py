@@ -71,9 +71,13 @@ class A1Infra311Test(unittest.TestCase):
                 "compiled": True,
                 "phase": "compiler",
                 "reason": None,
+                "opcode": None,
+                "offset": None,
             },
         )
         self.assertEqual(result["subscr"]["reason"], "REFUSE_SHAPE_EXECUTE_SURFACE")
+        self.assertIsInstance(result["subscr"]["opcode"], int)
+        self.assertIsInstance(result["subscr"]["offset"], int)
         self.assertFalse(result["subscr"]["eligible"])
         self.assertEqual(result["async"]["reason"], "REFUSE_SHAPE_ASYNC_CODE")
         self.assertFalse(result["async"]["eligible"])
@@ -123,3 +127,40 @@ class A1Infra311Test(unittest.TestCase):
         )
         self.assertEqual(result["type"], "TypeError")
         self.assertIn("expected a Python function", result["message"])
+
+    def test_execute_surface_and_per_code_entry_ledger(self):
+        result = self.run_child(
+            """
+            import dis, json
+            import _cinderx, cinderx
+            cinderx.init()
+            _cinderx.install_frame_evaluator()
+            import cinderjit
+
+            surface = [dis.opname[op] for op in cinderjit._jit311_execute_surface()]
+            cinderjit._jit311_reset_entry_ledger()
+
+            def target(value):
+                return value + 1
+
+            diagnostic = cinderjit._jit311_compile_diagnostic(target)
+            assert diagnostic["compiled"]
+            assert [target(value) for value in range(3)] == [1, 2, 3]
+            ledger = cinderjit._jit311_entry_ledger()
+            rows = [
+                row for row in ledger["entries"]
+                if row["filename"] == target.__code__.co_filename
+                and row["firstlineno"] == target.__code__.co_firstlineno
+                and row["qualname"] == target.__code__.co_qualname
+            ]
+            print(json.dumps({
+                "surface": surface,
+                "entries": rows[0]["entries"] if len(rows) == 1 else None,
+                "dropped": ledger["dropped"],
+            }, sort_keys=True))
+            """
+        )
+        self.assertIn("LOAD_ATTR", result["surface"])
+        self.assertNotIn("BINARY_SUBSCR", result["surface"])
+        self.assertEqual(result["entries"], 3)
+        self.assertEqual(result["dropped"], 0)
