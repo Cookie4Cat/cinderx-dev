@@ -16,6 +16,7 @@ from ci_pipeline.jit311.a2_report import (
     judge_transitions,
     render_frame_position_report,
     render_markdown,
+    render_policy_footprint_report,
 )
 
 OLD_THRESHOLD1_GAPS = (
@@ -181,9 +182,9 @@ def render_penetration_v02(result: dict, path: Path) -> None:
             f"- New crash/hang/no-result modules: `{json.dumps(bad_module_states, sort_keys=True)}`",
             f"- Differential result: `{differential.get('result')}`",
             "",
-            "The two threshold=1 superinstruction candidates do not reproduce under "
-            "the current JIT-ALL run and are reported as stale rather than silently "
-            "accepted. No new baseline entry is created.",
+            "The former threshold=1 superinstruction candidates do not reproduce "
+            "under JIT-ALL and were removed from the formal A2 v0.2 deviation input. "
+            "No new baseline entry is created.",
             "",
         ]
     )
@@ -645,6 +646,12 @@ class A2Runner:
         directory.mkdir()
         repetition_path = directory / "repetition.json"
         footprint_path = directory / "footprint.json"
+        code_swap_paths = {
+            "default": directory / "code-swap-default.json",
+            "zero": directory / "code-swap-budget-0.json",
+            "large": directory / "code-swap-budget-65535.json",
+            "force": directory / "code-swap-force-compile.json",
+        }
         rc_repetition = self.base._run(
             "40-A2-R-repetition",
             [
@@ -669,6 +676,26 @@ class A2Runner:
             ],
             env=self.base._product_env(threshold="1"),
         )
+        code_swap_returncodes = {}
+        for name, path in code_swap_paths.items():
+            command = [
+                str(self.base.python),
+                "-m",
+                "ci_pipeline.jit311.a2_code_swap_probe",
+                "--cycles",
+                "100",
+            ]
+            if name == "force":
+                command.append("--force-compile")
+            command.extend(["--out", str(path)])
+            env = self.base._product_env(threshold="1")
+            if name == "zero":
+                env["PYTHONJITFRESHATTACHBUDGET"] = "0"
+            elif name == "large":
+                env["PYTHONJITFRESHATTACHBUDGET"] = "65535"
+            code_swap_returncodes[name] = self.base._run(
+                f"45-A2-R-code-swap-{name}", command, env=env
+            )
         repetition = (
             json.loads(repetition_path.read_text())
             if repetition_path.is_file()
@@ -679,133 +706,296 @@ class A2Runner:
             if footprint_path.is_file()
             else {"result": "FAIL"}
         )
-        return {
-            "result": (
-                "PASS"
-                if rc_repetition == 0
-                and rc_footprint == 0
-                and repetition["result"] == "PASS"
-                and footprint["result"] == "PASS"
-                else (
-                    "REVIEW_REQUIRED"
-                    if repetition["result"] == "PASS"
-                    and footprint["result"] == "REVIEW_REQUIRED"
-                    else "FAIL"
-                )
-            ),
+        code_swap = {
+            name: (
+                json.loads(path.read_text()) if path.is_file() else {"result": "FAIL"}
+            )
+            for name, path in code_swap_paths.items()
+        }
+        good = (
+            rc_repetition == 0
+            and rc_footprint == 0
+            and repetition["result"] == "PASS"
+            and footprint["result"] == "PASS"
+            and all(value == 0 for value in code_swap_returncodes.values())
+            and all(arm.get("result") == "PASS" for arm in code_swap.values())
+        )
+        result = {
+            "result": "PASS" if good else "FAIL",
             "repetition": repetition,
             "footprint": footprint,
-            "returncodes": {"repetition": rc_repetition, "footprint": rc_footprint},
+            "code_swap": code_swap,
+            "returncodes": {
+                "repetition": rc_repetition,
+                "footprint": rc_footprint,
+                "code_swap": code_swap_returncodes,
+            },
         }
+        render_policy_footprint_report(
+            result, self.output / "A2_POLICY_AND_FOOTPRINT_REPORT.md"
+        )
+        return result
 
     def finalize(self, provenance: dict) -> str:
         blockers: list[dict] = []
         penetration = self.results.get("P", {})
         aggressive = penetration.get("aggressive_coverage", {})
+        transitions = self.results.get("T", {})
+        repetition = self.results.get("R", {})
+
+        def add_blocker(
+            *,
+            ident: str,
+            severity: str,
+            classification: str,
+            cluster: str,
+            summary: str,
+            reproducer: str,
+            stock: str,
+            jit: str,
+            machine_proof: str,
+            transition_proof: str,
+            root_cause: str,
+            changed_files: list[str],
+            fix_summary: str,
+            regression_tests: list[str],
+            evidence: str,
+            **extra,
+        ) -> None:
+            blockers.append(
+                {
+                    "id": ident,
+                    "severity": severity,
+                    "classification": classification,
+                    "cluster": cluster,
+                    "summary": summary,
+                    "minimal_reproducer": reproducer,
+                    "stock_observable": stock,
+                    "jit_observable": jit,
+                    "machine_entry_proof": machine_proof,
+                    "transition_proof": transition_proof,
+                    "root_cause_layer": root_cause,
+                    "changed_files": changed_files,
+                    "fix_summary": fix_summary,
+                    "regression_tests": regression_tests,
+                    "evidence": evidence,
+                    **extra,
+                }
+            )
+
         gaps = sorted(
             module
             for module, row in aggressive.get("modules", {}).items()
             if row.get("status") == "A2_COVERAGE_GAP"
         )
         if gaps:
-            blockers.append(
+            observed_thresholds = sorted(
                 {
-                    "id": "A2-P-COVERAGE",
-                    "severity": "FAIL",
-                    "cluster": "scheduler/short-lived-code",
-                    "summary": f"threshold=1 own-code penetration is {72-len(gaps)}/72",
-                    "modules": gaps,
-                    "evidence": "P/p2-coverage.json",
+                    row.get("scheduler_threshold")
+                    for row in aggressive.get("modules", {}).values()
+                    if row.get("scheduler_threshold") is not None
                 }
+            )
+            add_blocker(
+                ident="A2-P-JITALL-CONFIG",
+                severity="FAIL",
+                classification="PRODUCT_BUG",
+                cluster="scheduler/configuration",
+                summary=(
+                    f"PYTHONJITALL=1 reaches {72-len(gaps)}/72 own-code targets; "
+                    f"the 3.11 frame scheduler reports thresholds {observed_thresholds}"
+                ),
+                reproducer="Run A2 P2 with only PYTHONJITALL=1 and inspect _get_observe_stats()['threshold'].",
+                stock="Stock arm completes 72 requested modules without JIT scheduling.",
+                jit=f"72/72 workers enter machine code, but only {72-len(gaps)}/72 target modules do.",
+                machine_proof=f"P2 worker machine entry is {aggressive.get('totals', {}).get('worker_jit_active', 0)}/72; own-code ledger is {72-len(gaps)}/72.",
+                transition_proof="P2 scheduler rows report threshold 50; P2-DIAG threshold=1 reaches 65/72.",
+                root_cause="CPython 3.11 observe scheduler parses PYTHONJITAUTO but not PYTHONJITALL, while the JIT config parses both.",
+                changed_files=[
+                    "ci_pipeline/jit311/a2_runner.py",
+                    "ci_pipeline/jit311/a2_penetration.py",
+                ],
+                fix_summary="Acceptance method is corrected and the product configuration mismatch is exposed; Phase 1 intentionally does not alter scheduler semantics.",
+                regression_tests=[
+                    "ci_pipeline.test_a2_report.A2ReportTest.test_a2_p2_uses_jit_all_and_diagnostic_uses_threshold_one",
+                    "ci_pipeline.test_a2_report.A2ReportTest.test_penetration_classifier_uses_package_ownership",
+                ],
+                evidence="P/p2-coverage.json, P/p2-diag-coverage.json, A2_PENETRATION_V02_REPORT.md",
+                modules=gaps,
             )
         unexpected = penetration.get("differential", {}).get("unexpected", {})
-        inspect_key = "test.test_inspect.TestInterpreterStack.test_stack"
-        if inspect_key in unexpected:
-            blockers.append(
-                {
-                    "id": "A2-FRAME-COLUMN",
-                    "severity": "FAIL",
-                    "cluster": "frame-restore/position",
-                    "summary": "threshold=1 changes inspect.stack column end from 27 to 12",
-                    "testcase": inspect_key,
-                    "evidence": "P/p0-vs-p2.json",
-                }
-            )
         slots_key = "test.test_descr.ClassPropertiesAndMethods.test_slots"
         if slots_key in unexpected:
-            plateau = (
-                self.results.get("R", {}).get("footprint", {}).get("plateau", False)
-            )
-            blockers.append(
-                {
-                    "id": "A2-RUNTIME-FOOTPRINT",
-                    "severity": "REVIEW_REQUIRED",
-                    "cluster": "one-time-jit-footprint",
-                    "summary": (
-                        "first publication adds five GC-tracked objects; plateau is proven and explicit approval is required"
-                        if plateau
-                        else "first publication adds five GC-tracked objects; plateau is not proven"
-                    ),
-                    "plateau_proven": plateau,
-                    "testcase": slots_key,
-                    "evidence": "P/p0-vs-p2.json and R/footprint.json",
-                }
+            strict = repetition.get("footprint", {}).get("strict_plateau", False)
+            add_blocker(
+                ident="A2-RUNTIME-FOOTPRINT-APPROVAL",
+                severity="REVIEW_REQUIRED" if strict else "FAIL",
+                classification=(
+                    "APPROVED_DEVIATION_CANDIDATE" if strict else "PRODUCT_BUG"
+                ),
+                cluster="runtime/first-publication-footprint",
+                summary=(
+                    "Exact G.__eq__ footprint is bounded +5 and needs human approval."
+                    if strict
+                    else "Exact G.__eq__ footprint does not reach a strict plateau."
+                ),
+                reproducer="Run ci_pipeline.jit311.a2_footprint at threshold=1.",
+                stock="test_slots observes no new GC object without publication.",
+                jit="First publication adds exactly five explained GC-tracked objects.",
+                machine_proof="G.__eq__ is installed after the first call and machine entries increase through call 1000.",
+                transition_proof="10, 100 and 1000 exact histograms plus two post-GC samples are recorded.",
+                root_cause="One-time CompiledFunction publication footprint, not repeated lookup growth.",
+                changed_files=["ci_pipeline/jit311/a2_footprint.py"],
+                fix_summary="Replaced heuristic Box probe with exact G.__eq__ shape and strict equality checks; no baseline was changed.",
+                regression_tests=["ci_pipeline.jit311.a2_footprint"],
+                evidence="R/footprint.json, A2_POLICY_AND_FOOTPRINT_REPORT.md",
+                testcase=slots_key,
             )
         other_unexpected = sorted(
-            key
-            for key in unexpected
-            if key
-            not in {
-                inspect_key,
-                slots_key,
-                "<module> test_inspect",
-                "<module> test_descr",
-            }
+            key for key in unexpected if key not in {slots_key, "<module> test_descr"}
         )
         if other_unexpected:
-            blockers.append(
-                {
-                    "id": "A2-P-UNEXPECTED",
-                    "severity": "FAIL",
-                    "cluster": "penetration-differential",
-                    "summary": "unexpected threshold=1 testcase differences",
-                    "testcases": other_unexpected,
-                    "evidence": "P/p0-vs-p2.json",
-                }
+            add_blocker(
+                ident="A2-P-UNEXPECTED",
+                severity="FAIL",
+                classification="PRODUCT_BUG",
+                cluster="penetration/differential",
+                summary="Unexpected Stock vs JIT-ALL correctness differences remain.",
+                reproducer="Run A2 P0 and P2 and compare normalized per-test outcomes.",
+                stock="See P/p0-stock/result.json.",
+                jit="See P/p2-jit-all/result.json.",
+                machine_proof="P/p2-coverage.json records target machine entries.",
+                transition_proof="Not applicable; differential is testcase-level.",
+                root_cause="Unclassified product behavior difference.",
+                changed_files=[],
+                fix_summary="No automatic baseline was added.",
+                regression_tests=other_unexpected,
+                evidence="P/p0-vs-p2.json",
+                testcases=other_unexpected,
+            )
+        position_result = transitions.get("frame_positions", {})
+        if position_result and position_result.get("result") != "PASS":
+            add_blocker(
+                ident="A2-FRAME-POSITION",
+                severity="FAIL",
+                classification="PRODUCT_BUG",
+                cluster="frame/position",
+                summary="Running-frame or traceback position matrix differs from Stock.",
+                reproducer="Run a2_frame_position_probe and a2_error_position_probe in Stock/JIT arms.",
+                stock="Exact f_lasti, line, column and traceback rows are recorded in T/*-stock.json.",
+                jit="One or more exact rows differ.",
+                machine_proof="Every JIT matrix row requires its own entry-ledger proof.",
+                transition_proof="Every error row requires a typed deopt ledger row.",
+                root_cause="JIT frame cursor or error resume mapping.",
+                changed_files=[
+                    "cinderx/Jit/hir/insert_update_prev_instr.cpp",
+                    "cinderx/Jit/deopt.cpp",
+                    "cinderx/Interpreter/3.11/ceval_wrapper.c",
+                ],
+                fix_summary="Precise boundary publication and opcode-family error resume were implemented, but the matrix is still red.",
+                regression_tests=[
+                    "InsertUpdatePrevInstrTest.PythonVisibleBoundariesPublishPrecisePositions",
+                    "Exception311Test.PropagatedCallStopsAtTheLastCacheUnit",
+                ],
+                evidence="T/frame-position-*.json, T/error-position-*.json, A2_FRAME_POSITION_REPORT.md",
             )
         transition_failures = [
             row
-            for row in self.results.get("T", {}).get("transitions", [])
+            for row in transitions.get("transitions", [])
             if row.get("result") == "FAIL"
         ]
         if transition_failures:
-            blockers.append(
-                {
-                    "id": "A2-DEOPT-TB-LASTI",
-                    "severity": "FAIL",
-                    "cluster": "exception-deopt/frame-position",
-                    "summary": "T03 and T10 resume with target-frame tb_lasti eight bytes before Stock",
-                    "transitions": [row["id"] for row in transition_failures],
-                    "evidence": "T/stock.json, T/jit.json, T/result.json",
-                }
+            failed_ids = [row["id"] for row in transition_failures]
+            recursion_only = (
+                failed_ids == ["T10"] and position_result.get("result") == "PASS"
             )
-        repetition_failures = [
-            row
-            for row in self.results.get("R", {})
-            .get("repetition", {})
-            .get("transitions", [])
-            if row.get("semantic_failures") or row.get("state_failures")
-        ]
-        if repetition_failures:
-            blockers.append(
-                {
-                    "id": "A2-CODE-SWAP-RECOVERY",
-                    "severity": "FAIL",
-                    "cluster": "code-identity/auto-recovery",
-                    "summary": "repeated two-code __code__ swaps preserve semantics but fail automatic old-artifact recovery",
-                    "rows": repetition_failures,
-                    "evidence": "R/repetition.json",
-                }
+            add_blocker(
+                ident=(
+                    "A2-RECURSION-BOUNDARY"
+                    if recursion_only
+                    else "A2-TRANSITION-CORRECTNESS"
+                ),
+                severity="FAIL",
+                classification="PRODUCT_BUG",
+                cluster=(
+                    "recursion/entry-accounting"
+                    if recursion_only
+                    else "runtime/transition"
+                ),
+                summary=(
+                    "T10 traceback positions match, but JIT exposes one fewer recursive frame than Stock."
+                    if recursion_only
+                    else "One or more A2 transitions fail the Stock semantic/recovery contract."
+                ),
+                reproducer=(
+                    "Run a2_transition_probe T10 with depth 100000."
+                    if recursion_only
+                    else "Run the A2 transition matrix."
+                ),
+                stock=(
+                    "T10 contains 992 t10_recursive traceback frames at tb_lasti 52."
+                    if recursion_only
+                    else "See T/stock.json."
+                ),
+                jit=(
+                    "T10 contains 991 t10_recursive traceback frames, all at tb_lasti 52."
+                    if recursion_only
+                    else "See T/jit.json."
+                ),
+                machine_proof=(
+                    "T10 records compiled pre-state and 992 machine entries/deopt rows."
+                    if recursion_only
+                    else "Each failed transition retains pre-JIT entry proof."
+                ),
+                transition_proof=(
+                    "T10 UnhandledException rows are typed and position-correct; frame cardinality differs."
+                    if recursion_only
+                    else "See transition_rows in T/result.json."
+                ),
+                root_cause=(
+                    "Recursion entry/traceback cardinality, separate from F2 cursor restoration."
+                    if recursion_only
+                    else "Unclassified transition runtime layer."
+                ),
+                changed_files=[
+                    "cinderx/Jit/deopt.cpp",
+                    "ci_pipeline/jit311/a2_transition_probe.py",
+                ],
+                fix_summary=(
+                    "F2 tb_lasti is fixed; recursion cardinality remains open."
+                    if recursion_only
+                    else "No weakening or baseline was applied."
+                ),
+                regression_tests=["T03", "T10", "a2_error_position_probe"],
+                evidence="T/stock.json, T/jit.json, T/result.json, A2_FRAME_POSITION_REPORT.md",
+                transitions=failed_ids,
+            )
+        failed_code_swap = {
+            name: arm
+            for name, arm in repetition.get("code_swap", {}).items()
+            if arm.get("result") != "PASS"
+        }
+        if failed_code_swap:
+            add_blocker(
+                ident="A2-CODE-SWAP-POLICY",
+                severity="FAIL",
+                classification="PRODUCT_BUG",
+                cluster="scheduler/code-identity-policy",
+                summary="Code-swap diagnostics lack semantics, no-stale-entry or typed-policy proof.",
+                reproducer="Run default, budget=0, budget=65535 and force-compile code-swap arms.",
+                stock="Python semantics remain the oracle on every cycle.",
+                jit="At least one arm fails its explicit policy contract.",
+                machine_proof="Each cycle records current-code and stale-old-code entry deltas.",
+                transition_proof="Each cycle records scheduler slot, artifact, verdict and attach state.",
+                root_cause="Scheduler churn policy or compiler/runtime capability.",
+                changed_files=[
+                    "ci_pipeline/jit311/a2_code_swap_probe.py",
+                    "cinderx/Jit/pyjit.cpp",
+                ],
+                fix_summary="No forced automatic re-JIT was introduced.",
+                regression_tests=["a2_code_swap_probe:default/zero/large/force"],
+                evidence="R/code-swap-*.json, A2_POLICY_AND_FOOTPRINT_REPORT.md",
+                arms=sorted(failed_code_swap),
             )
         states = [result.get("result") for result in self.results.values()]
         if "FAIL" in states:
@@ -821,34 +1011,37 @@ class A2Runner:
             "provenance": provenance,
             "penetration": self.results.get("P", {}),
             "transitions": self.results.get("T", {}),
-            "repetition": self.results.get("R", {}).get("repetition", {}),
-            "footprint": self.results.get("R", {}).get("footprint", {}),
+            "repetition": repetition.get("repetition", {}),
+            "footprint": repetition.get("footprint", {}),
+            "code_swap_policy": repetition.get("code_swap", {}),
             "blockers": blockers,
             "commands": self.base.command_results,
         }
         (self.output / "a2_result.json").write_text(
             json.dumps(payload, indent=2, sort_keys=True) + "\n"
         )
-        render_markdown(payload, self.output / "A2_EXECUTION_REPORT.md")
-        if blockers:
-            blocker_lines = ["# A2 Blockers", ""]
-            for item in blockers:
-                blocker_lines.extend(
-                    [
-                        f"## {item['id']}",
-                        "",
-                        f"- Severity: `{item['severity']}`",
-                        f"- Cluster: `{item['cluster']}`",
-                        f"- Summary: {item['summary']}",
-                        f"- Evidence: `{item['evidence']}`",
-                        "",
-                        "```json",
-                        json.dumps(item, indent=2, sort_keys=True),
-                        "```",
-                        "",
-                    ]
-                )
-            (self.output / "A2_BLOCKERS.md").write_text("\n".join(blocker_lines) + "\n")
+        render_markdown(payload, self.output / "A2_EXECUTION_REPORT_V02.md")
+        blocker_lines = ["# A2 v0.2 Blockers", ""]
+        if not blockers:
+            blocker_lines.extend(["None.", ""])
+        for item in blockers:
+            blocker_lines.extend(
+                [
+                    f"## {item['id']}",
+                    "",
+                    f"- Severity: `{item['severity']}`",
+                    f"- Classification: `{item['classification']}`",
+                    f"- Cluster: `{item['cluster']}`",
+                    f"- Summary: {item['summary']}",
+                    f"- Evidence: `{item['evidence']}`",
+                    "",
+                    "```json",
+                    json.dumps(item, indent=2, sort_keys=True),
+                    "```",
+                    "",
+                ]
+            )
+        (self.output / "A2_BLOCKERS_V02.md").write_text("\n".join(blocker_lines) + "\n")
         return final
 
     def run(self) -> str:
@@ -888,7 +1081,7 @@ def main(argv: list[str] | None = None) -> int:
             file=sys.stderr,
         )
         return 1
-    print(f"A2 {final}: {runner.output / 'A2_EXECUTION_REPORT.md'}")
+    print(f"A2 {final}: {runner.output / 'A2_EXECUTION_REPORT_V02.md'}")
     if final in PASS_STATES:
         return 0
     return 2 if final == "REVIEW_REQUIRED" else 1

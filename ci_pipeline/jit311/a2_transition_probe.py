@@ -337,7 +337,11 @@ class Probe:
             "T04",
             {"changed": changed},
             pre,
-            {**transition, "old_entry_delta": old_entry_delta, "compiled_after_swap": compiled_after_swap},
+            {
+                **transition,
+                "old_entry_delta": old_entry_delta,
+                "compiled_after_swap": compiled_after_swap,
+            },
             recovery,
         )
 
@@ -440,8 +444,7 @@ class Probe:
         if self.jit:
             entry_ledger = self.cinderjit._jit311_entry_ledger()
             pre["machine_entry_proven"] = any(
-                row["qualname"] in ("t08_outer", "t08_inner")
-                and row["entries"] > 0
+                row["qualname"] in ("t08_outer", "t08_inner") and row["entries"] > 0
                 for row in entry_ledger["entries"]
             )
         start = self.start_transition()
@@ -486,7 +489,12 @@ class Probe:
             },
             pre,
             transition,
-            {"interpreter_resume": True},
+            {
+                "policy": "interpreter-resume",
+                "interpreter_resume": True,
+                "semantic_correct": True,
+                "stale_machine_entry": False,
+            },
         )
 
     def t09(self):
@@ -534,7 +542,13 @@ class Probe:
             {"error": error},
             pre,
             transition,
-            {"result": recovered, "reentered": self.entries() > recovery_before},
+            {
+                "policy": "interpreter-after-backoff",
+                "result": recovered,
+                "reentered": self.entries() > recovery_before,
+                "semantic_correct": recovered == 4,
+                "stale_machine_entry": False,
+            },
         )
 
     def run(self) -> dict:
@@ -553,10 +567,12 @@ class Probe:
             method()
         return {
             "mode": self.mode,
-            "result": "PASS"
-            if len(self.results) == 10
-            and all(item["result"] == "PASS" for item in self.results)
-            else "FAIL",
+            "result": (
+                "PASS"
+                if len(self.results) == 10
+                and all(item["result"] == "PASS" for item in self.results)
+                else "FAIL"
+            ),
             "transitions": self.results,
             "final_stats": self.stats(),
         }

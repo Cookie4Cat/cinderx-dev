@@ -139,19 +139,33 @@ class A2ReportTest(unittest.TestCase):
         with tempfile.TemporaryDirectory() as temporary:
             directory = Path(temporary)
             left, right = directory / "left.json", directory / "right.json"
+            deviations = directory / "deviations.json"
             left.write_text(json.dumps(stock))
             right.write_text(json.dumps(aggressive))
-            report = compare_penetration(
-                left, right, DATA / "a2_compatibility_deviations.json"
+            deviations.write_text(
+                json.dumps(
+                    {
+                        "deviations": [
+                            {
+                                "testcase": testcase,
+                                "stock": "pass",
+                                "aggressive": "failure",
+                                "fingerprint": [
+                                    "AssertionError",
+                                    "RESUME_QUICK",
+                                    "LOAD_FAST__LOAD_FAST",
+                                    "STORE_FAST__STORE_FAST",
+                                ],
+                            }
+                        ]
+                    }
+                )
             )
+            report = compare_penetration(left, right, deviations)
             aggressive["diagnostics"][testcase] = "AssertionError unrelated"
             right.write_text(json.dumps(aggressive))
-            wrong = compare_penetration(
-                left, right, DATA / "a2_compatibility_deviations.json"
-            )
-        self.assertEqual(report["result"], "REVIEW_REQUIRED")
-        # The other approved superinstruction case is stale in this synthetic
-        # one-case input; the matching case itself must not be unexpected.
+            wrong = compare_penetration(left, right, deviations)
+        self.assertEqual(report["result"], "PASS_WITH_APPROVED_DEVIATIONS")
         self.assertNotIn(testcase, report["unexpected"])
         self.assertEqual(wrong["result"], "FAIL")
         self.assertIn(testcase, wrong["unexpected"])
@@ -166,8 +180,14 @@ class A2ReportTest(unittest.TestCase):
             stock_rows.append({"id": spec["id"], "semantic": semantic})
             required = spec["requires_transition_reason"]
             recovery = (
-                {"interpreter_resume": True}
-                if spec["recovery"] == "interpreter-resume"
+                {
+                    "policy": spec["recovery"],
+                    "interpreter_resume": True,
+                    "semantic_correct": True,
+                    "stale_machine_entry": False,
+                }
+                if spec["recovery"]
+                in ("interpreter-resume", "interpreter-after-backoff")
                 else {"reentered": True}
             )
             jit_rows.append(

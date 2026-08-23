@@ -350,6 +350,50 @@ void Ci_Observe311_OnCodeDeath(PyCodeObject* code) {
   }
 }
 
+int Ci_Observe311_GetCodeState(
+    PyCodeObject* code,
+    uint64_t* count,
+    int* dispatched,
+    int* attachable) {
+  if (count != NULL) {
+    *count = 0;
+  }
+  if (dispatched != NULL) {
+    *dispatched = 0;
+  }
+  if (attachable != NULL) {
+    *attachable = 0;
+  }
+  if (code == NULL || ci_observe_capacity == 0) {
+    return 0;
+  }
+  uintptr_t key = (uintptr_t)code;
+  size_t probe = slot_index(key, ci_observe_capacity);
+  for (size_t steps = 0; steps < ci_observe_capacity; steps++) {
+    Ci_ObserveSlot* slot = &ci_observe_table[probe];
+    if (slot->key == key) {
+      if (slot->dead) {
+        return 0;
+      }
+      if (count != NULL) {
+        *count = slot->count;
+      }
+      if (dispatched != NULL) {
+        *dispatched = slot->dispatched;
+      }
+      if (attachable != NULL) {
+        *attachable = slot->attachable;
+      }
+      return 1;
+    }
+    if (slot->key == 0) {
+      return 0;
+    }
+    probe = (probe + 1) & (ci_observe_capacity - 1);
+  }
+  return 0;
+}
+
 // Guarantee that this code object's death will be reported.
 //
 // The notice arrives through the code-extra free function, which CPython

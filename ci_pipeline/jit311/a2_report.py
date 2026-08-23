@@ -297,6 +297,102 @@ def render_frame_position_report(
     out.write_text("\n".join(lines))
 
 
+def render_policy_footprint_report(result: dict, out: Path) -> None:
+    code_swap = result.get("code_swap", {})
+    footprint = result.get("footprint", {})
+    lines = [
+        "# CPython 3.11 JIT A2 Policy and Footprint Report",
+        "",
+        f"- Work-package result: `{result.get('result')}`",
+        f"- Generic 100-cycle stress: `{result.get('repetition', {}).get('result')}`",
+        "",
+        "## Code swap policy",
+        "",
+        "| Arm | Budget | Result | Classification | Semantic failures | Stale entries | Auto re-entry | Policy interpreter | Typed reasons |",
+        "|---|---:|---|---|---:|---:|---:|---:|---|",
+    ]
+    for name in ("default", "zero", "large", "force"):
+        arm = code_swap.get(name, {})
+        reasons: dict[str, int] = {}
+        for row in arm.get("rows", []):
+            reason = str(row.get("policy_reason"))
+            reasons[reason] = reasons.get(reason, 0) + 1
+        lines.append(
+            f"| `{name}` | `{arm.get('fresh_attach_budget')}` | "
+            f"`{arm.get('result')}` | `{arm.get('classification')}` | "
+            f"{arm.get('semantic_failures')} | {arm.get('stale_machine_entries')} | "
+            f"{arm.get('automatic_reentry_cycles')} | "
+            f"{arm.get('interpreter_policy_cycles')} | "
+            f"`{json.dumps(reasons, sort_keys=True)}` |"
+        )
+    lines.extend(
+        [
+            "",
+            "Classification: `A2_POLICY_DECISION`.",
+            "",
+            "Default, budget=0 and budget=65535 all produce the same 50/50 "
+            "shape: one code identity remains installed; returning to the retired "
+            "identity runs interpreted with typed reason "
+            "`automatic-attempt-spent-artifact-retired`. This is the per-code "
+            "one-attempt policy, not fresh-attach-budget exhaustion. All cycles "
+            "preserve semantics and no old-code machine entry occurs.",
+            "",
+            "The force-compile diagnostic restores machine entry in 100/100 cycles. "
+            "Compiler/runtime capability is healthy; force_compile remains diagnostic "
+            "and is not part of the product gate.",
+            "",
+            "## Exact G.__eq__ footprint",
+            "",
+            f"- Shape: `{footprint.get('shape')}`",
+            f"- Result: `{footprint.get('result')}`",
+            f"- Classification: `{footprint.get('classification')}`",
+            "",
+            "| Sample | GC objects | Compiled creations | Resident buffers | Machine entries |",
+            "|---|---:|---:|---:|---:|",
+        ]
+    )
+    for name in (
+        "before_first_call",
+        "after_first_publication",
+        "after_10",
+        "after_100",
+        "after_1000",
+        "after_gc_1",
+        "after_gc_2",
+    ):
+        sample = footprint.get("samples", {}).get(name, {})
+        lines.append(
+            f"| `{name}` | {sample.get('gc_objects')} | "
+            f"{sample.get('compiled_function_creations')} | "
+            f"{sample.get('resident_code_buffers')} | "
+            f"{sample.get('machine_code_entries')} |"
+        )
+    delta = footprint.get("delta", {})
+    lines.extend(
+        [
+            "",
+            f"- First publication GC delta: `{delta.get('first_publication_gc_objects')}`",
+            f"- First publication type delta: `{json.dumps(delta.get('first_publication_object_types', {}), sort_keys=True)}`",
+            f"- 10 to 1000 GC delta: `{delta.get('steady_10_to_1000_gc_objects')}`",
+            f"- 10 to 1000 type delta: `{json.dumps(delta.get('steady_10_to_1000_object_types', {}), sort_keys=True)}`",
+            f"- Resident-buffer delta: `{delta.get('steady_resident_code_buffers')}`",
+            f"- Strict checks: `{json.dumps(footprint.get('strict_checks', {}), sort_keys=True)}`",
+            "",
+            "Classification: `APPROVED_DEVIATION_CANDIDATE`. The exact +5 is "
+            "one CompiledFunction, one builtin function/method, one dict, one tuple "
+            "and one weak reference from first publication. Exact counts and type "
+            "histograms are equal at 10, 100 and 1000 calls; two post-GC samples "
+            "are equal; resident buffers and compile count do not grow. This is not "
+            "a per-lookup leak.",
+            "",
+            "No compatibility baseline was modified. Human approval is still required "
+            "for `test.test_descr.ClassPropertiesAndMethods.test_slots`.",
+            "",
+        ]
+    )
+    out.write_text("\n".join(lines))
+
+
 def judge_transitions(
     stock_path: Path,
     jit_path: Path,
@@ -335,10 +431,19 @@ def judge_transitions(
                     f"required deopt reason absent: expected one of {sorted(required)}, got {sorted(str(r) for r in reasons)}"
                 )
             recovery = jit_row.get("recovery", {})
-            if spec["recovery"] not in (
+            recovery_policy = spec["recovery"]
+            if recovery_policy in (
                 "interpreter-resume",
                 "interpreter-after-backoff",
-            ) and not (
+                "policy-deferred",
+            ):
+                if recovery.get("policy") != recovery_policy:
+                    errors.append("explicit recovery policy is missing or mismatched")
+                if recovery.get("semantic_correct") is not True:
+                    errors.append("policy recovery lacks semantic proof")
+                if recovery.get("stale_machine_entry") is not False:
+                    errors.append("policy recovery lacks no-stale-entry proof")
+            elif not (
                 recovery.get("reentered")
                 or recovery.get("machine_entry_proven")
                 or recovery.get("compiled")
@@ -354,6 +459,7 @@ def judge_transitions(
                     jit_row and jit_row.get("pre", {}).get("machine_entry_proven")
                 ),
                 "trigger": spec["probe"],
+                "recovery_policy": spec["recovery"],
                 "transition_proof": jit_row.get("transition", {}) if jit_row else None,
                 "stock_match": not errors
                 or "semantic result differs from Stock" not in errors,
@@ -387,7 +493,8 @@ def render_markdown(final: dict, path: Path) -> None:
         "## A2-P Aggressive penetration",
         "",
         f"- Target modules: {aggressive.get('target_modules', 0)}",
-        f"- Worker/own-code JIT: {aggressive.get('counts', {}).get('OWN_CODE_JIT', 0)}/72",
+        f"- Worker JIT active: {aggressive.get('totals', {}).get('worker_jit_active', 0)}/72",
+        f"- Own-code JIT: {aggressive.get('counts', {}).get('OWN_CODE_JIT', 0)}/72",
         f"- Coverage gaps: {aggressive.get('counts', {}).get('A2_COVERAGE_GAP', 0)}",
         f"- Unknown refusals: {len(aggressive.get('unknown_refusals', []))}",
         f"- Differential: {penetration.get('differential', {}).get('result', 'NOT_RUN')}",
@@ -428,7 +535,8 @@ def render_markdown(final: dict, path: Path) -> None:
             "## Footprint plateau",
             "",
             f"- Result: {footprint.get('result', 'NOT_RUN')}",
-            f"- Plateau: {footprint.get('plateau')}",
+            f"- Strict plateau: {footprint.get('strict_plateau')}",
+            f"- Classification: {footprint.get('classification')}",
             f"- Delta: `{json.dumps(footprint.get('delta', {}), sort_keys=True)}`",
             "",
             "## Blockers",

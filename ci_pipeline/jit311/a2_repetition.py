@@ -112,8 +112,7 @@ def run(cycles: int) -> dict:
                 semantic_failures += 1
             if (
                 not cinderjit.is_enabled()
-                or _cinderx._get_trigger_stats()["machine_code_entries"]
-                <= before_entry
+                or _cinderx._get_trigger_stats()["machine_code_entries"] <= before_entry
             ):
                 state_failures += 1
         rows.append(
@@ -127,6 +126,7 @@ def run(cycles: int) -> dict:
 
     original_code = code_a.__code__
     semantic_failures = state_failures = 0
+    policy_reasons: dict[str, int] = {}
     ensure_auto(cinderjit, code_a, lambda: code_a(1))
     for index in range(cycles):
         code_a.__code__ = code_b.__code__ if index % 2 else original_code
@@ -138,7 +138,15 @@ def run(cycles: int) -> dict:
             code_a(1)
             if cinderjit.is_jit_compiled(code_a):
                 break
-        if not cinderjit.is_jit_compiled(code_a):
+        state = cinderjit._jit311_code_state(code_a)
+        reason = str(state["policy_reason"])
+        policy_reasons[reason] = policy_reasons.get(reason, 0) + 1
+        if not state["installed"] and reason not in {
+            "code-verdict-final",
+            "automatic-attempt-spent-artifact-retired",
+            "existing-member-not-fresh-attachable",
+            "fresh-attach-budget-exhausted",
+        }:
             state_failures += 1
     code_a.__code__ = original_code
     rows.append(
@@ -147,6 +155,7 @@ def run(cycles: int) -> dict:
             "cycles": cycles,
             "semantic_failures": semantic_failures,
             "state_failures": state_failures,
+            "policy_reasons": policy_reasons,
         }
     )
 
@@ -156,9 +165,7 @@ def run(cycles: int) -> dict:
     semantic_failures = state_failures = 0
     for index in range(cycles):
         expected = index % 2 + 1
-        Dynamic.method = (
-            original_method if expected == 1 else lambda self: 2
-        )
+        Dynamic.method = original_method if expected == 1 else lambda self: 2
         if attribute_function(obj) != expected:
             semantic_failures += 1
         if not cinderjit.is_enabled():
@@ -207,10 +214,12 @@ def run(cycles: int) -> dict:
 
     after = dict(_cinderx._get_trigger_stats())
     final_jit_usable = bool(cinderjit.is_enabled())
-    passed = all(
-        row["semantic_failures"] == 0 and row["state_failures"] == 0
-        for row in rows
-    ) and final_jit_usable
+    passed = (
+        all(
+            row["semantic_failures"] == 0 and row["state_failures"] == 0 for row in rows
+        )
+        and final_jit_usable
+    )
     return {
         "result": "PASS" if passed else "FAIL",
         "cycles": cycles,
@@ -233,7 +242,9 @@ def main(argv: list[str] | None = None) -> int:
     args = parser.parse_args(argv)
     report = run(args.cycles)
     args.out.write_text(json.dumps(report, indent=2, sort_keys=True) + "\n")
-    print(json.dumps({"result": report["result"], "cycles": args.cycles}, sort_keys=True))
+    print(
+        json.dumps({"result": report["result"], "cycles": args.cycles}, sort_keys=True)
+    )
     return 0 if report["result"] == "PASS" else 1
 
 

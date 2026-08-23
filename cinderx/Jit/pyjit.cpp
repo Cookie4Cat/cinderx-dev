@@ -2632,6 +2632,87 @@ PyObject* jit311_compile_diagnostic(PyObject* /* self */, PyObject* arg) {
   return result.release();
 }
 
+PyObject* jit311_code_state(PyObject* /* self */, PyObject* arg) {
+  BorrowedRef<PyFunctionObject> func = get_func_arg("_jit311_code_state", arg);
+  if (func == nullptr) {
+    return nullptr;
+  }
+  BorrowedRef<PyCodeObject> code{func->func_code};
+  CodeExtra* extra = codeExtraIfExists(code);
+  bool has_artifact = Ci_JitShell311_CodeHasArtifact(code);
+  bool auto_disabled =
+      extra != nullptr && Ci_code_extra_jit311_auto_disabled(extra);
+  auto* artifact = extra == nullptr
+      ? nullptr
+      : reinterpret_cast<CompiledFunction*>(
+            _Py_atomic_load_ptr_acquire(&extra->jit_compiled));
+  bool artifact_member =
+      artifact != nullptr && artifact->functions().contains(func);
+  uint32_t attach_count =
+      extra != nullptr ? Ci_code_extra_jit311_attach_count(extra) : 0;
+  uint32_t attach_budget = getConfig().fresh_attach_budget;
+  uint64_t scheduler_count = 0;
+  int scheduler_dispatched = 0;
+  int scheduler_attachable = 0;
+  bool scheduler_observed = Ci_Observe311_GetCodeState(
+      code,
+      &scheduler_count,
+      &scheduler_dispatched,
+      &scheduler_attachable);
+  bool installed = Ci_JitShell311_InstalledArtifact(func) != nullptr;
+  const char* policy_reason = "automatic-attempt-available";
+  if (installed) {
+    policy_reason = "installed";
+  } else if (auto_disabled) {
+    policy_reason = "code-verdict-final";
+  } else if (has_artifact && artifact_member) {
+    policy_reason = "existing-member-not-fresh-attachable";
+  } else if (has_artifact && attach_count >= attach_budget) {
+    policy_reason = "fresh-attach-budget-exhausted";
+  } else if (has_artifact) {
+    policy_reason = "artifact-awaiting-fresh-attach";
+  } else if (scheduler_dispatched) {
+    policy_reason = "automatic-attempt-spent-artifact-retired";
+  } else if (extra == nullptr) {
+    policy_reason = "code-unobserved";
+  }
+
+  return Py_BuildValue(
+      "{s:O,s:O,s:O,s:O,s:I,s:I,s:O,s:K,s:O,s:O,s:s,s:K,s:K,s:i,s:O}",
+      "installed",
+      installed ? Py_True : Py_False,
+      "code_has_artifact",
+      has_artifact ? Py_True : Py_False,
+      "auto_jit_disabled",
+      auto_disabled ? Py_True : Py_False,
+      "artifact_member",
+      artifact_member ? Py_True : Py_False,
+      "fresh_attach_count",
+      attach_count,
+      "fresh_attach_budget",
+      attach_budget,
+      "scheduler_observed",
+      scheduler_observed ? Py_True : Py_False,
+      "scheduler_count",
+      static_cast<unsigned long long>(scheduler_count),
+      "scheduler_dispatched",
+      scheduler_dispatched ? Py_True : Py_False,
+      "scheduler_attachable",
+      scheduler_attachable ? Py_True : Py_False,
+      "policy_reason",
+      policy_reason,
+      "function_id",
+      static_cast<unsigned long long>(
+          reinterpret_cast<std::uintptr_t>(func.get())),
+      "code_id",
+      static_cast<unsigned long long>(
+          reinterpret_cast<std::uintptr_t>(code.get())),
+      "code_firstlineno",
+      code->co_firstlineno,
+      "code_qualname",
+      code->co_qualname);
+}
+
 PyObject* jit311_execute_surface(PyObject* /* self */, PyObject* /* arg */) {
   Ref<> result = Ref<>::steal(PyList_New(0));
   if (result == nullptr) {
@@ -4668,6 +4749,11 @@ PyMethodDef jit_methods_311_canary[] = {
      METH_O,
      PyDoc_STR("Attempt CPython 3.11 compilation and return a private, typed "
                "compile/refusal classification for a Python function.")},
+    {"_jit311_code_state",
+     jit311_code_state,
+     METH_O,
+     PyDoc_STR("Return the private CPython 3.11 automatic-JIT policy state "
+               "for a Python function.")},
     {"_jit311_execute_surface",
      jit311_execute_surface,
      METH_NOARGS,

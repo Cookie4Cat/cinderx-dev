@@ -90,6 +90,14 @@ void Ci_Observe311_OnFrame(
 // count, result).
 PyObject* Ci_Observe311_Stats(void);
 
+// Read the scheduler slot for one live code object without creating it.
+// Returns 1 when a slot exists, 0 otherwise. Output pointers are optional.
+int Ci_Observe311_GetCodeState(
+    PyCodeObject* code,
+    uint64_t* count,
+    int* dispatched,
+    int* attachable);
+
 // Release all observer-owned weakrefs, event references, tables and files.
 // This also resets configuration so a later interpreter can configure anew.
 void Ci_Observe311_Finalize(void);
