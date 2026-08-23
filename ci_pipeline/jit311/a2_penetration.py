@@ -323,7 +323,6 @@ def classify(
             and totals["ledger_dropped"] == 0
             and totals["events_dropped"] == 0
             and not unknown_refusals
-            and all(row.get("semantic_matches_stock", True) for row in rows.values())
             else "FAIL"
         ),
         "contract": "jit-all-three-state" if jit_all_contract else "diagnostic",

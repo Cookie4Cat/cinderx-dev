@@ -580,6 +580,65 @@ class A2ReportTest(unittest.TestCase):
         self.assertEqual(report["counts"]["EXPECTED_SAFE_REFUSAL"], 24)
         self.assertEqual(report["counts"].get("COVERAGE_GAP", 0), 0)
 
+    def test_jitall_coverage_defers_own_code_semantics_to_exact_differential(self):
+        targets = [
+            line.strip()
+            for line in (DATA / "a1_compile_all_modules.txt").read_text().splitlines()
+            if line.strip() and not line.startswith("#")
+        ]
+        with tempfile.TemporaryDirectory() as temporary:
+            directory = Path(temporary)
+            journal = directory / "journal"
+            journal.mkdir()
+            stock_modules = {target: "pass" for target in targets}
+            jit_modules = dict(stock_modules)
+            jit_modules[targets[0]] = "fail"
+            for index, target in enumerate(targets):
+                filename = f"/usr/lib/python3.11/test/{target}.py"
+                (journal / f"{index}.json").write_text(
+                    json.dumps(
+                        {
+                            "target_module": "test." + target,
+                            "trigger": {"machine_code_entries": 1},
+                            "observe": {
+                                "threshold": 0,
+                                "threshold_source": "shared-jit-config",
+                                "events": [
+                                    {
+                                        "filename": filename,
+                                        "qualname": "witness",
+                                        "result": "installed",
+                                    }
+                                ],
+                                "events_dropped": 0,
+                            },
+                            "ownership": {
+                                "module_file": filename,
+                                "spec_origin": filename,
+                                "package_roots": [],
+                            },
+                            "entry_ledger": [
+                                {"filename": filename, "entries": 1}
+                            ],
+                            "entry_ledger_dropped": 0,
+                        }
+                    )
+                )
+            result_path = directory / "result.json"
+            stock_path = directory / "stock.json"
+            result_path.write_text(json.dumps({"modules": jit_modules}))
+            stock_path.write_text(json.dumps({"modules": stock_modules}))
+            report = classify(
+                journal,
+                DATA / "a1_compile_all_modules.txt",
+                result_path,
+                stock_result_path=stock_path,
+                jit_all_contract=True,
+            )
+        self.assertEqual(report["result"], "PASS")
+        self.assertFalse(report["modules"][targets[0]]["semantic_matches_stock"])
+        self.assertEqual(report["modules"][targets[0]]["status"], "OWN_CODE_JIT")
+
     def test_penetration_classifier_rejects_unowned_rows(self):
         targets = [
             line.strip()
