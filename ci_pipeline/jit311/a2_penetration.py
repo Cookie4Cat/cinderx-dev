@@ -43,6 +43,27 @@ def install_hook() -> None:
     _cinderx.install_frame_evaluator()
     cinderjit._jit311_reset_entry_ledger()
 
+    def ownership() -> dict:
+        target = worker_target_module()
+        module = sys.modules.get(target) if target else None
+        filename = getattr(module, "__file__", None)
+        if filename and filename.endswith((".pyc", ".pyo")):
+            filename = filename[:-1]
+        spec = getattr(module, "__spec__", None)
+        origin = getattr(spec, "origin", None)
+        if origin and origin.endswith((".pyc", ".pyo")):
+            origin = origin[:-1]
+        roots = [os.path.realpath(path) for path in getattr(module, "__path__", ())]
+        return {
+            "module_file": os.path.realpath(filename) if filename else None,
+            "spec_origin": (
+                os.path.realpath(origin)
+                if origin and origin not in ("built-in", "frozen")
+                else origin
+            ),
+            "package_roots": roots,
+        }
+
     def emit() -> None:
         try:
             trigger = _cinderx._get_trigger_stats()
@@ -62,6 +83,7 @@ def install_hook() -> None:
                 "observe": observe,
                 "entry_ledger": rows,
                 "entry_ledger_dropped": ledger["dropped"],
+                "ownership": ownership(),
             }
         except BaseException as exc:
             payload = {
@@ -85,6 +107,14 @@ def _targets(path: Path) -> list[str]:
     ]
 
 
+def _normalized_source_path(value: object) -> str | None:
+    if not isinstance(value, str) or not value or value in {"built-in", "frozen"}:
+        return None
+    if value.endswith((".pyc", ".pyo")):
+        value = value[:-1]
+    return os.path.realpath(value)
+
+
 def classify(journal: Path, target_path: Path, result_path: Path) -> dict:
     target_modules = _targets(target_path)
     test_result = json.loads(result_path.read_text())
@@ -100,22 +130,45 @@ def classify(journal: Path, target_path: Path, result_path: Path) -> dict:
         if not target:
             continue
         short = target.removeprefix("test.")
-        # The target module is gone in this parent process. Resolve its file
-        # from the exact code rows: rows owned by Lib/test/<target>.py are the
-        # only acceptable own-code evidence.
-        suffix = f"/test/{short}.py"
+        ownership = payload.get("ownership", {})
+        owned_files = {
+            path
+            for path in (
+                _normalized_source_path(ownership.get("module_file")),
+                _normalized_source_path(ownership.get("spec_origin")),
+            )
+            if path is not None
+        }
+        package_roots = {
+            path
+            for path in (
+                _normalized_source_path(item)
+                for item in ownership.get("package_roots", ())
+            )
+            if path is not None
+        }
+
+        def is_owned(filename: object) -> bool:
+            path = _normalized_source_path(filename)
+            if path is None:
+                return False
+            if path in owned_files:
+                return True
+            return any(
+                path == root or path.startswith(root + os.sep) for root in package_roots
+            )
+
         own = [
             row
             for row in payload.get("entry_ledger", ())
-            if os.path.realpath(str(row.get("filename", ""))).endswith(suffix)
-            and int(row.get("entries", 0)) > 0
+            if is_owned(row.get("filename")) and int(row.get("entries", 0)) > 0
         ]
         trigger = payload.get("trigger", {})
         observe = payload.get("observe", {})
         own_scheduler = [
             event
             for event in observe.get("events", [])
-            if os.path.realpath(str(event.get("filename", ""))).endswith(suffix)
+            if is_owned(event.get("filename"))
         ]
         for event in observe.get("events", []):
             result = event.get("result")
@@ -135,11 +188,14 @@ def classify(journal: Path, target_path: Path, result_path: Path) -> dict:
                 )
         dropped = int(payload.get("entry_ledger_dropped", 0))
         status = "OWN_CODE_JIT" if own else "A2_COVERAGE_GAP"
+        machine_entries = int(trigger.get("machine_code_entries", 0))
         rows[short] = {
             "status": status,
-            "worker_machine_entries": int(trigger.get("machine_code_entries", 0)),
+            "worker_jit_active": machine_entries > 0,
+            "worker_machine_entries": machine_entries,
             "own_code_entries": sum(int(row["entries"]) for row in own),
             "own_code_rows": own,
+            "machine_entry_proven": bool(own),
             "compiled_function_creations": int(
                 trigger.get("compiled_function_creations", 0)
             ),
@@ -147,8 +203,16 @@ def classify(journal: Path, target_path: Path, result_path: Path) -> dict:
             "forced_deopts": int(trigger.get("forced_deopt_hits", 0)),
             "scheduler_events": observe.get("events", []),
             "own_scheduler_events": own_scheduler,
+            "scheduler_threshold": observe.get("threshold"),
             "discovered_functions": len(
                 {event.get("qualname") for event in own_scheduler}
+            ),
+            "observed_own_functions": sorted(
+                {
+                    str(event.get("qualname"))
+                    for event in own_scheduler
+                    if event.get("qualname") is not None
+                }
             ),
             "observed_call_count": sum(
                 int(event.get("count", 0)) for event in own_scheduler
@@ -156,8 +220,12 @@ def classify(journal: Path, target_path: Path, result_path: Path) -> dict:
             "compile_results": dict(
                 Counter(str(event.get("result")) for event in own_scheduler)
             ),
+            "artifact_installed": any(
+                event.get("result") == "installed" for event in own_scheduler
+            ),
             "events_dropped": int(observe.get("events_dropped", 0)),
             "entry_ledger_dropped": dropped,
+            "ownership": ownership,
         }
         totals["machine_entries"] += rows[short]["worker_machine_entries"]
         totals["compiled_function_creations"] += rows[short][
@@ -166,6 +234,7 @@ def classify(journal: Path, target_path: Path, result_path: Path) -> dict:
         totals["organic_deopts"] += rows[short]["organic_deopts"]
         totals["forced_deopts"] += rows[short]["forced_deopts"]
         totals["ledger_dropped"] += dropped
+        totals["worker_jit_active"] += int(rows[short]["worker_jit_active"])
 
     missing = sorted(set(target_modules) - set(rows))
     if missing:
@@ -175,13 +244,15 @@ def classify(journal: Path, target_path: Path, result_path: Path) -> dict:
             rows[target] = {"status": "A2_COVERAGE_GAP", "missing": True}
     counts = Counter(row["status"] for row in rows.values())
     result = {
-        "result": "PASS"
-        if len(target_modules) == 72
-        and counts["OWN_CODE_JIT"] == 72
-        and not errors
-        and totals["ledger_dropped"] == 0
-        and not unknown_refusals
-        else "FAIL",
+        "result": (
+            "PASS"
+            if len(target_modules) == 72
+            and counts["OWN_CODE_JIT"] == 72
+            and not errors
+            and totals["ledger_dropped"] == 0
+            and not unknown_refusals
+            else "FAIL"
+        ),
         "target_modules": len(target_modules),
         "counts": dict(counts),
         "totals": dict(totals),

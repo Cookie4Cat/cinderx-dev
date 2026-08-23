@@ -6,6 +6,7 @@ import unittest
 
 from ci_pipeline.jit311.a2_penetration import classify
 from ci_pipeline.jit311.a2_report import compare_penetration, judge_transitions
+from ci_pipeline.jit311.a2_runner import A2Runner
 
 
 ROOT = Path(__file__).resolve().parent.parent
@@ -13,6 +14,33 @@ DATA = ROOT / "ci_pipeline/jit311/data"
 
 
 class A2ReportTest(unittest.TestCase):
+    def test_a2_p2_uses_jit_all_and_diagnostic_uses_threshold_one(self):
+        runner = A2Runner(
+            wheel=Path("wheel.whl"),
+            source=ROOT,
+            output=Path("out"),
+            lanes={"P"},
+            jobs=16,
+            timeout=1200,
+        )
+        runner.base.stage = ROOT
+        jit_all = runner._arm_command(
+            out=Path("p2"),
+            jit_all=True,
+            startup=Path("startup"),
+            journal=Path("journal"),
+        )
+        diagnostic = runner._arm_command(
+            out=Path("diag"),
+            threshold=1,
+            startup=Path("startup"),
+            journal=Path("journal"),
+        )
+        self.assertIn("PYTHONJITALL=1", jit_all)
+        self.assertFalse(any(item.startswith("PYTHONJITAUTO=") for item in jit_all))
+        self.assertIn("PYTHONJITAUTO=1", diagnostic)
+        self.assertNotIn("PYTHONJITALL=1", diagnostic)
+
     def test_penetration_deviation_requires_fingerprint(self):
         testcase = "test.test_dis.DisTests.test_super_instructions"
         stock = {
@@ -68,11 +96,9 @@ class A2ReportTest(unittest.TestCase):
                     "pre": {"compiled": True, "machine_entry_proven": True},
                     "transition": {
                         "transition_ledger_dropped": 0,
-                        "transition_rows": [
-                            {"deopt_reason": required[0]}
-                        ]
-                        if required
-                        else [],
+                        "transition_rows": (
+                            [{"deopt_reason": required[0]}] if required else []
+                        ),
                     },
                     "recovery": recovery,
                     "result": "PASS",
@@ -118,6 +144,11 @@ class A2ReportTest(unittest.TestCase):
                                 "forced_deopt_hits": 0,
                             },
                             "observe": {"events": [], "events_dropped": 0},
+                            "ownership": {
+                                "module_file": f"/usr/lib/python3.11/test/{target}.py",
+                                "spec_origin": f"/usr/lib/python3.11/test/{target}.py",
+                                "package_roots": [],
+                            },
                             "entry_ledger": [
                                 {
                                     "filename": f"/usr/lib/python3.11/test/{target}.py",
@@ -139,6 +170,100 @@ class A2ReportTest(unittest.TestCase):
             )
         self.assertEqual(report["result"], "PASS")
         self.assertEqual(report["counts"]["OWN_CODE_JIT"], 72)
+
+    def test_penetration_classifier_uses_package_ownership(self):
+        targets = [
+            line.strip()
+            for line in (DATA / "a1_compile_all_modules.txt").read_text().splitlines()
+            if line.strip() and not line.startswith("#")
+        ]
+        with tempfile.TemporaryDirectory() as temporary:
+            directory = Path(temporary)
+            journal = directory / "journal"
+            journal.mkdir()
+            modules = {}
+            for index, target in enumerate(targets):
+                modules[target] = "pass"
+                package = f"/usr/lib/python3.11/test/{target}"
+                is_package = target == "test_dataclasses"
+                filename = (
+                    f"{package}/case.py"
+                    if is_package
+                    else f"/usr/lib/python3.11/test/{target}.py"
+                )
+                origin = f"{package}/__init__.py" if is_package else filename
+                (journal / f"{index}.json").write_text(
+                    json.dumps(
+                        {
+                            "target_module": "test." + target,
+                            "trigger": {"machine_code_entries": 1},
+                            "observe": {"events": [], "events_dropped": 0},
+                            "ownership": {
+                                "module_file": origin,
+                                "spec_origin": origin,
+                                "package_roots": [package] if is_package else [],
+                            },
+                            "entry_ledger": [{"filename": filename, "entries": 1}],
+                            "entry_ledger_dropped": 0,
+                        }
+                    )
+                )
+            result_path = directory / "result.json"
+            result_path.write_text(json.dumps({"modules": modules}))
+            report = classify(
+                journal,
+                DATA / "a1_compile_all_modules.txt",
+                result_path,
+            )
+        self.assertEqual(report["result"], "PASS")
+        row = report["modules"]["test_dataclasses"]
+        self.assertTrue(row["machine_entry_proven"])
+        self.assertEqual(row["own_code_entries"], 1)
+
+    def test_penetration_classifier_rejects_unowned_rows(self):
+        targets = [
+            line.strip()
+            for line in (DATA / "a1_compile_all_modules.txt").read_text().splitlines()
+            if line.strip() and not line.startswith("#")
+        ]
+        with tempfile.TemporaryDirectory() as temporary:
+            directory = Path(temporary)
+            journal = directory / "journal"
+            journal.mkdir()
+            modules = {}
+            for index, target in enumerate(targets):
+                modules[target] = "pass"
+                filename = f"/usr/lib/python3.11/test/{target}.py"
+                (journal / f"{index}.json").write_text(
+                    json.dumps(
+                        {
+                            "target_module": "test." + target,
+                            "trigger": {"machine_code_entries": 1},
+                            "observe": {"events": [], "events_dropped": 0},
+                            "ownership": {
+                                "module_file": filename,
+                                "spec_origin": filename,
+                                "package_roots": [],
+                            },
+                            "entry_ledger": [
+                                {
+                                    "filename": "/usr/lib/python3.11/test/support/__init__.py",
+                                    "entries": 1,
+                                }
+                            ],
+                            "entry_ledger_dropped": 0,
+                        }
+                    )
+                )
+            result_path = directory / "result.json"
+            result_path.write_text(json.dumps({"modules": modules}))
+            report = classify(
+                journal,
+                DATA / "a1_compile_all_modules.txt",
+                result_path,
+            )
+        self.assertEqual(report["counts"]["A2_COVERAGE_GAP"], 72)
+        self.assertEqual(report["counts"].get("OWN_CODE_JIT", 0), 0)
 
 
 if __name__ == "__main__":
