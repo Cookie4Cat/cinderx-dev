@@ -143,14 +143,16 @@ void Ci_Observe311_SetResolvedAutoJitConfig(
 }
 
 static int parse_autojit_threshold(const char* raw, uint64_t* threshold) {
+  if (strcmp(raw, "auto") == 0 || strncmp(raw, "auto:", 5) == 0) {
+    PyErr_Format(
+        PyExc_RuntimeError,
+        "PYTHONJITAUTO=%s is not usable on CPython 3.11: expected a "
+        "positive integer threshold (or 0 for immediate scheduling); "
+        "classification is not supported",
+        raw);
+    return -1;
+  }
   const char* number = raw;
-  if (strcmp(raw, "auto") == 0) {
-    *threshold = 50;
-    return 0;
-  }
-  if (strncmp(raw, "auto:", 5) == 0) {
-    number = raw + 5;
-  }
   int digits_only = *number != '\0';
   for (const char* cursor = number; *cursor != '\0'; cursor++) {
     if (*cursor < '0' || *cursor > '9') {
@@ -166,7 +168,7 @@ static int parse_autojit_threshold(const char* raw, uint64_t* threshold) {
     PyErr_Format(
         PyExc_RuntimeError,
         "PYTHONJITAUTO=%s is not usable on CPython 3.11: expected a "
-        "non-negative integer, auto, or auto:N",
+        "non-negative integer threshold",
         raw);
     return -1;
   }
@@ -187,9 +189,6 @@ static int resolve_autojit_threshold_from_env(uint64_t* threshold) {
     }
   }
   const char* raw_auto = getenv("PYTHONJITAUTO");
-  if (raw_auto != NULL && strncmp(raw_auto, "auto", 4) == 0) {
-    ci_shared_autojit_classify = 1;
-  }
   if (raw_auto != NULL && *raw_auto != '\0' &&
       parse_autojit_threshold(raw_auto, threshold) < 0) {
     return -1;

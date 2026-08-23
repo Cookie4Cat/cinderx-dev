@@ -83,32 +83,49 @@ def _run_case(cwd: Path, updates: dict[str, str]) -> dict:
 
 def run() -> dict:
     specs = {
-        "jitall_only": ({"PYTHONJITALL": "1"}, 0),
-        "jitauto_only": ({"PYTHONJITAUTO": "1"}, 1),
+        "default_canary": ({}, None, 50),
+        "jitall_only": ({"PYTHONJITALL": "1"}, 0, 0),
+        "jitauto_only": ({"PYTHONJITAUTO": "1"}, 1, 1),
         "jitauto_overrides_jitall": (
             {"PYTHONJITALL": "1", "PYTHONJITAUTO": "7"},
+            7,
             7,
         ),
         "jit_disabled": (
             {"PYTHONJITALL": "1", "PYTHONJITDISABLE": "1"},
             None,
+            None,
         ),
-        "invalid_jitauto": ({"PYTHONJITAUTO": "not-a-threshold"}, None),
+        "invalid_jitauto": (
+            {"PYTHONJITAUTO": "not-a-threshold"},
+            None,
+            None,
+        ),
+        "unsupported_auto_classifier": (
+            {"PYTHONJITAUTO": "auto"},
+            None,
+            None,
+        ),
     }
     rows = {}
     errors = []
     with tempfile.TemporaryDirectory() as temporary:
         cwd = Path(temporary)
-        for name, (env, expected) in specs.items():
+        for name, (env, expected_shared, expected_observe) in specs.items():
             row = _run_case(cwd, env)
             rows[name] = row
             payload = row["payload"] or {}
-            if name == "invalid_jitauto":
+            if name in {"invalid_jitauto", "unsupported_auto_classifier"}:
+                expected_message = (
+                    "classification is not supported"
+                    if name == "unsupported_auto_classifier"
+                    else "invalid PYTHONJITAUTO"
+                )
                 if (
                     row["returncode"] == 0
-                    or "invalid PYTHONJITAUTO" not in row["stderr"]
+                    or expected_message not in row["stderr"]
                 ):
-                    errors.append("invalid JITAUTO did not fail closed")
+                    errors.append(f"{name} did not fail closed")
             elif name == "jit_disabled":
                 if (
                     row["returncode"] != 0
@@ -118,8 +135,8 @@ def run() -> dict:
                     errors.append("JIT disable did not dominate execute mode")
             elif (
                 row["returncode"] != 0
-                or payload.get("shared_threshold") != expected
-                or payload.get("observe_threshold") != expected
+                or payload.get("shared_threshold") != expected_shared
+                or payload.get("observe_threshold") != expected_observe
                 or payload.get("threshold_source") != "shared-jit-config"
             ):
                 errors.append(f"{name} shared/scheduler threshold mismatch")

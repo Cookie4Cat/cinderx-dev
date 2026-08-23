@@ -5547,14 +5547,10 @@ int initialize() {
         "invalid PYTHONJITAUTO/-X jit-auto value for CPython 3.11");
     return -1;
   }
-  if ((shadow_requested || canary_requested) &&
-      !getConfig().compile_after_n_calls.has_value()) {
-    configureCompileAfterNCalls(50, false);
-  }
   auto resolved_threshold = getConfig().compile_after_n_calls;
   Ci_Observe311_SetResolvedAutoJitConfig(
-      resolved_threshold.has_value(),
-      resolved_threshold.value_or(0),
+      1,
+      resolved_threshold.value_or(50),
       getConfig().auto_classify,
       1);
 #endif

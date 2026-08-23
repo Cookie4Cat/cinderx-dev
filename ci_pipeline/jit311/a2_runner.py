@@ -372,7 +372,10 @@ def render_jitall_scheduler_report(result: dict, path: Path) -> None:
     ]
     for name, row in config.get("cases", {}).items():
         payload = row.get("payload") or {}
-        expected_failure = name == "invalid_jitauto"
+        expected_failure = name in {
+            "invalid_jitauto",
+            "unsupported_auto_classifier",
+        }
         passed = (
             row.get("returncode") != 0
             if expected_failure
@@ -391,6 +394,11 @@ def render_jitall_scheduler_report(result: dict, path: Path) -> None:
             "JIT-ALL first and JITAUTO second, so JITAUTO=7 overrides JIT-ALL=1. "
             "The final resolved value is published to the 3.11 frame scheduler; "
             "PYTHONJITDISABLE still resolves execute mode to off.",
+            "",
+            "With neither JITALL nor JITAUTO set, the scheduler's effective default "
+            "is 50 while `compile_after_n_calls` remains unset. This is deliberate: "
+            "the implicit observation default must not masquerade as an explicit "
+            "Auto-JIT policy and arm ROI backoff for force-compiled functions.",
             "",
             "Threshold zero means the first observed frame schedules and publishes. "
             "It does not replace the already-running interpreted frame; a one-call "
