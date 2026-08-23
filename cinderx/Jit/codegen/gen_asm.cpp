@@ -300,6 +300,21 @@ DeoptResult prepareForDeopt(
     frame_iter = frame_iter->previous;
   }
 
+#if PY_VERSION_HEX < 0x030C0000
+  BorrowedRef<PyCodeObject> ledger_code = deopt_meta.innermostFrame().code;
+  int resume_offset = static_cast<int>(
+      (frame->prev_instr + 1 - _PyCode_CODE(ledger_code)) *
+      sizeof(_Py_CODEUNIT));
+  a2TransitionLedgerRecord(
+      ledger_code,
+      "deopt",
+      deoptReasonName(deopt_meta.reason),
+      deopt_meta.innermostFrame().cause_instr_idx.value(),
+      resume_offset,
+      is_forced_deopt,
+      is_instrumentation_deopt);
+#endif
+
   // For instrumentation deopts where the bytecode's C call completed
   // (reason != kPeriodicTaskFailure), push its return value onto the
   // operand stack on top of the pre-instruction state restored by reifyStack.

@@ -2657,6 +2657,16 @@ PyObject* jit311_reset_entry_ledger(PyObject* /* self */, PyObject* /* arg */) {
 PyObject* jit311_entry_ledger(PyObject* /* self */, PyObject* /* arg */) {
   return jit::a1EntryLedgerSnapshot();
 }
+
+PyObject* jit311_reset_transition_ledger(
+    PyObject* /* self */, PyObject* /* arg */) {
+  jit::a2TransitionLedgerReset();
+  Py_RETURN_NONE;
+}
+
+PyObject* jit311_transition_ledger(PyObject* /* self */, PyObject* /* arg */) {
+  return jit::a2TransitionLedgerSnapshot();
+}
 #endif
 
 PyObject*
@@ -4673,6 +4683,16 @@ PyMethodDef jit_methods_311_canary[] = {
      METH_NOARGS,
      PyDoc_STR("Return exact code-object machine-entry counts and the dropped "
                "evidence count for CPython 3.11 A1.")},
+    {"_jit311_reset_transition_ledger",
+     jit311_reset_transition_ledger,
+     METH_NOARGS,
+     PyDoc_STR("Reset and enable the private CPython 3.11 A2 transition "
+               "ledger.")},
+    {"_jit311_transition_ledger",
+     jit311_transition_ledger,
+     METH_NOARGS,
+     PyDoc_STR("Return CPython 3.11 A2 deopt/generator transition rows and "
+               "the dropped evidence count.")},
     // MR-05: the inverse of force_compile, and the only published way to
     // take a function back off machine code.  A call already inside the
     // artifact keeps running it -- the guarded entry pins it for the
@@ -5662,6 +5682,7 @@ void finalize() {
   if (isJitShadow()) {
     getMutableConfig().state = State::kFinalizing;
     jit::a1EntryLedgerDisable();
+    jit::a2TransitionLedgerDisable();
 
     auto mod_state = cinderx::getModuleState();
     auto* context = static_cast<Context*>(mod_state->jit_context.get());
@@ -5693,6 +5714,7 @@ void finalize() {
   setInterpreterJitFlag(false);
   syncOSRFlags();
   jit::a1EntryLedgerDisable();
+  jit::a2TransitionLedgerDisable();
 
   // Deopt all JIT generators, since JIT generators reference code and other
   // metadata that we will be freeing later in this function.

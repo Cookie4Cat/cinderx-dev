@@ -257,6 +257,31 @@ TEST_F(JITContextTest, A1EntryLedgerAttributesExactCodeObject) {
   jit::a1EntryLedgerDisable();
 }
 
+TEST_F(JITContextTest, A2TransitionLedgerRecordsExactResumeEvidence) {
+  SKIP_311_EXECUTABLE_COMPILE();
+
+  Ref<PyFunctionObject> func(
+      compileAndGet("def func(value):\n    return value + 1", "func"));
+  ASSERT_NE(func, nullptr);
+  auto* code = reinterpret_cast<PyCodeObject*>(func->func_code);
+  jit::a2TransitionLedgerReset();
+  jit::a2TransitionLedgerRecord(
+      code, "deopt", "GuardFailure", 4, 6, false, false);
+  Ref<> snapshot = Ref<>::steal(jit::a2TransitionLedgerSnapshot());
+  ASSERT_NE(snapshot, nullptr);
+  BorrowedRef<> rows = PyDict_GetItemString(snapshot, "rows");
+  BorrowedRef<> dropped = PyDict_GetItemString(snapshot, "dropped");
+  ASSERT_TRUE(PyList_Check(rows));
+  ASSERT_EQ(PyList_GET_SIZE(rows.get()), 1);
+  BorrowedRef<> row = PyList_GET_ITEM(rows.get(), 0);
+  EXPECT_STREQ(PyUnicode_AsUTF8(PyDict_GetItemString(row, "deopt_reason")),
+               "GuardFailure");
+  EXPECT_EQ(PyLong_AsLong(PyDict_GetItemString(row, "cause_offset")), 4);
+  EXPECT_EQ(PyLong_AsLong(PyDict_GetItemString(row, "resume_offset")), 6);
+  EXPECT_EQ(PyLong_AsLong(dropped), 0);
+  jit::a2TransitionLedgerDisable();
+}
+
 TEST_F(JITContextTest, DecrefsPrecedeTheNextBoundaryPoll) {
   SKIP_311_EXECUTABLE_COMPILE();
 

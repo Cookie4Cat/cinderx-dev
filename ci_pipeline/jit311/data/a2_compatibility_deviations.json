@@ -1,0 +1,20 @@
+{
+  "format": "cp311-jit-a2-deviations-v1",
+  "comment": "A2 reuses only the four already-approved adaptive-only A1 differences. New threshold=1 differences fail until independently reviewed.",
+  "deviations": [
+    {
+      "id": "A2-P-DIS-002",
+      "testcase": "test.test_dis.DisTests.test_super_instructions",
+      "stock": "pass",
+      "aggressive": "failure",
+      "fingerprint": ["AssertionError", "RESUME_QUICK", "LOAD_FAST__LOAD_FAST", "STORE_FAST__STORE_FAST"]
+    },
+    {
+      "id": "A2-P-DIS-004",
+      "testcase": "test.test_dis.DisWithFileTests.test_super_instructions",
+      "stock": "pass",
+      "aggressive": "failure",
+      "fingerprint": ["AssertionError", "RESUME_QUICK", "LOAD_FAST__LOAD_FAST", "STORE_FAST__STORE_FAST"]
+    }
+  ]
+}
