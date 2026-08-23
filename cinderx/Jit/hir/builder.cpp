@@ -871,20 +871,12 @@ static bool should_snapshot(
   }
 
 #if PY_VERSION_HEX < 0x030C0000
-  // The executing mode writes local mutations through to the observable
-  // frame (JITRT_StoreFrameLocal311).  Releasing the slot's previous value
-  // can run arbitrary __del__ code, so the store is not replayable and its
-  // boundary needs its own resume point -- without one, bindGuards finds
-  // no dominating FrameState for a following guard.
+  // Instrumentation can be activated by any Python callback, including a
+  // destructor inserted later by the refcount pass.  Execute mode therefore
+  // needs one resumable Snapshot at every non-terminator bytecode boundary;
+  // insertInstrumentationPolls311 turns those snapshots into deopt checks.
   if (getConfig().state == State::kRunning) {
-    switch (bci.opcode()) {
-      case STORE_FAST:
-      case STORE_FAST_LOAD_FAST:
-      case STORE_FAST_STORE_FAST:
-        return true;
-      default:
-        break;
-    }
+    return true;
   }
 #endif
 
