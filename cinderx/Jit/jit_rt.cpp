@@ -2928,7 +2928,16 @@ PyObject* JITRT_InvokeIterNext(PyObject* iterator) {
     }
     PyErr_Clear();
   }
-  Py_INCREF(&JITRT_IterDoneSentinel);
+  // The sentinel is a borrowed address marker, not an owned reference.
+  // Compiled code only compares the returned pointer against its address
+  // (CondBranchIterNotDone) and never releases it, and the other
+  // producer -- JITRT_GenSendHandleStopAsyncIteration -- hands the same
+  // sentinel back without an incref.  Nothing in the tree decrefs it.
+  //
+  // From 3.12 on the object is immortal, so increfing it here was free.
+  // On 3.11 it is mortal (ob_refcnt starts at 1), so this incref was a
+  // real, unbalanced increment: every for-loop that ran to exhaustion in
+  // compiled code leaked exactly one reference.
   return &JITRT_IterDoneSentinel;
 }
 

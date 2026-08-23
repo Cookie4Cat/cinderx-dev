@@ -95,114 +95,134 @@ redundant: `-R` measures the process-wide Python reference total, which
 says nothing about an executable mapping, a raw code-extra block or the
 observer's `calloc()`ed table.
 
-**The leg currently fails, and it is right to.** Running it revealed a
-reference leak on the execute path that had never been visible, because
-nothing could build CinderX against a debug interpreter until the
-version gate above existed. What is known about it:
+**Running the leg found a real defect, which is now fixed.** Nothing
+could build CinderX against a debug interpreter until the version gate
+above existed, so the defect had been invisible for the whole port.
 
-* It is confined to execute mode. `off`, `observe` and `shadow` all
-  report SUCCESS on the same corpus; only `execute` leaks.
-* It is steady-state, not warm-up. `-R 3:6` on `test_bool` reports
-  `[15, 18, 18, 18, 18, 18]` -- a constant per-repetition cost with no
-  sign of settling.
-* **It predates this branch.** Built against the same debug interpreter,
-  the MR-10 base (`ca50dc69`) leaks `sum=63` on `test_bool` where this
-  branch leaks `sum=51`, and its auto-mode probe leaks three references
-  per round to this branch's one. MR-11 does not introduce it and
-  measurably reduces it.
-* The reference-count matrix and the residency census stay green
-  throughout, which places the leak outside both: it is not per-object
-  drift on anything a corpus names, and not a native allocation that
-  fails to come back.
-* It is **per execution of compiled code**, not per compile and not per
-  scheduling decision. Instrumenting regrtest's own repetition loop shows
-  the JIT's counters flat from the second repetition onward --
-  `compiled_function_creations`, `resident_code_buffers`,
-  `resident_code_extra_blocks`, `watched_codes` and the compiled-function
-  registry all stop moving -- while `machine_code_entries` grows by a
-  fixed amount per repetition and the reference total grows with it, at
-  roughly 0.06 references per machine-code entry. Nothing is being
-  allocated and retained; something INCREFs on an execution path without
-  a matching DECREF.
-* What gains references are live, long-lived objects: `TextIOWrapper`
-  (+2 and +3 per repetition), the test class and `RegressionTestResult`
-  types (+2), the `_codecs`, `codecs` and `_signal` modules (+1), and
-  some `frozenset`/`set` singletons. No object *type* grows in number,
-  which is why the object census cannot see it.
-* The smallest reproducer found is an empty test method:
-  `python -m test -R 3:3 -m test_nothing <module>` with a
-  `unittest.TestCase` whose body is `pass` leaks ten references per
-  repetition under `CINDERX_JIT_MODE=execute PYTHONJITAUTO=1`, and none
-  under `off`. The leak is entirely in the harness code the JIT compiles;
-  the test body is irrelevant.
+### Root cause: the iterator-done sentinel is mortal on 3.11
 
-Two bisection levers were tried and do not work, which is worth knowing
-before the next attempt:
+`JITRT_IterDoneSentinel` (`cinderx/Jit/jit_rt.cpp`) is a statically
+allocated `PyObject` used as an address marker: when an iterator is
+exhausted, `JITRT_InvokeIterNext` returns its address, and compiled code
+recognises the end of the loop by comparing the returned pointer against
+that address (`CondBranchIterNotDone` in the LIR generator). Compiled
+code never releases it, and the sentinel's other producer,
+`JITRT_GenSendHandleStopAsyncIteration`, hands it back without an
+incref. Nothing in the tree decrefs it. It is a borrowed marker.
 
-* `PYTHONJITLISTFILE` has no effect on this path -- an empty list
-  compiles exactly as many functions as no list at all -- so the leaking
-  function cannot be isolated by restricting what compiles.
-* The `PYTHONJITAUTO` threshold does change whether the leak appears
-  (thresholds 1-24 leak, 25 and above are clean on the minimal
-  reproducer), but not monotonically, and the leaked amounts swing widely
-  between runs at the same threshold (88 to 362 on the same command).
-  Diffing the compiled-function sets across the boundary yields five
-  candidates -- two of which, `TestResult._setupStdout` and
-  `_restoreStdout`, assign `sys.stdout`/`sys.stderr` and would explain
-  the `TextIOWrapper` growth -- but compiling each of them alone, with
-  nothing else compiled, reproduces no leak. So the boundary is not a
-  clean bisection: which functions compile at a given threshold varies
-  between runs.
+`JITRT_InvokeIterNext` nevertheless did `Py_INCREF` on it. From 3.12 on
+the sentinel is initialised with `_Py_IMMORTAL_REFCNT`, so that incref is
+a no-op and the imbalance is invisible. On 3.11 the initialiser is a
+plain `1` -- the object is **mortal** -- so the incref was a real,
+unbalanced increment. **Every `for` loop that ran to exhaustion in
+compiled code leaked exactly one reference.**
 
-The obvious minimal reproducer -- `exec()` a fresh code object per round
-and watch `sys.gettotalrefcount()` -- is useless here: it reports the same
-one reference per round with the JIT disabled entirely, because that is
-CPython's own per-`exec` growth. Any candidate reproducer has to be
-bracketed by mode the way the regrtest corpus is.
+The fix removes the incref, which changes nothing on 3.12+.
 
-It is a real leak, not a `gettotalrefcount` accounting artifact. Measured
-together across repetitions, `sys.getallocatedblocks()` grows by five
-blocks per repetition while `len(gc.get_objects())` stays exactly flat --
-so five untracked allocations are stranded per round, and the fifteen
-references belong to objects that really do gain them. Scanning every
-reachable object's refcount between repetitions names them: two
-`TextIOWrapper`s (+3 and +2), the test class and `RegressionTestResult`
-(+2 each), the `_codecs`, `codecs` and `_signal` modules (+1 each), and a
-couple of `frozenset`/`set` singletons. Those sum to the fifteen.
+Measured on the micro-reproducer, before and after:
 
-Instruments that did NOT localize it, so the next attempt need not repeat
-them:
+| function | before | after |
+| --- | --- | --- |
+| one `for` loop | 1.01 refs/call | 0.00 |
+| two sequential loops | 2.00 | 0.00 |
+| three sequential loops | 3.00 | 0.00 |
+| nested (1 outer + 5 inner) | 6.00 | 0.00 |
+| loop exited by `break` | 0.00 | 0.00 |
+| `while` loop | 0.00 | 0.00 |
 
-* `tracemalloc`, at depth 20 with its own frames filtered out, reports no
-  site growing consistently across rounds -- the stranded blocks are not
-  attributable to a Python allocation site.
-* Per-operation refcount probes. Compiling a function that does only a
-  global load, a module attribute load, a class attribute load, a method
-  call, `isinstance`, `type()`, a set membership test, a string concat, a
-  tuple index or a slice, then watching the refcount of the exact objects
-  involved over thousands of calls, shows zero drift on every one.
-* The deopt path. Deopts do correlate in the failing run (exactly four
-  per repetition against fifteen references), but forcing thirty-two
-  deopts directly produces six references, a tenth of the implied rate,
-  so the correlation is two per-repetition constants rather than cause.
+`break` does not leak because it never reaches the exhaustion path, and
+`while` does not because it never touches the iterator protocol.
 
-The objects that gain references are the ones `TestResult._setupStdout`
-and `_restoreStdout` touch, which is the most promising thread left. It
-was not possible to confirm it from the outside: those functions are
-refused by `force_compile`, so they cannot be compiled in isolation, and
-compiling each of the five threshold-boundary candidates alone reproduces
-nothing.
+### Why it was mistaken for a scheduling defect
 
-The next instrument should be C-level: refcount accounting inside the
-generated code and its runtime helpers -- the `JITRT_IncRefTotal` /
-`JITRT_DecRefTotal` pair exists precisely because generated code
-manipulates refcounts outside the `Py_INCREF` macros, and auditing where
-that accounting is and is not paired is a more direct question than any
-further black-box bisection.
+The bug is as old as machine-code execution on this port. Steady-state
+per-repetition leak, measured per milestone with `-R 30:5` on
+`test_grammar -m test_pass_stmt`:
 
-Fixing it is work in the shared compile and publication machinery, which
-3.12 and 3.14 also use, and belongs in its own change rather than inside
-the milestone that made it visible.
+| commit | milestone | refs/rep |
+| --- | --- | --- |
+| `1aba4064` | M-04, first machine-code execution | 0 |
+| `647da465` | M-06 | 0 |
+| `6a61af87` | M-07 | 0 |
+| `60b6f749` | M-08, exception surface opens | 4 |
+| `3328a8cc` | M-09, attribute surface opens | 13 |
+| `682d96a0` | M-11 | 13 |
+
+The zeroes are not evidence of a healthy tree: the defect was present at
+every one of those commits, and a direct micro-reproducer shows one
+reference per loop at all of them. What changed at M-08 and M-09 is the
+*compile surface*. Each opened more opcodes, so more functions containing
+`for` loops became compilable, and the same bug surfaced more of itself.
+Attributing the growth to those merge requests would have been wrong.
+
+Two measurement rules came out of this and are worth keeping:
+
+* **`-R 3:3` cannot compare commits.** Three warm-ups leave compilation
+  happening inside the measured repetitions. M-04 reports `[39, 25, 1]`
+  at `-R 3:3`, which reads as a leak; at `-R 30:5` its steady state is
+  zero. Every number above is a settled floor.
+* **A "clean" arm must prove it executed.** Three configuration knobs
+  (`IMMORTALIZECOMPILEDFUNCTIONS`, `LIGHTWEIGHTFRAME`,
+  `SUPPORTINSTRUMENTATION`) turn the leak off by making the 3.11 gate
+  refuse the configuration outright -- `entries=0`, `compiled=0`. Clean
+  for the wrong reason.
+
+### Why twelve instruments missed it
+
+The sentinel is a static `PyObject`. It is never registered through
+`_Py_NewReference`, so it is absent from the `Py_TRACE_REFS` refchain and
+`sys.getobjects()` cannot enumerate it; it is not GC-tracked, so
+`gc.get_objects()` cannot see it; and it is never allocated or freed, so
+no object census moves. It evades every whole-heap scan simultaneously.
+Establishing that -- a complete-heap scan over 68,386 objects finding no
+monotone grower while the total climbed 13 per repetition -- was what
+finally implicated a static object.
+
+Building the `Py_TRACE_REFS` interpreter that made that scan possible
+required fixing a latent compile error: the `#ifdef Py_TRACE_REFS` branch
+in `cinderx/Jit/lir/generator.cpp` referenced an undeclared `obj` where
+the surrounding code uses `instr`. No CI configuration builds with
+trace-refs, so the branch had rotted, and with it the ability to use
+whole-heap enumeration as a debugging tool on any Python version.
+
+The other dead end worth recording: every micro-reproducer written
+before this used a `while` loop, which never touches `GET_ITER` /
+`FOR_ITER`. They all reported clean, correctly, about the wrong thing.
+
+What did localize it was suppressing compiled functions one at a time
+(`cinderjit.jit_suppress`) and watching the steady-state number fall.
+The three largest contributors -- `BaseTestSuite.addTests`,
+`TestSuite.run` and `test.support._filter_suite` -- are all `for` loops,
+which named the mechanism.
+
+### Remaining: a memory-block leak in the vendored interpreter
+
+With the sentinel fixed, eight of the ten refleak modules pass and **no
+module leaks references any more**. Two still leak memory *blocks*:
+`test_listcomps` 8 per repetition and `test_unpack` 3, flat at
+`-R 30:5`, with zero reference growth.
+
+That defect is not in the JIT:
+
+| configuration | result |
+| --- | --- |
+| stock Py_DEBUG CPython 3.11.6 | clean |
+| CinderX installed, plugin not enabled (stock evaluator) | clean |
+| plugin enabled, `CINDERX_EVAL_MODE=cinder`, **JIT off** | 8 / 3 blocks per repetition |
+| same, `shadow` | 8 / 3 |
+| same, `execute` | 8 / 3 |
+
+It appears exactly when the vendored 3.11 evaluator is installed and is
+identical whether the JIT runs or not, which places it in
+`cinderx/Interpreter/3.11/` rather than anywhere MR-11 touches. Ruled
+out so far: it is not `CodeExtra` blocks (`resident_code_extra_blocks` is
+flat per repetition), and it does not scale with comprehension
+execution, unpacking, or `compile()`/`exec()` of fresh code objects --
+steady-state per-call block growth for all of those is zero under both
+evaluators. It is a fixed cost per test-module repetition.
+
+`jit311_refleak_execute` stays red on that residue, and the leg is left
+red rather than narrowed to hide it.
 
 ## 4. Import and setup suppression is wired end to end
 
