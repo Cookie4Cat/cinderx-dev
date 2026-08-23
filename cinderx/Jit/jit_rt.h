@@ -90,13 +90,22 @@ PyObject* JITRT_CallWithKeywordArgsSimple(
 
 #if PY_VERSION_HEX < 0x030C0000
 // 3.11 canary: consume a recursion slot after a successful positional
-// bind, then re-enter the compiled body.  Used by the generated
+// bind, then re-enter the compiled body. Used by the generated
 // equal-argcount prologue so GuardedEntry does not Enter before binding.
 PyObject* JITRT_ReenterAfterBind(
     PyFunctionObject* func,
     PyObject** args,
     size_t nargsf,
     PyObject* kwnames);
+
+// Transfer the current 3.11 JIT frame's recursion slot to the interpreter
+// before deopt resume. The interpreter will Enter/Leave the same real frame.
+void JITRT_TransferRecursionToInterpreter311();
+void JITRT_GetRecursionState311(
+    int* remaining,
+    int* headroom,
+    int* boundary_active,
+    int* jit_entries);
 #endif
 
 // On Windows x64, returning JITRT_StaticCallReturn (16 bytes) would use a

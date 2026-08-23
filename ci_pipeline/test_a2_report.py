@@ -8,6 +8,7 @@ from ci_pipeline.jit311.a2_penetration import classify
 from ci_pipeline.jit311.a2_report import (
     compare_frame_positions,
     compare_penetration,
+    compare_recursion_boundary,
     judge_transitions,
 )
 from ci_pipeline.jit311.a2_runner import A2Runner
@@ -18,6 +19,73 @@ DATA = ROOT / "ci_pipeline/jit311/data"
 
 
 class A2ReportTest(unittest.TestCase):
+    def test_recursion_comparison_requires_exact_frames_and_balanced_state(self):
+        state = {
+            "recursion_remaining": 52,
+            "recursion_headroom": 0,
+            "boundary_active": False,
+            "jit_entries": 0,
+        }
+        frame = {
+            "function": "recursive",
+            "tb_lasti": 52,
+            "f_lasti": 52,
+            "line": 12,
+            "position": [12, 12, 36, 62],
+        }
+        stock_rows = []
+        jit_rows = []
+        for index in range(1, 7):
+            ident = f"R{index}"
+            error = (
+                None
+                if ident == "R6"
+                else {
+                    "type": "TypeError" if ident == "R4" else "RecursionError",
+                    "message": (
+                        "required_argument() missing 1 required positional argument: 'value'"
+                        if ident == "R4"
+                        else "maximum recursion depth exceeded"
+                    ),
+                }
+            )
+            target_frames = [] if ident in {"R4", "R6"} else [frame]
+            common = {
+                "id": ident,
+                "before": dict(state),
+                "after": dict(state),
+                "error": error,
+                "target_frames": target_frames,
+                "post_error_recovery": 4,
+            }
+            stock_rows.append({**common, "pre": {"machine_entry_proven": False}})
+            jit_rows.append({**common, "pre": {"machine_entry_proven": True}})
+        stock = {
+            "result": "PASS",
+            "rows": stock_rows,
+            "entry_ledger_dropped": 0,
+        }
+        jit = {
+            "result": "PASS",
+            "rows": jit_rows,
+            "entry_ledger_dropped": 0,
+        }
+        with tempfile.TemporaryDirectory() as temporary:
+            directory = Path(temporary)
+            stock_path = directory / "stock.json"
+            jit_path = directory / "jit.json"
+            stock_path.write_text(json.dumps(stock))
+            jit_path.write_text(json.dumps(jit))
+            report = compare_recursion_boundary(stock_path, jit_path)
+            jit_rows[0]["target_frames"] = []
+            jit_rows[1]["after"] = {**state, "jit_entries": 1}
+            jit_path.write_text(json.dumps(jit))
+            wrong = compare_recursion_boundary(stock_path, jit_path)
+        self.assertEqual(report["result"], "PASS")
+        self.assertEqual(wrong["result"], "FAIL")
+        self.assertTrue(any("cardinality" in item for item in wrong["errors"]))
+        self.assertTrue(any("ownership leaked" in item for item in wrong["errors"]))
+
     def test_frame_position_comparison_requires_exact_lasti_and_traceback(self):
         observation = {
             "function": "target",

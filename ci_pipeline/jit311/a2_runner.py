@@ -13,10 +13,12 @@ from ci_pipeline.jit311.a1_runner import A1Runner, PASS_STATES
 from ci_pipeline.jit311.a2_report import (
     compare_frame_positions,
     compare_penetration,
+    compare_recursion_boundary,
     judge_transitions,
     render_frame_position_report,
     render_markdown,
     render_policy_footprint_report,
+    render_recursion_boundary_report,
 )
 
 OLD_THRESHOLD1_GAPS = (
@@ -731,6 +733,35 @@ class A2Runner:
             [str(self.base.python), "-m", "test", "-j1", "test_inspect"],
             env=self.base._product_env(threshold="1"),
         )
+        recursion_stock = directory / "recursion-boundary-stock.json"
+        recursion_jit = directory / "recursion-boundary-jit.json"
+        recursion_module = "ci_pipeline.jit311.a2_recursion_boundary_probe"
+        rc_recursion_stock = self.base._run(
+            "38-A2-recursion-stock",
+            [
+                str(self.base.python),
+                "-m",
+                recursion_module,
+                "--mode",
+                "stock",
+                "--out",
+                str(recursion_stock),
+            ],
+            env={**self.base._base_env(), "PYTHONPATH": str(self.base.stage)},
+        )
+        rc_recursion_jit = self.base._run(
+            "39-A2-recursion-jit",
+            [
+                str(self.base.python),
+                "-m",
+                recursion_module,
+                "--mode",
+                "jit",
+                "--out",
+                str(recursion_jit),
+            ],
+            env=self.base._product_env(threshold="1"),
+        )
         if stock.is_file() and jit.is_file():
             result = judge_transitions(
                 stock,
@@ -765,6 +796,12 @@ class A2Runner:
             else {"result": "FAIL", "errors": ["position probe report missing"]}
         )
         result["frame_positions"] = positions
+        recursion = (
+            compare_recursion_boundary(recursion_stock, recursion_jit)
+            if recursion_stock.is_file() and recursion_jit.is_file()
+            else {"result": "FAIL", "errors": ["recursion probe report missing"]}
+        )
+        result["recursion_boundary"] = recursion
         result["worker_returncodes"].update(
             {
                 "frame_stock": rc_running_stock,
@@ -772,6 +809,8 @@ class A2Runner:
                 "error_stock": rc_error_stock,
                 "error_jit": rc_error_jit,
                 "test_inspect": rc_inspect,
+                "recursion_stock": rc_recursion_stock,
+                "recursion_jit": rc_recursion_jit,
             }
         )
         render_frame_position_report(
@@ -782,6 +821,11 @@ class A2Runner:
             rc_inspect,
             self.output / "A2_FRAME_POSITION_REPORT.md",
         )
+        render_recursion_boundary_report(
+            recursion,
+            result,
+            self.output / "A2_RECURSION_BOUNDARY_REPORT.md",
+        )
         if (
             rc_stock != 0
             or rc_jit != 0
@@ -791,8 +835,11 @@ class A2Runner:
             or rc_error_stock != 0
             or rc_error_jit != 0
             or rc_inspect != 0
+            or rc_recursion_stock != 0
+            or rc_recursion_jit != 0
             or tracing_regression.get("result") != "PASS"
             or positions.get("result") != "PASS"
+            or recursion.get("result") != "PASS"
         ):
             result["result"] = "FAIL"
         (directory / "result.json").write_text(

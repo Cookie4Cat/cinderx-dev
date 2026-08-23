@@ -4188,6 +4188,65 @@ def with_def(a, b=1):
   PyErr_Clear();
 }
 
+TEST_F(JITLifecycle311Test, RecursionBoundaryMatchesStockFrameCardinality) {
+  SKIP_311_EXECUTABLE_COMPILE();
+
+  runCode(R"(
+import _testinternalcapi
+import cinderjit
+import sys
+
+def recursive(depth):
+    return 0 if depth == 0 else 1 + recursive(depth - 1)
+
+def capture(function):
+    before = _testinternalcapi.get_recursion_depth()
+    try:
+        function(100_000)
+    except RecursionError as exc:
+        frames = []
+        tb = exc.__traceback__
+        while tb is not None:
+            if tb.tb_frame.f_code is function.__code__:
+                code = tb.tb_frame.f_code
+                positions = list(code.co_positions())
+                position = positions[tb.tb_lasti // 2]
+                frames.append((
+                    tb.tb_lasti,
+                    tb.tb_frame.f_lasti,
+                    tb.tb_lineno - code.co_firstlineno,
+                    (
+                        position[0] - code.co_firstlineno,
+                        position[1] - code.co_firstlineno,
+                        position[2],
+                        position[3],
+                    ),
+                ))
+            tb = tb.tb_next
+        result = (type(exc).__name__, str(exc), frames)
+    else:
+        raise AssertionError("recursive call did not fail")
+    after = _testinternalcapi.get_recursion_depth()
+    assert after == before, (before, after)
+    return result
+
+old_limit = sys.getrecursionlimit()
+sys.setrecursionlimit(60)
+try:
+    cinderjit.disable()
+    stock = capture(recursive)
+    cinderjit.enable()
+    assert cinderjit.force_compile(recursive) is True
+    machine = capture(recursive)
+finally:
+    sys.setrecursionlimit(old_limit)
+
+assert machine == stock, (stock, machine)
+assert len(machine[2]) > 0
+assert recursive(4) == 4
+)");
+}
+
 TEST_F(JITLifecycle311Test, CallDeliversAsyncExcBeforeNextStatement) {
   SKIP_311_EXECUTABLE_COMPILE();
 

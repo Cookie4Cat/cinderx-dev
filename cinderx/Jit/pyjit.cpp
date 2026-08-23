@@ -42,6 +42,7 @@
 #include "cinderx/Jit/jit_flag_processor.h"
 #include "cinderx/Jit/jit_gdb_support.h"
 #include "cinderx/Jit/jit_list.h"
+#include "cinderx/Jit/jit_rt.h"
 #include "cinderx/Jit/jit_time_log.h"
 #include "cinderx/Jit/mmap_file.h"
 #include "cinderx/Jit/osr.h"
@@ -2737,6 +2738,25 @@ PyObject* jit311_config_state(PyObject* /* self */, PyObject* /* arg */) {
   return result.release();
 }
 
+PyObject* jit311_recursion_state(PyObject* /* self */, PyObject* /* arg */) {
+  int remaining;
+  int headroom;
+  int boundary_active;
+  int jit_entries;
+  JITRT_GetRecursionState311(
+      &remaining, &headroom, &boundary_active, &jit_entries);
+  return Py_BuildValue(
+      "{s:i,s:i,s:O,s:i}",
+      "recursion_remaining",
+      remaining,
+      "recursion_headroom",
+      headroom,
+      "boundary_active",
+      boundary_active ? Py_True : Py_False,
+      "jit_entries",
+      jit_entries);
+}
+
 PyObject* jit311_execute_surface(PyObject* /* self */, PyObject* /* arg */) {
   Ref<> result = Ref<>::steal(PyList_New(0));
   if (result == nullptr) {
@@ -4782,6 +4802,10 @@ PyMethodDef jit_methods_311_canary[] = {
      jit311_config_state,
      METH_NOARGS,
      PyDoc_STR("Return the private resolved CPython 3.11 JIT configuration.")},
+    {"_jit311_recursion_state",
+     jit311_recursion_state,
+     METH_NOARGS,
+     PyDoc_STR("Return private CPython 3.11 recursion accounting state.")},
     {"_jit311_execute_surface",
      jit311_execute_surface,
      METH_NOARGS,

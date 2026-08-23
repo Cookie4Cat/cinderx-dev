@@ -182,6 +182,125 @@ def compare_frame_positions(
     }
 
 
+def compare_recursion_boundary(stock_path: Path, jit_path: Path) -> dict:
+    stock = json.loads(stock_path.read_text())
+    jit = json.loads(jit_path.read_text())
+    stock_rows = {row["id"]: row for row in stock.get("rows", [])}
+    jit_rows = {row["id"]: row for row in jit.get("rows", [])}
+    rows = []
+    errors = []
+    for ident in sorted(set(stock_rows) | set(jit_rows)):
+        left = stock_rows.get(ident)
+        right = jit_rows.get(ident)
+        row_errors = []
+        if left is None or right is None:
+            row_errors.append("missing Stock or JIT row")
+        else:
+            left_error = left.get("error") or {}
+            right_error = right.get("error") or {}
+            for key in ("type", "message"):
+                if left_error.get(key) != right_error.get(key):
+                    row_errors.append(f"exception {key} differs from Stock")
+            if left.get("target_frames") != right.get("target_frames"):
+                row_errors.append("traceback frame cardinality/position differs")
+            if left.get("post_error_recovery") != right.get(
+                "post_error_recovery"
+            ):
+                row_errors.append("post-error recovery differs from Stock")
+            for side, document in (("Stock", left), ("JIT", right)):
+                if document["before"]["recursion_remaining"] != document[
+                    "after"
+                ]["recursion_remaining"]:
+                    row_errors.append(f"{side} recursion_remaining drift")
+            if not right.get("pre", {}).get("machine_entry_proven"):
+                row_errors.append("JIT machine-entry proof missing")
+            if right["after"].get("recursion_headroom") != 0:
+                row_errors.append("JIT recursion headroom leaked")
+            if right["after"].get("boundary_active") is not False:
+                row_errors.append("JIT recursion boundary flag leaked")
+            if right["after"].get("jit_entries") != 0:
+                row_errors.append("JIT recursion entry ownership leaked")
+        errors.extend(f"{ident}: {error}" for error in row_errors)
+        rows.append(
+            {
+                "id": ident,
+                "stock": left,
+                "jit": right,
+                "errors": row_errors,
+                "result": "PASS" if not row_errors else "FAIL",
+            }
+        )
+    if stock.get("result") != "PASS" or jit.get("result") != "PASS":
+        errors.append("Stock or JIT recursion probe self-check failed")
+    if jit.get("entry_ledger_dropped", 0):
+        errors.append("JIT recursion probe dropped entry evidence")
+    return {
+        "result": "PASS" if not errors and len(rows) == 6 else "FAIL",
+        "rows": rows,
+        "errors": errors,
+    }
+
+
+def render_recursion_boundary_report(
+    comparison: dict,
+    transition_result: dict,
+    out: Path,
+) -> None:
+    transitions = {
+        row["id"]: row for row in transition_result.get("transitions", [])
+    }
+    lines = [
+        "# CPython 3.11 A2 Recursion Boundary Report",
+        "",
+        f"- Recursion matrix: `{comparison.get('result')}`",
+        f"- T10: `{transitions.get('T10', {}).get('result', 'MISSING')}`",
+        "- Before fix T10: Stock 992 recursive frames, JIT 991",
+        "",
+        "| Case | Exception | Stock frames | JIT frames | Stock/JIT remaining | Recovery | Machine proof | Result |",
+        "|---|---|---:|---:|---|---|---:|---|",
+    ]
+    for row in comparison.get("rows", []):
+        stock = row.get("stock") or {}
+        jit = row.get("jit") or {}
+        stock_error = stock.get("error") or {}
+        jit_error = jit.get("error") or {}
+        lines.append(
+            f"| `{row['id']}` | `{stock_error.get('type')}` | "
+            f"{len(stock.get('target_frames', []))} | "
+            f"{len(jit.get('target_frames', []))} | "
+            f"`{stock.get('before', {}).get('recursion_remaining')}/"
+            f"{jit.get('before', {}).get('recursion_remaining')}` | "
+            f"`{jit.get('post_error_recovery')}` | "
+            f"{'yes' if jit.get('pre', {}).get('machine_entry_proven') else 'no'} | "
+            f"`{row.get('result')}` |"
+        )
+    lines.extend(
+        [
+            "",
+            "## Lifecycle change",
+            "",
+            "Before: generated binding called Py_EnterRecursiveCall before the "
+            "attempted JIT frame was linked. On deopt, the anchored evaluator then "
+            "tried to Enter the same frame again; at recursion_remaining=0 that "
+            "duplicate Enter exited without writing the deepest traceback frame.",
+            "",
+            "After: successful binding prelinks the real frame, then performs the "
+            "recursion check. The last admitted compiled frame keeps CPython helper "
+            "headroom while blocking nested Python frames at the logical limit. On "
+            "deopt, recursion-slot ownership is transferred to the anchored evaluator, "
+            "which performs the frame's single interpreter Enter/Leave pair. Normal "
+            "machine return remains owned by the generated bind wrapper.",
+            "",
+            "The failed attempted frame is cleaned through the real frame lifecycle; "
+            "no traceback object or testcase expectation is forged.",
+            "",
+            f"- Matrix errors: `{json.dumps(comparison.get('errors', []), sort_keys=True)}`",
+            "",
+        ]
+    )
+    out.write_text("\n".join(lines))
+
+
 def render_frame_position_report(
     comparison: dict,
     before_path: Path,

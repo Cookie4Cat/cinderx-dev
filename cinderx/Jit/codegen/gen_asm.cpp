@@ -468,6 +468,13 @@ PyObject* resumeInInterpreter(
   }
 
   PyObject* result = nullptr;
+#if PY_VERSION_HEX < 0x030C0000
+  // The generated bind wrapper entered recursion for this real JIT frame.
+  // The anchored evaluator is about to Enter the same frame again. Transfer
+  // ownership first so boundary deopts do not fail the duplicate Enter and
+  // silently omit the deepest traceback frame.
+  JITRT_TransferRecursionToInterpreter311();
+#endif
   // Resume all of the inlined frames and the caller
   int inline_depth = deopt_meta.inline_depth();
   while (inline_depth >= 0) {

@@ -268,16 +268,77 @@ static vectorcallfunc jitrtBoundArgsReentry(PyFunctionObject* func) {
 }
 #define JITRT_CAPTURE_REENTRY(func) jitrtBoundArgsReentry(func)
 
+static PyThreadState* allocate_and_link_interpreter_frame(
+    PyFunctionObject* func,
+    PyCodeObject* co);
+
+thread_local _PyInterpreterFrame* t_prelinked_recursion_frame = nullptr;
+thread_local int t_jit_recursion_entries = 0;
+
 // CPython 3.11 binds in initialize_locals, then consumes a recursion
-// slot at start_frame.  The canary vectorcall never goes through eval,
-// so the same order is: bind in the generated prologue / these helpers,
-// then Enter at body reentry.  GuardedEntry only does the C-stack check.
+// slot only after the attempted frame is linked at start_frame. Binding stays
+// in the generated prologue. This scope then prelinks the real JIT frame,
+// consumes the recursion slot, and lets LoadFrame consume that prelinked frame
+// instead of allocating a second one. A failed Enter unlinks the attempted
+// frame exactly once and returns RecursionError to the caller.
 class RecursiveCallAfterBind {
  public:
-  RecursiveCallAfterBind() : entered_(Py_EnterRecursiveCall("") == 0) {}
+  explicit RecursiveCallAfterBind(PyFunctionObject* func)
+      : entries_before_{t_jit_recursion_entries} {
+    JIT_CHECK(
+        t_prelinked_recursion_frame == nullptr,
+        "nested prelinked CPython 3.11 recursion frame");
+    PyThreadState* tstate = allocate_and_link_interpreter_frame(
+        func, reinterpret_cast<PyCodeObject*>(func->func_code));
+    t_prelinked_recursion_frame = currentFrame(tstate);
+    if (Ci_JitRecursionBoundary311_IsActive()) {
+      Ci_JitRecursionBoundary311_Refuse(tstate);
+      t_prelinked_recursion_frame = nullptr;
+      tstate->recursion_remaining--;
+      JITRT_UnlinkFrame(tstate);
+      tstate->recursion_remaining++;
+      return;
+    }
+    if (_Py_EnterRecursiveCallTstate(tstate, "") == 0) {
+      entered_ = true;
+      t_jit_recursion_entries++;
+      if (tstate->recursion_remaining == 0) {
+        tstate->recursion_headroom++;
+        Ci_JitRecursionBoundary311_Enter();
+        boundary_headroom_ = true;
+      }
+      return;
+    }
+
+    // _Py_CheckRecursiveCall restored recursion_remaining after setting the
+    // exception. Stock temporarily consumes one slot while clearing the
+    // failed entry frame (_PyEvalFrameClearAndPop); mirror that headroom.
+    t_prelinked_recursion_frame = nullptr;
+    tstate->recursion_remaining--;
+    JITRT_UnlinkFrame(tstate);
+    tstate->recursion_remaining++;
+  }
   ~RecursiveCallAfterBind() {
-    if (entered_) {
-      Py_LeaveRecursiveCall();
+    if (t_prelinked_recursion_frame != nullptr) {
+      // Reentry failed before LoadFrame consumed the prelinked frame (for
+      // example, a static type check). Keep the frame chain balanced.
+      PyThreadState* tstate = PyThreadState_GET();
+      t_prelinked_recursion_frame = nullptr;
+      JITRT_UnlinkFrame(tstate);
+    }
+    if (boundary_headroom_ && Ci_JitRecursionBoundary311_IsActive()) {
+      Ci_JitRecursionBoundary311_Leave();
+      PyThreadState_GET()->recursion_headroom--;
+    }
+    if (entered_ && t_jit_recursion_entries == entries_before_ + 1) {
+      t_jit_recursion_entries--;
+      _Py_LeaveRecursiveCallTstate(PyThreadState_GET());
+    } else if (entered_) {
+      JIT_CHECK(
+          t_jit_recursion_entries == entries_before_,
+          "unbalanced transferred 3.11 recursion slot: before={} after={}",
+          entries_before_,
+          t_jit_recursion_entries);
     }
   }
   RecursiveCallAfterBind(const RecursiveCallAfterBind&) = delete;
@@ -288,7 +349,33 @@ class RecursiveCallAfterBind {
 
  private:
   bool entered_{false};
+  bool boundary_headroom_{false};
+  int entries_before_;
 };
+
+void JITRT_TransferRecursionToInterpreter311() {
+  if (t_jit_recursion_entries == 0) {
+    return;
+  }
+  if (Ci_JitRecursionBoundary311_IsActive()) {
+    Ci_JitRecursionBoundary311_Leave();
+    PyThreadState_GET()->recursion_headroom--;
+  }
+  t_jit_recursion_entries--;
+  _Py_LeaveRecursiveCallTstate(PyThreadState_GET());
+}
+
+void JITRT_GetRecursionState311(
+    int* remaining,
+    int* headroom,
+    int* boundary_active,
+    int* jit_entries) {
+  PyThreadState* tstate = PyThreadState_GET();
+  *remaining = tstate->recursion_remaining;
+  *headroom = tstate->recursion_headroom;
+  *boundary_active = Ci_JitRecursionBoundary311_IsActive();
+  *jit_entries = t_jit_recursion_entries;
+}
 
 static PyObject* jitrtReenterAfterBind(
     vectorcallfunc reentry,
@@ -296,7 +383,7 @@ static PyObject* jitrtReenterAfterBind(
     PyObject** args,
     size_t nargsf,
     PyObject* kwnames) {
-  RecursiveCallAfterBind rec;
+  RecursiveCallAfterBind rec{reinterpret_cast<PyFunctionObject*>(func)};
   if (!rec.entered()) {
     return nullptr;
   }
@@ -437,7 +524,7 @@ JITRT_StaticCallFPReturn JITRT_CallWithIncorrectArgcountFPReturn(
   size_t new_nargsf = argcount;
 
 #if PY_VERSION_HEX < 0x030C0000
-  RecursiveCallAfterBind rec;
+  RecursiveCallAfterBind rec{func};
   if (!rec.entered()) {
     return {0.0, 0.0};
   }
@@ -511,7 +598,7 @@ JITRT_CallWithIncorrectArgcount(
   size_t new_nargsf = argcount;
 
 #if PY_VERSION_HEX < 0x030C0000
-  RecursiveCallAfterBind rec;
+  RecursiveCallAfterBind rec{func};
   if (!rec.entered()) {
 #ifdef _WIN32
     return nullptr;
@@ -601,7 +688,7 @@ TRetType JITRT_CallStaticallyWithPrimitiveSignatureWorker(
 
 #if PY_VERSION_HEX < 0x030C0000
   {
-    RecursiveCallAfterBind rec;
+    RecursiveCallAfterBind rec{func};
     if (!rec.entered()) {
       return TRetType();
     }
@@ -803,6 +890,18 @@ static PyThreadState* allocate_and_link_interpreter_frame(
     PyCodeObject* co) {
   PyThreadState* tstate = PyThreadState_GET();
   JIT_DCHECK(tstate != nullptr, "thread state cannot be null");
+
+#if PY_VERSION_HEX < 0x030C0000
+  if (t_prelinked_recursion_frame != nullptr) {
+    _PyInterpreterFrame* frame = t_prelinked_recursion_frame;
+    JIT_CHECK(
+        currentFrame(tstate) == frame && frame->f_func == func &&
+            frame->f_code == co,
+        "prelinked recursion frame does not match compiled body");
+    t_prelinked_recursion_frame = nullptr;
+    return tstate;
+  }
+#endif
 
 #if PY_VERSION_HEX >= 0x030C0000
   _PyInterpreterFrame* frame =
