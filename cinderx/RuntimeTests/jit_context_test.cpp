@@ -4186,10 +4186,6 @@ def with_def(a, b=1):
   EXPECT_TRUE(PyErr_ExceptionMatches(PyExc_RecursionError))
       << "a successful bind must still consume a recursion slot";
   PyErr_Clear();
-}
-
-TEST_F(JITLifecycle311Test, RecursionBoundaryMatchesStockFrameCardinality) {
-  SKIP_311_EXECUTABLE_COMPILE();
 
   runCode(R"(
 import _testinternalcapi

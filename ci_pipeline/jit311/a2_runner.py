@@ -33,6 +33,138 @@ OLD_THRESHOLD1_GAPS = (
     "test_unpack_ex",
 )
 
+ADAPTIVE_DEVIATIONS = {
+    "test.test_dis.DisTests.test_super_instructions",
+    "test.test_dis.DisWithFileTests.test_super_instructions",
+}
+FOOTPRINT_DEVIATION = "test.test_descr.ClassPropertiesAndMethods.test_slots"
+EXPECTED_PUBLICATION_TYPES = {
+    "builtins.CompiledFunction": 1,
+    "builtins.builtin_function_or_method": 1,
+    "builtins.dict": 1,
+    "builtins.tuple": 1,
+    "weakref.ReferenceType": 1,
+}
+
+
+def validate_approved_deviations(penetration: dict, repetition: dict) -> dict:
+    """Require independent proof for every exact compatibility deviation."""
+    differential = penetration.get("differential", {})
+    differences = set(differential.get("differences", {}))
+    approved_rows = {
+        row["testcase"]: row
+        for row in differential.get("approved_deviations", [])
+    }
+    fingerprints = differential.get("fingerprints", {})
+    errors = []
+    proofs = {}
+
+    unregistered = differences - set(approved_rows)
+    if unregistered:
+        errors.append(f"unregistered differences: {sorted(unregistered)}")
+    supported = ADAPTIVE_DEVIATIONS | {FOOTPRINT_DEVIATION}
+    unsupported = differences - supported
+    if unsupported:
+        errors.append(f"unsupported approved differences: {sorted(unsupported)}")
+
+    adaptive_present = differences & ADAPTIVE_DEVIATIONS
+    if adaptive_present:
+        if adaptive_present != ADAPTIVE_DEVIATIONS:
+            errors.append("adaptive disassembly deviation testcase pair is incomplete")
+        semantic = penetration.get("adaptive_semantic_probe", {})
+        required_checks = {
+            "control_load_quickens",
+            "control_loop_quickens",
+            "exceptions_equal",
+            "jit_load_stays_generic",
+            "jit_loop_stays_generic",
+            "jit_machine_entry",
+            "semantic_results_equal",
+        }
+        failed_checks = sorted(
+            name
+            for name in required_checks
+            if semantic.get("checks", {}).get(name) is not True
+        )
+        if semantic.get("result") != "PASS" or failed_checks:
+            errors.append(
+                "adaptive semantic proof failed: "
+                f"result={semantic.get('result')} checks={failed_checks}"
+            )
+        if int(semantic.get("machine_entries_delta", 0)) <= 0:
+            errors.append("adaptive semantic proof has no machine entry")
+        for testcase in sorted(adaptive_present):
+            if fingerprints.get(testcase, {}).get("matched") is not True:
+                errors.append(f"adaptive diagnostic fingerprint failed: {testcase}")
+            approved = approved_rows.get(testcase, {})
+            if approved.get("classification") != (
+                "APPROVED_ADAPTIVE_DISASSEMBLY_DEVIATION"
+            ) or approved.get("proof") != "P/adaptive-semantic-probe.json":
+                errors.append(f"adaptive baseline metadata is not exact: {testcase}")
+        proofs["adaptive_disassembly"] = {
+            "testcases": sorted(adaptive_present),
+            "semantic_result": semantic.get("result"),
+            "checks": semantic.get("checks", {}),
+            "machine_entries_delta": semantic.get("machine_entries_delta"),
+        }
+
+    if FOOTPRINT_DEVIATION in differences:
+        approved = approved_rows.get(FOOTPRINT_DEVIATION, {})
+        if (
+            approved.get("classification") != "APPROVED_STRESS_MODE_DEVIATION"
+            or approved.get("reason")
+            != "one-time JIT publication footprint; not repeated lookup leak"
+            or approved.get("proof") != "R/footprint.json"
+        ):
+            errors.append("test_slots baseline metadata is not exact")
+        footprint = repetition.get("footprint", {})
+        delta = footprint.get("delta", {})
+        strict_checks = footprint.get("strict_checks", {})
+        footprint_errors = []
+        if footprint.get("result") != "PASS":
+            footprint_errors.append("probe result is not PASS")
+        if footprint.get("classification") != "APPROVED_STRESS_MODE_DEVIATION":
+            footprint_errors.append("classification is not final approved stress mode")
+        if footprint.get("shape") != (
+            "test.test_descr.ClassPropertiesAndMethods.test_slots:G.__eq__"
+        ):
+            footprint_errors.append("probe shape is not exact test_slots G.__eq__")
+        if footprint.get("strict_plateau") is not True or not strict_checks or not all(
+            value is True for value in strict_checks.values()
+        ):
+            footprint_errors.append("10/100/1000 or post-GC plateau is not strict")
+        if delta.get("first_publication_gc_objects") != 5:
+            footprint_errors.append("first publication GC delta is not exactly +5")
+        if delta.get("first_publication_object_types") != EXPECTED_PUBLICATION_TYPES:
+            footprint_errors.append("first publication type histogram is not exact")
+        for field in (
+            "steady_10_to_1000_gc_objects",
+            "steady_resident_code_buffers",
+            "steady_compiled_function_creations",
+        ):
+            if delta.get(field) != 0:
+                footprint_errors.append(f"{field} is not zero")
+        if delta.get("steady_10_to_1000_object_types") != {}:
+            footprint_errors.append("steady object-type histogram changed")
+        if fingerprints.get(FOOTPRINT_DEVIATION, {}).get("matched") is not True:
+            footprint_errors.append("test_slots diagnostic fingerprint failed")
+        errors.extend(f"footprint proof: {item}" for item in footprint_errors)
+        proofs["one_time_publication_footprint"] = {
+            "testcase": FOOTPRINT_DEVIATION,
+            "classification": footprint.get("classification"),
+            "shape": footprint.get("shape"),
+            "strict_checks": strict_checks,
+            "delta": delta,
+            "errors": footprint_errors,
+        }
+
+    return {
+        "result": "PASS" if not errors else "FAIL",
+        "actual_deviations": sorted(differences),
+        "proofs": proofs,
+        "errors": errors,
+    }
+
 
 def _coverage_count(report: dict, status: str) -> int:
     return int(report.get("counts", {}).get(status, 0))
@@ -992,74 +1124,72 @@ class A2Runner:
         gaps = sorted(
             module
             for module, row in aggressive.get("modules", {}).items()
-            if row.get("status") == "A2_COVERAGE_GAP"
+            if row.get("status") == "COVERAGE_GAP"
         )
-        if gaps:
-            observed_thresholds = sorted(
-                {
-                    row.get("scheduler_threshold")
-                    for row in aggressive.get("modules", {}).values()
-                    if row.get("scheduler_threshold") is not None
-                }
+        coverage_counts = aggressive.get("counts", {})
+        observed_thresholds = sorted(
+            {
+                row.get("scheduler_threshold")
+                for row in aggressive.get("modules", {}).values()
+                if row.get("scheduler_threshold") is not None
+            }
+        )
+        classified = sum(
+            int(coverage_counts.get(state, 0))
+            for state in (
+                "OWN_CODE_JIT",
+                "PUBLISHED_NO_REENTRY",
+                "EXPECTED_SAFE_REFUSAL",
             )
+        )
+        coverage_errors = []
+        if aggressive.get("classified_modules") != 72 or classified != 72:
+            coverage_errors.append(
+                "three-state classified population is not exactly 72"
+            )
+        if gaps or int(coverage_counts.get("COVERAGE_GAP", 0)) != 0:
+            coverage_errors.append(f"COVERAGE_GAP remains: {gaps}")
+        if aggressive.get("unknown_refusals"):
+            coverage_errors.append("unknown scheduler refusal remains")
+        totals = aggressive.get("totals", {})
+        if int(totals.get("ledger_dropped", 0)) != 0:
+            coverage_errors.append("entry ledger dropped evidence")
+        if int(totals.get("events_dropped", 0)) != 0:
+            coverage_errors.append("scheduler event ledger dropped evidence")
+        if observed_thresholds != [0]:
+            coverage_errors.append(
+                f"JIT-ALL scheduler threshold is not exactly [0]: {observed_thresholds}"
+            )
+        if penetration.get("jitall_config_matrix", {}).get("result") != "PASS":
+            coverage_errors.append("JIT-ALL configuration matrix is not PASS")
+        if coverage_errors:
             add_blocker(
                 ident="A2-P-JITALL-CONFIG",
                 severity="FAIL",
                 classification="PRODUCT_BUG",
                 cluster="scheduler/configuration",
-                summary=(
-                    f"PYTHONJITALL=1 reaches {72-len(gaps)}/72 own-code targets; "
-                    f"the 3.11 frame scheduler reports thresholds {observed_thresholds}"
-                ),
+                summary="; ".join(coverage_errors),
                 reproducer="Run A2 P2 with only PYTHONJITALL=1 and inspect _get_observe_stats()['threshold'].",
                 stock="Stock arm completes 72 requested modules without JIT scheduling.",
-                jit=f"72/72 workers enter machine code, but only {72-len(gaps)}/72 target modules do.",
-                machine_proof=f"P2 worker machine entry is {aggressive.get('totals', {}).get('worker_jit_active', 0)}/72; own-code ledger is {72-len(gaps)}/72.",
-                transition_proof="P2 scheduler rows report threshold 50; P2-DIAG threshold=1 reaches 65/72.",
-                root_cause="CPython 3.11 observe scheduler parses PYTHONJITAUTO but not PYTHONJITALL, while the JIT config parses both.",
+                jit=f"Three-state counts are {json.dumps(coverage_counts, sort_keys=True)}; scheduler thresholds are {observed_thresholds}.",
+                machine_proof=f"P2 own-code machine entry is {totals.get('actual_own_code_machine_entry_modules', 0)}/72; all other modules require a typed non-entry class.",
+                transition_proof="P2 requires threshold=0 and one of OWN_CODE_JIT, PUBLISHED_NO_REENTRY or EXPECTED_SAFE_REFUSAL for every target.",
+                root_cause="JIT-ALL scheduler/configuration, classification, or evidence-ledger contract.",
                 changed_files=[
                     "ci_pipeline/jit311/a2_runner.py",
                     "ci_pipeline/jit311/a2_penetration.py",
                 ],
-                fix_summary="Acceptance method is corrected and the product configuration mismatch is exposed; Phase 1 intentionally does not alter scheduler semantics.",
+                fix_summary="Final A2 fails closed on any unclassified module, unknown refusal, or dropped evidence.",
                 regression_tests=[
                     "ci_pipeline.test_a2_report.A2ReportTest.test_a2_p2_uses_jit_all_and_diagnostic_uses_threshold_one",
                     "ci_pipeline.test_a2_report.A2ReportTest.test_penetration_classifier_uses_package_ownership",
                 ],
-                evidence="P/p2-coverage.json, P/p2-diag-coverage.json, A2_PENETRATION_V02_REPORT.md",
+                evidence="P/p2-coverage.json, A2_JITALL_SCHEDULER_REPORT.md",
                 modules=gaps,
+                errors=coverage_errors,
             )
         unexpected = penetration.get("differential", {}).get("unexpected", {})
-        slots_key = "test.test_descr.ClassPropertiesAndMethods.test_slots"
-        if slots_key in unexpected:
-            strict = repetition.get("footprint", {}).get("strict_plateau", False)
-            add_blocker(
-                ident="A2-RUNTIME-FOOTPRINT-APPROVAL",
-                severity="REVIEW_REQUIRED" if strict else "FAIL",
-                classification=(
-                    "APPROVED_DEVIATION_CANDIDATE" if strict else "PRODUCT_BUG"
-                ),
-                cluster="runtime/first-publication-footprint",
-                summary=(
-                    "Exact G.__eq__ footprint is bounded +5 and needs human approval."
-                    if strict
-                    else "Exact G.__eq__ footprint does not reach a strict plateau."
-                ),
-                reproducer="Run ci_pipeline.jit311.a2_footprint at threshold=1.",
-                stock="test_slots observes no new GC object without publication.",
-                jit="First publication adds exactly five explained GC-tracked objects.",
-                machine_proof="G.__eq__ is installed after the first call and machine entries increase through call 1000.",
-                transition_proof="10, 100 and 1000 exact histograms plus two post-GC samples are recorded.",
-                root_cause="One-time CompiledFunction publication footprint, not repeated lookup growth.",
-                changed_files=["ci_pipeline/jit311/a2_footprint.py"],
-                fix_summary="Replaced heuristic Box probe with exact G.__eq__ shape and strict equality checks; no baseline was changed.",
-                regression_tests=["ci_pipeline.jit311.a2_footprint"],
-                evidence="R/footprint.json, A2_POLICY_AND_FOOTPRINT_REPORT.md",
-                testcase=slots_key,
-            )
-        other_unexpected = sorted(
-            key for key in unexpected if key not in {slots_key, "<module> test_descr"}
-        )
+        other_unexpected = sorted(unexpected)
         if other_unexpected:
             add_blocker(
                 ident="A2-P-UNEXPECTED",
@@ -1078,6 +1208,31 @@ class A2Runner:
                 regression_tests=other_unexpected,
                 evidence="P/p0-vs-p2.json",
                 testcases=other_unexpected,
+            )
+        deviation_proof = validate_approved_deviations(penetration, repetition)
+        if deviation_proof["result"] != "PASS":
+            add_blocker(
+                ident="A2-APPROVED-DEVIATION-PROOF",
+                severity="FAIL",
+                classification="PRODUCT_BUG",
+                cluster="compatibility/deviation-proof",
+                summary="An exact compatibility deviation lacks its required independent proof.",
+                reproducer="Run A2 P and R and validate the exact testcase fingerprints against the semantic and footprint probes.",
+                stock="Stock outcomes are recorded in P/p0-stock/result.json.",
+                jit="Only the three reviewed exact testcase outcomes may differ under JIT-ALL.",
+                machine_proof="Adaptive and footprint probes each require their own machine-entry evidence.",
+                transition_proof="The footprint proof requires exact +5 publication and a zero-growth plateau.",
+                root_cause="Deviation fingerprint or independent semantic/mechanism proof.",
+                changed_files=[
+                    "ci_pipeline/jit311/data/a2_compatibility_deviations.json",
+                    "ci_pipeline/jit311/a2_runner.py",
+                ],
+                fix_summary="The final judge rejects a baseline-only approval.",
+                regression_tests=[
+                    "A2ReportTest.test_final_deviation_proof_requires_semantics_and_exact_footprint"
+                ],
+                evidence="P/p0-vs-p2.json, P/adaptive-semantic-probe.json, R/footprint.json",
+                errors=deviation_proof["errors"],
             )
         position_result = transitions.get("frame_positions", {})
         if position_result and position_result.get("result") != "PASS":
@@ -1105,6 +1260,33 @@ class A2Runner:
                 ],
                 evidence="T/frame-position-*.json, T/error-position-*.json, A2_FRAME_POSITION_REPORT.md",
             )
+        recursion_result = transitions.get("recursion_boundary", {})
+        if recursion_result and recursion_result.get("result") != "PASS":
+            add_blocker(
+                ident="A2-RECURSION-BOUNDARY",
+                severity="FAIL",
+                classification="PRODUCT_BUG",
+                cluster="recursion/entry-accounting",
+                summary="Stock/JIT recursion frame cardinality or accounting differs.",
+                reproducer="Run a2_recursion_boundary_probe in Stock and JIT arms plus transition T10.",
+                stock="R1-R6 and T10 provide the exact Stock traceback-frame oracle.",
+                jit="Every target frame, exception, cursor and post-error accounting must match Stock.",
+                machine_proof="Every JIT recursion row requires an entry-ledger row for its target.",
+                transition_proof="T10 and R1-R6 compare full target-frame lists and balanced recursion state.",
+                root_cause="Recursion frame lifecycle or recursion-slot ownership.",
+                changed_files=[
+                    "cinderx/Jit/jit_rt.cpp",
+                    "cinderx/Interpreter/3.11/interpreter.c",
+                ],
+                fix_summary="The final gate does not permit a recursion-cardinality deviation.",
+                regression_tests=[
+                    "JITLifecycle311Test.BindFailureAtRecursionLimitMatchesStock",
+                    "a2_recursion_boundary_probe:R1-R6",
+                    "T10",
+                ],
+                evidence="T/recursion-boundary-*.json, T/result.json, A2_RECURSION_BOUNDARY_REPORT.md",
+                errors=recursion_result.get("errors", []),
+            )
         transition_failures = [
             row
             for row in transitions.get("transitions", [])
@@ -1112,68 +1294,24 @@ class A2Runner:
         ]
         if transition_failures:
             failed_ids = [row["id"] for row in transition_failures]
-            recursion_only = (
-                failed_ids == ["T10"] and position_result.get("result") == "PASS"
-            )
             add_blocker(
-                ident=(
-                    "A2-RECURSION-BOUNDARY"
-                    if recursion_only
-                    else "A2-TRANSITION-CORRECTNESS"
-                ),
+                ident="A2-TRANSITION-CORRECTNESS",
                 severity="FAIL",
                 classification="PRODUCT_BUG",
-                cluster=(
-                    "recursion/entry-accounting"
-                    if recursion_only
-                    else "runtime/transition"
-                ),
-                summary=(
-                    "T10 traceback positions match, but JIT exposes one fewer recursive frame than Stock."
-                    if recursion_only
-                    else "One or more A2 transitions fail the Stock semantic/recovery contract."
-                ),
-                reproducer=(
-                    "Run a2_transition_probe T10 with depth 100000."
-                    if recursion_only
-                    else "Run the A2 transition matrix."
-                ),
-                stock=(
-                    "T10 contains 992 t10_recursive traceback frames at tb_lasti 52."
-                    if recursion_only
-                    else "See T/stock.json."
-                ),
-                jit=(
-                    "T10 contains 991 t10_recursive traceback frames, all at tb_lasti 52."
-                    if recursion_only
-                    else "See T/jit.json."
-                ),
-                machine_proof=(
-                    "T10 records compiled pre-state and 992 machine entries/deopt rows."
-                    if recursion_only
-                    else "Each failed transition retains pre-JIT entry proof."
-                ),
-                transition_proof=(
-                    "T10 UnhandledException rows are typed and position-correct; frame cardinality differs."
-                    if recursion_only
-                    else "See transition_rows in T/result.json."
-                ),
-                root_cause=(
-                    "Recursion entry/traceback cardinality, separate from F2 cursor restoration."
-                    if recursion_only
-                    else "Unclassified transition runtime layer."
-                ),
+                cluster="runtime/transition",
+                summary="One or more A2 transitions fail the Stock semantic/recovery contract.",
+                reproducer="Run the A2 transition matrix.",
+                stock="See T/stock.json.",
+                jit="See T/jit.json.",
+                machine_proof="Each failed transition retains pre-JIT entry proof.",
+                transition_proof="See transition_rows in T/result.json.",
+                root_cause="Unclassified transition runtime layer.",
                 changed_files=[
-                    "cinderx/Jit/deopt.cpp",
                     "ci_pipeline/jit311/a2_transition_probe.py",
                 ],
-                fix_summary=(
-                    "F2 tb_lasti is fixed; recursion cardinality remains open."
-                    if recursion_only
-                    else "No weakening or baseline was applied."
-                ),
-                regression_tests=["T03", "T10", "a2_error_position_probe"],
-                evidence="T/stock.json, T/jit.json, T/result.json, A2_FRAME_POSITION_REPORT.md",
+                fix_summary="No transition failure is converted to a deviation.",
+                regression_tests=failed_ids,
+                evidence="T/stock.json, T/jit.json, T/result.json",
                 transitions=failed_ids,
             )
         failed_code_swap = {
@@ -1204,11 +1342,34 @@ class A2Runner:
                 arms=sorted(failed_code_swap),
             )
         states = [result.get("result") for result in self.results.values()]
-        if "FAIL" in states:
+        if any(state in {"FAIL", "REVIEW_REQUIRED"} for state in states):
+            severity = "FAIL" if "FAIL" in states else "REVIEW_REQUIRED"
+            add_blocker(
+                ident="A2-LANE-RESULT",
+                severity=severity,
+                classification="PRODUCT_BUG" if severity == "FAIL" else "REVIEW_REQUIRED",
+                cluster="acceptance/lane-result",
+                summary=f"One or more A2 lanes did not pass: {states}",
+                reproducer="Inspect P/result.json, T/result.json and R probe outputs.",
+                stock="Stock or control observations are recorded by each lane.",
+                jit="At least one lane-level contract is not green.",
+                machine_proof="See the failing lane's entry ledgers.",
+                transition_proof="See the failing lane's typed result rows.",
+                root_cause="Lane-specific acceptance contract.",
+                changed_files=[],
+                fix_summary="No lane failure is converted to an approved deviation.",
+                regression_tests=[],
+                evidence="P/result.json, T/result.json, R/*.json",
+            )
+        blocker_severities = {item["severity"] for item in blockers}
+        if "FAIL" in states or "FAIL" in blocker_severities:
             final = "FAIL"
-        elif "REVIEW_REQUIRED" in states:
+        elif "REVIEW_REQUIRED" in states or "REVIEW_REQUIRED" in blocker_severities:
             final = "REVIEW_REQUIRED"
-        elif "PASS_WITH_APPROVED_DEVIATIONS" in states:
+        elif (
+            penetration.get("differential", {}).get("differences")
+            and deviation_proof["result"] == "PASS"
+        ):
             final = "PASS_WITH_APPROVED_DEVIATIONS"
         else:
             final = "PASS"
@@ -1220,16 +1381,17 @@ class A2Runner:
             "repetition": repetition.get("repetition", {}),
             "footprint": repetition.get("footprint", {}),
             "code_swap_policy": repetition.get("code_swap", {}),
+            "approved_deviation_proof": deviation_proof,
             "blockers": blockers,
             "commands": self.base.command_results,
         }
         (self.output / "a2_result.json").write_text(
             json.dumps(payload, indent=2, sort_keys=True) + "\n"
         )
-        render_markdown(payload, self.output / "A2_EXECUTION_REPORT_V02.md")
-        blocker_lines = ["# A2 v0.2 Blockers", ""]
+        render_markdown(payload, self.output / "A2_EXECUTION_REPORT_FINAL.md")
+        blocker_lines = ["# CPython 3.11 CinderX JIT A2 Final Blockers", ""]
         if not blockers:
-            blocker_lines.extend(["None.", ""])
+            blocker_lines.extend(["No remaining A2 correctness blocker.", ""])
         for item in blockers:
             blocker_lines.extend(
                 [
@@ -1247,7 +1409,9 @@ class A2Runner:
                     "",
                 ]
             )
-        (self.output / "A2_BLOCKERS_V02.md").write_text("\n".join(blocker_lines) + "\n")
+        (self.output / "A2_BLOCKERS_FINAL.md").write_text(
+            "\n".join(blocker_lines) + "\n"
+        )
         return final
 
     def run(self) -> str:
@@ -1287,7 +1451,7 @@ def main(argv: list[str] | None = None) -> int:
             file=sys.stderr,
         )
         return 1
-    print(f"A2 {final}: {runner.output / 'A2_EXECUTION_REPORT_V02.md'}")
+    print(f"A2 {final}: {runner.output / 'A2_EXECUTION_REPORT_FINAL.md'}")
     if final in PASS_STATES:
         return 0
     return 2 if final == "REVIEW_REQUIRED" else 1

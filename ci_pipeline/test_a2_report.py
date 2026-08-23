@@ -11,7 +11,7 @@ from ci_pipeline.jit311.a2_report import (
     compare_recursion_boundary,
     judge_transitions,
 )
-from ci_pipeline.jit311.a2_runner import A2Runner
+from ci_pipeline.jit311.a2_runner import A2Runner, validate_approved_deviations
 
 
 ROOT = Path(__file__).resolve().parent.parent
@@ -19,6 +19,132 @@ DATA = ROOT / "ci_pipeline/jit311/data"
 
 
 class A2ReportTest(unittest.TestCase):
+    def test_final_deviation_proof_requires_semantics_and_exact_footprint(self):
+        adaptive = {
+            "test.test_dis.DisTests.test_super_instructions",
+            "test.test_dis.DisWithFileTests.test_super_instructions",
+        }
+        slots = "test.test_descr.ClassPropertiesAndMethods.test_slots"
+        testcases = adaptive | {slots}
+        penetration = {
+            "differential": {
+                "differences": {testcase: {} for testcase in testcases},
+                "approved_deviations": [
+                    {
+                        "testcase": testcase,
+                        "classification": (
+                            "APPROVED_STRESS_MODE_DEVIATION"
+                            if testcase == slots
+                            else "APPROVED_ADAPTIVE_DISASSEMBLY_DEVIATION"
+                        ),
+                        "reason": (
+                            "one-time JIT publication footprint; not repeated lookup leak"
+                            if testcase == slots
+                            else "adaptive"
+                        ),
+                        "proof": (
+                            "R/footprint.json"
+                            if testcase == slots
+                            else "P/adaptive-semantic-probe.json"
+                        ),
+                    }
+                    for testcase in testcases
+                ],
+                "fingerprints": {
+                    testcase: {"matched": True} for testcase in testcases
+                },
+            },
+            "adaptive_semantic_probe": {
+                "result": "PASS",
+                "machine_entries_delta": 11,
+                "checks": {
+                    "control_load_quickens": True,
+                    "control_loop_quickens": True,
+                    "exceptions_equal": True,
+                    "jit_load_stays_generic": True,
+                    "jit_loop_stays_generic": True,
+                    "jit_machine_entry": True,
+                    "semantic_results_equal": True,
+                },
+            },
+        }
+        footprint = {
+            "result": "PASS",
+            "classification": "APPROVED_STRESS_MODE_DEVIATION",
+            "shape": (
+                "test.test_descr.ClassPropertiesAndMethods.test_slots:G.__eq__"
+            ),
+            "strict_plateau": True,
+            "strict_checks": {"steady": True, "post_gc": True},
+            "delta": {
+                "first_publication_gc_objects": 5,
+                "first_publication_object_types": {
+                    "builtins.CompiledFunction": 1,
+                    "builtins.builtin_function_or_method": 1,
+                    "builtins.dict": 1,
+                    "builtins.tuple": 1,
+                    "weakref.ReferenceType": 1,
+                },
+                "steady_10_to_1000_gc_objects": 0,
+                "steady_10_to_1000_object_types": {},
+                "steady_resident_code_buffers": 0,
+                "steady_compiled_function_creations": 0,
+            },
+        }
+        report = validate_approved_deviations(
+            penetration, {"footprint": footprint}
+        )
+        footprint["delta"]["steady_resident_code_buffers"] = 1
+        wrong = validate_approved_deviations(
+            penetration, {"footprint": footprint}
+        )
+        self.assertEqual(report["result"], "PASS")
+        self.assertEqual(wrong["result"], "FAIL")
+        self.assertTrue(any("resident" in item for item in wrong["errors"]))
+
+    def test_penetration_deviation_supports_exact_diagnostic_regex(self):
+        testcase = "test.test_descr.ClassPropertiesAndMethods.test_slots"
+        stock = {
+            "modules": {"test_descr": "pass"},
+            "cases": {testcase: "pass"},
+            "diagnostics": {},
+        }
+        aggressive = {
+            "modules": {"test_descr": "fail"},
+            "cases": {testcase: "failure"},
+            "diagnostics": {
+                testcase: "AssertionError: AssertionError: 19457 != 19462"
+            },
+        }
+        with tempfile.TemporaryDirectory() as temporary:
+            directory = Path(temporary)
+            left, right = directory / "left.json", directory / "right.json"
+            deviations = directory / "deviations.json"
+            left.write_text(json.dumps(stock))
+            right.write_text(json.dumps(aggressive))
+            deviations.write_text(
+                json.dumps(
+                    {
+                        "deviations": [
+                            {
+                                "testcase": testcase,
+                                "stock": "pass",
+                                "aggressive": "failure",
+                                "fingerprint_regex": [
+                                    "^AssertionError: AssertionError: [0-9]+ != [0-9]+$"
+                                ],
+                            }
+                        ]
+                    }
+                )
+            )
+            report = compare_penetration(left, right, deviations)
+            aggressive["diagnostics"][testcase] = "AssertionError: unrelated"
+            right.write_text(json.dumps(aggressive))
+            wrong = compare_penetration(left, right, deviations)
+        self.assertEqual(report["result"], "PASS_WITH_APPROVED_DEVIATIONS")
+        self.assertEqual(wrong["result"], "FAIL")
+
     def test_recursion_comparison_requires_exact_frames_and_balanced_state(self):
         state = {
             "recursion_remaining": 52,

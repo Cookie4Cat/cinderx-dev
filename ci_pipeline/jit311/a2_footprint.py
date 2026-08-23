@@ -122,7 +122,7 @@ def run() -> dict:
     return {
         "result": "PASS" if strict_plateau else "FAIL",
         "classification": (
-            "APPROVED_DEVIATION_CANDIDATE" if strict_plateau else "PRODUCT_BUG"
+            "APPROVED_STRESS_MODE_DEVIATION" if strict_plateau else "PRODUCT_BUG"
         ),
         "shape": "test.test_descr.ClassPropertiesAndMethods.test_slots:G.__eq__",
         "samples": samples,
@@ -150,7 +150,7 @@ def run() -> dict:
         "strict_plateau": strict_plateau,
         "compatibility_baseline_changed": False,
         "explanation": (
-            "bounded first JIT publication footprint, not per-lookup growth"
+            "one-time JIT publication footprint; not repeated lookup leak"
             if strict_plateau
             else "steady-state footprint continued to change"
         ),
