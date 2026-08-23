@@ -46,6 +46,12 @@ static const char* ci_observe_spelling = "off";
 // an already-dispatched code object are offered for fresh attachment.
 static int ci_observe_execute;
 static uint64_t ci_observe_threshold;
+static const char* ci_observe_threshold_source = "unconfigured";
+static int ci_shared_autojit_set;
+static int ci_shared_autojit_configured;
+static int ci_shared_autojit_valid;
+static int ci_shared_autojit_classify;
+static uint64_t ci_shared_autojit_threshold;
 static FILE* ci_observe_file;
 // Compilation is synchronous under the 3.11 GIL.  Keep all frames entered by
 // the compiler itself out of observation and protect the single JIT context
@@ -122,6 +128,73 @@ static int env_flag_enabled(const char* name) {
   }
   return strcmp(value, "1") == 0 || strcasecmp(value, "true") == 0 ||
       strcasecmp(value, "yes") == 0 || strcasecmp(value, "on") == 0;
+}
+
+void Ci_Observe311_SetResolvedAutoJitConfig(
+    int configured,
+    uint64_t threshold,
+    int auto_classify,
+    int valid) {
+  ci_shared_autojit_set = 1;
+  ci_shared_autojit_configured = configured != 0;
+  ci_shared_autojit_threshold = threshold;
+  ci_shared_autojit_classify = auto_classify != 0;
+  ci_shared_autojit_valid = valid != 0;
+}
+
+static int parse_autojit_threshold(const char* raw, uint64_t* threshold) {
+  const char* number = raw;
+  if (strcmp(raw, "auto") == 0) {
+    *threshold = 50;
+    return 0;
+  }
+  if (strncmp(raw, "auto:", 5) == 0) {
+    number = raw + 5;
+  }
+  int digits_only = *number != '\0';
+  for (const char* cursor = number; *cursor != '\0'; cursor++) {
+    if (*cursor < '0' || *cursor > '9') {
+      digits_only = 0;
+      break;
+    }
+  }
+  errno = 0;
+  char* end = NULL;
+  unsigned long long parsed = strtoull(number, &end, 10);
+  if (!digits_only || end == number || *end != '\0' || errno == ERANGE ||
+      parsed > UINT32_MAX) {
+    PyErr_Format(
+        PyExc_RuntimeError,
+        "PYTHONJITAUTO=%s is not usable on CPython 3.11: expected a "
+        "non-negative integer, auto, or auto:N",
+        raw);
+    return -1;
+  }
+  *threshold = (uint64_t)parsed;
+  return 0;
+}
+
+static int resolve_autojit_threshold_from_env(uint64_t* threshold) {
+  *threshold = 50;
+  ci_shared_autojit_classify = 0;
+  const char* raw_all = getenv("PYTHONJITALL");
+  if (raw_all != NULL && *raw_all != '\0') {
+    errno = 0;
+    char* end = NULL;
+    (void)strtol(raw_all, &end, 10);
+    if (end != raw_all && *end == '\0' && errno != ERANGE) {
+      *threshold = 0;
+    }
+  }
+  const char* raw_auto = getenv("PYTHONJITAUTO");
+  if (raw_auto != NULL && strncmp(raw_auto, "auto", 4) == 0) {
+    ci_shared_autojit_classify = 1;
+  }
+  if (raw_auto != NULL && *raw_auto != '\0' &&
+      parse_autojit_threshold(raw_auto, threshold) < 0) {
+    return -1;
+  }
+  return 0;
 }
 
 int Ci_Observe311_ResolveMode(Ci_JitMode311* mode, const char** spelling) {
@@ -231,37 +304,21 @@ int Ci_Observe311_Configure(void) {
     return -1;
   }
 
-  // The hot threshold reuses the auto-JIT knob rather than growing a new
-  // one.  Counting is explicit, so only a plain positive count is accepted;
-  // the 3.12+ "auto[:N]" classifier spellings are not part of this port.
   uint64_t threshold = 50;
-  const char* raw_threshold = getenv("PYTHONJITAUTO");
-  if (raw_threshold != NULL && *raw_threshold != '\0') {
-    // Digits only, checked before strtoull rather than after: strtoull
-    // accepts a sign, so "-1" would convert to 18446744073709551615 and
-    // read back as a threshold no program ever reaches -- auto-JIT
-    // apparently on, in practice never compiling anything.  Range errors
-    // are refused for the same reason instead of saturating.
-    int digits_only = 1;
-    for (const char* c = raw_threshold; *c != '\0'; c++) {
-      if (*c < '0' || *c > '9') {
-        digits_only = 0;
-        break;
-      }
-    }
-    errno = 0;
-    char* end = NULL;
-    unsigned long long parsed = strtoull(raw_threshold, &end, 10);
-    if (!digits_only || end == raw_threshold || *end != '\0' ||
-        errno == ERANGE || parsed == 0) {
-      PyErr_Format(
+  if (ci_shared_autojit_set) {
+    if (!ci_shared_autojit_valid) {
+      PyErr_SetString(
           PyExc_RuntimeError,
-          "PYTHONJITAUTO=%s is not a usable observe threshold: expected a "
-          "positive integer",
-          raw_threshold);
+          "shared CPython 3.11 Auto-JIT threshold resolution failed");
       return -1;
     }
-    threshold = (uint64_t)parsed;
+    threshold = ci_shared_autojit_configured ? ci_shared_autojit_threshold : 50;
+    ci_observe_threshold_source = "shared-jit-config";
+  } else {
+    if (resolve_autojit_threshold_from_env(&threshold) < 0) {
+      return -1;
+    }
+    ci_observe_threshold_source = "environment-fallback";
   }
 
   FILE* file = NULL;
@@ -861,6 +918,12 @@ PyObject* Ci_Observe311_Stats(void) {
       stats_set_str(stats, "mode", mode_names[ci_observe_mode]) < 0 ||
       stats_set_str(stats, "requested_mode", ci_observe_spelling) < 0 ||
       stats_set_uint(stats, "threshold", ci_observe_threshold) < 0 ||
+      stats_set_str(stats, "threshold_source", ci_observe_threshold_source) <
+          0 ||
+      PyDict_SetItemString(
+          stats,
+          "auto_classify",
+          ci_shared_autojit_classify ? Py_True : Py_False) < 0 ||
       stats_set_uint(stats, "codes_seen", ci_observe_codes_seen) < 0 ||
       stats_set_uint(stats, "events_dropped", ci_observe_events_dropped) < 0 ||
       stats_set_uint(stats, "fresh_attachments", ci_observe_fresh_attachments) <
@@ -920,6 +983,12 @@ void Ci_Observe311_Finalize(void) {
   ci_observe_spelling = "off";
   ci_observe_execute = 0;
   ci_observe_threshold = 0;
+  ci_observe_threshold_source = "unconfigured";
+  ci_shared_autojit_set = 0;
+  ci_shared_autojit_configured = 0;
+  ci_shared_autojit_valid = 0;
+  ci_shared_autojit_classify = 0;
+  ci_shared_autojit_threshold = 0;
   ci_observe_codes_seen = 0;
   ci_observe_events_dropped = 0;
   ci_observe_fresh_attachments = 0;

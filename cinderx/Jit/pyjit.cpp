@@ -765,16 +765,16 @@ void configureCompileAfterNCalls(uint32_t calls, bool auto_classify) {
       auto_classify && autoJitImportProviderEnabledFromEnv();
 }
 
-void parseAutoJitOption(const std::string& value) {
+bool parseAutoJitOption(const std::string& value) {
   if (value.empty()) {
     configureCompileAfterNCalls(1, false);
-    return;
+    return true;
   }
 
   uint32_t threshold = 0;
   if (value == "auto") {
     configureCompileAfterNCalls(kAutoJitClassifyDefaultThreshold, true);
-    return;
+    return true;
   }
   constexpr std::string_view kAutoPrefix{"auto:"};
   if (value.starts_with(kAutoPrefix)) {
@@ -784,15 +784,20 @@ void parseAutoJitOption(const std::string& value) {
       configureCompileAfterNCalls(threshold, true);
     } else {
       JIT_LOG("Invalid value for jit-auto/PYTHONJITAUTO: {}", value);
+      return false;
     }
-    return;
+    return true;
   }
   if (parse_uint32_arg(value, &threshold)) {
     configureCompileAfterNCalls(threshold, false);
   } else {
     JIT_LOG("Invalid value for jit-auto/PYTHONJITAUTO: {}", value);
+    return false;
   }
+  return true;
 }
+
+bool g_auto_jit_option_valid = true;
 
 FlagProcessor initFlagProcessor() {
   FlagProcessor flag_processor;
@@ -815,7 +820,9 @@ FlagProcessor initFlagProcessor() {
   flag_processor.addOption(
       "jit-auto",
       "PYTHONJITAUTO",
-      [](const std::string& val) { parseAutoJitOption(val); },
+      [](const std::string& val) {
+        g_auto_jit_option_valid = parseAutoJitOption(val);
+      },
       "Enable auto-JIT mode, which compiles functions after the given "
       "threshold");
 
@@ -2711,6 +2718,23 @@ PyObject* jit311_code_state(PyObject* /* self */, PyObject* arg) {
       code->co_firstlineno,
       "code_qualname",
       code->co_qualname);
+}
+
+PyObject* jit311_config_state(PyObject* /* self */, PyObject* /* arg */) {
+  auto threshold = getConfig().compile_after_n_calls;
+  Ref<> result = Ref<>::steal(PyDict_New());
+  Ref<> threshold_obj = threshold.has_value()
+      ? Ref<>::steal(PyLong_FromUnsignedLong(*threshold))
+      : Ref<>::create(Py_None);
+  if (result == nullptr || threshold_obj == nullptr ||
+      PyDict_SetItemString(result, "compile_after_n_calls", threshold_obj) < 0 ||
+      PyDict_SetItemString(
+          result,
+          "auto_classify",
+          getConfig().auto_classify ? Py_True : Py_False) < 0) {
+    return nullptr;
+  }
+  return result.release();
 }
 
 PyObject* jit311_execute_surface(PyObject* /* self */, PyObject* /* arg */) {
@@ -4754,6 +4778,10 @@ PyMethodDef jit_methods_311_canary[] = {
      METH_O,
      PyDoc_STR("Return the private CPython 3.11 automatic-JIT policy state "
                "for a Python function.")},
+    {"_jit311_config_state",
+     jit311_config_state,
+     METH_NOARGS,
+     PyDoc_STR("Return the private resolved CPython 3.11 JIT configuration.")},
     {"_jit311_execute_surface",
      jit311_execute_surface,
      METH_NOARGS,
@@ -5480,12 +5508,32 @@ int initialize() {
   }
   getMutableConfig().use_stable_pointers = use_stable_pointers;
 
+  g_auto_jit_option_valid = true;
   FlagProcessor flag_processor = initFlagProcessor();
   if (flag_processor.hasHandled("jit-help")) {
     std::cout << flag_processor.jitXOptionHelpMessage() << '\n';
     // Return rather than exit here for arg printing test doesn't end early.
     return -2;
   }
+#if PY_VERSION_HEX < 0x030C0000
+  if (!g_auto_jit_option_valid) {
+    Ci_Observe311_SetResolvedAutoJitConfig(0, 0, 0, 0);
+    PyErr_Format(
+        PyExc_RuntimeError,
+        "invalid PYTHONJITAUTO/-X jit-auto value for CPython 3.11");
+    return -1;
+  }
+  if ((shadow_requested || canary_requested) &&
+      !getConfig().compile_after_n_calls.has_value()) {
+    configureCompileAfterNCalls(50, false);
+  }
+  auto resolved_threshold = getConfig().compile_after_n_calls;
+  Ci_Observe311_SetResolvedAutoJitConfig(
+      resolved_threshold.has_value(),
+      resolved_threshold.value_or(0),
+      getConfig().auto_classify,
+      1);
+#endif
   if (validateFrameModeConfig() < 0) {
     return -1;
   }

@@ -191,6 +191,121 @@ def render_penetration_v02(result: dict, path: Path) -> None:
     path.write_text("\n".join(lines))
 
 
+def render_jitall_scheduler_report(result: dict, path: Path) -> None:
+    aggressive = result["aggressive_coverage"]
+    diagnostic = result["threshold1_diagnostic_coverage"]
+    differential = result["differential"]
+    config = result["jitall_config_matrix"]
+    gaps = {
+        name: row
+        for name, row in aggressive.get("modules", {}).items()
+        if row.get("status") == "COVERAGE_GAP"
+    }
+    counts = aggressive.get("counts", {})
+    thresholds = sorted(
+        {
+            row.get("scheduler_threshold")
+            for row in aggressive.get("modules", {}).values()
+            if row.get("scheduler_threshold") is not None
+        }
+    )
+    bad_modules = {
+        name: state
+        for name, state in aggressive.get("test_modules", {}).items()
+        if state in {"crash", "no_result"}
+    }
+    lines = [
+        "# CPython 3.11 A2 JIT-ALL Scheduler Report",
+        "",
+        f"- Gate result: `{result['result']}`",
+        f"- Config matrix: `{config.get('result')}`",
+        f"- Target modules: `{aggressive.get('target_modules')}`",
+        f"- Classified modules: `{aggressive.get('classified_modules')}/72`",
+        f"- OWN_CODE_JIT: `{counts.get('OWN_CODE_JIT', 0)}`",
+        f"- PUBLISHED_NO_REENTRY: `{counts.get('PUBLISHED_NO_REENTRY', 0)}`",
+        f"- EXPECTED_SAFE_REFUSAL: `{counts.get('EXPECTED_SAFE_REFUSAL', 0)}`",
+        f"- COVERAGE_GAP: `{counts.get('COVERAGE_GAP', 0)}`",
+        f"- Actual own-code machine entry: `{aggressive.get('totals', {}).get('actual_own_code_machine_entry_modules', 0)}/72`",
+        f"- Unknown refusals: `{len(aggressive.get('unknown_refusals', []))}`",
+        f"- Entry-ledger dropped: `{aggressive.get('totals', {}).get('ledger_dropped', 0)}`",
+        f"- Scheduler events dropped: `{aggressive.get('totals', {}).get('events_dropped', 0)}`",
+        f"- Observed JIT-ALL scheduler thresholds: `{thresholds}`",
+        "",
+        "## Threshold resolution contract",
+        "",
+        "| Case | Environment | Shared threshold | Scheduler threshold | Mode | Result |",
+        "|---|---|---:|---:|---|---|",
+    ]
+    for name, row in config.get("cases", {}).items():
+        payload = row.get("payload") or {}
+        expected_failure = name == "invalid_jitauto"
+        passed = (
+            row.get("returncode") != 0
+            if expected_failure
+            else row.get("returncode") == 0
+        )
+        lines.append(
+            f"| `{name}` | `{json.dumps(row.get('environment', {}), sort_keys=True)}` | "
+            f"`{payload.get('shared_threshold')}` | "
+            f"`{payload.get('observe_threshold')}` | "
+            f"`{payload.get('observe_mode')}` | {'PASS' if passed else 'FAIL'} |"
+        )
+    lines.extend(
+        [
+            "",
+            "The shared FlagProcessor remains the execute/shadow oracle. It processes "
+            "JIT-ALL first and JITAUTO second, so JITAUTO=7 overrides JIT-ALL=1. "
+            "The final resolved value is published to the 3.11 frame scheduler; "
+            "PYTHONJITDISABLE still resolves execute mode to off.",
+            "",
+            "Threshold zero means the first observed frame schedules and publishes. "
+            "It does not replace the already-running interpreted frame; a one-call "
+            "function may therefore be PUBLISHED_NO_REENTRY.",
+            "",
+            "## Historical threshold=1 gaps",
+            "",
+            "| Module | threshold=1 machine entry | Final JIT-ALL class | Events | Verdicts |",
+            "|---|---:|---|---:|---|",
+        ]
+    )
+    for name in OLD_THRESHOLD1_GAPS:
+        diag = diagnostic.get("modules", {}).get(name, {})
+        final = aggressive.get("modules", {}).get(name, {})
+        lines.append(
+            f"| `{name}` | {'yes' if diag.get('status') == 'OWN_CODE_JIT' else 'no'} | "
+            f"`{final.get('status')}` | {len(final.get('own_scheduler_events', []))} | "
+            f"`{json.dumps(final.get('compile_results', {}), sort_keys=True)}` |"
+        )
+    lines.extend(
+        [
+            "",
+            "## Remaining coverage gaps",
+            "",
+        ]
+    )
+    if not gaps:
+        lines.append("No COVERAGE_GAP remains.")
+    for name, row in sorted(gaps.items()):
+        lines.append(
+            f"- `{name}` ownership={json.dumps(row.get('ownership', {}), sort_keys=True)} "
+            f"events={json.dumps(row.get('own_scheduler_events', []), sort_keys=True)}"
+        )
+    lines.extend(
+        [
+            "",
+            "## Semantic and runtime integrity",
+            "",
+            f"- Stock vs JIT-ALL testcase differences: `{len(differential.get('differences', {}))}`",
+            f"- Unexpected differences: `{len(differential.get('unexpected', {}))}`",
+            f"- Approved exact deviations used: `{len(differential.get('approved_deviations', []))}`",
+            f"- Differential result: `{differential.get('result')}`",
+            f"- Crash/hang/no-result modules: `{json.dumps(bad_modules, sort_keys=True)}`",
+            "",
+        ]
+    )
+    path.write_text("\n".join(lines))
+
+
 class A2Runner:
     def __init__(
         self,
@@ -280,26 +395,35 @@ class A2Runner:
         return env
 
     def _classify_penetration(
-        self, name: str, journal: Path, test_result: Path, out: Path
+        self,
+        name: str,
+        journal: Path,
+        test_result: Path,
+        out: Path,
+        *,
+        stock_result: Path | None = None,
+        jit_all_contract: bool = False,
     ) -> int:
+        command = [
+            str(self.base.python),
+            "-m",
+            "ci_pipeline.jit311.a2_penetration",
+            "--journal",
+            str(journal),
+            "--targets",
+            str(self.base.stage / "ci_pipeline/jit311/data/a1_compile_all_modules.txt"),
+            "--test-result",
+            str(test_result),
+            "--out",
+            str(out),
+        ]
+        if stock_result is not None:
+            command.extend(["--stock-result", str(stock_result)])
+        if jit_all_contract:
+            command.append("--jit-all-contract")
         return self.base._run(
             name,
-            [
-                str(self.base.python),
-                "-m",
-                "ci_pipeline.jit311.a2_penetration",
-                "--journal",
-                str(journal),
-                "--targets",
-                str(
-                    self.base.stage
-                    / "ci_pipeline/jit311/data/a1_compile_all_modules.txt"
-                ),
-                "--test-result",
-                str(test_result),
-                "--out",
-                str(out),
-            ],
+            command,
             env={**self.base._base_env(), "PYTHONPATH": str(self.base.stage)},
         )
 
@@ -340,6 +464,32 @@ class A2Runner:
                 str(a1_summary),
             ],
             env=self.base._product_env(threshold="50"),
+        )
+        config_probe_path = directory / "jitall-config-matrix.json"
+        rc_config_probe = self.base._run(
+            "11-A2-JITALL-config-probe",
+            [
+                str(self.base.python),
+                "-m",
+                "ci_pipeline.jit311.a2_jitall_config_probe",
+                "--out",
+                str(config_probe_path),
+            ],
+            env={**self.base._base_env(), "PYTHONPATH": str(self.base.stage)},
+        )
+        rc_config_ut = self.base._run(
+            "12-A2-JITALL-config-ut",
+            [
+                str(self.base.python),
+                "-m",
+                "pytest",
+                "-q",
+                str(
+                    self.base.stage
+                    / "test_cinderx/test_kunpeng/test_jitall_scheduler_config.py"
+                ),
+            ],
+            env={**self.base._base_env(), "PYTHONPATH": str(self.base.stage)},
         )
         rc0 = self.base._run("20-A2-P0-stock", self._arm_command(out=stock))
         rc1 = self.base._run(
@@ -383,6 +533,8 @@ class A2Runner:
             aggressive_journal,
             aggressive / "result.json",
             aggressive_coverage,
+            stock_result=stock / "result.json",
+            jit_all_contract=True,
         )
         rc_diagnostic_coverage = self._classify_penetration(
             "24D-A2-P2-threshold1-coverage",
@@ -425,6 +577,8 @@ class A2Runner:
         )
         good = (
             rc_a1 == 0
+            and rc_config_probe == 0
+            and rc_config_ut == 0
             and rc0 == 0
             and rc1 == 0
             and rc2 == 0
@@ -443,6 +597,7 @@ class A2Runner:
                 else "PASS" if good else "FAIL"
             ),
             "a1_prerequisite": json.loads(a1_summary.read_text()),
+            "jitall_config_matrix": json.loads(config_probe_path.read_text()),
             "stock_result": stock_result,
             "control_result": control_result,
             "control_coverage": control_report,
@@ -452,6 +607,8 @@ class A2Runner:
             "adaptive_semantic_probe": semantic_probe,
             "commands": {
                 "p0": rc0,
+                "config_probe": rc_config_probe,
+                "config_ut": rc_config_ut,
                 "p1": rc1,
                 "p2": rc2,
                 "p2_diag": rc2_diag,
@@ -463,7 +620,9 @@ class A2Runner:
         (directory / "result.json").write_text(
             json.dumps(result, indent=2, sort_keys=True) + "\n"
         )
-        render_penetration_v02(result, self.output / "A2_PENETRATION_V02_REPORT.md")
+        render_jitall_scheduler_report(
+            result, self.output / "A2_JITALL_SCHEDULER_REPORT.md"
+        )
         return result
 
     def run_transitions(self) -> dict:

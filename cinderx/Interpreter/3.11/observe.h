@@ -63,6 +63,16 @@ Ci_JitMode311 Ci_Observe311_Mode(void);
 // exception and returns -1, and a later call parses again.
 int Ci_Observe311_Configure(void);
 
+// Publish the final CPython 3.11 threshold resolved by the shared JIT flag
+// processor. Execute/shadow mode calls this before installing the evaluator,
+// so the frame scheduler consumes the same final value (including option
+// ordering) rather than reparsing the environment independently.
+void Ci_Observe311_SetResolvedAutoJitConfig(
+    int configured,
+    uint64_t threshold,
+    int auto_classify,
+    int valid);
+
 // Frame-entry hot counting: one scheduling request per code object crossing
 // the threshold, walked into Ci_JitShell311_RequestCompile with the real
 // function object.  In execute mode a later frame of an already-dispatched

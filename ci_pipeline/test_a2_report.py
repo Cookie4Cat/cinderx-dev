@@ -321,6 +321,71 @@ class A2ReportTest(unittest.TestCase):
         self.assertTrue(row["machine_entry_proven"])
         self.assertEqual(row["own_code_entries"], 1)
 
+    def test_jitall_classifier_accepts_three_fail_closed_states(self):
+        targets = [
+            line.strip()
+            for line in (DATA / "a1_compile_all_modules.txt").read_text().splitlines()
+            if line.strip() and not line.startswith("#")
+        ]
+        with tempfile.TemporaryDirectory() as temporary:
+            directory = Path(temporary)
+            journal = directory / "journal"
+            journal.mkdir()
+            modules = {target: "pass" for target in targets}
+            for index, target in enumerate(targets):
+                filename = f"/usr/lib/python3.11/test/{target}.py"
+                event = {
+                    "filename": filename,
+                    "qualname": "witness",
+                    "count": 1,
+                }
+                entries = []
+                if index < 24:
+                    entries = [{"filename": filename, "entries": 1}]
+                    events = [{**event, "result": "installed"}]
+                elif index < 48:
+                    events = [{**event, "result": "installed"}]
+                else:
+                    events = [{**event, "result": "REFUSE_SHAPE_EXECUTE_SURFACE"}]
+                (journal / f"{index}.json").write_text(
+                    json.dumps(
+                        {
+                            "target_module": "test." + target,
+                            "trigger": {"machine_code_entries": int(bool(entries))},
+                            "observe": {
+                                "threshold": 0,
+                                "threshold_source": "shared-jit-config",
+                                "events": events,
+                                "events_dropped": 0,
+                            },
+                            "ownership": {
+                                "module_file": filename,
+                                "spec_origin": filename,
+                                "package_roots": [],
+                            },
+                            "entry_ledger": entries,
+                            "entry_ledger_dropped": 0,
+                        }
+                    )
+                )
+            result_path = directory / "result.json"
+            stock_path = directory / "stock.json"
+            result_path.write_text(json.dumps({"modules": modules}))
+            stock_path.write_text(json.dumps({"modules": modules}))
+            report = classify(
+                journal,
+                DATA / "a1_compile_all_modules.txt",
+                result_path,
+                stock_result_path=stock_path,
+                jit_all_contract=True,
+            )
+        self.assertEqual(report["result"], "PASS")
+        self.assertEqual(report["classified_modules"], 72)
+        self.assertEqual(report["counts"]["OWN_CODE_JIT"], 24)
+        self.assertEqual(report["counts"]["PUBLISHED_NO_REENTRY"], 24)
+        self.assertEqual(report["counts"]["EXPECTED_SAFE_REFUSAL"], 24)
+        self.assertEqual(report["counts"].get("COVERAGE_GAP", 0), 0)
+
     def test_penetration_classifier_rejects_unowned_rows(self):
         targets = [
             line.strip()

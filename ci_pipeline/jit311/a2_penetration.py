@@ -13,6 +13,13 @@ import sys
 from ci_pipeline.jit311.report import KNOWN_REFUSAL_REASONS
 
 
+FORMAL_STATES = {
+    "OWN_CODE_JIT",
+    "PUBLISHED_NO_REENTRY",
+    "EXPECTED_SAFE_REFUSAL",
+}
+
+
 def worker_target_module() -> str | None:
     for index, arg in enumerate(sys.argv):
         encoded = None
@@ -115,9 +122,21 @@ def _normalized_source_path(value: object) -> str | None:
     return os.path.realpath(value)
 
 
-def classify(journal: Path, target_path: Path, result_path: Path) -> dict:
+def classify(
+    journal: Path,
+    target_path: Path,
+    result_path: Path,
+    *,
+    stock_result_path: Path | None = None,
+    jit_all_contract: bool = False,
+) -> dict:
     target_modules = _targets(target_path)
     test_result = json.loads(result_path.read_text())
+    stock_result = (
+        json.loads(stock_result_path.read_text())
+        if stock_result_path is not None
+        else None
+    )
     rows: dict[str, dict] = {}
     errors: list[str] = []
     totals: Counter[str] = Counter()
@@ -187,7 +206,45 @@ def classify(journal: Path, target_path: Path, result_path: Path) -> dict:
                     }
                 )
         dropped = int(payload.get("entry_ledger_dropped", 0))
-        status = "OWN_CODE_JIT" if own else "A2_COVERAGE_GAP"
+        events_dropped = int(observe.get("events_dropped", 0))
+        scheduler_threshold = observe.get("threshold")
+        installed_events = [
+            event for event in own_scheduler if event.get("result") == "installed"
+        ]
+        refusal_events = [
+            event
+            for event in own_scheduler
+            if event.get("result") in KNOWN_REFUSAL_REASONS
+        ]
+        ownership_resolved = bool(owned_files or package_roots)
+        test_state = test_result.get("modules", {}).get(short)
+        stock_state = (
+            stock_result.get("modules", {}).get(short)
+            if stock_result is not None
+            else None
+        )
+        semantic_matches_stock = stock_result is None or test_state == stock_state
+        if own:
+            status = "OWN_CODE_JIT"
+        elif (
+            jit_all_contract
+            and ownership_resolved
+            and scheduler_threshold == 0
+            and installed_events
+            and semantic_matches_stock
+        ):
+            status = "PUBLISHED_NO_REENTRY"
+        elif (
+            jit_all_contract
+            and ownership_resolved
+            and scheduler_threshold == 0
+            and own_scheduler
+            and len(refusal_events) == len(own_scheduler)
+            and semantic_matches_stock
+        ):
+            status = "EXPECTED_SAFE_REFUSAL"
+        else:
+            status = "COVERAGE_GAP" if jit_all_contract else "A2_COVERAGE_GAP"
         machine_entries = int(trigger.get("machine_code_entries", 0))
         rows[short] = {
             "status": status,
@@ -203,7 +260,8 @@ def classify(journal: Path, target_path: Path, result_path: Path) -> dict:
             "forced_deopts": int(trigger.get("forced_deopt_hits", 0)),
             "scheduler_events": observe.get("events", []),
             "own_scheduler_events": own_scheduler,
-            "scheduler_threshold": observe.get("threshold"),
+            "scheduler_threshold": scheduler_threshold,
+            "scheduler_threshold_source": observe.get("threshold_source"),
             "discovered_functions": len(
                 {event.get("qualname") for event in own_scheduler}
             ),
@@ -223,7 +281,14 @@ def classify(journal: Path, target_path: Path, result_path: Path) -> dict:
             "artifact_installed": any(
                 event.get("result") == "installed" for event in own_scheduler
             ),
-            "events_dropped": int(observe.get("events_dropped", 0)),
+            "publication_events": installed_events,
+            "safe_refusal_events": refusal_events,
+            "no_reentry_after_publication": bool(installed_events and not own),
+            "ownership_resolved": ownership_resolved,
+            "semantic_matches_stock": semantic_matches_stock,
+            "test_module_state": test_state,
+            "stock_module_state": stock_state,
+            "events_dropped": events_dropped,
             "entry_ledger_dropped": dropped,
             "ownership": ownership,
         }
@@ -234,26 +299,36 @@ def classify(journal: Path, target_path: Path, result_path: Path) -> dict:
         totals["organic_deopts"] += rows[short]["organic_deopts"]
         totals["forced_deopts"] += rows[short]["forced_deopts"]
         totals["ledger_dropped"] += dropped
+        totals["events_dropped"] += events_dropped
         totals["worker_jit_active"] += int(rows[short]["worker_jit_active"])
+        totals["actual_own_code_machine_entry_modules"] += int(bool(own))
 
     missing = sorted(set(target_modules) - set(rows))
     if missing:
         errors.append(f"missing worker summaries: {missing}")
     for target in target_modules:
         if target not in rows:
-            rows[target] = {"status": "A2_COVERAGE_GAP", "missing": True}
+            rows[target] = {
+                "status": "COVERAGE_GAP" if jit_all_contract else "A2_COVERAGE_GAP",
+                "missing": True,
+            }
     counts = Counter(row["status"] for row in rows.values())
+    classified = sum(counts[state] for state in FORMAL_STATES)
     result = {
         "result": (
             "PASS"
             if len(target_modules) == 72
-            and counts["OWN_CODE_JIT"] == 72
+            and (classified == 72 if jit_all_contract else counts["OWN_CODE_JIT"] == 72)
             and not errors
             and totals["ledger_dropped"] == 0
+            and totals["events_dropped"] == 0
             and not unknown_refusals
+            and all(row.get("semantic_matches_stock", True) for row in rows.values())
             else "FAIL"
         ),
+        "contract": "jit-all-three-state" if jit_all_contract else "diagnostic",
         "target_modules": len(target_modules),
+        "classified_modules": classified,
         "counts": dict(counts),
         "totals": dict(totals),
         "modules": rows,
@@ -269,9 +344,17 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--journal", type=Path, required=True)
     parser.add_argument("--targets", type=Path, required=True)
     parser.add_argument("--test-result", type=Path, required=True)
+    parser.add_argument("--stock-result", type=Path)
+    parser.add_argument("--jit-all-contract", action="store_true")
     parser.add_argument("--out", type=Path, required=True)
     args = parser.parse_args(argv)
-    report = classify(args.journal, args.targets, args.test_result)
+    report = classify(
+        args.journal,
+        args.targets,
+        args.test_result,
+        stock_result_path=args.stock_result,
+        jit_all_contract=args.jit_all_contract,
+    )
     args.out.write_text(json.dumps(report, indent=2, sort_keys=True) + "\n")
     print(json.dumps({"result": report["result"], **report["counts"]}, sort_keys=True))
     return 0 if report["result"] == "PASS" else 1
