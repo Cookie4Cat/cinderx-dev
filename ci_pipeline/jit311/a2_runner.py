@@ -11,8 +11,10 @@ import sys
 
 from ci_pipeline.jit311.a1_runner import A1Runner, PASS_STATES
 from ci_pipeline.jit311.a2_report import (
+    compare_frame_positions,
     compare_penetration,
     judge_transitions,
+    render_frame_position_report,
     render_markdown,
 )
 
@@ -506,6 +508,69 @@ class A2Runner:
             ],
             env=self.base._product_env(threshold="1"),
         )
+        running_stock = directory / "frame-position-stock.json"
+        running_jit = directory / "frame-position-jit.json"
+        error_stock = directory / "error-position-stock.json"
+        error_jit = directory / "error-position-jit.json"
+        probe_module = "ci_pipeline.jit311.a2_frame_position_probe"
+        error_module = "ci_pipeline.jit311.a2_error_position_probe"
+        rc_running_stock = self.base._run(
+            "33-A2-F1-running-stock",
+            [
+                str(self.base.python),
+                "-m",
+                probe_module,
+                "--mode",
+                "stock",
+                "--out",
+                str(running_stock),
+            ],
+            env={**self.base._base_env(), "PYTHONPATH": str(self.base.stage)},
+        )
+        rc_running_jit = self.base._run(
+            "34-A2-F1-running-jit",
+            [
+                str(self.base.python),
+                "-m",
+                probe_module,
+                "--mode",
+                "jit",
+                "--out",
+                str(running_jit),
+            ],
+            env=self.base._product_env(threshold="1"),
+        )
+        rc_error_stock = self.base._run(
+            "35-A2-F2-error-stock",
+            [
+                str(self.base.python),
+                "-m",
+                error_module,
+                "--mode",
+                "stock",
+                "--out",
+                str(error_stock),
+            ],
+            env={**self.base._base_env(), "PYTHONPATH": str(self.base.stage)},
+        )
+        rc_error_jit = self.base._run(
+            "36-A2-F2-error-jit",
+            [
+                str(self.base.python),
+                "-m",
+                error_module,
+                "--mode",
+                "jit",
+                "--out",
+                str(error_jit),
+            ],
+            env=self.base._product_env(threshold="1"),
+        )
+        rc_inspect = self.base._run(
+            "37-A2-F1-test-inspect",
+            [str(self.base.python), "-m", "test", "-j1", "test_inspect"],
+            env=self.base._product_env(threshold="1"),
+        )
         if stock.is_file() and jit.is_file():
             result = judge_transitions(
                 stock,
@@ -526,11 +591,48 @@ class A2Runner:
         )
         result["aggressive_tracing_regression"] = tracing_regression
         result["worker_returncodes"]["tracing_regression"] = rc_tracing_regression
+        positions = (
+            compare_frame_positions(
+                running_stock,
+                running_jit,
+                error_stock,
+                error_jit,
+            )
+            if all(
+                path.is_file()
+                for path in (running_stock, running_jit, error_stock, error_jit)
+            )
+            else {"result": "FAIL", "errors": ["position probe report missing"]}
+        )
+        result["frame_positions"] = positions
+        result["worker_returncodes"].update(
+            {
+                "frame_stock": rc_running_stock,
+                "frame_jit": rc_running_jit,
+                "error_stock": rc_error_stock,
+                "error_jit": rc_error_jit,
+                "test_inspect": rc_inspect,
+            }
+        )
+        render_frame_position_report(
+            positions,
+            self.base.stage
+            / "ci_pipeline/jit311/data/a2_frame_position_before_v02.json",
+            result,
+            rc_inspect,
+            self.output / "A2_FRAME_POSITION_REPORT.md",
+        )
         if (
             rc_stock != 0
             or rc_jit != 0
             or rc_tracing_regression != 0
+            or rc_running_stock != 0
+            or rc_running_jit != 0
+            or rc_error_stock != 0
+            or rc_error_jit != 0
+            or rc_inspect != 0
             or tracing_regression.get("result") != "PASS"
+            or positions.get("result") != "PASS"
         ):
             result["result"] = "FAIL"
         (directory / "result.json").write_text(

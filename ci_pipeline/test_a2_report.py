@@ -5,7 +5,11 @@ import tomllib
 import unittest
 
 from ci_pipeline.jit311.a2_penetration import classify
-from ci_pipeline.jit311.a2_report import compare_penetration, judge_transitions
+from ci_pipeline.jit311.a2_report import (
+    compare_frame_positions,
+    compare_penetration,
+    judge_transitions,
+)
 from ci_pipeline.jit311.a2_runner import A2Runner
 
 
@@ -14,6 +18,83 @@ DATA = ROOT / "ci_pipeline/jit311/data"
 
 
 class A2ReportTest(unittest.TestCase):
+    def test_frame_position_comparison_requires_exact_lasti_and_traceback(self):
+        observation = {
+            "function": "target",
+            "f_lasti": 8,
+            "f_lineno": 3,
+            "co_position": [3, 3, 4, 10],
+            "inspect_position": [3, 3, 4, 10],
+            "stack_position": [3, 3, 4, 10],
+        }
+        frame = {
+            "function": "target",
+            "tb_lasti": 8,
+            "f_lasti": 8,
+            "tb_lineno": 3,
+            "position": [3, 3, 4, 10],
+            "opcode": "CALL",
+            "opcode_offset": 4,
+            "inline_cache_span": 4,
+        }
+        running_stock = {
+            "result": "PASS",
+            "rows": [{"case": "CALL", "observation": observation}],
+            "entry_ledger_dropped": 0,
+        }
+        running_jit = {
+            "result": "PASS",
+            "rows": [
+                {
+                    "case": "CALL",
+                    "observation": observation,
+                    "machine_entry_proven": True,
+                }
+            ],
+            "entry_ledger_dropped": 0,
+        }
+        error_stock = {
+            "result": "PASS",
+            "rows": [
+                {
+                    "case": "CALL",
+                    "target_frame": frame,
+                    "traceback_frames": [frame],
+                }
+            ],
+            "entry_ledger_dropped": 0,
+        }
+        error_jit = {
+            "result": "PASS",
+            "rows": [
+                {
+                    "case": "CALL",
+                    "target_frame": frame,
+                    "traceback_frames": [frame],
+                    "machine_entry_proven": True,
+                    "transitions": [{"deopt_reason": "UnhandledException"}],
+                    "transition_ledger_dropped": 0,
+                }
+            ],
+            "entry_ledger_dropped": 0,
+        }
+        with tempfile.TemporaryDirectory() as temporary:
+            directory = Path(temporary)
+            paths = []
+            for index, document in enumerate(
+                (running_stock, running_jit, error_stock, error_jit)
+            ):
+                path = directory / f"{index}.json"
+                path.write_text(json.dumps(document))
+                paths.append(path)
+            report = compare_frame_positions(*paths)
+            error_jit["rows"][0]["target_frame"] = {**frame, "tb_lasti": 6}
+            paths[-1].write_text(json.dumps(error_jit))
+            wrong = compare_frame_positions(*paths)
+        self.assertEqual(report["result"], "PASS")
+        self.assertEqual(wrong["result"], "FAIL")
+        self.assertTrue(any("traceback position" in item for item in wrong["errors"]))
+
     def test_a2_p2_uses_jit_all_and_diagnostic_uses_threshold_one(self):
         runner = A2Runner(
             wheel=Path("wheel.whl"),

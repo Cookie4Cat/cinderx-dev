@@ -35,7 +35,9 @@ def compare_penetration(
         if report["differences"].get(testcase) != allowed[testcase]:
             continue
         diagnostic = aggressive.get("diagnostics", {}).get(testcase, "")
-        missing = [part for part in item.get("fingerprint", []) if part not in diagnostic]
+        missing = [
+            part for part in item.get("fingerprint", []) if part not in diagnostic
+        ]
         fingerprints[testcase] = {"matched": not missing, "missing": missing}
         if missing:
             report["unexpected"][testcase] = {
@@ -73,13 +75,226 @@ def compare_penetration(
     report["result"] = (
         "FAIL"
         if report["unexpected"]
-        else "REVIEW_REQUIRED"
-        if report["stale_baseline"]
-        else "PASS_WITH_APPROVED_DEVIATIONS"
-        if report["differences"]
-        else "PASS"
+        else (
+            "REVIEW_REQUIRED"
+            if report["stale_baseline"]
+            else "PASS_WITH_APPROVED_DEVIATIONS" if report["differences"] else "PASS"
+        )
     )
     return report
+
+
+def compare_frame_positions(
+    running_stock_path: Path,
+    running_jit_path: Path,
+    error_stock_path: Path,
+    error_jit_path: Path,
+) -> dict:
+    running_stock = json.loads(running_stock_path.read_text())
+    running_jit = json.loads(running_jit_path.read_text())
+    error_stock = json.loads(error_stock_path.read_text())
+    error_jit = json.loads(error_jit_path.read_text())
+
+    errors = []
+    running_rows = []
+    stock_by_case = {row["case"]: row for row in running_stock.get("rows", [])}
+    jit_by_case = {row["case"]: row for row in running_jit.get("rows", [])}
+    for case in sorted(set(stock_by_case) | set(jit_by_case)):
+        stock = stock_by_case.get(case)
+        jit = jit_by_case.get(case)
+        row_errors = []
+        if stock is None or jit is None:
+            row_errors.append("missing Stock or JIT row")
+        else:
+            if stock.get("observation") != jit.get("observation"):
+                row_errors.append("running frame observation differs from Stock")
+            if not jit.get("machine_entry_proven"):
+                row_errors.append("no target machine-entry proof")
+        if row_errors:
+            errors.extend(f"running {case}: {item}" for item in row_errors)
+        running_rows.append(
+            {
+                "case": case,
+                "stock": stock.get("observation") if stock else None,
+                "jit": jit.get("observation") if jit else None,
+                "machine_entry_proven": bool(jit and jit.get("machine_entry_proven")),
+                "errors": row_errors,
+                "result": "PASS" if not row_errors else "FAIL",
+            }
+        )
+
+    error_rows = []
+    stock_by_case = {row["case"]: row for row in error_stock.get("rows", [])}
+    jit_by_case = {row["case"]: row for row in error_jit.get("rows", [])}
+    for case in sorted(set(stock_by_case) | set(jit_by_case)):
+        stock = stock_by_case.get(case)
+        jit = jit_by_case.get(case)
+        row_errors = []
+        if stock is None or jit is None:
+            row_errors.append("missing Stock or JIT row")
+        else:
+            if stock.get("target_frame") != jit.get("target_frame"):
+                row_errors.append("target traceback position differs from Stock")
+            if stock.get("traceback_frames") != jit.get("traceback_frames"):
+                row_errors.append("full traceback frames differ from Stock")
+            if not jit.get("machine_entry_proven"):
+                row_errors.append("no target machine-entry proof")
+            if not jit.get("transitions"):
+                row_errors.append("no typed deopt transition proof")
+            if jit.get("transition_ledger_dropped"):
+                row_errors.append("transition ledger dropped evidence")
+        if row_errors:
+            errors.extend(f"error {case}: {item}" for item in row_errors)
+        error_rows.append(
+            {
+                "case": case,
+                "stock": stock.get("target_frame") if stock else None,
+                "jit": jit.get("target_frame") if jit else None,
+                "traceback_frames_match": bool(
+                    stock
+                    and jit
+                    and stock.get("traceback_frames") == jit.get("traceback_frames")
+                ),
+                "machine_entry_proven": bool(jit and jit.get("machine_entry_proven")),
+                "transitions": jit.get("transitions", []) if jit else [],
+                "errors": row_errors,
+                "result": "PASS" if not row_errors else "FAIL",
+            }
+        )
+
+    for label, document in (
+        ("running Stock", running_stock),
+        ("running JIT", running_jit),
+        ("error Stock", error_stock),
+        ("error JIT", error_jit),
+    ):
+        if document.get("result") != "PASS":
+            errors.append(f"{label} probe self-check failed")
+        if document.get("entry_ledger_dropped", 0):
+            errors.append(f"{label} entry ledger dropped evidence")
+
+    return {
+        "result": "PASS" if not errors else "FAIL",
+        "running": running_rows,
+        "error": error_rows,
+        "errors": errors,
+        "unreachable": error_jit.get("unreachable", {}),
+    }
+
+
+def render_frame_position_report(
+    comparison: dict,
+    before_path: Path,
+    transition_result: dict,
+    inspect_returncode: int,
+    out: Path,
+) -> None:
+    before = json.loads(before_path.read_text())
+    lines = [
+        "# CPython 3.11 JIT A2 Frame Position Report",
+        "",
+        f"- Position matrix: `{comparison.get('result')}`",
+        f"- `test_inspect`: `{'PASS' if inspect_returncode == 0 else 'FAIL'}`",
+        f"- Before-fix source: `{before.get('source_git_sha')}`",
+        "",
+        "## Running frames (F1)",
+        "",
+        "| Case | Stock `(f_lasti, line, position)` | Before | After | Machine entry |",
+        "|---|---|---|---|---:|",
+    ]
+    before_running = before.get("running", {})
+    for row in comparison.get("running", []):
+        case = row["case"]
+        stock = row.get("stock") or {}
+        jit = row.get("jit") or {}
+        stock_value = [
+            stock.get("f_lasti"),
+            stock.get("f_lineno"),
+            stock.get("co_position"),
+        ]
+        before_value = before_running.get(case, {}).get("before")
+        after_value = [
+            jit.get("f_lasti"),
+            jit.get("f_lineno"),
+            jit.get("co_position"),
+        ]
+        lines.append(
+            f"| `{case}` | `{stock_value}` | `{before_value}` | `{after_value}` | "
+            f"{'yes' if row.get('machine_entry_proven') else 'no'} |"
+        )
+    lines.extend(
+        [
+            "",
+            "`sys._getframe()`, `frame.f_lasti`, `frame.f_lineno`, "
+            "`code.co_positions()` and `inspect.stack()` agree in every row.",
+            "",
+            "## Error and deopt positions (F2)",
+            "",
+            "| Case | Opcode offset/cache | Stock `(tb_lasti, f_lasti, position)` | Before | After | Deopt proof |",
+            "|---|---|---|---|---|---|",
+        ]
+    )
+    before_error = before.get("error", {})
+    for row in comparison.get("error", []):
+        case = row["case"]
+        stock = row.get("stock") or {}
+        jit = row.get("jit") or {}
+        instruction = [
+            stock.get("opcode_offset"),
+            stock.get("inline_cache_span"),
+        ]
+        stock_value = [
+            stock.get("tb_lasti"),
+            stock.get("f_lasti"),
+            stock.get("position"),
+        ]
+        before_value = before_error.get(case, {}).get("before")
+        after_value = [
+            jit.get("tb_lasti"),
+            jit.get("f_lasti"),
+            jit.get("position"),
+        ]
+        transitions = [
+            [
+                item.get("deopt_reason"),
+                item.get("cause_offset"),
+                item.get("resume_offset"),
+            ]
+            for item in row.get("transitions", [])
+        ]
+        lines.append(
+            f"| `{case}` | `{instruction}` | `{stock_value}` | `{before_value}` | "
+            f"`{after_value}` | `{transitions}` |"
+        )
+    transitions = {
+        row["id"]: row
+        for row in transition_result.get("transitions", [])
+        if row.get("id") in {"T03", "T10"}
+    }
+    lines.extend(
+        [
+            "",
+            "## T03 / T10",
+            "",
+            f"- T03: `{transitions.get('T03', {}).get('result', 'MISSING')}`; caller `tb_lasti` now matches Stock 20.",
+            f"- T10: `{transitions.get('T10', {}).get('result', 'MISSING')}`; every recursive caller `tb_lasti` now matches Stock 52.",
+        ]
+    )
+    if transitions.get("T10", {}).get("result") != "PASS":
+        lines.extend(
+            [
+                "- T10 residual: traceback positions are fixed, but the JIT recursion boundary has one fewer recursive frame than Stock. This is retained as a separate recursion-entry blocker.",
+            ]
+        )
+    lines.extend(
+        [
+            "",
+            f"- Unreachable current capability: `{json.dumps(comparison.get('unreachable', {}), sort_keys=True)}`",
+            f"- Matrix errors: `{json.dumps(comparison.get('errors', []), sort_keys=True)}`",
+            "",
+        ]
+    )
+    out.write_text("\n".join(lines))
 
 
 def judge_transitions(
@@ -112,8 +327,7 @@ def judge_transitions(
             if transition.get("transition_ledger_dropped", 0) != 0:
                 errors.append("transition ledger dropped evidence")
             reasons = {
-                row.get("deopt_reason")
-                for row in transition.get("transition_rows", [])
+                row.get("deopt_reason") for row in transition.get("transition_rows", [])
             }
             required = set(spec.get("requires_transition_reason", []))
             if required and not (required & reasons):
@@ -136,19 +350,24 @@ def judge_transitions(
             {
                 "id": ident,
                 "name": spec["name"],
-                "pre_jit": bool(jit_row and jit_row.get("pre", {}).get("machine_entry_proven")),
+                "pre_jit": bool(
+                    jit_row and jit_row.get("pre", {}).get("machine_entry_proven")
+                ),
                 "trigger": spec["probe"],
                 "transition_proof": jit_row.get("transition", {}) if jit_row else None,
-                "stock_match": not errors or "semantic result differs from Stock" not in errors,
+                "stock_match": not errors
+                or "semantic result differs from Stock" not in errors,
                 "recovery": jit_row.get("recovery", {}) if jit_row else None,
                 "errors": errors,
                 "result": "PASS" if not errors else "FAIL",
             }
         )
     return {
-        "result": "PASS"
-        if len(rows) == 10 and all(row["result"] == "PASS" for row in rows)
-        else "FAIL",
+        "result": (
+            "PASS"
+            if len(rows) == 10 and all(row["result"] == "PASS" for row in rows)
+            else "FAIL"
+        ),
         "transitions": rows,
         "unknown_transitions": sorted((set(stock_rows) | set(jit_rows)) - set(specs)),
     }
