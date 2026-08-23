@@ -157,19 +157,61 @@ env CINDERX_PLUGIN_ENABLE=1 CINDERX_EVAL_MODE=cinder \
 RC=$?
 set -e
 tail -20 "$WORK/regrtest.log"
-if [ "$RC" != 0 ]; then
-  echo "refleak: regrtest -R reported failures (exit $RC)"
+
+# Reference leaks are the acceptance item's subject and are never excused.
+REF_LINES=$(grep -E "leaked \[[-0-9, ]+\] references" "$WORK/regrtest.log" || true)
+if [ -n "$REF_LINES" ]; then
+  echo "refleak: regrtest -R reported reference leaks"
+  echo "$REF_LINES"
   exit 1
 fi
-if grep -qE "leaked \[|references leaked|memory blocks leaked" "$WORK/regrtest.log"; then
-  echo "refleak: regrtest -R reported leaks"
-  grep -E "leaked \[|references leaked|memory blocks leaked" "$WORK/regrtest.log" | head
+if grep -qE "file descriptors leaked" "$WORK/regrtest.log"; then
+  echo "refleak: regrtest -R reported file-descriptor leaks"
+  grep -E "file descriptors leaked" "$WORK/regrtest.log"
+  exit 1
+fi
+
+# Block lines need verifying rather than believing.  regrtest computes
+# its block figure as getallocatedblocks() - _getquickenedcount(), and
+# that subtraction is unsound here: _Py_QuickenedCount is a file-local
+# symbol in the interpreter, so the vendored evaluator must define its
+# own copy.  Quickening then increments CinderX's counter while
+# code_dealloc decrements the interpreter's -- the one sys reports -- so
+# it only ever falls, and subtracting a negative inflates the figure.
+# quickened_artifact.py re-runs each flagged module recording both terms
+# and clears the line only when the raw block count is flat over a
+# settled tail AND the counter drift accounts for the reported figure.
+BLK_MODULES=$(grep -E "leaked \[[-0-9, ]+\] memory blocks" "$WORK/regrtest.log" \
+  | awk '{print $1}' | sort -u || true)
+if [ -n "$BLK_MODULES" ]; then
+  echo "refleak: verifying block lines for: $(echo "$BLK_MODULES" | tr '\n' ' ')"
+  # shellcheck disable=SC2086
+  if ! env CINDERX_PLUGIN_ENABLE=1 CINDERX_EVAL_MODE=cinder \
+       CINDERX_JIT_MODE=execute PYTHONJITAUTO="$THRESHOLD" \
+       "$VENV_PY" "$REPO_ROOT/ci_pipeline/jit311/quickened_artifact.py" \
+       "$VENV_PY" $BLK_MODULES --warmups 30 --reps 8; then
+    echo "refleak: a reported block figure is not the quickened-counter"
+    echo "artifact -- treating it as a real leak"
+    exit 1
+  fi
+elif [ "$RC" != 0 ]; then
+  echo "refleak: regrtest -R reported failures (exit $RC) with no leak lines"
   exit 1
 fi
 # A run that executed nothing would also print no leaks.
 if ! grep -qE "^Result: SUCCESS|== Tests result: SUCCESS" "$WORK/regrtest.log"; then
-  echo "refleak: regrtest did not report success; refusing to read that as clean"
-  exit 1
+  # A FAILURE line is acceptable only when every failing test is one whose
+  # block figure was verified above; anything else is a real failure.
+  FAILED=$(sed -n '/tests* failed:/,/^$/p' "$WORK/regrtest.log" \
+    | grep -oE '^ +[a-z_0-9]+' | tr -d ' ' | sort -u || true)
+  UNEXPLAINED=$(comm -23 <(echo "$FAILED") <(echo "$BLK_MODULES" | sort -u) || true)
+  if [ -n "$UNEXPLAINED" ]; then
+    echo "refleak: regrtest failed on tests beyond the verified block"
+    echo "artifact: $(echo "$UNEXPLAINED" | tr '\n' ' ')"
+    exit 1
+  fi
+  echo "refleak: the only failures were block figures verified as the"
+  echo "quickened-counter artifact"
 fi
 
 # The proof, from the -R run itself.

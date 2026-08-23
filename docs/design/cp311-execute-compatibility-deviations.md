@@ -195,34 +195,60 @@ The three largest contributors -- `BaseTestSuite.addTests`,
 `TestSuite.run` and `test.support._filter_suite` -- are all `for` loops,
 which named the mechanism.
 
-### Remaining: a memory-block leak in the vendored interpreter
+### The residual "memory block" figures are a counter artifact
 
-With the sentinel fixed, eight of the ten refleak modules pass and **no
-module leaks references any more**. Two still leak memory *blocks*:
-`test_listcomps` 8 per repetition and `test_unpack` 3, flat at
-`-R 30:5`, with zero reference growth.
+With the sentinel fixed, no module leaks references. Two modules still
+drew a *memory block* line from regrtest -- `test_listcomps` at eight per
+repetition and `test_unpack` at three. Neither is a leak.
 
-That defect is not in the JIT:
+regrtest computes its block figure as
 
-| configuration | result |
-| --- | --- |
-| stock Py_DEBUG CPython 3.11.6 | clean |
-| CinderX installed, plugin not enabled (stock evaluator) | clean |
-| plugin enabled, `CINDERX_EVAL_MODE=cinder`, **JIT off** | 8 / 3 blocks per repetition |
-| same, `shadow` | 8 / 3 |
-| same, `execute` | 8 / 3 |
+    alloc_after = sys.getallocatedblocks() - sys._getquickenedcount()
 
-It appears exactly when the vendored 3.11 evaluator is installed and is
-identical whether the JIT runs or not, which places it in
-`cinderx/Interpreter/3.11/` rather than anywhere MR-11 touches. Ruled
-out so far: it is not `CodeExtra` blocks (`resident_code_extra_blocks` is
-flat per repetition), and it does not scale with comprehension
-execution, unpacking, or `compile()`/`exec()` of fresh code objects --
-steady-state per-call block growth for all of those is zero under both
-evaluators. It is a fixed cost per test-module repetition.
+and that subtraction is unsound in this configuration. `nm` reports
+`_Py_QuickenedCount` as a file-local symbol in the interpreter binary, so
+it cannot be linked against, and the vendored evaluator has to define its
+own copy in `cinderx/Interpreter/3.11/upstream/specialize.c`. Quickening
+therefore increments CinderX's counter, while `code_dealloc` decrements
+the interpreter's counter for every code object with `co_warmup == 0` --
+and the interpreter's counter is the one `sys._getquickenedcount()`
+returns. It can only fall. Subtracting a negative number inflates
+`alloc_after` by exactly the drift.
 
-`jit311_refleak_execute` stays red on that residue, and the leg is left
-red rather than narrowed to hide it.
+Measured, with a settled window:
+
+| module | evaluator | regrtest figure | raw blocks drift | quickened drift |
+| --- | --- | --- | --- | --- |
+| `test_listcomps` | stock | clean | 0 | 0 |
+| `test_listcomps` | vendored | 8 per repetition | **0** | **-8 per repetition** |
+| `test_unpack` | stock | clean | 0 | 0 |
+| `test_unpack` | vendored | 3 per repetition | **0** | **-3 per repetition** |
+
+The raw block count, the object count and the reference total are all
+flat; only the counter moves, and it moves by exactly the reported
+figure. Only these two modules are affected because only they create and
+destroy code objects in bulk on every repetition.
+
+The symbol is not exported, so this cannot be fixed at the source: the
+vendored evaluator has no way to reach the interpreter's counter. What
+the leg does instead is stop believing a derived number it can prove
+wrong. `ci_pipeline/jit311/quickened_artifact.py` re-runs each flagged
+module while recording both terms and clears the line only when the raw
+block count is flat across a settled tail *and* the counter's drift
+accounts for the reported figure. Reference and file-descriptor leaks are
+never excused by it, and a block figure that fails either test is
+reported as a real leak.
+
+The classifier is checked in both directions: it clears the two modules
+above, and against an unpatched build -- one that still increfs the
+sentinel -- it reports `test_grammar` as a real reference leak of 56 per
+repetition rather than an artifact.
+
+One trap worth recording: the first version of that check compared the
+first and last sample of the whole window and called both modules real
+leaks, because in execute mode the early repetitions are still compiling
+and the JIT's code buffers grow. Judging block counts requires a settled
+tail for the same reason comparing commits does.
 
 ## 4. Import and setup suppression is wired end to end
 
