@@ -77,6 +77,14 @@ class A2ReportTest(unittest.TestCase):
         }
         slots = "test.test_descr.ClassPropertiesAndMethods.test_slots"
         testcases = adaptive | {slots}
+        numeric_spec = {
+            "regex": (
+                "^AssertionError: AssertionError: "
+                "(?P<lhs>[0-9]+) != (?P<rhs>[0-9]+)$"
+            ),
+            "direction": "rhs_minus_lhs",
+            "expected": 5,
+        }
         penetration = {
             "differential": {
                 "differences": {testcase: {} for testcase in testcases},
@@ -98,11 +106,33 @@ class A2ReportTest(unittest.TestCase):
                             if testcase == slots
                             else "P/adaptive-semantic-probe.json"
                         ),
+                        **(
+                            {"fingerprint_numeric_delta": numeric_spec}
+                            if testcase == slots
+                            else {}
+                        ),
                     }
                     for testcase in testcases
                 ],
                 "fingerprints": {
-                    testcase: {"matched": True} for testcase in testcases
+                    testcase: {
+                        "matched": True,
+                        **(
+                            {
+                                "numeric_delta": {
+                                    "lhs": 19457,
+                                    "rhs": 19462,
+                                    "direction": "rhs_minus_lhs",
+                                    "delta": 5,
+                                    "expected": 5,
+                                    "matched": True,
+                                }
+                            }
+                            if testcase == slots
+                            else {}
+                        ),
+                    }
+                    for testcase in testcases
                 },
             },
             "adaptive_semantic_probe": {
@@ -155,6 +185,14 @@ class A2ReportTest(unittest.TestCase):
 
     def test_penetration_deviation_supports_exact_diagnostic_regex(self):
         testcase = "test.test_descr.ClassPropertiesAndMethods.test_slots"
+        numeric_spec = {
+            "regex": (
+                "^AssertionError: AssertionError: "
+                "(?P<lhs>[0-9]+) != (?P<rhs>[0-9]+)$"
+            ),
+            "direction": "rhs_minus_lhs",
+            "expected": 5,
+        }
         stock = {
             "modules": {"test_descr": "pass"},
             "cases": {testcase: "pass"},
@@ -182,19 +220,26 @@ class A2ReportTest(unittest.TestCase):
                                 "stock": "pass",
                                 "aggressive": "failure",
                                 "fingerprint_regex": [
-                                    "^AssertionError: AssertionError: [0-9]+ != [0-9]+$"
+                                    numeric_spec["regex"]
                                 ],
+                                "fingerprint_numeric_delta": numeric_spec,
                             }
                         ]
                     }
                 )
             )
             report = compare_penetration(left, right, deviations)
-            aggressive["diagnostics"][testcase] = "AssertionError: unrelated"
+            aggressive["diagnostics"][testcase] = (
+                "AssertionError: AssertionError: 19457 != 19461"
+            )
             right.write_text(json.dumps(aggressive))
             wrong = compare_penetration(left, right, deviations)
         self.assertEqual(report["result"], "PASS_WITH_APPROVED_DEVIATIONS")
+        self.assertEqual(
+            report["fingerprints"][testcase]["numeric_delta"]["delta"], 5
+        )
         self.assertEqual(wrong["result"], "FAIL")
+        self.assertIn("numeric", str(wrong["unexpected"][testcase]))
 
     def test_recursion_comparison_requires_exact_frames_and_balanced_state(self):
         state = {
@@ -583,6 +628,7 @@ class A2ReportTest(unittest.TestCase):
                     "filename": filename,
                     "qualname": "witness",
                     "count": 1,
+                    "post_publication_interpreted_frames": 0,
                 }
                 entries = []
                 if index < 24:
@@ -624,12 +670,27 @@ class A2ReportTest(unittest.TestCase):
                 stock_result_path=stock_path,
                 jit_all_contract=True,
             )
+            changed_path = journal / "24.json"
+            changed = json.loads(changed_path.read_text())
+            changed["observe"]["events"][0][
+                "post_publication_interpreted_frames"
+            ] = 1
+            changed_path.write_text(json.dumps(changed))
+            wrong = classify(
+                journal,
+                DATA / "a1_compile_all_modules.txt",
+                result_path,
+                stock_result_path=stock_path,
+                jit_all_contract=True,
+            )
         self.assertEqual(report["result"], "PASS")
         self.assertEqual(report["classified_modules"], 72)
         self.assertEqual(report["counts"]["OWN_CODE_JIT"], 24)
         self.assertEqual(report["counts"]["PUBLISHED_NO_REENTRY"], 24)
         self.assertEqual(report["counts"]["EXPECTED_SAFE_REFUSAL"], 24)
         self.assertEqual(report["counts"].get("COVERAGE_GAP", 0), 0)
+        self.assertEqual(wrong["result"], "FAIL")
+        self.assertEqual(wrong["modules"][targets[24]]["status"], "COVERAGE_GAP")
 
     def test_jitall_coverage_defers_own_code_semantics_to_exact_differential(self):
         targets = [

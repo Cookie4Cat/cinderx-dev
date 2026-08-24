@@ -63,6 +63,7 @@ static uint64_t ci_observe_events_dropped;
 static uint64_t ci_observe_fresh_attachments;
 static uint64_t ci_observe_auto_jit_disabled_codes;
 static uint64_t ci_observe_late_deferrals;
+static uint64_t ci_observe_post_publication_interpreted_frames;
 
 // One slot per code object ever observed.  The key is the code's address,
 // which is only ever trusted together with `dead`: the code-extra free
@@ -78,6 +79,12 @@ typedef struct {
   // this code object (fresh function objects) are offered for attachment.
   // Cleared once the attach entry point answers "never again".
   int attachable;
+  // Sticky after a successful publication. Any later interpreter frame for
+  // this code object is evidence that publication did have a re-entry
+  // opportunity, even if the artifact was retired in the meantime.
+  int published;
+  uint64_t post_publication_interpreted_frames;
+  Py_ssize_t event_index; // -1 when the bounded event ledger dropped it
   // The keyed code object has been destroyed.  The key stays so probe
   // chains through this slot survive; the state does not.
   int dead;
@@ -113,6 +120,7 @@ typedef struct {
   char* filename; // owned malloc'd UTF-8; NULL when unavailable
   uint64_t count;
   const char* result; // static string from the compile entry point
+  uint64_t post_publication_interpreted_frames;
 } Ci_ObserveEvent;
 
 static Ci_ObserveEvent* ci_observe_events;
@@ -393,6 +401,9 @@ void Ci_Observe311_OnCodeDeath(PyCodeObject* code) {
       slot->count = 0;
       slot->dispatched = 0;
       slot->attachable = 0;
+      slot->published = 0;
+      slot->post_publication_interpreted_frames = 0;
+      slot->event_index = -1;
       slot->dead = 1;
       if (ci_observe_watched > 0) {
         ci_observe_watched--;
@@ -547,6 +558,9 @@ static Ci_ObserveSlot* observe_slot_for(PyCodeObject* code) {
       slot->count = 0;
       slot->dispatched = 0;
       slot->attachable = 0;
+      slot->published = 0;
+      slot->post_publication_interpreted_frames = 0;
+      slot->event_index = -1;
       slot->dead = 0;
       ci_observe_watched++;
       ci_observe_codes_seen++;
@@ -560,6 +574,9 @@ static Ci_ObserveSlot* observe_slot_for(PyCodeObject* code) {
       slot->count = 0;
       slot->dispatched = 0;
       slot->attachable = 0;
+      slot->published = 0;
+      slot->post_publication_interpreted_frames = 0;
+      slot->event_index = -1;
       slot->dead = 0;
       ci_observe_live++;
       ci_observe_watched++;
@@ -625,8 +642,12 @@ static void observe_on_frame_locked(
     PyCodeObject* code,
     struct _PyInterpreterFrame* frame);
 
-static const char*
-observe_emit(PyFunctionObject* func, PyCodeObject* code, uint64_t count) {
+static const char* observe_emit(
+    PyFunctionObject* func,
+    PyCodeObject* code,
+    uint64_t count,
+    Py_ssize_t* event_index) {
+  *event_index = -1;
   const char* result = Ci_JitShell311_RequestCompile(func, code);
   // The observer only runs when no exception is active.  Compilation is
   // diagnostic and may fail, but that failure must not leak into evaluation.
@@ -636,11 +657,13 @@ observe_emit(PyFunctionObject* func, PyCodeObject* code, uint64_t count) {
   PyObject* filename = code->co_filename;
   if ((size_t)ci_observe_event_count < ci_observe_event_capacity ||
       observe_events_grow() == 0) {
+    *event_index = ci_observe_event_count;
     Ci_ObserveEvent* event = &ci_observe_events[ci_observe_event_count++];
     event->qualname = observe_copy_utf8(qualname);
     event->filename = observe_copy_utf8(filename);
     event->count = count;
     event->result = result;
+    event->post_publication_interpreted_frames = 0;
   } else {
     ci_observe_events_dropped++;
   }
@@ -732,6 +755,16 @@ static void observe_on_frame_locked(
     // Only the latter has anything to gain, and only while the dispatch
     // installed an artifact; the attach entry point tells the two apart
     // cheaply and says when to stop asking for this code object.
+    if (slot->published) {
+      slot->post_publication_interpreted_frames++;
+      ci_observe_post_publication_interpreted_frames++;
+      if (slot->event_index >= 0 &&
+          slot->event_index < ci_observe_event_count) {
+        ci_observe_events[slot->event_index]
+            .post_publication_interpreted_frames =
+            slot->post_publication_interpreted_frames;
+      }
+    }
     if (slot->attachable) {
       int attached = Ci_JitShell311_AttachFresh(func);
       // Attachment is scheduling, not evaluation: nothing it raised may
@@ -779,7 +812,9 @@ static void observe_on_frame_locked(
     if (ci_observe_execute) {
       Ci_JitShell311_TrackOuterFromFrame(func, frame);
     }
-    const char* result = observe_emit(func, code, slot->count);
+    Py_ssize_t event_index = -1;
+    const char* result = observe_emit(func, code, slot->count, &event_index);
+    slot->event_index = event_index;
     if (ci_observe_execute) {
       if (strcmp(result, CI_JIT_RESULT_311_INSTALLED) == 0 ||
           (strcmp(result, CI_JIT_RESULT_311_PUBLISHED_ELSEWHERE) == 0 &&
@@ -798,6 +833,7 @@ static void observe_on_frame_locked(
         // correctness fix for one refusal, not a scheduling policy
         // change.
         slot->attachable = 1;
+        slot->published = 1;
       } else if (strcmp(result, CI_JIT_RESULT_311_DEFERRED) == 0) {
         // The attempt was withheld rather than made: everything the
         // scheduler did is undone, and the next frame that finds the JIT
@@ -889,6 +925,8 @@ PyObject* Ci_Observe311_Stats(void) {
     const char* filename = event->filename;
     uint64_t count = event->count;
     const char* result = event->result;
+    uint64_t post_publication_interpreted_frames =
+        event->post_publication_interpreted_frames;
 
     PyObject* entry = PyDict_New();
     int rc = entry == NULL ? -1 : 0;
@@ -897,6 +935,10 @@ PyObject* Ci_Observe311_Stats(void) {
          stats_set_str_or_none(entry, "filename", filename) < 0 ||
          stats_set_uint(entry, "count", count) < 0 ||
          stats_set_str(entry, "result", result) < 0 ||
+         stats_set_uint(
+             entry,
+             "post_publication_interpreted_frames",
+             post_publication_interpreted_frames) < 0 ||
          PyList_Append(events, entry) < 0)) {
       rc = -1;
     }
@@ -932,6 +974,10 @@ PyObject* Ci_Observe311_Stats(void) {
           "auto_jit_disabled_codes",
           ci_observe_auto_jit_disabled_codes) < 0 ||
       stats_set_uint(stats, "late_deferrals", ci_observe_late_deferrals) < 0 ||
+      stats_set_uint(
+          stats,
+          "post_publication_interpreted_frames",
+          ci_observe_post_publication_interpreted_frames) < 0 ||
       stats_set_uint(stats, "watched_codes", ci_observe_watched) < 0 ||
       stats_set_uint(stats, "table_capacity", ci_observe_capacity) < 0 ||
       PyDict_SetItemString(stats, "events", events) < 0) {
@@ -993,4 +1039,5 @@ void Ci_Observe311_Finalize(void) {
   ci_observe_fresh_attachments = 0;
   ci_observe_auto_jit_disabled_codes = 0;
   ci_observe_late_deferrals = 0;
+  ci_observe_post_publication_interpreted_frames = 0;
 }

@@ -38,8 +38,13 @@
       "reason": "one-time JIT publication footprint; not repeated lookup leak",
       "proof": "R/footprint.json",
       "fingerprint_regex": [
-        "^AssertionError: AssertionError: [0-9]+ != [0-9]+$"
-      ]
+        "^AssertionError: AssertionError: (?P<lhs>[0-9]+) != (?P<rhs>[0-9]+)$"
+      ],
+      "fingerprint_numeric_delta": {
+        "regex": "^AssertionError: AssertionError: (?P<lhs>[0-9]+) != (?P<rhs>[0-9]+)$",
+        "direction": "rhs_minus_lhs",
+        "expected": 5
+      }
     }
   ]
 }

@@ -211,6 +211,14 @@ def classify(
         installed_events = [
             event for event in own_scheduler if event.get("result") == "installed"
         ]
+        post_publication_evidence_complete = bool(installed_events) and all(
+            "post_publication_interpreted_frames" in event
+            for event in installed_events
+        )
+        post_publication_interpreted_frames = sum(
+            int(event.get("post_publication_interpreted_frames", 0))
+            for event in installed_events
+        )
         refusal_events = [
             event
             for event in own_scheduler
@@ -231,6 +239,8 @@ def classify(
             and ownership_resolved
             and scheduler_threshold == 0
             and installed_events
+            and post_publication_evidence_complete
+            and post_publication_interpreted_frames == 0
             and semantic_matches_stock
         ):
             status = "PUBLISHED_NO_REENTRY"
@@ -282,6 +292,12 @@ def classify(
                 event.get("result") == "installed" for event in own_scheduler
             ),
             "publication_events": installed_events,
+            "post_publication_evidence_complete": (
+                post_publication_evidence_complete
+            ),
+            "post_publication_interpreted_frames": (
+                post_publication_interpreted_frames
+            ),
             "safe_refusal_events": refusal_events,
             "no_reentry_after_publication": bool(installed_events and not own),
             "ownership_resolved": ownership_resolved,
@@ -300,6 +316,9 @@ def classify(
         totals["forced_deopts"] += rows[short]["forced_deopts"]
         totals["ledger_dropped"] += dropped
         totals["events_dropped"] += events_dropped
+        totals["post_publication_interpreted_frames"] += (
+            post_publication_interpreted_frames
+        )
         totals["worker_jit_active"] += int(rows[short]["worker_jit_active"])
         totals["actual_own_code_machine_entry_modules"] += int(bool(own))
 

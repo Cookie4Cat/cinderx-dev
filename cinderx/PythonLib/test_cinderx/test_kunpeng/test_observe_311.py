@@ -372,6 +372,52 @@ print(json.dumps({
         # The calls after the threshold crossing ran compiled.
         self.assertEqual(payload["entries"], 5)
 
+    def test_post_publication_interpreter_frame_is_counted(self) -> None:
+        payload = run_child(
+            PREAMBLE
+            + """\
+import sys
+
+def published(value):
+    return value + 1
+
+assert published(1) == 2
+before = [
+    event for event in _cinderx._get_observe_stats()["events"]
+    if event["qualname"] == "published"
+][0]
+
+def trace(frame, event, arg):
+    return trace
+
+sys.settrace(trace)
+try:
+    assert published(2) == 3
+finally:
+    sys.settrace(None)
+stats = _cinderx._get_observe_stats()
+after = [
+    event for event in stats["events"]
+    if event["qualname"] == "published"
+][0]
+print(json.dumps({
+    "before": before,
+    "after": after,
+    "total": stats["post_publication_interpreted_frames"],
+}))
+""",
+            CINDERX_JIT_MODE="execute",
+            PYTHONJITAUTO="1",
+        )
+        self.assertEqual(payload["before"]["result"], "installed")
+        self.assertEqual(
+            payload["before"]["post_publication_interpreted_frames"], 0
+        )
+        self.assertEqual(
+            payload["after"]["post_publication_interpreted_frames"], 1
+        )
+        self.assertGreaterEqual(payload["total"], 1)
+
     def test_canary_is_the_test_spelling_of_execute(self) -> None:
         # Same machinery, same policy, reported under its own name so the
         # earlier gate legs keep their configuration and their evidence.

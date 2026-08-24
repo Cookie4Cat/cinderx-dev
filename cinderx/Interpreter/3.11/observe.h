@@ -96,8 +96,9 @@ void Ci_Observe311_OnFrame(
 
 // Snapshot dict for tests and diagnostics: enabled, mode, requested_mode,
 // threshold, codes_seen, events_dropped, fresh_attachments,
+// post_publication_interpreted_frames,
 // auto_jit_disabled_codes, and the bounded event list (qualname, filename,
-// count, result).
+// count, result, post_publication_interpreted_frames).
 PyObject* Ci_Observe311_Stats(void);
 
 // Read the scheduler slot for one live code object without creating it.

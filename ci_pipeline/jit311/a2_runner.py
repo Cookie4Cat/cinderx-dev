@@ -12,11 +12,14 @@ import sys
 from ci_pipeline.jit311.a1_runner import A1Runner, PASS_STATES
 from ci_pipeline.jit311.a2_report import (
     compare_frame_positions,
+    compare_native_recursion_boundary,
     compare_penetration,
     compare_recursion_boundary,
     judge_transitions,
     render_frame_position_report,
+    render_footprint_deviation_proof_final,
     render_markdown,
+    render_native_recursion_boundary_report,
     render_policy_footprint_report,
     render_recursion_boundary_report,
 )
@@ -110,13 +113,31 @@ def validate_approved_deviations(penetration: dict, repetition: dict) -> dict:
 
     if FOOTPRINT_DEVIATION in differences:
         approved = approved_rows.get(FOOTPRINT_DEVIATION, {})
+        expected_numeric_spec = {
+            "regex": (
+                "^AssertionError: AssertionError: "
+                "(?P<lhs>[0-9]+) != (?P<rhs>[0-9]+)$"
+            ),
+            "direction": "rhs_minus_lhs",
+            "expected": 5,
+        }
         if (
             approved.get("classification") != "APPROVED_STRESS_MODE_DEVIATION"
             or approved.get("reason")
             != "one-time JIT publication footprint; not repeated lookup leak"
             or approved.get("proof") != "R/footprint.json"
+            or approved.get("fingerprint_numeric_delta") != expected_numeric_spec
         ):
             errors.append("test_slots baseline metadata is not exact")
+        fingerprint = fingerprints.get(FOOTPRINT_DEVIATION, {})
+        diagnostic_numeric_delta = fingerprint.get("numeric_delta") or {}
+        if (
+            fingerprint.get("matched") is not True
+            or diagnostic_numeric_delta.get("matched") is not True
+            or diagnostic_numeric_delta.get("direction") != "rhs_minus_lhs"
+            or diagnostic_numeric_delta.get("delta") != 5
+        ):
+            errors.append("test_slots actual diagnostic delta is not exact +5")
         footprint = repetition.get("footprint", {})
         delta = footprint.get("delta", {})
         strict_checks = footprint.get("strict_checks", {})
@@ -155,6 +176,7 @@ def validate_approved_deviations(penetration: dict, repetition: dict) -> dict:
             "shape": footprint.get("shape"),
             "strict_checks": strict_checks,
             "delta": delta,
+            "diagnostic_numeric_delta": diagnostic_numeric_delta,
             "errors": footprint_errors,
         }
 
@@ -442,6 +464,90 @@ def render_jitall_scheduler_report(result: dict, path: Path) -> None:
             f"- Approved exact deviations used: `{len(differential.get('approved_deviations', []))}`",
             f"- Differential result: `{differential.get('result')}`",
             f"- Crash/hang/no-result modules: `{json.dumps(bad_modules, sort_keys=True)}`",
+            "",
+        ]
+    )
+    path.write_text("\n".join(lines))
+
+
+def published_no_reentry_proof(aggressive: dict) -> dict:
+    rows = []
+    errors = []
+    for module, row in sorted(aggressive.get("modules", {}).items()):
+        if row.get("status") != "PUBLISHED_NO_REENTRY":
+            continue
+        publications = row.get("publication_events", [])
+        post_frames = row.get("post_publication_interpreted_frames")
+        evidence_complete = row.get("post_publication_evidence_complete") is True
+        row_errors = []
+        if not publications:
+            row_errors.append("no own installed publication event")
+        if not evidence_complete:
+            row_errors.append("post-publication frame evidence missing")
+        if post_frames != 0:
+            row_errors.append(
+                f"post-publication interpreted frames is {post_frames}, expected 0"
+            )
+        if row.get("own_code_entries") != 0:
+            row_errors.append("own-code machine entry is not zero")
+        errors.extend(f"{module}: {error}" for error in row_errors)
+        rows.append(
+            {
+                "module": module,
+                "functions": [event.get("qualname") for event in publications],
+                "publication_events": publications,
+                "publication_call_counts": [
+                    event.get("count") for event in publications
+                ],
+                "machine_entries": row.get("own_code_entries"),
+                "post_publication_interpreted_frames": post_frames,
+                "evidence_complete": evidence_complete,
+                "result": "PASS" if not row_errors else "FAIL",
+                "errors": row_errors,
+            }
+        )
+    if aggressive.get("result") != "PASS":
+        errors.append("formal JIT-ALL coverage is not PASS")
+    return {
+        "result": "PASS" if not errors else "FAIL",
+        "modules": rows,
+        "count": len(rows),
+        "errors": errors,
+    }
+
+
+def render_published_no_reentry_proof(proof: dict, path: Path) -> None:
+    lines = [
+        "# CPython 3.11 A2 PUBLISHED_NO_REENTRY Proof",
+        "",
+        f"- Result: `{proof.get('result')}`",
+        f"- Modules: `{proof.get('count')}`",
+        "",
+        "| Module | Own function | Scheduler event / publication call | Machine entries | Post-publication interpreted frames | Result |",
+        "|---|---|---|---:|---:|---|",
+    ]
+    for row in proof.get("modules", []):
+        functions = "<br>".join(
+            f"`{name}`" for name in row.get("functions", []) if name
+        )
+        events = "<br>".join(
+            f"`{event.get('result')}@{event.get('count')}`"
+            for event in row.get("publication_events", [])
+        )
+        lines.append(
+            f"| `{row['module']}` | {functions or 'none'} | {events or 'none'} | "
+            f"{row.get('machine_entries')} | "
+            f"{row.get('post_publication_interpreted_frames')} | "
+            f"`{row.get('result')}` |"
+        )
+    lines.extend(
+        [
+            "",
+            "Every listed code object published successfully at threshold 0, "
+            "had no own-code machine entry opportunity, and recorded zero later "
+            "interpreter frames after publication.",
+            "",
+            f"- Errors: `{json.dumps(proof.get('errors', []), sort_keys=True)}`",
             "",
         ]
     )
@@ -759,11 +865,18 @@ class A2Runner:
                 "p2_diag_coverage": rc_diagnostic_coverage,
             },
         }
+        result["published_no_reentry_proof"] = published_no_reentry_proof(
+            aggressive_report
+        )
         (directory / "result.json").write_text(
             json.dumps(result, indent=2, sort_keys=True) + "\n"
         )
         render_jitall_scheduler_report(
             result, self.output / "A2_JITALL_SCHEDULER_REPORT.md"
+        )
+        render_published_no_reentry_proof(
+            result["published_no_reentry_proof"],
+            self.output / "A2_PUBLISHED_NO_REENTRY_PROOF.md",
         )
         return result
 
@@ -902,6 +1015,37 @@ class A2Runner:
             ],
             env=self.base._product_env(threshold="1"),
         )
+        native_recursion_stock = directory / "native-recursion-boundary-stock.json"
+        native_recursion_jit = directory / "native-recursion-boundary-jit.json"
+        native_recursion_module = (
+            "ci_pipeline.jit311.a2_native_recursion_boundary_probe"
+        )
+        rc_native_recursion_stock = self.base._run(
+            "39S-A2-native-recursion-stock",
+            [
+                str(self.base.python),
+                "-m",
+                native_recursion_module,
+                "--mode",
+                "stock",
+                "--out",
+                str(native_recursion_stock),
+            ],
+            env={**self.base._base_env(), "PYTHONPATH": str(self.base.stage)},
+        )
+        rc_native_recursion_jit = self.base._run(
+            "39J-A2-native-recursion-jit",
+            [
+                str(self.base.python),
+                "-m",
+                native_recursion_module,
+                "--mode",
+                "jit",
+                "--out",
+                str(native_recursion_jit),
+            ],
+            env=self.base._product_env(threshold="1"),
+        )
         if stock.is_file() and jit.is_file():
             result = judge_transitions(
                 stock,
@@ -942,6 +1086,18 @@ class A2Runner:
             else {"result": "FAIL", "errors": ["recursion probe report missing"]}
         )
         result["recursion_boundary"] = recursion
+        native_recursion = (
+            compare_native_recursion_boundary(
+                native_recursion_stock, native_recursion_jit
+            )
+            if native_recursion_stock.is_file() and native_recursion_jit.is_file()
+            else {
+                "result": "FAIL",
+                "errors": ["native recursion probe report missing"],
+                "product_fix_required": True,
+            }
+        )
+        result["native_recursion_boundary"] = native_recursion
         result["worker_returncodes"].update(
             {
                 "frame_stock": rc_running_stock,
@@ -951,6 +1107,8 @@ class A2Runner:
                 "test_inspect": rc_inspect,
                 "recursion_stock": rc_recursion_stock,
                 "recursion_jit": rc_recursion_jit,
+                "native_recursion_stock": rc_native_recursion_stock,
+                "native_recursion_jit": rc_native_recursion_jit,
             }
         )
         render_frame_position_report(
@@ -966,6 +1124,10 @@ class A2Runner:
             result,
             self.output / "A2_RECURSION_BOUNDARY_REPORT.md",
         )
+        render_native_recursion_boundary_report(
+            native_recursion,
+            self.output / "A2_NATIVE_RECURSION_BOUNDARY_REPORT.md",
+        )
         if (
             rc_stock != 0
             or rc_jit != 0
@@ -977,9 +1139,12 @@ class A2Runner:
             or rc_inspect != 0
             or rc_recursion_stock != 0
             or rc_recursion_jit != 0
+            or rc_native_recursion_stock != 0
+            or rc_native_recursion_jit != 0
             or tracing_regression.get("result") != "PASS"
             or positions.get("result") != "PASS"
             or recursion.get("result") != "PASS"
+            or native_recursion.get("result") != "PASS"
         ):
             result["result"] = "FAIL"
         (directory / "result.json").write_text(
@@ -1170,6 +1335,11 @@ class A2Runner:
             )
         if penetration.get("jitall_config_matrix", {}).get("result") != "PASS":
             coverage_errors.append("JIT-ALL configuration matrix is not PASS")
+        no_reentry_proof = penetration.get("published_no_reentry_proof", {})
+        if no_reentry_proof.get("result") != "PASS":
+            coverage_errors.append(
+                "PUBLISHED_NO_REENTRY post-publication proof is not PASS"
+            )
         if coverage_errors:
             add_blocker(
                 ident="A2-P-JITALL-CONFIG",
@@ -1218,6 +1388,11 @@ class A2Runner:
                 testcases=other_unexpected,
             )
         deviation_proof = validate_approved_deviations(penetration, repetition)
+        render_footprint_deviation_proof_final(
+            deviation_proof,
+            repetition.get("footprint", {}),
+            self.output / "A2_FOOTPRINT_DEVIATION_PROOF_FINAL.md",
+        )
         if deviation_proof["result"] != "PASS":
             add_blocker(
                 ident="A2-APPROVED-DEVIATION-PROOF",
@@ -1294,6 +1469,32 @@ class A2Runner:
                 ],
                 evidence="T/recursion-boundary-*.json, T/result.json, A2_RECURSION_BOUNDARY_REPORT.md",
                 errors=recursion_result.get("errors", []),
+            )
+        native_recursion_result = transitions.get("native_recursion_boundary", {})
+        if native_recursion_result.get("result") != "PASS":
+            add_blocker(
+                ident="A2-NATIVE-RECURSION-BOUNDARY",
+                severity="FAIL",
+                classification="PRODUCT_BUG",
+                cluster="recursion/native-c-api",
+                summary="Direct native Py_EnterRecursiveCall behavior differs from Stock.",
+                reproducer="Run a2_native_recursion_boundary_probe in Stock and JIT arms.",
+                stock="The last admitted Python frame calls the native recursion probe.",
+                jit="The compiled target must return the same rc, exception and accounting.",
+                machine_proof="The JIT arm requires a native_recursive entry-ledger row.",
+                transition_proof="Before/after remaining, headroom, boundary and JIT ownership are recorded.",
+                root_cause="Logical JIT recursion boundary versus CPython native recursion API.",
+                changed_files=[
+                    "cinderx/Jit/jit_rt.cpp",
+                    "cinderx/Interpreter/3.11/interpreter.c",
+                ],
+                fix_summary="CPython recovery headroom is no longer held across user code.",
+                regression_tests=[
+                    "a2_native_recursion_boundary_probe",
+                    "JITLifecycle311Test.BindFailureAtRecursionLimitMatchesStock",
+                ],
+                evidence="T/native-recursion-boundary-*.json, A2_NATIVE_RECURSION_BOUNDARY_REPORT.md",
+                errors=native_recursion_result.get("errors", []),
             )
         transition_failures = [
             row
@@ -1381,6 +1582,16 @@ class A2Runner:
             final = "PASS_WITH_APPROVED_DEVIATIONS"
         else:
             final = "PASS"
+        freeze_hardening = {
+            "FH-1": native_recursion_result.get("result", "NOT_RUN"),
+            "FH-2": no_reentry_proof.get("result", "NOT_RUN"),
+            "FH-3": deviation_proof.get("result", "NOT_RUN"),
+        }
+        a2_frozen = (
+            final in PASS_STATES
+            and not blockers
+            and all(result == "PASS" for result in freeze_hardening.values())
+        )
         payload = {
             "final": final,
             "provenance": provenance,
@@ -1390,6 +1601,8 @@ class A2Runner:
             "footprint": repetition.get("footprint", {}),
             "code_swap_policy": repetition.get("code_swap", {}),
             "approved_deviation_proof": deviation_proof,
+            "freeze_hardening": freeze_hardening,
+            "a2_freeze": "A2 FROZEN" if a2_frozen else "NOT FROZEN",
             "blockers": blockers,
             "commands": self.base.command_results,
         }

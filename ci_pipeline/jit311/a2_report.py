@@ -159,16 +159,48 @@ def compare_penetration(
             for pattern in item.get("fingerprint_regex", [])
             if re.fullmatch(pattern, diagnostic) is None
         ]
+        numeric_delta = None
+        numeric_error = None
+        numeric_spec = item.get("fingerprint_numeric_delta")
+        if numeric_spec is not None:
+            numeric_match = re.fullmatch(numeric_spec["regex"], diagnostic)
+            if numeric_match is None:
+                numeric_error = "numeric diagnostic regex did not match"
+            else:
+                lhs = int(numeric_match.group("lhs"))
+                rhs = int(numeric_match.group("rhs"))
+                direction = numeric_spec.get("direction")
+                if direction != "rhs_minus_lhs":
+                    numeric_error = f"unsupported numeric delta direction: {direction}"
+                    delta = None
+                else:
+                    delta = rhs - lhs
+                    if delta != int(numeric_spec["expected"]):
+                        numeric_error = (
+                            f"numeric diagnostic delta is {delta}, expected "
+                            f"{numeric_spec['expected']}"
+                        )
+                numeric_delta = {
+                    "lhs": lhs,
+                    "rhs": rhs,
+                    "direction": direction,
+                    "delta": delta,
+                    "expected": int(numeric_spec["expected"]),
+                    "matched": numeric_error is None,
+                }
         fingerprints[testcase] = {
-            "matched": not missing and not unmatched_regex,
+            "matched": not missing and not unmatched_regex and numeric_error is None,
             "missing": missing,
             "unmatched_regex": unmatched_regex,
+            "numeric_delta": numeric_delta,
+            "numeric_error": numeric_error,
         }
-        if missing or unmatched_regex:
+        if missing or unmatched_regex or numeric_error is not None:
             report["unexpected"][testcase] = {
                 **allowed[testcase],
                 "diagnostic_fingerprint_missing": missing,
                 "diagnostic_regex_unmatched": unmatched_regex,
+                "diagnostic_numeric_delta_error": numeric_error,
             }
     concrete = {
         key for key in report["differences"] if key.startswith("test.test_dis.")
@@ -651,6 +683,52 @@ def render_policy_footprint_report(result: dict, out: Path) -> None:
     out.write_text("\n".join(lines))
 
 
+def render_footprint_deviation_proof_final(
+    deviation_proof: dict,
+    footprint: dict,
+    out: Path,
+) -> None:
+    proof = deviation_proof.get("proofs", {}).get(
+        "one_time_publication_footprint", {}
+    )
+    diagnostic = proof.get("diagnostic_numeric_delta", {})
+    samples = footprint.get("samples", {})
+    delta = footprint.get("delta", {})
+    lines = [
+        "# CPython 3.11 A2 Footprint Deviation Proof Final",
+        "",
+        f"- Result: `{deviation_proof.get('result')}`",
+        f"- Testcase: `{proof.get('testcase')}`",
+        f"- Actual assertion lhs/rhs: `{diagnostic.get('lhs')} != {diagnostic.get('rhs')}`",
+        f"- Diagnostic direction: `{diagnostic.get('direction')}`",
+        f"- Diagnostic delta: `{diagnostic.get('delta')}`",
+        f"- Independent first-publication delta: `{delta.get('first_publication_gc_objects')}`",
+        f"- Exact first-publication type histogram: `{json.dumps(delta.get('first_publication_object_types', {}), sort_keys=True)}`",
+        "",
+        "| Sample | GC objects | Compiled creations | Resident buffers |",
+        "|---|---:|---:|---:|",
+    ]
+    for name in ("after_10", "after_100", "after_1000", "after_gc_1", "after_gc_2"):
+        sample = samples.get(name, {})
+        lines.append(
+            f"| `{name}` | {sample.get('gc_objects')} | "
+            f"{sample.get('compiled_function_creations')} | "
+            f"{sample.get('resident_code_buffers')} |"
+        )
+    lines.extend(
+        [
+            "",
+            f"- 10-to-1000 GC growth: `{delta.get('steady_10_to_1000_gc_objects')}`",
+            f"- 10-to-1000 type growth: `{json.dumps(delta.get('steady_10_to_1000_object_types', {}), sort_keys=True)}`",
+            f"- Steady resident-buffer growth: `{delta.get('steady_resident_code_buffers')}`",
+            f"- Strict checks: `{json.dumps(footprint.get('strict_checks', {}), sort_keys=True)}`",
+            f"- Errors: `{json.dumps(deviation_proof.get('errors', []), sort_keys=True)}`",
+            "",
+        ]
+    )
+    out.write_text("\n".join(lines))
+
+
 def judge_transitions(
     stock_path: Path,
     jit_path: Path,
@@ -781,6 +859,7 @@ def render_markdown(final: dict, path: Path) -> None:
             "",
             f"Frame-position matrix: **{transitions.get('frame_positions', {}).get('result', 'NOT_RUN')}**",
             f"Recursion-boundary matrix: **{transitions.get('recursion_boundary', {}).get('result', 'NOT_RUN')}**",
+            f"Native C recursion boundary: **{transitions.get('native_recursion_boundary', {}).get('result', 'NOT_RUN')}**",
         ]
     )
     lines.extend(
@@ -811,6 +890,13 @@ def render_markdown(final: dict, path: Path) -> None:
             f"- Result: {proof.get('result', 'NOT_RUN')}",
             f"- Exact differences: `{json.dumps(sorted(differential.get('differences', {})))}`",
             f"- Proof errors: `{json.dumps(proof.get('errors', []), sort_keys=True)}`",
+            "",
+            "## Freeze hardening",
+            "",
+            f"- FH-1 native recursion: {final.get('freeze_hardening', {}).get('FH-1', 'NOT_RUN')}",
+            f"- FH-2 no re-entry proof: {final.get('freeze_hardening', {}).get('FH-2', 'NOT_RUN')}",
+            f"- FH-3 footprint fingerprint: {final.get('freeze_hardening', {}).get('FH-3', 'NOT_RUN')}",
+            f"- Conclusion: **{final.get('a2_freeze', 'NOT FROZEN')}**",
             "",
             "## Blockers",
             "",
