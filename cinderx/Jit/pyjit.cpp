@@ -2757,6 +2757,187 @@ PyObject* jit311_recursion_state(PyObject* /* self */, PyObject* /* arg */) {
       jit_entries);
 }
 
+static int lifecycleSetSize(PyObject* dict, const char* key, size_t value) {
+  Ref<> number = Ref<>::steal(PyLong_FromSize_t(value));
+  return number == nullptr ? -1 : PyDict_SetItemString(dict, key, number);
+}
+
+static int lifecycleSetU64(PyObject* dict, const char* key, uint64_t value) {
+  Ref<> number = Ref<>::steal(PyLong_FromUnsignedLongLong(value));
+  return number == nullptr ? -1 : PyDict_SetItemString(dict, key, number);
+}
+
+static int lifecycleSetBool(PyObject* dict, const char* key, bool value) {
+  return PyDict_SetItemString(dict, key, value ? Py_True : Py_False);
+}
+
+PyObject* jit311_lifecycle_snapshot(PyObject* /* self */, PyObject* /* arg */) {
+  cinderx::ModuleState* module_state = cinderx::getModuleState();
+  if (module_state == nullptr) {
+    PyErr_SetString(
+        PyExc_RuntimeError, "CPython 3.11 lifecycle module state is unavailable");
+    return nullptr;
+  }
+  CompilerContext<Compiler>* ctx = jitCtx();
+  LifecycleSnapshot311 census;
+  if (ctx != nullptr) {
+    census = ctx->lifecycleSnapshot311();
+  }
+  TriggerStats trigger = triggerStatsSnapshot();
+  uint64_t observer_watched = 0;
+  uint64_t observer_keyed = 0;
+  uint64_t observer_capacity = 0;
+  uint64_t observer_events = 0;
+  uint64_t observer_post_publication = 0;
+  Ci_Observe311_GetLifecycleState(
+      &observer_watched,
+      &observer_keyed,
+      &observer_capacity,
+      &observer_events,
+      &observer_post_publication);
+
+  Ref<> result = Ref<>::steal(PyDict_New());
+  Ref<> jit_state = Ref<>::steal(PyDict_New());
+  Ref<> module = Ref<>::steal(PyDict_New());
+  Ref<> runtime = Ref<>::steal(PyDict_New());
+  Ref<> observer = Ref<>::steal(PyDict_New());
+  Ref<> generator = Ref<>::steal(PyDict_New());
+  Ref<> schema = Ref<>::steal(PyUnicode_FromString("cp311-jit-a3-lifecycle-v1"));
+  Ref<> unavailable =
+      Ref<>::steal(PyUnicode_FromString("GENERATOR_NATIVE_GAUGE_NOT_AVAILABLE"));
+  if (result == nullptr || jit_state == nullptr || module == nullptr ||
+      runtime == nullptr || observer == nullptr || generator == nullptr ||
+      schema == nullptr || unavailable == nullptr) {
+    return nullptr;
+  }
+  int rc = 0;
+  rc |= PyDict_SetItemString(result, "schema", schema);
+  rc |= lifecycleSetBool(result, "context_present", ctx != nullptr);
+  rc |= lifecycleSetSize(jit_state, "compiled_codes", census.compiled_codes);
+  rc |= lifecycleSetSize(
+      jit_state, "installed_functions", census.installed_functions);
+  rc |= lifecycleSetSize(
+      jit_state, "associated_functions", census.associated_functions);
+  rc |= lifecycleSetSize(jit_state, "parked_functions", census.parked_functions);
+  rc |= lifecycleSetSize(jit_state, "watched_functions", census.watched_functions);
+  rc |= lifecycleSetSize(jit_state, "artifact_members", census.artifact_members);
+  rc |= lifecycleSetSize(
+      jit_state,
+      "deferred_anchor_releases",
+      census.deferred_anchor_releases);
+  rc |= lifecycleSetSize(jit_state, "active_compiles", census.active_compiles);
+  rc |= lifecycleSetSize(
+      jit_state, "completed_compiles", census.completed_compiles);
+  rc |= lifecycleSetSize(
+      jit_state, "deferred_finalizations", census.deferred_finalizations);
+  rc |= lifecycleSetSize(
+      jit_state,
+      "orphaned_compiled_codes",
+      census.orphaned_compiled_codes);
+  rc |= lifecycleSetSize(
+      jit_state, "code_dedup_entries", census.code_dedup_entries);
+  rc |= lifecycleSetSize(
+      jit_state, "code_outer_functions", census.code_outer_functions);
+  rc |= lifecycleSetSize(
+      jit_state, "context_references", census.context_references);
+  rc |= lifecycleSetSize(
+      jit_state, "code_runtimes_allocated", census.code_runtimes_allocated);
+  rc |= lifecycleSetSize(
+      jit_state, "code_runtimes_live", census.code_runtimes_live);
+  rc |= lifecycleSetSize(
+      module,
+      "registered_compilation_units",
+      module_state->registered_compilation_units.size());
+  rc |= lifecycleSetSize(
+      module,
+      "perf_trampoline_worklist",
+      module_state->perf_trampoline_worklist.size());
+  rc |= lifecycleSetBool(
+      module,
+      "unit_deletion_tracking_failed",
+      module_state->unit_deletion_tracking_failed);
+  rc |= lifecycleSetBool(
+      module, "code_allocator_present", module_state->code_allocator != nullptr);
+  rc |= lifecycleSetSize(
+      module,
+      "code_allocator_used_bytes",
+      module_state->code_allocator == nullptr
+          ? 0
+          : module_state->code_allocator->usedBytes());
+  rc |= lifecycleSetU64(
+      runtime, "resident_code_buffers", trigger.resident_code_buffers);
+  rc |= lifecycleSetU64(
+      runtime, "resident_code_extra_blocks", liveCodeExtraBlocks());
+  rc |= lifecycleSetU64(
+      runtime,
+      "compiled_function_creations",
+      trigger.compiled_function_creations);
+  rc |= lifecycleSetU64(
+      runtime,
+      "function_destroyed_notifications",
+      trigger.function_destroyed_notifications);
+  rc |= lifecycleSetU64(
+      runtime,
+      "code_destroyed_notifications",
+      trigger.code_destroyed_notifications);
+  rc |= lifecycleSetU64(
+      runtime, "executable_alloc_calls", trigger.executable_alloc_calls);
+  rc |= lifecycleSetU64(
+      runtime, "executable_alloc_bytes", trigger.executable_alloc_bytes);
+  rc |= lifecycleSetU64(
+      runtime, "machine_code_entries", trigger.machine_code_entries);
+  rc |= lifecycleSetU64(observer, "watched_codes", observer_watched);
+  rc |= lifecycleSetU64(observer, "keyed_slots", observer_keyed);
+  rc |= lifecycleSetU64(observer, "table_capacity", observer_capacity);
+  rc |= lifecycleSetU64(observer, "events", observer_events);
+  rc |= lifecycleSetU64(
+      observer,
+      "post_publication_interpreted_frames",
+      observer_post_publication);
+  rc |= lifecycleSetBool(generator, "native_gauge_available", false);
+  rc |= PyDict_SetItemString(generator, "status", unavailable);
+  rc |= PyDict_SetItemString(result, "jit", jit_state);
+  rc |= PyDict_SetItemString(result, "module", module);
+  rc |= PyDict_SetItemString(result, "runtime", runtime);
+  rc |= PyDict_SetItemString(result, "observer", observer);
+  rc |= PyDict_SetItemString(result, "generator", generator);
+  return rc < 0 ? nullptr : result.release();
+}
+
+PyObject* jit311_lifecycle_invariants(
+    PyObject* /* self */, PyObject* /* arg */) {
+  cinderx::ModuleState* module_state = cinderx::getModuleState();
+  if (module_state == nullptr) {
+    PyErr_SetString(
+        PyExc_RuntimeError, "CPython 3.11 lifecycle module state is unavailable");
+    return nullptr;
+  }
+  std::vector<std::string> errors;
+  if (CompilerContext<Compiler>* ctx = jitCtx()) {
+    errors = ctx->lifecycleInvariantErrors311();
+  }
+  if (module_state->unit_deletion_tracking_failed) {
+    errors.emplace_back("I8 unit deletion tracking is poisoned");
+  }
+  Ref<> error_list = Ref<>::steal(PyList_New(0));
+  Ref<> result = Ref<>::steal(PyDict_New());
+  if (error_list == nullptr || result == nullptr) {
+    return nullptr;
+  }
+  for (const std::string& error : errors) {
+    Ref<> text = Ref<>::steal(PyUnicode_FromString(error.c_str()));
+    if (text == nullptr || PyList_Append(error_list, text) < 0) {
+      return nullptr;
+    }
+  }
+  if (PyDict_SetItemString(
+          result, "ok", errors.empty() ? Py_True : Py_False) < 0 ||
+      PyDict_SetItemString(result, "errors", error_list) < 0) {
+    return nullptr;
+  }
+  return result.release();
+}
+
 PyObject* jit311_execute_surface(PyObject* /* self */, PyObject* /* arg */) {
   Ref<> result = Ref<>::steal(PyList_New(0));
   if (result == nullptr) {
@@ -4806,6 +4987,14 @@ PyMethodDef jit_methods_311_canary[] = {
      jit311_recursion_state,
      METH_NOARGS,
      PyDoc_STR("Return private CPython 3.11 recursion accounting state.")},
+    {"_jit311_lifecycle_snapshot",
+     jit311_lifecycle_snapshot,
+     METH_NOARGS,
+     PyDoc_STR("Return the private numeric CPython 3.11 A3 lifecycle census.")},
+    {"_jit311_lifecycle_invariants",
+     jit311_lifecycle_invariants,
+     METH_NOARGS,
+     PyDoc_STR("Check private CPython 3.11 JIT ownership invariants.")},
     {"_jit311_execute_surface",
      jit311_execute_surface,
      METH_NOARGS,

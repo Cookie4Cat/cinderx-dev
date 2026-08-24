@@ -1360,6 +1360,134 @@ const UnorderedSet<BorrowedRef<PyFunctionObject>>& Context::deoptedFuncs() {
   return deopted_funcs_;
 }
 
+LifecycleSnapshot311 Context::lifecycleSnapshot311() {
+  LifecycleSnapshot311 snapshot;
+  snapshot.compiled_codes = compiled_codes_.size();
+  snapshot.installed_functions = compiled_funcs_.size();
+  snapshot.parked_functions = deopted_funcs_.size();
+  snapshot.active_compiles = active_compiles_.size();
+  snapshot.completed_compiles = completed_compiles_.size();
+  snapshot.deferred_finalizations = deferred_finalizations_.size();
+  snapshot.orphaned_compiled_codes = orphaned_compiled_codes_.size();
+  snapshot.code_dedup_entries = code_dedup_size_;
+  snapshot.code_outer_functions = code_outer_funcs_.size();
+  snapshot.context_references = references_.size();
+#if PY_VERSION_HEX < 0x030C0000
+  snapshot.associated_functions = associated_funcs_.size();
+  snapshot.watched_functions = func_death_watch_.size();
+  snapshot.deferred_anchor_releases = deferred_anchor_releases_.size();
+#endif
+  std::unordered_set<CompiledFunction*> artifacts;
+  for (const auto& [key, compiled] : compiled_codes_) {
+    artifacts.insert(compiled.get());
+  }
+#if PY_VERSION_HEX < 0x030C0000
+  for (const auto& [func, compiled] : associated_funcs_) {
+    artifacts.insert(compiled.get());
+  }
+#endif
+  for (CompiledFunction* compiled : artifacts) {
+    snapshot.artifact_members += compiled->functions().size();
+  }
+  for (CodeRuntime& runtime : code_runtimes_) {
+    snapshot.code_runtimes_allocated++;
+    snapshot.code_runtimes_live += !runtime.isCleared();
+  }
+  return snapshot;
+}
+
+std::vector<std::string> Context::lifecycleInvariantErrors311() const {
+  std::vector<std::string> errors;
+#if PY_VERSION_HEX < 0x030C0000
+  auto watched = [&](PyFunctionObject* func) {
+    auto watch = func_death_watch_.find(func);
+    return watch != func_death_watch_.end() &&
+        PyWeakref_GET_OBJECT(watch->second.get()) != Py_None;
+  };
+  bool installed_association_error = false;
+  bool association_member_error = false;
+  bool member_association_error = false;
+  bool borrowed_watch_error = false;
+  bool detached_artifact_error = false;
+  bool code_extra_identity_error = false;
+  std::unordered_set<CompiledFunction*> artifacts;
+  for (const auto& [func, compiled] : compiled_funcs_) {
+    auto assoc = associated_funcs_.find(func);
+    installed_association_error |= assoc == associated_funcs_.end() ||
+        assoc->second.get() != compiled.get();
+    association_member_error |= !compiled->functions().contains(func);
+    borrowed_watch_error |= !watched(func.get());
+    artifacts.insert(compiled.get());
+  }
+  for (const auto& [func, compiled] : associated_funcs_) {
+    association_member_error |= !compiled->functions().contains(func);
+    borrowed_watch_error |= !watched(func.get());
+    detached_artifact_error |= compiled->owner() != this;
+    artifacts.insert(compiled.get());
+  }
+  for (BorrowedRef<PyFunctionObject> func : deopted_funcs_) {
+    borrowed_watch_error |= !watched(func.get());
+  }
+  for (const auto& [key, compiled] : compiled_codes_) {
+    detached_artifact_error |= compiled->owner() != this;
+    artifacts.insert(compiled.get());
+    CodeExtra* extra = codeExtraIfExists(
+        reinterpret_cast<PyCodeObject*>(key.code));
+    if (extra == nullptr) {
+      continue;
+    }
+    auto* cached = reinterpret_cast<CompiledFunction*>(
+        _Py_atomic_load_ptr_acquire(&extra->jit_compiled));
+    if (cached == nullptr) {
+      continue;
+    }
+    bool found = false;
+    for (const auto& [candidate_key, candidate] : compiled_codes_) {
+      if (candidate_key.code == key.code && candidate.get() == cached) {
+        found = true;
+        break;
+      }
+    }
+    code_extra_identity_error |= !found;
+  }
+  for (CompiledFunction* compiled : artifacts) {
+    for (BorrowedRef<PyFunctionObject> func : compiled->functions()) {
+      auto assoc = associated_funcs_.find(func);
+      member_association_error |= assoc == associated_funcs_.end() ||
+          assoc->second.get() != compiled;
+    }
+  }
+  if (installed_association_error) {
+    errors.emplace_back("I1 installed function lacks its exact association");
+  }
+  if (association_member_error) {
+    errors.emplace_back("I2 association is absent from artifact members");
+  }
+  if (member_association_error) {
+    errors.emplace_back("I2 artifact member lacks its exact association");
+  }
+  if (borrowed_watch_error) {
+    errors.emplace_back("I3 borrowed function registry lacks a live death watch");
+  }
+  if (detached_artifact_error) {
+    errors.emplace_back("I6 compiled registry contains a detached artifact");
+  }
+  if (code_extra_identity_error) {
+    errors.emplace_back("I7 CodeExtra cache names an unknown artifact");
+  }
+#endif
+  if (!active_compiles_.empty() || !completed_compiles_.empty() ||
+      !deferred_finalizations_.empty()) {
+    errors.emplace_back("I4 stable checkpoint retains compile transaction state");
+  }
+#if PY_VERSION_HEX < 0x030C0000
+  if (!deferred_anchor_releases_.empty()) {
+    errors.emplace_back("I5 control-plane boundary retains deferred anchors");
+  }
+#endif
+  return errors;
+}
+
 void Context::addCompileTime(std::chrono::nanoseconds time) {
   auto ms = std::chrono::duration_cast<std::chrono::milliseconds>(time);
   total_compile_time_ms_.fetch_add(ms.count(), std::memory_order_relaxed);

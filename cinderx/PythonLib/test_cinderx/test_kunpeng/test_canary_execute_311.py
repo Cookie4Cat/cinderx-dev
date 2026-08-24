@@ -66,6 +66,59 @@ CHILD = textwrap.dedent(
     "the canary execute surface targets the vendored CPython 3.11.6",
 )
 class CanaryExecute311Test(unittest.TestCase):
+    def test_lifecycle_snapshot_is_non_retaining(self):
+        env = _capability_clean_env()
+        env["CINDERX_JIT_MODE"] = "canary"
+        env["PYTHONJITAUTO"] = "1000000"
+        probe = textwrap.dedent(
+            """
+            import gc
+            import json
+            import _cinderx, cinderx
+            cinderx.init()
+            _cinderx.install_frame_evaluator()
+            import cinderjit
+
+            def hot(value):
+                return value + 1
+
+            assert cinderjit.force_compile(hot) is True
+            assert hot(4) == 5
+            gc.collect(); gc.collect()
+            before = cinderjit._jit311_lifecycle_snapshot()
+            assert before["schema"] == "cp311-jit-a3-lifecycle-v1"
+            assert cinderjit._jit311_lifecycle_invariants() == {
+                "ok": True,
+                "errors": [],
+            }
+            for _index in range(100):
+                current = cinderjit._jit311_lifecycle_snapshot()
+                assert current["schema"] == before["schema"]
+                del current
+            gc.collect(); gc.collect()
+            after = cinderjit._jit311_lifecycle_snapshot()
+            for section in ("jit", "module", "runtime", "observer"):
+                assert after[section] == before[section], (
+                    section, before[section], after[section])
+            assert after["generator"] == {
+                "native_gauge_available": False,
+                "status": "GENERATOR_NATIVE_GAUGE_NOT_AVAILABLE",
+            }
+            assert cinderjit._jit311_lifecycle_invariants()["ok"] is True
+            print(json.dumps({"before": before, "after": after}))
+            """
+        )
+        proc = subprocess.run(
+            [sys.executable, "-c", probe],
+            capture_output=True,
+            text=True,
+            env=env,
+            timeout=120,
+        )
+        self.assertEqual(proc.returncode, 0, proc.stderr[-1200:])
+        report = json.loads(proc.stdout.strip().splitlines()[-1])
+        self.assertEqual(report["before"], report["after"])
+
     def test_canary_child_executes_and_default_stays_zero(self):
         env = dict(os.environ)
         env["CINDERX_JIT_MODE"] = "canary"
