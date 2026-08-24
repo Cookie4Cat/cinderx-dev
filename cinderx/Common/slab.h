@@ -103,6 +103,12 @@ class Slab {
     return ptr;
   }
 
+  // Whether the pointer names an allocated slot of this slab.
+  bool contains(const T* obj) const {
+    auto ptr = reinterpret_cast<const char*>(obj);
+    return ptr >= base_.get() && ptr < fill_;
+  }
+
 #ifndef WIN32
   void mlock() {
     if (::mlock(base_.get(), kSlabSize) < 0) {

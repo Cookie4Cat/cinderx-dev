@@ -123,6 +123,11 @@ class CompiledFunctionOwner {
   virtual void forgetCompiledFunction(CompiledFunction& function) = 0;
 
   virtual void unwatch(TypeDeoptPatcher*) = 0;
+
+  // Hand a cleared CodeRuntime's storage back for reuse.  Called by
+  // CompiledFunction::clear() after the runtime's references are released,
+  // never during context finalization (the storage dies wholesale there).
+  virtual void recycleCodeRuntime(CodeRuntime* runtime) = 0;
 };
 
 // CompiledFunction is a Python GC object that contains a pointer to the native
@@ -240,6 +245,19 @@ class CompiledFunction {
   // Clear all references held by this CompiledFunction and deopt all
   // associated functions.
   void clear(bool context_finalizing = false);
+
+#if PY_VERSION_HEX < 0x030C0000
+  /*
+   * Registry retirement for a generation that may still be pinned -- by an
+   * in-flight invocation or a suspended generator -- and must therefore
+   * keep its CodeRuntime fully functional.  Performs exactly the
+   * owner-side bookkeeping of clear() (every step identity-guarded, so the
+   * destructor's repeat is a no-op) and severs the owner link, but leaves
+   * the runtime untouched: destruction releases it and hands its storage
+   * back.
+   */
+  void retire();
+#endif
 
  private:
   explicit CompiledFunction(CompiledFunctionData&& data)

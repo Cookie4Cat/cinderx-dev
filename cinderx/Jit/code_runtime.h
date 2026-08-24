@@ -132,6 +132,18 @@ class alignas(16) CodeRuntime {
   // True if the references have been cleared
   bool isCleared() const;
 
+  // The CompiledFunction this runtime belongs to, as a borrowed Python
+  // object.  Set at artifact creation and severed by the artifact's
+  // clear(), it lets code running inside an invocation -- which the
+  // guarded entry pins -- hand out further pins (a generator suspending
+  // itself takes one for its own lifetime).
+  PyObject* owningArtifact() const {
+    return owning_artifact_;
+  }
+  void setOwningArtifact(PyObject* artifact) {
+    owning_artifact_ = artifact;
+  }
+
   // Get the UnitCallStack from a deopt metadata index.
   std::optional<UnitCallStack> getUnitCallStackFromDeoptIdx(
       std::size_t deopt_idx) const;
@@ -194,6 +206,9 @@ class alignas(16) CodeRuntime {
   // Map from call return addresses to post-call guard deopt exits.
   // Built during codegen, used by deoptAllJitFramesOnStack().
   std::unordered_map<uintptr_t, uintptr_t> callsite_deopt_exits_;
+
+  // Borrowed backlink to the owning CompiledFunction; see owningArtifact().
+  PyObject* owning_artifact_{nullptr};
 
   int frame_size_{-1};
   uint32_t spill_words_{0};

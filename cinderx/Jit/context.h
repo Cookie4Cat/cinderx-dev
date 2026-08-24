@@ -429,6 +429,14 @@ class Context : public IJitContext, public CompiledFunctionOwner {
   LifecycleSnapshot311 lifecycleSnapshot311();
   std::vector<std::string> lifecycleInvariantErrors311() const;
 
+  // Hand a retired artifact's cleared CodeRuntime back to the slab for
+  // reuse, after purging every side table keyed by its address so the
+  // slot's next tenant cannot inherit the old one's state.
+  void recycleCodeRuntime(CodeRuntime* runtime) override;
+
+  // Whether the runtime lives in this context's slab storage.
+  bool ownsCodeRuntime(const CodeRuntime* runtime) const override;
+
   /*
    * Get the total time spent compiling functions thus far.
    */

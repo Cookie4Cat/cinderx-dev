@@ -1031,6 +1031,14 @@ JITRT_AllocateAndLinkGenAndInterpreterFrame(
   footer->yieldPoint = nullptr;
   footer->gen = static_cast<PyGenObject*>(gen);
   footer->code_rt = code_rt;
+#if PY_VERSION_HEX < 0x030C0000
+  // A suspended generator is a paused invocation: it resumes into this
+  // artifact's machine code and its GC traversal reads this runtime's
+  // metadata, so it takes the same pin the guarded entry holds for the
+  // active call.  Released when the object stops being a JIT generator.
+  footer->artifact = code_rt->owningArtifact();
+  Py_XINCREF(footer->artifact);
+#endif
   footer->tree_iter_state = nullptr;
   footer->originalFramePointer = original_frame_pointer;
   footer->linkAddress =

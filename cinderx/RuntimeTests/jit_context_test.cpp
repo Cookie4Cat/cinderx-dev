@@ -5744,6 +5744,110 @@ def orphaned_survivor(x):
   func.reset();
 }
 
+TEST_F(JITLifecycle311Test, PinnedRetirementKeepsTheRuntimeWhole) {
+  SKIP_311_EXECUTABLE_COMPILE();
+
+  // A pinned generation -- an in-flight invocation or a suspended
+  // generator holds one -- keeps resuming into its machine code and
+  // reading its CodeRuntime after the registries have moved on, so
+  // retirement must leave the runtime whole; only the last pin's release
+  // guts it and hands the storage back.
+  const char* py_src = R"(
+def pinned_retiree(x):
+    return x * 3
+)";
+
+  Ref<PyFunctionObject> func(compileAndGet(py_src, "pinned_retiree"));
+  ASSERT_NE(func, nullptr);
+  auto mod = importCinderJitModule();
+  callJitOneArg(mod, "force_compile", func);
+  ASSERT_TRUE(isJitCompiled(func));
+
+  jit::Context* ctx = jit::getContext();
+  ASSERT_NE(ctx, nullptr);
+  auto borrowed = ctx->lookupFunc(func);
+  ASSERT_NE(borrowed, nullptr);
+  auto pin = Ref<jit::CompiledFunction>::create(borrowed);
+  size_t live_before = ctx->lifecycleSnapshot311().code_runtimes_live;
+
+  callJitOneArg(mod, "force_uncompile", func);
+  ASSERT_FALSE(isJitCompiled(func));
+  EXPECT_EQ(pin->owner(), nullptr) << "retirement kept the owner link";
+  ASSERT_NE(pin->runtime(), nullptr)
+      << "retirement gutted a runtime a pin may still be reading";
+  EXPECT_FALSE(pin->runtime()->isCleared());
+  EXPECT_EQ(ctx->lifecycleSnapshot311().code_runtimes_live, live_before);
+
+  // The retired generation answers from the interpreter.
+  auto arg = makeLong(5);
+  auto args = Ref<>::steal(PyTuple_Pack(1, arg.get()));
+  auto result = Ref<>::steal(PyObject_Call(func, args, nullptr));
+  ASSERT_NE(result, nullptr);
+  EXPECT_EQ(PyLong_AsLong(result), 15);
+
+  // Kill the function; the external pin now stands alone, the way a
+  // suspended generator's does, and the runtime must still be whole.
+  ASSERT_EQ(PyDict_DelItemString(func->func_globals, "pinned_retiree"), 0);
+  func.reset();
+  ASSERT_NE(pin->runtime(), nullptr);
+  EXPECT_FALSE(pin->runtime()->isCleared());
+
+  // The last release guts the runtime and returns the slot.
+  size_t allocated = ctx->lifecycleSnapshot311().code_runtimes_allocated;
+  pin.reset();
+  auto after = ctx->lifecycleSnapshot311();
+  EXPECT_EQ(after.code_runtimes_allocated, allocated);
+  EXPECT_EQ(after.code_runtimes_live, live_before - 1);
+}
+
+TEST_F(JITLifecycle311Test, RetiredCodeRuntimeStorageIsRecycled) {
+  SKIP_311_EXECUTABLE_COMPILE();
+
+  // Artifact death must hand the CodeRuntime slot back: churning
+  // independent code objects through compile and death reuses storage
+  // instead of growing the slab by one slot per compile (A3 blocker
+  // B7-RUNTIME).
+  jit::Context* ctx = jit::getContext();
+  ASSERT_NE(ctx, nullptr);
+  auto mod = importCinderJitModule();
+
+  auto compile_one = [&](const char* src, const char* name) {
+    Ref<PyFunctionObject> func(compileAndGet(src, name));
+    if (func == nullptr) {
+      return Ref<PyFunctionObject>{};
+    }
+    callJitOneArg(mod, "force_compile", func);
+    if (!isJitCompiled(func)) {
+      return Ref<PyFunctionObject>{};
+    }
+    return func;
+  };
+
+  auto kill = [&](Ref<PyFunctionObject>& func, const char* name) {
+    ASSERT_EQ(PyDict_DelItemString(func->func_globals, name), 0);
+    func.reset();
+  };
+
+  auto first = compile_one("def recycle_a(x):\n    return x + 1\n", "recycle_a");
+  ASSERT_NE(first, nullptr);
+  auto baseline = ctx->lifecycleSnapshot311();
+  kill(first, "recycle_a");
+
+  auto dead = ctx->lifecycleSnapshot311();
+  EXPECT_EQ(dead.code_runtimes_allocated, baseline.code_runtimes_allocated)
+      << "death should recycle the slot, not shrink the slab";
+  EXPECT_EQ(dead.code_runtimes_live, baseline.code_runtimes_live - 1);
+
+  auto second =
+      compile_one("def recycle_b(x):\n    return x + 2\n", "recycle_b");
+  ASSERT_NE(second, nullptr);
+  auto reused = ctx->lifecycleSnapshot311();
+  EXPECT_EQ(reused.code_runtimes_allocated, baseline.code_runtimes_allocated)
+      << "a fresh compile grew the slab instead of reusing the freed slot";
+  EXPECT_EQ(reused.code_runtimes_live, baseline.code_runtimes_live);
+  kill(second, "recycle_b");
+}
+
 TEST_F(JITLifecycle311Test, FinalizeEmptiesTheInstalledRegistry) {
   SKIP_311_EXECUTABLE_COMPILE();
 

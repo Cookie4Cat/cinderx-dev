@@ -1275,7 +1275,17 @@ void Context::forgetCodeEntry(
 
   clearCachedCompiledIfMatches(code, cf.get());
   dropDedupArtifact(code, cf);
+#if PY_VERSION_HEX < 0x030C0000
+  // Retirement must leave the runtime intact: an in-flight invocation and
+  // a suspended generator both pin the artifact and keep reading its
+  // CodeRuntime -- and resuming into its machine code -- long after the
+  // registries have moved on.  retire() does the owner-side bookkeeping
+  // only; the runtime is released and its storage handed back when the
+  // last pin drops and the artifact is destroyed.
+  cf->retire();
+#else
   cf->clear();
+#endif
   auto current = compiled_codes_.find(key);
   if (current != compiled_codes_.end() &&
       current->second.get() == retiring.get()) {
@@ -1375,6 +1385,23 @@ Context::compiledFuncs() {
 
 const UnorderedSet<BorrowedRef<PyFunctionObject>>& Context::deoptedFuncs() {
   return deopted_funcs_;
+}
+
+void Context::recycleCodeRuntime(CodeRuntime* runtime) {
+  JIT_CHECK(
+      runtime != nullptr && runtime->isCleared(),
+      "Only a cleared CodeRuntime husk may be recycled");
+  // ABA purge: the slot's next tenant answers to the same address, so
+  // every table keyed by that address must forget this one first.
+  {
+    std::lock_guard<std::mutex> lock{deopt_stats_mutex_};
+    deopt_stats_.erase(runtime);
+  }
+  code_runtimes_.free(runtime);
+}
+
+bool Context::ownsCodeRuntime(const CodeRuntime* runtime) const {
+  return code_runtimes_.contains(runtime);
 }
 
 LifecycleSnapshot311 Context::lifecycleSnapshot311() {

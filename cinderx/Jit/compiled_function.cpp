@@ -15,6 +15,7 @@
 // The MR-04 execute surface, defined in Jit/pyjit_311_gate.cpp.
 #include "cinderx/Interpreter/3.11/observe.h"
 #endif
+#include "cinderx/Jit/context_iface.h"
 #include "cinderx/Jit/hir/printer.h"
 #include "cinderx/Jit/trigger_stats.h"
 #include "cinderx/module_c_state.h"
@@ -182,6 +183,13 @@ Ref<CompiledFunction> CompiledFunction::create(
 #else
     _Py_SetImmortal(&cf->ob_base);
 #endif
+  }
+
+  // The runtime's backlink is what lets an invocation hand out further
+  // pins on this artifact (a suspending generator takes one); it is
+  // severed again by clear(), together with the forward pointer.
+  if (cf->runtime() != nullptr) {
+    cf->runtime()->setOwningArtifact(reinterpret_cast<PyObject*>(cf));
   }
 
   // Trigger-proof accounting: every compiled-function object ever created
@@ -406,9 +414,31 @@ int CompiledFunction::traverse(visitproc visit, void* arg) {
 void CompiledFunction::forgetFunctions() {
   functions_.clear();
 }
+
+void CompiledFunction::retire() {
+  if (owner_ == nullptr) {
+    return;
+  }
+  // The owner-side bookkeeping of clear(), verbatim: registry entries and
+  // watches this artifact still owns are unwound (identity-guarded on both
+  // sides), the member claims are dropped, and the owner link is severed
+  // so the publication-reentry detectors keep reading "retired".  The
+  // CodeRuntime deliberately stays whole -- see the header comment.
+  owner_->forgetCompiledFunction(*this);
+  for (auto& patcher : data_.code_patchers) {
+    if (auto typed_patcher = dynamic_cast<TypeDeoptPatcher*>(patcher.get())) {
+      owner_->unwatch(typed_patcher);
+    }
+  }
+  functions_.clear();
+  owner_ = nullptr;
+}
 #endif
 
 void CompiledFunction::clear(bool context_finalizing) {
+  // The owner is nulled below, but the runtime hand-back at the bottom
+  // still needs it: only the owner knows which slab the storage came from.
+  [[maybe_unused]] CompiledFunctionOwner* entry_owner = owner_;
   // Copy function pointers before clearing the set.
   if (owner_ != nullptr) {
     if (!context_finalizing) {
@@ -452,7 +482,30 @@ void CompiledFunction::clear(bool context_finalizing) {
 
   // Clear all references held by the CodeRuntime.
   if (data_.runtime != nullptr) {
+    data_.runtime->setOwningArtifact(nullptr);
     data_.runtime->releaseReferences();
+#if PY_VERSION_HEX < 0x030C0000
+    // clear() runs at artifact death, at GC collection of an unreachable
+    // artifact, or at context finalization -- registry retirement goes
+    // through retire() and never reaches here -- so no invocation and no
+    // suspended generator can still need this runtime: both hold the
+    // artifact alive.  Hand the storage back for reuse.  Finalization
+    // skips the hand-back (the slab dies wholesale with the context), and
+    // an artifact whose owner link is already severed -- retired, or
+    // orphaned by the multithread teardown -- answers to the module's
+    // context only after proving that context actually owns the slot, so
+    // a test-private context's storage is never adopted.
+    if (!context_finalizing) {
+      if (entry_owner != nullptr) {
+        entry_owner->recycleCodeRuntime(data_.runtime);
+      } else if (auto* mod_state = cinderx::getModuleState()) {
+        jit::IJitContext* ctx = mod_state->jit_context.get();
+        if (ctx != nullptr && ctx->ownsCodeRuntime(data_.runtime)) {
+          ctx->recycleCodeRuntime(data_.runtime);
+        }
+      }
+    }
+#endif
     data_.runtime = nullptr;
   }
 }

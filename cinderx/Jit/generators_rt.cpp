@@ -218,6 +218,12 @@ int jitgen_traverse(PyObject* obj, visitproc visit, void* arg) {
   JitGenObject* jit_gen = JitGenObject::cast(obj);
   if (jit_gen != nullptr) {
     const GenDataFooter* gen_footer = jit_gen->genDataFooter();
+#if PY_VERSION_HEX < 0x030C0000
+    // The lifetime pin on the artifact is a strong reference, and the
+    // artifact reaches module globals through its runtime; an unvisited
+    // pin would keep every generator-in-a-global cycle uncollectable.
+    Py_VISIT(gen_footer->artifact);
+#endif
     // Only visit JIT-specific live values if we have a valid yield point.
     // If yieldPoint is null, the generator hasn't yielded yet or has completed,
     // but we still need to call PyGen_Type.tp_traverse below to visit standard
@@ -1001,6 +1007,11 @@ PyType_Spec JitCoro_Spec = {
 };
 
 void deopt_jit_gen_object_only(JitGenObject* gen) {
+#if PY_VERSION_HEX < 0x030C0000
+  // The footer's artifact pin ends here: from this point the interpreter
+  // owns every resume and the GC traversal stops reading JIT metadata.
+  Py_CLEAR(gen->genDataFooter()->artifact);
+#endif
   PyTypeObject* old_type = Py_TYPE(gen);
 
   PyTypeObject* type = Py_TYPE(gen) == cinderx::getModuleState()->gen_type

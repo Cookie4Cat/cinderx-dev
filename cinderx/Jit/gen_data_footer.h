@@ -57,6 +57,13 @@ struct GenDataFooter {
   // JIT metadata for associated code object
   CodeRuntime* code_rt{nullptr};
 
+  // Strong reference (CPython 3.11): the artifact whose machine code and
+  // CodeRuntime this generator resumes into.  A suspended generator is a
+  // paused invocation, so it holds the pin the guarded entry holds for an
+  // active one; without it the artifact can die under the suspension and
+  // release exactly the storage the resume and the GC traversal read.
+  PyObject* artifact{nullptr};
+
   // State machine state for the TreeIter optimisation.  Null for non-TreeIter
   // generators and before the first resume of an optimised generator.
   TreeIterState* tree_iter_state{nullptr};

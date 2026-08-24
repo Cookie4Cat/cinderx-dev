@@ -91,8 +91,9 @@ class SlabArenaIterator {
 };
 
 // SlabArena is a simple arena allocator, using slabs that are multiples of the
-// system's page size. Allocated objects never move after creation, and all
-// objects will be kept alive until the SlabArena they came from is destroyed.
+// system's page size. Allocated objects never move after creation, and every
+// object lives until the SlabArena is destroyed unless its slot is handed
+// back with free(), which recycles it for a later allocate().
 //
 // It is intended to keep objects of a given type together on the same page,
 // either to achieve desired certain copy-on-write behavior, or to mlock() all
@@ -131,6 +132,16 @@ class SlabArena {
     }
 #endif
 
+    // Reuse a freed slot before growing a slab.  The husk occupying it is
+    // destroyed only now, so between free() and here it stayed a valid
+    // object for iteration and for the slab's own teardown.
+    if (!free_list_.empty()) {
+      T* slot = free_list_.back();
+      free_list_.pop_back();
+      slot->~T();
+      return new (slot) T(std::forward<Args>(args)...);
+    }
+
     void* mem = slabs_.back().allocate();
     if (mem == nullptr) {
       mem = slabs_.emplace_back(SizeTrait::size()).allocate();
@@ -142,6 +153,28 @@ class SlabArena {
 #endif
     }
     return new (mem) T(std::forward<Args>(args)...);
+  }
+
+  // Whether the pointer names an allocated slot in this arena.
+  bool contains(const T* obj) const {
+    std::lock_guard<std::mutex> guard{mutex_};
+    for (const auto& slab : slabs_) {
+      if (slab.contains(obj)) {
+        return true;
+      }
+    }
+    return false;
+  }
+
+  // Hand an object's slot back for reuse by a later allocate().  The object
+  // is deliberately NOT destroyed here: iteration may still visit the slot,
+  // and the slab destroys its current occupant at arena teardown, so the
+  // caller must leave the object in a state that is valid to iterate and to
+  // destroy (a cleared husk).  Each slot holds exactly one constructed
+  // object at all times.
+  void free(T* obj) {
+    std::lock_guard<std::mutex> guard{mutex_};
+    free_list_.push_back(obj);
   }
 
 #ifndef WIN32
@@ -172,7 +205,9 @@ class SlabArena {
 
  private:
   std::vector<Slab<T, kSlabSize>> slabs_;
-  std::mutex mutex_;
+  // Slots handed back by free(), still holding their husks.
+  std::vector<T*> free_list_;
+  mutable std::mutex mutex_;
 #ifndef WIN32
   bool mlocked_{false};
 #endif
