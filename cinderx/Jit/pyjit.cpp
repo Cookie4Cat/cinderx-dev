@@ -1373,6 +1373,24 @@ FlagProcessor initFlagProcessor() {
 
   flag_processor.setFlags(PySys_GetXOptions());
 
+#if PY_VERSION_HEX < 0x030C0000
+  // The CPython 3.11 surface requires retired machine code to be
+  // reclaimed, and only the asmjit-backed allocator has a real
+  // releaseCode(); CodeAllocatorCinder's is a deliberate no-op, so its
+  // huge-page pools grow by one artifact's code for every compile a
+  // churning workload retires.  Answer an explicit huge-page request
+  // here rather than rerouting it at allocator construction, so the
+  // configuration always reads the effective policy.
+  if (getConfig().use_huge_pages) {
+    if (flag_processor.hasHandled("jit-huge-pages")) {
+      JIT_LOG(
+          "Huge-page code allocation cannot reclaim retired code and is not "
+          "part of the CPython 3.11 surface; using the reclaiming allocator.");
+    }
+    getMutableConfig().use_huge_pages = false;
+  }
+#endif
+
   // Inlining relies on lightweight-frame reification support.  Keep the
   // inliner disabled for normal-frame runs so tests and explicit normal-mode
   // configurations do not build inline frames that cannot be safely unlinked.

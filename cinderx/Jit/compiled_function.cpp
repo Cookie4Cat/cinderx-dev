@@ -209,7 +209,15 @@ CompiledFunction::~CompiledFunction() {
     if (mod_state != nullptr) {
       auto code_allocator = mod_state->code_allocator.get();
       if (code_allocator != nullptr) {
-        code_allocator->releaseCode(const_cast<std::byte*>(data_.code.data()));
+        // A refused release means the allocator no longer recognizes this
+        // span: either the buffer was released twice or the accounting has
+        // already diverged from the allocator's, and every later usedBytes()
+        // reading would be fiction.
+        asmjit::Error error = code_allocator->releaseCode(
+            const_cast<std::byte*>(data_.code.data()));
+        JIT_CHECK(
+            error == asmjit::kErrorOk,
+            "Code allocator refused to release an owned code buffer");
       }
     }
   }

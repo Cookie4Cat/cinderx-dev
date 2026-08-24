@@ -112,7 +112,18 @@ AllocateResult CodeAllocator::addCode(asmjit::CodeHolder* code) {
   asmjit::Error error = runtime_.add(&addr, code);
 
   if (addr != nullptr && error == asmjit::kErrorOk) {
-    used_bytes_.fetch_add(code->codeSize(), std::memory_order_relaxed);
+    // Account the physical span rather than the logical code size: the
+    // allocator hands back aligned blocks and releaseCode() can only
+    // subtract what query() reports, so symmetric accounting is what makes
+    // used_bytes_ return to its plateau under compile/release churn --
+    // asymmetric accounting underflows the counter one alignment gap at a
+    // time.
+    asmjit::JitAllocator::Span span;
+    JIT_CHECK(
+        runtime_.allocator()->query(span, addr) == asmjit::kErrorOk,
+        "Code allocator cannot answer for a span it just allocated");
+    triggerStatsOnExecutableAlloc(span.size());
+    used_bytes_.fetch_add(span.size(), std::memory_order_relaxed);
   }
 
   return AllocateResult{addr, error};
