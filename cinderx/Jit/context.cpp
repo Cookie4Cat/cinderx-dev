@@ -238,14 +238,31 @@ Context::~Context() {
   for (auto& compiled : pinned) {
     compiled->clear(true /* context_finalizing */);
   }
-
-  // Nothing borrowed is left for a notification to protect; drop the
-  // watches.  Dropping a weak reference runs no Python.
-  clearFunctionDeathWatch();
 #else
   for (auto& code : compiled_codes_) {
     code.second->clear(true /* context_finalizing */);
   }
+#endif
+
+  // Artifacts orphaned by clearForMultithreadedCompileTest() left every
+  // registry and lost their owner, so the walks above cannot reach them --
+  // yet a function-dictionary anchor can keep such an artifact alive long
+  // past this destructor, while its CodeRuntime pointer aims into
+  // code_runtimes_, which dies with this context.  The GC then walks
+  // tp_traverse or tp_clear (and ~CompiledFunction runs clear()) through
+  // the dangling pointer.  Sever them in the same window as every other
+  // artifact, and release the pins here rather than in member destruction,
+  // so a release-driven function death still has its watch to report
+  // through.
+  for (auto& compiled : orphaned_compiled_codes_) {
+    compiled->clear(true /* context_finalizing */);
+  }
+  orphaned_compiled_codes_.clear();
+
+#if PY_VERSION_HEX < 0x030C0000
+  // Nothing borrowed is left for a notification to protect; drop the
+  // watches.  Dropping a weak reference runs no Python.
+  clearFunctionDeathWatch();
 #endif
 }
 

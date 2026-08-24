@@ -5683,6 +5683,67 @@ def orphaned(x):
   ctx.reset();
 }
 
+TEST_F(JITLifecycle311Test, OrphanedArtifactOutlivesContextTeardown) {
+  SKIP_311_EXECUTABLE_COMPILE();
+
+  // clearForMultithreadedCompileTest() detaches an artifact from every
+  // registry and hands its pin to orphan storage, while a
+  // function-dictionary anchor can keep the artifact alive past the
+  // context.  The teardown contract under test: the context severs the
+  // orphan's CodeRuntime while the runtime storage is still alive, so the
+  // GC's traverse/clear and the final release no longer depend on the
+  // context.
+  const char* py_src = R"(
+def orphaned_survivor(x):
+    return x + 4
+)";
+
+  Ref<PyFunctionObject> func(compileAndGet(py_src, "orphaned_survivor"));
+  ASSERT_NE(func, nullptr);
+
+  auto ctx = std::make_unique<jit::CompilerContext<jit::Compiler>>();
+  std::unique_ptr<jit::hir::Preloader> preloader(
+      jit::hir::Preloader::make(func, jit::makeFrameReifier(func->func_code)));
+  ASSERT_EQ(
+      jit::compilePreloaderImpl(ctx.get(), *preloader, func), jit::Result::OK);
+
+  auto borrowed =
+      ctx->lookupCode(func->func_code, func->func_builtins, func->func_globals);
+  ASSERT_NE(borrowed, nullptr);
+  // The external pin stands in for the function-dictionary anchor that
+  // keeps a real orphan alive beyond the context.
+  auto survivor = Ref<jit::CompiledFunction>::create(borrowed);
+
+  ctx->clearForMultithreadedCompileTest();
+  ASSERT_EQ(survivor->owner(), nullptr);
+  ASSERT_NE(survivor->runtime(), nullptr)
+      << "orphaning already dropped the runtime; the teardown window under "
+         "test no longer exists";
+
+  ctx.reset();
+
+  EXPECT_EQ(survivor->runtime(), nullptr)
+      << "the orphaned artifact still names a CodeRuntime that died with "
+         "the context";
+
+  // What a late survivor does must now be context-independent: traverse
+  // visits nothing through the runtime, and a call answers from the
+  // interpreter.
+  visitproc visit = [](PyObject*, void*) { return 0; };
+  EXPECT_EQ(survivor->traverse(visit, nullptr), 0);
+
+  auto arg = makeLong(3);
+  auto args = Ref<>::steal(PyTuple_Pack(1, arg.get()));
+  auto result = Ref<>::steal(PyObject_Call(func, args, nullptr));
+  ASSERT_NE(result, nullptr);
+  EXPECT_EQ(PyLong_AsLong(result), 7);
+
+  // The last release runs ~CompiledFunction -> clear() on the severed
+  // artifact.
+  survivor.reset();
+  func.reset();
+}
+
 TEST_F(JITLifecycle311Test, FinalizeEmptiesTheInstalledRegistry) {
   SKIP_311_EXECUTABLE_COMPILE();
 
