@@ -4189,6 +4189,7 @@ def with_def(a, b=1):
 
   runCode(R"(
 import _testinternalcapi
+import _cinderx
 import cinderjit
 import sys
 
@@ -4240,6 +4241,59 @@ finally:
 assert machine == stock, (stock, machine)
 assert len(machine[2]) > 0
 assert recursive(4) == 4
+
+def native_recursive(remaining, operand):
+    if remaining:
+        return native_recursive(remaining - 1, operand)
+    return operand + 0
+
+def exercise_native(operand):
+    outer_before = _cinderx._native_recursion_state()
+    native = native_recursive(outer_before["recursion_remaining"], operand)
+    outer_after = _cinderx._native_recursion_state()
+    return outer_before, native, outer_after
+
+def native_semantics(result):
+    native = result[1]
+    return (
+        native["entered"],
+        native["return_code"],
+        native["error_occurred"],
+        native["exception_type"],
+        native["exception_message"],
+        native["before"]["recursion_remaining"],
+        native["after"]["recursion_remaining"],
+        native["before"]["recursion_headroom"],
+        native["after"]["recursion_headroom"],
+    )
+
+operand = _cinderx._native_recursion_probe_operand()
+sys.setrecursionlimit(60)
+try:
+    cinderjit.disable()
+    native_stock = exercise_native(operand)
+    cinderjit.enable()
+    assert cinderjit.force_compile(native_recursive) is True
+    cinderjit._jit311_reset_entry_ledger()
+    native_machine = exercise_native(operand)
+finally:
+    sys.setrecursionlimit(old_limit)
+
+assert native_semantics(native_machine) == native_semantics(native_stock)
+assert native_stock[1]["entered"] is False
+assert native_stock[1]["exception_type"] == "RecursionError"
+assert native_stock[1]["before"]["recursion_remaining"] == 0
+assert native_machine[1]["before"]["recursion_remaining"] == 0
+for result in (native_stock, native_machine):
+    assert (result[0]["recursion_remaining"]
+            == result[2]["recursion_remaining"])
+assert native_machine[2]["recursion_headroom"] == 0
+assert native_machine[2]["boundary_active"] is False
+assert native_machine[2]["jit_entries"] == 0
+ledger = cinderjit._jit311_entry_ledger()
+assert ledger["dropped"] == 0
+assert any(row["qualname"] == "native_recursive"
+           and row["entries"] > 0 for row in ledger["entries"])
 )");
 }
 

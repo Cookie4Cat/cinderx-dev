@@ -13,6 +13,121 @@ from ci_pipeline.libtest_diff_311 import diff_results_symmetric, load
 PASS_STATES = {"PASS", "PASS_WITH_APPROVED_DEVIATIONS"}
 
 
+def compare_native_recursion_boundary(stock_path: Path, jit_path: Path) -> dict:
+    stock = json.loads(stock_path.read_text())
+    jit = json.loads(jit_path.read_text())
+    errors = []
+    if stock.get("native_helper_executed") != jit.get("native_helper_executed"):
+        errors.append("native helper execution differs from Stock")
+    if stock.get("call_error") != jit.get("call_error"):
+        errors.append("exposed exception/traceback differs from Stock")
+    semantic_keys = (
+        "entered",
+        "return_code",
+        "error_occurred",
+        "exception_type",
+        "exception_message",
+    )
+    if stock.get("native") is not None and jit.get("native") is not None:
+        for key in semantic_keys:
+            if stock.get("native", {}).get(key) != jit.get("native", {}).get(key):
+                errors.append(f"native {key} differs from Stock")
+        for phase in ("before", "after"):
+            for key in ("recursion_remaining", "recursion_headroom"):
+                if stock.get("native", {}).get(phase, {}).get(key) != jit.get(
+                    "native", {}
+                ).get(phase, {}).get(key):
+                    errors.append(f"native {phase} {key} differs from Stock")
+    for label, document in (("Stock", stock), ("JIT", jit)):
+        native = document.get("native", {})
+        if native is not None:
+            for key in ("recursion_remaining", "recursion_headroom"):
+                if native.get("before", {}).get(key) != native.get(
+                    "after", {}
+                ).get(key):
+                    errors.append(f"{label} native {key} drift")
+            for key in ("boundary_active", "jit_entries"):
+                if native.get("before", {}).get(key) != native.get(
+                    "after", {}
+                ).get(key):
+                    errors.append(f"{label} native {key} changed")
+        if document.get("outer_before", {}).get(
+            "recursion_remaining"
+        ) != document.get("outer_after", {}).get("recursion_remaining"):
+            errors.append(f"{label} outer recursion_remaining drift")
+        if document.get("post_error_normal_call") != 10:
+            errors.append(f"{label} post-error normal call failed")
+        if document.get("result") != "PASS":
+            errors.append(f"{label} probe self-check failed")
+    if jit.get("outer_after", {}).get("recursion_headroom") != 0:
+        errors.append("JIT recursion_headroom leaked")
+    if jit.get("outer_after", {}).get("boundary_active") is not False:
+        errors.append("JIT boundary flag leaked")
+    if jit.get("outer_after", {}).get("jit_entries") != 0:
+        errors.append("JIT entry ownership leaked")
+    if not jit.get("machine_entry_proven"):
+        errors.append("JIT recursive target has no machine-entry proof")
+    if jit.get("entry_ledger_dropped", 0):
+        errors.append("JIT entry ledger dropped evidence")
+    return {
+        "result": "PASS" if not errors else "FAIL",
+        "stock": stock,
+        "jit": jit,
+        "errors": errors,
+        "product_fix_required": bool(errors),
+    }
+
+
+def render_native_recursion_boundary_report(comparison: dict, out: Path) -> None:
+    stock = comparison.get("stock", {})
+    jit = comparison.get("jit", {})
+    lines = [
+        "# CPython 3.11 A2 Native Recursion Boundary Report",
+        "",
+        f"- Result: `{comparison.get('result')}`",
+        f"- Product fix required: `{comparison.get('product_fix_required')}`",
+        "",
+        "| Observable | Stock | JIT |",
+        "|---|---|---|",
+        f"| `native_helper_executed` | `{stock.get('native_helper_executed')}` | `{jit.get('native_helper_executed')}` |",
+        f"| `call_error` | `{json.dumps(stock.get('call_error'), sort_keys=True)}` | `{json.dumps(jit.get('call_error'), sort_keys=True)}` |",
+    ]
+    for key in (
+        "entered",
+        "return_code",
+        "error_occurred",
+        "exception_type",
+        "exception_message",
+    ):
+        lines.append(
+            f"| `{key}` | `{(stock.get('native') or {}).get(key)}` | "
+            f"`{(jit.get('native') or {}).get(key)}` |"
+        )
+    for phase in ("before", "after"):
+        for key in (
+            "recursion_remaining",
+            "recursion_headroom",
+            "boundary_active",
+            "jit_entries",
+        ):
+            lines.append(
+                f"| `{phase}.{key}` | "
+                f"`{(stock.get('native') or {}).get(phase, {}).get(key)}` | "
+                f"`{(jit.get('native') or {}).get(phase, {}).get(key)}` |"
+            )
+    lines.extend(
+        [
+            "",
+            f"- Stock post-error normal call: `{stock.get('post_error_normal_call')}`",
+            f"- JIT post-error normal call: `{jit.get('post_error_normal_call')}`",
+            f"- JIT machine-entry proof: `{jit.get('machine_entry_proven')}`",
+            f"- Errors: `{json.dumps(comparison.get('errors', []), sort_keys=True)}`",
+            "",
+        ]
+    )
+    out.write_text("\n".join(lines))
+
+
 def compare_penetration(
     stock_path: Path,
     aggressive_path: Path,

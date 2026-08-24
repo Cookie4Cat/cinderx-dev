@@ -7,6 +7,7 @@ import unittest
 from ci_pipeline.jit311.a2_penetration import classify
 from ci_pipeline.jit311.a2_report import (
     compare_frame_positions,
+    compare_native_recursion_boundary,
     compare_penetration,
     compare_recursion_boundary,
     judge_transitions,
@@ -19,6 +20,56 @@ DATA = ROOT / "ci_pipeline/jit311/data"
 
 
 class A2ReportTest(unittest.TestCase):
+    def test_native_recursion_comparison_requires_stock_c_api_semantics(self):
+        state = {
+            "recursion_remaining": 0,
+            "recursion_headroom": 0,
+            "boundary_active": False,
+            "jit_entries": 0,
+        }
+        native = {
+            "entered": False,
+            "return_code": -1,
+            "error_occurred": True,
+            "exception_type": "RecursionError",
+            "exception_message": "maximum recursion depth exceeded",
+            "before": state,
+            "after": state,
+        }
+        stock = {
+            "result": "PASS",
+            "outer_before": {**state, "recursion_remaining": 52},
+            "native_helper_executed": True,
+            "native": native,
+            "call_error": None,
+            "outer_after": {**state, "recursion_remaining": 52},
+            "post_error_normal_call": 10,
+        }
+        jit = {
+            **stock,
+            "machine_entry_proven": True,
+            "entry_ledger_dropped": 0,
+        }
+        with tempfile.TemporaryDirectory() as temporary:
+            directory = Path(temporary)
+            stock_path = directory / "stock.json"
+            jit_path = directory / "jit.json"
+            stock_path.write_text(json.dumps(stock))
+            jit_path.write_text(json.dumps(jit))
+            report = compare_native_recursion_boundary(stock_path, jit_path)
+            jit["native_helper_executed"] = False
+            jit["native"] = None
+            jit["call_error"] = {
+                "type": "RecursionError",
+                "message": "maximum recursion depth exceeded",
+                "frames": [],
+            }
+            jit_path.write_text(json.dumps(jit))
+            wrong = compare_native_recursion_boundary(stock_path, jit_path)
+        self.assertEqual(report["result"], "PASS")
+        self.assertEqual(wrong["result"], "FAIL")
+        self.assertTrue(wrong["product_fix_required"])
+
     def test_final_deviation_proof_requires_semantics_and_exact_footprint(self):
         adaptive = {
             "test.test_dis.DisTests.test_super_instructions",
