@@ -225,18 +225,28 @@ class A3Runner:
         (directory / "result.json").write_text(json.dumps(result, indent=2, sort_keys=True) + "\n")
         return result
 
+    # Per-state quotas, not a total: 100 round-robin exits gave the
+    # multithread-completed state ~16 attempts.  The teardown class of
+    # crash is deterministic per memory layout, so the lane also relies
+    # on a3_shutdown's MALLOC_PERTURB_ poisoning and per-child layout
+    # entropy rather than on repetition count alone.
+    SHUTDOWN_QUOTA = (
+        "installed=200,parked=200,function-death=200,code-death=200,"
+        "failure-unwind=200,multithread-completed=2000"
+    )
+
     def run_f(self) -> dict | None:
         directory = self.output / "F"
         directory.mkdir()
-        out = directory / "shutdown-100.json"
+        out = directory / "shutdown.json"
         rc = self.base._run(
-            "40-A3-F-shutdown-100",
+            "40-A3-F-shutdown",
             [
                 str(self.base.python),
                 "-m",
                 "ci_pipeline.jit311.a3_shutdown",
-                "--repetitions",
-                "100",
+                "--quota",
+                self.SHUTDOWN_QUOTA,
                 "--child-timeout",
                 "30",
                 "--out",

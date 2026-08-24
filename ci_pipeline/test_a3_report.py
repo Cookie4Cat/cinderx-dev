@@ -104,3 +104,31 @@ def test_multithread_shutdown_crash_is_both_lifetime_and_finalize_blocker():
     blockers = classify_blockers({}, None, finalize)
     assert [blocker["id"] for blocker in blockers] == ["B8", "B9"]
     assert all(blocker["errors"] == ["exit code -11"] for blocker in blockers)
+
+
+def test_shutdown_blocker_evidence_is_the_ledger_not_the_repetition_list():
+    crash = {
+        "state": "multithread-completed",
+        "returncode": -11,
+        "errors": ["exit code -11"],
+    }
+    finalize = {
+        "result": "FAIL",
+        "failures": [dict(crash, iteration=index) for index in range(1, 2001)],
+        "per_state": {
+            "multithread-completed": {
+                "attempts": 2000,
+                "successes": 0,
+                "sigsegv": 2000,
+                "cores": ["cores/multithread-completed-0001/core"],
+                "native_backtrace": "#2 jit::CodeRuntime::releaseReferences()",
+            }
+        },
+    }
+    blockers = classify_blockers({}, None, finalize)
+    for blocker in blockers:
+        evidence = blocker["evidence"]["F"]
+        assert len(evidence["failures"]) == 5
+        ledger = evidence["per_state"]["multithread-completed"]
+        assert ledger["sigsegv"] == 2000
+        assert "releaseReferences" in ledger["native_backtrace"]

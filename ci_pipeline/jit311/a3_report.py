@@ -74,7 +74,14 @@ def _add_blocker(groups: dict, cluster: str, scenario: str, result: dict) -> Non
     if result.get("samples"):
         group["evidence"][scenario] = [_compact_sample(sample) for sample in result["samples"]]
     elif result.get("failures"):
-        group["evidence"][scenario] = result["failures"]
+        # A deterministic teardown crash fails thousands of identical
+        # children; the per-state ledger plus the first few rows (which
+        # carry the stdio tails, core path and gdb backtrace) is the
+        # evidence, not the full repetition list.
+        evidence: dict[str, Any] = {"failures": result["failures"][:5]}
+        if result.get("per_state"):
+            evidence["per_state"] = result["per_state"]
+        group["evidence"][scenario] = evidence
 
 
 def classify_blockers(c_results: dict, ownership: dict | None, finalize: dict | None) -> list[dict]:
@@ -186,6 +193,22 @@ def _snapshot_rows(c_results: dict) -> list[str]:
     return rows
 
 
+def _shutdown_state_rows(per_state: dict | None) -> list[str]:
+    if not per_state:
+        return ["Per-state shutdown ledger: `not recorded by this lane run`."]
+    rows = [
+        "| Shutdown state | attempts | successes | SIGSEGV | SIGABRT | timeout | forbidden stderr |",
+        "|---|---:|---:|---:|---:|---:|---:|",
+    ]
+    for state, summary in per_state.items():
+        rows.append(
+            f"| {state} | {summary.get('attempts', 0)} | {summary.get('successes', 0)} | "
+            f"{summary.get('sigsegv', 0)} | {summary.get('sigabrt', 0)} | "
+            f"{summary.get('timeouts', 0)} | {summary.get('forbidden_stderr', 0)} |"
+        )
+    return rows
+
+
 def render_discovery(document: dict, path: Path) -> None:
     c_results = document["lanes"].get("C", {})
     lines = [
@@ -265,7 +288,10 @@ def render_discovery(document: dict, path: Path) -> None:
             "",
             f"- A3-O: `{document['lane_results'].get('O')}`; refcount corpus details: `O/result.json`.",
             f"- A3-F: `{document['lane_results'].get('F')}`; process exits: `{(document['lanes'].get('F') or {}).get('successful_exits')}/{(document['lanes'].get('F') or {}).get('repetitions')}`.",
+            f"- A3-F detector: `{json.dumps((document['lanes'].get('F') or {}).get('detector'), sort_keys=True)}`.",
             "- A3-S: `NOT_RUN_DISCOVERY_PHASE`; ASAN/LSan/refleak are not silently treated as PASS.",
+            "",
+            *_shutdown_state_rows((document["lanes"].get("F") or {}).get("per_state")),
             "",
         ]
     )
