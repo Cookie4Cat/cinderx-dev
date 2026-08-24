@@ -47,7 +47,7 @@ def test_missing_c_result_is_infrastructure_failure():
     assert status == "INFRA_FAIL"
 
 
-def test_resident_drift_adds_primary_and_code_buffer_clusters():
+def test_resident_drift_is_clustered_as_code_buffer_not_function_watch():
     baseline = _snapshot()
     final = _snapshot(runtime__resident_code_buffers=1)
     result = {
@@ -59,7 +59,18 @@ def test_resident_drift_adds_primary_and_code_buffer_clusters():
         "samples": [_sample("baseline", baseline), _sample("after_gc_2", final)],
     }
     blockers = classify_blockers({"C1": result}, None, None)
-    assert [blocker["id"] for blocker in blockers] == ["B1", "B7"]
+    assert [blocker["id"] for blocker in blockers] == ["B7"]
+
+
+def test_function_liveness_signal_stays_in_function_watch_cluster():
+    result = {
+        "result": "FAIL",
+        "errors": ["final Python liveness weakrefs_alive is non-zero"],
+        "plateau": {"gauge_drift": {}},
+        "samples": [_sample("baseline", _snapshot()), _sample("after_gc_2", _snapshot())],
+    }
+    blockers = classify_blockers({"C1": result}, None, None)
+    assert [blocker["id"] for blocker in blockers] == ["B1"]
 
 
 def test_refcount_failure_is_not_an_approved_deviation():

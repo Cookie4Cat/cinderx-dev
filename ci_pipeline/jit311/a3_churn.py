@@ -53,6 +53,25 @@ def _initialize():
     return _cinderx, cinderjit
 
 
+def _suppress_harness():
+    """Keep the probe's own persistent control code out of JIT-ALL census."""
+    from cinderx.jit import jit_suppress
+
+    helpers = (
+        _suppress_harness,
+        _alive_count,
+        _count_exact_type,
+        _make_plain,
+        _collect_sample,
+        _settle_census,
+        _finalize_samples,
+        _compile_and_enter,
+        *SCENARIOS.values(),
+    )
+    for helper in helpers:
+        jit_suppress(helper)
+
+
 def _make_plain(index: int, prefix: str):
     name = f"{prefix}_{index}"
     source = (
@@ -70,11 +89,27 @@ def _make_plain(index: int, prefix: str):
     return function, namespace, 15 + index
 
 
+def _alive_count(refs) -> int:
+    alive = 0
+    for reference in refs:
+        if reference() is not None:
+            alive += 1
+    return alive
+
+
+def _count_exact_type(objects, expected_type) -> int:
+    count = 0
+    for obj in objects:
+        if type(obj) is expected_type:
+            count += 1
+    return count
+
+
 def _collect_sample(cinderjit, label: str, refs=None, extra=None):
     refs = refs or []
     python = {
         "weakrefs_total": len(refs),
-        "weakrefs_alive": sum(ref() is not None for ref in refs),
+        "weakrefs_alive": _alive_count(refs),
     }
     if extra:
         python.update(extra)
@@ -88,8 +123,14 @@ def _settle_census(cinderjit):
     eligible too.  Settling them first keeps harness compilation out of the
     ephemeral-code lifetime measurement.
     """
-    _collect_sample(cinderjit, "unmeasured_settle_1")
-    _collect_sample(cinderjit, "unmeasured_settle_2")
+    warm, namespace, expected = _make_plain(900_000_000, "census_settle")
+    _compile_and_enter(cinderjit, warm, (3, 5, 1), expected)
+    del warm, namespace, expected
+    _alive_count([])
+    _count_exact_type([], object)
+    unmeasured = []
+    _finalize_samples(cinderjit, unmeasured, [])
+    _collect_sample(cinderjit, "unmeasured_settle_3")
 
 
 def _finalize_samples(cinderjit, samples, refs, *, extra=None):
@@ -132,14 +173,14 @@ def scenario_c1(_cinderx, cinderjit):
                     cinderjit,
                     f"after_{index}",
                     refs,
-                    {"code_weakrefs_alive": sum(ref() is not None for ref in code_refs)},
+                    {"code_weakrefs_alive": _alive_count(code_refs)},
                 )
             )
     _finalize_samples(
         cinderjit,
         samples,
         refs,
-        extra={"code_weakrefs_alive": sum(ref() is not None for ref in code_refs)},
+        extra={"code_weakrefs_alive": _alive_count(code_refs)},
     )
     return samples, {"function_weakrefs": len(refs), "code_weakrefs": len(code_refs)}
 
@@ -157,7 +198,7 @@ def scenario_c2(_cinderx, cinderjit):
     identities = set()
     for index in range(1, checkpoints[-1] + 1):
         function, namespace, expected = _make_plain(index, "c2")
-        identities.add(id(function.__code__))
+        identities.add(function.__code__.co_filename)
         refs.append(weakref.ref(function))
         try:
             code_refs.append(weakref.ref(function.__code__))
@@ -177,9 +218,7 @@ def scenario_c2(_cinderx, cinderjit):
                     refs,
                     {
                         "unique_code_identities": len(identities),
-                        "code_weakrefs_alive": sum(
-                            ref() is not None for ref in code_refs
-                        ),
+                        "code_weakrefs_alive": _alive_count(code_refs),
                     },
                 )
             )
@@ -189,7 +228,7 @@ def scenario_c2(_cinderx, cinderjit):
         refs,
         extra={
             "unique_code_identities": len(identities),
-            "code_weakrefs_alive": sum(ref() is not None for ref in code_refs),
+            "code_weakrefs_alive": _alive_count(code_refs),
         },
     )
     return samples, {"unique_code_identities": len(identities)}
@@ -296,7 +335,6 @@ def scenario_c5(_cinderx, cinderjit):
 def scenario_c6(_cinderx, cinderjit):
     checkpoints = ACTIVE_CHECKPOINTS["C6"]
     _settle_census(cinderjit)
-    samples = [_collect_sample(cinderjit, "baseline")]
     namespace = {"__builtins__": __builtins__, "__name__": "__main__"}
     exec(
         compile(
@@ -310,11 +348,23 @@ def scenario_c6(_cinderx, cinderjit):
         namespace,
     )
     function = namespace.pop("a3_generator")
+    type_probe = function(0)
+    generator_type = type(type_probe)
+    type_probe.close()
+    del type_probe
+    gc.collect()
+    baseline_generators = _count_exact_type(gc.get_objects(), generator_type)
+    samples = [
+        _collect_sample(
+            cinderjit,
+            "baseline",
+            extra={"jit_generator_gc_objects": baseline_generators},
+        )
+    ]
     if not cinderjit.force_compile(function):
         raise AssertionError("C6 generator function did not compile")
     samples.append(_collect_sample(cinderjit, "owner_baseline"))
     refs = []
-    generator_type = None
     modes = ("exhaust", "close", "throw", "suspended-drop")
     for index in range(1, checkpoints[-1] + 1):
         for mode in modes:
@@ -337,9 +387,7 @@ def scenario_c6(_cinderx, cinderjit):
             del generator
         if index in checkpoints:
             gc.collect()
-            live_type = sum(
-                type(obj) is generator_type for obj in gc.get_objects()
-            )
+            live_type = _count_exact_type(gc.get_objects(), generator_type)
             samples.append(
                 _collect_sample(
                     cinderjit,
@@ -350,7 +398,7 @@ def scenario_c6(_cinderx, cinderjit):
             )
     del function, namespace
     gc.collect()
-    live_type = sum(type(obj) is generator_type for obj in gc.get_objects())
+    live_type = _count_exact_type(gc.get_objects(), generator_type)
     _finalize_samples(
         cinderjit,
         samples,
@@ -458,6 +506,7 @@ def run(scenario: str, *, quick: bool = False) -> dict:
     global ACTIVE_CHECKPOINTS
     ACTIVE_CHECKPOINTS = QUICK_CHECKPOINTS if quick else CHECKPOINTS
     _cinderx, cinderjit = _initialize()
+    _suppress_harness()
     before_entries = _cinderx._get_trigger_stats()["machine_code_entries"]
     samples, evidence = SCENARIOS[scenario](_cinderx, cinderjit)
     after_entries = _cinderx._get_trigger_stats()["machine_code_entries"]
@@ -465,6 +514,20 @@ def run(scenario: str, *, quick: bool = False) -> dict:
     capacity_pair = (f"after_{cycles[-2]}", f"after_{cycles[-1]}")
     plateau = judge_plateau(samples, capacity_pair=capacity_pair)
     errors = list(plateau["errors"])
+    final_liveness = samples[-1].get("python_liveness", {})
+    for field in ("weakrefs_alive", "code_weakrefs_alive"):
+        if int(final_liveness.get(field, 0)) != 0:
+            errors.append(f"final Python liveness {field} is non-zero")
+    if scenario == "C6":
+        baseline_generators = samples[0]["python_liveness"].get(
+            "jit_generator_gc_objects"
+        )
+        final_generators = final_liveness.get("jit_generator_gc_objects")
+        if final_generators != baseline_generators:
+            errors.append(
+                "generator GC census did not return to baseline: "
+                f"{baseline_generators}->{final_generators}"
+            )
     machine_entries = after_entries - before_entries
     if machine_entries <= 0:
         errors.append("scenario has no machine-code entry proof")

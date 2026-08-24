@@ -26,7 +26,6 @@ GAUGE_PATHS = (
     "jit.code_runtimes_live",
     "module.registered_compilation_units",
     "module.perf_trampoline_worklist",
-    "module.code_allocator_used_bytes",
     "runtime.resident_code_buffers",
     "runtime.resident_code_extra_blocks",
     "observer.watched_codes",
@@ -34,6 +33,7 @@ GAUGE_PATHS = (
 
 CAPACITY_PATHS = (
     "jit.code_runtimes_allocated",
+    "module.code_allocator_used_bytes",
     "observer.keyed_slots",
     "observer.table_capacity",
 )

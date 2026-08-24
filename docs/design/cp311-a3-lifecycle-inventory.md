@@ -117,7 +117,7 @@ Schema: `cp311-jit-a3-lifecycle-v1`.
 | `module.registered_compilation_units` | gauge | borrowed pending units |
 | `module.perf_trampoline_worklist` | gauge | borrowed prefork functions |
 | `module.unit_deletion_tracking_failed` | invariant boolean | must remain false |
-| `module.code_allocator_used_bytes` | gauge | live executable bytes |
+| `module.code_allocator_used_bytes` | capacity/high-water | `CodeAllocatorCinder::releaseCode()` is intentionally a no-op; bytes are reclaimed only with allocator teardown |
 | `runtime.resident_code_buffers` | gauge | physical live code buffers |
 | `runtime.resident_code_extra_blocks` | gauge | live CodeExtra blocks |
 | `runtime.compiled_function_creations` | cumulative | artifact creation proof |

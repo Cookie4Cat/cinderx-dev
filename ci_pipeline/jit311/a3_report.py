@@ -71,20 +71,51 @@ def classify_blockers(c_results: dict, ownership: dict | None, finalize: dict | 
     for scenario, result in sorted(c_results.items()):
         if result.get("result") == "PASS":
             continue
-        _add_blocker(groups, PRIMARY_CLUSTERS[scenario], scenario, result)
         paths = set(result.get("plateau", {}).get("gauge_drift", {}))
         errors = " ".join(result.get("errors", []))
-        if any(path.startswith("observer.") for path in paths) or "observer." in errors:
+        matched = False
+        if any(path.startswith("observer.") for path in paths) or any(
+            token in errors
+            for token in ("observer.", "resident_code_extra_blocks")
+        ):
             _add_blocker(groups, "B2 code-extra / observer tombstone", scenario, result)
+            matched = True
         if any(
             path.startswith(("module.code_allocator", "runtime.resident_code"))
             for path in paths
+        ) or any(
+            token in errors
+            for token in (
+                "module.code_allocator_used_bytes",
+                "runtime.resident_code_buffers",
+                "jit.code_runtimes_allocated",
+                "jit.code_runtimes_live",
+            )
         ):
             _add_blocker(groups, "B7 code buffer residency", scenario, result)
+            matched = True
+        primary_signals = {
+            "C1": ("weakrefs_alive", "jit.watched_functions", "I3 "),
+            "C2": ("observer.", "resident_code_extra_blocks"),
+            "C3": ("jit.artifact_members", "jit.associated_functions", "I2 "),
+            "C4": ("jit.parked_functions", "I3 parked"),
+            "C5": ("jit.artifact_members", "jit.associated_functions", "I7 "),
+            "C6": ("generator", "jit_generator_gc_objects"),
+            "C7": ("deferred_anchor", "active_compiles", "completed_compiles"),
+            "C8": ("registered_compilation_units", "completed_compiles"),
+        }
+        if any(signal in errors for signal in primary_signals[scenario]):
+            _add_blocker(groups, PRIMARY_CLUSTERS[scenario], scenario, result)
+            matched = True
+        if not matched:
+            _add_blocker(groups, PRIMARY_CLUSTERS[scenario], scenario, result)
     if ownership and ownership.get("result") != "PASS":
         _add_blocker(groups, "B10 refcount/native memory safety", "O3", ownership)
     if finalize and finalize.get("result") != "PASS":
         _add_blocker(groups, "B9 finalize/shutdown", "F", finalize)
+        failed_states = {row.get("state") for row in finalize.get("failures", [])}
+        if "multithread-completed" in failed_states:
+            _add_blocker(groups, "B8 multithread compile lifetime", "F", finalize)
     return [groups[key] for key in sorted(groups)]
 
 
