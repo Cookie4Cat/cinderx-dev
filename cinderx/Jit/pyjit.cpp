@@ -2938,6 +2938,76 @@ PyObject* jit311_lifecycle_invariants(
   return result.release();
 }
 
+PyObject* jit311_compile_with_publish_failure(
+    PyObject* /* self */, PyObject* args) {
+  PyObject* func_obj;
+  int step;
+  if (!PyArg_ParseTuple(
+          args,
+          "Oi:_jit311_compile_with_publish_failure",
+          &func_obj,
+          &step)) {
+    return nullptr;
+  }
+  BorrowedRef<PyFunctionObject> func = get_func_arg(
+      "_jit311_compile_with_publish_failure", func_obj);
+  if (func == nullptr) {
+    return nullptr;
+  }
+  if (step < 1 || step > 7) {
+    PyErr_SetString(PyExc_ValueError, "publish failure step must be 1..7");
+    return nullptr;
+  }
+  if (!isJitUsable() || isJitCompiled(func)) {
+    PyErr_SetString(
+        PyExc_RuntimeError,
+        "fault publication requires an enabled JIT and an uncompiled function");
+    return nullptr;
+  }
+
+  std::unique_ptr<hir::Preloader> preloader(
+      hir::Preloader::make(func, makeFrameReifier(func->func_code)));
+  if (preloader == nullptr) {
+    return nullptr;
+  }
+
+  Result result;
+  failJitPublishStepForTest(step);
+  try {
+    // Call the publication layer directly.  compileFunction() deliberately
+    // JIT_CHECKs on PYTHON_EXCEPTION, which is the right production contract
+    // but would turn an intentional allocation-failure probe into SIGABRT.
+    result = compilePreloader(*preloader, func);
+  } catch (const std::exception& exn) {
+    failJitPublishStepForTest(0);
+    setRuntimeError(exn);
+    return nullptr;
+  }
+  failJitPublishStepForTest(0);
+
+  bool memory_error = result == Result::PYTHON_EXCEPTION &&
+      PyErr_Occurred() && PyErr_ExceptionMatches(PyExc_MemoryError);
+  PyErr_Clear();
+  if (!memory_error) {
+    PyErr_Format(
+        PyExc_RuntimeError,
+        "publish failure step %d returned result %d instead of MemoryError",
+        step,
+        static_cast<int>(result));
+    return nullptr;
+  }
+  Py_RETURN_TRUE;
+}
+
+PyObject* jit311_register_for_compile(PyObject* /* self */, PyObject* arg) {
+  BorrowedRef<PyFunctionObject> func =
+      get_func_arg("_jit311_register_for_compile", arg);
+  if (func == nullptr) {
+    return nullptr;
+  }
+  return PyBool_FromLong(registerFunction(func));
+}
+
 PyObject* jit311_execute_surface(PyObject* /* self */, PyObject* /* arg */) {
   Ref<> result = Ref<>::steal(PyList_New(0));
   if (result == nullptr) {
@@ -4995,6 +5065,22 @@ PyMethodDef jit_methods_311_canary[] = {
      jit311_lifecycle_invariants,
      METH_NOARGS,
      PyDoc_STR("Check private CPython 3.11 JIT ownership invariants.")},
+    {"_jit311_compile_with_publish_failure",
+     jit311_compile_with_publish_failure,
+     METH_VARARGS,
+     PyDoc_STR("Run one private CPython 3.11 failed-publication transaction.")},
+    {"_jit311_register_for_compile",
+     jit311_register_for_compile,
+     METH_O,
+     PyDoc_STR("Register a function for private A3 batch-compile testing.")},
+    {"_jit311_multithreaded_compile_test",
+     multithreaded_compile_test,
+     METH_NOARGS,
+     PyDoc_STR("Run the private A3 multithreaded compile test.")},
+    {"_jit311_multithreaded_compile_test_enabled",
+     is_multithreaded_compile_test_enabled,
+     METH_NOARGS,
+     PyDoc_STR("Return whether private A3 multithreaded compile is enabled.")},
     {"_jit311_execute_surface",
      jit311_execute_surface,
      METH_NOARGS,
