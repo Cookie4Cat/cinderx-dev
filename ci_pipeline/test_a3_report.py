@@ -88,3 +88,19 @@ def test_observer_keyed_slots_allow_bounded_tombstone_jitter_only():
     result = judge_plateau([baseline, left, linear, final])
     assert result["result"] == "FAIL"
     assert "observer.keyed_slots" in result["errors"][0]
+
+
+def test_multithread_shutdown_crash_is_both_lifetime_and_finalize_blocker():
+    finalize = {
+        "result": "FAIL",
+        "failures": [
+            {
+                "state": "multithread-completed",
+                "returncode": -11,
+                "errors": ["exit code -11"],
+            }
+        ],
+    }
+    blockers = classify_blockers({}, None, finalize)
+    assert [blocker["id"] for blocker in blockers] == ["B8", "B9"]
+    assert all(blocker["errors"] == ["exit code -11"] for blocker in blockers)

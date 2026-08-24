@@ -61,9 +61,20 @@ def _add_blocker(groups: dict, cluster: str, scenario: str, result: dict) -> Non
     )
     if scenario not in group["scenarios"]:
         group["scenarios"].append(scenario)
-    group["errors"].extend(error for error in result.get("errors", []) if error not in group["errors"])
+    result_errors = list(result.get("errors", []))
+    if not result_errors:
+        result_errors.extend(
+            error
+            for failure in result.get("failures", [])
+            for error in failure.get("errors", [])
+        )
+    group["errors"].extend(
+        error for error in result_errors if error not in group["errors"]
+    )
     if result.get("samples"):
         group["evidence"][scenario] = [_compact_sample(sample) for sample in result["samples"]]
+    elif result.get("failures"):
+        group["evidence"][scenario] = result["failures"]
 
 
 def classify_blockers(c_results: dict, ownership: dict | None, finalize: dict | None) -> list[dict]:
