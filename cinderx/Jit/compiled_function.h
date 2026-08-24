@@ -260,6 +260,11 @@ class CompiledFunction {
 #endif
 
  private:
+#if PY_VERSION_HEX < 0x030C0000
+  // Whether data_.runtime still points at live storage; see the definition.
+  bool runtimeStorageAlive() const;
+#endif
+
   explicit CompiledFunction(CompiledFunctionData&& data)
       : data_(std::move(data)) {}
 

@@ -396,11 +396,44 @@ void CompiledFunction::removeFunction(BorrowedRef<PyFunctionObject> func) {
   functions_.erase(func.get());
 }
 
+#if PY_VERSION_HEX < 0x030C0000
+// Whether the runtime this artifact points at is still backed by live
+// storage.  A retired or orphaned artifact has no owner link, sits in no
+// registry, and can outlive its context inside a module cycle collected at
+// interpreter exit; the context's destructor already released the
+// runtime's owned references (its release walk covers every arena slot)
+// and freed the slab storage, so the first GC hook to run afterwards must
+// sever the pointer without touching it.  With a live owner the storage
+// lives at least as long as the artifact; without one, the module context
+// answers -- and only for slots it actually owns.
+bool CompiledFunction::runtimeStorageAlive() const {
+  if (data_.runtime == nullptr) {
+    return false;
+  }
+  if (owner_ != nullptr) {
+    return true;
+  }
+  cinderx::ModuleState* mod_state = cinderx::getModuleState();
+  if (mod_state == nullptr) {
+    return false;
+  }
+  jit::IJitContext* ctx = mod_state->jit_context.get();
+  return ctx != nullptr && ctx->ownsCodeRuntime(data_.runtime);
+}
+#endif
+
 int CompiledFunction::traverse(visitproc visit, void* arg) {
   // Don't traverse functions_ - these are borrowed references that we don't
   // own. The functions are responsible for removing themselves via
   // funcDestroyed() when they are deallocated. Not traversing them allows
   // functions to be garbage collected independently of this CompiledFunction.
+
+#if PY_VERSION_HEX < 0x030C0000
+  if (data_.runtime != nullptr && !runtimeStorageAlive()) {
+    data_.runtime = nullptr;
+    return 0;
+  }
+#endif
 
   // Traverse all references held by the CodeRuntime.
   if (data_.runtime != nullptr) {
@@ -479,6 +512,15 @@ void CompiledFunction::clear(bool context_finalizing) {
 
     owner_ = nullptr;
   }
+
+#if PY_VERSION_HEX < 0x030C0000
+  // See runtimeStorageAlive(): after the owning context died, the runtime's
+  // references were already released by the context's own walk and the
+  // storage is gone -- sever without touching.
+  if (data_.runtime != nullptr && !runtimeStorageAlive()) {
+    data_.runtime = nullptr;
+  }
+#endif
 
   // Clear all references held by the CodeRuntime.
   if (data_.runtime != nullptr) {
