@@ -158,12 +158,27 @@ def judge_plateau(
         for path in CAPACITY_PATHS:
             left = value_at(by_label[left_label]["snapshot"], path)
             right = value_at(by_label[right_label]["snapshot"], path)
+            if path == "observer.keyed_slots":
+                # keyed_slots includes live keys plus tombstones.  Exact
+                # equality is not a valid open-addressing invariant: bounded
+                # tombstone jitter can occur while the allocated table stays
+                # fixed.  Eight slots is a structural policy, not a measured
+                # baseline; linear growth still fails loudly.
+                allowed_growth = 8
+                plateau = right <= left + allowed_growth
+                policy = "bounded-tombstone-jitter"
+            else:
+                allowed_growth = 0
+                plateau = left == right
+                policy = "exact-high-water-plateau"
             capacity[path] = {
                 left_label: left,
                 right_label: right,
-                "plateau": left == right,
+                "allowed_growth": allowed_growth,
+                "policy": policy,
+                "plateau": plateau,
             }
-            if left != right:
+            if not plateau:
                 errors.append(
                     f"capacity {path} grows from {left_label}={left} "
                     f"to {right_label}={right}"

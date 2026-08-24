@@ -1,4 +1,4 @@
-from ci_pipeline.jit311.a3_census import BOOLEAN_PATHS, REQUIRED_PATHS
+from ci_pipeline.jit311.a3_census import BOOLEAN_PATHS, REQUIRED_PATHS, judge_plateau
 from ci_pipeline.jit311.a3_report import classify_blockers, judge
 
 
@@ -76,3 +76,15 @@ def test_function_liveness_signal_stays_in_function_watch_cluster():
 def test_refcount_failure_is_not_an_approved_deviation():
     blockers = classify_blockers({}, {"result": "FAIL", "errors": ["drift"]}, None)
     assert blockers[0]["id"] == "B10"
+
+
+def test_observer_keyed_slots_allow_bounded_tombstone_jitter_only():
+    baseline = _sample("baseline", _snapshot())
+    final = _sample("after_gc_2", _snapshot())
+    left = _sample("after_100", _snapshot(observer__keyed_slots=100))
+    bounded = _sample("after_1000", _snapshot(observer__keyed_slots=108))
+    assert judge_plateau([baseline, left, bounded, final])["result"] == "PASS"
+    linear = _sample("after_1000", _snapshot(observer__keyed_slots=109))
+    result = judge_plateau([baseline, left, linear, final])
+    assert result["result"] == "FAIL"
+    assert "observer.keyed_slots" in result["errors"][0]
