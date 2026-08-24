@@ -310,6 +310,23 @@ class A3Runner:
 
 
 def main(argv: list[str] | None = None) -> int:
+    # --profile core delegates to the simplified-plan v1.1 acceptance
+    # profile with its own argument surface (--case/--asan-build/
+    # --penetration-hook/--hook-base); --profile full stays here.
+    argv = list(sys.argv[1:] if argv is None else argv)
+    if "--profile" in argv:
+        index = argv.index("--profile")
+        profile = argv[index + 1] if index + 1 < len(argv) else ""
+        remainder = argv[:index] + argv[index + 2 :]
+        if profile == "core":
+            from ci_pipeline.jit311.a3_core import main as core_main
+
+            return core_main(remainder)
+        if profile != "full":
+            print(f"unknown --profile {profile!r}", file=sys.stderr)
+            return 2
+        argv = remainder
+
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--wheel", type=Path, required=True)
     parser.add_argument("--source", type=Path, required=True)

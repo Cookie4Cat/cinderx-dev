@@ -36,6 +36,18 @@ QUICK_CHECKPOINTS = {
     "C8": (1, 4),
 }
 
+# The A3-Core profile (simplified plan v1.1): L1/L2 at 100 cycles, the
+# observer smoke at 1000 codes, park/die/re-enable at 100 rounds and a
+# 10-round multithread batch.  Full-scale endurance stays on the full
+# profile.
+CORE_CHECKPOINTS = {
+    "C1": (1, 10, 100),
+    "C2": (100, 1000),
+    "C4": (1, 10, 100),
+    "C5": (1, 10, 100),
+    "C8": (1, 10),
+}
+
 ACTIVE_CHECKPOINTS = CHECKPOINTS
 
 
@@ -166,6 +178,11 @@ def scenario_c1(_cinderx, cinderjit):
         except TypeError:
             pass
         _compile_and_enter(cinderjit, function, (3, 5, 1), expected)
+        if index == 1:
+            # Non-vacuity evidence (v1.1 §10): sample while the population
+            # is alive, so the final return-to-baseline provably describes
+            # a rise and fall rather than a scenario that never populated.
+            samples.append(_collect_sample(cinderjit, "live_1", refs))
         del function, namespace
         if index in checkpoints:
             samples.append(
@@ -209,6 +226,11 @@ def scenario_c2(_cinderx, cinderjit):
             raise AssertionError("C2 semantic failure")
         if _cinderx._get_trigger_stats()["machine_code_entries"] <= before:
             raise AssertionError("C2 code object did not enter machine code")
+        if index == 1:
+            # Non-vacuity evidence (v1.1 §10): the observer population must
+            # be seen alive before the smoke's return-to-baseline means
+            # anything.
+            samples.append(_collect_sample(cinderjit, "live_1", refs))
         del function, namespace
         if index in checkpoints:
             samples.append(
@@ -502,9 +524,20 @@ SCENARIOS = {
 }
 
 
-def run(scenario: str, *, quick: bool = False) -> dict:
+SCALES = {
+    "full": CHECKPOINTS,
+    "quick": QUICK_CHECKPOINTS,
+    "core": CORE_CHECKPOINTS,
+}
+
+
+def run(scenario: str, *, quick: bool = False, scale: str | None = None) -> dict:
     global ACTIVE_CHECKPOINTS
-    ACTIVE_CHECKPOINTS = QUICK_CHECKPOINTS if quick else CHECKPOINTS
+    if scale is None:
+        scale = "quick" if quick else "full"
+    if scenario not in SCALES[scale]:
+        raise ValueError(f"scenario {scenario} has no {scale} scale")
+    ACTIVE_CHECKPOINTS = SCALES[scale]
     _cinderx, cinderjit = _initialize()
     _suppress_harness()
     before_entries = _cinderx._get_trigger_stats()["machine_code_entries"]
@@ -538,7 +571,7 @@ def run(scenario: str, *, quick: bool = False) -> dict:
         "scenario": scenario,
         "result": "PASS" if not errors else "FAIL",
         "cycles": list(cycles),
-        "quick": quick,
+        "scale": scale,
         "machine_code_entries": machine_entries,
         "samples": samples,
         "plateau": plateau,
@@ -557,9 +590,14 @@ def main(argv: list[str] | None = None) -> int:
         action="store_true",
         help="use a tiny developer-only scale; official discovery never sets this",
     )
+    parser.add_argument(
+        "--scale",
+        choices=sorted(SCALES),
+        help="checkpoint scale; 'core' is the A3-Core profile, overriding --quick",
+    )
     args = parser.parse_args(argv)
     try:
-        result = run(args.scenario, quick=args.quick)
+        result = run(args.scenario, quick=args.quick, scale=args.scale)
     except BaseException as exc:
         result = {
             "scenario": args.scenario,
