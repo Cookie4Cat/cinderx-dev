@@ -26,9 +26,9 @@ PyObject* _Py_HOT_FUNCTION Ci_EvalFrameDefault_311(
 // with an exception set.
 int Ci_EvalFrameHandlePending_311(PyThreadState* tstate);
 
-// The last admitted compiled Python frame keeps one CPython recursion
-// headroom slot available for generic C helpers. Any nested Python frame must
-// still fail at the logical recursion boundary after its arguments are bound.
+// The last admitted compiled Python frame records a CinderX-owned logical
+// boundary without borrowing CPython's overflow-recovery headroom. Any nested
+// Python frame fails at that logical boundary after its arguments are bound.
 int Ci_JitRecursionBoundary311_IsActive(void);
 void Ci_JitRecursionBoundary311_Enter(void);
 void Ci_JitRecursionBoundary311_Leave(void);

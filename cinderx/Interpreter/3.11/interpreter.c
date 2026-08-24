@@ -34,12 +34,10 @@ void Ci_JitRecursionBoundary311_Leave(void) {
 
 int Ci_JitRecursionBoundary311_Refuse(PyThreadState* tstate) {
   assert(ci_jit_recursion_boundary_active == 1);
-  assert(tstate->recursion_headroom > 0);
-  // Temporarily remove the helper headroom so CPython's own recursion check
-  // constructs the canonical RecursionError and restores the counter.
-  tstate->recursion_headroom--;
+  assert(tstate->recursion_headroom == 0);
+  // The logical JIT boundary does not borrow CPython's overflow-recovery
+  // headroom. Let CPython's own check construct the canonical RecursionError.
   int rc = _Py_EnterRecursiveCallTstate(tstate, "");
-  tstate->recursion_headroom++;
   if (rc == 0) {
     _Py_LeaveRecursiveCallTstate(tstate);
     PyErr_SetString(PyExc_RecursionError, "maximum recursion depth exceeded");

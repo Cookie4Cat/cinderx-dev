@@ -303,9 +303,8 @@ class RecursiveCallAfterBind {
       entered_ = true;
       t_jit_recursion_entries++;
       if (tstate->recursion_remaining == 0) {
-        tstate->recursion_headroom++;
         Ci_JitRecursionBoundary311_Enter();
-        boundary_headroom_ = true;
+        boundary_active_ = true;
       }
       return;
     }
@@ -326,9 +325,8 @@ class RecursiveCallAfterBind {
       t_prelinked_recursion_frame = nullptr;
       JITRT_UnlinkFrame(tstate);
     }
-    if (boundary_headroom_ && Ci_JitRecursionBoundary311_IsActive()) {
+    if (boundary_active_ && Ci_JitRecursionBoundary311_IsActive()) {
       Ci_JitRecursionBoundary311_Leave();
-      PyThreadState_GET()->recursion_headroom--;
     }
     if (entered_ && t_jit_recursion_entries == entries_before_ + 1) {
       t_jit_recursion_entries--;
@@ -349,7 +347,7 @@ class RecursiveCallAfterBind {
 
  private:
   bool entered_{false};
-  bool boundary_headroom_{false};
+  bool boundary_active_{false};
   int entries_before_;
 };
 
@@ -359,7 +357,6 @@ void JITRT_TransferRecursionToInterpreter311() {
   }
   if (Ci_JitRecursionBoundary311_IsActive()) {
     Ci_JitRecursionBoundary311_Leave();
-    PyThreadState_GET()->recursion_headroom--;
   }
   t_jit_recursion_entries--;
   _Py_LeaveRecursiveCallTstate(PyThreadState_GET());
@@ -2760,8 +2757,32 @@ DEFINE_FAST_COMPACT_LONG_COMPARE_BOOL(GreaterThanEqual, >=, Py_GE)
 #undef DEFINE_FAST_COMPACT_LONG_COMPARE_BOOL
 #endif
 
+PyObject* JITRT_RichCompare(PyObject* v, PyObject* w, int op) {
+#if PY_VERSION_HEX < 0x030C0000
+  // Stock 3.11's warmed exact-int COMPARE_OP does not enter Python
+  // recursion. The generic JIT helper does, so at the last admitted JIT
+  // frame it would raise before the recursive CALL and move the traceback
+  // cursor. Borrow CPython recovery headroom only around this exact-builtin
+  // operation; user-defined comparison slots never receive it.
+  PyThreadState* tstate = PyThreadState_GET();
+  bool exact_long_boundary = Ci_JitRecursionBoundary311_IsActive() &&
+      tstate->recursion_headroom == 0 && PyLong_CheckExact(v) &&
+      PyLong_CheckExact(w);
+  if (exact_long_boundary) {
+    tstate->recursion_headroom++;
+  }
+#endif
+  PyObject* result = PyObject_RichCompare(v, w, op);
+#if PY_VERSION_HEX < 0x030C0000
+  if (exact_long_boundary) {
+    tstate->recursion_headroom--;
+  }
+#endif
+  return result;
+}
+
 static int JITRT_RichCompareBoolGeneric(PyObject* v, PyObject* w, int op) {
-  Ref<> res = Ref<>::steal(PyObject_RichCompare(v, w, op));
+  Ref<> res = Ref<>::steal(JITRT_RichCompare(v, w, op));
 
   if (res == nullptr) {
     return -1;

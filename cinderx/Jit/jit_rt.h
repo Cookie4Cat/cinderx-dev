@@ -559,6 +559,8 @@ int JITRT_NotContainsBool(PyObject* w, PyObject* v);
    Unlike PyObject_RichCompareBool this doesn't perform an object equality
    check, which is incompatible w/ float comparisons. */
 
+PyObject* JITRT_RichCompare(PyObject* v, PyObject* w, int op);
+
 #if CINDERX_JIT_COMPACT_LONG_COMPARE_BOOL_FASTPATH
 int JITRT_FastPyObjectRichCompareBoolLessThan(PyObject* v, PyObject* w);
 int JITRT_FastPyObjectRichCompareBoolLessThanEqual(PyObject* v, PyObject* w);
