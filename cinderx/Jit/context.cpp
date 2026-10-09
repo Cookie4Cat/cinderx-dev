@@ -568,7 +568,24 @@ void Context::addDeferredFinalization(
       ThreadedRef<PyFunctionObject>::create(func), compiled);
 }
 
+void Context::deferCodeRuntimeRelease(CodeRuntime* runtime) {
+  ThreadedCompileSerialize guard;
+  deferred_release_runtimes_.push_back(runtime);
+}
+
 void Context::finalizeMultiThreadedCompile() {
+  // Runs on the main thread with the GIL held, after the workers joined.
+  // Release the runtimes the workers handed over: dropping their references
+  // decrements refcounts of objects shared between workers, which is only
+  // safe here.
+  for (CodeRuntime* runtime : deferred_release_runtimes_) {
+    runtime->releaseReferences();
+#if PY_VERSION_HEX < 0x030C0000
+    recycleCodeRuntime(runtime);
+#endif
+  }
+  deferred_release_runtimes_.clear();
+
   fixupFunctionEntryCachePostMultiThreadedCompile();
   watchPendingTypes();
 

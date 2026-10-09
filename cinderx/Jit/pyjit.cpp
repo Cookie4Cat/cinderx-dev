@@ -25,6 +25,7 @@
 #include "cinderx/Jit/code_allocator.h"
 #include "cinderx/Jit/codegen/arch/detection.h"
 #include "cinderx/Jit/codegen/tls.h"
+#include "cinderx/Jit/compile_budget.h"
 #include "cinderx/Jit/compiled_function.h"
 #include "cinderx/Jit/compiler.h"
 #include "cinderx/Jit/config.h"
@@ -1412,6 +1413,22 @@ FlagProcessor initFlagProcessor() {
       "Set the maximum code size for JIT in bytes (no suffix). For kilobytes "
       "use k or K as a suffix. "
       "Megabytes is m or M and gigabytes is g or G. 0 implies no limit.");
+
+  flag_processor.addOption(
+      "jit-max-lir-blocks",
+      "PYTHONJITMAXLIRBLOCKS",
+      getMutableConfig().max_lir_blocks,
+      "Set the maximum number of LIR basic blocks in a compiled function. "
+      "Larger functions are not compiled. Unlike jit-max-code-size, 0 is not "
+      "special: it rejects every function.");
+
+  flag_processor.addOption(
+      "jit-max-lir-instrs",
+      "PYTHONJITMAXLIRINSTRS",
+      getMutableConfig().max_lir_instrs,
+      "Set the maximum number of LIR instructions in a compiled function. "
+      "Larger functions are not compiled. Unlike jit-max-code-size, 0 is not "
+      "special: it rejects every function.");
 
   flag_processor.addOption(
       "jit-emit-type-annotation-guards",
@@ -3233,6 +3250,13 @@ PyObject* force_compile(PyObject* /* self */, PyObject* arg) {
   if (Ci_InitFrameEvalFunc() < 0) {
     return nullptr;
   }
+
+#if PY_VERSION_HEX < 0x030C0000
+  // force_compile() reports through its return value and exceptions, never
+  // through the refusal slot: consume whatever this request recorded, on every
+  // exit, so it cannot be read as the reason of a later, unrelated compile.
+  SCOPE_EXIT(Ci_JitShell311_TakeExecuteRefusal());
+#endif
 
   // Compile the function.
   Result result;
@@ -6589,6 +6613,13 @@ Result compileFunction(
     BorrowedRef<PyFunctionObject> func,
     BorrowedRef<PyCodeObject> expected_code) {
   FreeThreadedJITEntrypointGuard guard;
+#if PY_VERSION_HEX < 0x030C0000
+  // A refusal reason belongs to the request that recorded it.  Drop any reason
+  // an earlier request left behind, so that whoever reads the reason after
+  // this call -- even on an early return below -- only ever sees one this
+  // request produced.
+  Ci_JitShell311_TakeExecuteRefusal();
+#endif
   if (!isJitInitialized()) {
     return Result::NOT_INITIALIZED;
   }
@@ -6965,8 +6996,13 @@ Result compilePreloaderImpl(
   }
 
   std::optional<CompiledFunctionData> compiled_func;
+  [[maybe_unused]] bool over_budget = false;
   try {
     compiled_func = jit_ctx->compiler().Compile(preloader);
+  } catch (const CompileBudgetExceeded& exn) {
+    // The function is too large to be worth compiling; it stays interpreted.
+    JIT_DLOG("{}", exn.what());
+    over_budget = true;
   } catch (const std::exception& exn) {
     JIT_DLOG("{}", exn.what());
   }
@@ -6974,6 +7010,14 @@ Result compilePreloaderImpl(
   ThreadedCompileSerialize guard;
   jit_ctx->removeActiveCompile(key);
   if (!compiled_func.has_value()) {
+#if PY_VERSION_HEX < 0x030C0000
+    if (over_budget) {
+      // The refusal reason was recorded where the budget was checked; report
+      // it as a refusal (not as a compiler failure) so that
+      // _jit311_compile_diagnostic() and the scheduling gate name it.
+      return Result::CANNOT_SPECIALIZE;
+    }
+#endif
     return Result::UNKNOWN_ERROR;
   }
 

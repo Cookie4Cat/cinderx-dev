@@ -1047,6 +1047,25 @@ BB %10 - preds: %0 %7 - section: hot
       parsed_func->basicblocks()[2]->section(), codegen::CodeSection::kHot);
 }
 
+TEST(LIRParserTest, FunctionSizeCounts) {
+  // The size budget counts blocks and instructions across the whole function.
+  const std::string source =
+      "Function:\nBB %0\n"
+      "    %1:64bit = Move 1(0x1):64bit\n"
+      "    CondBranch %1:64bit, BB%2, BB%3\n"
+      "\n"
+      "BB %2 - preds: %0 - succs: %3\n"
+      "    Return %1:64bit\n"
+      "\n"
+      "BB %3 - preds: %0 %2\n"
+      "    Return %1:64bit\n";
+  Parser parser;
+  auto function = parser.parse(source);
+  ASSERT_NE(function, nullptr);
+  EXPECT_EQ(function->getNumBasicBlocks(), 3);
+  EXPECT_EQ(function->getNumInstrs(), 4);
+}
+
 template <typename... Args>
 std::string formatMemoryIndirect(Args&&... args) {
   jit::lir::MemoryIndirect im(nullptr);

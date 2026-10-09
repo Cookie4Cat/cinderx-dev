@@ -21,6 +21,7 @@
 #include "cinderx/Jit/codegen/autogen.h"
 #include "cinderx/Jit/codegen/code_section.h"
 #include "cinderx/Jit/codegen/gen_asm_utils.h"
+#include "cinderx/Jit/compile_budget.h"
 #include "cinderx/Jit/compiled_function.h"
 #include "cinderx/Jit/config.h"
 #include "cinderx/Jit/context.h"
@@ -43,6 +44,7 @@
 #include "cinderx/Jit/lir/verify.h"
 #include "cinderx/Jit/perf_jitdump.h"
 #include "cinderx/Jit/pyjit.h"
+#include "cinderx/Jit/threaded_compile.h"
 #include "cinderx/Jit/trigger_stats.h"
 #include "cinderx/UpstreamBorrow/borrowed.h"
 
@@ -162,6 +164,38 @@ void restoreSyntheticResumeCallEvents(PyThreadState* tstate) {
 
 // Scratch register used by the various deopt trampolines.
 [[maybe_unused]] const auto deopt_scratch_reg = arch::reg_scratch_deopt;
+
+// Raise an exception if an LIR function exceeds a reasonable size.
+void checkLirSize(const lir::Function& func) {
+  auto name = [&] {
+    auto hir_func = func.hirFunc();
+    return hir_func != nullptr ? hir_func->fullname : "<unknown func>";
+  };
+
+  auto num_blocks = func.getNumBasicBlocks();
+  auto max_blocks = getConfig().max_lir_blocks;
+  if (num_blocks > max_blocks) {
+    throwCompileBudgetExceeded(
+        kRefuseLirSizeLimit,
+        fmt::format(
+            "LIR function '{}' has too many basic blocks ({}, max={})",
+            name(),
+            num_blocks,
+            max_blocks));
+  }
+
+  auto num_instrs = func.getNumInstrs();
+  auto max_instrs = getConfig().max_lir_instrs;
+  if (num_instrs > max_instrs) {
+    throwCompileBudgetExceeded(
+        kRefuseLirSizeLimit,
+        fmt::format(
+            "LIR function '{}' has too many instructions ({}, max={})",
+            name(),
+            num_instrs,
+            max_instrs));
+  }
+}
 
 void raiseUnboundLocalError(BorrowedRef<> name) {
   // name is converted into a `char*` in format_exc_check_arg
@@ -1071,6 +1105,30 @@ void* NativeGenerator::compile(bool shadow) {
       GetFunction()->compilation_phase_timer,
       "Lowering into LIR",
       lir_func = lirgen.TranslateFunction())
+  try {
+    checkLirSize(*lir_func);
+  } catch (const CompileBudgetExceeded&) {
+    // The CodeRuntime was allocated before the LIR existed, and no artifact
+    // will ever adopt it, so nothing else would release the references it
+    // holds.  Give it back the way an artifact does when it dies.  A shadow
+    // compile owns its CodeRuntime and is cleaned up by the scope exit above.
+    if (!shadow && env_.code_rt != nullptr) {
+      if (getThreadedCompileContext().compileRunning()) {
+        // A compile worker must not drop the references itself: the
+        // decrements touch objects shared with the other workers.  Hand the
+        // runtime to the context, which releases it on the main thread once
+        // the workers have joined.
+        env_.ctx->deferCodeRuntimeRelease(env_.code_rt);
+      } else {
+        env_.code_rt->releaseReferences();
+#if PY_VERSION_HEX < 0x030C0000
+        env_.ctx->recycleCodeRuntime(env_.code_rt);
+#endif
+      }
+      env_.code_rt = nullptr;
+    }
+    throw;
+  }
 
   JIT_LOGIF(
       getConfig().log.dump_lir,

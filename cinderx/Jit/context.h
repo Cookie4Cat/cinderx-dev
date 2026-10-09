@@ -591,6 +591,13 @@ class Context : public IJitContext, public CompiledFunctionOwner {
       BorrowedRef<PyFunctionObject> func,
       BorrowedRef<CompiledFunction> compiled);
 
+  // Defers the release of a CodeRuntime whose compilation was abandoned by
+  // a worker thread (e.g. an over-budget function).  Dropping the runtime's
+  // references decrements refcounts of objects shared between workers, so a
+  // worker must not do it itself; finalizeMultiThreadedCompile performs the
+  // release on the main thread, which holds the GIL.
+  void deferCodeRuntimeRelease(CodeRuntime* runtime);
+
   void finalizeMultiThreadedCompile();
 
   // Notifies that a compilation is complete. If we're not in multi-threaded
@@ -790,6 +797,13 @@ class Context : public IJitContext, public CompiledFunctionOwner {
   std::vector<
       std::pair<ThreadedRef<PyFunctionObject>, BorrowedRef<CompiledFunction>>>
       deferred_finalizations_;
+
+  /*
+   * CodeRuntimes abandoned by compile workers (over-budget functions).
+   * Their references are released on the main thread by
+   * finalizeMultiThreadedCompile, after the workers have joined.
+   */
+  std::vector<CodeRuntime*> deferred_release_runtimes_;
 
   /*
    * Code which is being kept alive in case it was in use when
