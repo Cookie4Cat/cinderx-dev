@@ -492,6 +492,7 @@ const Builtins& Context::builtins() {
 }
 
 void Context::unwatch(TypeDeoptPatcher* patcher) {
+  ThreadedCompileSerialize guard;
   type_deopt_patchers_[patcher->type()].erase(patcher);
 }
 
