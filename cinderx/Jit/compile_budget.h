@@ -16,8 +16,10 @@ extern "C" void Ci_JitShell311_SetExecuteRefusal(const char* reason);
 namespace jit {
 
 // Stable names of the CPython 3.11 refusal reasons for a function that exceeds
-// the per-function size budgets (jit-max-lir-*).  They are registered in
-// Interpreter/3.11/bytecode_support.toml.
+// the per-function size budgets (jit-max-hir-* and jit-max-lir-*).  They are
+// registered in Interpreter/3.11/bytecode_support.toml.
+inline constexpr const char* kRefuseHirSizeLimit =
+    "REFUSE_SHAPE_HIR_SIZE_LIMIT";
 inline constexpr const char* kRefuseLirSizeLimit =
     "REFUSE_SHAPE_LIR_SIZE_LIMIT";
 

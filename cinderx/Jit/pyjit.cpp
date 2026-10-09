@@ -1415,6 +1415,22 @@ FlagProcessor initFlagProcessor() {
       "Megabytes is m or M and gigabytes is g or G. 0 implies no limit.");
 
   flag_processor.addOption(
+      "jit-max-hir-blocks",
+      "PYTHONJITMAXHIRBLOCKS",
+      getMutableConfig().max_hir_blocks,
+      "Set the maximum number of HIR basic blocks in a function when it "
+      "starts to be compiled. Larger functions are not compiled. Unlike "
+      "jit-max-code-size, 0 is not special: it rejects every function.");
+
+  flag_processor.addOption(
+      "jit-max-hir-instrs",
+      "PYTHONJITMAXHIRINSTRS",
+      getMutableConfig().max_hir_instrs,
+      "Set the maximum number of HIR instructions in a function when it "
+      "starts to be compiled. Larger functions are not compiled. Unlike "
+      "jit-max-code-size, 0 is not special: it rejects every function.");
+
+  flag_processor.addOption(
       "jit-max-lir-blocks",
       "PYTHONJITMAXLIRBLOCKS",
       getMutableConfig().max_lir_blocks,

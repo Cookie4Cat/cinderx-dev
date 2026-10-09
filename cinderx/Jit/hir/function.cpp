@@ -35,6 +35,14 @@ void Function::setCode(BorrowedRef<PyCodeObject> new_code) {
   frameMode = getConfig().frame_mode;
 }
 
+std::size_t Function::numBlocks() const {
+  return cfg.numBlocks();
+}
+
+std::size_t Function::numInstrs() const {
+  return cfg.numInstrs();
+}
+
 std::size_t Function::CountInstrs(InstrPredicate pred) const {
   std::size_t result = 0;
   for (const auto& block : cfg.blocks) {

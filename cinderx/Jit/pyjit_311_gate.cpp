@@ -593,6 +593,7 @@ bool isCodeScopedRefusal311(const char* reason) {
       "REFUSE_SHAPE_SPECULATIVE_GUARD",
       // The code is over the per-function size budget; compiling it again
       // would only repeat the work that found that out.
+      jit::kRefuseHirSizeLimit,
       jit::kRefuseLirSizeLimit,
       "SUPPORTED_OPCODE_FAILURE",
   };

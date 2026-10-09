@@ -71,6 +71,7 @@ REFUSE_SHAPE_SHARED_ARTIFACT_LIFECYCLE = "retired: same-namespace functions shar
 REFUSE_SHAPE_AUTO_JIT_DISABLED = "automatic compilation of the code object was disabled after its one failed or refused automatic attempt (execute mode)"
 REFUSE_SHAPE_IMPORTLIB_BOOTSTRAP = "import machinery is kept interpreted on 3.11; compiling it taxes startup and is not a steady-state win"
 REFUSE_SHAPE_CINDER_MODULE = "compiling cinderx keeps the extension module alive past finalize"
+REFUSE_SHAPE_HIR_SIZE_LIMIT = "the function's HIR exceeds the per-function block or instruction budget (jit-max-hir-*)"
 REFUSE_SHAPE_LIR_SIZE_LIMIT = "the function's LIR exceeds the per-function block or instruction budget (jit-max-lir-*)"
 
 [opcodes]
