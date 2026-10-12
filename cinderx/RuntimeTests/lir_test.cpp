@@ -113,6 +113,122 @@ class LIRGeneratorTest : public RuntimeTest {
   }
 };
 
+// Construct guards without any preloader, constant, or Environment owner for
+// their targets. This isolates the ownership added by LIR lowering.
+TEST_F(LIRGeneratorTest, GuardIsPinsTargetUntilRuntimeRelease) {
+  runCode("class Target: pass\n");
+  auto target = Ref<>::steal(PyObject_CallNoArgs(getGlobal("Target")));
+  ASSERT_NE(target, nullptr);
+  auto weak = Ref<>::steal(PyWeakref_NewRef(target, nullptr));
+  ASSERT_NE(weak, nullptr);
+  auto func = hir::HIRParser{}.ParseHIR(R"(
+fun guard_owner {
+  bb 0 {
+    v0 = LoadArg<0>
+    Snapshot { CurInstrOffset 0 Locals<1> v0 }
+    v1 = GuardIs<Py_None> v0
+    v2 = GuardIs<Py_None> v1
+    Return v2
+  }
+}
+)");
+  ASSERT_NE(func, nullptr);
+  runCode("def guard_runtime(value): return value\n");
+  BorrowedRef<PyFunctionObject> owner{getGlobal("guard_runtime")};
+  func->setCode(BorrowedRef<PyCodeObject>{owner->func_code});
+  func->builtins.reset(owner->func_builtins);
+  func->globals.reset(owner->func_globals);
+  for (auto& block : func->cfg.blocks) {
+    for (auto it = block.begin(); it != block.end();) {
+      auto& instr = *it++;
+      if (!instr.IsGuardIs()) {
+        continue;
+      }
+      auto replacement =
+          hir::GuardIs::create(instr.output(), target, instr.GetOperand(0));
+      replacement->setFrameState(hir::FrameState{});
+      instr.ReplaceWith(*replacement);
+      delete &instr;
+    }
+  }
+  Compiler::runPasses(*func, static_cast<PassConfig>(0));
+  CodeRuntime runtime{func->code, func->builtins, func->globals};
+  codegen::Environ env;
+  env.ctx = getContext();
+  env.code_rt = &runtime;
+  auto before = Py_REFCNT(target.get());
+  LIRGenerator generator(func.get(), &env);
+  auto lir = generator.TranslateFunction();
+  ASSERT_NE(lir, nullptr);
+  EXPECT_EQ(Py_REFCNT(target.get()), before + 1);
+  lir.reset();
+  func.reset();
+  target.reset();
+  PyGC_Collect();
+  EXPECT_NE(PyWeakref_GetObject(weak), Py_None);
+  runtime.releaseReferences();
+  PyGC_Collect();
+  EXPECT_EQ(PyWeakref_GetObject(weak), Py_None);
+}
+
+TEST_F(LIRGeneratorTest, GuardTypePinsHeapTypeUntilRuntimeRelease) {
+  auto target = Ref<>::steal(PyObject_CallFunction(
+      reinterpret_cast<PyObject*>(&PyType_Type), "s(){}", "GuardTarget"));
+  ASSERT_NE(target, nullptr);
+  auto weak = Ref<>::steal(PyWeakref_NewRef(target, nullptr));
+  ASSERT_NE(weak, nullptr);
+  auto func = hir::HIRParser{}.ParseHIR(R"(
+fun type_owner {
+  bb 0 {
+    v0 = LoadArg<0>
+    Snapshot { CurInstrOffset 0 Locals<1> v0 }
+    v1 = GuardType<Object> v0
+    Return v1
+  }
+}
+)");
+  ASSERT_NE(func, nullptr);
+  runCode("def guard_runtime(value): return value\n");
+  BorrowedRef<PyFunctionObject> owner{getGlobal("guard_runtime")};
+  func->setCode(BorrowedRef<PyCodeObject>{owner->func_code});
+  func->builtins.reset(owner->func_builtins);
+  func->globals.reset(owner->func_globals);
+  for (auto& block : func->cfg.blocks) {
+    for (auto it = block.begin(); it != block.end();) {
+      auto& instr = *it++;
+      if (!instr.IsGuardType()) {
+        continue;
+      }
+      auto replacement = hir::GuardType::create(
+          instr.output(),
+          hir::Type::fromTypeExact(
+              reinterpret_cast<PyTypeObject*>(target.get())),
+          instr.GetOperand(0),
+          hir::FrameState{});
+      instr.ReplaceWith(*replacement);
+      delete &instr;
+    }
+  }
+  Compiler::runPasses(*func, static_cast<PassConfig>(0));
+  CodeRuntime runtime{func->code, func->builtins, func->globals};
+  codegen::Environ env;
+  env.ctx = getContext();
+  env.code_rt = &runtime;
+  auto before = Py_REFCNT(target.get());
+  LIRGenerator generator(func.get(), &env);
+  auto lir = generator.TranslateFunction();
+  ASSERT_NE(lir, nullptr);
+  EXPECT_EQ(Py_REFCNT(target.get()), before + 1);
+  lir.reset();
+  func.reset();
+  target.reset();
+  PyGC_Collect();
+  EXPECT_NE(PyWeakref_GetObject(weak), Py_None);
+  runtime.releaseReferences();
+  PyGC_Collect();
+  EXPECT_EQ(PyWeakref_GetObject(weak), Py_None);
+}
+
 #if PY_VERSION_HEX < 0x030C0000
 struct Translated311HIR {
   std::unique_ptr<hir::Function> hir;
