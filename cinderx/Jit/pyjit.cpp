@@ -776,13 +776,13 @@ size_t parse_sized_argument(const std::string& val) {
   // " 1024 k" should parse OK - so remove the space.
   std::remove_copy_if(
       val.begin(), val.end(), std::back_inserter(parsed), ::isspace);
-  JIT_CHECK(!parsed.empty(), "Input string is empty");
+  JIT_THROW_IF(parsed.empty(), "Input string is empty");
   static_assert(
       sizeof(decltype(std::stoull(parsed))) == sizeof(size_t),
       "stoull parses to size_t size");
   size_t scale = 1;
   // "1024k" and "1024K" are the same - so upper case.
-  char lastChar = std::toupper(parsed.back());
+  char lastChar = std::toupper(static_cast<unsigned char>(parsed.back()));
   switch (lastChar) {
     case 'K':
       scale = 1024;
@@ -797,18 +797,20 @@ size_t parse_sized_argument(const std::string& val) {
       parsed.pop_back();
       break;
     default:
-      JIT_CHECK(
-          std::isdigit(lastChar), "Invalid character in input string: {}", val);
+      JIT_THROW_IF(
+          !std::isdigit(static_cast<unsigned char>(lastChar)),
+          "Invalid character in input string: {}",
+          val);
   }
   size_t ret_value{0};
   auto p_last = parsed.data() + parsed.size();
   auto int_ok = std::from_chars(parsed.data(), p_last, ret_value);
-  JIT_CHECK(
-      int_ok.ec == std::errc() && int_ok.ptr == p_last,
+  JIT_THROW_IF(
+      int_ok.ec != std::errc() || int_ok.ptr != p_last,
       "Invalid unsigned integer in input string: '{}'",
       val);
-  JIT_CHECK(
-      ret_value <= (std::numeric_limits<size_t>::max() / scale),
+  JIT_THROW_IF(
+      ret_value > (std::numeric_limits<size_t>::max() / scale),
       "Unsigned Integer overflow in input string: '{}'",
       val);
   return ret_value * scale;

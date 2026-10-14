@@ -266,6 +266,7 @@ test_kunpeng() {
     test_cinderx.test_kunpeng.test_early_quicken_311 \
     test_cinderx.test_kunpeng.test_load_method_descriptor_fallback \
     test_cinderx.test_kunpeng.test_list_extend_refcount_311 \
+    test_cinderx.test_kunpeng.test_jit_size_args \
     test_cinderx.test_kunpeng.test_exact_float_inplace_311 \
     test_cinderx.test_kunpeng.test_float_box_sink_311 \
     test_cinderx.test_kunpeng.test_float_power_exact_311 \
