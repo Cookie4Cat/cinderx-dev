@@ -466,7 +466,7 @@ void LinearScanAllocator::calculateLiveIntervals() {
       // output
       auto output_opnd = instr->output();
       if (output_opnd->isVreg()) {
-        if (kPyDebug) {
+        if constexpr (kDebug) {
           auto inserted = seen_outputs.insert(output_opnd).second;
           JIT_CHECK(
               inserted,

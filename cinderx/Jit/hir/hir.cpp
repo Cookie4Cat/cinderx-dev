@@ -72,7 +72,7 @@ void DeoptBase::sortLiveRegs() {
         return a.reg->id() < b.reg->id();
       });
 
-  if (kPyDebug) {
+  if constexpr (kDebug) {
     // Check for uniqueness after sorting rather than inside the predicate
     // passed to std::sort(), in case sort() performs extra comparisons to
     // sanity-check our predicate.
@@ -80,7 +80,7 @@ void DeoptBase::sortLiveRegs() {
         live_regs_.begin(),
         live_regs_.end(),
         [](const RegState& a, const RegState& b) { return a.reg == b.reg; });
-    JIT_DCHECK(it == live_regs_.end(), "Register {} is live twice", *it->reg);
+    JIT_CHECK(it == live_regs_.end(), "Register {} is live twice", *it->reg);
   }
 }
 

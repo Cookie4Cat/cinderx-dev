@@ -44,6 +44,15 @@ struct jit_string_t* ss_sprintf_alloc(const char* format, ...);
 #ifdef __cplusplus
 }
 
+// True when CinderX itself is built in debug mode (NDEBUG is not defined).
+// Not to be confused with kPyDebug, which describes the Python runtime.
+constexpr bool kDebug =
+#ifdef NDEBUG
+    false;
+#else
+    true;
+#endif
+
 constexpr bool kPyDebug =
 #ifdef Py_DEBUG
     true;

@@ -13,6 +13,7 @@ CodeAllocatorTest
 CopyGraphTest
 CopyPropagationTest
 DataFlowTest
+DeoptBaseTest
 DeoptSiteIdTest
 FloatInPlaceBoxSinkTest
 FuncTypeCheckTest

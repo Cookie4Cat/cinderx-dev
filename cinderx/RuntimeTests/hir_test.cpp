@@ -285,6 +285,23 @@ TEST(BasicBlockTest, SplitAfterSplitsBlockAfterInstruction) {
   EXPECT_TRUE(tail->GetTerminator()->IsReturn());
 }
 
+TEST(DeoptBaseTest, SortLiveRegsRejectsDuplicateRegister) {
+  Environment env;
+  auto v0 = env.AllocateRegister();
+  std::unique_ptr<Deopt> deopt(Deopt::create());
+  deopt->emplaceLiveReg(v0, RefKind::kOwned, ValueKind::kObject);
+  deopt->emplaceLiveReg(v0, RefKind::kOwned, ValueKind::kObject);
+  if constexpr (kDebug) {
+    // A CinderX debug build checks for duplicates regardless of whether
+    // the Python runtime is a debug build.
+    EXPECT_DEATH(deopt->sortLiveRegs(), "Register v0 is live twice");
+  } else {
+    // Release builds compile the check out.
+    deopt->sortLiveRegs();
+    EXPECT_EQ(deopt->live_regs().size(), 2);
+  }
+}
+
 TEST(CFGIterTest, IteratingEmptyCFGReturnsEmptyTraversal) {
   CFG cfg;
   std::vector<BasicBlock*> traversal = cfg.GetRPOTraversal();
