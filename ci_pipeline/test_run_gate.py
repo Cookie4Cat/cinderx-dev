@@ -219,6 +219,7 @@ def test_cp311_stage_wrapper_reuses_daily_wheel_and_avoids_duplicate_suites():
         "test_attr_cache_new_shape_load_311",
         "test_attr_cache_new_shape_store_311",
         "test_early_quicken_311",
+        "test_load_method_descriptor_fallback",
         "test_list_extend_refcount_311",
         "test_lightweight_frames",
     ):
