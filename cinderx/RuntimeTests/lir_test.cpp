@@ -11,6 +11,7 @@
 #include "cinderx/Jit/frame.h"
 #include "cinderx/Jit/hir/hir.h"
 #include "cinderx/Jit/hir/parser.h"
+#include "cinderx/Jit/hir/pass.h"
 #include "cinderx/Jit/jit_rt.h"
 #include "cinderx/Jit/lir/dce.h"
 #include "cinderx/Jit/lir/generator.h"
@@ -425,6 +426,93 @@ def test(value):
       << errors.str() << *lir_func;
 }
 #endif
+
+TEST_F(LIRGeneratorTest, GILRefcountGuardsFollowImmortalizationCapability) {
+  if constexpr (kFreeThreadedBuild) {
+    GTEST_SKIP() << "GIL refcount lowering contract";
+  }
+  for (std::string_view type :
+       {"MortalListExact", "Object", "OptObject", "ImmortalObject"}) {
+    SCOPED_TRACE(type);
+    bool nullable = type == "OptObject";
+    bool immortal = type == "ImmortalObject";
+    bool runtime_check = !immortal &&
+        (PY_VERSION_HEX >= 0x030C0000 || type != "MortalListExact");
+    auto source = fmt::format(
+        R"(fun test {{
+  bb 0 {{
+    v0 = LoadArg<0>
+    v1 = RefineType<{}> v0
+    Incref v1
+    {}Decref v1
+    Return v0
+  }}
+}}
+)",
+        type,
+        nullable ? "X" : "");
+    auto irfunc = hir::HIRParser{}.ParseHIR(source.c_str());
+    ASSERT_NE(irfunc, nullptr);
+    hir::reflowTypes(*irfunc);
+    if (nullable) {
+      // The HIR parser does not support XIncref; construct that instruction.
+      hir::Instr* incref = nullptr;
+      for (auto& instr : *irfunc->cfg.entry_block) {
+        if (instr.IsIncref()) {
+          incref = &instr;
+          break;
+        }
+      }
+      ASSERT_NE(incref, nullptr);
+      incref->ReplaceWith(*hir::XIncref::create(incref->GetOperand(0)));
+      delete incref;
+    }
+    jit::codegen::Environ env;
+    jit::CodeRuntime runtime{irfunc->code, irfunc->builtins, irfunc->globals};
+    env.ctx = getContext();
+    env.code_rt = &runtime;
+    LIRGenerator lir_gen(irfunc.get(), &env);
+    auto function = lir_gen.TranslateFunction();
+
+    size_t increfs = 0;
+    size_t decrefs = 0;
+    size_t incref_guards = 0;
+    size_t decref_guards = 0;
+    size_t null_checks = 0;
+    for (const auto* block : function->basicblocks()) {
+      for (const auto& instr : block->instructions()) {
+        const auto* origin = instr->origin();
+        if (origin == nullptr) {
+          continue;
+        }
+        bool inc = origin->IsIncref() || origin->IsXIncref();
+        bool dec = origin->IsDecref() || origin->IsXDecref();
+        if (!inc && !dec) {
+          continue;
+        }
+        if (inc && instr->opcode() == Instruction::kInc) {
+          ++increfs;
+          EXPECT_EQ(
+              instr->getInput(0)->dataType(),
+              runtime_check ? DataType::k32bit : DataType::k64bit);
+        }
+        decrefs += dec && instr->opcode() == Instruction::kDec;
+#if PY_VERSION_HEX >= 0x030E0000
+        incref_guards += inc && instr->opcode() == Instruction::kBranchS;
+#else
+        incref_guards += inc && instr->opcode() == Instruction::kBranchE;
+#endif
+        decref_guards += dec && instr->opcode() == Instruction::kBranchBitSet;
+        null_checks += instr->opcode() == Instruction::kCondBranch;
+      }
+    }
+    EXPECT_EQ(increfs, immortal ? 0u : 1u) << *function;
+    EXPECT_EQ(decrefs, immortal ? 0u : 1u) << *function;
+    EXPECT_EQ(incref_guards, runtime_check ? 1u : 0u) << *function;
+    EXPECT_EQ(decref_guards, runtime_check ? 1u : 0u) << *function;
+    EXPECT_EQ(null_checks, nullable ? 2u : 0u) << *function;
+  }
+}
 
 TEST_F(LIRGeneratorTest, BroadPythonTranslationCoverage) {
   const char* snippets[] = {

@@ -190,7 +190,8 @@ class LIRGenerator {
   void makeIncref(
       BasicBlockBuilder& bbb,
       lir::Instruction* instr,
-      bool xincref = false);
+      bool xincref = false,
+      bool possible_immortal = true);
   void makeIncref(
       BasicBlockBuilder& bbb,
       const jit::hir::Instr& instr,
@@ -199,7 +200,8 @@ class LIRGenerator {
       BasicBlockBuilder& bbb,
       lir::Instruction* instr,
       std::optional<destructor> destructor,
-      bool xdecref = false);
+      bool xdecref = false,
+      bool possible_immortal = true);
   void makeDecref(
       BasicBlockBuilder& bbb,
       const jit::hir::Instr& instr,
@@ -218,12 +220,14 @@ class LIRGenerator {
   void makeIncrefGILEnabled(
       BasicBlockBuilder& bbb,
       lir::Instruction* instr,
-      BasicBlock* end_incref);
+      BasicBlock* end_incref,
+      bool possible_immortal);
   void makeDecrefGILEnabled(
       BasicBlockBuilder& bbb,
       lir::Instruction* instr,
       BasicBlock* end_decref,
-      std::optional<destructor> destructor);
+      std::optional<destructor> destructor,
+      bool possible_immortal);
 #if defined(CINDER_AARCH64)
   void updateDeoptIndex(
       BasicBlockBuilder& bbb,
