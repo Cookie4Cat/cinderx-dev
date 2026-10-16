@@ -11,6 +11,7 @@
 #include "cinderx/Jit/bytecode.h"
 #include "cinderx/Jit/compiler.h"
 #include "cinderx/Jit/config.h"
+#include "cinderx/Jit/context.h"
 #include "cinderx/Jit/hir/builder.h"
 #include "cinderx/Jit/hir/hir.h"
 #include "cinderx/Jit/hir/inliner.h"
@@ -3592,6 +3593,165 @@ def f():
       Ref<>::steal(PyObject_Call(pyfunc, empty_tuple, /*kwargs=*/nullptr));
   EXPECT_TRUE(isIntEquals(call_result2, 2));
 }
+
+TEST_F(CppInlinerTest, CallerEnvironmentPinsInlinedCallee) {
+  std::unique_ptr<Function> func;
+  ASSERT_NO_FATAL_FAILURE(CompileToHIR(
+      R"(
+def callee():
+    return 42
+
+def caller(func):
+    return func()
+)",
+      "caller",
+      func));
+  ASSERT_NE(func, nullptr);
+  auto callee = getGlobal("callee");
+  ASSERT_NE(callee, nullptr);
+  // Preload the independent known callee without introducing a caller global
+  // or constant that already owns it.
+  auto callee_hir = buildHIR(BorrowedRef<PyFunctionObject>{callee});
+  ASSERT_NE(callee_hir, nullptr);
+  for (auto& ref : func->env.references()) {
+    ASSERT_NE(ref.get(), callee);
+  }
+  Compiler::runPasses(*func, PassConfig::kSimplify);
+  // Model a known call target without adding a constant/Environment owner.
+  for (auto& block : func->cfg.blocks) {
+    for (auto& instr : block) {
+      if (instr.IsVectorCall()) {
+        static_cast<VectorCall&>(instr).func()->set_type(
+            Type::fromObject(callee));
+      }
+    }
+  }
+  InlineFunctionCalls{}.Run(*func);
+  bool inlined = false;
+  for (auto& block : func->cfg.blocks) {
+    for (auto& instr : block) {
+      inlined |= instr.IsBeginInlinedFunction();
+    }
+  }
+  ASSERT_TRUE(inlined) << fullPrinter().ToString(*func);
+  bool owned = false;
+  for (auto& ref : func->env.references()) {
+    owned |= ref.get() == callee;
+  }
+  EXPECT_TRUE(owned);
+  auto marker_block = func->cfg.AllocateBlock();
+  BeginInlinedFunction* copied_begin = nullptr;
+  for (auto& block : func->cfg.blocks) {
+    if (&block == marker_block) {
+      continue;
+    }
+    for (auto& instr : block) {
+      if (instr.IsBeginInlinedFunction()) {
+        copied_begin = static_cast<BeginInlinedFunction*>(instr.clone());
+        break;
+      }
+    }
+    if (copied_begin != nullptr) {
+      break;
+    }
+  }
+  ASSERT_NE(copied_begin, nullptr);
+  marker_block->Append(copied_begin);
+  marker_block->Append(EndInlinedFunction::create(copied_begin));
+  BeginInlinedFunctionElimination{}.Run(*func);
+  EXPECT_TRUE(marker_block->empty());
+  owned = false;
+  for (auto& ref : func->env.references()) {
+    owned |= ref.get() == callee;
+  }
+  EXPECT_TRUE(owned);
+}
+
+TEST_F(CppInlinerTest, RejectedCalleeDoesNotAddEnvironmentOwner) {
+  std::unique_ptr<Function> func;
+  ASSERT_NO_FATAL_FAILURE(CompileToHIR(
+      R"(
+def callee(*args):
+    return 42
+
+def caller(func):
+    return func()
+)",
+      "caller",
+      func));
+  ASSERT_NE(func, nullptr);
+  auto callee = getGlobal("callee");
+  ASSERT_NE(callee, nullptr);
+  // Preload the independent known callee without introducing a caller global
+  // or constant that already owns it.
+  auto callee_hir = buildHIR(BorrowedRef<PyFunctionObject>{callee});
+  ASSERT_NE(callee_hir, nullptr);
+  for (auto& ref : func->env.references()) {
+    ASSERT_NE(ref.get(), callee);
+  }
+  Compiler::runPasses(*func, PassConfig::kSimplify);
+  for (auto& block : func->cfg.blocks) {
+    for (auto& instr : block) {
+      if (instr.IsVectorCall()) {
+        static_cast<VectorCall&>(instr).func()->set_type(
+            Type::fromObject(callee));
+      }
+    }
+  }
+  auto before = func->env.references().size();
+  InlineFunctionCalls{}.Run(*func);
+  EXPECT_EQ(func->env.references().size(), before);
+  for (auto& block : func->cfg.blocks) {
+    for (auto& instr : block) {
+      EXPECT_FALSE(instr.IsBeginInlinedFunction());
+    }
+  }
+}
+
+// Executable HIR inlining is supported only by the 3.14+ lightweight-frame
+// runtime. Do not register a permanently skipped 3.11 canary test.
+#if PY_VERSION_HEX >= 0x030E0000
+TEST_F(CppInlinerTest, ChangingInlinedCalleeCodePreservesInterpreterResult) {
+  if (!getConfig().hir_opts.inliner) {
+    GTEST_SKIP() << "Executable inlining requires supported lightweight frames";
+  }
+  Ref<> caller(compileAndGet(
+      R"(
+def callee():
+    return 42
+
+def replacement():
+    return 99
+
+def caller():
+    return callee()
+)",
+      "caller"));
+  ASSERT_NE(caller, nullptr);
+  BorrowedRef<PyFunctionObject> caller_func{caller};
+  auto caller_hir = buildHIR(caller_func);
+  ASSERT_NE(caller_hir, nullptr);
+  ASSERT_EQ(jit::compileFunction(caller_func), jit::Result::OK);
+  auto compiled = getContext()->lookupFunc(caller_func);
+  ASSERT_NE(compiled, nullptr);
+  ASSERT_GT(compiled->inlinedFunctionsStats().num_inlined_functions, 0);
+  auto first = Ref<>::steal(PyObject_CallNoArgs(caller));
+  ASSERT_NE(first, nullptr);
+  EXPECT_TRUE(isIntEquals(first, 42));
+  runCode("callee.__code__ = replacement.__code__\n");
+  PyGC_Collect();
+  auto second = Ref<>::steal(PyObject_CallNoArgs(caller));
+  ASSERT_NE(second, nullptr);
+  EXPECT_TRUE(isIntEquals(second, 99));
+  jit::uncompile(caller_func);
+  EXPECT_EQ(getContext()->lookupFunc(caller_func), nullptr);
+  PyGC_Collect();
+  auto interpreted = Ref<>::steal(PyObject_CallNoArgs(caller));
+  ASSERT_NE(interpreted, nullptr);
+  EXPECT_TRUE(isIntEquals(interpreted, 99));
+}
+
+#endif
 
 TEST_F(CppInlinerTest, ColdCallThresholdZeroDoesNotPruneAll) {
   struct RestoreFlag {
