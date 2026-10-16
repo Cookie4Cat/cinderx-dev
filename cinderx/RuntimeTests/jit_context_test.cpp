@@ -18,10 +18,13 @@
 #include "cinderx/Interpreter/3.11/observe.h"
 #endif
 
+#include <chrono>
+#include <future>
 #include <initializer_list>
 #include <memory>
 #include <stdexcept>
 #include <string>
+#include <thread>
 #include <utility>
 
 #if defined(__linux__)
@@ -998,6 +1001,116 @@ def other(a, b):
 }
 
 #endif
+
+namespace {
+
+class CountingTypeDeoptPatcher : public jit::TypeDeoptPatcher {
+ public:
+  CountingTypeDeoptPatcher() : TypeDeoptPatcher(&PyLong_Type) {}
+
+  bool maybePatch(BorrowedRef<PyTypeObject>) override {
+    ++notifications;
+    return false;
+  }
+
+  int notifications{0};
+};
+
+} // namespace
+
+TEST_F(JITContextTest, UnwatchRemovesOnlyTheRequestedPatcher) {
+  CountingTypeDeoptPatcher removed;
+  CountingTypeDeoptPatcher retained;
+  jit_ctx_->watchType(&PyLong_Type, &removed);
+  jit_ctx_->watchType(&PyLong_Type, &retained);
+  jit_ctx_->unwatch(&removed);
+  jit_ctx_->unwatch(&removed);
+  jit_ctx_->notifyTypeModified(&PyLong_Type, &PyLong_Type);
+  EXPECT_EQ(removed.notifications, 0);
+  EXPECT_EQ(retained.notifications, 1);
+  jit_ctx_->unwatch(&retained);
+}
+
+TEST_F(JITContextTest, UnwatchSupportsRecursiveCompileLock) {
+  CountingTypeDeoptPatcher patcher;
+  auto& threaded = jit::getThreadedCompileContext();
+  threaded.startCompile({});
+  {
+    jit::ThreadedCompileSerialize guard;
+    jit_ctx_->watchType(&PyLong_Type, &patcher);
+    jit_ctx_->unwatch(&patcher);
+    EXPECT_TRUE(threaded.canAccessSharedData());
+  }
+  threaded.endCompile();
+  jit_ctx_->watchPendingTypes();
+  jit_ctx_->notifyTypeModified(&PyLong_Type, &PyLong_Type);
+  EXPECT_EQ(patcher.notifications, 0);
+}
+
+TEST_F(
+    JITContextTest,
+    UnwatchOnArtifactDestructionSupportsRecursiveCompileLock) {
+  // Shadow-mode 3.11 fixtures do not initialize the executable artifact type.
+  ASSERT_EQ(PyType_Ready(jit::getCompiledFunctionType()), 0);
+  auto compiled = jit::CompiledFunction::create({}, false);
+  ASSERT_NE(compiled, nullptr);
+  compiled->setOwner(jit_ctx_.get());
+  auto patcher = std::make_unique<CountingTypeDeoptPatcher>();
+  auto* owned_patcher = patcher.get();
+  CountingTypeDeoptPatcher retained;
+  std::vector<std::unique_ptr<jit::CodePatcher>> patchers;
+  patchers.push_back(std::move(patcher));
+  compiled->setCodePatchers(std::move(patchers));
+
+  auto& threaded = jit::getThreadedCompileContext();
+  threaded.startCompile({});
+  {
+    jit::ThreadedCompileSerialize guard;
+    // Destroy through the real clear path while the compile lock is held.
+    jit_ctx_->watchType(&PyLong_Type, owned_patcher);
+    jit_ctx_->watchType(&PyLong_Type, &retained);
+    compiled.reset();
+    EXPECT_TRUE(threaded.canAccessSharedData());
+  }
+  threaded.endCompile();
+  jit_ctx_->watchPendingTypes();
+  jit_ctx_->notifyTypeModified(&PyLong_Type, &PyLong_Type);
+  EXPECT_EQ(retained.notifications, 1);
+  jit_ctx_->unwatch(&retained);
+}
+
+TEST_F(JITContextTest, UnwatchWaitsForCompileLock) {
+  CountingTypeDeoptPatcher patcher;
+  auto& threaded = jit::getThreadedCompileContext();
+  threaded.startCompile({});
+  std::promise<void> started;
+  std::promise<void> completed;
+  auto started_future = started.get_future();
+  auto completed_future = completed.get_future();
+  std::thread worker;
+  {
+    jit::ThreadedCompileSerialize guard;
+    jit_ctx_->watchType(&PyLong_Type, &patcher);
+    worker = std::thread([&] {
+      started.set_value();
+      jit_ctx_->unwatch(&patcher);
+      completed.set_value();
+    });
+    started_future.wait();
+    // No other thread accesses the registry while the worker tries to unwatch.
+    EXPECT_EQ(
+        completed_future.wait_for(std::chrono::milliseconds(200)),
+        std::future_status::timeout);
+  }
+  worker.join();
+  EXPECT_EQ(
+      completed_future.wait_for(std::chrono::seconds(0)),
+      std::future_status::ready);
+  threaded.endCompile();
+  jit_ctx_->watchPendingTypes();
+  jit_ctx_->notifyTypeModified(&PyLong_Type, &PyLong_Type);
+  EXPECT_EQ(patcher.notifications, 0);
+}
 
 TEST_F(JITContextTest, UnwatchableBuiltins) {
   SKIP_311_EXECUTABLE_COMPILE();
