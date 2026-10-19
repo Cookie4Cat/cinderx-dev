@@ -27,6 +27,7 @@
 #include "cinderx/Interpreter/3.11/observe.h"
 #include "cinderx/Jit/autojit_import.h"
 #include "cinderx/Jit/bytecode.h"
+#include "cinderx/Jit/compile_budget.h"
 #include "cinderx/Jit/compiled_function.h"
 #include "cinderx/Jit/compiler.h"
 #include "cinderx/Jit/config.h"
@@ -590,6 +591,10 @@ bool isCodeScopedRefusal311(const char* reason) {
       // The compiler could not produce an artifact for this code.
       "REFUSE_SHAPE_CODEGEN_SPAN",
       "REFUSE_SHAPE_SPECULATIVE_GUARD",
+      // The code is over the per-function size budget; compiling it again
+      // would only repeat the work that found that out.
+      jit::kRefuseHirSizeLimit,
+      jit::kRefuseLirSizeLimit,
       "SUPPORTED_OPCODE_FAILURE",
   };
   for (const char* known : kCodeScoped) {
@@ -772,6 +777,15 @@ extern "C" const char* Ci_JitShell311_RequestCompile(
     jit::triggerStatsOnShadowCompile(
         result->code_size, result->specialized_opcodes);
     return "compiled";
+  } catch (const jit::CompileBudgetExceeded& exc) {
+    // Not a compiler failure: the function is over the size budget.  The
+    // reason was recorded where the budget was checked; consume it here so
+    // it cannot be attributed to a later, unrelated compile.
+    PyErr_Clear();
+    JIT_LOG(
+        "shadow compile skipped for {}: {}", functionName(func), exc.what());
+    Ci_JitShell311_TakeExecuteRefusal();
+    return exc.reason();
   } catch (const std::exception& exc) {
     // Shadow compilation is observational: failures are reported through the
     // stable event reason and must never perturb the interpreted call.

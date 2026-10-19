@@ -5,6 +5,7 @@
 #include "cinderx/Common/log.h"
 #include "cinderx/Jit/bytecode.h"
 #include "cinderx/Jit/codegen/arch/detection.h"
+#include "cinderx/Jit/compile_budget.h"
 #include "cinderx/Jit/config.h"
 #include "cinderx/Jit/frame.h"
 #include "cinderx/Jit/hir/analysis.h"
@@ -30,9 +31,12 @@
 #include "cinderx/Jit/jit_time_log.h"
 #include "cinderx/Jit/osr.h"
 
+#include <fmt/format.h>
+
 #include <chrono>
 #include <iostream>
 #include <sstream>
+#include <stdexcept>
 
 #if PY_VERSION_HEX < 0x030C0000
 // Records a refusal reason the scheduling gate reports; defined in
@@ -46,6 +50,37 @@ void setLast311ExecuteRefusal(const char* reason) {
 #endif
 
 namespace jit {
+
+namespace {
+
+// Raise an exception if an HIR function exceeds a reasonable size.
+void checkHirSize(const hir::Function& func) {
+  auto num_blocks = func.numBlocks();
+  auto max_blocks = getConfig().max_hir_blocks;
+  if (num_blocks > max_blocks) {
+    throwCompileBudgetExceeded(
+        kRefuseHirSizeLimit,
+        fmt::format(
+            "HIR function '{}' has too many basic blocks ({}, max={})",
+            func.fullname,
+            num_blocks,
+            max_blocks));
+  }
+
+  auto num_instrs = func.numInstrs();
+  auto max_instrs = getConfig().max_hir_instrs;
+  if (num_instrs > max_instrs) {
+    throwCompileBudgetExceeded(
+        kRefuseHirSizeLimit,
+        fmt::format(
+            "HIR function '{}' has too many instructions ({}, max={})",
+            func.fullname,
+            num_instrs,
+            max_instrs));
+  }
+}
+
+} // namespace
 
 template <typename T>
 static void runPass(T&& pass, hir::Function& func, PostPassFunction callback) {
@@ -95,6 +130,11 @@ void Compiler::runPasses(
     jit::hir::Function& irfunc,
     PassConfig config,
     PostPassFunction callback) {
+  // Bail out before doing any work if the freshly-built HIR is already too
+  // large to be worth compiling.  Checked once here rather than before every
+  // pass to avoid repeatedly walking the CFG.
+  checkHirSize(irfunc);
+
   // SSAify must come first; nothing but SSAify should ever see non-SSA HIR.
   runPass(jit::hir::SSAify{}, irfunc, callback);
 
