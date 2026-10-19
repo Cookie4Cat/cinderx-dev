@@ -18,12 +18,14 @@ def test_runtime_tests_disable_lto_for_gcc_builds():
 
 def test_pr_pipeline_selects_cp311_gate_for_python311():
     assert run_gate.pipeline_for_python("pr", (3, 11)) == (
+        ("runner_selftests", False),
         ("cp311_gate", False),
     )
 
 
 def test_pr_pipeline_keeps_existing_suites_for_python314():
     assert run_gate.pipeline_for_python("pr", (3, 14)) == (
+        ("runner_selftests", False),
         ("runtime", True),
         ("cinderx_local", False),
     )
@@ -40,6 +42,7 @@ def test_pr_pipeline_rejects_unsupported_python():
 
 def test_daily_pipeline_selects_cp311_gate_and_daily_for_python311():
     assert run_gate.pipeline_for_python("daily", (3, 11)) == (
+        ("runner_selftests", False),
         ("cp311_gate", False),
         ("cp311_daily", False),
     )
@@ -47,6 +50,7 @@ def test_daily_pipeline_selects_cp311_gate_and_daily_for_python311():
 
 def test_daily_pipeline_keeps_existing_suites_for_python314():
     assert run_gate.pipeline_for_python("daily", (3, 14)) == (
+        ("runner_selftests", False),
         ("runtime", True),
         ("cinderx_local", False, {"CINDERX_LOCAL_RUN_LIBTEST": "1"}),
     )
@@ -63,6 +67,7 @@ def test_daily_pipeline_rejects_unsupported_python():
 
 def test_legacy_daily311_pipeline_remains_available():
     assert run_gate.pipeline_for_python("daily311", (3, 14)) == (
+        ("runner_selftests", False),
         ("cp311_gate", False),
         ("cp311_daily", False),
     )
@@ -270,6 +275,7 @@ def test_cp311_stage_failures_are_strict_but_daily_collects_all_signals():
         first_rc=$?
         set -e
         test "$first_rc" -ne 0
+        test -f "$LOG_DIR/fail_fast_probe.log"
         ! grep -q SHOULD_NOT_RUN "$LOG_DIR/fail_fast_probe.log"
 
         DAILY_FAILURES=()
@@ -306,6 +312,7 @@ def test_cp311_stage_failures_are_strict_but_daily_collects_all_signals():
     )
 
     assert completed.returncode == 0, completed.stdout + completed.stderr
+    assert "SECOND_STEP_RAN" in completed.stdout
 
 
 def test_cp311_test_support_preflight_reports_missing_module():

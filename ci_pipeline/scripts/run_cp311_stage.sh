@@ -64,8 +64,9 @@ run_step() {
   (
     set -e
     "$@"
-  ) > >(tee "$LOG_DIR/$name.log") 2>&1
+  ) > "$LOG_DIR/$name.log" 2>&1
   rc=$?
+  cat "$LOG_DIR/$name.log"
   if [ "$had_errexit" -eq 1 ]; then
     set -e
   else
