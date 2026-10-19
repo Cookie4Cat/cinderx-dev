@@ -1,4 +1,5 @@
 import json
+import os
 from pathlib import Path
 import subprocess
 import textwrap
@@ -226,6 +227,7 @@ def test_cp311_stage_wrapper_reuses_daily_wheel_and_avoids_duplicate_suites():
         "test_early_quicken_311",
         "test_load_method_descriptor_fallback",
         "test_list_extend_refcount_311",
+        "test_jit_immortalize",
         "test_lightweight_frames",
     ):
         assert script.count(module) == 1
@@ -313,6 +315,53 @@ def test_cp311_stage_failures_are_strict_but_daily_collects_all_signals():
 
     assert completed.returncode == 0, completed.stdout + completed.stderr
     assert "SECOND_STEP_RAN" in completed.stdout
+
+
+def test_cp311_immortalize_gate_executes_jit_and_propagates_failures(tmp_path):
+    script = (
+        Path(run_gate.REPO_ROOT) / "ci_pipeline/scripts/run_cp311_stage.sh"
+    ).read_text(encoding="utf-8")
+    body = script.split("test_kunpeng() {", 1)[1].split("\n}\n", 1)[0]
+    definition = "test_kunpeng() {" + body + "\n}\n"
+    (tmp_path / "cinderx/PythonLib").mkdir(parents=True)
+    harness = textwrap.dedent(
+        """\
+        set -u
+        PYTHON=fake_python
+        export CINDERX_JIT_MODE=off CINDERX_OSR_ENABLED=1
+        fake_python() {
+            printf '%s\t%s\t%s\n' "$CINDERX_JIT_MODE" "$CINDERX_OSR_ENABLED" "$*"
+            case " $* " in
+                *test_cinderx.test_kunpeng.test_jit_immortalize*) return "$IMMORTAL_RC" ;;
+                *) return "$BASE_RC" ;;
+            esac
+        }
+        """
+    ) + definition + "test_kunpeng\n"
+    for base_rc, immortal_rc in ((0, 0), (7, 0), (0, 9)):
+        completed = subprocess.run(
+            ["bash"],
+            input=harness,
+            text=True,
+            capture_output=True,
+            env={
+                **os.environ,
+                "REPO_ROOT": tmp_path.as_posix(),
+                "BASE_RC": str(base_rc),
+                "IMMORTAL_RC": str(immortal_rc),
+            },
+        )
+        assert completed.returncode == (base_rc or immortal_rc), completed.stderr
+        calls = completed.stdout.splitlines()
+        assert len(calls) == (1 if base_rc else 2), completed.stderr
+        assert calls[0].startswith("off\t1\t"), calls
+        if not base_rc:
+            mode, osr, arguments = calls[1].split("\t", 2)
+            assert (mode, osr) == ("execute", "0"), calls
+            assert arguments.split() == [
+                "-m", "unittest", "-v",
+                "test_cinderx.test_kunpeng.test_jit_immortalize",
+            ]
 
 
 def test_cp311_test_support_preflight_reports_missing_module():

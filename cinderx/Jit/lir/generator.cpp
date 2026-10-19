@@ -1819,7 +1819,9 @@ void LIRGenerator::makeIncrefGILEnabled(
   // If this could be an immortal object then we need to load the refcount as a
   // 32-bit integer to see if it overflows on increment, indicating that it's
   // immortal.  For mortal objects the refcount is a regular 64-bit integer.
-  if (possible_immortal) {
+  // Heap immortalization is unavailable on CPython 3.11. On newer versions,
+  // even a statically mortal object can become immortal after compilation.
+  if (PY_VERSION_HEX >= 0x030C0000 || possible_immortal) {
     auto mortal = bbb.allocateBlock();
     Instruction* r1 = bbb.appendInstr(
         OutVReg{OperandBase::k32bit},
@@ -1974,7 +1976,9 @@ void LIRGenerator::makeDecrefGILEnabled(
       Instruction::kMove,
       Ind{instr, kRefcountOffset});
 
-  if (possible_immortal) {
+  // Heap immortalization is unavailable on CPython 3.11. On newer versions,
+  // even a statically mortal object can become immortal after compilation.
+  if (PY_VERSION_HEX >= 0x030C0000 || possible_immortal) {
     auto mortal = bbb.allocateBlock();
     bbb.appendBranch(Instruction::kBranchBitSet, end_decref, r1, Imm{31});
     bbb.appendBlock(mortal);
