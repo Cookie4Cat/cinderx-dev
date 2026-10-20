@@ -1806,7 +1806,9 @@ class CinderJitModuleTests(StaticTestBase):
                     encoding=ENCODING,
                     env=subprocess_env(),
                 )
-                self.assertEqual(proc.returncode, -6, proc)
+                # A positive status is a normal failure of "import cinderx"; a
+                # negative one would mean the process was killed by a signal.
+                self.assertGreater(proc.returncode, 0, proc)
                 return proc.stderr
 
             self.assertIn(

@@ -227,6 +227,7 @@ def test_cp311_stage_wrapper_reuses_daily_wheel_and_avoids_duplicate_suites():
         "test_early_quicken_311",
         "test_load_method_descriptor_fallback",
         "test_list_extend_refcount_311",
+        "test_jit_size_args",
         "test_jit_immortalize",
         "test_lightweight_frames",
     ):
