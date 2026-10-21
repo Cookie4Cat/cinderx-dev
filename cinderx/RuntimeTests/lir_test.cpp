@@ -552,8 +552,9 @@ TEST_F(LIRGeneratorTest, GILRefcountGuardsFollowImmortalizationCapability) {
     SCOPED_TRACE(type);
     bool nullable = type == "OptObject";
     bool immortal = type == "ImmortalObject";
-    bool runtime_check = !immortal &&
-        (PY_VERSION_HEX >= 0x030C0000 || type != "MortalListExact");
+    // CPython 3.11 has no immortal heap objects: every refcount operation
+    // is emitted in the 64-bit mortal form without a capability guard.
+    bool runtime_check = !immortal && PY_VERSION_HEX >= 0x030C0000;
     auto source = fmt::format(
         R"(fun test {{
   bb 0 {{

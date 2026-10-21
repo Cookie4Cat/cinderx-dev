@@ -32,6 +32,7 @@
 #include "cinderx/Jit/compiler.h"
 #include "cinderx/Jit/config.h"
 #include "cinderx/Jit/context.h"
+#include "cinderx/Jit/direct_entry_gate_311.h"
 #include "cinderx/Jit/hir/builder.h"
 #include "cinderx/Jit/hir/preload.h"
 #include "cinderx/Jit/pyjit.h"
@@ -44,6 +45,7 @@
 #include <exception>
 #include <string_view>
 #include <utility>
+#include <vector>
 
 #if defined(__linux__)
 #include <pthread.h>
@@ -237,7 +239,13 @@ constexpr std::uintptr_t kCStackMarginBytes311 = 16 * 1024;
 constexpr std::uintptr_t kCStackMarginBytes311 = 16 * 1024;
 #endif
 
-thread_local std::uintptr_t t_c_stack_soft_limit = 0;
+// The generated entry guard reads this at a constant offset from the thread
+// pointer, so it must live in the static TLS block of every thread.  The
+// initial-exec model pins it there (a dlopen'd module takes the slot from
+// glibc's static-TLS surplus); the dynamic model would place it in a
+// per-thread DTV block at a thread-dependent offset.
+thread_local std::uintptr_t t_c_stack_soft_limit
+    __attribute__((tls_model("initial-exec"))) = 0;
 thread_local std::uintptr_t t_c_stack_hard_limit = 0;
 thread_local jit::CompiledFunction* t_invocation_artifact = nullptr;
 
@@ -323,6 +331,60 @@ bool cStackSoftLimitReached311() {
 }
 
 } // namespace
+
+#if defined(CINDER_AARCH64)
+// Direct entry re-proves the C-stack soft limit in the generated entry guard
+// instead of the shell.  The limit is thread-local; the guard reads it at a
+// constant offset from the thread pointer.  The variable is declared with the
+// initial-exec TLS model, so that offset is fixed by the static TLS layout
+// and identical in every thread; it is taken once from the calling thread.
+// No helper thread is created for this: glibc clears __libc_single_threaded
+// for good on the first pthread_create, after which every mutex in the
+// process (the GIL, SQLite, malloc arenas) pays the atomic path.
+namespace {
+int32_t g_cstack_soft_limit_tls_offset311 = -1;
+}
+
+extern "C" void Ci_JitShell311_InitCStackSoftLimitTls(void) {
+  std::uintptr_t tp = 0;
+  __asm__ volatile("mrs %0, tpidr_el0" : "=r"(tp));
+  const std::intptr_t here =
+      reinterpret_cast<std::intptr_t>(&t_c_stack_soft_limit) -
+      static_cast<std::intptr_t>(tp);
+  if (here >= INT32_MIN && here <= INT32_MAX) {
+    g_cstack_soft_limit_tls_offset311 = static_cast<int32_t>(here);
+  } else {
+    g_cstack_soft_limit_tls_offset311 = -1;
+  }
+}
+
+extern "C" int32_t Ci_JitShell311_CStackSoftLimitTlsOffset(void) {
+  return g_cstack_soft_limit_tls_offset311;
+}
+
+// First compiled call on a thread: establish its limits.  The guard stub
+// preserves the vectorcall registers around this call and then diverts the
+// call to the interpreter, so the limit is in place from the next call on.
+extern "C" void Ci_JitShell311_InitCStackLimits(void) {
+  initCStackLimits311();
+}
+
+// Fallback for the guard when the TLS offset is unknown: the full C check.
+extern "C" int Ci_JitShell311_CStackSoftLimitReached(void) {
+  return cStackSoftLimitReached311() ? 1 : 0;
+}
+
+// vectorcall-shaped: the guard tail-branches here when the stack pointer is
+// below the soft limit, mirroring the shell's RecursionError.
+extern "C" PyObject* Ci_JitShell311_CStackOverflow(
+    PyObject* /* func */,
+    PyObject* const* /* args */,
+    size_t /* nargsf */,
+    PyObject* /* kwnames */) {
+  PyErr_SetString(PyExc_RecursionError, "maximum recursion depth exceeded");
+  return nullptr;
+}
+#endif
 
 // The strict MR-04 execute surface: everything the shadow eligibility
 // rejects, plus the argument shape, the artifact ownership rule and the
@@ -439,7 +501,7 @@ extern "C" void* Ci_JitShell311_InstalledArtifact(PyFunctionObject* func) {
   if (compiled == nullptr ||
       (func->vectorcall !=
            reinterpret_cast<vectorcallfunc>(Ci_JitShell311_GuardedEntry) &&
-       func->vectorcall != compiled->artifactGuardedEntry311()) ||
+       !compiled->isInstalledEntry311(func->vectorcall)) ||
       extra->jit_globals != func->func_globals ||
       extra->jit_builtins != func->func_builtins ||
       // The artifact must be this function's own.
@@ -451,6 +513,95 @@ extern "C" void* Ci_JitShell311_InstalledArtifact(PyFunctionObject* func) {
 
 extern "C" void* Ci_JitShell311_InvocationArtifact(void) {
   return t_invocation_artifact;
+}
+
+// Direct entry has no per-call C shell to fail closed when the frame
+// evaluator is gone or the JIT is paused/disabled, so the generated entry
+// guard reads this byte instead: 1 while the evaluator is installed and the
+// JIT is usable.  Refreshed on every state transition of either input.
+// The guard reads two things through one materialized address: the usable
+// byte (JIT state, refreshed on every transition) and the evaluator our
+// frames expect in the interpreter's PEP 523 slot (compared live on every
+// entry, so a third party replacing the slot is noticed without a refresh).
+extern "C" PyObject*
+Ci_EvalFrame(PyThreadState* tstate, _PyInterpreterFrame* frame, int throwflag);
+extern "C" Ci_JitDirectEntryGate311Layout Ci_JitDirectEntryGate311 = {
+    nullptr,
+    0};
+extern "C" void Ci_JitShell311_RefreshDirectEntryGate(void) {
+  Ci_JitDirectEntryGate311.eval_frame = reinterpret_cast<void*>(&Ci_EvalFrame);
+  Ci_JitDirectEntryGate311.usable =
+      Ci_EvalHook311_IsInstalled() && jit::isJitUsable() ? 1 : 0;
+}
+
+// Artifact lifetime under direct entry.  The guarded C shell pinned the
+// artifact for the duration of every call; the generated entry does not.
+// Instead every compilation that links its frame inline counts itself in
+// and out of Ci_JitActiveFrames311 (entry at the inline frame link and at an
+// OSR entry, exit at the hard-exit epilogue that normal returns, exceptions
+// and deopt exits all pass through), and an artifact whose last reference
+// is dropped while any such frame is live is not destroyed: its dealloc
+// resurrects it onto the graveyard, and the graveyard is swept -- the
+// deferred destruction runs -- at the next safe point with no machine-code
+// frame on any stack (compile, uncompile, finalize, or the next evaluator
+// frame).  This covers every release path -- force_uncompile, clearing the
+// function's __dict__, GC, artifact replacement, ROI backoff from a deopt --
+// in one place, and the graveyard drains as soon as the stack unwinds.
+extern "C" uint8_t Ci_JitGraveyardPending311 = 0;
+
+namespace {
+// Intrusive singly linked chain through CompiledFunction::graveyard_next_311;
+// parking an artifact allocates nothing, so a failed allocation can never
+// escape tp_dealloc or leave a resurrected object untracked.
+PyObject* g_artifact_graveyard_head = nullptr;
+size_t g_artifact_graveyard_size = 0;
+
+jit::CompiledFunction* asArtifact(PyObject* artifact) {
+  return reinterpret_cast<jit::CompiledFunction*>(artifact);
+}
+} // namespace
+
+extern "C" int Ci_JitShell311_ArtifactClearDeferred(void) {
+  return *jit::triggerStatsActiveFramesAddress() != 0;
+}
+
+extern "C" int Ci_JitShell311_DeferArtifactRelease(PyObject* artifact) {
+  if (*jit::triggerStatsActiveFramesAddress() == 0) {
+    return 0;
+  }
+  // Resurrect: the refcount reached zero inside tp_dealloc; make it look as
+  // if the original release never happened (refcount accounting, tracing)
+  // and hold the only reference from the chain.
+  _Py_NewReference(artifact);
+  asArtifact(artifact)->graveyard_next_311 = g_artifact_graveyard_head;
+  g_artifact_graveyard_head = artifact;
+  g_artifact_graveyard_size++;
+  Ci_JitGraveyardPending311 = 1;
+  return 1;
+}
+
+extern "C" void Ci_JitShell311_SweepGraveyard(void) {
+  if (*jit::triggerStatsActiveFramesAddress() != 0 ||
+      g_artifact_graveyard_head == nullptr) {
+    return;
+  }
+  // Detach the whole chain first: a destructor can run Python that compiles
+  // or retires other functions; those arrive on the fresh chain and are
+  // swept by the next call.
+  PyObject* dead = g_artifact_graveyard_head;
+  g_artifact_graveyard_head = nullptr;
+  g_artifact_graveyard_size = 0;
+  Ci_JitGraveyardPending311 = 0;
+  while (dead != nullptr) {
+    PyObject* next = asArtifact(dead)->graveyard_next_311;
+    asArtifact(dead)->graveyard_next_311 = nullptr;
+    Py_DECREF(dead);
+    dead = next;
+  }
+}
+
+extern "C" size_t Ci_JitShell311_GraveyardSize(void) {
+  return g_artifact_graveyard_size;
 }
 
 // RuntimeTests uses this to enter synthetic artifacts which are not installed
@@ -484,6 +635,24 @@ extern "C" PyObject* Ci_JitShell311_InvokeArtifact(
   // call onto a different artifact or the interpreter's vectorcall layout.
   Ref<jit::CompiledFunction> pin{Ref<jit::CompiledFunction>::create(compiled)};
   InvocationArtifactScope invocation(compiled);
+  // A synthetic artifact is entered on request: the generated entry guard
+  // must find the direct-entry gate open for this call even when no frame
+  // evaluator is installed and the JIT is not usable (the RuntimeTests
+  // fixtures), exactly as the guarded shell entered the body without
+  // consulting the gate.  The gate is restored once machine code returns.
+  struct DirectEntryGateOverride311 {
+    Ci_JitDirectEntryGate311Layout saved;
+    explicit DirectEntryGateOverride311(PyThreadState* tstate)
+        : saved(Ci_JitDirectEntryGate311) {
+      Ci_JitDirectEntryGate311.eval_frame =
+          reinterpret_cast<void*>(tstate->interp->eval_frame);
+      Ci_JitDirectEntryGate311.usable = 1;
+    }
+    ~DirectEntryGateOverride311() {
+      Ci_JitDirectEntryGate311 = saved;
+    }
+  };
+  DirectEntryGateOverride311 gate_override{PyThreadState_GET()};
   return compiled->vectorcallEntry()(func_obj, args, nargsf, kwnames);
 }
 

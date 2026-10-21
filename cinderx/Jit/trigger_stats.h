@@ -56,6 +56,17 @@ struct TriggerStats {
 void triggerStatsOnExecutableAlloc(std::size_t bytes);
 void triggerStatsOnCompiledFunctionCreate();
 void triggerStatsOnMachineCodeEntry(PyCodeObject* code = nullptr);
+// Cells the inline frame link (CPython 3.11, AArch64) reads and writes
+// directly: the entry counter is bumped in machine code under the GIL (the
+// C++ side only ever reads it relaxed), and the ledger flag decides whether
+// the entry is handed to triggerStatsOnMachineCodeEntry() instead.
+uint64_t* triggerStatsMachineCodeEntriesAddress();
+// Live counted machine-code frames of the CPython 3.11 direct entry; laid
+// out 8 bytes after the entry counter (see triggerStatsActiveFramesAddress).
+uint64_t* triggerStatsActiveFramesAddress();
+#if PY_VERSION_HEX < 0x030C0000
+const uint8_t* triggerStatsEntryLedgerEnabledAddress();
+#endif
 void triggerStatsOnShadowCompile(
     std::size_t code_bytes,
     uint64_t specialized_opcodes);

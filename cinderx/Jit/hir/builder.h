@@ -219,6 +219,10 @@ class HIRBuilder {
       const jit::BytecodeInstruction& bc_instr,
       Register* receiver,
       int name_idx);
+  // CPython 3.11 generator-family frames keep their localsplus current at
+  // every store so a suspended generator's gi_frame.f_locals observes the
+  // live values (normal frames rebuild their locals from deopt metadata).
+  bool frameLocalsWrittenThrough311() const;
   void emitStoreFrameLocal311(TranslationContext& tc, int idx, Register* value);
   void emitLocalsplusWriteback311(TranslationContext& tc);
   void emitLoadMethod(TranslationContext& tc, int name_idx);

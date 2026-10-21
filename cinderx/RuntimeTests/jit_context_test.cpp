@@ -277,6 +277,13 @@ TEST_F(JITContextTest, DecrefsPrecedeTheNextBoundaryPoll) {
       "    return 42",
       "func"));
   ASSERT_NE(func, nullptr);
+  // The per-bytecode instrumentation polls are opt-in
+  // (PYTHONJITSUPPORTINSTRUMENTATION=1); this contract is about their
+  // placement relative to Decrefs, so turn them on for this compile.
+  auto saved_instrumentation = jit::getConfig().support_instrumentation;
+  SCOPE_EXIT(
+      jit::getMutableConfig().support_instrumentation = saved_instrumentation);
+  jit::getMutableConfig().support_instrumentation = true;
 
   std::unique_ptr<jit::hir::Function> irfunc =
       jit::compileToFinalHIRForTest(func);
@@ -492,23 +499,54 @@ def replacement(a, b):
   EXPECT_FALSE(prior_art->functions().contains(func.get()))
       << "the settled takeover left the prior claim standing";
 #if PY_VERSION_HEX < 0x030C0000
-  if (new_art->artifactGuardedEntry311() != nullptr) {
-    EXPECT_EQ(func->vectorcall, new_art->artifactGuardedEntry311())
-        << "takeover left the function on the prior stub";
-    if (prior_art->artifactGuardedEntry311() != nullptr) {
-      EXPECT_NE(func->vectorcall, prior_art->artifactGuardedEntry311());
-    }
-  } else {
-    EXPECT_EQ(
-        func->vectorcall,
-        reinterpret_cast<vectorcallfunc>(Ci_JitShell311_GuardedEntry));
-  }
+  // The installed entry is the successor's: its guarded stub, or the
+  // generated entry itself under direct entry (AArch64).
+  EXPECT_TRUE(new_art->isInstalledEntry311(func->vectorcall))
+      << "takeover left the function on the prior stub";
+  EXPECT_FALSE(prior_art->isInstalledEntry311(func->vectorcall));
+#else
+  EXPECT_EQ(func->vectorcall, new_art->vectorcallEntry());
 #endif
   EXPECT_EQ(
       PyDict_GetItemWithError(func->func_dict, jit::kCompiledFunctionKey),
       reinterpret_cast<PyObject*>(new_art));
   PyErr_Clear();
 }
+#if PY_VERSION_HEX < 0x030C0000
+extern "C" void Ci_JitShell311_SweepGraveyard(void);
+extern "C" size_t Ci_JitShell311_GraveyardSize(void);
+extern "C" uint8_t Ci_JitGraveyardPending311;
+
+TEST_F(JITContextTest, DeferredArtifactReleaseChainsWithoutAllocation) {
+  // An artifact whose last reference is dropped while a counted machine-code
+  // frame is live is parked on an intrusive chain: no allocation happens in
+  // tp_dealloc, every parked artifact is accounted for, the sweep refuses
+  // while the frame is live and drains the whole chain once it is gone.
+  // The fixture does not initialize the artifact type (no cinderjit module);
+  // PyType_Ready is idempotent.
+  ASSERT_EQ(PyType_Ready(jit::getCompiledFunctionType()), 0);
+  uint64_t* live_frames = jit::triggerStatsActiveFramesAddress();
+  ASSERT_EQ(*live_frames, 0u);
+  ASSERT_EQ(Ci_JitShell311_GraveyardSize(), 0u);
+  *live_frames = 1;
+  constexpr size_t kArtifacts = 4096;
+  for (size_t i = 0; i < kArtifacts; i++) {
+    Ref<jit::CompiledFunction> artifact = jit::CompiledFunction::create(
+        jit::CompiledFunctionData{}, /*immortal=*/false);
+    ASSERT_NE(artifact, nullptr);
+  }
+  EXPECT_EQ(Ci_JitShell311_GraveyardSize(), kArtifacts);
+  EXPECT_EQ(Ci_JitGraveyardPending311, 1);
+  Ci_JitShell311_SweepGraveyard();
+  EXPECT_EQ(Ci_JitShell311_GraveyardSize(), kArtifacts)
+      << "swept while a counted frame was live";
+  *live_frames = 0;
+  Ci_JitShell311_SweepGraveyard();
+  EXPECT_EQ(Ci_JitShell311_GraveyardSize(), 0u);
+  EXPECT_EQ(Ci_JitGraveyardPending311, 0);
+}
+#endif
+
 TEST_F(JITContextTest, TeardownReleasesCannotOutliveTheDeathWatch) {
   SKIP_311_EXECUTABLE_COMPILE();
 

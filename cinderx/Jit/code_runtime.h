@@ -119,6 +119,37 @@ class alignas(16) CodeRuntime {
   // Check if this is a generator/coroutine/async generator.
   bool isGen() const;
 
+  // Set at LIR generation when this compilation emitted the
+  // inline recursion ledger (decrement at frame build, increment at the
+  // epilogue).  Deopt and OSR exits consult it to keep the ledger balanced:
+  // a deopt exit bypasses the epilogue's repayment, and an OSR entry
+  // bypasses the frame-build decrement.
+  bool entryGuardInlined() const {
+    return entry_guard_inlined_;
+  }
+  void setEntryGuardInlined(bool value) {
+    entry_guard_inlined_ = value;
+  }
+  // Set at LIR generation when this compilation counts its live frames in
+  // Ci_JitActiveFrames311 (inline frame link and OSR entry count in, the
+  // hard-exit epilogue counts out).  The deferred artifact reclamation keys
+  // on that counter.
+  bool activeFrameCounted() const {
+    return active_frame_counted_;
+  }
+  void setActiveFrameCounted(bool value) {
+    active_frame_counted_ = value;
+  }
+  // The inline-linked 3.11 frame of this compilation
+  // holds no references of its own to f_func / f_code; every path that
+  // hands the frame to code expecting owned references adds them first.
+  bool frameNoRef() const {
+    return frame_no_ref_;
+  }
+  void setFrameNoRef(bool value) {
+    frame_no_ref_ = value;
+  }
+
   BorrowedRef<PyCodeObject> code() const;
   BorrowedRef<PyDictObject> builtins() const;
   BorrowedRef<PyDictObject> globals() const;
@@ -183,6 +214,11 @@ class alignas(16) CodeRuntime {
 #if PY_VERSION_HEX < 0x030C0000
   CompiledFunction* compiled_function_{nullptr};
 #endif
+  // See entryGuardInlined().
+  bool entry_guard_inlined_{false};
+  // See activeFrameCounted().
+  bool active_frame_counted_{false};
+  bool frame_no_ref_{false};
 
   // References owned by this CodeRuntime.
   std::unordered_set<ThreadedRef<PyObject>> references_;

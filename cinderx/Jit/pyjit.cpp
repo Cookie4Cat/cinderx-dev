@@ -79,9 +79,27 @@
 #if PY_VERSION_HEX < 0x030C0000
 // The MR-04 execute surface, defined in Jit/pyjit_311_gate.cpp.
 #include "cinderx/Interpreter/3.11/eval_hook.h"
+
+#if PY_VERSION_HEX < 0x030C0000
+extern "C" void Ci_JitShell311_RefreshDirectEntryGate(void);
+extern "C" void Ci_JitShell311_SweepGraveyard(void);
+#if defined(CINDER_AARCH64)
+extern "C" void Ci_JitShell311_InitCStackSoftLimitTls(void);
+#endif
+#endif
 #include "cinderx/Interpreter/3.11/observe.h"
 extern "C" const char* Ci_JitShell311_TakeExecuteRefusal(void);
 #endif
+
+// Every JIT state transition goes through here so that, on CPython 3.11, the
+// direct-entry gate the generated entry guards read stays in step with
+// isJitUsable().  Other versions only set the state.
+static inline void ciSetJitState(jit::State state) {
+  jit::getMutableConfig().state = state;
+#if PY_VERSION_HEX < 0x030C0000
+  Ci_JitShell311_RefreshDirectEntryGate();
+#endif
+}
 
 using namespace jit;
 
@@ -2178,6 +2196,14 @@ bool deoptFuncImpl(BorrowedRef<PyFunctionObject> func) {
 void uncompileImpl(BorrowedRef<PyFunctionObject> func) {
   deoptFuncImpl(func);
   jitCtx()->forgetCode(func);
+#if PY_VERSION_HEX < 0x030C0000
+  // This path is reachable from prepareForDeopt with the retiring artifact's
+  // machine code still live on the C stack (ROI-backoff despecialization
+  // runs at deopt time); the artifact's dealloc has deferred itself onto the
+  // graveyard in that case, and the sweep is a no-op until the stack
+  // unwinds.
+  Ci_JitShell311_SweepGraveyard();
+#endif
 }
 
 void uncompile(BorrowedRef<PyFunctionObject> func) {
@@ -2233,7 +2259,7 @@ void disable_jit_impl(bool deopt_all) {
   }
 
   if (isJitUsable()) {
-    getMutableConfig().state = State::kPaused;
+    ciSetJitState(State::kPaused);
     getMutableConfig().osr_capable = false;
     setInterpreterJitFlag(false);
     syncOSRFlags();
@@ -2384,7 +2410,7 @@ bool enable_jit_impl() {
   // only here; other versions keep the order they had.
   const State state_before_flip = getConfig().state;
   setInterpreterJitFlag(true);
-  getMutableConfig().state = State::kRunning;
+  ciSetJitState(State::kRunning);
   syncOSRFlags();
   if (!reattachParkedFuncs()) {
     // enable() either completes or leaves the world as it found it.  The
@@ -2399,7 +2425,7 @@ bool enable_jit_impl() {
     // walk's anchor drain -- is not overwritten either.
     if (isJitUsable()) {
       setInterpreterJitFlag(false);
-      getMutableConfig().state = state_before_flip;
+      ciSetJitState(state_before_flip);
       syncOSRFlags();
     }
     return false;
@@ -2422,7 +2448,7 @@ bool enable_jit_impl() {
 #endif
 
   setInterpreterJitFlag(true);
-  getMutableConfig().state = State::kRunning;
+  ciSetJitState(State::kRunning);
   syncOSRFlags();
 
   JIT_DLOG("Re-enabled the JIT");
@@ -3487,6 +3513,10 @@ PyObject* force_uncompile(PyObject* /* self */, PyObject* arg) {
     claimed.reset();
     detained_anchors.clear();
     jitCtx()->drainDeferredAnchorReleases();
+    // An artifact whose machine code is still on the stack (this call made
+    // from inside the function being retired) has deferred its destruction;
+    // reclaim what can be reclaimed now.
+    Ci_JitShell311_SweepGraveyard();
     // Verdict AFTER the releases: a __del__ there can reenter
     // force_compile(), and a rebuilt compilation state is a newer decision
     // this operation must not report over (symmetric to force_compile's
@@ -5685,6 +5715,18 @@ bool isLightweightFramesCompiledIn() {
 }
 
 int validateFrameModeConfig() {
+#if PY_VERSION_HEX < 0x030C0000
+  // CPython 3.11 runs the materialized frame only: the inline frame
+  // protocol below assumes it, and lightweight frames have no 3.11 delivery.
+  // The opt-in is refused rather than erroring so a shared environment
+  // keeps working; the frame-mode queries report normal frames.
+  if (getConfig().frame_mode == FrameMode::kLightweight) {
+    JIT_LOG(
+        "PYTHONJITLIGHTWEIGHTFRAME is not supported on CPython 3.11; "
+        "using normal frames");
+    getMutableConfig().frame_mode = FrameMode::kNormal;
+  }
+#endif
   if (getConfig().frame_mode == FrameMode::kLightweight &&
       !isLightweightFramesCompiledIn()) {
     PyErr_SetString(
@@ -6094,9 +6136,15 @@ int initialize() {
     std::unique_ptr<ICodeAllocator> code_allocator{CodeAllocator::make()};
     auto jit_context = std::make_unique<CompilerContext<Compiler>>();
     jit::codegen::initThreadStateOffset();
+#if defined(CINDER_AARCH64) && PY_VERSION_HEX < 0x030C0000
+    Ci_JitShell311_InitCStackSoftLimitTls();
+#endif
+#if defined(CINDER_AARCH64) && PY_VERSION_HEX < 0x030C0000
+    Ci_JitShell311_InitCStackSoftLimitTls();
+#endif
     shadow_mod_state->code_allocator = std::move(code_allocator);
     shadow_mod_state->jit_context = std::move(jit_context);
-    getMutableConfig().state = State::kShadow;
+    ciSetJitState(State::kShadow);
     return 0;
   }
 
@@ -6113,12 +6161,16 @@ int initialize() {
   // 3.11 frames still leave machine code through the existing per-bytecode
   // instrumentation polls; the stack-IP patcher is a no-op for this frame
   // mode/architecture.
-  getMutableConfig().support_instrumentation = true;
-  // The 3.12+ behaviour classifier (PYTHONJITAUTO=auto[:N]) is not part of
-  // this port: the 3.11 scheduler takes a plain threshold, and the
-  // classifier's per-code state machine has no 3.11 opcode tables.  The
-  // observe parser already refuses the environment spelling; the -X
-  // option reaches only this flag, so refuse it here too.
+  // The per-bytecode instrumentation poll keeps the config default (off):
+  // a 3-opcode function body would pick up 13 CheckInstrumentation
+  // instructions from it.  sys.settrace/sys.setprofile pause the JIT and
+  // deoptimize the frames on the stack instead;
+  // PYTHONJITSUPPORTINSTRUMENTATION=1 restores the polls. The 3.12+ behaviour
+  // classifier (PYTHONJITAUTO=auto[:N]) is not part of this port: the 3.11
+  // scheduler takes a plain threshold, and the classifier's per-code state
+  // machine has no 3.11 opcode tables.  The observe parser already refuses the
+  // environment spelling; the -X option reaches only this flag, so refuse it
+  // here too.
   if (getConfig().auto_classify) {
     PyErr_SetString(
         PyExc_RuntimeError,
@@ -6172,6 +6224,12 @@ int initialize() {
     std::unique_ptr<ICodeAllocator> code_allocator{CodeAllocator::make()};
     auto jit_context = std::make_unique<CompilerContext<Compiler>>();
     jit::codegen::initThreadStateOffset();
+#if defined(CINDER_AARCH64) && PY_VERSION_HEX < 0x030C0000
+    Ci_JitShell311_InitCStackSoftLimitTls();
+#endif
+#if defined(CINDER_AARCH64) && PY_VERSION_HEX < 0x030C0000
+    Ci_JitShell311_InitCStackSoftLimitTls();
+#endif
     canary_mod_state->code_allocator = std::move(code_allocator);
     canary_mod_state->jit_context = std::move(jit_context);
   }
@@ -6222,7 +6280,7 @@ int initialize() {
   // advancing by eight quickens on the first interpreted entry, before the
   // required PYTHONJITAUTO=2 compilation gate.
   Ci_QuickenWarmupStep_311 = 8;
-  getMutableConfig().state = State::kRunning;
+  ciSetJitState(State::kRunning);
   return 0;
 #endif
 
@@ -6255,6 +6313,9 @@ int initialize() {
   // directly from the thread-local segment register instead of calling
   // _PyThreadState_GetCurrent().
   jit::codegen::initThreadStateOffset();
+#if defined(CINDER_AARCH64) && PY_VERSION_HEX < 0x030C0000
+  Ci_JitShell311_InitCStackSoftLimitTls();
+#endif
 
   // Initialize the main compiler object and its context.  This will throw if
   // asmjit cannot initialize.
@@ -6278,7 +6339,7 @@ int initialize() {
 
   setInterpreterJitFlag(true);
   getMutableConfig().osr_capable = true;
-  getMutableConfig().state = State::kRunning;
+  ciSetJitState(State::kRunning);
   syncOSRFlags();
 
   mod_state->jit_list = std::move(jit_list);
@@ -6311,9 +6372,12 @@ void finalize() {
   if (!isJitInitialized()) {
     return;
   }
+#if PY_VERSION_HEX < 0x030C0000
+  Ci_JitShell311_SweepGraveyard();
+#endif
 
   if (isJitShadow()) {
-    getMutableConfig().state = State::kFinalizing;
+    ciSetJitState(State::kFinalizing);
     jit::executionEntryLedgerDisable();
     jit::runtimeTransitionLedgerDisable();
 
@@ -6340,13 +6404,13 @@ void finalize() {
 #if PY_VERSION_HEX < 0x030C0000
     Ci_QuickenWarmupStep_311 = 1;
 #endif
-    getMutableConfig().state = State::kNotInitialized;
+    ciSetJitState(State::kNotInitialized);
     return;
   }
 
   // Disable the JIT first so nothing we do in here ends up attempting to
   // invoke the JIT while we're finalizing our data structures.
-  getMutableConfig().state = State::kFinalizing;
+  ciSetJitState(State::kFinalizing);
   setInterpreterJitFlag(false);
   syncOSRFlags();
   jit::executionEntryLedgerDisable();
@@ -6434,7 +6498,7 @@ void finalize() {
 #if PY_VERSION_HEX < 0x030C0000
   Ci_QuickenWarmupStep_311 = 1;
 #endif
-  getMutableConfig().state = State::kNotInitialized;
+  ciSetJitState(State::kNotInitialized);
   getMutableConfig().osr_capable = false;
   syncOSRFlags();
 }

@@ -178,6 +178,9 @@ int64_t JITRT_ConsumeForcedDeopt(jit::CodeRuntime* code_rt, uint64_t deopt_id);
 // localsplus slot (MR-08 frame observability; value may be nullptr for
 // DELETE_FAST).  Returns 0.
 uint64_t JITRT_StoreFrameLocal311(uint64_t idx, PyObject* value);
+PyThreadState* JITRT_AllocateAndLinkInterpreterFrameNoRef311(
+    PyFunctionObject* func);
+void JITRT_UnlinkFrameNoRef311(PyThreadState* tstate);
 #endif
 
 /*

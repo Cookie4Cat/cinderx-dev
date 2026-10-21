@@ -48,11 +48,22 @@ int Ci_JitRecursionBoundary311_Refuse(PyThreadState* tstate) {
 // PEP 523 entry point.  Once installed, every Python frame in the process
 // enters here and runs on the vendored CPython 3.11.6 evaluator instead of
 // libpython's own copy.
+extern uint64_t* const Ci_JitActiveFrames311Ptr;
+extern uint8_t Ci_JitGraveyardPending311;
+extern void Ci_JitShell311_SweepGraveyard(void);
+
 PyObject* _Py_HOT_FUNCTION
 Ci_EvalFrame(PyThreadState* tstate, _PyInterpreterFrame* frame, int throwflag) {
   if (Ci_JitRecursionBoundary311_IsActive()) {
     Ci_JitRecursionBoundary311_Refuse(tstate);
     return NULL;
+  }
+  // Deferred artifact reclamation: an artifact retired while its machine
+  // code was on the stack waits on the graveyard; the first evaluator frame
+  // entered with no live machine-code frame destroys it.  One byte test on
+  // the common path.
+  if (Ci_JitGraveyardPending311 && *Ci_JitActiveFrames311Ptr == 0) {
+    Ci_JitShell311_SweepGraveyard();
   }
   // The counting modes' whole disabled-path budget is this predictable flag
   // test; counting, discard-only compilation and execute-mode scheduling

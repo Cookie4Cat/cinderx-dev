@@ -608,6 +608,12 @@ expected = (True, 6.0, 1)
   auto saved_state = jit::getConfig().state;
   SCOPE_EXIT(jit::getMutableConfig().state = saved_state);
   jit::getMutableConfig().state = jit::State::kRunning;
+  // The per-bytecode instrumentation polls are opt-in
+  // (PYTHONJITSUPPORTINSTRUMENTATION=1); this test keys on one of them.
+  auto saved_instrumentation = jit::getConfig().support_instrumentation;
+  SCOPE_EXIT(
+      jit::getMutableConfig().support_instrumentation = saved_instrumentation);
+  jit::getMutableConfig().support_instrumentation = true;
   auto irfunc = jit::compileToFinalHIRForTest(func);
   ASSERT_NE(irfunc, nullptr);
 

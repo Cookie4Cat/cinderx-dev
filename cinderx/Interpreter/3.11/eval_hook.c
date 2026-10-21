@@ -40,6 +40,8 @@ static int check_main_interpreter(PyInterpreterState* interp) {
   return 0;
 }
 
+extern void Ci_JitShell311_RefreshDirectEntryGate(void);
+
 int Ci_EvalHook311_Install(void) {
   PyThreadState* tstate = PyThreadState_Get();
   if (tstate == NULL) {
@@ -93,6 +95,7 @@ int Ci_EvalHook311_Install(void) {
   ci_eval_hook_state.original = current;
   ci_eval_hook_state.owner_interp = interp;
   ci_eval_hook_state.installed = 1;
+  Ci_JitShell311_RefreshDirectEntryGate();
   ci_eval_hook_state.generation++;
   return 0;
 }
@@ -125,6 +128,7 @@ Ci_EvalHook311_RemoveResult Ci_EvalHook311_Remove(void) {
     ci_eval_hook_state.installed = 0;
     ci_eval_hook_state.owner_interp = NULL;
     ci_eval_hook_state.original = NULL;
+    Ci_JitShell311_RefreshDirectEntryGate();
     return CI_EVAL_HOOK_OWNERSHIP_LOST;
   }
 
@@ -132,6 +136,7 @@ Ci_EvalHook311_RemoveResult Ci_EvalHook311_Remove(void) {
   ci_eval_hook_state.installed = 0;
   ci_eval_hook_state.owner_interp = NULL;
   ci_eval_hook_state.original = NULL;
+  Ci_JitShell311_RefreshDirectEntryGate();
   return CI_EVAL_HOOK_REMOVED;
 }
 

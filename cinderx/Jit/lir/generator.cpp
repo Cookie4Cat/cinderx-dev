@@ -27,6 +27,7 @@ extern "C" {
 #endif
 }
 
+#include "cinderx/Common/extra-py-flags.h"
 #include "cinderx/Common/log.h"
 #include "cinderx/Common/py-portability.h"
 #include "cinderx/Common/util.h"
@@ -57,6 +58,26 @@ extern "C" {
 #include <fmt/ostream.h>
 
 #include <algorithm>
+#include <cstdlib>
+
+// CPython 3.11 normal frames are linked and unlinked inline (see
+// canInlineNormalFrame / emitInlineLinkNormalFrame).  The inline-linked
+// frame keeps no owned references to f_func / f_code: the caller holds func
+// for the whole call (vectorcall contract) and the compiled artifact pins
+// code, so the frame's own pair would only add four refcount
+// read-modify-writes per call.  The slow link / unlink helpers and the deopt
+// hand-off restore stock ownership.  Code with cell / free variables takes
+// the same ritual: cell variables never touch the frame (MakeCell keeps the
+// fresh cell in a register and the slot stays NULL, exactly as the C link
+// path leaves it), so only the free-variable slots need two extra steps --
+// the entry stores the closure cells (one owned reference each) into their
+// localsplus slots, the inline form of JITRT_InitFrameCellVars, and the exit
+// releases those same slots.  The unlink reads the frame it linked (the
+// prologue phi of the fast-path bump and the slow-path reload) instead of
+// re-deriving it through tstate->cframe->current_frame, and the link reuses
+// the thread state the generated entry guard already loaded (bound from
+// INITIAL_TSTATE_REG) instead of a second mov/movk/ldr chain at the head of
+// the frame push.
 #include <cstring>
 #include <functional>
 #include <iterator>
@@ -298,6 +319,7 @@ BasicBlock* LIRGenerator::GenerateEntryBlock() {
 
   env_->asm_extra_args = bindVReg(codegen::INITIAL_EXTRA_ARGS_REG);
   env_->asm_tstate = bindVReg(codegen::INITIAL_TSTATE_REG);
+  env_->asm_tstate_entry = env_->asm_tstate;
   env_->asm_func = bindVReg(codegen::INITIAL_FUNC_REG);
 
   entry_block_->addSuccessor(frame_setup_block_);
@@ -376,9 +398,9 @@ class FrameInitPlan {
   template <typename Provider>
   static FrameInitPlan build(
       Provider&& provider,
-      [[maybe_unused]] int nlocalsplus = 0) {
+      const FrameInitTable& table = kFrameInitTable,
+      int nlocalsplus = 0) {
     FrameInitPlan plan;
-    constexpr auto& table = kFrameInitTable;
     for (size_t i = 0; i < table.num_fields; i++) {
       const auto& field = table.fields[i];
       Instruction* val = provider(field.kind, field.data_type);
@@ -418,13 +440,11 @@ class FrameInitPlan {
       plan.groups_[plan.num_groups_++] = {
           static_cast<uint8_t>(start), static_cast<uint8_t>(i - start)};
     }
-#if !defined(ENABLE_LIGHTWEIGHT_FRAMES) || PY_VERSION_HEX < 0x030C0000
     if (nlocalsplus > 0) {
       plan.localsplus_zero_offset_ =
           static_cast<int32_t>(offsetof(_PyInterpreterFrame, localsplus));
       plan.localsplus_zero_count_ = nlocalsplus;
     }
-#endif
     return plan;
   }
 
@@ -956,11 +976,11 @@ void GenerateArgcountCheckBlocks(
         nullptr,
         PhyReg{nargsf_reg, OperandBase::k32bit},
         PhyReg{kwnames_reg, OperandBase::k32bit});
-#if PY_VERSION_HEX < 0x030C0000
-    // 3.11: a matching count is a successful bind.  Consume recursion at
-    // body reentry instead of jumping into the body from GuardedEntry
-    // without an Enter.  Primitive-double returns keep the old jump;
-    // that ABI is not the canary vectorcall.
+#if PY_VERSION_HEX < 0x030C0000 && !defined(CINDER_AARCH64)
+    // 3.11 without the inline entry guard: a matching count is a successful
+    // bind.  Consume recursion at body reentry instead of jumping into the
+    // body from GuardedEntry without an Enter.  Primitive-double returns keep
+    // the old jump; that ABI is not the canary vectorcall.
     if (!returns_primitive_double) {
       auto* wrong_count = lir_func->allocateBasicBlock();
       argcount_check->allocateInstr(
@@ -1234,7 +1254,23 @@ void LIRGenerator::GenerateExitBlocks(bool has_normal_return) {
       bool has_freevars =
           func_->code != nullptr && func_->code->co_nfreevars > 0;
       if (func_->frameMode == FrameMode::kNormal) {
-        bbb.appendInvokeInstruction(JITRT_UnlinkFrame, env_->asm_tstate);
+#if PY_VERSION_HEX < 0x030C0000
+        if (canInlineNormalFrame()) {
+          emitInlineUnlinkNormalFrame(bbb);
+        } else
+#endif
+        {
+          bbb.appendInvokeInstruction(JITRT_UnlinkFrame, env_->asm_tstate);
+        }
+#if PY_VERSION_HEX < 0x030C0000
+        // Repay the frame-build recursion debit on the normal
+        // return path.  Deopt exits bypass this and are repaid in
+        // prepareForDeopt.
+        if (env_->code_rt->entryGuardInlined()) {
+          bbb.annotateNext("Recursion leave (inline entry guard)");
+          emitRecursionLeave(bbb);
+        }
+#endif
       } else {
         PyObject* executable;
         std::optional<destructor> exec_dtor;
@@ -1851,6 +1887,25 @@ void LIRGenerator::makeIncrefGILEnabled(
 }
 #endif
 
+// Stock 3.11 has no immortal objects and cinderx's heap
+// immortalizer is compiled out below 3.12 (can_immortalize returns false),
+// so no refcount ever carries the sign-bit sentinel.  The type lattice still
+// lets unknown objects "could be" immortal, which costs every incref a
+// 32-bit overflow-checked form with a branch and every decref a tbnz on the
+// sign bit (incref+decref are 9.2% of JIT self time in the census).  With
+// the switch set the plain mortal forms are emitted, matching stock's
+// Py_INCREF/Py_DECREF exactly.
+static bool possibleImmortal311(bool lattice_says) {
+#if PY_VERSION_HEX < 0x030C0000
+  // Stock 3.11 has no immortal objects: the heap immortalization is compiled
+  // out below 3.12 and the pseudo-immortal threshold is invisible in the low
+  // 32 bits, so the type lattice's "could be immortal" never pays off.
+  return false;
+#else
+  return lattice_says;
+#endif
+}
+
 void LIRGenerator::makeIncref(
     BasicBlockBuilder& bbb,
     const hir::Instr& instr,
@@ -1863,7 +1918,10 @@ void LIRGenerator::makeIncref(
   }
 
   makeIncref(
-      bbb, bbb.getDefInstr(obj), xincref, obj->type().couldBe(TImmortalObject));
+      bbb,
+      bbb.getDefInstr(obj),
+      xincref,
+      possibleImmortal311(obj->type().couldBe(TImmortalObject)));
 }
 
 void LIRGenerator::makeDecref(
@@ -2020,12 +2078,10 @@ void LIRGenerator::makeDecref(
     return;
   }
 
-  makeDecref(
-      bbb,
-      bbb.getDefInstr(obj),
-      obj->type().runtimePyTypeDestructor(),
-      xdecref,
-      obj->type().couldBe(TImmortalObject));
+  std::optional<destructor> dtor = obj->type().runtimePyTypeDestructor();
+  const bool possible_immortal =
+      possibleImmortal311(obj->type().couldBe(TImmortalObject));
+  makeDecref(bbb, bbb.getDefInstr(obj), dtor, xdecref, possible_immortal);
 }
 
 LIRGenerator::TranslatedBlock LIRGenerator::TranslateOneBasicBlock(
@@ -2158,6 +2214,13 @@ LIRGenerator::TranslatedBlock LIRGenerator::TranslateOneBasicBlock(
       }
       case Opcode::kInitFrameCellVars: {
         auto& hir_instr = static_cast<const InitFrameCellVars&>(i);
+#if PY_VERSION_HEX < 0x030C0000
+        // The inline-linked frame takes the inline form.
+        if (!is_gen_ && canInlineNormalFrame()) {
+          emitInlineInitFrameFreeVars(bbb, hir_instr);
+          break;
+        }
+#endif
         bbb.appendInvokeInstruction(
             JITRT_InitFrameCellVars,
             bbb.getDefInstr(hir_instr.func()),
@@ -5146,6 +5209,7 @@ LIRGenerator::TranslatedBlock LIRGenerator::TranslateOneBasicBlock(
               }
               JIT_ABORT("Unexpected FrameFieldKind");
             },
+            kFrameInitTable,
             code->co_nlocalsplus);
         plan.emit(bbb, callee_frame);
 
@@ -6014,6 +6078,7 @@ CurrentFrameAccessor LIRGenerator::makeCurrentFrameAccessor(
 }
 
 void LIRGenerator::emitLoadFrame(BasicBlockBuilder& bbb) {
+  Instruction* inline_linked_frame = nullptr;
   // For non-generator normal (heavy) frames, allocate and link the
   // interpreter frame via a runtime call. This moves the work that
   // was previously done in frame_asm.cpp's linkNormalFunctionFrame
@@ -6063,7 +6128,12 @@ void LIRGenerator::emitLoadFrame(BasicBlockBuilder& bbb) {
 #endif
   } else if (func_->frameMode == FrameMode::kNormal) {
     bbb.annotateNext("Allocate and link interpreter frame");
-    if (kPyDebug) {
+#if PY_VERSION_HEX < 0x030C0000
+    if (canInlineNormalFrame()) {
+      inline_linked_frame = emitInlineLinkNormalFrame(bbb);
+    } else
+#endif
+        if (kPyDebug) {
       env_->asm_tstate = bbb.appendCallInstruction(
           OutVReg{},
           JITRT_AllocateAndLinkInterpreterFrame_Debug,
@@ -6075,6 +6145,23 @@ void LIRGenerator::emitLoadFrame(BasicBlockBuilder& bbb) {
           JITRT_AllocateAndLinkInterpreterFrame_Release,
           env_->asm_func);
     }
+#if PY_VERSION_HEX < 0x030C0000
+    // Recursion ledger debit at frame build (stock order:
+    // count after the frame is linked).  Unconditional here; the overflow
+    // pre-check in the generated entry diverts without touching the
+    // ledger, and the debit is strictly balanced by the epilogue repayment
+    // (emitRecursionLeave), the deopt-exit repayment (prepareForDeopt) and
+    // the OSR-entry debit (emitOSRFrameSetup).  Binding-failure paths
+    // never reach frame build and so carry no ledger entry.
+    if (emitsInlineEntryGuard()) {
+      env_->code_rt->setEntryGuardInlined(true);
+      bbb.annotateNext("Recursion enter (inline entry guard)");
+      emitRecursionEnter(bbb);
+    }
+#endif
+#if PY_VERSION_HEX < 0x030C0000 && defined(CINDER_AARCH64)
+    emitActiveFrameCountIn(bbb);
+#endif
   }
 #ifdef ENABLE_LIGHTWEIGHT_FRAMES
   else if (func_->frameMode == FrameMode::kLightweight) {
@@ -6227,6 +6314,7 @@ void LIRGenerator::emitLoadFrame(BasicBlockBuilder& bbb) {
           }
           JIT_ABORT("Unexpected FrameFieldKind");
         },
+        kFrameInitTable,
         func_->code->co_nlocalsplus);
     plan.emit(bbb, frame);
 
@@ -6310,9 +6398,473 @@ void LIRGenerator::emitLoadFrame(BasicBlockBuilder& bbb) {
     cfa.store(frame);
   }
 #endif
+  if (inline_linked_frame != nullptr) {
+    env_->asm_interpreter_frame = inline_linked_frame;
+    return;
+  }
   bbb.annotateNext("Load current interpreter frame");
   env_->asm_interpreter_frame = makeCurrentFrameAccessor(bbb).load();
 }
+
+#if PY_VERSION_HEX < 0x030C0000
+// Static eligibility for inlining the 3.11 normal (materialized)
+// frame ritual.  The inline exit relies on every localsplus slot it did not
+// write itself still being NULL: nothing stores owned references into the
+// frame's localsplus while the body runs (local-variable stores stay in
+// registers; the frame is rebuilt from deopt metadata when it is
+// materialized).
+bool LIRGenerator::canInlineNormalFrame() const {
+#if !defined(CINDER_AARCH64)
+  // The direct-entry protocol (inline entry guard, live-frame count, counted
+  // epilogue) is emitted for AArch64 only.  Other targets keep the C helper
+  // frame build, which consumes the recursion frame prelinked by the
+  // argument helpers (RecursiveCallAfterBind).
+  return false;
+#endif
+  BorrowedRef<PyCodeObject> code = func_->code;
+  if (kPyDebug || code == nullptr) {
+    return false;
+  }
+  if (code->co_ncellvars == 0 && code->co_nfreevars == 0) {
+    return true;
+  }
+  // Generator-family code never takes the inline link (its frame comes from
+  // JITRT_AllocateAndLinkGenAndInterpreterFrame) and the InitFrameCellVars
+  // lowering keys on this predicate, so exclude it here.
+  return !(code->co_flags & kCoFlagsAnyGenerator);
+}
+
+// 入口：行内分配+初始化+链接解释器帧，镜像
+// JITRT_AllocateAndLinkInterpreterFrame_Release =
+// _PyThreadState_PushFrame 快路径 + _PyFrame_InitializeSpecials +
+// localsplus 置空 + previous/current_frame 链接。所有布局量
+// （framesize/nlocalsplus/code/prev_instr）为编译期常量；数据栈越界
+// 回落 C 全路径（含新 chunk 分配）。引用会计与 C 版逐项等价：f_func、
+// f_code 各持一强引用，f_globals/f_builtins 借用（每调用从 func 现读，
+// 与 InitializeSpecials 同源）。
+Instruction* LIRGenerator::emitInlineLinkNormalFrame(BasicBlockBuilder& bbb) {
+  BorrowedRef<PyCodeObject> code = func_->code;
+  // The fast path already holds the new frame in a
+  // register (the old datastack_top); re-deriving it afterwards through
+  // tstate->cframe->current_frame costs two dependent loads on every call
+  // (1.3% of JIT self time across the census, 2.9% in richards'
+  // isTaskHoldingOrWaiting).  Merge the fast-path register with a slow-path
+  // reload in a phi and hand that to the caller instead.
+
+  bbb.annotateNext("Inline frame link: load tstate");
+  // Every entry of a function carrying the inline entry
+  // guard (vectorcall, direct call, helper reentry trampoline) leaves the
+  // thread state in INITIAL_TSTATE_REG; statically compiled code has a
+  // static entry that bypasses the guard, so it keeps the fresh load.
+  if (env_->asm_tstate_entry != nullptr && emitsInlineEntryGuard() &&
+      !(code->co_flags & CI_CO_STATICALLY_COMPILED)) {
+    env_->asm_tstate = env_->asm_tstate_entry;
+  } else {
+    env_->asm_tstate =
+        bbb.appendInstr(OutVReg{}, Instruction::kLoadThreadState);
+  }
+
+  auto slow_block = bbb.allocateBlock();
+  auto done_block = bbb.allocateBlock();
+
+  const int32_t frame_bytes = static_cast<int32_t>(
+      (code->co_nlocalsplus + code->co_stacksize + FRAME_SPECIALS_SIZE) *
+      kPointerSize);
+  bbb.annotateNext("Inline frame link: datastack bump");
+  Instruction* top = bbb.appendInstr(
+      OutVReg{},
+      Instruction::kMove,
+      Ind{env_->asm_tstate,
+          static_cast<int32_t>(offsetof(PyThreadState, datastack_top))});
+  Instruction* limit = bbb.appendInstr(
+      OutVReg{},
+      Instruction::kMove,
+      Ind{env_->asm_tstate,
+          static_cast<int32_t>(offsetof(PyThreadState, datastack_limit))});
+  Instruction* new_top =
+      bbb.appendInstr(OutVReg{}, Instruction::kLea, Ind{top, frame_bytes});
+  bbb.appendInstr(Instruction::kCmp, new_top, limit);
+  // 镜像 stock：top + size >= limit 即溢出（无符号指针比较）。
+  bbb.appendBranch(Instruction::kBranchAE, slow_block);
+
+  auto fast_block = bbb.allocateBlock();
+  bbb.appendBlock(fast_block);
+  bbb.appendInstr(
+      OutInd{
+          env_->asm_tstate,
+          static_cast<int32_t>(offsetof(PyThreadState, datastack_top))},
+      Instruction::kMove,
+      new_top);
+  Instruction* frame = top;
+
+  CurrentFrameAccessor cfa = makeCurrentFrameAccessor(bbb);
+  Instruction* prev_frame = cfa.load();
+
+  Instruction* code_reg = nullptr;
+  Instruction* zero_reg = nullptr;
+  auto plan = FrameInitPlan::build(
+      [&](FrameFieldKind kind, DataType dt) -> Instruction* {
+        switch (kind) {
+          case FrameFieldKind::kExecutable:
+            JIT_DCHECK(code_reg == nullptr, "should only be emitted once");
+            code_reg = bbb.appendInstr(
+                OutVReg{},
+                Instruction::kMove,
+                reinterpret_cast<PyObject*>(code.get()));
+            return code_reg;
+          case FrameFieldKind::kPrevFrame:
+            return prev_frame;
+          case FrameFieldKind::kFuncObj:
+            return env_->asm_func;
+          case FrameFieldKind::kInstrPtr:
+            return bbb.appendInstr(
+                OutVReg{}, Instruction::kMove, _PyCode_CODE(code.get()) - 1);
+          case FrameFieldKind::kStackPointer:
+            // <0x030E：stacktop = nlocalsplus（32 位立即数）。
+            return bbb.appendInstr(
+                OutVReg{dt},
+                Instruction::kMove,
+                Imm{static_cast<uint64_t>(code->co_nlocalsplus), dt});
+          case FrameFieldKind::kBuiltins:
+            return bbb.appendInstr(
+                OutVReg{},
+                Instruction::kMove,
+                Ind{env_->asm_func, offsetof(PyFunctionObject, func_builtins)});
+          case FrameFieldKind::kGlobals:
+            return bbb.appendInstr(
+                OutVReg{},
+                Instruction::kMove,
+                Ind{env_->asm_func, offsetof(PyFunctionObject, func_globals)});
+          case FrameFieldKind::kZero:
+          case FrameFieldKind::kOwnerThread:
+            static_assert(
+                FRAME_OWNED_BY_THREAD == 0,
+                "FRAME_OWNED_BY_THREAD has changed");
+            if (zero_reg == nullptr) {
+              zero_reg =
+                  bbb.appendInstr(OutVReg{dt}, Instruction::kMove, Imm{0, dt});
+            }
+            return zero_reg;
+          default:
+            JIT_ABORT("Unexpected FrameFieldKind for normal frame");
+        }
+      },
+      kNormalFrameInitTable,
+      code->co_nlocalsplus);
+  plan.emit(bbb, frame);
+
+  // 引用会计：f_func 与 f_code 各持一强引用（镜像调用方 Py_NewRef(func)
+  // + InitializeSpecials 的 Py_NewRef(code)）。
+  const bool frame_no_ref = !(code->co_flags & kCoFlagsAnyGenerator);
+  env_->code_rt->setFrameNoRef(frame_no_ref);
+  if (!frame_no_ref) {
+    bbb.annotateNext("Inline frame link: incref func/code");
+    makeIncref(bbb, env_->asm_func, false);
+    JIT_DCHECK(code_reg != nullptr, "executable field missing from plan");
+    makeIncref(bbb, code_reg, false);
+  }
+
+  // Entry accounting: the inline link bypasses
+  // JITRT_AllocateAndLinkInterpreterFrame, the counting point of the
+  // trigger-stats contract.  Count in machine code (GIL-serialised; the C++
+  // side only reads the cell relaxed) and hand the entry to the C++ hook when
+  // the execution entry ledger is armed.
+  {
+    bbb.annotateNext("Inline frame link: entry accounting");
+    Instruction* counters = bbb.appendInstr(
+        OutVReg{},
+        Instruction::kMove,
+        Imm{reinterpret_cast<uint64_t>(
+            triggerStatsMachineCodeEntriesAddress())});
+    Instruction* ledger_on = bbb.appendInstr(
+        OutVReg{DataType::k8bit},
+        Instruction::kMove,
+        MemImm{const_cast<uint8_t*>(triggerStatsEntryLedgerEnabledAddress())});
+    BasicBlock* ledger_block = bbb.allocateBlock();
+    BasicBlock* count_block = bbb.allocateBlock();
+    BasicBlock* counted_block = bbb.allocateBlock();
+    bbb.appendBranch(
+        Instruction::kCondBranch, ledger_on, ledger_block, count_block);
+    bbb.switchBlock(ledger_block);
+    if (getConfig().multiple_code_sections) {
+      ledger_block->setSection(codegen::CodeSection::kCold);
+    }
+    bbb.appendInvokeInstruction(triggerStatsOnMachineCodeEntry, code.get());
+    bbb.appendBranch(Instruction::kBranch, counted_block);
+    bbb.switchBlock(count_block);
+    Instruction* count =
+        bbb.appendInstr(OutVReg{}, Instruction::kMove, Ind{counters});
+    Instruction* next =
+        bbb.appendInstr(OutVReg{}, Instruction::kAdd, count, Imm{1});
+    bbb.appendInstr(OutInd{counters}, Instruction::kMove, next);
+    bbb.appendBranch(Instruction::kBranch, counted_block);
+    bbb.switchBlock(counted_block);
+  }
+
+  bbb.annotateNext("Inline frame link: set current frame");
+  cfa.store(frame);
+  BasicBlock* fast_pred = bbb.curBlock();
+  bbb.appendBranch(Instruction::kBranch, done_block);
+
+  // slow_block 仅为分支目标（fast 块已以无条件跳转终结，不可再挂
+  // fallthrough 后继）——switchBlock 而非 appendBlock。
+  bbb.switchBlock(slow_block);
+  if (getConfig().multiple_code_sections) {
+    slow_block->setSection(codegen::CodeSection::kCold);
+  }
+  // 数据栈溢出：C 全路径重做分配+初始化+链接（返回值即 tstate，与
+  // kLoadThreadState 同值，无需合流）。
+  bbb.appendCallInstruction(
+      OutVReg{},
+      frame_no_ref ? JITRT_AllocateAndLinkInterpreterFrameNoRef311
+                   : JITRT_AllocateAndLinkInterpreterFrame_Release,
+      env_->asm_func);
+  Instruction* slow_frame = makeCurrentFrameAccessor(bbb).load();
+  BasicBlock* slow_pred = bbb.curBlock();
+  bbb.appendBranch(Instruction::kBranch, done_block);
+
+  bbb.switchBlock(done_block);
+  Instruction* phi = bbb.appendInstr(OutVReg{}, Instruction::kPhi);
+  phi->allocateLabelInput(fast_pred);
+  phi->allocateLinkedInput(frame);
+  phi->allocateLabelInput(slow_pred);
+  phi->allocateLinkedInput(slow_frame);
+
+  return phi;
+}
+
+// Live-frame count for the deferred artifact reclamation (see
+// triggerStatsActiveFramesAddress): counted in once the frame is linked, by
+// whichever path built it -- the inline link's fast bump, the C helper of its
+// slow path, or the C helper build of a Py_DEBUG compilation -- so that the
+// hard-exit epilogue's count-out is always matched.
+void LIRGenerator::emitActiveFrameCountIn(BasicBlockBuilder& bbb) {
+  bbb.annotateNext("Frame link: active-frame count");
+  Instruction* active_cell = bbb.appendInstr(
+      OutVReg{},
+      Instruction::kMove,
+      Imm{reinterpret_cast<uint64_t>(triggerStatsActiveFramesAddress())});
+  Instruction* active =
+      bbb.appendInstr(OutVReg{}, Instruction::kMove, Ind{active_cell});
+  Instruction* active_next =
+      bbb.appendInstr(OutVReg{}, Instruction::kAdd, active, Imm{1});
+  bbb.appendInstr(OutInd{active_cell}, Instruction::kMove, active_next);
+  env_->code_rt->setActiveFrameCounted(true);
+}
+
+// Inline form of JITRT_InitFrameCellVars for the
+// inline-linked normal frame.  The link already zeroed every localsplus
+// slot and set stacktop = nlocalsplus; what remains is the closure cells,
+// one owned reference each into the free-variable slots.  The frame then
+// carries exactly the layout the C helper leaves behind, so the deopt
+// reifier, the escaped-frame take-over and the slow unlink stay unchanged.
+void LIRGenerator::emitInlineInitFrameFreeVars(
+    BasicBlockBuilder& bbb,
+    const hir::InitFrameCellVars& instr) {
+  BorrowedRef<PyCodeObject> code = func_->code;
+  const int nvars = instr.num_cell_vars();
+  JIT_CHECK(
+      nvars == code->co_nfreevars,
+      "InitFrameCellVars count {} does not match co_nfreevars {}",
+      nvars,
+      code->co_nfreevars);
+  Instruction* frame = env_->asm_interpreter_frame;
+  JIT_CHECK(frame != nullptr, "inline frame link must precede cell init");
+  const int offset = code->co_nlocalsplus - nvars;
+  bbb.annotateNext("Inline frame link: closure cells into free var slots");
+  Instruction* closure = bbb.appendInstr(
+      OutVReg{},
+      Instruction::kMove,
+      Ind{bbb.getDefInstr(instr.func()),
+          static_cast<int32_t>(offsetof(PyFunctionObject, func_closure))});
+  for (int i = 0; i < nvars; ++i) {
+    Instruction* cell = bbb.appendInstr(
+        OutVReg{},
+        Instruction::kMove,
+        Ind{closure,
+            static_cast<int32_t>(
+                offsetof(PyTupleObject, ob_item) + i * kPointerSize)});
+    makeIncref(bbb, cell, false);
+    bbb.appendInstr(
+        OutInd{
+            frame,
+            static_cast<int32_t>(
+                offsetof(_PyInterpreterFrame, localsplus) +
+                (offset + i) * kPointerSize)},
+        Instruction::kMove,
+        cell);
+  }
+}
+
+// 出口：行内解链+清理+弹栈，镜像 JITRT_UnlinkFrame 的普通帧路径。
+// 三前置检查（检查期零突变，任一失败整体回落 C）：① frame_obj 已
+// 物化（逃逸帧归属转移）；② f_locals 已写（PyEval_GetLocals 族可在
+// 无 frame_obj 时直写）；③ 帧位于 chunk 基（弹出须释放 chunk）。
+// 三项皆空时 cell-free 资格保证 localsplus 自入口起全 NULL——
+// ClearExceptCode 的逐槽 XDECREF 与 f_locals 清理为空操作，剩余
+// 语义 = 解链（先于清理，GH-99729）+ f_func/f_code 各减一强引用 +
+// datastack_top 回拨。
+void LIRGenerator::emitInlineUnlinkNormalFrame(BasicBlockBuilder& bbb) {
+  BorrowedRef<PyCodeObject> code = func_->code;
+  CurrentFrameAccessor cfa = makeCurrentFrameAccessor(bbb);
+  // The frame this function linked is still in a register
+  // (prologue phi of the fast-path bump and the slow-path reload); the
+  // escape checks below read it directly instead of behind the
+  // tstate->cframe->current_frame chain.
+  Instruction* frame = env_->asm_interpreter_frame != nullptr
+      ? env_->asm_interpreter_frame
+      : cfa.load();
+
+  auto slow_block = bbb.allocateBlock();
+  auto done_block = bbb.allocateBlock();
+
+  bbb.annotateNext("Inline frame unlink: escape checks");
+  Instruction* frame_obj = bbb.appendInstr(
+      OutVReg{},
+      Instruction::kMove,
+      Ind{frame,
+          static_cast<int32_t>(offsetof(_PyInterpreterFrame, frame_obj))});
+  bbb.appendInstr(Instruction::kTest, frame_obj, frame_obj);
+  bbb.appendBranch(Instruction::kBranchNZ, slow_block);
+
+  auto check_locals = bbb.allocateBlock();
+  bbb.appendBlock(check_locals);
+  Instruction* f_locals = bbb.appendInstr(
+      OutVReg{},
+      Instruction::kMove,
+      Ind{frame,
+          static_cast<int32_t>(offsetof(_PyInterpreterFrame, f_locals))});
+  bbb.appendInstr(Instruction::kTest, f_locals, f_locals);
+  bbb.appendBranch(Instruction::kBranchNZ, slow_block);
+
+  auto check_chunk = bbb.allocateBlock();
+  bbb.appendBlock(check_chunk);
+  Instruction* chunk = bbb.appendInstr(
+      OutVReg{},
+      Instruction::kMove,
+      Ind{env_->asm_tstate,
+          static_cast<int32_t>(offsetof(PyThreadState, datastack_chunk))});
+  Instruction* chunk_data = bbb.appendInstr(
+      OutVReg{},
+      Instruction::kLea,
+      Ind{chunk, static_cast<int32_t>(offsetof(_PyStackChunk, data))});
+  bbb.appendInstr(Instruction::kCmp, frame, chunk_data);
+  bbb.appendBranch(Instruction::kBranchE, slow_block);
+
+  auto fast_block = bbb.allocateBlock();
+  bbb.appendBlock(fast_block);
+  bbb.annotateNext("Inline frame unlink: relink previous");
+  Instruction* prev = bbb.appendInstr(
+      OutVReg{},
+      Instruction::kMove,
+      Ind{frame,
+          static_cast<int32_t>(offsetof(_PyInterpreterFrame, previous))});
+  cfa.store(prev);
+
+  // The free-variable slots hold the closure cells stored
+  // at entry (emitInlineInitFrameFreeVars); release them after the unlink,
+  // in the C helper's order (GH-99729: clearing can run finalizers).  An
+  // OSR entry steals its live-in slots into registers and leaves NULL
+  // behind, hence the NULL-tolerant form.
+  if (code->co_nfreevars > 0) {
+    bbb.annotateNext("Inline frame unlink: release free var cells");
+    const int offset = code->co_nlocalsplus - code->co_nfreevars;
+    for (int i = 0; i < code->co_nfreevars; ++i) {
+      Instruction* cell = bbb.appendInstr(
+          OutVReg{},
+          Instruction::kMove,
+          Ind{frame,
+              static_cast<int32_t>(
+                  offsetof(_PyInterpreterFrame, localsplus) +
+                  (offset + i) * kPointerSize)});
+      makeDecref(
+          bbb, cell, std::optional<destructor>(PyCell_Type.tp_dealloc), true);
+    }
+  }
+
+  if (!env_->code_rt->frameNoRef()) {
+    bbb.annotateNext("Inline frame unlink: decref func/code");
+    makeDecref(
+        bbb,
+        env_->asm_func,
+        std::optional<destructor>(PyFunction_Type.tp_dealloc),
+        false);
+    Instruction* code_reg = bbb.appendInstr(
+        OutVReg{}, Instruction::kMove, reinterpret_cast<PyObject*>(code.get()));
+    makeDecref(
+        bbb,
+        code_reg,
+        std::optional<destructor>(PyCode_Type.tp_dealloc),
+        false);
+  }
+
+  bbb.annotateNext("Inline frame unlink: pop datastack");
+  bbb.appendInstr(
+      OutInd{
+          env_->asm_tstate,
+          static_cast<int32_t>(offsetof(PyThreadState, datastack_top))},
+      Instruction::kMove,
+      frame);
+  bbb.appendBranch(Instruction::kBranch, done_block);
+
+  bbb.switchBlock(slow_block);
+  if (getConfig().multiple_code_sections) {
+    slow_block->setSection(codegen::CodeSection::kCold);
+  }
+  bbb.appendInvokeInstruction(
+      env_->code_rt->frameNoRef() ? JITRT_UnlinkFrameNoRef311
+                                  : JITRT_UnlinkFrame,
+      env_->asm_tstate);
+  bbb.appendBranch(Instruction::kBranch, done_block);
+
+  bbb.switchBlock(done_block);
+}
+
+// Does this compilation carry the inline recursion ledger?  With the
+// generated vectorcall entry installed directly (no guarded C shell), the
+// generated entry is the sole owner of the per-call recursion semantics.
+// Exclusions: generator-family code (the initial call exits
+// through the Yield machinery, so the exit surface does not close over
+// the epilogue) and primitive-args static functions (the typecheck
+// failure exit never passes frame build).
+bool LIRGenerator::emitsInlineEntryGuard() const {
+#if defined(CINDER_AARCH64)
+  return func_->code != nullptr &&
+      !(func_->code->co_flags & jit::kCoFlagsAnyGenerator) &&
+      !func_->has_primitive_args;
+#else
+  return false;
+#endif
+}
+
+void LIRGenerator::emitRecursionEnter(BasicBlockBuilder& bbb) {
+  constexpr int32_t kRemainingOffset =
+      static_cast<int32_t>(offsetof(PyThreadState, recursion_remaining));
+  Instruction* rem = bbb.appendInstr(
+      OutVReg{DataType::k32bit},
+      Instruction::kMove,
+      Ind{env_->asm_tstate, kRemainingOffset});
+  bbb.appendInstr(Instruction::kDec, rem);
+  bbb.appendInstr(
+      OutInd{env_->asm_tstate, kRemainingOffset, DataType::k32bit},
+      Instruction::kMove,
+      rem);
+}
+
+void LIRGenerator::emitRecursionLeave(BasicBlockBuilder& bbb) {
+  constexpr int32_t kRemainingOffset =
+      static_cast<int32_t>(offsetof(PyThreadState, recursion_remaining));
+  Instruction* rem = bbb.appendInstr(
+      OutVReg{DataType::k32bit},
+      Instruction::kMove,
+      Ind{env_->asm_tstate, kRemainingOffset});
+  bbb.appendInstr(Instruction::kInc, rem);
+  bbb.appendInstr(
+      OutInd{env_->asm_tstate, kRemainingOffset, DataType::k32bit},
+      Instruction::kMove,
+      rem);
+}
+#endif // PY_VERSION_HEX < 0x030C0000
 
 void LIRGenerator::emitUnlinkFrame(
     BasicBlockBuilder& bbb,

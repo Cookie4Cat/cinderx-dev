@@ -18,7 +18,19 @@ namespace {
 std::atomic<uint64_t> s_executable_alloc_calls{0};
 std::atomic<uint64_t> s_executable_alloc_bytes{0};
 std::atomic<uint64_t> s_compiled_function_creations{0};
-std::atomic<uint64_t> s_machine_code_entries{0};
+// The machine-code entry counter and the live-frame counter of the CPython
+// 3.11 direct entry sit in one block: the generated frame link materializes
+// the block's address once and bumps both through it.
+struct EntryCounters {
+  std::atomic<uint64_t> machine_code_entries{0};
+  uint64_t active_frames{0};
+};
+static_assert(
+    offsetof(EntryCounters, active_frames) == 8,
+    "codegen addresses active_frames at +8 from machine_code_entries");
+EntryCounters s_entry_counters;
+std::atomic<uint64_t>& s_machine_code_entries =
+    s_entry_counters.machine_code_entries;
 std::atomic<uint64_t> s_shadow_compile_success{0};
 std::atomic<uint64_t> s_shadow_specialized_opcodes_consumed{0};
 std::atomic<uint64_t> s_shadow_codegen_bytes{0};
@@ -69,6 +81,26 @@ void triggerStatsOnExecutableAlloc(std::size_t bytes) {
 void triggerStatsOnCompiledFunctionCreate() {
   s_compiled_function_creations.fetch_add(1, std::memory_order_relaxed);
 }
+
+uint64_t* triggerStatsMachineCodeEntriesAddress() {
+  static_assert(sizeof(std::atomic<uint64_t>) == sizeof(uint64_t));
+  return reinterpret_cast<uint64_t*>(&s_entry_counters.machine_code_entries);
+}
+
+uint64_t* triggerStatsActiveFramesAddress() {
+  return &s_entry_counters.active_frames;
+}
+
+// C-side view (the 3.11 evaluator's graveyard check).
+extern "C" uint64_t* const Ci_JitActiveFrames311Ptr =
+    &s_entry_counters.active_frames;
+
+#if PY_VERSION_HEX < 0x030C0000
+const uint8_t* triggerStatsEntryLedgerEnabledAddress() {
+  static_assert(sizeof(std::atomic<bool>) == sizeof(uint8_t));
+  return reinterpret_cast<const uint8_t*>(&s_entry_ledger_enabled);
+}
+#endif
 
 void triggerStatsOnMachineCodeEntry(PyCodeObject* code) {
   s_machine_code_entries.fetch_add(1, std::memory_order_relaxed);

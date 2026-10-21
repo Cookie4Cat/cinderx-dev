@@ -4,17 +4,20 @@
 
 #include "internal/pycore_long.h"
 #include "internal/pycore_pystate.h"
+#include "internal/pycore_runtime.h"
 
 #include "cinderx/Common/util.h"
 #include "cinderx/Jit/code_patcher.h"
 #include "cinderx/Jit/codegen/arch.h"
 #include "cinderx/Jit/codegen/gen_asm_utils.h"
+#include "cinderx/Jit/config.h"
 #include "cinderx/Jit/frame.h"
 #include "cinderx/Jit/generators_rt.h"
 #include "cinderx/Jit/hir/hir.h"
 #include "cinderx/Jit/jit_rt.h"
 #include "cinderx/Jit/lir/instruction.h"
 #include "cinderx/Jit/lir/printer.h"
+#include "cinderx/Jit/trigger_stats.h"
 #include "cinderx/module_state.h"
 
 using namespace asmjit;
@@ -860,6 +863,17 @@ void translateLoadThreadState(Environ* env, const Instruction* instr) {
             dst,
             cinderx::getModuleState()->tstate_offset,
             arch::reg_scratch_0));
+#if PY_VERSION_HEX < 0x030C0000
+  } else {
+    // 3.11 keeps the current thread state in
+    // _PyRuntime.gilstate.tstate_current (an exported data symbol), not in
+    // TLS, so the TLS matcher never arms and every function entry would pay
+    // a call through the PLT.  Load the word directly instead.
+    as->mov(
+        dst, reinterpret_cast<uint64_t>(&_PyRuntime.gilstate.tstate_current));
+    as->ldr(dst, a64::ptr(dst));
+  }
+#else
   } else {
     // Fallback: call _PyThreadState_GetCurrent().
     as->bl(_PyThreadState_GetCurrent);
@@ -867,6 +881,7 @@ void translateLoadThreadState(Environ* env, const Instruction* instr) {
       as->mov(dst, a64::x0);
     }
   }
+#endif
 
   if (output->isStack()) {
     as->str(
@@ -1162,6 +1177,30 @@ void translateEpilogueEnd(Environ* env, const Instruction* instr) {
   }
 
   as->bind(env->hard_exit_label);
+#if PY_VERSION_HEX < 0x030C0000
+  // Count the live frame out (see triggerStatsActiveFramesAddress).  Every
+  // exit of a
+  // counted compilation passes here: the normal return, the exception
+  // return and the deopt exit (the trampoline lands on this label after the
+  // interpreter has finished the frame).  The prologue-exit, static
+  // typecheck and wrapper stubs tear down their own frame before the inline
+  // link ran, so they are balanced by never having counted in.  x9/x10 are
+  // scratch here; the return value sits in x0/x1 or d0/d1.
+  if (env->code_rt->activeFrameCounted()) {
+    // The counter's address comes from the function's constant pool (one
+    // PC-relative load) rather than a movz/movk chain.
+    const uint64_t counter =
+        reinterpret_cast<uint64_t>(triggerStatsActiveFramesAddress());
+    auto it = env->const_pool_labels.find(counter);
+    if (it == env->const_pool_labels.end()) {
+      it = env->const_pool_labels.emplace(counter, as->newLabel()).first;
+    }
+    as->ldr(a64::x9, a64::ptr(it->second));
+    as->ldr(a64::x10, a64::ptr(a64::x9));
+    as->sub(a64::x10, a64::x10, 1);
+    as->str(a64::x10, a64::ptr(a64::x9));
+  }
+#endif
   auto saved_regs = env->changed_regs & CALLEE_SAVE_REGS;
   if (!saved_regs.Empty()) {
     JIT_CHECK(
