@@ -5338,6 +5338,18 @@ PyMethodDef jit_methods_311_canary[] = {
      METH_NOARGS,
      PyDoc_STR("Per-class fill/hit/miss/invalidation tallies of the "
                "pull-validated attribute caches.")},
+    {"get_and_clear_inline_cache_stats",
+     get_and_clear_inline_cache_stats,
+     METH_NOARGS,
+     PyDoc_STR(
+         "Returns and clears information about the runtime inline cache stats "
+         "behavior of JIT-compiled code. Stats will only be collected with X "
+         "flag jit-enable-inline-cache-stats-collection.")},
+    {"is_inline_cache_stats_collection_enabled",
+     is_inline_cache_stats_collection_enabled,
+     METH_NOARGS,
+     PyDoc_STR("Return True if jit-enable-inline-cache-stats-collection is on "
+               "and False otherwise.")},
     {"get_compiled_functions",
      get_compiled_functions,
      METH_NOARGS,
@@ -6023,7 +6035,6 @@ int initialize() {
   auto use_stable_pointers = getConfig().use_stable_pointers;
 
 #if PY_VERSION_HEX < 0x030C0000
-  resetDictValueTransition311();
   // CPython 3.11 only initializes the compiler for the explicit shadow and
   // execute modes (or RuntimeTests' force-init hook). Observe and off stay
   // capability-gated before a compiler context or code allocator is
