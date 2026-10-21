@@ -17,6 +17,7 @@ extern "C" {
 
 #include "cinderx/Common/code.h"
 #include "cinderx/Common/dict.h"
+#include "cinderx/Common/func.h"
 #include "cinderx/Common/py-portability.h"
 #include "cinderx/Common/ref.h"
 #include "cinderx/Interpreter/cinder_opcode.h"
@@ -2339,7 +2340,7 @@ void HIRBuilder::translate(
           break;
         }
         case STORE_ATTR: {
-          emitStoreAttr(tc, bc_instr);
+          emitStoreAttr(irfunc.cfg, tc, bc_instr);
           break;
         }
         case STORE_FAST: {
@@ -4033,9 +4034,13 @@ void HIRBuilder::emitLoadAttr(
   bool method_with_values_fast_path_enabled = false;
 #endif
 #if PY_VERSION_HEX < 0x030C0000
-  // The slot fast path needs the 3.14 type-version cache; it is out of scope
-  // on 3.11 and stays off (see the attrSlot* stubs above).
-  slot_fast_path_enabled = false;
+  // the 3.14 path resolves the PyMemberDef through the
+  // interpreter's type-version cache, which 3.11 lacks.  The 3.11
+  // specializer's OBJECT_SLOT contract (upstream/specialize.c) already
+  // pins everything the fast path needs into the inline cache: the slot is
+  // a T_OBJECT_EX member at cache->index on a type with generic getattro,
+  // valid while tp_version_tag equals cache->version.  Pull-validating
+  // that version at every access needs no watcher.
 #endif
 #ifdef Py_GIL_DISABLED
   slot_fast_path_enabled = false;
@@ -4049,11 +4054,6 @@ void HIRBuilder::emitLoadAttr(
 
   Register* receiver = tc.frame.stack.pop();
 
-#if PY_VERSION_HEX < 0x030C0000
-  if (tryEmitLoadAttrInstanceValue311(tc, bc_instr, receiver, name_idx)) {
-    return;
-  }
-#endif
 
   if (getConfig().specialized_opcodes) {
     switch (specialized_opcode) {
@@ -4068,6 +4068,14 @@ void HIRBuilder::emitLoadAttr(
         if (!slot_fast_path_enabled) {
           break;
         }
+        int slot_offset = 0;
+        bool slot_object_ex = true;
+        bool may_need_getattr_fallback = true;
+#if PY_VERSION_HEX < 0x030C0000
+        // offset straight from the inline cache; a NULL slot
+        // takes the generic LoadAttr so the AttributeError matches stock.
+        slot_offset = bc_instr.attrCacheIndex();
+#else
         PyMemberDef* member_def =
             attrSlotMemberDef(code_, bc_instr, name_idx);
         if (member_def == nullptr) {
@@ -4078,6 +4086,10 @@ void HIRBuilder::emitLoadAttr(
           }
           break;
         }
+        slot_offset = member_def->offset;
+        slot_object_ex = member_def->type == T_OBJECT_EX;
+        may_need_getattr_fallback = attrSlotTypeDefinesGetattr(bc_instr);
+#endif
         BorrowedRef<PyUnicodeObject> name =
             PyTuple_GET_ITEM(code_->co_names, name_idx);
         const char* field_name = PyUnicode_AsUTF8(name);
@@ -4085,7 +4097,6 @@ void HIRBuilder::emitLoadAttr(
           PyErr_Clear();
           field_name = "<unknown>";
         }
-        bool may_need_getattr_fallback = attrSlotTypeDefinesGetattr(bc_instr);
         Register* matches = emitSlotTypeVersionMatches(
             tc, receiver, bc_instr.attrCacheTypeVersion());
         BasicBlock* fast_path = cfg.AllocateBlock();
@@ -4097,12 +4108,8 @@ void HIRBuilder::emitLoadAttr(
         tc.block = fast_path;
         Register* field = temps_.AllocateStack();
         tc.emit<LoadField>(
-            field,
-            receiver,
-            field_name,
-            member_def->offset,
-            TOptObject);
-        if (member_def->type == T_OBJECT_EX) {
+            field, receiver, field_name, slot_offset, TOptObject);
+        if (slot_object_ex) {
           if (may_need_getattr_fallback) {
             BasicBlock* set_block = cfg.AllocateBlock();
             BasicBlock* fallback_block = cfg.AllocateBlock();
@@ -4146,12 +4153,18 @@ void HIRBuilder::emitLoadAttr(
         }
 
         tc.block = slow_path;
+#if PY_VERSION_HEX < 0x030C0000
+        // keep the polymorphic cache form for receivers that
+        // fail the version check (see the IVINLINE slow path).
+        tc.emit<LoadAttr>(result, receiver, name_idx, tc.frame);
+#else
         tc.emit<LoadAttr>(
             result,
             receiver,
             name_idx,
             tc.frame,
             /* already_optimized= */ true);
+#endif
         tc.emit<Branch>(done);
 
         tc.block = done;
@@ -4203,6 +4216,73 @@ void HIRBuilder::emitLoadAttr(
 #endif
 #if PY_VERSION_HEX < 0x030C0000
       case LOAD_ATTR_INSTANCE_VALUE: {
+        // consume the 3.11 LOAD_ATTR_INSTANCE_VALUE cache
+        // the way the interpreter does (upstream/ceval.c): tp_version_tag
+        // pins the type (managed dict, generic getattro, name resolves to
+        // the split-keys slot cache->index), a live values array means the
+        // instance is still on the shared keys, and the slot itself is
+        // read directly.  Every other case -- version drift, materialized
+        // dict, unset slot -- takes the generic LoadAttr, so the observable
+        // behaviour (including the AttributeError text) is stock's.
+        uint32_t iv_version = bc_instr.attrCacheTypeVersion();
+        if (iv_version != 0) {
+          BorrowedRef<PyUnicodeObject> iv_name =
+              PyTuple_GET_ITEM(code_->co_names, name_idx);
+          const char* iv_field = PyUnicode_AsUTF8(iv_name);
+          if (iv_field == nullptr) {
+            PyErr_Clear();
+            iv_field = "<unknown>";
+          }
+          Register* matches =
+              emitSlotTypeVersionMatches(tc, receiver, iv_version);
+          BasicBlock* fast_path = cfg.AllocateBlock();
+          BasicBlock* have_values = cfg.AllocateBlock();
+          BasicBlock* set_block = cfg.AllocateBlock();
+          BasicBlock* slow_path = cfg.AllocateBlock();
+          BasicBlock* done = cfg.AllocateBlock();
+          Register* iv_result = temps_.AllocateStack();
+          tc.emit<CondBranch>(matches, fast_path, slow_path);
+
+          tc.block = fast_path;
+          Register* values_raw = temps_.AllocateNonStack();
+          tc.emit<LoadField>(
+              values_raw,
+              receiver,
+              "__dict_values__",
+              -4 * sizeof(PyObject*),
+              TCUInt64);
+          tc.emit<CondBranch>(values_raw, have_values, slow_path);
+
+          tc.block = have_values;
+          Register* values_obj = temps_.AllocateNonStack();
+          tc.emit<BitCast>(values_obj, values_raw, TOptObject);
+          Register* iv_value = temps_.AllocateStack();
+          tc.emit<LoadField>(
+              iv_value,
+              values_obj,
+              iv_field,
+              static_cast<size_t>(bc_instr.attrCacheIndex()) *
+                  sizeof(PyObject*),
+              TOptObject);
+          tc.emit<CondBranch>(iv_value, set_block, slow_path);
+
+          tc.block = set_block;
+          Register* iv_checked = temps_.AllocateNonStack();
+          tc.emit<RefineType>(iv_checked, TObject, iv_value);
+          tc.emit<Assign>(iv_result, iv_checked);
+          tc.emit<Branch>(done);
+
+          tc.block = slow_path;
+          // Not "already optimized": a receiver that fails the version
+          // check (polymorphic site) must still reach the polymorphic
+          // LoadAttrCached form, not the fully generic getattr.
+          tc.emit<LoadAttr>(iv_result, receiver, name_idx, tc.frame);
+          tc.emit<Branch>(done);
+
+          tc.block = done;
+          tc.frame.stack.push(iv_result);
+          return;
+        }
         BorrowedRef<PyTypeObject> owner_type = preloader_.methodOwnerType();
         if (owner_type != nullptr) {
           auto guard = tc.emit<GuardType>(
@@ -4220,54 +4300,6 @@ void HIRBuilder::emitLoadAttr(
   Register* result = temps_.AllocateStack();
   tc.emit<LoadAttr>(result, receiver, name_idx, tc.frame);
   tc.frame.stack.push(result);
-}
-
-bool HIRBuilder::tryEmitLoadAttrInstanceValue311(
-    TranslationContext& tc,
-    const jit::BytecodeInstruction& bc_instr,
-    Register* receiver,
-    int name_idx) {
-#if PY_VERSION_HEX < 0x030C0000
-  if (!getConfig().specialized_opcodes ||
-      bc_instr.specializedOpcode() != LOAD_ATTR_INSTANCE_VALUE) {
-    return false;
-  }
-
-  const _Py_CODEUNIT* instr = codeUnit(code_) + bc_instr.opcodeIndex().value();
-  auto cache = reinterpret_cast<const _PyAttrCache*>(instr + 1);
-  uint32_t type_version = readCacheU32(cache->version);
-  if (type_version == 0) {
-    return false;
-  }
-
-  BorrowedRef<> name = PyTuple_GET_ITEM(code_->co_names, name_idx);
-  Register* name_reg = temps_.AllocateNonStack();
-  tc.emit<LoadConst>(name_reg, Type::fromObject(env_->addReference(name)));
-
-  Register* type_version_reg = temps_.AllocateNonStack();
-  tc.emit<LoadConst>(type_version_reg, Type::fromCUInt(type_version, TCUInt32));
-
-  Register* index_reg = temps_.AllocateNonStack();
-  tc.emit<LoadConst>(
-      index_reg,
-      Type::fromCUInt(static_cast<uint64_t>(cache->index), TCUInt64));
-
-  Register* result = temps_.AllocateStack();
-  auto call = tc.emit<CallStatic>(
-      4,
-      result,
-      reinterpret_cast<void*>(JITRT_LoadAttrInstanceValueOrGeneric),
-      TOptObject);
-  call->SetOperand(0, receiver);
-  call->SetOperand(1, name_reg);
-  call->SetOperand(2, type_version_reg);
-  call->SetOperand(3, index_reg);
-  tc.emit<CheckExc>(result, result, tc.frame);
-  tc.frame.stack.push(result);
-  return true;
-#else
-  return false;
-#endif
 }
 
 void HIRBuilder::emitLoadMethod(TranslationContext& tc, int name_idx) {
@@ -5702,21 +5734,176 @@ void HIRBuilder::emitPopJumpIfNone(
 }
 
 void HIRBuilder::emitStoreAttr(
+    CFG& cfg,
     TranslationContext& tc,
     const jit::BytecodeInstruction& bc_instr) {
   Register* receiver = tc.frame.stack.pop();
   Register* value = tc.frame.stack.pop();
+#if PY_VERSION_HEX < 0x030C0000
+  // STORE_ATTR_INSTANCE_VALUE mirrors the interpreter's
+  // handler: version-pinned type, live values array, and an already-set
+  // slot are overwritten in place (the old value released); an unset slot
+  // would have to record insertion order, so that and every other case take
+  // the generic StoreAttr.
+  if (getConfig().specialized_opcodes &&
+      bc_instr.specializedOpcode() == STORE_ATTR_INSTANCE_VALUE &&
+      bc_instr.attrCacheTypeVersion() != 0) {
+    BorrowedRef<PyUnicodeObject> iv_name =
+        PyTuple_GET_ITEM(code_->co_names, bc_instr.oparg());
+    const char* iv_field = PyUnicode_AsUTF8(iv_name);
+    if (iv_field == nullptr) {
+      PyErr_Clear();
+      iv_field = "<unknown>";
+    }
+    size_t iv_offset =
+        static_cast<size_t>(bc_instr.attrCacheIndex()) * sizeof(PyObject*);
+    Register* matches = emitSlotTypeVersionMatches(
+        tc, receiver, bc_instr.attrCacheTypeVersion());
+    BasicBlock* fast_path = cfg.AllocateBlock();
+    BasicBlock* have_values = cfg.AllocateBlock();
+    BasicBlock* set_block = cfg.AllocateBlock();
+    BasicBlock* slow_path = cfg.AllocateBlock();
+    BasicBlock* done = cfg.AllocateBlock();
+    tc.emit<CondBranch>(matches, fast_path, slow_path);
+
+    tc.block = fast_path;
+    Register* values_raw = temps_.AllocateNonStack();
+    tc.emit<LoadField>(
+        values_raw,
+        receiver,
+        "__dict_values__",
+        -4 * sizeof(PyObject*),
+        TCUInt64);
+    tc.emit<CondBranch>(values_raw, have_values, slow_path);
+
+    tc.block = have_values;
+    // The values array is non-null on this arm; StoreField below requires an
+    // Object base (the shadow HIR verifier rejects OptObject there).
+    Register* values_obj = temps_.AllocateNonStack();
+    tc.emit<BitCast>(values_obj, values_raw, TObject);
+    Register* old_borrowed = temps_.AllocateNonStack();
+    tc.emit<LoadField>(
+        old_borrowed, values_obj, iv_field, iv_offset, TOptObject);
+    BasicBlock* insert_block = cfg.AllocateBlock();
+    tc.emit<CondBranch>(old_borrowed, set_block, insert_block);
+
+    // Unset slot: the interpreter's insertion arm (value stored, insertion
+    // order recorded).  The shared keys already hold the name at this index
+    // by the specializer's contract, so no dict bookkeeping beyond that.
+    tc.block = insert_block;
+    Register* insert_index = temps_.AllocateNonStack();
+    tc.emit<LoadConst>(
+        insert_index,
+        Type::fromCInt(
+            static_cast<int64_t>(bc_instr.attrCacheIndex()), TCInt64));
+    auto insert_call = tc.emit<CallStatic>(
+        3,
+        temps_.AllocateNonStack(),
+        reinterpret_cast<void*>(JITRT_StoreSplitValueInsert311),
+        TCInt32);
+    insert_call->SetOperand(0, values_obj);
+    insert_call->SetOperand(1, insert_index);
+    insert_call->SetOperand(2, value);
+    // The values array belongs to the receiver and the BitCast above does
+    // not make that dependency visible to refcount insertion: a receiver
+    // whose last use is the values load would be released before the
+    // write (a temporary `f().x = v` dies in between).  Hold it until the
+    // write has happened.
+    tc.emit<UseObj>(receiver);
+    tc.emit<Branch>(done);
+
+    tc.block = set_block;
+    Register* previous = temps_.AllocateStack();
+    tc.emit<LoadField>(
+        previous,
+        values_obj,
+        iv_field,
+        iv_offset,
+        TOptObject,
+        /* borrowed= */ false);
+    tc.emit<StoreField>(
+        values_obj, iv_field, iv_offset, value, TOptObject, previous);
+    // Stock order: the new value is stored, the old value is released while
+    // the receiver is still held by the stack, then the receiver.  The two
+    // uses pin that order for refcount insertion.
+    tc.emit<UseObj>(previous);
+    tc.emit<UseObj>(receiver);
+    tc.emit<Branch>(done);
+
+    tc.block = slow_path;
+    tc.emit<StoreAttr>(receiver, value, bc_instr.oparg(), tc.frame);
+    tc.emit<Branch>(done);
+
+    tc.block = done;
+    return;
+  }
+#endif
+#if PY_VERSION_HEX < 0x030C0000
+  // STORE_ATTR_WITH_HINT -- inline type-version check,
+  // then the lean helper above; anything it declines takes the generic
+  // StoreAttr (the polymorphic cache).
+  if (getConfig().specialized_opcodes &&
+      bc_instr.specializedOpcode() == STORE_ATTR_WITH_HINT &&
+      bc_instr.attrCacheTypeVersion() != 0) {
+    Register* matches = emitSlotTypeVersionMatches(
+        tc, receiver, bc_instr.attrCacheTypeVersion());
+    BasicBlock* fast_path = cfg.AllocateBlock();
+    BasicBlock* slow_path = cfg.AllocateBlock();
+    BasicBlock* done = cfg.AllocateBlock();
+    tc.emit<CondBranch>(matches, fast_path, slow_path);
+
+    tc.block = fast_path;
+    BorrowedRef<> hs_name = PyTuple_GET_ITEM(code_->co_names, bc_instr.oparg());
+    Register* name_reg = temps_.AllocateNonStack();
+    tc.emit<LoadConst>(name_reg, Type::fromObject(env_->addReference(hs_name)));
+    Register* hint_reg = temps_.AllocateNonStack();
+    tc.emit<LoadConst>(
+        hint_reg,
+        Type::fromCInt(
+            static_cast<int64_t>(bc_instr.attrCacheIndex()), TCInt64));
+    Register* handled = temps_.AllocateNonStack();
+    auto hs_call = tc.emit<CallStatic>(
+        4,
+        handled,
+        reinterpret_cast<void*>(JITRT_StoreAttrWithHint311),
+        TCInt32);
+    hs_call->SetOperand(0, receiver);
+    hs_call->SetOperand(1, name_reg);
+    hs_call->SetOperand(2, hint_reg);
+    hs_call->SetOperand(3, value);
+    tc.emit<CondBranch>(handled, done, slow_path);
+
+    tc.block = slow_path;
+    tc.emit<StoreAttr>(receiver, value, bc_instr.oparg(), tc.frame);
+    tc.emit<Branch>(done);
+
+    tc.block = done;
+    return;
+  }
+#endif
 #ifndef Py_GIL_DISABLED
   if (getConfig().specialized_opcodes &&
       bc_instr.specializedOpcode() == STORE_ATTR_SLOT) {
     // STORE_ATTR oparg is always the co_names index; unlike LOAD_ATTR it does
     // not reserve a low bit for method-call stack shaping.
+    int slot_offset = 0;
+#if PY_VERSION_HEX < 0x030C0000
+    // see emitLoadAttr.  The 3.11 STORE_ATTR OBJECT_SLOT
+    // contract additionally excludes READONLY members.
+    if (bc_instr.attrCacheIndex() < sizeof(PyObject)) {
+      tc.emit<StoreAttr>(receiver, value, bc_instr.oparg(), tc.frame);
+      return;
+    }
+    slot_offset = bc_instr.attrCacheIndex();
+#else
     PyMemberDef* member_def =
         attrSlotMemberDef(code_, bc_instr, bc_instr.oparg());
     if (member_def == nullptr) {
       tc.emit<StoreAttr>(receiver, value, bc_instr.oparg(), tc.frame);
       return;
     }
+    slot_offset = member_def->offset;
+#endif
     BorrowedRef<PyUnicodeObject> name =
         PyTuple_GET_ITEM(code_->co_names, bc_instr.oparg());
     const char* field_name = PyUnicode_AsUTF8(name);
@@ -5731,16 +5918,15 @@ void HIRBuilder::emitStoreAttr(
         previous,
         receiver,
         field_name,
-        member_def->offset,
+        slot_offset,
         TOptObject,
         /* borrowed= */ false);
     tc.emit<StoreField>(
-        receiver,
-        field_name,
-        member_def->offset,
-        value,
-        TOptObject,
-        previous);
+        receiver, field_name, slot_offset, value, TOptObject, previous);
+    // Stock order (STORE_ATTR_SLOT): the old value is released while the
+    // receiver is still held by the stack, then the receiver.
+    tc.emit<UseObj>(previous);
+    tc.emit<UseObj>(receiver);
     return;
   }
 #endif

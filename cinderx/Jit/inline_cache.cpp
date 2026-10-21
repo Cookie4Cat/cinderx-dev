@@ -265,15 +265,19 @@ bool hookUsesGenericGetAttr(BorrowedRef<PyTypeObject> type) {
   return getattribute == cinderx::getModuleState()->object_getattribute;
 }
 
-#if PY_VERSION_HEX < 0x030C0000
+// The metaclass counterpart: a metaclass that defines __getattr__ carries
+// the slot hook, but the hook's first half is whatever __getattribute__
+// resolves to on the metaclass.  Only type.__getattribute__ (type_getattro)
+// is what the type-receiver cache replicates; a metaclass that overrides
+// __getattribute__ must not be cached (it may hide class attributes and
+// route them to __getattr__).
 bool metaclassHookUsesTypeGetAttr(BorrowedRef<PyTypeObject> metatype) {
+  static PyObject* type_getattribute =
+      PyDict_GetItemString(PyType_Type.tp_dict, "__getattribute__");
   BorrowedRef<> getattribute =
       _PyType_Lookup(metatype, &_Py_ID(__getattribute__));
-  BorrowedRef<> type_getattribute =
-      _PyType_Lookup(&PyType_Type, &_Py_ID(__getattribute__));
-  return getattribute != nullptr && getattribute == type_getattribute;
+  return type_getattribute != nullptr && getattribute == type_getattribute;
 }
-#endif
 
 // Check whether a type uses the __getattr__ hook as its tp_getattro.
 // CPython installs _Py_slot_tp_getattr_hook (captured as Ci_tp_getattr_hook)
@@ -509,6 +513,15 @@ void AttributeMutator::changeKindFromSplitInline(
 }
 
 #if PY_VERSION_HEX < 0x030C0000
+// a kSplit entry stays "valid" for as long as the type
+// version holds, yet once this type's instances materialize and re-key
+// their dicts every access pays the full-probe slow path forever -- the
+// cache never re-kinds on its own (the yaml Reader/Scanner/Emitter
+// pattern).  Demote to kDict: the hint-indexed read serves materialized
+// dicts (asm kdict arm on hits), and values-form receivers still take the
+// type-cached-keys values read inside DictMutator.  set_dict re-derives
+// the version from the live tag, which the caller's pull validation just
+// proved current.
 PyObject* AttributeMutator::demoteSplitToDict(
     SplitMutator* split,
     PyObject* obj,
@@ -752,39 +765,12 @@ PyObject* SplitMutator::getAttr(PyObject* obj, PyObject* name) {
   return result;
 }
 #else
-struct DictValueTransition311 {
-  uint64_t before{0};
-  uint64_t after{0};
-};
-
-// Under the 3.11 GIL, a value-only replacement preserves every absent key.
-// Remember only the most recent transition; no dict or keys pointer is held.
-static DictValueTransition311 last_dict_value_transition;
-
-template <bool kCombined>
-static void replaceMaterializedDictValue311(
-    PyDictObject* dict,
-    PyObject** slot,
-    PyObject* value) {
-  PyObject* old_value = *slot;
-  JIT_DCHECK(old_value != nullptr, "Only existing values may be overwritten");
-  [[maybe_unused]] uint64_t old_version = 0;
-  if constexpr (kCombined) {
-    old_version = dict->ma_version_tag;
-  }
-  Py_INCREF(value);
-  *slot = value;
-  dict->ma_version_tag = Cix_PyDict_NextVersion();
-  if constexpr (kCombined) {
-    last_dict_value_transition = {old_version, dict->ma_version_tag};
-  }
-  if (!_PyObject_GC_IS_TRACKED(reinterpret_cast<PyObject*>(dict)) &&
-      _PyObject_GC_MAY_BE_TRACKED(value)) {
-    PyObject_GC_Track(reinterpret_cast<PyObject*>(dict));
-  }
-  Py_DECREF(old_value);
-}
-
+// a materialized receiver used to fall all the way to
+// PyObject_SetAttr/PyObject_GetAttr (full generic lookup + _PyType_Lookup)
+// even though the split entry knows the exact slot.  When the dict still
+// shares the captured keys, the value sits at ma_values[val_offset]; a
+// re-keyed dict does one dict probe.  Class-side shadowing stays pinned
+// by the entry's pull-validated type version (descr was NULL at fill).
 int SplitMutator::setAttr(PyObject* obj, PyObject* name, PyObject* value) {
   PyDictValues* values = *_PyObject_ValuesPointer(obj);
   if (values == nullptr) {
@@ -794,13 +780,18 @@ int SplitMutator::setAttr(PyObject* obj, PyObject* name, PyObject* value) {
         dict->ma_values != nullptr && val_offset >= 0 &&
         static_cast<size_t>(val_offset) + 2 <
             reinterpret_cast<const uint8_t*>(dict->ma_values)[-1]) {
-      PyObject* old_value = dict->ma_values->values[val_offset];
-      if (old_value != nullptr) {
-        replaceMaterializedDictValue311<false>(
-            dict, &dict->ma_values->values[val_offset], value);
+      if (dict->ma_values->values[val_offset] != nullptr) {
+        // Overwrite only; an insertion needs the insertion-order and
+        // ma_used bookkeeping of the generic path.  The dict's version
+        // advances as stock's PyDict_SetItem would advance it.
+        replaceMaterializedDictValue311(
+            dict, &dict->ma_values->values[val_offset], value, false);
         return 0;
       }
     }
+    // Store side of the demotion: a re-keyed materialized dict is a
+    // permanent state; re-kind the entry so future stores take the
+    // hint-indexed overwrite instead of the full generic setattr chain.
     if (dict != nullptr && dict->ma_keys != keys) {
       return AttributeMutator::demoteSplitToDictStore(this, obj, name, value);
     }
@@ -834,6 +825,9 @@ PyObject* SplitMutator::getAttr(PyObject* obj, PyObject* name) {
         }
         return getAttrFallback(obj, name);
       }
+      // A re-keyed dict is a permanent state for this instance; re-kind
+      // the entry so future accesses take the hint-indexed path instead
+      // of one hash probe per access.
       return AttributeMutator::demoteSplitToDict(this, obj, name);
     }
     return PyObject_GetAttr(obj, name);
@@ -933,42 +927,50 @@ PyObject* DictMutator::getAttr(PyObject* obj, PyObject* name) {
 // values into a real dict on 3.11, so reads go through the managed-dict
 // slot directly.
 int DictMutator::setAttr(PyObject* obj, PyObject* name, PyObject* value) {
-  PyDictObject* managed =
-      reinterpret_cast<PyDictObject*>(*_PyObject_ManagedDictPointer(obj));
-  if (managed == nullptr && *_PyObject_ValuesPointer(obj) != nullptr) {
-    // A re-keyed receiver may demote this type-keyed entry to kDict while its
-    // siblings still use live split values. Let stock update those values;
-    // GenericGetDict would materialize every sibling unconditionally.
-    return PyObject_SetAttr(obj, name, value);
-  }
-  if (managed != nullptr) {
-    PyDictKeysObject* keys = managed->ma_keys;
-    if (DK_IS_UNICODE(keys)) {
-      Py_ssize_t hint = dict_hint;
-      if (hint < 0 || hint >= keys->dk_nentries ||
-          DK_UNICODE_ENTRIES(keys)[hint].me_key != name) {
-        hint = getDictKeysIndex(keys, name);
-        if (hint >= 0) {
-          dict_hint = hint;
+  // store side: hint-indexed overwrite on the
+  // materialized receiver dict, validated by interned-key identity.
+  // Overwrite only -- an insertion or a deleted slot needs the generic
+  // path's ma_used / insertion-order / resize bookkeeping.  The new
+  // value is increfed before the old one is released, so storing the
+  // same object back is safe.
+  {
+    PyDictObject* mdict =
+        reinterpret_cast<PyDictObject*>(*_PyObject_ManagedDictPointer(obj));
+    if (mdict == nullptr && *_PyObject_ValuesPointer(obj) != nullptr) {
+      // A re-keyed receiver demoted this type-keyed entry to kDict while
+      // its siblings still use live split values.  Stock stores into those
+      // values in place; PyObject_GenericGetDict below would materialize
+      // every sibling unconditionally.
+      return PyObject_SetAttr(obj, name, value);
+    }
+    if (mdict != nullptr) {
+      PyDictKeysObject* keys = mdict->ma_keys;
+      if (DK_IS_UNICODE(keys)) {
+        Py_ssize_t hint = dict_hint;
+        if (hint < 0 || hint >= keys->dk_nentries ||
+            DK_UNICODE_ENTRIES(keys)[hint].me_key != name) {
+          hint = getDictKeysIndex(keys, name);
+          if (hint >= 0) {
+            dict_hint = hint;
+          }
         }
-      }
-      if (hint >= 0) {
-        if (managed->ma_values != nullptr) {
-          if (static_cast<size_t>(hint) + 2 <
-              reinterpret_cast<const uint8_t*>(managed->ma_values)[-1]) {
-            PyObject* old_value = managed->ma_values->values[hint];
-            if (old_value != nullptr) {
-              replaceMaterializedDictValue311<false>(
-                  managed, &managed->ma_values->values[hint], value);
+        if (hint >= 0) {
+          if (mdict->ma_values != nullptr) {
+            if (static_cast<size_t>(hint) + 2 <
+                reinterpret_cast<const uint8_t*>(mdict->ma_values)[-1]) {
+              if (mdict->ma_values->values[hint] != nullptr) {
+                replaceMaterializedDictValue311(
+                    mdict, &mdict->ma_values->values[hint], value, false);
+                return 0;
+              }
+            }
+          } else {
+            PyDictUnicodeEntry* ep = &DK_UNICODE_ENTRIES(keys)[hint];
+            if (ep->me_value != nullptr) {
+              replaceMaterializedDictValue311(
+                  mdict, &ep->me_value, value, true);
               return 0;
             }
-          }
-        } else {
-          PyDictUnicodeEntry* entry = &DK_UNICODE_ENTRIES(keys)[hint];
-          if (entry->me_value != nullptr) {
-            replaceMaterializedDictValue311<true>(
-                managed, &entry->me_value, value);
-            return 0;
           }
         }
       }
@@ -985,55 +987,82 @@ PyObject* DictMutator::getAttr(PyObject* obj, PyObject* name) {
   BorrowedRef<PyDictObject> dict =
       reinterpret_cast<PyDictObject*>(*_PyObject_ManagedDictPointer(obj));
   if (dict == nullptr) {
-    PyDictValues* values = *_PyObject_ValuesPointer(obj);
-    PyDictKeysObject* keys = getSplitKeys(Py_TYPE(obj));
-    if (values != nullptr && keys != nullptr && DK_IS_UNICODE(keys)) {
-      Py_ssize_t hint = values_hint;
+    // Full-keys era: live inline values cannot hold this attribute, so
+    // the __getattr__/AttributeError fallback would be exact.  In the
+    // late-attr era the shared keys can still grow, so a values-live
+    // instance may hold the attribute inline -- run the full generic
+    // protocol instead of asserting absence.
+    {
+      // Values-form fast read through the type's cached shared keys.  The
+      // hint is validated by interned-pointer key equality,
+      // capacity-guarded by the values prefix byte, and only a non-null
+      // slot is a hit -- everything else is the old path.
+      {
+        PyDictValues* values = *_PyObject_ValuesPointer(obj);
+        PyDictKeysObject* keys = getSplitKeys(Py_TYPE(obj));
+        if (values != nullptr && keys != nullptr && DK_IS_UNICODE(keys)) {
+          Py_ssize_t hint = values_hint;
+          if (hint < 0 || hint >= keys->dk_nentries ||
+              DK_UNICODE_ENTRIES(keys)[hint].me_key != name) {
+            hint = getDictKeysIndex(keys, name);
+            if (hint >= 0) {
+              values_hint = hint;
+            }
+          }
+          if (hint >= 0 &&
+              static_cast<size_t>(hint) + 2 <
+                  reinterpret_cast<const uint8_t*>(values)[-1]) {
+            PyObject* v = values->values[hint];
+            if (v != nullptr) {
+              return Py_NewRef(v);
+            }
+          }
+        }
+      }
+      // The generic lookup alone is only the inner half of a hook
+      // receiver's tp_getattro: slot_tp_getattr_hook runs it with
+      // AttributeError suppressed and then calls the pinned __getattr__.
+      // A demoted entry (kSplit -> kDict) whose receiver deleted the
+      // attribute from its inline values arrives here and must take the
+      // hook, not raise.
+      GetAttrHookSnapshot311 hook(getattr_method);
+      PyObject* result = PyObject_GenericGetAttr(obj, name);
+      if (result == nullptr && hook.suppressAttributeError()) {
+        return hook.call(obj, name);
+      }
+      return result;
+    }
+  }
+  // Materialized receiver: indexed read validated by key identity,
+  // replacing the full hash lookup on the steady path.  A deleted entry
+  // (me_value NULL) and any mismatch fall through to the exact slow
+  // protocol below.
+  {
+    PyDictKeysObject* keys = dict->ma_keys;
+    if (DK_IS_UNICODE(keys)) {
+      Py_ssize_t hint = dict_hint;
       if (hint < 0 || hint >= keys->dk_nentries ||
           DK_UNICODE_ENTRIES(keys)[hint].me_key != name) {
         hint = getDictKeysIndex(keys, name);
         if (hint >= 0) {
-          values_hint = hint;
+          dict_hint = hint;
         }
       }
-      if (hint >= 0 &&
-          static_cast<size_t>(hint) + 2 <
-              reinterpret_cast<const uint8_t*>(values)[-1]) {
-        PyObject* value = values->values[hint];
-        if (value != nullptr) {
-          return Py_NewRef(value);
-        }
-      }
-    }
-    GetAttrHookSnapshot311 hook(getattr_method);
-    PyObject* result = PyObject_GenericGetAttr(obj, name);
-    if (result == nullptr && hook.suppressAttributeError()) {
-      return hook.call(obj, name);
-    }
-    return result;
-  }
-  PyDictKeysObject* keys = dict->ma_keys;
-  if (DK_IS_UNICODE(keys)) {
-    Py_ssize_t hint = dict_hint;
-    if (hint < 0 || hint >= keys->dk_nentries ||
-        DK_UNICODE_ENTRIES(keys)[hint].me_key != name) {
-      hint = getDictKeysIndex(keys, name);
       if (hint >= 0) {
-        dict_hint = hint;
-      }
-    }
-    if (hint >= 0) {
-      PyObject* value = nullptr;
-      if (dict->ma_values != nullptr) {
-        if (static_cast<size_t>(hint) + 2 <
-            reinterpret_cast<const uint8_t*>(dict->ma_values)[-1]) {
-          value = dict->ma_values->values[hint];
+        PyObject* v;
+        if (dict->ma_values != nullptr) {
+          if (static_cast<size_t>(hint) + 2 <
+              reinterpret_cast<const uint8_t*>(dict->ma_values)[-1]) {
+            v = dict->ma_values->values[hint];
+          } else {
+            v = nullptr;
+          }
+        } else {
+          v = DK_UNICODE_ENTRIES(keys)[hint].me_value;
         }
-      } else {
-        value = DK_UNICODE_ENTRIES(keys)[hint].me_value;
-      }
-      if (value != nullptr) {
-        return Py_NewRef(value);
+        if (v != nullptr) {
+          return Py_NewRef(v);
+        }
       }
     }
   }
@@ -1152,14 +1181,20 @@ int DescrOrClassVarMutator::setAttr(
 }
 
 PyObject* DescrOrClassVarMutator::getAttr(PyObject* obj, PyObject* name) {
-  BorrowedRef<PyTypeObject> descr_type(Py_TYPE(descr));
+  // Everything this call needs is captured up front: a mega-cache entry is
+  // shared storage that a reentrant fill (reached from the instance peek
+  // below, whose dict probe can run a key's __eq__) may overwrite while the
+  // call is in flight, so the members are never re-read after this point.
+  auto descr_guard = Ref<>::create(descr);
+  PyObject* held = descr_guard.get();
+  const uint32_t captured_keys_version = keys_version;
+  BorrowedRef<PyTypeObject> descr_type(Py_TYPE(held));
   descrsetfunc setter = descr_type->tp_descr_set;
   descrgetfunc getter = descr_type->tp_descr_get;
 
-  auto descr_guard = Ref<>::create(descr);
   if (setter != nullptr && getter != nullptr) {
     BorrowedRef<PyTypeObject> type(Py_TYPE(obj));
-    return getter(descr, obj, type);
+    return getter(held, obj, type);
   }
 
 #if PY_VERSION_HEX < 0x030C0000
@@ -1171,7 +1206,8 @@ PyObject* DescrOrClassVarMutator::getAttr(PyObject* obj, PyObject* name) {
   // inside slot_tp_getattr_hook: on a hook receiver the DISPATCH layer
   // then clears an AttributeError and calls the pinned __getattr__; on
   // a plain receiver it propagates.
-  if (keys_version == 0 || !isValidKeysVersion(keys_version, obj)) {
+  if (captured_keys_version == 0 ||
+      !isValidKeysVersion(captured_keys_version, obj)) {
     PyObject* shadow = nullptr;
     int found = peekInstanceAttr311(obj, name, &shadow);
     if (found < 0) {
@@ -1190,9 +1226,9 @@ PyObject* DescrOrClassVarMutator::getAttr(PyObject* obj, PyObject* name) {
 
   // Check instance dict.
   if (dict != nullptr) {
-    if (keys_version == 0 ||
+    if (captured_keys_version == 0 ||
         reinterpret_cast<PyDictObject*>(dict.get())->ma_keys->dk_version !=
-            keys_version) {
+            captured_keys_version) {
       auto res = Ref<>::create(PyDict_GetItem(dict, name));
       if (res != nullptr) {
         return res.release();
@@ -1204,7 +1240,7 @@ PyObject* DescrOrClassVarMutator::getAttr(PyObject* obj, PyObject* name) {
   if (getter != nullptr) {
     // Non-data descriptor
     BorrowedRef<PyTypeObject> type(Py_TYPE(obj));
-    return getter(descr, obj, type);
+    return getter(held, obj, type);
   }
 
   // Class var
@@ -1279,92 +1315,6 @@ void AttributeMutator::set_getattr(
   getattr_.keys_version = keys_version;
 }
 
-#if PY_VERSION_HEX < 0x030C0000
-void AttributeMutator::set_type_recv_value(
-    PyTypeObject* receiver,
-    uint32_t meta_version,
-    PyObject* payload,
-    uint32_t payload_type_version) {
-  set_type(receiver, Kind::kTypeRecv);
-  type_recv_.payload = payload;
-  type_recv_.meta_version = meta_version;
-  type_recv_.payload_type_version = payload_type_version;
-  type_recv_.form = TypeRecvMutator::Form::kValue;
-}
-
-void AttributeMutator::set_type_recv_meta_descr(
-    PyTypeObject* metatype,
-    PyObject* payload,
-    uint32_t payload_type_version) {
-  set_type(metatype, Kind::kTypeRecv);
-  type_recv_.payload = payload;
-  type_recv_.meta_version = metatype->tp_version_tag;
-  type_recv_.payload_type_version = payload_type_version;
-  type_recv_.form = TypeRecvMutator::Form::kMetaDescr;
-}
-
-void AttributeMutator::set_type_recv_static_method(
-    PyTypeObject* receiver,
-    uint32_t meta_version,
-    PyObject* wrapper,
-    uint32_t wrapper_type_version) {
-  set_type(receiver, Kind::kTypeRecv);
-  type_recv_.payload = wrapper;
-  type_recv_.meta_version = meta_version;
-  type_recv_.payload_type_version = wrapper_type_version;
-  type_recv_.form = TypeRecvMutator::Form::kStaticMethod;
-}
-
-PyObject* AttributeMutator::getTypeRecvAttr(PyObject* obj, PyObject* name) {
-  auto receiver = reinterpret_cast<PyTypeObject*>(obj);
-  PyTypeObject* metatype = Py_TYPE(obj);
-  if (type_recv_.form != TypeRecvMutator::Form::kMetaDescr) {
-    if (type() != receiver || !typeVersionMatches(receiver) ||
-        !Ci_Type_HasValidVersionTag(metatype) ||
-        metatype->tp_version_tag != type_recv_.meta_version) {
-      reset();
-      return nullptr;
-    }
-    PyTypeObject* payload_type = Py_TYPE(type_recv_.payload);
-    if (!Ci_Type_HasValidVersionTag(payload_type) ||
-        payload_type->tp_version_tag != type_recv_.payload_type_version) {
-      reset();
-      return nullptr;
-    }
-    if (type_recv_.form == TypeRecvMutator::Form::kStaticMethod) {
-      if (Py_TYPE(type_recv_.payload) != &PyStaticMethod_Type) {
-        reset();
-        return nullptr;
-      }
-      PyObject* callable = Ci_PyStaticMethod_GetFunc(type_recv_.payload);
-      return callable == nullptr ? nullptr : Py_NewRef(callable);
-    }
-    return Py_NewRef(type_recv_.payload);
-  }
-
-  if (type() != metatype || !typeVersionMatches(metatype)) {
-    reset();
-    return nullptr;
-  }
-  PyTypeObject* payload_type = Py_TYPE(type_recv_.payload);
-  if (!Ci_Type_HasValidVersionTag(payload_type) ||
-      payload_type->tp_version_tag != type_recv_.payload_type_version ||
-      payload_type->tp_descr_get == nullptr ||
-      !PyDescr_IsData(type_recv_.payload)) {
-    reset();
-    return nullptr;
-  }
-  Ref<> payload = Ref<>::create(type_recv_.payload);
-  GetAttrHookSnapshot311 hook(obj);
-  PyObject* result = payload_type->tp_descr_get(
-      payload, obj, reinterpret_cast<PyObject*>(metatype));
-  if (result == nullptr && hook.suppressAttributeError()) {
-    return hook.call(obj, name);
-  }
-  return result;
-}
-#endif
-
 BorrowedRef<PyTypeObject> AttributeMutator::watchedDescrType() const {
   if (get_kind() == Kind::kDataDescr) {
     return data_descr_.descr_type;
@@ -1419,9 +1369,6 @@ inline PyObject* AttributeMutator::getAttr(PyObject* obj, PyObject* name) {
 #if PY_VERSION_HEX >= 0x030E0000
     case AttributeMutator::Kind::kSplitInline:
       return split_.getAttrInline(obj, name);
-#elif PY_VERSION_HEX < 0x030C0000
-    case AttributeMutator::Kind::kTypeRecv:
-      return getTypeRecvAttr(obj, name);
 #endif
     case AttributeMutator::Kind::kCombined:
       return combined_.getAttr(obj, name);
@@ -1575,6 +1522,74 @@ AttributeMutator* AttributeCache::findEmptyEntry() {
   return it == entries().end() ? nullptr : &*it;
 }
 
+bool canCacheAttribute(
+    BorrowedRef<PyTypeObject> type,
+    BorrowedRef<> name,
+    uint32_t& keys_version);
+
+#if PY_VERSION_HEX < 0x030C0000
+// a process-wide (receiver type, name) -> AttributeMutator
+// table behind the per-site entries.  A site whose four entries are taken
+// by other receiver types used to run the full lookup on every further
+// miss and then attempt -- and refuse -- a fill each time (sqlglot: 1.4M
+// "entries-full" refusals over four iterations on Expression.args /
+// arg_types across dozens of Expression subclasses; sqlalchemy and pprint
+// show the same shape).  Such a miss now fills a direct-mapped global
+// entry, and the next miss on that (type, name) pair anywhere in the
+// process is answered by it through the same pull-validated mutator the
+// site entries use.  Names are compared by identity (code-object interned
+// strings); a collision simply overwrites.  Nothing is watched: on 3.11
+// every entry validates the receiver type's version tag on the hit path.
+namespace {
+// The name is held: the table outlives the code object whose co_names
+// supplied it, and a released name's address could be reused by another
+// string that the identity compare would then accept.
+struct MegaEntry311 {
+  AttributeMutator mut;
+  PyObject* name{nullptr};
+};
+
+inline void megaSetName311(PyObject*& slot, PyObject* name) {
+  Py_XINCREF(name);
+  PyObject* old = slot;
+  slot = name;
+  Py_XDECREF(old);
+}
+constexpr size_t kMegaEntries311 = 2048;
+MegaEntry311 s_mega_load_311[kMegaEntries311];
+MegaEntry311 s_mega_store_311[kMegaEntries311];
+
+inline size_t megaIndex311(PyTypeObject* type, PyObject* name) {
+  uint64_t h = (reinterpret_cast<uintptr_t>(type) >> 4) * 0x9E3779B97F4A7C15ull;
+  h ^= (reinterpret_cast<uintptr_t>(name) >> 4) * 0xC2B2AE3D27D4EB4Full;
+  return static_cast<size_t>(h >> 40) & (kMegaEntries311 - 1);
+}
+
+inline MegaEntry311&
+megaEntry311(bool is_set, PyTypeObject* type, PyObject* name) {
+  return (
+      is_set ? s_mega_store_311 : s_mega_load_311)[megaIndex311(type, name)];
+}
+
+// A validated global entry for (Py_TYPE(obj), name), or nullptr.  A stale
+// entry (type version moved on) is dropped on the way.
+inline AttributeMutator*
+megaLookup311(bool is_set, PyTypeObject* tp, PyObject* name) {
+  MegaEntry311& me = megaEntry311(is_set, tp, name);
+  if (me.name != name || me.mut.type() != tp) {
+    return nullptr;
+  }
+  if (!me.mut.typeVersionMatches(tp) || !me.mut.descrVersionMatches()) {
+    me.mut.reset();
+    megaSetName311(me.name, nullptr);
+    return nullptr;
+  }
+  return &me.mut;
+}
+
+} // namespace
+#endif
+
 void AttributeCache::fill(BorrowedRef<> obj, BorrowedRef<> name, bool is_set) {
   BorrowedRef<> descr = _PyType_Lookup(Py_TYPE(obj), name);
   fill(obj, name, descr, is_set);
@@ -1639,16 +1654,22 @@ void AttributeCache::fill(
       (!is_set && type->tp_getattro != PyObject_GenericGetAttr &&
        (type->tp_getattro != Ci_tp_getattr_hook ||
         !hookUsesGenericGetAttr(type)))) {
-    // tp_ slot takes precedence. When tp_getattro is the __getattr__ hook,
-    // we can only cache if the hook wraps PyObject_GenericGetAttr. For
-    // metaclasses, the hook wraps type_getattro which does MRO search,
-    // and our IC cannot replicate that.
+    // tp_ slot takes precedence.
     return;
   }
 
   AttributeMutator* mut = findEmptyEntry();
+  bool mega = false;
   if (mut == nullptr) {
+#if PY_VERSION_HEX < 0x030C0000
+    MegaEntry311& me = megaEntry311(is_set, type, name);
+    me.mut.reset();
+    megaSetName311(me.name, name);
+    mut = &me.mut;
+    mega = true;
+#else
     return;
+#endif
   }
 
   if (descr != nullptr) {
@@ -1682,7 +1703,9 @@ void AttributeCache::fill(
         // On 3.12+ this watcher retires the entry; on 3.11 watch() is a
         // no-op and the hit path pull-validates the tag captured by
         // set_data_descr instead (descrVersionMatches).
-        ac_descr_watcher.watch(descr_type, this);
+        if (!mega) {
+          ac_descr_watcher.watch(descr_type, this);
+        }
         mut->set_data_descr(type, descr);
       }
     } else {
@@ -1694,7 +1717,9 @@ void AttributeCache::fill(
       canCacheAttribute(type, name, keys_version);
       mut->set_descr_or_classvar(type, descr, keys_version);
     }
-    ac_watcher.watch(type, this);
+    if (!mega) {
+      ac_watcher.watch(type, this);
+    }
     countAttrCacheFill311(is_set);
     return;
   }
@@ -1708,8 +1733,6 @@ void AttributeCache::fill(
   PyDictKeysObject* keys = getSplitKeys(type);
   if (PyType_HasFeature(type, Py_TPFLAGS_MANAGED_DICT)) {
 #if PY_VERSION_HEX < 0x030C0000
-    // A 3.11 managed-dict heap type can be caught before its cached keys
-    // exist; there is nothing to specialize against yet.
     if (keys == nullptr) {
       return;
     }
@@ -1738,31 +1761,38 @@ void AttributeCache::fill(
             keys_version = 0;
           }
           mut->set_getattr(type, getattr_method, keys_version);
-          ac_watcher.watch(type, this);
+          if (!mega) {
+            ac_watcher.watch(type, this);
+          }
           countAttrCacheFill311(is_set);
           return;
         }
       }
 
       if (keys->dk_nentries == SHARED_KEYS_MAX_SIZE) {
-        // The shared dict is full, fallback to dict access via managed
-        // dict APIs.
         mut->set_dict(type);
-        ac_watcher.watch(type, this);
+        if (!mega) {
+          ac_watcher.watch(type, this);
+        }
         countAttrCacheFill311(is_set);
         return;
       }
-
 #if PY_VERSION_HEX < 0x030C0000
-      // A late-added attribute can live in a materialized dict even while the
-      // type's shared keys are not full. B1 admitted the read side; B2 makes
-      // the same kDict shape available to stores, whose DictMutator consumer
-      // owns versioning, GC tracking and overwrite fallback semantics.
+      // A late-added attribute that never entered the type's cached shared
+      // keys lives in materialized combined dicts; refusing the fill retried
+      // (and re-refused) on every miss (go: 9.2M futile fill calls in 3
+      // rounds).  kDict serves it: materialized dicts get a direct dict
+      // lookup, values-live instances take the generic path (the 3.11
+      // DictMutator::getAttr below reads inline values), and class-level
+      // changes stay pinned by the pull-validated type version.  3.12+
+      // DictMutator treats a values-live instance as a miss, so the shape
+      // stays refused there.
       mut->set_dict(type);
-      ac_watcher.watch(type, this);
+      if (!mega) {
+        ac_watcher.watch(type, this);
+      }
       countAttrCacheFill311(is_set);
 #endif
-
       return;
     }
 
@@ -1772,7 +1802,9 @@ void AttributeCache::fill(
     // combined handles __getattr__ fallback too
     mut->set_combined(type);
   }
-  ac_watcher.watch(type, this);
+  if (!mega) {
+    ac_watcher.watch(type, this);
+  }
   countAttrCacheFill311(is_set);
 }
 
@@ -1804,6 +1836,12 @@ int StoreAttrCache::doInvoke(PyObject* obj, PyObject* name, PyObject* value) {
       return entry.setAttr(obj, name, value);
     }
   }
+#if PY_VERSION_HEX < 0x030C0000
+  if (AttributeMutator* mut = megaLookup311(true, tp, name)) {
+    attrCacheStats311().store_attr.hits++;
+    return mut->setAttr(obj, name, value);
+  }
+#endif
   return invokeSlowPath(obj, name, value);
 }
 
@@ -1824,21 +1862,109 @@ StoreAttrCache::invokeSlowPath(PyObject* obj, PyObject* name, PyObject* value) {
   return result;
 }
 
-PyObject*
-LoadAttrCache::invoke(LoadAttrCache* cache, PyObject* obj, PyObject* name) {
-  return cache->doInvoke(obj, name);
-}
 
 #if PY_VERSION_HEX < 0x030C0000
 PyObject* AttributeCache::typeRecvGetAttr(PyObject* obj, PyObject* name) {
-  auto receiver = reinterpret_cast<PyTypeObject*>(obj);
+  if (type_recv_ == nullptr) {
+    return nullptr;
+  }
+  auto tp = reinterpret_cast<PyTypeObject*>(obj);
   PyTypeObject* metatype = Py_TYPE(obj);
-  for (auto& entry : entries()) {
-    if (!entry.isTypeRecv() ||
-        (entry.type() != receiver && entry.type() != metatype)) {
+  for (auto& e : type_recv_->entries) {
+    if (e.form == TypeRecvEntry::Form::kNone) {
       continue;
     }
-    return entry.getTypeRecvAttr(obj, name);
+    if (e.form == TypeRecvEntry::Form::kValue) {
+      if (e.recv != tp) {
+        continue;
+      }
+      // Metatype version (no new shadowing data descriptor on the
+      // metatype side), then receiver version (any MRO-layer change
+      // propagates through PyType_Modified).  A stale entry is cleared
+      // in place -- versions are monotonic, it can never hit again --
+      // without dereferencing its borrowed payload.
+      if (!Ci_Type_HasValidVersionTag(metatype) ||
+          metatype->tp_version_tag != e.meta_version) {
+        e = TypeRecvEntry{};
+        return nullptr;
+      }
+      if (!Ci_Type_HasValidVersionTag(tp) ||
+          tp->tp_version_tag != e.recv_version) {
+        e = TypeRecvEntry{};
+        return nullptr;
+      }
+      // The class dict still holds the payload (receiver version); its
+      // type must not have grown a __get__ since the fill.
+      PyTypeObject* pt = Py_TYPE(e.payload);
+      if (!Ci_Type_HasValidVersionTag(pt) ||
+          pt->tp_version_tag != e.payload_version) {
+        e = TypeRecvEntry{};
+        return nullptr;
+      }
+      return Py_NewRef(e.payload);
+    }
+    if (e.form == TypeRecvEntry::Form::kDescrGet) {
+      if (e.recv != tp) {
+        continue;
+      }
+      if (!Ci_Type_HasValidVersionTag(metatype) ||
+          metatype->tp_version_tag != e.meta_version) {
+        e = TypeRecvEntry{};
+        return nullptr;
+      }
+      if (!Ci_Type_HasValidVersionTag(tp) ||
+          tp->tp_version_tag != e.recv_version) {
+        e = TypeRecvEntry{};
+        return nullptr;
+      }
+      // type_getattro's second step for a non-data-descriptor-shadowed
+      // class attribute that carries __get__.  The descriptor's type is
+      // pinned by its version (it may have lost __get__), and the
+      // descriptor itself is held across the call: its __get__ may delete
+      // it from the class.
+      PyTypeObject* pt = Py_TYPE(e.payload);
+      if (!Ci_Type_HasValidVersionTag(pt) ||
+          pt->tp_version_tag != e.payload_version ||
+          pt->tp_descr_get == nullptr) {
+        e = TypeRecvEntry{};
+        return nullptr;
+      }
+      // slot_tp_getattr_hook pins the metatype's __getattr__ BEFORE the
+      // generic lookup runs the descriptor; the descriptor may republish
+      // or delete the hook, and this access must still use the pinned one.
+      GetAttrHookSnapshot311 hook(obj);
+      auto held = Ref<>::create(e.payload);
+      PyObject* result = pt->tp_descr_get(held, nullptr, obj);
+      if (result == nullptr && hook.suppressAttributeError()) {
+        result = hook.call(obj, name);
+      }
+      return result;
+    }
+    // kMetaDescr: keyed on the metatype (a data descriptor with this
+    // name serves every class of the metatype); receiver-independent.
+    if (e.recv != metatype) {
+      continue;
+    }
+    if (!Ci_Type_HasValidVersionTag(metatype) ||
+        metatype->tp_version_tag != e.meta_version) {
+      e = TypeRecvEntry{};
+      return nullptr;
+    }
+    PyTypeObject* pt = Py_TYPE(e.payload);
+    if (!Ci_Type_HasValidVersionTag(pt) ||
+        pt->tp_version_tag != e.payload_version ||
+        pt->tp_descr_get == nullptr) {
+      e = TypeRecvEntry{};
+      return nullptr;
+    }
+    GetAttrHookSnapshot311 hook(obj);
+    auto held = Ref<>::create(e.payload);
+    PyObject* result =
+        pt->tp_descr_get(held, obj, reinterpret_cast<PyObject*>(metatype));
+    if (result == nullptr && hook.suppressAttributeError()) {
+      result = hook.call(obj, name);
+    }
+    return result;
   }
   return nullptr;
 }
@@ -1849,83 +1975,170 @@ void AttributeCache::typeRecvTryFill(
     PyObject* result) {
   auto tp = reinterpret_cast<PyTypeObject*>(obj);
   PyTypeObject* metatype = Py_TYPE(obj);
+  // Standard type_getattro is replicable; the __getattr__ slot hook is
+  // too on the HIT side (its first half is type_getattro: a class-dict
+  // hit returns before __getattr__ runs).  A cache miss returns nullptr
+  // and falls back to the full protocol including the hook, so there is
+  // no "assert absent" path.  Other custom metatype getattros are not
+  // cached.
   if ((metatype->tp_getattro != PyType_Type.tp_getattro &&
        (metatype->tp_getattro != Ci_tp_getattr_hook ||
         !metaclassHookUsesTypeGetAttr(metatype))) ||
       !ensureVersionTag(metatype)) {
     return;
   }
-  auto pick_slot = [&](PyTypeObject* key) -> AttributeMutator* {
-    AttributeMutator* empty = nullptr;
-    for (auto& entry : entries()) {
-      if (entry.isTypeRecv() && entry.type() == key) {
-        return &entry;
+  if (type_recv_ == nullptr) {
+    // Allocated on the call path, where a C++ exception has no handler:
+    // the fill is an optimisation, so an allocation failure skips it and
+    // the attribute value already produced is the answer.
+    type_recv_.reset(new (std::nothrow) TypeRecvEntries());
+    if (type_recv_ == nullptr) {
+      return;
+    }
+  }
+  // Slot choice: same-key slot first (refill), then an empty slot, else
+  // round-robin replacement (polymorphic receivers are the point).
+  auto pick_slot = [&](PyTypeObject* key) -> TypeRecvEntry* {
+    TypeRecvEntry* slot = nullptr;
+    for (auto& e : type_recv_->entries) {
+      if (e.recv == key) {
+        return &e;
       }
-      if (empty == nullptr && entry.isEmpty()) {
-        empty = &entry;
+      if (slot == nullptr && e.form == TypeRecvEntry::Form::kNone) {
+        slot = &e;
       }
     }
-    return empty;
+    if (slot == nullptr) {
+      slot = &type_recv_->entries[type_recv_->rr];
+      type_recv_->rr = (type_recv_->rr + 1) % TypeRecvEntries::kNumEntries;
+    }
+    return slot;
   };
 
   BorrowedRef<> meta_attr = _PyType_Lookup(metatype, name);
   if (meta_attr != nullptr &&
       Py_TYPE(meta_attr.get())->tp_descr_get != nullptr &&
       PyDescr_IsData(meta_attr.get())) {
-    PyTypeObject* payload_type = Py_TYPE(meta_attr.get());
-    if (!ensureVersionTag(payload_type)) {
+    PyTypeObject* pt = Py_TYPE(meta_attr.get());
+    if (!ensureVersionTag(pt)) {
       return;
     }
-    AttributeMutator* slot = pick_slot(metatype);
-    if (slot != nullptr) {
-      slot->set_type_recv_meta_descr(
-          metatype, meta_attr.get(), payload_type->tp_version_tag);
-    }
+    *pick_slot(metatype) = TypeRecvEntry{
+        metatype,
+        0,
+        metatype->tp_version_tag,
+        TypeRecvEntry::Form::kMetaDescr,
+        meta_attr.get(),
+        pt->tp_version_tag};
     return;
   }
+  // A same-named metatype candidate that is not a data descriptor now may
+  // become one later without any version the kValue / kDescrGet entries
+  // check moving: its heap type gains __set__ (PyType_Modified on that type
+  // reaches neither the metatype nor the receiver class), or the object
+  // takes another type through __class__ assignment (allowed between
+  // mutable types, and for module objects even though their type is
+  // immutable).  Such sites stay on the generic protocol; only a candidate
+  // of an immutable, non-module type cannot change.
+  if (meta_attr != nullptr &&
+      (!PyType_HasFeature(Py_TYPE(meta_attr.get()), Py_TPFLAGS_IMMUTABLETYPE) ||
+       PyModule_Check(meta_attr.get()))) {
+    return;
+  }
+  TypeRecvEntry* slot = pick_slot(tp);
 
   BorrowedRef<> raw = _PyType_Lookup(tp, name);
   if (raw == nullptr) {
     return;
   }
   PyObject* payload = nullptr;
-  PyTypeObject* raw_type = Py_TYPE(raw.get());
+  PyTypeObject* rt = Py_TYPE(raw.get());
   if (raw.get() == result) {
-    if (raw_type->tp_descr_get == nullptr || raw_type == &PyFunction_Type ||
-        raw_type == &PyWrapperDescr_Type || raw_type == &PyMethodDescr_Type) {
+    // Identity-stable forms: a plain class var with no __get__, or a
+    // known descriptor type whose class-level access returns itself
+    // (function / wrapper / method descriptors).  A custom descriptor
+    // that happened to return itself this time is not taken.
+    if (rt->tp_descr_get == nullptr || rt == &PyFunction_Type ||
+        rt == &PyWrapperDescr_Type || rt == &PyMethodDescr_Type) {
       payload = raw.get();
     }
-  } else if (
-      raw_type == &PyStaticMethod_Type &&
-      Ci_PyStaticMethod_GetFunc(raw.get()) == result) {
-    payload = raw.get();
   }
-  PyTypeObject* payload_type = payload == nullptr ? nullptr : Py_TYPE(payload);
-  if (payload == nullptr || !ensureVersionTag(tp) ||
-      !ensureVersionTag(payload_type)) {
+  // A staticmethod is NOT unwrapped into a value form: staticmethod.__init__
+  // can rebind its callable in place without any type version change (and
+  // drop the previous callable's last reference), so the class-level read
+  // must run staticmethod.__get__ per hit, the kDescrGet form below.
+  if (payload == nullptr && rt->tp_descr_get != nullptr &&
+      !PyDescr_IsData(raw.get())) {
+    // anything else with __get__ (classmethod, the C
+    // classmethod descriptor, custom descriptors) is served by running
+    // that __get__ on each hit, exactly as type_getattro does once the
+    // lookups are done.  A data descriptor on the receiver class is left
+    // to the general protocol (its class-level get is the same call, but
+    // keep the admitted set narrow).
+    if (!ensureVersionTag(tp) || !ensureVersionTag(rt)) {
+      return;
+    }
+    *slot = TypeRecvEntry{
+        tp,
+        tp->tp_version_tag,
+        metatype->tp_version_tag,
+        TypeRecvEntry::Form::kDescrGet,
+        raw.get(),
+        rt->tp_version_tag};
     return;
   }
-  AttributeMutator* slot = pick_slot(tp);
-  if (slot != nullptr) {
-    if (raw_type == &PyStaticMethod_Type) {
-      slot->set_type_recv_static_method(
-          tp, metatype->tp_version_tag, payload, payload_type->tp_version_tag);
-    } else {
-      slot->set_type_recv_value(
-          tp, metatype->tp_version_tag, payload, payload_type->tp_version_tag);
-    }
+  if (payload == nullptr || !ensureVersionTag(tp) || !ensureVersionTag(rt)) {
+    return;
   }
+  *slot = TypeRecvEntry{
+      tp,
+      tp->tp_version_tag,
+      metatype->tp_version_tag,
+      TypeRecvEntry::Form::kValue,
+      payload,
+      rt->tp_version_tag};
 }
+#endif // PY_VERSION_HEX < 0x030C0000
+
+PyObject*
+LoadAttrCache::invoke(LoadAttrCache* cache, PyObject* obj, PyObject* name) {
+#if PY_VERSION_HEX < 0x030C0000
+  // PyObject_GetAttr completes an AttributeError with the name and the
+  // receiver once the lookup has failed, whichever path raised it; the
+  // cached paths below (a descriptor's __get__, a pinned __getattr__ hook)
+  // raise without passing through it, so the completion is made here, at
+  // the same point of the protocol, for the receiver as the site saw it.
+  PyObject* result = cache->doInvoke(obj, name);
+  if (result == nullptr && PyErr_ExceptionMatches(PyExc_AttributeError)) {
+    Cix_set_attribute_error_context(obj, name);
+  }
+  return result;
+#else
+  return cache->doInvoke(obj, name);
 #endif
+}
 
 PyObject* LoadAttrCache::doInvoke(PyObject* obj, PyObject* name) {
   PyTypeObject* tp = Py_TYPE(obj);
-  for (auto& entry : entries()) {
-    if (entry.type() == tp
 #if PY_VERSION_HEX < 0x030C0000
-        && !entry.isTypeRecv()
+  // method_getattro's delegation.  A name the (static,
+  // never modified) method type does not define is looked up on im_func;
+  // the site remembers that verdict and continues with the function as
+  // the receiver, whose loads the ordinary entries cache (docutils reads
+  // method.__name__ on every visitor dispatch).
+  if (tp == &PyMethod_Type) {
+    if (method_delegate_ == 0) {
+      method_delegate_ =
+          _PyType_Lookup(&PyMethod_Type, name) == nullptr ? 1 : 2;
+    }
+    if (method_delegate_ == 1) {
+      obj = reinterpret_cast<PyMethodObject*>(obj)->im_func;
+      tp = Py_TYPE(obj);
+    }
+  }
 #endif
-    ) {
+  for (auto& entry : entries()) {
+    if (entry.type() == tp) {
 #if PY_VERSION_HEX < 0x030C0000
       // Pull-based invalidation: no watcher retires entries on 3.11, so a
       // hit must prove the receiver type is unchanged since fill -- and,
@@ -1944,12 +2157,20 @@ PyObject* LoadAttrCache::doInvoke(PyObject* obj, PyObject* name) {
     }
   }
 #if PY_VERSION_HEX < 0x030C0000
+  if (AttributeMutator* mut = megaLookup311(false, tp, name)) {
+    attrCacheStats311().load_attr.hits++;
+    return mut->getAttr(obj, name);
+  }
   if (PyType_Check(obj)) {
     if (PyObject* result = typeRecvGetAttr(obj, name)) {
       attrCacheStats311().load_attr.hits++;
       return result;
     }
     if (PyErr_Occurred()) {
+      // A cached descriptor's __get__ raised and the hook pinned before
+      // the call (typeRecvGetAttr) did not absorb it: this is
+      // type_getattro's own outcome, so it must not fall into the generic
+      // slow path with the error pending.
       return nullptr;
     }
   }
@@ -1972,6 +2193,8 @@ PyObject* __attribute__((noinline)) LoadAttrCache::invokeSlowPath(
   }
   fill(obj, name, /* is_set */ false);
 #if PY_VERSION_HEX < 0x030C0000
+  // The general fill refuses class receivers (metatype getattro takes
+  // the tp-slot early return); give them the type-receiver entries.
   if (PyType_Check(obj)) {
     typeRecvTryFill(obj, name, result.get());
   }
@@ -2199,6 +2422,40 @@ std::string_view kCacheMissReasons[] = {
 std::string_view cacheMissReason(CacheMissReason reason) {
   return kCacheMissReasons[static_cast<size_t>(reason)];
 }
+
+#if PY_VERSION_HEX < 0x030C0000
+struct DictValueTransition311 {
+  uint64_t before{0};
+  uint64_t after{0};
+};
+
+// Under the 3.11 GIL, a value-only replacement preserves every absent key.
+// Remember only the most recent transition; no dict or keys pointer is held.
+static DictValueTransition311 last_dict_value_transition;
+
+void replaceMaterializedDictValue311(
+    PyDictObject* dict,
+    PyObject** slot,
+    PyObject* value,
+    bool combined) {
+  PyObject* old_value = *slot;
+  JIT_DCHECK(old_value != nullptr, "Only existing values may be overwritten");
+  uint64_t old_version = dict->ma_version_tag;
+  Py_INCREF(value);
+  *slot = value;
+  dict->ma_version_tag = Cix_PyDict_NextVersion();
+  if (combined) {
+    last_dict_value_transition = {old_version, dict->ma_version_tag};
+  }
+  // Mirror insertdict's MAINTAIN_TRACKING: a container stored into a
+  // so-far-untracked dict must make the dict visible to the cycle collector.
+  if (!_PyObject_GC_IS_TRACKED(reinterpret_cast<PyObject*>(dict)) &&
+      _PyObject_GC_MAY_BE_TRACKED(value)) {
+    PyObject_GC_Track(reinterpret_cast<PyObject*>(dict));
+  }
+  Py_DECREF(old_value);
+}
+#endif
 
 LoadMethodCache::~LoadMethodCache() {
   for (auto& entry : entries_) {

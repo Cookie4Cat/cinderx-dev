@@ -206,6 +206,8 @@ int BytecodeInstruction::specializedOpcode() const {
     case LOAD_METHOD_WITH_VALUES:
     case LOAD_METHOD_MODULE:
     case LOAD_GLOBAL_MODULE:
+    case STORE_ATTR_INSTANCE_VALUE:
+    case STORE_ATTR_WITH_HINT:
 #endif
     case LOAD_ATTR_MODULE:
     case STORE_ATTR_SLOT:

@@ -16,6 +16,7 @@
 #include "cinderx/Common/util.h"
 #include "cinderx/Interpreter/interpreter.h"
 #include "cinderx/Jit/config.h"
+#include "cinderx/Jit/inline_cache.h"
 #if PY_VERSION_HEX < 0x030C0000
 #include "cinderx/Interpreter/3.11/interpreter_contract.h"
 #include "cinderx/Interpreter/3.11/observe.h"
@@ -1674,6 +1675,61 @@ PyObject* JITRT_Call(
   return res;
 }
 
+#if PY_VERSION_HEX < 0x030C0000
+// STORE_ATTR_WITH_HINT as a lean helper mirroring the
+// interpreter's handler (upstream/ceval.c) for a materialized, combined
+// instance dict: hint in range, unicode keys, cached key identity, existing
+// value -- overwrite in place.  Returns 1 when done, 0 to take the generic
+// path.  The replacement goes through the same routine as the hint-indexed
+// C++ overwrite in DictMutator::setAttr, so the dict's PEP 509 version
+// advances exactly as stock's handler advances it.
+int JITRT_StoreAttrWithHint311(
+    PyObject* owner,
+    PyObject* name,
+    Py_ssize_t hint,
+    PyObject* value) {
+  auto* dict = *reinterpret_cast<PyDictObject**>(
+      reinterpret_cast<PyObject**>(owner) - 3);
+  if (dict == nullptr || !PyDict_CheckExact(dict) ||
+      dict->ma_values != nullptr) {
+    return 0;
+  }
+  PyDictKeysObject* keys = dict->ma_keys;
+  if (!DK_IS_UNICODE(keys) ||
+      static_cast<size_t>(hint) >= static_cast<size_t>(keys->dk_nentries)) {
+    return 0;
+  }
+  PyDictUnicodeEntry* ep = DK_UNICODE_ENTRIES(keys) + hint;
+  if (ep->me_key != name) {
+    return 0;
+  }
+  if (ep->me_value == nullptr) {
+    return 0;
+  }
+  jit::replaceMaterializedDictValue311(dict, &ep->me_value, value, true);
+  return 1;
+}
+
+// Insertion into a fresh split-values slot, the
+// interpreter's STORE_ATTR_INSTANCE_VALUE old_value == NULL arm:
+// _PyDictValues_AddToInsertionOrder is not linkable, so its two-byte
+// bookkeeping ([-1] prefix size, [-2] used size, order bytes below) is
+// reproduced here.  `values` arrives as the raw values pointer.
+void JITRT_StoreSplitValueInsert311(
+    PyObject* values_raw,
+    Py_ssize_t index,
+    PyObject* value) {
+  auto* values = reinterpret_cast<PyDictValues*>(values_raw);
+  Py_INCREF(value);
+  values->values[index] = value;
+  uint8_t* size_ptr = reinterpret_cast<uint8_t*>(values) - 2;
+  int size = *size_ptr;
+  size++;
+  size_ptr[-size] = static_cast<uint8_t>(index);
+  *size_ptr = static_cast<uint8_t>(size);
+}
+#endif
+
 PyObject* JITRT_VectorcallTstate(
     PyThreadState* tstate,
     PyObject* callable,
@@ -1792,6 +1848,18 @@ LoadMethodResult JITRT_LoadAttrMethodWithValues(
   Py_INCREF(descr);
   Py_INCREF(obj);
   return {descr, obj};
+}
+#endif
+
+#if PY_VERSION_HEX < 0x030C0000
+// The attribute load stub's getter arm returns the descriptor's own result
+// to the generated code; an AttributeError it raised is completed with the
+// name and the receiver here, as PyObject_GetAttr would complete it.
+PyObject* JITRT_LoadAttrError311(PyObject* obj, PyObject* name) {
+  if (PyErr_ExceptionMatches(PyExc_AttributeError)) {
+    Cix_set_attribute_error_context(obj, name);
+  }
+  return nullptr;
 }
 #endif
 

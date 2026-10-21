@@ -220,6 +220,11 @@ int JITRT_ListPrefixReverseAssign(PyObject* list, PyObject* index);
 PyObject*
 JITRT_CallFunctionEx(PyObject* func, PyObject* pargs, PyObject* kwargs);
 
+// Completes an AttributeError raised by a cached descriptor's getter with
+// the name and the receiver (PyObject_GetAttr's context) and returns NULL;
+// the attribute load stub leaves through it on a raising getter.
+PyObject* JITRT_LoadAttrError311(PyObject* obj, PyObject* name);
+
 PyObject* JITRT_LoadAttrInstanceValueOrGeneric(
     PyObject* obj,
     PyObject* name,
@@ -252,6 +257,21 @@ PyObject* JITRT_Call(
  * Performs a function call with a vectorcall. Will check and handle any
  * eval breaker events after the call.
  */
+#if PY_VERSION_HEX < 0x030C0000
+// STORE_ATTR_WITH_HINT fast helper: 1 when the store was done in place, 0 to
+// take the generic path.
+int JITRT_StoreAttrWithHint311(
+    PyObject* owner,
+    PyObject* name,
+    Py_ssize_t hint,
+    PyObject* value);
+// STORE_ATTR_INSTANCE_VALUE insertion into an unset split-values slot.
+void JITRT_StoreSplitValueInsert311(
+    PyObject* values_raw,
+    Py_ssize_t index,
+    PyObject* value);
+#endif
+
 PyObject* JITRT_VectorcallTstate(
     PyThreadState* tstate,
     PyObject* callable,
