@@ -19,6 +19,68 @@
 
 namespace jit {
 
+class CodeRuntime;
+
+#if PY_VERSION_HEX < 0x030C0000
+// Per-call-site entry cache for the CPython 3.11 generated call sequence.
+// The codegen probe compares the callee against (code, vectorcall); a hit
+// branches to fast_target, which is either the callee's direct entry (the
+// compiled body past its own prologue) or a neutral fill of the callee's
+// vectorcall at fill time.  A direct fill is admitted only for a bare
+// compiled entry with no varargs / keyword-only parameters, a site argument
+// count equal to co_argcount and a non-static prototype, so the prologue's
+// argument-count and __code__ checks are proven once by the fill.  The
+// vectorcall entry sits at a body-independent offset inside the artifact,
+// so a (code, vectorcall) match also pins the direct entry.
+//
+// code is a borrowed pointer used for identity comparison only; address
+// reuse after its death is covered by the vectorcall identity guard.
+// helper_budget bounds the miss helper's refills so a polymorphic site
+// settles on the generic arm.  The first four fields are read by the
+// codegen probe at hardcoded offsets (see the static_assert below).
+struct CallSiteEntryCache {
+  PyObject* code{nullptr};
+  void* vectorcall{nullptr};
+  void* fast_target{nullptr};
+  uint8_t helper_budget{64};
+  // Constructor arm: a heap class whose instances object_new allocates and
+  // a Python __init__ initialises.  The __init__ resolution is pinned by the
+  // class version tag, its entry by the function's vectorcall identity.
+  // Read by the runtime helper only.
+  PyTypeObject* ctor_type{nullptr};
+  uint32_t ctor_version{0};
+  uint8_t ctor_budget{16};
+  PyObject* ctor_init{nullptr};
+  void* ctor_init_vectorcall{nullptr};
+  void* ctor_target{nullptr};
+  PyObject* ctor_init_code{nullptr}; // identity only
+  // The caller's code runtime: every code object an entry names is added
+  // to its references, so an address compared above cannot be reused.
+  CodeRuntime* runtime{nullptr};
+};
+
+static_assert(
+    offsetof(CallSiteEntryCache, code) == 0 &&
+        offsetof(CallSiteEntryCache, vectorcall) == 8 &&
+        offsetof(CallSiteEntryCache, fast_target) == 16 &&
+        offsetof(CallSiteEntryCache, helper_budget) == 24,
+    "codegen probe hardcodes CallSiteEntryCache layout");
+
+// Per-site cache for the builtin super() lookup.  The descriptor super()
+// finds for (instance type, start class, name) is a function of the
+// instance type's MRO and of the dicts along it, all covered by the
+// instance type's version tag (a change to any base invalidates every
+// subclass), so one entry keyed by (instance type, version tag, start class)
+// replays the lookup.  descr is borrowed from the type dict that the tag
+// keeps unchanged.
+struct SuperSiteCache311 {
+  PyTypeObject* obj_type{nullptr};
+  uint32_t version{0};
+  PyTypeObject* start_type{nullptr};
+  PyObject* descr{nullptr};
+};
+#endif
+
 // Mutator for an instance attribute that is stored in a split dictionary
 struct SplitMutator {
   PyObject* getAttr(PyObject* obj, PyObject* name);

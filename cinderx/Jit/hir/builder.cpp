@@ -4564,7 +4564,20 @@ bool HIRBuilder::tryEmitLoadMethodOrAttrSuper311(
 
   BytecodeInstruction load_global = *bc_it;
   Register* global_super = temps_.AllocateStack();
+  // The `super` global of the zero-argument super() pattern took the helper
+  // form (JITRT_LoadGlobal: a globals miss plus a builtins hit, two
+  // dictionary lookups per call).  Emit it through the same guarded cached
+  // load every other LOAD_GLOBAL gets; the helper form stays the fallback
+  // when that declines.  The pattern consumes the CALL itself, so the
+  // oparg&1 NULL is never pushed.
+#if PY_VERSION_HEX < 0x030C0000
+  if (!tryEmitLoadGlobalModuleValue311(
+          tc, load_global, pattern->global_super_idx, global_super)) {
+    tc.emit<LoadGlobal>(global_super, pattern->global_super_idx, tc.frame);
+  }
+#else
   tc.emit<LoadGlobal>(global_super, pattern->global_super_idx, tc.frame);
+#endif
 
   Register* type = temps_.AllocateStack();
   Register* receiver = nullptr;
@@ -5305,6 +5318,113 @@ void HIRBuilder::emitSequenceSet(
 }
 
 #if PY_VERSION_HEX < 0x030C0000
+// Admissibility of a function-valued global as a static keyword-binding
+// target: the signature envelope the simplify-time rewrite
+// (trySimplifyStaticKwCall311) accepts.  Anything outside it would only earn
+// a useless identity guard.
+static bool kwStaticPinnable311(PyObject* value) {
+  if (!PyFunction_Check(value)) {
+    return false;
+  }
+  auto* co = reinterpret_cast<PyCodeObject*>(
+      reinterpret_cast<PyFunctionObject*>(value)->func_code);
+  return !(co->co_flags & (CO_VARARGS | CO_VARKEYWORDS)) &&
+      co->co_kwonlyargcount == 0 &&
+      !(co->co_flags & CI_CO_STATICALLY_COMPILED) && co->co_argcount <= 16;
+}
+
+// Admissibility of a function-valued global as a static default-completion
+// target for a positional call with `nargs` arguments: the envelope of the
+// simplify-time resolveArgs path -- no varargs / varkeywords / keyword-only
+// parameters, fewer arguments than parameters, and enough defaults to fill
+// the rest.
+static bool defaultPinnable311(PyObject* value, int nargs) {
+  if (!PyFunction_Check(value)) {
+    return false;
+  }
+  auto* fn = reinterpret_cast<PyFunctionObject*>(value);
+  auto* co = reinterpret_cast<PyCodeObject*>(fn->func_code);
+  if ((co->co_flags & (CO_VARARGS | CO_VARKEYWORDS)) ||
+      co->co_kwonlyargcount != 0 ||
+      (co->co_flags & CI_CO_STATICALLY_COMPILED)) {
+    return false;
+  }
+  const int argcount = co->co_argcount;
+  const int defcount = fn->func_defaults == nullptr
+      ? 0
+      : static_cast<int>(PyTuple_GET_SIZE(fn->func_defaults));
+  return nargs < argcount && nargs + defcount >= argcount;
+}
+
+// The shape of the call fed by this LOAD_GLOBAL (oparg & 1, the NULL-slot
+// call-target form): whether its PRECALL was found, whether that PRECALL is
+// preceded by KW_NAMES, and its argument count.  Nested calls inside the
+// argument list are skipped by counting their NULL/self openers (PUSH_NULL,
+// LOAD_GLOBAL|1, LOAD_METHOD*) against their CALL / CALL_FUNCTION_EX
+// closers.  A comprehension call has no opener (its [func, iter] layout
+// doubles as the method-call shape), so its PRECALL surfaces at depth 0 and
+// the scan reports that call instead -- a conservative miss, since it is
+// never a keyword call and its argument count never matches an under-arity
+// shape of the loaded function by more than chance.  The answer only decides
+// whether the loaded value is pinned; correctness never depends on it.
+struct LoadGlobalCallShape311 {
+  bool found{false};
+  bool kw{false};
+  int nargs{0};
+};
+
+static LoadGlobalCallShape311 scanLoadGlobalCallShape311(
+    BorrowedRef<PyCodeObject> code,
+    const jit::BytecodeInstruction& bc_instr) {
+  LoadGlobalCallShape311 shape;
+  if (!(bc_instr.oparg() & 1)) {
+    return shape;
+  }
+  const int end_idx = static_cast<int>(countIndices(code));
+  int depth = 0;
+  int prev = -1;
+  jit::BytecodeInstruction cur = bc_instr.nextInstr();
+  for (int steps = 0; steps < 96 && cur.opcodeIndex().value() < end_idx;
+       ++steps, cur = cur.nextInstr()) {
+    const int op = cur.opcode();
+    switch (op) {
+      case PUSH_NULL:
+      case LOAD_METHOD:
+      case LOAD_METHOD_STATIC:
+      case LOAD_METHOD_SUPER:
+        ++depth;
+        break;
+      case LOAD_GLOBAL:
+        if (cur.oparg() & 1) {
+          ++depth;
+        }
+        break;
+      case PRECALL:
+        if (depth == 0) {
+          shape.found = true;
+          shape.kw = prev == KW_NAMES;
+          shape.nargs = cur.oparg();
+          return shape;
+        }
+        break;
+      case CALL:
+      case CALL_FUNCTION_EX:
+        if (depth == 0) {
+          return shape;
+        }
+        --depth;
+        break;
+      default:
+        if (cur.isReturn() || op == RAISE_VARARGS || op == RERAISE) {
+          return shape;
+        }
+        break;
+    }
+    prev = op;
+  }
+  return shape;
+}
+
 bool HIRBuilder::tryEmitLoadGlobalModuleValue311(
     TranslationContext& tc,
     const jit::BytecodeInstruction& bc_instr,
@@ -5325,7 +5445,8 @@ bool HIRBuilder::tryEmitLoadGlobalModuleValue311(
     if (PyErr_Occurred()) {
       PyErr_Clear();
     }
-    return false;
+    // A module-level miss is the builtins-hit form.
+    return tryEmitLoadGlobalBuiltinValue311(tc, name, result);
   }
 
   Py_ssize_t index = -1;
@@ -5347,38 +5468,196 @@ bool HIRBuilder::tryEmitLoadGlobalModuleValue311(
     return false;
   }
 
+  // Pure-HIR guarded load.  The keys version pins the key structure and the
+  // entry layout, so the entry value offset is a compile-time constant; a
+  // same-key overwrite does not bump dk_version, so the value is read live
+  // from the entry slot, not baked in.  Guard failure deopts and re-executes
+  // this LOAD_GLOBAL in the interpreter.
+  PyDictKeysObject* gkeys_probe = globals->ma_keys;
+  ptrdiff_t value_off = reinterpret_cast<const char*>(
+                            &DK_UNICODE_ENTRIES(gkeys_probe)[index].me_value) -
+      reinterpret_cast<const char*>(gkeys_probe);
+
   Register* globals_reg = temps_.AllocateNonStack();
   tc.emit<LoadConst>(
       globals_reg,
       Type::fromObject(env_->addReference(BorrowedRef<>{globals})));
-
-  Register* name_reg = temps_.AllocateNonStack();
-  tc.emit<LoadConst>(name_reg, Type::fromObject(env_->addReference(name)));
-
-  Register* keys_version_reg = temps_.AllocateNonStack();
-  tc.emit<LoadConst>(keys_version_reg, Type::fromCUInt(keys_version, TCUInt32));
-
-  Register* index_reg = temps_.AllocateNonStack();
-  tc.emit<LoadConst>(index_reg, Type::fromCInt(index, TCInt64));
-
-  auto call = tc.emit<CallStatic>(
-      4,
-      result,
-      reinterpret_cast<void*>(JITRT_LoadGlobalModuleValue),
-      TOptObject);
-  call->SetOperand(0, globals_reg);
-  call->SetOperand(1, name_reg);
-  call->SetOperand(2, keys_version_reg);
-  call->SetOperand(3, index_reg);
-
+  Register* keys_reg = temps_.AllocateNonStack();
+  tc.emit<LoadField>(
+      keys_reg, globals_reg, "ma_keys", offsetof(PyDictObject, ma_keys), TCPtr);
+  Register* ver_reg = temps_.AllocateNonStack();
+  tc.emit<LoadField>(
+      ver_reg,
+      keys_reg,
+      "dk_version",
+      offsetof(PyDictKeysObject, dk_version),
+      TCUInt32);
+  Register* expected_reg = temps_.AllocateNonStack();
+  tc.emit<LoadConst>(expected_reg, Type::fromCUInt(keys_version, TCUInt32));
+  Register* ok_reg = temps_.AllocateNonStack();
+  tc.emit<PrimitiveCompare>(
+      ok_reg, PrimitiveCompareOp::kEqual, ver_reg, expected_reg);
   tc.emitSnapshot();
-  auto guard = tc.emit<Guard>(result);
-  guard->setFrameState(tc.frame);
-  guard->setGuiltyReg(result);
-  guard->setDescr(
-      fmt::format("LOAD_GLOBAL_MODULE: {}", PyUnicode_AsUTF8(name)));
+  auto ver_guard = tc.emit<Guard>(ok_reg);
+  ver_guard->setFrameState(tc.frame);
+  ver_guard->setDescr(
+      fmt::format("LOAD_GLOBAL_MODULE ver: {}", PyUnicode_AsUTF8(name)));
 
-  tc.emit<RefineType>(result, TObject, result);
+  Register* raw_reg = temps_.AllocateNonStack();
+  tc.emit<LoadField>(
+      raw_reg,
+      keys_reg,
+      "me_value",
+      static_cast<std::size_t>(value_off),
+      TOptObject);
+  tc.emitSnapshot();
+  auto nn_guard = tc.emit<Guard>(raw_reg);
+  nn_guard->setFrameState(tc.frame);
+  nn_guard->setGuiltyReg(raw_reg);
+  nn_guard->setDescr(
+      fmt::format("LOAD_GLOBAL_MODULE: {}", PyUnicode_AsUTF8(name)));
+  tc.emit<RefineType>(result, TObject, raw_reg);
+
+  // A function-valued global that is called with keywords is pinned by
+  // identity so the simplifier can bind the keyword arguments to parameter
+  // positions at compile time; the same pin serves a positional call with
+  // fewer arguments than parameters, so the simplifier's constant-callee
+  // default completion (resolveArgs) applies to module-global functions.
+  // Rebinding the global deopts at this load and the recompile re-pins the
+  // new value; a code object that keeps deopting here is retired by the ROI
+  // backoff like any other.
+  bool pin = false;
+  if (PyFunction_Check(value)) {
+    LoadGlobalCallShape311 shape = scanLoadGlobalCallShape311(code_, bc_instr);
+    if (shape.found) {
+      pin = shape.kw ? kwStaticPinnable311(value)
+                     : defaultPinnable311(value, shape.nargs);
+    }
+  }
+  if (PyFunction_Check(value) && (getConfig().hir_opts.inliner || pin)) {
+    auto is_guard = tc.emit<GuardIs>(result, value, result);
+    is_guard->setDescr(
+        fmt::format("LOAD_GLOBAL_MODULE func: {}", PyUnicode_AsUTF8(name)));
+  }
+  // Pin a class-valued global so the attribute loads on it (`Cls.CONST`)
+  // can be resolved at compile time behind the class's version tag;
+  // rebinding the global deopts and re-specializes.  Only plain `type`
+  // metatypes: a metaclass with its own getattro (Enum) would turn every
+  // attribute load on the pinned class into a full PyObject_GetAttr through
+  // the type-receiver helper.
+  if (PyType_Check(value) && Py_TYPE(value) == &PyType_Type &&
+      Ci_Type_HasValidVersionTag(reinterpret_cast<PyTypeObject*>(value))) {
+    auto is_guard = tc.emit<GuardIs>(result, value, result);
+    is_guard->setDescr(
+        fmt::format("LOAD_GLOBAL_MODULE type: {}", PyUnicode_AsUTF8(name)));
+  }
+  return true;
+}
+
+// Two dk_version guards replace the generic helper: the globals version
+// proves the name is still not shadowed at module level, the builtins
+// version pins the key layout so the entry offset is a compile-time
+// constant.  dk_version is allocated monotonically and globally, so any
+// delete or resize invalidates it.  A guard failure deopts and re-executes
+// this LOAD_GLOBAL in the interpreter, which is what the helper returning
+// null already meant.
+//
+// The loaded value is borrowed on purpose: reference accounting belongs to
+// the HIR refcount-insertion pass, which balances it at the consumption
+// point.
+bool HIRBuilder::tryEmitLoadGlobalBuiltinValue311(
+    TranslationContext& tc,
+    BorrowedRef<> name,
+    Register* result) {
+  BorrowedRef<PyDictObject> globals = preloader_.globals();
+  BorrowedRef<PyDictObject> builtins = preloader_.builtins();
+  if (builtins == nullptr || !PyDict_CheckExact(builtins) ||
+      builtins->ma_values != nullptr || !hasOnlyUnicodeKeys(builtins)) {
+    return false;
+  }
+
+  PyObject* value = PyDict_GetItemWithError(builtins, name);
+  if (value == nullptr) {
+    if (PyErr_Occurred()) {
+      PyErr_Clear();
+    }
+    return false;
+  }
+
+  Py_ssize_t index = findActiveUnicodeDictEntryIndex(builtins, name, value);
+  if (index < 0) {
+    return false;
+  }
+  uint32_t globals_keys_version = dictGetKeysVersion(nullptr, globals->ma_keys);
+  uint32_t builtins_keys_version =
+      dictGetKeysVersion(nullptr, builtins->ma_keys);
+  if (globals_keys_version == 0 || builtins_keys_version == 0) {
+    return false;
+  }
+
+  PyDictKeysObject* bkeys_probe = builtins->ma_keys;
+  ptrdiff_t value_off = reinterpret_cast<const char*>(
+                            &DK_UNICODE_ENTRIES(bkeys_probe)[index].me_value) -
+      reinterpret_cast<const char*>(bkeys_probe);
+
+  auto emit_keys_version_guard = [&](BorrowedRef<PyDictObject> dict,
+                                     uint32_t expected_version,
+                                     const char* what) -> Register* {
+    Register* dict_reg = temps_.AllocateNonStack();
+    tc.emit<LoadConst>(
+        dict_reg, Type::fromObject(env_->addReference(BorrowedRef<>{dict})));
+    Register* keys_reg = temps_.AllocateNonStack();
+    tc.emit<LoadField>(
+        keys_reg, dict_reg, "ma_keys", offsetof(PyDictObject, ma_keys), TCPtr);
+    Register* ver_reg = temps_.AllocateNonStack();
+    tc.emit<LoadField>(
+        ver_reg,
+        keys_reg,
+        "dk_version",
+        offsetof(PyDictKeysObject, dk_version),
+        TCUInt32);
+    Register* expected_reg = temps_.AllocateNonStack();
+    tc.emit<LoadConst>(
+        expected_reg, Type::fromCUInt(expected_version, TCUInt32));
+    Register* ok_reg = temps_.AllocateNonStack();
+    tc.emit<PrimitiveCompare>(
+        ok_reg, PrimitiveCompareOp::kEqual, ver_reg, expected_reg);
+    tc.emitSnapshot();
+    auto guard = tc.emit<Guard>(ok_reg);
+    guard->setFrameState(tc.frame);
+    guard->setDescr(fmt::format("{}: {}", what, PyUnicode_AsUTF8(name)));
+    return keys_reg;
+  };
+
+  emit_keys_version_guard(
+      globals, globals_keys_version, "LOAD_GLOBAL_BUILTIN globals ver");
+  Register* bkeys_reg = emit_keys_version_guard(
+      builtins, builtins_keys_version, "LOAD_GLOBAL_BUILTIN builtins ver");
+
+  tc.emit<LoadField>(
+      result,
+      bkeys_reg,
+      "me_value",
+      static_cast<std::size_t>(value_off),
+      TObject);
+  // Pin the builtins the simplifier can open up (len -> GetLength,
+  // isinstance -> inline type test, type -> ob_type load) so their call
+  // sites see a constant target.  Rebinding the name deopts and
+  // re-specializes like the class pin.
+  bool pin = false;
+  if (value == reinterpret_cast<PyObject*>(&PyType_Type)) {
+    pin = true;
+  } else if (Py_IS_TYPE(value, &PyCFunction_Type)) {
+    const char* mname =
+        reinterpret_cast<PyCFunctionObject*>(value)->m_ml->ml_name;
+    pin = mname != nullptr &&
+        (strcmp(mname, "len") == 0 || strcmp(mname, "isinstance") == 0);
+  }
+  if (pin) {
+    auto is_guard = tc.emit<GuardIs>(result, value, result);
+    is_guard->setDescr(
+        fmt::format("LOAD_GLOBAL_BUILTIN pin: {}", PyUnicode_AsUTF8(name)));
+  }
   return true;
 }
 #endif

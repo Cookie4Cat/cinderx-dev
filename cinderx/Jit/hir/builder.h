@@ -556,6 +556,13 @@ class HIRBuilder {
       const jit::BytecodeInstruction& bc_instr,
       int name_idx,
       Register* result);
+  // The builtins-hit form of LOAD_GLOBAL: two keys-version guards (globals
+  // not shadowing, builtins layout pinned) and a load from the builtins
+  // entry slot.
+  bool tryEmitLoadGlobalBuiltinValue311(
+      TranslationContext& tc,
+      BorrowedRef<> name,
+      Register* result);
 #endif
 
   void emitBuildInterpolation(

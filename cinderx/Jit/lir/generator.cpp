@@ -3270,6 +3270,24 @@ LIRGenerator::TranslatedBlock LIRGenerator::TranslateOneBasicBlock(
       case Opcode::kLoadMethodSuper: {
         auto instr = static_cast<const LoadMethodSuper*>(&i);
         Instruction* name = getNameFromIdx(bbb, instr);
+#if PY_VERSION_HEX < 0x030C0000
+        // Replay the (instance type, start class) resolution from a per-site
+        // entry; the MRO walk only runs on a version miss.
+        if (env_->ctx != nullptr) {
+          auto* cache = env_->ctx->allocateSuperSiteCache311();
+          appendCall2RetValues(
+              bbb,
+              instr->output(),
+              JITRT_GetMethodFromSuperCached311,
+              cache,
+              instr->global_super(),
+              instr->type(),
+              instr->receiver(),
+              name,
+              instr->no_args_in_super_call());
+          break;
+        }
+#endif
         appendCall2RetValues(
             bbb,
             instr->output(),
@@ -3284,6 +3302,21 @@ LIRGenerator::TranslatedBlock LIRGenerator::TranslateOneBasicBlock(
       case Opcode::kLoadAttrSuper: {
         auto instr = static_cast<const LoadAttrSuper*>(&i);
         Instruction* name = getNameFromIdx(bbb, instr);
+#if PY_VERSION_HEX < 0x030C0000
+        if (env_->ctx != nullptr) {
+          auto* cache = env_->ctx->allocateSuperSiteCache311();
+          bbb.appendCallInstruction(
+              instr->output(),
+              JITRT_GetAttrFromSuperCached311,
+              cache,
+              instr->global_super(),
+              instr->type(),
+              instr->receiver(),
+              name,
+              instr->no_args_in_super_call());
+          break;
+        }
+#endif
         bbb.appendCallInstruction(
             instr->output(),
             JITRT_GetAttrFromSuper,
@@ -4093,6 +4126,30 @@ LIRGenerator::TranslatedBlock LIRGenerator::TranslateOneBasicBlock(
               Instruction::kMove,
               OutVReg{OperandBase::k64bit},
               Ind{callable, kVectorcallOffset});
+        } else if (
+            env_->ctx != nullptr && !(hir_instr.flags() & CallFlags::KwArgs)) {
+          // Call-site entry cache (kwnames-free sites only; x3 is zeroed by
+          // the argument moves and the miss arm reuses that slot for the
+          // cache).  The selection / load chain is replaced by the dedicated
+          // translator's probe sequence: an {exact function type, func_code
+          // identity, vectorcall identity} guard, a hit branching to the
+          // cached fast target (the callee's direct entry or a neutral
+          // fill), a function-shaped miss within budget filling through
+          // JITRT_CallSiteEntryMiss311, and non-functions dispatched by the
+          // per-function stub.  Operand layout matches the generic
+          // VectorCall.
+          auto* cache = env_->ctx->allocateCallSiteEntryCache();
+          cache->runtime = env_->code_rt;
+          Instruction* instr = bbb.appendInstr(
+              hir_instr.output(),
+              Instruction::kCallSiteVectorCall,
+              Imm{reinterpret_cast<uint64_t>(cache)},
+              Imm{flags});
+          for (hir::Register* arg : hir_instr.GetOperands()) {
+            instr->addOperands(VReg{bbb.getDefInstr(arg)});
+          }
+          instr->addOperands(Imm{0});
+          break;
         } else {
           // Select an address before loading the target. This avoids reading
           // PyFunctionObject::vectorcall from a non-function object.
@@ -4288,6 +4345,26 @@ LIRGenerator::TranslatedBlock LIRGenerator::TranslateOneBasicBlock(
         auto& hir_instr = static_cast<const CallMethod&>(i);
         size_t flags = 0;
 #if PY_VERSION_HEX < 0x030C0000 && defined(CINDER_AARCH64)
+        if (env_->ctx != nullptr && !(hir_instr.flags() & CallFlags::KwArgs)) {
+          // Method-call entry cache.  The sentinel / select chain below is
+          // replaced by the probe sequence: a NULL/None callable and an
+          // empty receiver slot (JITRT_Call's double-NULL protocol) are
+          // inline prechecks that fall to the generic arm, where the
+          // dispatch stub applies the slot shift; the rest matches the
+          // VectorCall form.
+          auto* cache = env_->ctx->allocateCallSiteEntryCache();
+          cache->runtime = env_->code_rt;
+          Instruction* instr = bbb.appendInstr(
+              hir_instr.output(),
+              Instruction::kCallSiteCallMethod,
+              Imm{reinterpret_cast<uint64_t>(cache)},
+              Imm{flags});
+          for (hir::Register* arg : hir_instr.GetOperands()) {
+            instr->addOperands(VReg{bbb.getDefInstr(arg)});
+          }
+          instr->addOperands(Imm{0});
+          break;
+        }
         Instruction* callable = bbb.getDefInstr(hir_instr.func());
         constexpr int32_t kVectorcallOffset =
             static_cast<int32_t>(offsetof(PyFunctionObject, vectorcall));

@@ -544,6 +544,10 @@ class Context : public IJitContext, public CompiledFunctionOwner {
   LoadModuleMethodCache* allocateLoadModuleMethodCache();
   LoadTypeMethodCache* allocateLoadTypeMethodCache();
   StoreAttrCache* allocateStoreAttrCache();
+#if PY_VERSION_HEX < 0x030C0000
+  CallSiteEntryCache* allocateCallSiteEntryCache();
+  SuperSiteCache311* allocateSuperSiteCache311();
+#endif
 
   const Builtins& builtins();
 
@@ -644,6 +648,10 @@ class Context : public IJitContext, public CompiledFunctionOwner {
   SlabArena<LoadModuleMethodCache> load_module_method_caches_;
   SlabArena<LoadTypeMethodCache> load_type_method_caches_;
   SlabArena<StoreAttrCache, AttributeCacheSizeTrait> store_attr_caches_;
+#if PY_VERSION_HEX < 0x030C0000
+  SlabArena<CallSiteEntryCache> call_site_entry_caches_;
+  SlabArena<SuperSiteCache311> super_site_caches_;
+#endif
   SlabArena<void*> pointer_caches_;
 
   FunctionEntryCacheMap function_entry_caches_;
