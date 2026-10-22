@@ -34,6 +34,16 @@
 #include "cinderx/Jit/inline_cache.h"
 #include "cinderx/Jit/jit_gdb_support.h"
 #include "cinderx/Jit/jit_rt.h"
+#include "cinderx/Jit/threaded_compile.h"
+
+#if PY_VERSION_HEX < 0x030C0000
+#include "cinderx/Jit/direct_entry_gate_311.h"
+extern "C" int32_t Ci_JitShell311_CStackSoftLimitTlsOffset(void);
+extern "C" void Ci_JitShell311_InitCStackLimits(void);
+extern "C" int Ci_JitShell311_CStackSoftLimitReached(void);
+extern "C" PyObject*
+Ci_JitShell311_CStackOverflow(PyObject*, PyObject* const*, size_t, PyObject*);
+#endif
 #include "cinderx/Jit/lir/dce.h"
 #include "cinderx/Jit/lir/generator.h"
 #include "cinderx/Jit/lir/postalloc.h"
@@ -274,6 +284,15 @@ DeoptResult prepareForDeopt(
   }
 #endif
   PyThreadState* tstate = _PyThreadState_UncheckedGet();
+#if PY_VERSION_HEX < 0x030C0000
+  // Inline-recursion-ledger deopt repayment.  The deopt exit
+  // bypasses the epilogue's repayment; repay here per compilation-unit
+  // flag.  The interpreted resume that follows carries its own
+  // Enter/Leave pair, so the two ledgers do not interfere.
+  if (code_runtime->entryGuardInlined()) {
+    tstate->recursion_remaining++;
+  }
+#endif
   bool is_patched_instrumentation = false;
   _PyInterpreterFrame* frame = interpFrameFromThreadState(tstate);
 
@@ -320,6 +339,20 @@ DeoptResult prepareForDeopt(
     }
     setCurrentFrame(tstate, frame);
   }
+
+#if PY_VERSION_HEX < 0x030C0000
+  // The interpreter will clear (or hand to a frame
+  // object) the compiled activation's own frame with stock ownership
+  // semantics; give it the references the inline link did not take.
+  if (code_runtime->frameNoRef()) {
+    _PyInterpreterFrame* outer = frame;
+    for (size_t i = 0; i < deopt_meta.inline_depth(); i++) {
+      outer = outer->previous;
+    }
+    Py_INCREF(outer->f_func);
+    Py_INCREF(outer->f_code);
+  }
+#endif
 
   _PyInterpreterFrame* frame_iter = frame;
 
@@ -1356,6 +1389,42 @@ int32_t osrLocalsplusOffset(int localsplus_index) {
 
 void NativeGenerator::emitOSRFrameSetup(const jit::OSRMetadata& metadata) {
   generateFunctionEntry();
+#if defined(CINDER_AARCH64) && PY_VERSION_HEX < 0x030C0000
+  if (env_.code_rt->entryGuardInlined()) {
+    // An OSR entry bypasses the frame-build recursion debit,
+    // while the exit goes through the epilogue repayment (or the deopt
+    // repayment) -- debit here to balance.  The interpreter-side Enter for
+    // this call is repaid by its own Leave; the two ledgers do not
+    // interfere.
+    as_->mov(
+        a64::x9,
+        reinterpret_cast<uint64_t>(&ThreadedCompileContext::interpreter()
+                                        ->runtime->gilstate.tstate_current));
+    as_->ldr(a64::x9, a64::ptr(a64::x9));
+    as_->ldr(
+        a64::w10,
+        arch::ptr_offset(
+            a64::x9,
+            static_cast<int32_t>(offsetof(PyThreadState, recursion_remaining)),
+            arch::AccessSize::k32));
+    as_->sub(a64::w10, a64::w10, 1);
+    as_->str(
+        a64::w10,
+        arch::ptr_offset(
+            a64::x9,
+            static_cast<int32_t>(offsetof(PyThreadState, recursion_remaining)),
+            arch::AccessSize::k32));
+  }
+  if (env_.code_rt->activeFrameCounted()) {
+    // An OSR entry bypasses the inline frame link's count-in while its exit
+    // goes through the counted hard-exit epilogue -- count in here.
+    as_->mov(
+        a64::x9, reinterpret_cast<uint64_t>(triggerStatsActiveFramesAddress()));
+    as_->ldr(a64::x10, a64::ptr(a64::x9));
+    as_->add(a64::x10, a64::x10, 1);
+    as_->str(a64::x10, a64::ptr(a64::x9));
+  }
+#endif
   arch::sub_immediate(
       as_,
       a64::sp,
@@ -2587,6 +2656,184 @@ void NativeGenerator::generateCode(
     generateStaticEntryPoint(env_.finish_frame_setup, static_jmp_location);
   }
 
+#if defined(CINDER_AARCH64) && PY_VERSION_HEX < 0x030C0000
+  // The generated vectorcall entry is installed directly (no guarded C
+  // shell), so it is the only place left to re-prove the per-call
+  // invariants the shell owned.  The entry guard: a divert stub (tail jump
+  // into the stock interpreter entry with x0-x3 still in raw vectorcall
+  // form), a mandatory __code__ identity check, and a tracing + recursion
+  // pre-check.  The stub sits before the reentry stub: the reentry-stub to
+  // vectorcall-entry distance is the JITRT_CALL_REENTRY_OFFSET hard
+  // invariant and nothing may be inserted between them.
+  Label entry_guard_divert = as_->newLabel();
+  Label entry_guard_cstack_overflow = as_->newLabel();
+  const int32_t cstack_tls_offset = Ci_JitShell311_CStackSoftLimitTlsOffset();
+  {
+    auto divert_cursor = as_->cursor();
+    as_->bind(entry_guard_divert);
+    as_->mov(a64::x16, reinterpret_cast<uint64_t>(&_PyFunction_Vectorcall));
+    as_->br(a64::x16);
+    env_.addAnnotation("Entry guard divert", divert_cursor);
+    // C-stack overflow stub: raises RecursionError like the shell.
+    auto cstack_cursor = as_->cursor();
+    as_->bind(entry_guard_cstack_overflow);
+    as_->mov(
+        a64::x16, reinterpret_cast<uint64_t>(&Ci_JitShell311_CStackOverflow));
+    as_->br(a64::x16);
+    env_.addAnnotation("Entry guard C-stack stubs", cstack_cursor);
+  }
+  // Tracing + recursion pre-check, shared by the vectorcall entry and the
+  // direct call entry.  Read-only, before any frame is built; only x9/x10
+  // clobbered, x0-x3 untouched.  Tracing active or recursion budget about
+  // to overflow diverts the whole call: the interpreter carries its own
+  // recursion accounting and CheckRecursiveCall semantics, so the failure
+  // path needs no bookkeeping on this side.
+  auto emit_entry_guard = [&]() {
+    as_->mov(
+        a64::x9,
+        reinterpret_cast<uint64_t>(&ThreadedCompileContext::interpreter()
+                                        ->runtime->gilstate.tstate_current));
+    as_->ldr(a64::x9, a64::ptr(a64::x9));
+    // Hand the thread state to the LIR entry bind (INITIAL_TSTATE_REG) so
+    // the frame link does not load it again.
+    as_->mov(a64::x11, a64::x9);
+    as_->ldr(
+        a64::x10,
+        arch::ptr_offset(
+            a64::x9, static_cast<int32_t>(offsetof(PyThreadState, cframe))));
+    // use_tracing is a uint8_t on 3.11 -- must be read as a byte; a
+    // 32-bit load drags in neighboring padding and makes the divert
+    // unconditionally true.
+    static_assert(
+        sizeof(reinterpret_cast<_PyCFrame*>(0)->use_tracing) == 1,
+        "use_tracing width changed");
+    as_->ldrb(
+        a64::w10,
+        arch::ptr_offset(
+            a64::x10,
+            static_cast<int32_t>(offsetof(_PyCFrame, use_tracing)),
+            arch::AccessSize::k8));
+    as_->cbnz(a64::w10, entry_guard_divert);
+    // Fail closed when the JIT is paused or disabled (the usable byte
+    // follows every JIT state transition) or when the frame evaluator is
+    // not ours: another PEP 523 client can take the interpreter's slot
+    // without going through our install/remove, so the slot itself is read
+    // on every entry, exactly as the shell re-proved it
+    // (Ci_EvalHook311_IsInstalled).  One materialized address serves both
+    // reads.  x12 is free at the vectorcall entry; x11 carries the thread
+    // state.
+    {
+      // Gate address from the constant pool: one PC-relative load.
+      const uint64_t gate =
+          reinterpret_cast<uint64_t>(&Ci_JitDirectEntryGate311);
+      auto it = env_.const_pool_labels.find(gate);
+      if (it == env_.const_pool_labels.end()) {
+        it = env_.const_pool_labels.emplace(gate, as_->newLabel()).first;
+      }
+      as_->ldr(a64::x12, a64::ptr(it->second));
+    }
+    as_->ldrb(
+        a64::w10,
+        arch::ptr_offset(
+            a64::x12,
+            static_cast<int32_t>(
+                offsetof(Ci_JitDirectEntryGate311Layout, usable)),
+            arch::AccessSize::k8));
+    as_->cbz(a64::w10, entry_guard_divert);
+    as_->ldr(
+        a64::x12,
+        arch::ptr_offset(
+            a64::x12,
+            static_cast<int32_t>(
+                offsetof(Ci_JitDirectEntryGate311Layout, eval_frame))));
+    as_->ldr(
+        a64::x10,
+        arch::ptr_offset(
+            a64::x9, static_cast<int32_t>(offsetof(PyThreadState, interp))));
+    as_->ldr(
+        a64::x10,
+        arch::ptr_offset(
+            a64::x10,
+            static_cast<int32_t>(offsetof(PyInterpreterState, eval_frame))));
+    as_->cmp(a64::x10, a64::x12);
+    as_->b_ne(entry_guard_divert);
+    as_->ldr(
+        a64::w10,
+        arch::ptr_offset(
+            a64::x9,
+            static_cast<int32_t>(offsetof(PyThreadState, recursion_remaining)),
+            arch::AccessSize::k32));
+    as_->cmp(a64::w10, 0);
+    as_->b_le(entry_guard_divert);
+    // C-stack soft limit (the shell's cStackSoftLimitReached311): compare
+    // the stack pointer with this thread's limit.  Zero means the thread has
+    // not established its limits yet.
+    if (cstack_tls_offset >= 0) {
+      Label have_limit = as_->newLabel();
+      as_->mrs(a64::x10, a64::Predicate::SysReg::kTPIDR_EL0);
+      as_->mov(a64::x16, static_cast<uint64_t>(cstack_tls_offset));
+      as_->ldr(a64::x10, a64::ptr(a64::x10, a64::x16));
+      as_->cbnz(a64::x10, have_limit);
+      // First compiled call on this thread: establish its limits (the
+      // vectorcall registers are preserved around the C call), then
+      // re-read and continue into the function.
+      as_->stp(a64::x0, a64::x1, a64::ptr_pre(a64::sp, -16));
+      as_->stp(a64::x2, a64::x3, a64::ptr_pre(a64::sp, -16));
+      as_->stp(a64::x9, a64::x11, a64::ptr_pre(a64::sp, -16));
+      as_->stp(a64::x29, a64::x30, a64::ptr_pre(a64::sp, -16));
+      as_->mov(a64::x29, a64::sp);
+      as_->mov(
+          a64::x16,
+          reinterpret_cast<uint64_t>(&Ci_JitShell311_InitCStackLimits));
+      as_->blr(a64::x16);
+      as_->ldp(a64::x29, a64::x30, a64::ptr_post(a64::sp, 16));
+      as_->ldp(a64::x9, a64::x11, a64::ptr_post(a64::sp, 16));
+      as_->ldp(a64::x2, a64::x3, a64::ptr_post(a64::sp, 16));
+      as_->ldp(a64::x0, a64::x1, a64::ptr_post(a64::sp, 16));
+      as_->mrs(a64::x10, a64::Predicate::SysReg::kTPIDR_EL0);
+      as_->mov(a64::x16, static_cast<uint64_t>(cstack_tls_offset));
+      as_->ldr(a64::x10, a64::ptr(a64::x10, a64::x16));
+      as_->bind(have_limit);
+      as_->mov(a64::x16, a64::sp);
+      as_->cmp(a64::x16, a64::x10);
+      as_->b_lo(entry_guard_cstack_overflow);
+    } else {
+      as_->stp(a64::x0, a64::x1, a64::ptr_pre(a64::sp, -16));
+      as_->stp(a64::x2, a64::x3, a64::ptr_pre(a64::sp, -16));
+      as_->stp(a64::x9, a64::x11, a64::ptr_pre(a64::sp, -16));
+      as_->stp(a64::x29, a64::x30, a64::ptr_pre(a64::sp, -16));
+      as_->mov(a64::x29, a64::sp);
+      as_->mov(
+          a64::x16,
+          reinterpret_cast<uint64_t>(&Ci_JitShell311_CStackSoftLimitReached));
+      as_->blr(a64::x16);
+      as_->mov(a64::w10, a64::w0);
+      as_->ldp(a64::x29, a64::x30, a64::ptr_post(a64::sp, 16));
+      as_->ldp(a64::x9, a64::x11, a64::ptr_post(a64::sp, 16));
+      as_->ldp(a64::x2, a64::x3, a64::ptr_post(a64::sp, 16));
+      as_->ldp(a64::x0, a64::x1, a64::ptr_post(a64::sp, 16));
+      as_->cbnz(a64::w10, entry_guard_cstack_overflow);
+    }
+  };
+  // Helper reentry (JITRT_CallWithIncorrectArgcount and
+  // the keyword path jump to the stub after binding arguments) arrives
+  // without the entry guard, so the thread state is loaded on the way in.
+  // The stub keeps its fixed JITRT_CALL_REENTRY_OFFSET shape; only its
+  // branch target moves to this trampoline in the safe zone.
+  Label reentry_tstate_trampoline = as_->newLabel();
+  {
+    auto trampoline_cursor = as_->cursor();
+    as_->bind(reentry_tstate_trampoline);
+    as_->mov(
+        a64::x11,
+        reinterpret_cast<uint64_t>(&ThreadedCompileContext::interpreter()
+                                        ->runtime->gilstate.tstate_current));
+    as_->ldr(a64::x11, a64::ptr(a64::x11));
+    as_->b(env_.correct_arg_count);
+    env_.addAnnotation("Reentry tstate trampoline", trampoline_cursor);
+  }
+#endif
+
   // Reentry point: dispatched to from JITRT_CallWithIncorrectArgcount and
   // JITRT_CallWithKeywordArgs after argument binding. Must be exactly
   // JITRT_CALL_REENTRY_OFFSET bytes before the vectorcall entry.
@@ -2598,7 +2845,11 @@ void NativeGenerator::generateCode(
 #if defined(CINDER_X86_64)
   as_->short_().jmp(env_.correct_arg_count);
 #elif defined(CINDER_AARCH64)
+#if PY_VERSION_HEX < 0x030C0000
+  as_->b(reentry_tstate_trampoline);
+#else
   as_->b(env_.correct_arg_count);
+#endif
 #else
   CINDER_UNSUPPORTED
 #endif
@@ -2613,6 +2864,43 @@ void NativeGenerator::generateCode(
   // list, so the vectorcall entry falls through to them.
   Label vectorcall_entry_label = as_->newLabel();
   as_->bind(vectorcall_entry_label);
+
+#if defined(CINDER_AARCH64) && PY_VERSION_HEX < 0x030C0000
+  {
+    // __code__ identity check (mandatory under direct entry): 3.11 has no
+    // function watcher and a function may replace its __code__ at runtime
+    // (networkx argmap lazy compilation is exactly the swap-after-first-call
+    // pattern), while the compiled artifact is bound to the compile-time
+    // code object.  Compare func->func_code against the baked code pointer
+    // and divert the whole call to the stock interpreter entry on mismatch
+    // (which then executes the new code correctly).  The bound-args reentry
+    // path enters after this check; the outer call has already been checked.
+    {
+      auto code_check_cursor = as_->cursor();
+      as_->ldr(
+          a64::x9,
+          arch::ptr_offset(
+              a64::x0,
+              static_cast<int32_t>(offsetof(PyFunctionObject, func_code))));
+      as_->mov(a64::x10, reinterpret_cast<uint64_t>(GetFunction()->code.get()));
+      as_->cmp(a64::x9, a64::x10);
+      as_->b_ne(entry_guard_divert);
+      env_.addAnnotation("Code identity check", code_check_cursor);
+    }
+    // Tracing + recursion pre-check, read-only and before any frame is
+    // built (only x9/x10 clobbered, x0-x3 untouched).  Tracing active or
+    // recursion budget about to overflow diverts the whole call: the
+    // interpreter carries its own recursion accounting and
+    // CheckRecursiveCall semantics, so the failure path needs no
+    // bookkeeping on this side.
+    {
+      auto guard_cursor = as_->cursor();
+      emit_entry_guard();
+      env_.addAnnotation(
+          "Entry guard (tracing + recursion precheck)", guard_cursor);
+    }
+  }
+#endif
 
   // Append suffix blocks to the block list. These come after the body's exit
   // block but before code emission.

@@ -157,6 +157,11 @@ struct Environ {
   jit::lir::Instruction* asm_extra_args{nullptr};
   jit::lir::Instruction* asm_func{nullptr};
   jit::lir::Instruction* asm_interpreter_frame{nullptr};
+  // The entry block's bind of INITIAL_TSTATE_REG.  On the
+  // 3.11 AArch64 direct-entry path every entry (vectorcall, direct call,
+  // helper reentry) writes the thread state there, so the inline frame
+  // link reuses it instead of materialising the address a second time.
+  jit::lir::Instruction* asm_tstate_entry{nullptr};
 
   // Maps HIR values to the HIR values they were copied from. Used for LIR
   // generation purposes.

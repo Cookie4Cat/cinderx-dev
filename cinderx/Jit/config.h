@@ -151,6 +151,7 @@ struct Config {
   // calls.  This includes the code object, and the globals and builtins
   // dictionaries (but not their contents).
   bool stable_frame{true};
+
   // Use inline caches for attribute accesses.
   bool attr_caches{
 #ifdef Py_GIL_DISABLED

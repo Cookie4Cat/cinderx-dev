@@ -609,10 +609,18 @@ namespace {
 struct PublicationSubjectMoved {};
 } // namespace
 
+#if PY_VERSION_HEX < 0x030C0000
+extern "C" void Ci_JitShell311_SweepGraveyard(void);
+#endif
+
 bool Context::finalizeFunc(
     BorrowedRef<PyFunctionObject> func,
     BorrowedRef<CompiledFunction> compiled) {
 #if PY_VERSION_HEX < 0x030C0000
+  // A safe point for the deferred artifact reclamation: retired artifacts
+  // whose frames have since unwound are destroyed before a new one is
+  // published.
+  Ci_JitShell311_SweepGraveyard();
   // Every path that gives a function a machine-code entry point arrives
   // here: the direct compile, the batch and lazy paths, re-optimization of
   // a previously deopted function, and any re-attachment of an existing
@@ -885,13 +893,19 @@ bool Context::finalizeFunc(
   // Route 3.11 calls through the guarded entry, which re-checks the code
   // identity and the call form that compilation assumed before entering
   // machine code (see Jit/pyjit_311_gate.cpp).
-  vectorcallfunc entry = Ci_JitShell311_GuardedEntry;
 #if defined(CINDER_AARCH64)
+  // CPython 3.11 direct entry: the generated code carries the entry guard
+  // inline (code identity, recursion ledger, tracing precheck), so the
+  // generated vectorcall entry is installed directly, exactly like the 3.12+
+  // branch below.  The per-call C shell is kept only for other targets.
+  setVectorcall(func, compiled->vectorcallEntry());
+#else
+  vectorcallfunc entry = Ci_JitShell311_GuardedEntry;
   if (compiled->artifactGuardedEntry311() != nullptr) {
     entry = compiled->artifactGuardedEntry311();
   }
-#endif
   setVectorcall(func, entry);
+#endif
   if (hasFunctionEntryCache(func)) {
     void** indirect = findFunctionEntryCache(func);
     *indirect = compiled->staticEntry();
@@ -1614,7 +1628,7 @@ void Context::clearForMultithreadedCompileTest() {
   for (auto& compiled : pinned) {
 #if PY_VERSION_HEX < 0x030C0000
     for (PyFunctionObject* func : compiled->functions()) {
-      if (func->vectorcall == compiled->artifactGuardedEntry311()) {
+      if (compiled->isInstalledEntry311(func->vectorcall)) {
         func->vectorcall = getInterpretedVectorcall(func);
       }
     }

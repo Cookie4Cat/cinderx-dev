@@ -4,6 +4,7 @@
 
 #include "ceval.h"
 
+#include "cinderx/Jit/config.h"
 #include "cinderx/python_runtime.h"
 
 #if PY_VERSION_HEX >= 0x030C0000
@@ -1859,12 +1860,11 @@ void HIRBuilder::translate(
             tc.frame.stack.isEmpty(),
             "entry guards inserted with non-empty operand stack");
         // Entry setup is done: arguments are bound and the cell slots
-        // hold their cells, so this is where the frame's observable
-        // localsplus gets its entry snapshot (executing mode, 3.11).
-        // This must precede the annotation guards: their Snapshot is the
-        // dominating FrameState for the instructions that follow, and the
-        // write-through calls are not replayable, so placing them after
-        // the guards would leave that stretch with no resume point.
+        // hold their cells, so this is where a generator frame's
+        // observable localsplus gets its entry snapshot (3.11).  This must
+        // precede the annotation guards: their Snapshot is the dominating
+        // FrameState for the instructions that follow, and the
+        // write-through calls are not replayable.
         emitLocalsplusWriteback311(tc);
         if (tc.frame.stack.isEmpty()) {
           emitted_entry_guards = emitTypeAnnotationGuards(tc);
@@ -5773,12 +5773,25 @@ void HIRBuilder::moveOverwrittenStackRegisters(
 // living in registers for computation; the frame's copy is for observers,
 // owned by the frame and released by the existing clear paths
 // (JITRT_UnlinkFrame, deopt reification, _PyFrame_Clear).
+bool HIRBuilder::frameLocalsWrittenThrough311() const {
+#if PY_VERSION_HEX < 0x030C0000
+  // Normal frames rebuild their observable locals from deopt metadata when
+  // they are materialized; a suspended generator's frame is observed in
+  // place (gi_frame.f_locals, inspect.getgeneratorlocals), so generator
+  // family code keeps localsplus current at every store, as stock does.
+  return getConfig().state == State::kRunning && code_ != nullptr &&
+      (code_->co_flags & kCoFlagsAnyGenerator);
+#else
+  return false;
+#endif
+}
+
 void HIRBuilder::emitStoreFrameLocal311(
     [[maybe_unused]] TranslationContext& tc,
     [[maybe_unused]] int idx,
     [[maybe_unused]] Register* value) {
 #if PY_VERSION_HEX < 0x030C0000
-  if (getConfig().state != State::kRunning) {
+  if (!frameLocalsWrittenThrough311()) {
     return;
   }
   Register* idx_reg = temps_.AllocateNonStack();
@@ -5795,7 +5808,7 @@ void HIRBuilder::emitStoreFrameLocal311(
 void HIRBuilder::emitLocalsplusWriteback311(
     [[maybe_unused]] TranslationContext& tc) {
 #if PY_VERSION_HEX < 0x030C0000
-  if (getConfig().state != State::kRunning) {
+  if (!frameLocalsWrittenThrough311()) {
     return;
   }
   bool emitted = false;
@@ -5811,9 +5824,7 @@ void HIRBuilder::emitLocalsplusWriteback311(
   if (emitted) {
     // The write-through calls are not replayable, so any Snapshot before
     // them no longer dominates what follows; re-establish the resume
-    // point here.  The boundary logic reuses a trailing Snapshot in
-    // place, which would otherwise leave the stretch up to the next
-    // boundary with no FrameState for bindGuards to bind.
+    // point here.
     tc.emitSnapshot();
   }
 #endif

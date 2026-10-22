@@ -201,7 +201,7 @@ TEST_F(AutoJit311Test, FreshInstanceAttachesToThePublishedArtifact) {
   ASSERT_TRUE(isJitCompiled(first));
   jit::CompiledFunction* artifact = installedArtifact(first);
   ASSERT_NE(artifact, nullptr);
-  EXPECT_EQ(first->vectorcall, artifact->artifactGuardedEntry311())
+  EXPECT_TRUE(artifact->isInstalledEntry311(first->vectorcall))
       << "the installed function bypasses its artifact guard";
   uint64_t made = jit::triggerStatsSnapshot().compiled_function_creations;
 
@@ -212,7 +212,7 @@ TEST_F(AutoJit311Test, FreshInstanceAttachesToThePublishedArtifact) {
   EXPECT_TRUE(isJitCompiled(second));
   EXPECT_EQ(installedArtifact(second), artifact)
       << "the fresh instance did not attach to the code's own artifact";
-  EXPECT_EQ(second->vectorcall, artifact->artifactGuardedEntry311())
+  EXPECT_TRUE(artifact->isInstalledEntry311(second->vectorcall))
       << "the attached function bypasses its artifact guard";
   EXPECT_EQ(jit::triggerStatsSnapshot().compiled_function_creations, made)
       << "attachment compiled the code again";

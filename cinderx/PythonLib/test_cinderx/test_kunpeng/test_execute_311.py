@@ -353,6 +353,10 @@ class Execute311Test(unittest.TestCase):
     def test_third_party_evaluator_degrades_the_jit_safely(self):
         payload = self.run_ok("third_party_evaluator")
         self.assertEqual(payload["entered_ours"], 1)
+        # Entered from C (map / partial) straight after the swap, before any
+        # status query: the entry itself must divert.
+        self.assertTrue(payload["direct_values_ok"])
+        self.assertEqual(payload["entered_foreign_direct"], 0)
         self.assertFalse(payload["installed_foreign"])
         self.assertFalse(payload["compiled_foreign"])
         self.assertTrue(payload["values_ok"])

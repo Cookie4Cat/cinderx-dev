@@ -187,6 +187,28 @@ class LIRGenerator {
       Instruction* instr,
       const hir::DeoptBase& hir_instr);
 
+#if PY_VERSION_HEX < 0x030C0000
+  // 3.11 normal-frame inline link/unlink.
+  bool canInlineNormalFrame() const;
+  void emitActiveFrameCountIn(BasicBlockBuilder& bbb);
+  // Inline InitFrameCellVars for the inline-linked frame.
+  void emitInlineInitFrameFreeVars(
+      BasicBlockBuilder& bbb,
+      const hir::InitFrameCellVars& instr);
+  // Returns the linked frame's LIR value (a phi over the inline fast path
+  // and the C slow path), else nullptr.
+  Instruction* emitInlineLinkNormalFrame(BasicBlockBuilder& bbb);
+  void emitInlineUnlinkNormalFrame(BasicBlockBuilder& bbb);
+  // Inline recursion ledger
+  // inlining.  Enter decrements tstate->recursion_remaining at frame
+  // build, Leave repays it at the epilogue; the overflow pre-check lives
+  // in the generated vectorcall entry (gen_asm) and diverts to the
+  // interpreter without touching the ledger.
+  bool emitsInlineEntryGuard() const;
+  void emitRecursionEnter(BasicBlockBuilder& bbb);
+  void emitRecursionLeave(BasicBlockBuilder& bbb);
+#endif
+
   void makeIncref(
       BasicBlockBuilder& bbb,
       lir::Instruction* instr,

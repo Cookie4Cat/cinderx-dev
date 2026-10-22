@@ -2,6 +2,8 @@
 
 #include "cinderx/Jit/deopt.h"
 
+#include "internal/pycore_pystate.h"
+
 // clang-tidy off
 #include "cinderx/UpstreamBorrow/borrowed.h"
 // clang-tidy on

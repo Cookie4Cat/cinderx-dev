@@ -15,6 +15,7 @@
 #include "cinderx/Common/string.h"
 #include "cinderx/Common/util.h"
 #include "cinderx/Interpreter/interpreter.h"
+#include "cinderx/Jit/config.h"
 #if PY_VERSION_HEX < 0x030C0000
 #include "cinderx/Interpreter/3.11/interpreter_contract.h"
 #include "cinderx/Interpreter/3.11/observe.h"
@@ -266,6 +267,35 @@ static BindKwStatus JITRT_BindKeywordArgs(
   return BindKwStatus::Bound;
 }
 
+#if PY_VERSION_HEX < 0x030C0000 && defined(CINDER_AARCH64)
+// Activation bracket for the generated prologue's argument helpers under the
+// CPython 3.11 direct entry.  The live-frame count that defers artifact
+// reclamation (triggerStatsActiveFramesAddress) is otherwise maintained by
+// the body: counted in once its frame is linked, out at its hard exit.  The
+// helpers run before that count-in and after that count-out, and both halves
+// can run Python -- the keyword binder's fallback evaluates the whole call in
+// the interpreter, the defaults tuple released on the way out can run a
+// destructor -- yet the helper returns into the artifact's prologue exit
+// afterwards.  A retirement in that window must be deferred like one inside
+// the body, so the helper counts itself as a live frame for its whole
+// extent.  Declared first in each helper so it is destroyed last, after
+// every owned reference the helper releases; nothing runs between its
+// count-out and the return into machine code.
+class PrologueActivation311 {
+ public:
+  PrologueActivation311() {
+    ++*jit::triggerStatsActiveFramesAddress();
+  }
+  ~PrologueActivation311() {
+    --*jit::triggerStatsActiveFramesAddress();
+  }
+  PrologueActivation311(const PrologueActivation311&) = delete;
+  PrologueActivation311& operator=(const PrologueActivation311&) = delete;
+};
+#else
+class PrologueActivation311 {};
+#endif
+
 #if PY_VERSION_HEX < 0x030C0000
 // The generated vectorcall prologue dispatches here, then re-enters the
 // compiled body at JITRT_CALL_REENTRY_OFFSET before the vectorcall entry.
@@ -276,6 +306,12 @@ static BindKwStatus JITRT_BindKeywordArgs(
 // function state after keyword equality has run.  InstalledArtifact is
 // only the fallback when this helper is entered without a snapshot.
 static vectorcallfunc jitrtBoundArgsReentry(PyFunctionObject* func) {
+  // Captured before any binding runs user code: the artifact installed for
+  // the function at this moment is the one whose prologue dispatched here.
+  // Direct entry installs the generated entry itself, so there is no shell
+  // snapshot; the installed-artifact lookup answers instead, and a function
+  // that is no longer installed re-enters the interpreter with the bound
+  // arguments.
   auto* compiled = reinterpret_cast<jit::CompiledFunction*>(
       Ci_JitShell311_InvocationArtifact());
   if (compiled == nullptr) {
@@ -293,9 +329,12 @@ static PyThreadState* allocate_and_link_interpreter_frame(
     PyFunctionObject* func,
     PyCodeObject* co);
 
+#if !defined(CINDER_AARCH64)
 thread_local _PyInterpreterFrame* t_prelinked_recursion_frame = nullptr;
+#endif
 thread_local int t_jit_recursion_entries = 0;
 
+#if !defined(CINDER_AARCH64)
 // CPython 3.11 binds in initialize_locals, then consumes a recursion slot only
 // after the attempted frame is linked at start_frame. Binding stays in the
 // generated prologue. Normal frames are prelinked here and consumed by
@@ -379,6 +418,11 @@ class RecursiveCallAfterBind {
   bool boundary_active_{false};
   int entries_before_;
 };
+#else
+// AArch64: the body links its own frame inline and carries the recursion
+// accounting in its generated entry guard, so the bound-args reentry paths
+// below hand the bound arguments straight back to the body.
+#endif
 
 void JITRT_TransferRecursionToInterpreter311() {
   if (t_jit_recursion_entries == 0) {
@@ -388,7 +432,7 @@ void JITRT_TransferRecursionToInterpreter311() {
     Ci_JitRecursionBoundary311_Leave();
   }
   t_jit_recursion_entries--;
-  _Py_LeaveRecursiveCallTstate(PyThreadState_GET());
+  _Py_LeaveRecursiveCallTstate(_PyThreadState_GET());
 }
 
 void JITRT_GetRecursionState311(
@@ -396,7 +440,7 @@ void JITRT_GetRecursionState311(
     int* headroom,
     int* boundary_active,
     int* jit_entries) {
-  PyThreadState* tstate = PyThreadState_GET();
+  PyThreadState* tstate = _PyThreadState_GET();
   *remaining = tstate->recursion_remaining;
   *headroom = tstate->recursion_headroom;
   *boundary_active = Ci_JitRecursionBoundary311_IsActive();
@@ -409,10 +453,12 @@ static PyObject* jitrtReenterAfterBind(
     PyObject** args,
     size_t nargsf,
     PyObject* kwnames) {
+#if !defined(CINDER_AARCH64)
   RecursiveCallAfterBind rec{reinterpret_cast<PyFunctionObject*>(func)};
   if (!rec.entered()) {
     return nullptr;
   }
+#endif
   return reentry(func, args, nargsf, kwnames);
 }
 
@@ -448,6 +494,7 @@ PyObject* JITRT_CallWithKeywordArgs(
     PyObject** args,
     size_t nargsf,
     PyObject* kwnames) {
+  [[maybe_unused]] PrologueActivation311 activation;
   vectorcallfunc reentry = JITRT_CAPTURE_REENTRY(func);
   PyCodeObject* co = (PyCodeObject*)func->func_code;
   const Py_ssize_t total_args = co->co_argcount + co->co_kwonlyargcount +
@@ -510,6 +557,7 @@ JITRT_StaticCallFPReturn JITRT_CallWithIncorrectArgcountFPReturn(
     PyObject** args,
     size_t nargsf,
     int argcount) {
+  [[maybe_unused]] PrologueActivation311 activation;
   vectorcallfunc reentry = JITRT_CAPTURE_REENTRY(func);
   PyObject* defaults = func->func_defaults;
   if (defaults == nullptr) {
@@ -549,7 +597,7 @@ JITRT_StaticCallFPReturn JITRT_CallWithIncorrectArgcountFPReturn(
 
   size_t new_nargsf = argcount;
 
-#if PY_VERSION_HEX < 0x030C0000
+#if PY_VERSION_HEX < 0x030C0000 && !defined(CINDER_AARCH64)
   RecursiveCallAfterBind rec{func};
   if (!rec.entered()) {
     return {0.0, 0.0};
@@ -574,6 +622,7 @@ JITRT_CallWithIncorrectArgcount(
     PyObject** args,
     size_t nargsf,
     int argcount) {
+  [[maybe_unused]] PrologueActivation311 activation;
   vectorcallfunc reentry = JITRT_CAPTURE_REENTRY(func);
   PyObject* defaults = func->func_defaults;
   if (defaults == nullptr) {
@@ -623,7 +672,7 @@ JITRT_CallWithIncorrectArgcount(
 
   size_t new_nargsf = argcount;
 
-#if PY_VERSION_HEX < 0x030C0000
+#if PY_VERSION_HEX < 0x030C0000 && !defined(CINDER_AARCH64)
   RecursiveCallAfterBind rec{func};
   if (!rec.entered()) {
 #ifdef _WIN32
@@ -712,7 +761,7 @@ TRetType JITRT_CallStaticallyWithPrimitiveSignatureWorker(
     goto fail;
   }
 
-#if PY_VERSION_HEX < 0x030C0000
+#if PY_VERSION_HEX < 0x030C0000 && !defined(CINDER_AARCH64)
   {
     RecursiveCallAfterBind rec{func};
     if (!rec.entered()) {
@@ -750,6 +799,7 @@ TRetType JITRT_CallStaticallyWithPrimitiveSignatureTemplate(
     size_t nargsf,
     PyObject* kwnames,
     _PyTypedArgsInfo* arg_info) {
+  [[maybe_unused]] PrologueActivation311 activation;
   Py_ssize_t nargs = PyVectorcall_NARGS(nargsf);
   PyCodeObject* co = (PyCodeObject*)func->func_code;
 
@@ -914,10 +964,10 @@ static void init_and_link_interpreter_frame(
 static PyThreadState* allocate_and_link_interpreter_frame(
     PyFunctionObject* func,
     PyCodeObject* co) {
-  PyThreadState* tstate = PyThreadState_GET();
+  PyThreadState* tstate = _PyThreadState_GET();
   JIT_DCHECK(tstate != nullptr, "thread state cannot be null");
 
-#if PY_VERSION_HEX < 0x030C0000
+#if PY_VERSION_HEX < 0x030C0000 && !defined(CINDER_AARCH64)
   if (t_prelinked_recursion_frame != nullptr) {
     _PyInterpreterFrame* frame = t_prelinked_recursion_frame;
     JIT_CHECK(
@@ -964,6 +1014,31 @@ PyThreadState* JITRT_AllocateAndLinkInterpreterFrame_Release(
   return allocate_and_link_interpreter_frame(func, co);
 }
 
+#if PY_VERSION_HEX < 0x030C0000
+// Datastack-overflow arm of the inline link.  The C path
+// takes the stock pair of references; drop them again so the frame matches
+// the inline contract (no owned f_func / f_code).  Both stay alive through
+// the caller's reference and the compiled artifact.
+PyThreadState* JITRT_AllocateAndLinkInterpreterFrameNoRef311(
+    PyFunctionObject* func) {
+  PyCodeObject* co = reinterpret_cast<PyCodeObject*>(func->func_code);
+  PyThreadState* tstate = allocate_and_link_interpreter_frame(func, co);
+  Py_DECREF(func);
+  Py_DECREF(co);
+  return tstate;
+}
+
+// Slow unlink for a frame without owned references:
+// restore stock ownership first, the generic clear / take-over path then
+// releases (or transfers) them as usual.
+void JITRT_UnlinkFrameNoRef311(PyThreadState* tstate) {
+  _PyInterpreterFrame* frame = currentFrame(tstate);
+  Py_INCREF(frame->f_func);
+  Py_INCREF(frame->f_code);
+  JITRT_UnlinkFrame(tstate);
+}
+#endif
+
 void JITRT_InitFrameCellVars(
     PyFunctionObject* func,
     int nvars,
@@ -1000,8 +1075,30 @@ JITRT_AllocateAndLinkGenAndInterpreterFrame(
   JIT_DCHECK(co == code_rt->code(), "Code object mismatch");
 
   uint64_t spill_words = code_rt->spillWords();
-  PyThreadState* tstate = PyThreadState_GET();
+  PyThreadState* tstate = _PyThreadState_GET();
   JIT_DCHECK(tstate != nullptr, "thread state cannot be null");
+#if PY_VERSION_HEX < 0x030C0000
+  // The runtime knows its owning artifact; the guarded shell's invocation
+  // artifact and the installed-artifact lookup name the same object for the
+  // code running here.  Direct entry bypasses the shell, so the invocation
+  // artifact alone is not enough.  Resolved and pinned before the generator
+  // is allocated: the allocation can run a collection whose callbacks retire
+  // this function, and nothing counts this activation as a live frame yet.
+  auto* compiled = code_rt->compiledFunction();
+  if (compiled == nullptr) {
+    compiled = reinterpret_cast<jit::CompiledFunction*>(
+        Ci_JitShell311_InvocationArtifact());
+  }
+  if (compiled == nullptr) {
+    compiled = reinterpret_cast<jit::CompiledFunction*>(
+        Ci_JitShell311_InstalledArtifact(func));
+  }
+  JIT_CHECK(
+      compiled != nullptr,
+      "3.11 JIT generator created without an invocation artifact");
+  Ref<jit::CompiledFunction> compiled_pin =
+      Ref<jit::CompiledFunction>::create(compiled);
+#endif
   auto [gen, gen_size] = cinderx::getModuleState()->jit_gen_free_list->allocate(
       co, spill_words * sizeof(uint64_t) + sizeof(jit::GenDataFooter));
 
@@ -1061,13 +1158,7 @@ JITRT_AllocateAndLinkGenAndInterpreterFrame(
   footer->gen = static_cast<PyGenObject*>(gen);
   footer->code_rt = code_rt;
 #if PY_VERSION_HEX < 0x030C0000
-  auto* compiled = reinterpret_cast<jit::CompiledFunction*>(
-      Ci_JitShell311_InvocationArtifact());
-  JIT_CHECK(
-      compiled != nullptr,
-      "3.11 JIT generator created without an invocation artifact");
-  footer->compiled =
-      reinterpret_cast<jit::CompiledFunction*>(Py_NewRef(compiled));
+  footer->compiled = compiled_pin.release();
 #endif
   footer->tree_iter_state = nullptr;
   footer->originalFramePointer = original_frame_pointer;
@@ -1111,7 +1202,7 @@ JITRT_UnlinkGenFrameAndReturnGenDataFooter(PyThreadState* tstate) {
 }
 
 void JITRT_MarkGeneratorCompleted() {
-  PyThreadState* tstate = PyThreadState_GET();
+  PyThreadState* tstate = _PyThreadState_GET();
   _PyInterpreterFrame* frame = currentFrame(tstate);
   if (frame->owner != FRAME_OWNED_BY_GENERATOR) {
     return;
@@ -2842,7 +2933,7 @@ PyObject* JITRT_RichCompare(PyObject* v, PyObject* w, int op) {
   // frame it would raise before the recursive CALL and move the traceback
   // cursor. Borrow CPython recovery headroom only around this exact-builtin
   // operation; user-defined comparison slots never receive it.
-  PyThreadState* tstate = PyThreadState_GET();
+  PyThreadState* tstate = _PyThreadState_GET();
   bool exact_long_boundary = Ci_JitRecursionBoundary311_IsActive() &&
       tstate->recursion_headroom == 0 && PyLong_CheckExact(v) &&
       PyLong_CheckExact(w);
@@ -3060,7 +3151,7 @@ LoadMethodResult JITRT_LoadSpecial(
       const char* errfmt = _PyEval_SpecialMethodCanSuggest(owner, special_idx)
           ? _Py_SpecialMethods[special_idx].error_suggestion
           : _Py_SpecialMethods[special_idx].error;
-      PyThreadState* tstate = PyThreadState_GET();
+      PyThreadState* tstate = _PyThreadState_GET();
       JIT_CHECK(!_PyErr_Occurred(tstate), "Unexpected existing exception");
       JIT_CHECK(errfmt, "No error message for special method");
       _PyErr_Format(tstate, PyExc_TypeError, errfmt, owner);
@@ -3446,6 +3537,7 @@ PyObject* JITRT_CallWithKeywordArgsSimple(
     PyObject** args,
     size_t nargsf,
     PyObject* kwnames) {
+  [[maybe_unused]] PrologueActivation311 activation;
   vectorcallfunc reentry = JITRT_CAPTURE_REENTRY(func);
   PyCodeObject* co = (PyCodeObject*)func->func_code;
   JIT_DCHECK(

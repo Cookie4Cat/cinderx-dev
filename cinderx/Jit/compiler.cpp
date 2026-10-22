@@ -262,7 +262,10 @@ std::unique_ptr<hir::Function> compileToFinalHIRForTest(
   if (irfunc == nullptr) {
     return nullptr;
   }
-  if (getConfig().state == State::kRunning) {
+  // The poll insertion was unconditional; honour the config
+  // (PYTHONJITSUPPORTINSTRUMENTATION).
+  if (getConfig().state == State::kRunning &&
+      getConfig().support_instrumentation) {
     insertInstrumentationPolls311(*irfunc);
   }
   Compiler::runPasses(*irfunc, createConfig());
@@ -452,7 +455,10 @@ std::optional<CompiledFunctionData> Compiler::Compile(
   }
 
 #if PY_VERSION_HEX < 0x030C0000
-  if (getConfig().state == State::kRunning) {
+  // The poll insertion was unconditional; honour the config
+  // (PYTHONJITSUPPORTINSTRUMENTATION).
+  if (getConfig().state == State::kRunning &&
+      getConfig().support_instrumentation) {
     insertInstrumentationPolls311(*irfunc);
   }
 #endif
