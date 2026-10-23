@@ -249,6 +249,53 @@ void insertInstrumentationPolls311(hir::Function& irfunc) {
   }
 }
 
+// The default placement of the instrumentation poll: a frame that was
+// running when sys.settrace / sys.setprofile was switched on must leave
+// machine code where the interpreter would next report an event, and the
+// interpreter reports at line granularity -- a `line` event when a source
+// line starts and a `return` event when the frame returns.  A poll before
+// the first instruction of every source line and before every Return
+// therefore delivers exactly the events the interpreter delivers from the
+// transition on, at a fraction of the per-bytecode placement's cost
+// (which PYTHONJITSUPPORTINSTRUMENTATION=1 still selects).  A line start is
+// recognised through the line table: the instruction's line differs from
+// the preceding code unit's.  The function entry and a code object without
+// line information poll at offset 0.
+void insertLineInstrumentationPolls311(hir::Function& irfunc) {
+  BorrowedRef<PyCodeObject> code = irfunc.code;
+  for (auto& block : irfunc.cfg.blocks) {
+    for (auto it = block.begin(); it != block.end();) {
+      hir::Instr& instr = *it;
+      ++it;
+      if (instr.opcode() != hir::Opcode::kSnapshot || it == block.end()) {
+        continue;
+      }
+      auto& snapshot = static_cast<hir::Snapshot&>(instr);
+      hir::FrameState* state = snapshot.frameState();
+      if (state == nullptr) {
+        continue;
+      }
+      bool poll = it->opcode() == hir::Opcode::kReturn;
+      if (!poll) {
+        int offset = state->cur_instr_offs.value();
+        if (offset <= 0) {
+          poll = true;
+        } else {
+          poll = PyCode_Addr2Line(code, offset) !=
+              PyCode_Addr2Line(
+                     code, offset - static_cast<int>(sizeof(_Py_CODEUNIT)));
+        }
+      }
+      if (!poll) {
+        continue;
+      }
+      hir::Instr* check = hir::CheckInstrumentation::create(*state);
+      check->copyBytecodeOffset(instr);
+      check->InsertBefore(*it);
+    }
+  }
+}
+
 PassConfig createConfig();
 
 std::unique_ptr<hir::Function> compileToFinalHIRForTest(
@@ -264,9 +311,12 @@ std::unique_ptr<hir::Function> compileToFinalHIRForTest(
   }
   // The poll insertion was unconditional; honour the config
   // (PYTHONJITSUPPORTINSTRUMENTATION).
-  if (getConfig().state == State::kRunning &&
-      getConfig().support_instrumentation) {
-    insertInstrumentationPolls311(*irfunc);
+  if (getConfig().state == State::kRunning) {
+    if (getConfig().support_instrumentation) {
+      insertInstrumentationPolls311(*irfunc);
+    } else {
+      insertLineInstrumentationPolls311(*irfunc);
+    }
   }
   Compiler::runPasses(*irfunc, createConfig());
   return irfunc;
@@ -457,9 +507,12 @@ std::optional<CompiledFunctionData> Compiler::Compile(
 #if PY_VERSION_HEX < 0x030C0000
   // The poll insertion was unconditional; honour the config
   // (PYTHONJITSUPPORTINSTRUMENTATION).
-  if (getConfig().state == State::kRunning &&
-      getConfig().support_instrumentation) {
-    insertInstrumentationPolls311(*irfunc);
+  if (getConfig().state == State::kRunning) {
+    if (getConfig().support_instrumentation) {
+      insertInstrumentationPolls311(*irfunc);
+    } else {
+      insertLineInstrumentationPolls311(*irfunc);
+    }
   }
 #endif
 

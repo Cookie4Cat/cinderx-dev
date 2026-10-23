@@ -3920,6 +3920,24 @@ LIRGenerator::TranslatedBlock LIRGenerator::TranslateOneBasicBlock(
       }
       case Opcode::kCheckInstrumentation: {
         const auto& instr = static_cast<const DeoptBase&>(i);
+#if PY_VERSION_HEX < 0x030C0000
+        // One byte: cframe->use_tracing is the interpreter's own "tracing
+        // possible" flag, set by either registration (sys.settrace or
+        // sys.setprofile), the same byte the entry guard reads.  It must be
+        // read as a byte -- a wider load drags in neighbouring padding.
+        static_assert(
+            sizeof(reinterpret_cast<_PyCFrame*>(0)->use_tracing) == 1,
+            "use_tracing width changed");
+        Instruction* cframe = bbb.appendInstr(
+            OutVReg{},
+            Instruction::kMove,
+            Ind{env_->asm_tstate, offsetof(PyThreadState, cframe)});
+        Instruction* tracing = bbb.appendInstr(
+            OutVReg{OperandBase::k8bit},
+            Instruction::kMove,
+            Ind{cframe, offsetof(_PyCFrame, use_tracing)});
+        appendGuard(bbb, InstrGuardKind::kZero, instr, tracing);
+#else
         // Two independent loads and exits rather than an OR: either
         // registration alone is the transition, and the deopt carries
         // the complete post-instruction frame state, so nothing here
@@ -3934,6 +3952,7 @@ LIRGenerator::TranslatedBlock LIRGenerator::TranslateOneBasicBlock(
             OutVReg{},
             Ind{env_->asm_tstate, offsetof(PyThreadState, c_profilefunc)});
         appendGuard(bbb, InstrGuardKind::kZero, instr, profile);
+#endif
         break;
       }
       case Opcode::kCheckExc:
