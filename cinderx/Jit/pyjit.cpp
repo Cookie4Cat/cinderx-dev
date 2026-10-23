@@ -7068,9 +7068,15 @@ Result compilePreloaderImpl(
       }
       return Result::OK;
     } else if (jit_ctx->hasCompletedCompile(key)) {
-      // We're in the multi-threaded scenario we've created the
-      // CompiledFunctionData and will create the CompiledFunction at the end
-      return Result::OK;
+      // Multi-threaded compile: a worker already produced the
+      // CompiledFunctionData for this key, and finalizeMultiThreadedCompile()
+      // turns it into a CompiledFunction after the workers have joined.  That
+      // step only attaches the function the data was recorded with, so a
+      // further function sharing the same code must be attached afterwards.
+      // Reporting it as scheduled puts it on the serial retry list, where
+      // lookupCode() finds the published artifact and finalizeFunc() attaches
+      // it.  A bare code object (nested function) has nothing to attach.
+      return func != nullptr ? Result::ALREADY_SCHEDULED : Result::OK;
     } else if (!jit_ctx->addActiveCompile(key)) {
       // The compilation is in-flight on another thread
       return Result::ALREADY_SCHEDULED;
@@ -7126,9 +7132,15 @@ Result compilePreloaderImpl(
   // Re-verify after the drain, so OK still means what the control plane
   // defines it to mean: this function's calls execute machine code as
   // this returns.
-  jit_ctx->drainDeferredAnchorReleases();
-  if (func != nullptr && !isJitCompiled(func)) {
-    return Result::CANNOT_SPECIALIZE;
+  // During a multi-threaded batch the publication was only parked: the
+  // CompiledFunction is created and the function attached by
+  // finalizeMultiThreadedCompile() on the main thread, so the verdict cannot
+  // be taken here and nothing was displaced yet.
+  if (!getThreadedCompileContext().compileRunning()) {
+    jit_ctx->drainDeferredAnchorReleases();
+    if (func != nullptr && !isJitCompiled(func)) {
+      return Result::CANNOT_SPECIALIZE;
+    }
   }
 #else
   jit_ctx->codeCompiled(func, key, std::move(*compiled_func));
