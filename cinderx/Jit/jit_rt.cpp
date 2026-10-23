@@ -1604,6 +1604,97 @@ JITRT_LoadGlobal(PyObject* globals, PyObject* builtins, PyObject* name) {
 }
 
 #if PY_VERSION_HEX < 0x030C0000
+namespace {
+void unpinGlobalLoadCell311(jit::GlobalLoadCell311* cell) {
+  cell->globals_keys_version = jit::kGlobalLoadCellUnpinned311;
+  cell->builtins_keys_version = jit::kGlobalLoadCellUnpinned311;
+  cell->slot = nullptr;
+}
+
+// Pins the cell to the entry slot the lookup answered from, recording the
+// keys versions the fast arm compares against.  Runs on the executing
+// thread with the GIL held: the version allocator and the dict tables are
+// not touched from compile threads.
+bool pinGlobalLoadCell311(
+    jit::GlobalLoadCell311* cell,
+    PyObject* globals_obj,
+    PyObject* builtins_obj,
+    PyObject* name,
+    PyObject* value) {
+  auto* globals = reinterpret_cast<PyDictObject*>(globals_obj);
+  auto* builtins = reinterpret_cast<PyDictObject*>(builtins_obj);
+  // Only combined, unicode-keyed tables have a stable per-entry value slot
+  // and exact-str keys whose comparison runs no Python code.
+  if (!PyDict_CheckExact(globals_obj) || !PyDict_CheckExact(builtins_obj) ||
+      globals->ma_values != nullptr || builtins->ma_values != nullptr ||
+      !hasOnlyUnicodeKeys(globals_obj) || !hasOnlyUnicodeKeys(builtins_obj)) {
+    unpinGlobalLoadCell311(cell);
+    return false;
+  }
+  // The versions are read after the lookups below cannot run anymore.  A
+  // zero version (the allocator is exhausted) cannot be pinned: a live zero
+  // would compare equal to it; nor can the unpinned sentinel, which the
+  // vendored allocator reserves.
+  PyDictObject* owner = globals;
+  Py_ssize_t index = getDictKeysIndex(globals->ma_keys, name);
+  if (index < 0 ||
+      DK_UNICODE_ENTRIES(globals->ma_keys)[index].me_value == nullptr) {
+    if (cell->globals_only) {
+      // The site checks the globals version only, which cannot witness a
+      // builtins entry; it stays on the slow arm until the global returns.
+      unpinGlobalLoadCell311(cell);
+      return false;
+    }
+    owner = builtins;
+    index = getDictKeysIndex(builtins->ma_keys, name);
+    if (index < 0) {
+      unpinGlobalLoadCell311(cell);
+      return false;
+    }
+  }
+  PyObject** slot = &DK_UNICODE_ENTRIES(owner->ma_keys)[index].me_value;
+  if (*slot != value) {
+    // The scan and the lookup disagree (a deleted entry below dk_nentries,
+    // or a value swapped in between): do not pin a slot the lookup did not
+    // answer from.
+    unpinGlobalLoadCell311(cell);
+    return false;
+  }
+  uint32_t globals_version = dictGetKeysVersion(nullptr, globals->ma_keys);
+  uint32_t builtins_version = dictGetKeysVersion(nullptr, builtins->ma_keys);
+  if (globals_version == 0 || builtins_version == 0 ||
+      globals_version == jit::kGlobalLoadCellUnpinned311 ||
+      builtins_version == jit::kGlobalLoadCellUnpinned311) {
+    unpinGlobalLoadCell311(cell);
+    return false;
+  }
+  cell->globals_keys_version = globals_version;
+  cell->builtins_keys_version = builtins_version;
+  cell->slot = slot;
+  return true;
+}
+} // namespace
+
+PyObject** JITRT_LoadGlobalRepin311(
+    jit::GlobalLoadCell311* cell,
+    PyObject* globals,
+    PyObject* builtins,
+    PyObject* name) {
+  PyObject* value = JITRT_LoadGlobal(globals, builtins, name);
+  if (value == nullptr) {
+    unpinGlobalLoadCell311(cell);
+    return &jit::kGlobalLoadNoValue311;
+  }
+  if (pinGlobalLoadCell311(cell, globals, builtins, name, value)) {
+    // The dict entry keeps the value alive; the site reads it from there.
+    Py_DECREF(value);
+    return cell->slot;
+  }
+  // Unpinnable shape: the cell keeps this answer alive until the next one.
+  Py_XSETREF(cell->held, value);
+  return &cell->held;
+}
+
 uint64_t JITRT_StoreFrameLocal311(uint64_t idx, PyObject* value) {
   // MR-08 frame observability: keep the materialized frame's localsplus
   // current so sys._getframe()/f_locals readers see what stock 3.11

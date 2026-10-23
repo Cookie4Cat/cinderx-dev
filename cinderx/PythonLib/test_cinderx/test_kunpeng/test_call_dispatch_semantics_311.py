@@ -356,10 +356,9 @@ def other(a, b=1, c=0):
     return ("other", a, b, c)
 
 # Every global the probe assigns exists before the compile, and none is
-# removed afterwards: a module key added or deleted would fail the pinned
-# load's keys-version guard at LOAD_GLOBAL, and the binder guards below
-# would never be the ones failing.  (An `except ... as name` handler
-# deletes its name on exit, so the handlers bind none.)
+# removed afterwards, so the deopts observed below come from the binder
+# guards alone and not from a global re-pin.  (An `except ... as name`
+# handler deletes its name on exit, so the handlers bind none.)
 _ = message = deopts = None
 assert cinderjit.force_compile(call) is True
 for _ in range(100):

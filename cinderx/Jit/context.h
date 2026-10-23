@@ -547,6 +547,7 @@ class Context : public IJitContext, public CompiledFunctionOwner {
 #if PY_VERSION_HEX < 0x030C0000
   CallSiteEntryCache* allocateCallSiteEntryCache();
   SuperSiteCache311* allocateSuperSiteCache311();
+  GlobalLoadCell311* allocateGlobalLoadCell311();
 #endif
 
   const Builtins& builtins();
@@ -651,6 +652,7 @@ class Context : public IJitContext, public CompiledFunctionOwner {
 #if PY_VERSION_HEX < 0x030C0000
   SlabArena<CallSiteEntryCache> call_site_entry_caches_;
   SlabArena<SuperSiteCache311> super_site_caches_;
+  SlabArena<GlobalLoadCell311> global_load_cells_311_;
 #endif
   SlabArena<void*> pointer_caches_;
 

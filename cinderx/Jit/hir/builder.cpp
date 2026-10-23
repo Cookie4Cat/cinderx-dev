@@ -2185,7 +2185,7 @@ void HIRBuilder::translate(
                   irfunc.cfg, tc, bc_it, bc_block)) {
             break;
           }
-          emitLoadGlobal(tc, bc_instr);
+          emitLoadGlobal(irfunc.cfg, tc, bc_instr);
           break;
         }
         case JUMP_ABSOLUTE:
@@ -4571,8 +4571,8 @@ bool HIRBuilder::tryEmitLoadMethodOrAttrSuper311(
   // when that declines.  The pattern consumes the CALL itself, so the
   // oparg&1 NULL is never pushed.
 #if PY_VERSION_HEX < 0x030C0000
-  if (!tryEmitLoadGlobalModuleValue311(
-          tc, load_global, pattern->global_super_idx, global_super)) {
+  if (!tryEmitLoadGlobal311(
+          cfg, tc, load_global, pattern->global_super_idx, global_super)) {
     tc.emit<LoadGlobal>(global_super, pattern->global_super_idx, tc.frame);
   }
 #else
@@ -5425,7 +5425,22 @@ static LoadGlobalCallShape311 scanLoadGlobalCallShape311(
   return shape;
 }
 
-bool HIRBuilder::tryEmitLoadGlobalModuleValue311(
+// LOAD_GLOBAL on 3.11, pure HIR around a per-site GlobalLoadCell311.  The
+// fast arm reads the live dk_version of the module and builtins keys,
+// compares each with the version recorded in the cell and loads the value
+// through the cell's slot (a same-key rebinding does not change dk_version,
+// so the value is read live).  A version that moved on -- a key added to or
+// removed from either dict -- takes the slow arm rather than a deopt: the
+// helper looks the name up the way the interpreter does, re-pins the cell
+// and returns the value, so the site is fast again on the next call and a
+// module that keeps growing its namespace never retires its compiled
+// functions.  The identity pins below (a function or class the simplifier
+// bound at compile time, a few builtins) still deopt when rebound.
+//
+// The fast arm's value is borrowed and the slow arm's is owned; the
+// refcount-insertion pass balances the two at the join.
+bool HIRBuilder::tryEmitLoadGlobal311(
+    CFG& cfg,
     TranslationContext& tc,
     const jit::BytecodeInstruction& bc_instr,
     int name_idx,
@@ -5433,90 +5448,170 @@ bool HIRBuilder::tryEmitLoadGlobalModuleValue311(
   if (!getConfig().stable_frame || bc_instr.opcode() != LOAD_GLOBAL) {
     return false;
   }
-
   BorrowedRef<PyDictObject> globals = preloader_.globals();
-  if (globals->ma_values != nullptr || !hasOnlyUnicodeKeys(globals)) {
+  BorrowedRef<PyDictObject> builtins = preloader_.builtins();
+  if (globals == nullptr || builtins == nullptr ||
+      !PyDict_CheckExact(globals) || !PyDict_CheckExact(builtins)) {
+    return false;
+  }
+  // The cell outlives the HIR function, so it is taken from the JIT
+  // context's arena, like the other per-site caches.
+  auto* ctx =
+      static_cast<Context*>(cinderx::getModuleState()->jit_context.get());
+  if (ctx == nullptr) {
     return false;
   }
 
+  // The dict lookups and the cell allocation are serialized across compile
+  // threads like the other builder-side reads of module state.
+  ThreadedCompileSerialize guard;
   BorrowedRef<> name = PyTuple_GET_ITEM(code_->co_names, name_idx);
+  bool from_builtins = false;
   PyObject* value = PyDict_GetItemWithError(globals, name);
   if (value == nullptr) {
     if (PyErr_Occurred()) {
       PyErr_Clear();
-    }
-    // A module-level miss is the builtins-hit form.
-    return tryEmitLoadGlobalBuiltinValue311(tc, name, result);
-  }
-
-  Py_ssize_t index = -1;
-  uint32_t keys_version = 0;
-  if (bc_instr.specializedOpcode() == LOAD_GLOBAL_MODULE) {
-    const _Py_CODEUNIT* instr =
-        codeUnit(code_) + bc_instr.opcodeIndex().value();
-    auto cache = reinterpret_cast<const _PyLoadGlobalCache*>(instr + 1);
-    keys_version = readCacheU32(cache->module_keys_version);
-    index = cache->index;
-  } else {
-    index = findActiveUnicodeDictEntryIndex(globals, name, value);
-    if (index < 0) {
       return false;
     }
-    keys_version = dictGetKeysVersion(nullptr, globals->ma_keys);
+    value = PyDict_GetItemWithError(builtins, name);
+    if (value == nullptr) {
+      // Absent from both at compile time: the generic load raises NameError
+      // or finds a later definition.
+      if (PyErr_Occurred()) {
+        PyErr_Clear();
+      }
+      return false;
+    }
+    from_builtins = true;
   }
-  if (keys_version == 0) {
+
+  GlobalLoadCell311* cell = ctx->allocateGlobalLoadCell311();
+  if (cell == nullptr) {
     return false;
   }
+  // The cell starts unpinned: the first call takes the slow arm, which
+  // pins it on the executing thread with the GIL held (the keys-version
+  // allocator and the entry tables are never touched from here).
+  cell->globals_only = !from_builtins;
 
-  // Pure-HIR guarded load.  The keys version pins the key structure and the
-  // entry layout, so the entry value offset is a compile-time constant; a
-  // same-key overwrite does not bump dk_version, so the value is read live
-  // from the entry slot, not baked in.  Guard failure deopts and re-executes
-  // this LOAD_GLOBAL in the interpreter.
-  PyDictKeysObject* gkeys_probe = globals->ma_keys;
-  ptrdiff_t value_off = reinterpret_cast<const char*>(
-                            &DK_UNICODE_ENTRIES(gkeys_probe)[index].me_value) -
-      reinterpret_cast<const char*>(gkeys_probe);
-
+  Register* cell_reg = temps_.AllocateNonStack();
+  tc.emit<LoadConst>(cell_reg, Type::fromCPtr(cell));
   Register* globals_reg = temps_.AllocateNonStack();
   tc.emit<LoadConst>(
       globals_reg,
       Type::fromObject(env_->addReference(BorrowedRef<>{globals})));
-  Register* keys_reg = temps_.AllocateNonStack();
-  tc.emit<LoadField>(
-      keys_reg, globals_reg, "ma_keys", offsetof(PyDictObject, ma_keys), TCPtr);
-  Register* ver_reg = temps_.AllocateNonStack();
-  tc.emit<LoadField>(
-      ver_reg,
-      keys_reg,
-      "dk_version",
-      offsetof(PyDictKeysObject, dk_version),
-      TCUInt32);
-  Register* expected_reg = temps_.AllocateNonStack();
-  tc.emit<LoadConst>(expected_reg, Type::fromCUInt(keys_version, TCUInt32));
-  Register* ok_reg = temps_.AllocateNonStack();
-  tc.emit<PrimitiveCompare>(
-      ok_reg, PrimitiveCompareOp::kEqual, ver_reg, expected_reg);
-  tc.emitSnapshot();
-  auto ver_guard = tc.emit<Guard>(ok_reg);
-  ver_guard->setFrameState(tc.frame);
-  ver_guard->setDescr(
-      fmt::format("LOAD_GLOBAL_MODULE ver: {}", PyUnicode_AsUTF8(name)));
+  // The builtins dict is a fast-arm operand only for a builtins-resolved
+  // name; the name itself is a slow-arm operand.  Each arm materializes
+  // the constants it reads, so the fast arm carries none it does not.
+  auto emit_builtins_const = [&]() -> Register* {
+    Register* reg = temps_.AllocateNonStack();
+    tc.emit<LoadConst>(
+        reg, Type::fromObject(env_->addReference(BorrowedRef<>{builtins})));
+    return reg;
+  };
 
-  Register* raw_reg = temps_.AllocateNonStack();
+  BasicBlock* check_builtins = from_builtins ? cfg.AllocateBlock() : nullptr;
+  BasicBlock* fast = cfg.AllocateBlock();
+  BasicBlock* slow = cfg.AllocateBlock();
+  BasicBlock* done = cfg.AllocateBlock();
+
+  auto emit_version_matches = [&](Register* dict_reg,
+                                  const char* field,
+                                  std::size_t expected_off) -> Register* {
+    Register* keys_reg = temps_.AllocateNonStack();
+    tc.emit<LoadField>(
+        keys_reg, dict_reg, "ma_keys", offsetof(PyDictObject, ma_keys), TCPtr);
+    Register* ver_reg = temps_.AllocateNonStack();
+    tc.emit<LoadField>(
+        ver_reg,
+        keys_reg,
+        "dk_version",
+        offsetof(PyDictKeysObject, dk_version),
+        TCUInt32);
+    Register* expected_reg = temps_.AllocateNonStack();
+    tc.emit<LoadField>(expected_reg, cell_reg, field, expected_off, TCUInt32);
+    Register* ok_reg = temps_.AllocateNonStack();
+    tc.emit<PrimitiveCompare>(
+        ok_reg, PrimitiveCompareOp::kEqual, ver_reg, expected_reg);
+    return ok_reg;
+  };
+
+  Register* globals_ok = emit_version_matches(
+      globals_reg,
+      "globals_keys_version",
+      offsetof(GlobalLoadCell311, globals_keys_version));
+  if (from_builtins) {
+    // A builtins entry can be shadowed by a new module key, so both
+    // versions guard the slot.  A module entry cannot be shadowed: its
+    // site checks the globals version only.
+    tc.emit<CondBranch>(globals_ok, check_builtins, slow);
+    tc.block = check_builtins;
+    Register* builtins_ok = emit_version_matches(
+        emit_builtins_const(),
+        "builtins_keys_version",
+        offsetof(GlobalLoadCell311, builtins_keys_version));
+    tc.emit<CondBranch>(builtins_ok, fast, slow);
+  } else {
+    tc.emit<CondBranch>(globals_ok, fast, slow);
+  }
+
+  // A version match proves the pinned entry is live and holds a value (the
+  // dict zeroes its keys version on every insertion and deletion), so the
+  // slot is read without a NULL test; an unpinned cell carries a version
+  // no dict can have.
+  tc.block = fast;
+  Register* slot_reg = temps_.AllocateNonStack();
   tc.emit<LoadField>(
-      raw_reg,
-      keys_reg,
-      "me_value",
-      static_cast<std::size_t>(value_off),
-      TOptObject);
+      slot_reg, cell_reg, "slot", offsetof(GlobalLoadCell311, slot), TCPtr);
+  Register* value_reg = temps_.AllocateNonStack();
+  tc.emit<LoadField>(value_reg, slot_reg, "me_value", 0, TObject);
+  tc.emit<Assign>(result, value_reg);
+  tc.emit<Branch>(done);
+
+  tc.block = slow;
+  Register* builtins_reg = emit_builtins_const();
+  Register* name_reg = temps_.AllocateNonStack();
+  tc.emit<LoadConst>(name_reg, Type::fromObject(env_->addReference(name)));
+  // The helper answers through stable storage (the pinned slot, the cell's
+  // held reference, or NULL storage with the NameError set), so the value
+  // is a borrowed load here just as on the fast arm and the merge below
+  // stays borrowed: no incref/decref pair on the fast arm.
+  Register* storage_reg = temps_.AllocateNonStack();
+  auto call = tc.emit<CallStatic>(
+      4, storage_reg, reinterpret_cast<void*>(JITRT_LoadGlobalRepin311), TCPtr);
+  call->SetOperand(0, cell_reg);
+  call->SetOperand(1, globals_reg);
+  call->SetOperand(2, builtins_reg);
+  call->SetOperand(3, name_reg);
+  Register* answer_reg = temps_.AllocateNonStack();
+  tc.emit<LoadField>(answer_reg, storage_reg, "value", 0, TOptObject);
+  Register* checked_reg = temps_.AllocateNonStack();
+  tc.emit<CheckExc>(checked_reg, answer_reg, tc.frame);
+  tc.emit<Assign>(result, checked_reg);
+  tc.emit<Branch>(done);
+
+  tc.block = done;
+  // The identity pins below are deopt points and take their frame state
+  // from the snapshot preceding them in this block.
   tc.emitSnapshot();
-  auto nn_guard = tc.emit<Guard>(raw_reg);
-  nn_guard->setFrameState(tc.frame);
-  nn_guard->setGuiltyReg(raw_reg);
-  nn_guard->setDescr(
-      fmt::format("LOAD_GLOBAL_MODULE: {}", PyUnicode_AsUTF8(name)));
-  tc.emit<RefineType>(result, TObject, raw_reg);
+
+  if (from_builtins) {
+    bool pin = false;
+    if (value == reinterpret_cast<PyObject*>(&PyType_Type)) {
+      pin = true;
+    } else if (Py_IS_TYPE(value, &PyCFunction_Type)) {
+      const char* mname =
+          reinterpret_cast<PyCFunctionObject*>(value)->m_ml->ml_name;
+      pin = mname != nullptr &&
+          (strcmp(mname, "len") == 0 || strcmp(mname, "isinstance") == 0);
+    }
+    if (pin) {
+      auto is_guard = tc.emit<GuardIs>(result, value, result);
+      is_guard->setDescr(
+          fmt::format("LOAD_GLOBAL_BUILTIN pin: {}", PyUnicode_AsUTF8(name)));
+    }
+    return true;
+  }
 
   // A function-valued global that is called with keywords is pinned by
   // identity so the simplifier can bind the keyword arguments to parameter
@@ -5553,116 +5648,10 @@ bool HIRBuilder::tryEmitLoadGlobalModuleValue311(
   }
   return true;
 }
-
-// Two dk_version guards replace the generic helper: the globals version
-// proves the name is still not shadowed at module level, the builtins
-// version pins the key layout so the entry offset is a compile-time
-// constant.  dk_version is allocated monotonically and globally, so any
-// delete or resize invalidates it.  A guard failure deopts and re-executes
-// this LOAD_GLOBAL in the interpreter, which is what the helper returning
-// null already meant.
-//
-// The loaded value is borrowed on purpose: reference accounting belongs to
-// the HIR refcount-insertion pass, which balances it at the consumption
-// point.
-bool HIRBuilder::tryEmitLoadGlobalBuiltinValue311(
-    TranslationContext& tc,
-    BorrowedRef<> name,
-    Register* result) {
-  BorrowedRef<PyDictObject> globals = preloader_.globals();
-  BorrowedRef<PyDictObject> builtins = preloader_.builtins();
-  if (builtins == nullptr || !PyDict_CheckExact(builtins) ||
-      builtins->ma_values != nullptr || !hasOnlyUnicodeKeys(builtins)) {
-    return false;
-  }
-
-  PyObject* value = PyDict_GetItemWithError(builtins, name);
-  if (value == nullptr) {
-    if (PyErr_Occurred()) {
-      PyErr_Clear();
-    }
-    return false;
-  }
-
-  Py_ssize_t index = findActiveUnicodeDictEntryIndex(builtins, name, value);
-  if (index < 0) {
-    return false;
-  }
-  uint32_t globals_keys_version = dictGetKeysVersion(nullptr, globals->ma_keys);
-  uint32_t builtins_keys_version =
-      dictGetKeysVersion(nullptr, builtins->ma_keys);
-  if (globals_keys_version == 0 || builtins_keys_version == 0) {
-    return false;
-  }
-
-  PyDictKeysObject* bkeys_probe = builtins->ma_keys;
-  ptrdiff_t value_off = reinterpret_cast<const char*>(
-                            &DK_UNICODE_ENTRIES(bkeys_probe)[index].me_value) -
-      reinterpret_cast<const char*>(bkeys_probe);
-
-  auto emit_keys_version_guard = [&](BorrowedRef<PyDictObject> dict,
-                                     uint32_t expected_version,
-                                     const char* what) -> Register* {
-    Register* dict_reg = temps_.AllocateNonStack();
-    tc.emit<LoadConst>(
-        dict_reg, Type::fromObject(env_->addReference(BorrowedRef<>{dict})));
-    Register* keys_reg = temps_.AllocateNonStack();
-    tc.emit<LoadField>(
-        keys_reg, dict_reg, "ma_keys", offsetof(PyDictObject, ma_keys), TCPtr);
-    Register* ver_reg = temps_.AllocateNonStack();
-    tc.emit<LoadField>(
-        ver_reg,
-        keys_reg,
-        "dk_version",
-        offsetof(PyDictKeysObject, dk_version),
-        TCUInt32);
-    Register* expected_reg = temps_.AllocateNonStack();
-    tc.emit<LoadConst>(
-        expected_reg, Type::fromCUInt(expected_version, TCUInt32));
-    Register* ok_reg = temps_.AllocateNonStack();
-    tc.emit<PrimitiveCompare>(
-        ok_reg, PrimitiveCompareOp::kEqual, ver_reg, expected_reg);
-    tc.emitSnapshot();
-    auto guard = tc.emit<Guard>(ok_reg);
-    guard->setFrameState(tc.frame);
-    guard->setDescr(fmt::format("{}: {}", what, PyUnicode_AsUTF8(name)));
-    return keys_reg;
-  };
-
-  emit_keys_version_guard(
-      globals, globals_keys_version, "LOAD_GLOBAL_BUILTIN globals ver");
-  Register* bkeys_reg = emit_keys_version_guard(
-      builtins, builtins_keys_version, "LOAD_GLOBAL_BUILTIN builtins ver");
-
-  tc.emit<LoadField>(
-      result,
-      bkeys_reg,
-      "me_value",
-      static_cast<std::size_t>(value_off),
-      TObject);
-  // Pin the builtins the simplifier can open up (len -> GetLength,
-  // isinstance -> inline type test, type -> ob_type load) so their call
-  // sites see a constant target.  Rebinding the name deopts and
-  // re-specializes like the class pin.
-  bool pin = false;
-  if (value == reinterpret_cast<PyObject*>(&PyType_Type)) {
-    pin = true;
-  } else if (Py_IS_TYPE(value, &PyCFunction_Type)) {
-    const char* mname =
-        reinterpret_cast<PyCFunctionObject*>(value)->m_ml->ml_name;
-    pin = mname != nullptr &&
-        (strcmp(mname, "len") == 0 || strcmp(mname, "isinstance") == 0);
-  }
-  if (pin) {
-    auto is_guard = tc.emit<GuardIs>(result, value, result);
-    is_guard->setDescr(
-        fmt::format("LOAD_GLOBAL_BUILTIN pin: {}", PyUnicode_AsUTF8(name)));
-  }
-  return true;
-}
 #endif
 
 void HIRBuilder::emitLoadGlobal(
+    [[maybe_unused]] CFG& cfg,
     TranslationContext& tc,
     const jit::BytecodeInstruction& bc_instr) {
   int name_idx = loadGlobalIndex(bc_instr.oparg());
@@ -5672,7 +5661,7 @@ void HIRBuilder::emitLoadGlobal(
   // Snapshot the pre-opcode stack so a GuardFailure re-executes
   // LOAD_GLOBAL without a second PUSH_NULL.  The NULL (oparg & 1) is
   // pushed only after the guard succeeds.
-  bool fast = tryEmitLoadGlobalModuleValue311(tc, bc_instr, name_idx, result);
+  bool fast = tryEmitLoadGlobal311(cfg, tc, bc_instr, name_idx, result);
   if (bc_instr.oparg() & 1) {
     emitPushNull(tc);
   }

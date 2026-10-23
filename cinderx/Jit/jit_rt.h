@@ -12,6 +12,7 @@
 namespace jit {
 class CodeRuntime;
 struct GenDataFooter;
+struct GlobalLoadCell311;
 struct JitGenObject;
 } // namespace jit
 
@@ -172,6 +173,18 @@ int64_t JITRT_ConsumeForcedDeopt(jit::CodeRuntime* code_rt, uint64_t deopt_id);
 // localsplus slot (MR-08 frame observability; value may be nullptr for
 // DELETE_FAST).  Returns 0.
 uint64_t JITRT_StoreFrameLocal311(uint64_t idx, PyObject* value);
+
+// 3.11 LOAD_GLOBAL per-site cell (jit::GlobalLoadCell311): the slow arm.
+// Performs the interpreter's lookup, then pins the cell for the next call
+// when the dicts allow it (combined, unicode-keyed, versionable) or leaves
+// it unpinned.  Returns a pointer to storage holding the value as a
+// borrowed reference: the pinned entry slot, the cell's own held reference
+// when it could not pin, or NULL storage with NameError set when absent.
+PyObject** JITRT_LoadGlobalRepin311(
+    jit::GlobalLoadCell311* cell,
+    PyObject* globals,
+    PyObject* builtins,
+    PyObject* name);
 PyThreadState* JITRT_AllocateAndLinkInterpreterFrameNoRef311(
     PyFunctionObject* func);
 void JITRT_UnlinkFrameNoRef311(PyThreadState* tstate);
@@ -365,7 +378,7 @@ PyObject* JITRT_GetAttrFromSuper(
 #if PY_VERSION_HEX < 0x030C0000
 namespace jit {
 struct SuperSiteCache311;
-}
+} // namespace jit
 
 // Per-site cached forms of the two lookups above (see
 // jit::SuperSiteCache311); the generic helper is the fallback for anything

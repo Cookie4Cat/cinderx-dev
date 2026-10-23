@@ -272,6 +272,7 @@ class HIRBuilder {
       TranslationContext& tc,
       const jit::BytecodeInstruction& bc_instr);
   void emitLoadGlobal(
+      CFG& cfg,
       TranslationContext& tc,
       const jit::BytecodeInstruction& bc_instr);
   void emitLoadType(
@@ -551,17 +552,14 @@ class HIRBuilder {
   bool emitTypeAnnotationGuards(TranslationContext& tc);
 
 #if PY_VERSION_HEX < 0x030C0000
-  bool tryEmitLoadGlobalModuleValue311(
+  // LOAD_GLOBAL through a per-site cell: live keys versions compared with
+  // the cell's, the value read through the pinned slot, and a slow arm that
+  // re-pins instead of deopting (see the definition).
+  bool tryEmitLoadGlobal311(
+      CFG& cfg,
       TranslationContext& tc,
       const jit::BytecodeInstruction& bc_instr,
       int name_idx,
-      Register* result);
-  // The builtins-hit form of LOAD_GLOBAL: two keys-version guards (globals
-  // not shadowing, builtins layout pinned) and a load from the builtins
-  // entry slot.
-  bool tryEmitLoadGlobalBuiltinValue311(
-      TranslationContext& tc,
-      BorrowedRef<> name,
       Register* result);
 #endif
 
