@@ -59,6 +59,11 @@ struct DictMutator {
 
   BorrowedRef<> getattr_method;
 #if PY_VERSION_HEX < 0x030C0000
+  // me_key-self-validating entry indexes, refreshed on
+  // every slow-path hit.  dict_hint indexes the receiver dict keys
+  // (materialized instances); values_hint indexes the type's cached
+  // shared keys (values-form instances).  A wrong hint just falls back,
+  // so per-instance keys divergence costs a refresh, not correctness.
   Py_ssize_t dict_hint{-1};
   Py_ssize_t values_hint{-1};
 #endif
@@ -109,20 +114,6 @@ struct GetAttrMutator {
   uint32_t keys_version;
 };
 
-#if PY_VERSION_HEX < 0x030C0000
-struct TypeRecvMutator {
-  enum class Form : uint8_t { kValue, kMetaDescr, kStaticMethod };
-
-  PyObject* payload{nullptr};
-  uint32_t meta_version{0};
-  uint32_t payload_type_version{0};
-  Form form{Form::kValue};
-};
-static_assert(
-    sizeof(TypeRecvMutator) <= sizeof(DictMutator),
-    "type receiver entries must not grow AttributeMutator");
-#endif
-
 // An instance of AttributeMutator is specialized to more efficiently perform a
 // get/set of a particular kind of attribute.
 class AttributeMutator {
@@ -132,11 +123,6 @@ class AttributeMutator {
   enum class Kind : uint8_t {
     kSplit,
     kSplitInline,
-#if PY_VERSION_HEX < 0x030C0000
-    // CPython 3.11 has no inline-values dictionaries, so the tagged value
-    // otherwise used by kSplitInline is available for type receivers.
-    kTypeRecv = kSplitInline,
-#endif
     kCombined,
     kDataDescr,
     kMemberDescr,
@@ -175,26 +161,6 @@ class AttributeMutator {
       PyTypeObject* type,
       PyObject* getattr_method,
       uint32_t keys_version);
-#if PY_VERSION_HEX < 0x030C0000
-  void set_type_recv_value(
-      PyTypeObject* receiver,
-      uint32_t meta_version,
-      PyObject* payload,
-      uint32_t payload_type_version);
-  void set_type_recv_meta_descr(
-      PyTypeObject* metatype,
-      PyObject* payload,
-      uint32_t payload_type_version);
-  void set_type_recv_static_method(
-      PyTypeObject* receiver,
-      uint32_t meta_version,
-      PyObject* wrapper,
-      uint32_t wrapper_type_version);
-  bool isTypeRecv() const {
-    return !isEmpty() && get_kind() == Kind::kTypeRecv;
-  }
-  PyObject* getTypeRecvAttr(PyObject* obj, PyObject* name);
-#endif
   BorrowedRef<PyTypeObject> watchedDescrType() const;
 
   PyObject* getAttr(PyObject* obj, PyObject* name);
@@ -202,8 +168,13 @@ class AttributeMutator {
 
   static void changeKindFromSplitInline(SplitMutator* split, Kind new_kind);
 #if PY_VERSION_HEX < 0x030C0000
+  // re-kind a kSplit entry whose receivers have
+  // materialized and re-keyed their dicts to kDict, so subsequent hits
+  // take the hint-indexed read (asm kdict arm / DictMutator) instead of
+  // a full hash probe per access, and answer the demoting access.
   static PyObject*
   demoteSplitToDict(SplitMutator* split, PyObject* obj, PyObject* name);
+  // Store-side twin: same demotion, answering the demoting store.
   static int demoteSplitToDictStore(
       SplitMutator* split,
       PyObject* obj,
@@ -226,8 +197,17 @@ class AttributeMutator {
         offsetof(SplitMutator, val_offset);
   }
 #if PY_VERSION_HEX < 0x030C0000
+  // the 3.11 stubs pull-validate against the captured
+  // receiver type version, exactly like doInvoke.
   static constexpr size_t typeVersionOffset() {
     return offsetof(AttributeMutator, type_version_);
+  }
+  static constexpr size_t memberDescrMemberdefOffset() {
+    return offsetof(AttributeMutator, member_descr_) +
+        offsetof(MemberDescrMutator, memberdef);
+  }
+  static constexpr uintptr_t memberDescrKind() {
+    return static_cast<uintptr_t>(Kind::kMemberDescr);
   }
   static constexpr size_t splitKeysOffset() {
     return offsetof(AttributeMutator, split_) + offsetof(SplitMutator, keys);
@@ -238,12 +218,33 @@ class AttributeMutator {
   static constexpr uintptr_t dictKind() {
     return static_cast<uintptr_t>(Kind::kDict);
   }
-  static constexpr size_t memberDescrMemberdefOffset() {
-    return offsetof(AttributeMutator, member_descr_) +
-        offsetof(MemberDescrMutator, memberdef);
+  static constexpr uintptr_t descrOrClassVarKind() {
+    return static_cast<uintptr_t>(Kind::kDescrOrClassVar);
   }
-  static constexpr uintptr_t memberDescrKind() {
-    return static_cast<uintptr_t>(Kind::kMemberDescr);
+  static constexpr size_t descrOrClassVarDescrOffset() {
+    return offsetof(AttributeMutator, descr_or_cvar_) +
+        offsetof(DescrOrClassVarMutator, descr);
+  }
+  static constexpr size_t descrOrClassVarKeysVersionOffset() {
+    return offsetof(AttributeMutator, descr_or_cvar_) +
+        offsetof(DescrOrClassVarMutator, keys_version);
+  }
+  // kDataDescr entry fields for the inline stub's direct
+  // descriptor call.
+  static constexpr uintptr_t dataDescrKind() {
+    return static_cast<uintptr_t>(Kind::kDataDescr);
+  }
+  static constexpr size_t dataDescrDescrOffset() {
+    return offsetof(AttributeMutator, data_descr_) +
+        offsetof(DataDescrMutator, descr);
+  }
+  static constexpr size_t dataDescrTypeOffset() {
+    return offsetof(AttributeMutator, data_descr_) +
+        offsetof(DataDescrMutator, descr_type);
+  }
+  static constexpr size_t dataDescrTypeVersionOffset() {
+    return offsetof(AttributeMutator, data_descr_) +
+        offsetof(DataDescrMutator, descr_type_version);
   }
 #endif
   template <typename T>
@@ -311,9 +312,6 @@ class AttributeMutator {
     MemberDescrMutator member_descr_;
     DescrOrClassVarMutator descr_or_cvar_;
     GetAttrMutator getattr_;
-#if PY_VERSION_HEX < 0x030C0000
-    TypeRecvMutator type_recv_;
-#endif
   };
 };
 
@@ -329,8 +327,55 @@ class AttributeCache {
   }
 
 #if PY_VERSION_HEX < 0x030C0000
+  // Type-receiver entries.  The
+  // general fill refuses class receivers (metatype getattro), so class
+  // constant reads (deltablue Strength.FORWARD: 12.9M futile fill calls
+  // per run) re-ran the full lookup every time.  Two forms: kValue keys
+  // on the receiver type (identity-stable class vars / functions /
+  // wrapper+method descriptors, staticmethod unwrap), kMetaDescr keys on
+  // the metatype (data descriptors like type.__name__, shared by every
+  // class of that metatype).  Both pull-validate tp_version_tag before
+  // the borrowed payload is touched; entries round-robin to absorb
+  // polymorphic receivers; lazily allocated so non-type sites pay
+  // nothing.
+  struct TypeRecvEntry {
+    PyTypeObject* recv{nullptr}; // pointer compare only; version-gated
+    uint32_t recv_version{0};
+    uint32_t meta_version{0};
+    // kDescrGet: a descriptor found on the receiver class whose class-level
+    // access is a fresh object each time (classmethod, classmethod_descriptor,
+    // custom __get__): the hit runs type_getattro's own step,
+    // tp_descr_get(descr, NULL, receiver), with the descriptor pinned by the
+    // receiver version and the metatype version proving no data descriptor
+    // shadows it.
+    enum class Form : uint8_t {
+      kNone,
+      kValue,
+      kMetaDescr,
+      kDescrGet
+    } form{Form::kNone};
+    PyObject* payload{nullptr}; // borrowed
+    // The payload's own type version: a value whose type later grows
+    // __get__ becomes a descriptor, a descriptor whose type loses __get__
+    // stops being one; neither touches the receiver or metatype version.
+    uint32_t payload_version{0};
+  };
+  struct TypeRecvEntries {
+    static constexpr size_t kNumEntries = 8;
+    TypeRecvEntry entries[kNumEntries];
+    size_t rr{0};
+  };
+
   PyObject* typeRecvGetAttr(PyObject* obj, PyObject* name);
   void typeRecvTryFill(PyObject* obj, PyObject* name, PyObject* result);
+
+  std::unique_ptr<TypeRecvEntries> type_recv_;
+  // bound-method receivers.  method_getattro delegates any
+  // name the method type itself lacks to im_func; that verdict is fixed
+  // for the static method type, so it is taken once per site and the
+  // function is then served by the ordinary entries.  0 unknown, 1
+  // delegates, 2 the method type has the name.
+  uint8_t method_delegate_{0};
 #endif
 
  protected:
@@ -716,6 +761,18 @@ struct AttrCacheStats311 {
 };
 
 AttrCacheStats311& attrCacheStats311();
+
+// Replace an existing value of a materialized instance dict in place: the
+// new value is owned before the old one is released (storing the same object
+// back is safe), the dict's PEP 509 version advances exactly as stock's
+// STORE_ATTR_WITH_HINT / insertdict do, and for a combined table the
+// value-only transition is recorded so a negative method-cache anchor taken
+// at the previous version stays valid (no key was added or removed).
+void replaceMaterializedDictValue311(
+    PyDictObject* dict,
+    PyObject** slot,
+    PyObject* value,
+    bool combined);
 void resetDictValueTransition311();
 #endif
 

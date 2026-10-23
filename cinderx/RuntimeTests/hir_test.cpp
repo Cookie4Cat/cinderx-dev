@@ -2273,9 +2273,6 @@ def test(seq):
 }
 
 TEST_F(HIR_BUILD_DEFERRED_TEST, SlotSpecializedLoadAndStoreUseFieldOps) {
-#if PY_VERSION_HEX < 0x030C0000
-  GTEST_SKIP() << "CPython 3.11 slot fast paths remain disabled until MR-09";
-#endif
   const char* src = R"(
 class SlotValue:
     __slots__ = ("value",)
@@ -2313,7 +2310,16 @@ def test(obj):
   EXPECT_EQ(countOpcode(*irfunc, Opcode::kStoreAttrCached), 0) << hir;
   EXPECT_GE(countOpcode(*irfunc, Opcode::kLoadField), 3) << hir;
   EXPECT_GE(countOpcode(*irfunc, Opcode::kStoreField), 1) << hir;
+#if PY_VERSION_HEX < 0x030C0000
+  // 3.11: the slot is read behind the receiver's type-version compare and
+  // an unset slot (or a receiver of another version) takes the generic
+  // LoadAttr arm, so no CheckField is emitted; the store writes the slot
+  // and then releases the old value and the receiver, in that order.
+  EXPECT_EQ(countOpcode(*irfunc, Opcode::kCheckField), 0) << hir;
+  EXPECT_GE(countOpcode(*irfunc, Opcode::kUseObj), 2) << hir;
+#else
   EXPECT_GE(countOpcode(*irfunc, Opcode::kCheckField), 2) << hir;
+#endif
   EXPECT_GE(countOpcode(*irfunc, Opcode::kPrimitiveCompare), 2) << hir;
   EXPECT_GE(countOpcode(*irfunc, Opcode::kCondBranch), 2) << hir;
   EXPECT_GE(countOpcode(*irfunc, Opcode::kGuard), 1) << hir;
@@ -2321,7 +2327,8 @@ def test(obj):
 
 TEST_F(HIR_BUILD_DEFERRED_TEST, SlotSpecializedLoadMethodUsesFieldOps) {
 #if PY_VERSION_HEX < 0x030C0000
-  GTEST_SKIP() << "CPython 3.11 slot fast paths remain disabled until MR-09";
+  GTEST_SKIP() << "CPython 3.11 compiles obj.fn() to LOAD_METHOD, which has "
+                  "no slot specialisation";
 #endif
   const char* src = R"(
 def target():
@@ -2366,9 +2373,6 @@ def test(obj):
 TEST_F(
     HIR_BUILD_DEFERRED_TEST,
     SlotSpecializedLoadAttrUnsetSlotUsesCheckField) {
-#if PY_VERSION_HEX < 0x030C0000
-  GTEST_SKIP() << "CPython 3.11 slot fast paths remain disabled until MR-09";
-#endif
   const char* src = R"(
 class SlotValue:
     __slots__ = ("value",)
@@ -2398,19 +2402,29 @@ def test(obj):
   ASSERT_NE(irfunc, nullptr);
 
   std::string hir = fullPrinter().ToString(*irfunc);
+#if PY_VERSION_HEX < 0x030C0000
+  // 3.11: an unset slot and a receiver of another type version each take
+  // a generic LoadAttr arm (the former raises the AttributeError the
+  // interpreter raises), so there are two and no CheckField.
+  EXPECT_EQ(countOpcode(*irfunc, Opcode::kLoadAttr), 2) << hir;
+  EXPECT_EQ(countOpcode(*irfunc, Opcode::kCheckField), 0) << hir;
+  EXPECT_GE(countOpcode(*irfunc, Opcode::kCondBranch), 2) << hir;
+#else
   EXPECT_EQ(countOpcode(*irfunc, Opcode::kLoadAttr), 1) << hir;
+  EXPECT_GE(countOpcode(*irfunc, Opcode::kCheckField), 1) << hir;
+  EXPECT_GE(countOpcode(*irfunc, Opcode::kCondBranch), 1) << hir;
+#endif
   EXPECT_EQ(countOpcode(*irfunc, Opcode::kLoadAttrCached), 0) << hir;
   EXPECT_GE(countOpcode(*irfunc, Opcode::kLoadField), 2) << hir;
-  EXPECT_GE(countOpcode(*irfunc, Opcode::kCheckField), 1) << hir;
   EXPECT_GE(countOpcode(*irfunc, Opcode::kPrimitiveCompare), 1) << hir;
-  EXPECT_GE(countOpcode(*irfunc, Opcode::kCondBranch), 1) << hir;
 }
 
 TEST_F(
     HIR_BUILD_DEFERRED_TEST,
     SlotSpecializedLoadAttrUnsetSlotWithGetattrFallsBack) {
 #if PY_VERSION_HEX < 0x030C0000
-  GTEST_SKIP() << "CPython 3.11 slot fast paths remain disabled until MR-09";
+  GTEST_SKIP() << "CPython 3.11 does not specialise LOAD_ATTR on a type with "
+                  "__getattr__ (tp_getattro is not the generic one)";
 #endif
   const char* src = R"(
 class SlotValue:
@@ -2455,6 +2469,60 @@ def test(obj):
       1)
       << hir;
 }
+
+#if PY_VERSION_HEX < 0x030C0000
+// LOAD_ATTR_INSTANCE_VALUE / STORE_ATTR_INSTANCE_VALUE: a managed-dict
+// instance still in values form reads and writes its values slot behind
+// the receiver's type-version compare.  A receiver of another version (or
+// one whose dict was materialised) takes the generic LoadAttr / StoreAttr
+// arm, a store into an unset slot takes the insertion helper (CallStatic),
+// and the inline store releases the old value and the receiver after the
+// write.
+TEST_F(
+    HIR_BUILD_DEFERRED_TEST,
+    InstanceValueSpecializedLoadAndStoreUseFieldOps311) {
+  const char* src = R"(
+class Point:
+    def __init__(self):
+        self.value = 0
+
+obj = Point()
+
+def test(obj):
+    obj.value = obj.value + 1
+    return obj.value
+)";
+
+  Ref<PyFunctionObject> func(compileAndGet(src, "test"));
+  ASSERT_NE(func.get(), nullptr);
+  Ref<> obj(getGlobal("obj"));
+  ASSERT_NE(obj.get(), nullptr);
+
+  for (int i = 0; i < 100; i++) {
+    auto result = Ref<>::steal(PyObject_CallFunctionObjArgs(
+        reinterpret_cast<PyObject*>(func.get()), obj.get(), nullptr));
+    ASSERT_NE(result.get(), nullptr);
+    ASSERT_TRUE(isIntEquals(result, i + 1));
+  }
+  ASSERT_TRUE(hasSpecializedOpcode(func, LOAD_ATTR_INSTANCE_VALUE));
+  ASSERT_TRUE(hasSpecializedOpcode(func, STORE_ATTR_INSTANCE_VALUE));
+
+  std::unique_ptr<Function> irfunc(buildHIR(func));
+  ASSERT_NE(irfunc, nullptr);
+
+  std::string hir = fullPrinter().ToString(*irfunc);
+  EXPECT_EQ(countOpcode(*irfunc, Opcode::kLoadAttr), 2) << hir;
+  EXPECT_EQ(countOpcode(*irfunc, Opcode::kStoreAttr), 1) << hir;
+  EXPECT_EQ(countOpcode(*irfunc, Opcode::kLoadAttrCached), 0) << hir;
+  EXPECT_EQ(countOpcode(*irfunc, Opcode::kStoreAttrCached), 0) << hir;
+  EXPECT_GE(countOpcode(*irfunc, Opcode::kStoreField), 1) << hir;
+  EXPECT_GE(countOpcode(*irfunc, Opcode::kCallStatic), 1) << hir;
+  EXPECT_GE(countOpcode(*irfunc, Opcode::kLoadField), 3) << hir;
+  EXPECT_GE(countOpcode(*irfunc, Opcode::kPrimitiveCompare), 3) << hir;
+  EXPECT_GE(countOpcode(*irfunc, Opcode::kCondBranch), 4) << hir;
+  EXPECT_GE(countOpcode(*irfunc, Opcode::kUseObj), 3) << hir;
+}
+#endif
 
 #if PY_VERSION_HEX >= 0x030E0000
 TEST_F(HIRBuildTest, SlotSpecializedLoadAttrWithHeaderOffsetFallsBack) {

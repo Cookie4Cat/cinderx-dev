@@ -2149,6 +2149,80 @@ Register* simplifyLoadAttrTypeReceiver(Env& env, const LoadAttr* load_attr) {
   }
 
 #if PY_VERSION_HEX < 0x030C0000
+  // a receiver pinned to one specific class (GuardIs on a
+  // class-valued global) lets the load resolve at compile time.  The three
+  // facts the runtime cache re-proves per hit are pinned here instead:
+  // the owner's MRO answer by the owner's version tag (guard), the
+  // metatype by requiring exactly `type` with no attribute of this name
+  // (static, `type` is immutable), and the value's non-descriptor nature
+  // by requiring no tp_descr_get -- with a version guard on the value's
+  // type when that type is a heap type that could later grow __get__.
+  if (receiver->type().hasObjectSpec()) {
+    BorrowedRef<PyTypeObject> cls{receiver->type().objectSpec()};
+    BorrowedRef<PyUnicodeObject> attr_name{load_attr->name()};
+    BorrowedRef<> descr;
+    if (cls != nullptr && PyType_Check(cls) &&
+        Py_TYPE(cls.get()) == &PyType_Type && Ci_Type_HasValidVersionTag(cls) &&
+        PyUnicode_CheckExact(attr_name)) {
+      // _PyType_Lookup fills the shared method cache; compile workers may
+      // run in parallel, so the lookups take the serialization lock.
+      ThreadedCompileSerialize guard;
+      if (_PyType_Lookup(&PyType_Type, attr_name) == nullptr) {
+        descr = _PyType_Lookup(cls, attr_name);
+      }
+    }
+    if (cls != nullptr) {
+      if (descr != nullptr && Py_TYPE(descr.get())->tp_descr_get == nullptr) {
+        env.emit<UseType>(receiver, TType);
+        Register* owner = env.emit<LoadConst>(
+            Type::fromObject(env.func.env.addReference(BorrowedRef<>{cls})));
+        Register* version = env.emit<LoadField>(
+            owner,
+            "tp_version_tag",
+            offsetof(PyTypeObject, tp_version_tag),
+            TCUInt32);
+        Register* expected =
+            env.emit<LoadConst>(Type::fromCUInt(cls->tp_version_tag, TCUInt32));
+        Register* same = env.emit<PrimitiveCompare>(
+            PrimitiveCompareOp::kEqual, version, expected);
+        env.emit<Guard>(same);
+        BorrowedRef<PyTypeObject> value_type{Py_TYPE(descr.get())};
+        if (PyType_HasFeature(value_type, Py_TPFLAGS_HEAPTYPE) &&
+            !Ci_Type_HasValidVersionTag(value_type)) {
+          return nullptr;
+        }
+        // The payload's live type must still be the captured one: a
+        // __class__ assignment (heap types, module subtypes) swaps in a type
+        // that may carry __get__ without touching either version tag.
+        Register* payload = env.emit<LoadConst>(
+            Type::fromObject(env.func.env.addReference(descr)));
+        Register* live_type = env.emit<LoadField>(
+            payload, "ob_type", offsetof(PyObject, ob_type), TType);
+        Register* vt = env.emit<LoadConst>(Type::fromObject(
+            env.func.env.addReference(BorrowedRef<>{value_type})));
+        Register* same_type = env.emit<PrimitiveCompare>(
+            PrimitiveCompareOp::kEqual, live_type, vt);
+        env.emit<Guard>(same_type);
+        if (PyType_HasFeature(value_type, Py_TPFLAGS_HEAPTYPE)) {
+          Register* vt_version = env.emit<LoadField>(
+              vt,
+              "tp_version_tag",
+              offsetof(PyTypeObject, tp_version_tag),
+              TCUInt32);
+          Register* vt_expected = env.emit<LoadConst>(
+              Type::fromCUInt(value_type->tp_version_tag, TCUInt32));
+          Register* vt_same = env.emit<PrimitiveCompare>(
+              PrimitiveCompareOp::kEqual, vt_version, vt_expected);
+          env.emit<Guard>(vt_same);
+        }
+        return payload;
+      }
+    }
+    // Pinned but not resolvable here (descriptor-valued attribute, metatype
+    // attribute, missing name): keep the generic polymorphic cache the
+    // unpinned site would have used rather than the type-receiver helper.
+    return nullptr;
+  }
   // 3.11 has no type watcher, so the inline "cached type pointer matches"
   // fast path below would serve stale answers: the pointer still matches
   // after the class, its metaclass or the value's type is mutated.  The

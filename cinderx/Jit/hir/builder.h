@@ -214,11 +214,6 @@ class HIRBuilder {
       Register* receiver,
       uint32_t type_version,
       const char* descr);
-  bool tryEmitLoadAttrInstanceValue311(
-      TranslationContext& tc,
-      const jit::BytecodeInstruction& bc_instr,
-      Register* receiver,
-      int name_idx);
   // CPython 3.11 generator-family frames keep their localsplus current at
   // every store so a suspended generator's gi_frame.f_locals observes the
   // live values (normal frames rebuild their locals from deopt metadata).
@@ -313,6 +308,7 @@ class HIRBuilder {
       TranslationContext& tc,
       const jit::BytecodeInstruction& bc_instr);
   void emitStoreAttr(
+      CFG& cfg,
       TranslationContext& tc,
       const jit::BytecodeInstruction& bc_instr);
   void emitStoreFast(
