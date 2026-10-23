@@ -841,10 +841,27 @@ print("neutral upgrade ok")
 # refills the entry, a callback that empties the dict drops the defaults.
 # The function whose code the memo ends up owning is created by exec: a
 # code object defined at module level is a constant of the module's code
-# and never dies.
+# and never dies.  Slots are keyed by code object, so the displacing
+# function's code is placed on the retired code's slot by construction.
 KWDEFAULTS_RETIRE_PROBE = PREAMBLE + """
 import gc
 import weakref
+
+# The memo chooses its slot by code object, so displacing an entry (and
+# releasing the code it held) takes another code object on the same slot:
+# the displacing function is defined by exec until its code lands there.
+def memo_slot(code):
+    return (id(code) >> 4) & 255
+
+_keep = []
+def colliding(target_code, src, **env):
+    for _ in range(20000):
+        ns = dict(env, __builtins__=__builtins__)
+        exec(src, ns)
+        _keep.append(ns)
+        if memo_slot(ns["g"].__code__) == memo_slot(target_code):
+            return ns
+    raise AssertionError("no code object shares the memo slot")
 
 class V:
     def __init__(self, n):
@@ -866,22 +883,22 @@ D = {"a": 11, "b": 22}
 ns = {"D": D, "__builtins__": __builtins__}
 exec("def f(*, a): return a\\ndef callf(): return f()\\nf.__kwdefaults__ = D", ns)
 
-def g(*, a):
-    return a
+gns = colliding(
+    ns["f"].__code__,
+    "def g(*, a): return a\\ndef callg(): return g()\\ng.__kwdefaults__ = D",
+    D=D,
+)
+callg = gns["callg"]
 
 def h(*, b):
     return b
 
-g.__kwdefaults__ = D
 h.__kwdefaults__ = D
-
-def callg():
-    return g()
 
 def callh():
     return h()
 
-for fn in (ns["f"], ns["callf"], g, h, callg, callh):
+for fn in (ns["f"], ns["callf"], gns["g"], callg, h, callh):
     assert cinderjit.force_compile(fn) is True
 assert ns["callf"]() == 11  # the memo holds the code of f
 state = {"fired": 0}
@@ -902,15 +919,14 @@ E = {"a": V(11)}
 ns = {"D": E, "__builtins__": __builtins__}
 exec("def f(*, a): return a.n\\ndef callf(): return f()\\nf.__kwdefaults__ = D", ns)
 
-def k(*, a):
-    return a.n
+kns = colliding(
+    ns["f"].__code__,
+    "def g(*, a): return a.n\\ndef callg(): return g()\\ng.__kwdefaults__ = D",
+    D=E,
+)
+callk = kns["callg"]
 
-k.__kwdefaults__ = E
-
-def callk():
-    return k()
-
-for fn in (ns["f"], ns["callf"], k, callk):
+for fn in (ns["f"], ns["callf"], kns["g"], callk):
     assert cinderjit.force_compile(fn) is True
 assert ns["callf"]() == 11
 state = {"fired": 0}
@@ -939,6 +955,22 @@ KWDEFAULTS_RECODE_PROBE = PREAMBLE + """
 import gc
 import weakref
 
+# The memo chooses its slot by code object, so displacing an entry (and
+# releasing the code it held) takes another code object on the same slot:
+# the displacing function is defined by exec until its code lands there.
+def memo_slot(code):
+    return (id(code) >> 4) & 255
+
+_keep = []
+def colliding(target_code, src, **env):
+    for _ in range(20000):
+        ns = dict(env, __builtins__=__builtins__)
+        exec(src, ns)
+        _keep.append(ns)
+        if memo_slot(ns["g"].__code__) == memo_slot(target_code):
+            return ns
+    raise AssertionError("no code object shares the memo slot")
+
 def noop():
     pass
 
@@ -951,13 +983,15 @@ exec(
     ns,
 )
 
-def g(*, missing):
-    return missing
-
-g.__kwdefaults__ = D  # non-empty, but no default for `missing`
-
-def callg():
-    return g()
+# g's dict is non-empty, but holds no default for `missing`.
+gns = colliding(
+    ns["f"].__code__,
+    "def g(*, missing): return missing\\ndef callg(): return g()\\n"
+    "g.__kwdefaults__ = D",
+    D=D,
+)
+g = gns["g"]
+callg = gns["callg"]
 
 for fn in (ns["f"], ns["callf"], g, callg):
     assert cinderjit.force_compile(fn) is True

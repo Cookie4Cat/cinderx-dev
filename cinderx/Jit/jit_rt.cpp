@@ -171,9 +171,14 @@ const PyObject* const* kwOnlyDefaults311(
   if (!hasOnlyUnicodeKeys(kwdefs)) {
     return nullptr;
   }
+  // Slots are chosen by the code object, not the defaults dict: a function
+  // re-created on every call brings a fresh dict (and address) each time,
+  // and indexing by dict would spread one code's entries over the table,
+  // each holding a reference to the code until some later dict happens to
+  // land on that slot.  Per code, the entry is rewritten in place and the
+  // table reaches a steady state after one fill, like the type cache.
   KwDefaultsEntry311& e = s_kwdefaults_311
-      [(reinterpret_cast<uintptr_t>(kwdefs) >> 4) &
-       (kKwDefaultsEntries311 - 1)];
+      [(reinterpret_cast<uintptr_t>(co) >> 4) & (kKwDefaultsEntries311 - 1)];
   const uint64_t version =
       reinterpret_cast<PyDictObject*>(kwdefs)->ma_version_tag;
   if (e.kwdefs == kwdefs && e.code == co && e.version == version) {
