@@ -23,6 +23,7 @@
 
 #include <algorithm>
 #include <memory>
+#include <string>
 
 namespace jit {
 
@@ -1548,11 +1549,41 @@ struct MegaEntry311 {
   PyObject* name{nullptr};
 };
 
+// Slots compare names by identity, so a slot's name object must stay alive
+// for as long as the slot can be read, or its address could be reused by
+// another string the comparison would then accept.  Holding a reference per
+// slot made the held count grow with every newly occupied (type, name) slot:
+// bounded by the tables, but regrtest's reference-leak hunt, which empties
+// CPython's own type attribute cache between repetitions and cannot reach
+// these tables, reads that growth as a leak.  Every distinct name is held
+// once instead, in a registry keyed by content, and the slots borrow the
+// registered object.  A name that dies (code built by eval) and comes back
+// as a new object with the same content maps to the registered one; the
+// identity compare then misses for it, which only costs the slow path.
+UnorderedMap<std::string, PyObject*> s_mega_names_311;
+
+PyObject* megaRegisteredName311(PyObject* name) {
+  Py_ssize_t size = 0;
+  const char* utf8 = PyUnicode_AsUTF8AndSize(name, &size);
+  if (utf8 == nullptr) {
+    PyErr_Clear();
+    return nullptr;
+  }
+  try {
+    auto [it, inserted] = s_mega_names_311.try_emplace(
+        std::string(utf8, static_cast<size_t>(size)), nullptr);
+    if (inserted) {
+      Py_INCREF(name);
+      it->second = name;
+    }
+    return it->second;
+  } catch (const std::bad_alloc&) {
+    return nullptr;
+  }
+}
+
 inline void megaSetName311(PyObject*& slot, PyObject* name) {
-  Py_XINCREF(name);
-  PyObject* old = slot;
-  slot = name;
-  Py_XDECREF(old);
+  slot = name == nullptr ? nullptr : megaRegisteredName311(name);
 }
 constexpr size_t kMegaEntries311 = 2048;
 MegaEntry311 s_mega_load_311[kMegaEntries311];
@@ -1593,7 +1624,7 @@ megaLookup311(bool is_set, PyTypeObject* tp, PyObject* name) {
 // global (type, name) table of the same Entry shape; a site miss that finds
 // its type there copies the entry into a round-robin site slot and looks up
 // again, so the inline peek path serves the type until it is evicted.
-// The name is held (see MegaEntry311).
+// The name is registered (see megaSetName311).
 struct MegaMethodEntry311 {
   LoadMethodCache::Entry entry;
   PyObject* name{nullptr};
@@ -2951,9 +2982,8 @@ const CacheStats* LoadMethodCache::cacheStats() {
   return cache_stats_.get();
 }
 
-LoadMethodResult __attribute__((noinline)) LoadMethodCache::lookupSlowPath(
-    BorrowedRef<> obj,
-    BorrowedRef<> name) {
+LoadMethodResult __attribute__((noinline))
+LoadMethodCache::lookupSlowPath(BorrowedRef<> obj, BorrowedRef<> name) {
   PyTypeObject* tp = Py_TYPE(obj);
   PyObject* descr;
   descrgetfunc f = nullptr;

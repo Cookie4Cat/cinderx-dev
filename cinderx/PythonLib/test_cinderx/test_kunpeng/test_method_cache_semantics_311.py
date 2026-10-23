@@ -479,6 +479,62 @@ print("metatype priority ok")
 """
 
 
+# The process-level overflow tables (attribute load / store, method) hold the
+# names of their entries.  Types created and dropped in a loop pass through
+# compiled sites, fill overflow slots and die; once they are gone the names
+# must not stay held, or every program that keeps creating classes (the
+# reference-leak hunt of regrtest among them) reads as leaking.
+OVERFLOW_RELEASE_PROBE = PREAMBLE + """
+import gc
+
+NAME_M = "zz_overflow_method"
+NAME_A = "zz_overflow_attr"
+
+def call_method(o):
+    return o.zz_overflow_method()
+
+def load_attr(o):
+    return o.zz_overflow_attr
+
+def store_attr(o, v):
+    o.zz_overflow_attr = v
+
+def fresh_type(i):
+    return type("T%d" % i, (object,), {NAME_M: lambda self: 1, NAME_A: i})
+
+for f in (call_method, load_attr, store_attr):
+    assert cinderjit.force_compile(f) is True
+
+# Warm every site past its four per-site slots once, so the measured round
+# starts with the overflow tables already in use.
+for i in range(8):
+    o = fresh_type(i)()
+    call_method(o); load_attr(o); store_attr(o, i)
+del o
+gc.collect()
+# CPython's own type attribute cache also holds one name per type version
+# until sys._clear_type_cache() (regrtest's leak hunt clears it the same
+# way); clearing it isolates the overflow tables' share.
+sys._clear_type_cache()
+base_m = sys.getrefcount(NAME_M)
+base_a = sys.getrefcount(NAME_A)
+for i in range(100, 160):
+    o = fresh_type(i)()
+    call_method(o); load_attr(o); store_attr(o, i)
+del o
+gc.collect()
+gc.collect()
+sys._clear_type_cache()
+extra = (sys.getrefcount(NAME_M) - base_m, sys.getrefcount(NAME_A) - base_a)
+assert extra == (0, 0), extra
+# A live type keeps its entries: the next call is still served.
+keep = fresh_type(999)()
+for _ in range(3):
+    assert call_method(keep) == 1 and load_attr(keep) == 999
+print("overflow names released ok")
+"""
+
+
 @unittest.skipUnless(
     sys.version_info[:2] == (3, 11), "CPython 3.11 method caches"
 )
@@ -539,6 +595,9 @@ class MethodCacheSemantics311Test(unittest.TestCase):
 
     def test_metatype_data_descriptor_wins_without_owner_probe(self):
         self._run(METATYPE_PRIORITY_PROBE, "metatype priority ok")
+
+    def test_overflow_tables_release_names_of_dead_types(self):
+        self._run(OVERFLOW_RELEASE_PROBE, "overflow names released ok")
 
     def test_class_receiver_cache_under_statistics(self):
         self._run(
