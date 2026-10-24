@@ -308,16 +308,27 @@ TEST_F(LIRGeneratorTest, Python311VectorCallSelectsFastAndSlowTargets) {
 )";
   auto exact = translate311HIR(exact_source, getContext());
   ASSERT_NE(exact.lir, nullptr);
-  const Instruction* exact_call =
-      findOpcode(*exact.lir, Instruction::kVectorCall);
-  ASSERT_NE(exact_call, nullptr) << *exact.lir;
   EXPECT_FALSE(hasImmediate(
       *exact.lir, reinterpret_cast<uint64_t>(&g_JITRT_Vectorcall311_slot)))
       << *exact.lir;
+#if defined(CINDER_AARCH64)
+  // A callee known to be a function takes the call-site entry cache as well:
+  // a fresh function object (one this code just made) still carries the
+  // interpreter's vectorcall, and only the cache's miss arm dispatches it by
+  // code into its artifact; the raw vectorcall-slot call would interpret it.
+  EXPECT_NE(findOpcode(*exact.lir, Instruction::kCallSiteVectorCall), nullptr)
+      << *exact.lir;
+  EXPECT_EQ(findOpcode(*exact.lir, Instruction::kVectorCall), nullptr)
+      << *exact.lir;
+#else
+  const Instruction* exact_call =
+      findOpcode(*exact.lir, Instruction::kVectorCall);
+  ASSERT_NE(exact_call, nullptr) << *exact.lir;
   ASSERT_GT(exact_call->getNumInputs(), 0u);
   EXPECT_TRUE(exact_call->getInput(exact_call->getNumInputs() - 1)->isImm());
   EXPECT_EQ(
       exact_call->getInput(exact_call->getNumInputs() - 1)->getConstant(), 0);
+#endif
 
   const char* generic_source = R"(fun generic_call {
   bb 0 {

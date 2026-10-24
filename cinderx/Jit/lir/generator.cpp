@@ -4244,13 +4244,7 @@ LIRGenerator::TranslatedBlock LIRGenerator::TranslateOneBasicBlock(
         Instruction* target = nullptr;
         constexpr int32_t kVectorcallOffset =
             static_cast<int32_t>(offsetof(PyFunctionObject, vectorcall));
-        if (hir_instr.func()->type() <= TFunc) {
-          target = bbb.appendInstr(
-              Instruction::kMove,
-              OutVReg{OperandBase::k64bit},
-              Ind{callable, kVectorcallOffset});
-        } else if (
-            env_->ctx != nullptr && !(hir_instr.flags() & CallFlags::KwArgs)) {
+        if (env_->ctx != nullptr && !(hir_instr.flags() & CallFlags::KwArgs)) {
           // Call-site entry cache (kwnames-free sites only; x3 is zeroed by
           // the argument moves and the miss arm reuses that slot for the
           // cache).  The selection / load chain is replaced by the dedicated
@@ -4260,7 +4254,11 @@ LIRGenerator::TranslatedBlock LIRGenerator::TranslateOneBasicBlock(
           // fill), a function-shaped miss within budget filling through
           // JITRT_CallSiteEntryMiss311, and non-functions dispatched by the
           // per-function stub.  Operand layout matches the generic
-          // VectorCall.
+          // VectorCall.  A callee known to be a function takes this arm too:
+          // a fresh function object (one this code just made) still carries
+          // the interpreter's vectorcall, and only the miss arm's by-code
+          // dispatch runs it in its code's artifact -- a raw vectorcall-slot
+          // call would interpret it, as the evaluator's own CALL would not.
           auto* cache = env_->ctx->allocateCallSiteEntryCache();
           cache->runtime = env_->code_rt;
           Instruction* instr = bbb.appendInstr(
@@ -4273,6 +4271,11 @@ LIRGenerator::TranslatedBlock LIRGenerator::TranslateOneBasicBlock(
           }
           instr->addOperands(Imm{0});
           break;
+        } else if (hir_instr.func()->type() <= TFunc) {
+          target = bbb.appendInstr(
+              Instruction::kMove,
+              OutVReg{OperandBase::k64bit},
+              Ind{callable, kVectorcallOffset});
         } else {
           // Select an address before loading the target. This avoids reading
           // PyFunctionObject::vectorcall from a non-function object.
