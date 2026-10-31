@@ -466,26 +466,134 @@ ATTR_PATH_MODE=cinderx "$PY" -c 'import _cinderx_auto; print(_cinderx_auto._veri
 
 ---
 
-# 附录A：需固定的运行参数
+# 附录A：模型运行配置记录
 
-只列启动时可通过命令行、环境变量或配置文件调整的参数。模型固定结构沿用同一版本的RecSDK，不再展开源码中的层宽、词表和字段定义。
+模型采用 RecSDK `develop_torch_benchmark`，提交为 `566af0c556da3430598f09a273e6298804a22c69`。HLLM、GR依赖的外部源码与模型配置随配套交付包固定。本附录记录十个模型的运行配置，具体启动与验收操作见交付包。
 
-## A.1 通用设置
+## A.1 十模型通用配置
 
-执行模式和对照方式按3.6，Batch按2.2。两组固定相同输入、权重、设备及随机种子，不启用动态批量或随机输入长度。
-
-- Batch接口：普通RecSDK入口使用`batch_size/test_batch_size`；HLLM使用`eval_batch_size`；GR使用`BATCH_SIZE`。
-- 精度：DLRM、AutoInt、MMOE、ESMM、ETA、DIEN、SASRec、DCNv2使用FP32、HF32开启；HLLM采用BF16 mixed；GR保留FP32 Embedding与BF16主体。
-- 源码及模型配置文件使用同一固定版本；实际输入shape、dtype和资产路径在运行时记录。
-
-## A.2 模型特有运行参数
-
-只列需要单独指定的参数；其余模型及参数沿用选定源码和模型配置，不重复列出Batch或固定网络结构。
-
-| 模型 | 本次设置 |
+| 项目 | 设置 |
 |---|---|
-| DLRM | `embedding_size=8` |
-| AutoInt | `embedding_size=128` |
-| DIEN、SASRec | `embedding_size=32` |
-| HLLM | 历史长度10，文本长度上限256，启用商品特征缓存 |
-| GR 2B | 选择2B配置，序列长度2048，候选数100，关闭MoE/FFN/RAB |
+| 环境 | Linux ARM64＋Ascend NPU；CPython 3.11.6（PGO＋LTO） |
+| 软件栈 | Torch 2.10.0+cpu、torch-npu 2.10.0.post4、CANN 9.1.0 |
+| 执行模式 | eval/no_grad、纯 eager；compile、graph、JIT关闭；前向入口按各模型配置 |
+| Batch与随机种子 | 默认Batch128、seed=2025；HLLM使用seed=2020，GR使用Batch1、seed=42；同一模型A/B使用相同权重和输入 |
+| 输入与资产 | 按模型使用原生成器或已有数据资产，固定输入规模；每次A/B重放同一份权重、输入及所需缓存 |
+| 精度 | 默认FP32权重、HF32开启；HLLM采用BF16 mixed，GR采用FP32 Embedding＋BF16主体 |
+| 其他设置 | Q1；pymalloc；GC开启；静态TLS可选配额512字节；绑核按现场site配置 |
+| 性能采集 | 三块ABBA→BAAB→ABBA；每进程50+50次预热，两段各400次CLEAN，独立Card取20个有效step |
+| 指标与质量策略 | FREE=本进程CLEAN E2E均值−独立Card；默认 `WINDOW_COMPARABLE`，逐step差异单独标注 |
+
+## A.2 各模型配置
+
+RecSDK入口路径相对于 `rec_model_zoo_pytorch/`；HLLM、GR的依赖源码入口另行注明。下文 `E` 为 Embedding 维度，`E循环`表示按字段循环采用 `[8,16,32,64,128]`；`宽度×层数`表示连续相同宽度的隐藏层。层宽按原入口处理后的实际值记录。
+
+### A.2.1 DLRM
+
+Embedding与MLP结合的特征交互模型，将稀疏特征分组聚合后与稠密特征进行点积交互。
+
+- **入口**：`feature_interaction/dlrm.py`，运行模式为`test_qps`。
+- **规模**：E8，field1000，vocab5000；每20字段一组，共50组。
+- **结构**：Dense MLP为 `1000 → 6144×6 → 3072×3 → 1536×3 → 8`；固定源码的预测头为 `Linear(166472, 1)`。
+- **交互维度**：Embedding表为`[5000,8]`；50组稀疏特征形成400维表示，与8维稠密表示拼接成408维后进行交互。
+- **输入**：`feat_ids [128,1000] int64`，ID范围`[0,32)`；`feat_vals [128,1000] FP32`，取值范围`[0,1)`。
+- **输出**：`ctr [128] FP32`。
+
+### A.2.2 AutoInt
+
+基于多层自注意力的特征交互模型，特征嵌入与数值特征相乘后，经过注意力层、展平和全连接输出。
+
+- **入口**：`feature_interaction/autoint.py`，运行模式为`test_qps`。
+- **规模**：E128，field300，vocab10000，extra_fields=0。
+- **结构**：Embedding表为`[10000,128]`；8层注意力、8头，每头维度16，保留原`batch_first=False`；输出层为`Linear(38400, 1)`。
+- **其他参数**：`attention_dim=16`、`max_seq_len=100`；实际输入宽度由`field_size=300`决定，原入口的模块级`params`保持不变。
+- **输入**：`feat_ids [128,300] int64`，ID范围`[0,32)`；`feat_vals [128,300] FP32`，取值范围`[0,1)`。
+- **输出**：`ctr [128] FP32`。
+
+### A.2.3 MMOE
+
+多任务、多专家推荐模型，任务通过各自的gate组合共享专家输出，再进入对应tower。
+
+- **入口**：`behaviour_and_multi_task/mmoe.py`，运行模式为`test_qps`。
+- **规模**：E循环，extra_fields=300，8 experts，reuse_hash=True，hash_bits=32。
+- **结构**：Expert隐藏层 `4096×3 → 2048×3 → 1024×3 → 512×3`；Tower隐藏层 `2048×3 → 1024×3 → 512×3 → 256×3`。
+- **字段定义**：使用`datasets/aliccp/spec.json`和原扩展逻辑；`field_size=39`是基础配置，最终字段数及每字段词表以展开后的spec为准。
+- **输入**：原Aliccp字典，字段及词表按`spec.json`展开；单值`[128]`、多值`[128,50]`、special`[128,38]`，均为int64。
+- **输出**：`ctr [128] FP32`、`ctcvr [128] FP32`。
+
+### A.2.4 ESMM
+
+双塔多任务推荐模型，关联点击与转化预测，返回ctr和ctcvr两路输出。
+
+- **入口**：`behaviour_and_multi_task/esmm.py`，运行模式为`test_qps`。
+- **规模**：E循环，extra_fields=200，reuse_hash=True。
+- **结构**：双tower，隐藏层为 `6144×4 → 3072×4 → 1536×4 → 768×4 → 384×4`。
+- **输入**：原Aliccp字典，字段及词表按`spec.json`展开；单值`[128]`、多值`[128,50]`、special`[128,38]`，均为int64。
+- **输出**：`ctr [128] FP32`、`ctcvr [128] FP32`。
+- **状态特性**：Embedding模块保存在普通字典中；保持原结构，字典内权重也随模型状态一起保存和回放。
+
+### A.2.5 ETA
+
+基于行为序列的推荐模型，包含hash检索、top-k筛选和候选相关注意力计算。
+
+- **入口**：`behaviour_and_multi_task/eta.py`，运行模式为`test_qps`。
+- **规模**：E循环，extra_fields=15，序列长度50，4头，topk=8，hash_bits=128，reuse_hash=True。
+- **结构**：Deep隐藏层 `12288×4 → 6144×4 → 3072×4 → [1536,1536,1596,1536] → 768×4`，保留其中的1596。
+- **输入**：原Aliccp字典，字段及词表按`spec.json`展开；单值`[128]`、多值`[128,50]`、special`[128,38]`，均为int64。
+- **输出**：`ctr [128] FP32`。
+- **状态特性**：`long_attention.reuse_hash`作为持久Tensor保存；`masks/emb_cats`由每次前向重新生成。
+
+### A.2.6 DIEN
+
+通过循环结构与注意力刻画用户兴趣演化的序列推荐模型，保留原长度50的序列处理路径。
+
+- **入口**：`behaviour_and_multi_task/dien.py`，运行模式为`test_qps`。
+- **规模**：E32，extra_fields=100，序列长度50，reuse_hash=True，hash_bits=32。
+- **结构**：DNN隐藏层 `2048×4 → 512×4 → 256×4`；Attention隐藏层 `2048×4 → 512×4 → 256×4 → 128×4 → 32×4`，使用原MyGRU前向。
+- **输入**：原Aliccp字典，字段及词表按`spec.json`展开；单值`[128]`、多值`[128,50]`、special`[128,38]`，均为int64。
+- **输出**：`ctr [128,1] FP32`。
+- **初始化**：首个前向前使用原`MyGRU.reset_parameters()`初始化相关权重，随后冻结供A/B共同使用；派生的`aux_loss`仍在前向中生成。
+
+### A.2.7 SASRec
+
+基于自注意力的序列推荐模型，对每条长度150的用户序列计算101个候选物品的得分。
+
+- **入口**：`behaviour_and_multi_task/sasrec.py`，运行模式为`test_qps`。
+- **规模**：E32，maxlen=150，16 blocks，4头，norm_first=False，dropout=0.2（eval）。
+- **词表**：`item_num`取所选`ml-1m.txt`的最大物品ID，Embedding行数为`item_num+1`；数据SHA和实际行数随运行记录。
+- **输入**：`seq/user_ids [128,150] int64`，`item_ids [128,101] int64`；原生成器ID范围`[0,3416)`。
+- **输出**：`ctr [128,101] FP32`。
+- **数据特性**：`ml-1m.txt`决定词表规模，计时输入仍由原`TestML1MHandler`随机生成；位置Embedding为`[151,32]`。
+
+### A.2.8 DCNv2
+
+交叉网络与深层网络结合的推荐模型，处理multi-hot稀疏特征与13维稠密特征。
+
+- **入口**：`feature_interaction/dcn_v2_multihot.py`，运行模式为`test_qps`，验收名称为`dcn_v2`。
+- **规模**：E循环，156个multi-hot字段，12层cross，projection=1024。
+- **结构**：Deep隐藏层 `4096×3 → 2048×3 → 1024×3 → 512×3 → 256×3`；Predict层宽 `4096×3 → 2048×3 → 1024×3 → 512×3 → 2`。
+- **输入**：`feat_ids [128,1284] int64`，ID按各字段词表取值；`feat_vals [128,13] FP32`。
+- **输出**：`ctr [128,2] FP32`。
+- **字段与状态**：26种multi-hot长度循环6次，拼接宽度为1284；156张Embedding表保留在原普通列表中，全部随模型状态保存和回放。
+
+### A.2.9 HLLM
+
+结合物品与用户侧语言模型的推荐模型，复用已有物品特征缓存，对用户历史序列进行全商品打分。
+
+- **入口**：RecSDK的`HLLM/`适配；依赖源码中调用`TrainerNPU._full_sort_batch_eval`，stage=2，经`model(..., mode="predict")`执行原预测路径。
+- **规模**：Batch128，用户历史长度10，物品文本长度上限256，seed=2020；数据配置的物品数为686624。
+- **结构与精度**：item/user LLM均为22层，hidden=2048，intermediate=5632，32个attention heads、4个KV heads，vocab=32000；采用原BF16 mixed配置，`use_ft_flash_attn=False`。
+- **资产与计时**：使用匹配的HLLM checkpoint、item/user预训练资产、数据集及item_feature缓存；权重和缓存准备在计时外完成，保留原前向内的搬运与屏蔽处理。
+- **输入**：用户物品ID与时间序列各`[128,10] int64`，附带历史及正样本索引；item_feature为`[N,2048]`，N和缓存实际dtype随所选资产记录。
+- **输出**：`scores [128,N]`及正样本索引，得分dtype沿用原混合精度路径；保留padding和历史物品位置的`-inf`屏蔽值。
+
+### A.2.10 GR 2B
+
+基于HSTU的序列推荐模型，采用直接模型eager forward场景，包含Embedding、序列处理和候选打分。
+
+- **入口**：HSTU依赖源码中的`benchmark/inference_benchmark_2b_random.py`，调用`InferenceRankingGR.forward(batch, uids)`；验收名称为`gr_2b`。
+- **规模**：Batch1，24层，hidden=4096，16头、head_dim=256，实际tokens=2048，候选数100；`full_mode=True`，MoE/FFN/RAB关闭。
+- **结构与精度**：item Embedding为`[1000000,4096] FP32`，action Embedding为`[512,4096] FP32`；HSTU及预测头为BF16，保留原类的精度转换与真实`hstu_jagged`算子。
+- **权重来源**：`USE_RANDOM_PARM=1`，seed=42，按`uniform[-0.5,0.5]`初始化；生成后冻结，供OFF/ON共同回放。
+- **输入**：原Batch/JT/KJT结构，包含974个历史item、974个action和100个候选；video_id values为`[1074] int64`，action_weights values为`[974] int64`，uids为`[1] int64`；长度与offset等元数据由原生成器产生。
+- **输出**：候选得分Tensor，shape为`[100,1]`，dtype为BF16。
