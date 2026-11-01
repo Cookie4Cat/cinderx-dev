@@ -46,3 +46,34 @@ cmake --build build/interpreter-311 --target \
 That target leaves the integration-time dependencies declared in
 `interpreter_dependencies.h` unresolved; the main build supplies them from the
 Borrow library.
+
+## Quickened-code accounting
+
+CPython 3.11 owns code-object destruction and the counter read by
+`sys._getquickenedcount()`. Neither that counter nor `_PyCode_Quicken` is
+exported by the supported stripped libpython. Incrementing a borrowed copy
+while stock `code_dealloc` decrements its own counter makes the stock count
+fall below the live population and corrupts regrtest's block accounting.
+
+`specialize_wrapper.c` therefore credits CPython's native counter through a
+fixed internal `RESUME 2; LOAD_CONST None; RETURN_VALUE` frame. The credit
+belongs to the real code being quickened. The internal code immediately returns
+to an unquickened state, so only the real code's eventual stock destruction
+balances the credit. The sys getter, its cached aliases and code destruction
+remain stock. Actual user bytecode continues in the existing evaluator.
+
+The frame cannot execute user instructions or service the eval breaker, and
+Python tracing/profile hooks are suppressed only for this internal operation.
+Its internal recursion reservation is restored before user execution resumes.
+The fixed function has an acyclic private object graph, is hidden from Python
+GC enumeration, and is owned by an interpreter-local capsule through teardown.
+The destructor restores GC tracking before handing it to stock `func_dealloc`.
+If accounting cannot obtain its state, quickening is deferred with the code
+still generic and no credit published. Pending exceptions are preserved.
+
+The pristine upstream source remains hash-locked. Its local increment is
+renamed to bounded scratch storage, not used as a second accounting stream.
+Daily now requires every original Py_DEBUG `-R 10:3` module to succeed, with no
+memory-block or quickened-counter exemption. Formal regressions cover cached
+getters, mixed evaluator warmup, cyclic/retained code, suspended generators,
+JIT retirement, tracing/profile/recursion, pending errors and allocation failure.

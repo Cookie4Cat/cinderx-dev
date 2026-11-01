@@ -6,6 +6,26 @@ This directory maintains the local gate flow for ARM64 Linux CPython 3.11 and
 3.14 CinderX JIT work. The entry point is `ci_pipeline/run_gate.py`; suite
 configuration lives in `ci_pipeline/suites/*.toml`.
 
+## CPython 3.11 strict quickening checks
+
+CinderX quickening now credits CPython's native quickened count, paired with
+stock code destruction. Cached `sys._getquickenedcount` aliases observe the
+same count. Runtime regressions cover both evaluators, retained/cyclic code,
+generators, JIT retirement, tracing, recursion and allocation failure.
+
+Daily requires the original Py_DEBUG `-R 10:3` run to succeed for every module.
+All reported reference, memory-block or FD leaks fail; there is no counter
+artifact exemption or successful-rerun substitute. The stdlib import canary
+also checks 253 organic deopts and their complete site/reason fingerprint.
+This import-coverage sweep disables startup grace while retaining the default
+bounded generic retry. Its retry opt-out regression restores the prior 189-event
+fingerprint; product scheduling tests exercise the normal startup grace.
+Compiled-execution and lifetime probes also disable startup grace to prove
+their target paths immediately; the refleak build-sanity probe compiles
+explicitly, while the original `-R` workers retain their own execution proof.
+The `-R` workers disable grace so compilation can settle during all ten warmup
+repetitions, without changing the measured repetitions or leak verdict.
+
 ## Software Dependencies
 
 Before running `run_gate.py`, prepare the target Python, build toolchain, CMake,

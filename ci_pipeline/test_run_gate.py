@@ -492,14 +492,15 @@ def test_cp311_daily_build_scripts_honor_runner_resources_and_offline_inputs():
     assert "--no-index" in refleak_script
     assert "THRESHOLD=${PYTHONJITAUTO:-20}" in refleak_script
     assert "ROUNDS=${CINDERX_REFLEAK_ROUNDS:-10:3}" in refleak_script
+    assert "CINDERX_JIT_STARTUP_GRACE_MS=0" in refleak_script
     assert 'for MODULE in "${MODULES[@]}"' in refleak_script
     assert '"$VENV_PY" -m test -R "$ROUNDS" "$MODULE"' in refleak_script
-    assert 'FAILED_MODULES+=("$MODULE")' in refleak_script
-    assert "comm -3" in refleak_script
-    assert '--original-log-dir "$MODULE_LOG_DIR"' in refleak_script
-    assert "any global SUCCESS epilogue" in refleak_script
+    assert '"$MODULE_LOG_DIR/$MODULE.exitcode"' in refleak_script
+    assert 'ci_pipeline.jit311.refleak_verdict' in refleak_script
+    assert '--logs "$MODULE_LOG_DIR" "${MODULES[@]}"' in refleak_script
+    assert 'quickened_artifact.py' not in refleak_script
     assert 'PYTHONPATH="$START${PYTHONPATH:+:$PYTHONPATH}"' not in refleak_script
-    assert refleak_script.count('PYTHONPATH="$START"') == 2
+    assert refleak_script.count('PYTHONPATH="$START"') == 1
 
 
 def test_cp311_container_scripts_resolve_bare_executable_names():

@@ -74,6 +74,9 @@ int Ci_EvalHook311_Install(void) {
   if (Ci_InitInterpreter_311() < 0) {
     return -1;
   }
+  if (Ci_InitQuickening_311() < 0) {
+    return -1;
+  }
 
   // Runtime-mode configuration shares the takeover choke point: an
   // unaccepted CINDERX_JIT_MODE refuses the installation outright, and the

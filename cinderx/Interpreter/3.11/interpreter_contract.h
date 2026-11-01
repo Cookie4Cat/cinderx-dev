@@ -13,6 +13,7 @@ extern "C" {
 
 // Must be called after Python initialization and before evaluating frames.
 int Ci_InitInterpreter_311(void);
+int Ci_InitQuickening_311(void);
 PyObject* _Py_HOT_FUNCTION Ci_EvalFrameDefault_311(
     PyThreadState* tstate,
     struct _PyInterpreterFrame* frame,

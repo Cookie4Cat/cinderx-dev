@@ -1,0 +1,216 @@
+{
+  "format": "cp311-stdlib-canary-deopts-v1",
+  "python": "3.11.6",
+  "baseline_source": "3e26a6961966feef946cfda39a784cbdcf296c08",
+  "total": 253,
+  "sites": [
+    {
+      "filename": "<frozen _collections_abc>",
+      "qualname": "Mapping.__contains__",
+      "reason": "UnhandledException",
+      "cause_offset": 4,
+      "resume_offset": 10,
+      "count": 1
+    },
+    {
+      "filename": "<frozen _collections_abc>",
+      "qualname": "Mapping.get",
+      "reason": "UnhandledException",
+      "cause_offset": 4,
+      "resume_offset": 10,
+      "count": 5
+    },
+    {
+      "filename": "<frozen _collections_abc>",
+      "qualname": "MutableMapping.clear",
+      "reason": "UnhandledException",
+      "cause_offset": 17,
+      "resume_offset": 44,
+      "count": 1
+    },
+    {
+      "filename": "<frozen genericpath>",
+      "qualname": "exists",
+      "reason": "UnhandledException",
+      "cause_offset": 16,
+      "resume_offset": 42,
+      "count": 8
+    },
+    {
+      "filename": "<frozen genericpath>",
+      "qualname": "isfile",
+      "reason": "UnhandledException",
+      "cause_offset": 16,
+      "resume_offset": 42,
+      "count": 1
+    },
+    {
+      "filename": "<frozen os>",
+      "qualname": "_Environ.__getitem__",
+      "reason": "UnhandledException",
+      "cause_offset": 28,
+      "resume_offset": 58,
+      "count": 6
+    },
+    {
+      "filename": "contextlib.py",
+      "qualname": "_GeneratorContextManager.__exit__",
+      "reason": "UnhandledException",
+      "cause_offset": 18,
+      "resume_offset": 46,
+      "count": 8
+    },
+    {
+      "filename": "contextlib.py",
+      "qualname": "_GeneratorContextManager.__exit__",
+      "reason": "UnhandledException",
+      "cause_offset": 91,
+      "resume_offset": 192,
+      "count": 1
+    },
+    {
+      "filename": "ctypes/__init__.py",
+      "qualname": "CFUNCTYPE",
+      "reason": "UnhandledException",
+      "cause_offset": 124,
+      "resume_offset": 250,
+      "count": 2
+    },
+    {
+      "filename": "enum.py",
+      "qualname": "Enum.__new__",
+      "reason": "UnhandledException",
+      "cause_offset": 28,
+      "resume_offset": 58,
+      "count": 2
+    },
+    {
+      "filename": "enum.py",
+      "qualname": "EnumType.__getattr__",
+      "reason": "Raise",
+      "cause_offset": 30,
+      "resume_offset": 60,
+      "count": 17
+    },
+    {
+      "filename": "enum.py",
+      "qualname": "EnumType.__getattr__",
+      "reason": "Raise",
+      "cause_offset": 70,
+      "resume_offset": 140,
+      "count": 7
+    },
+    {
+      "filename": "enum.py",
+      "qualname": "EnumType.__getattr__",
+      "reason": "UnhandledException",
+      "cause_offset": 39,
+      "resume_offset": 80,
+      "count": 8
+    },
+    {
+      "filename": "enum.py",
+      "qualname": "_is_single_bit",
+      "reason": "GuardFailure",
+      "cause_offset": 19,
+      "resume_offset": 38,
+      "count": 1
+    },
+    {
+      "filename": "functools.py",
+      "qualname": "update_wrapper",
+      "reason": "UnhandledException",
+      "cause_offset": 16,
+      "resume_offset": 42,
+      "count": 1
+    },
+    {
+      "filename": "pathlib.py",
+      "qualname": "PurePath.__str__",
+      "reason": "UnhandledException",
+      "cause_offset": 3,
+      "resume_offset": 8,
+      "count": 2
+    },
+    {
+      "filename": "re/__init__.py",
+      "qualname": "_compile",
+      "reason": "UnhandledException",
+      "cause_offset": 53,
+      "resume_offset": 108,
+      "count": 32
+    },
+    {
+      "filename": "re/_parser.py",
+      "qualname": "SubPattern.__getitem__",
+      "reason": "GuardFailure",
+      "cause_offset": 61,
+      "resume_offset": 122,
+      "count": 32
+    },
+    {
+      "filename": "re/_parser.py",
+      "qualname": "SubPattern.__getitem__",
+      "reason": "UnhandledException",
+      "cause_offset": 61,
+      "resume_offset": 124,
+      "count": 64
+    },
+    {
+      "filename": "re/_parser.py",
+      "qualname": "SubPattern.getwidth",
+      "reason": "GuardFailure",
+      "cause_offset": 126,
+      "resume_offset": 252,
+      "count": 3
+    },
+    {
+      "filename": "re/_parser.py",
+      "qualname": "SubPattern.getwidth",
+      "reason": "GuardFailure",
+      "cause_offset": 218,
+      "resume_offset": 436,
+      "count": 2
+    },
+    {
+      "filename": "re/_parser.py",
+      "qualname": "SubPattern.getwidth",
+      "reason": "GuardFailure",
+      "cause_offset": 283,
+      "resume_offset": 566,
+      "count": 27
+    },
+    {
+      "filename": "re/_parser.py",
+      "qualname": "Tokenizer.__next",
+      "reason": "UnhandledException",
+      "cause_offset": 16,
+      "resume_offset": 34,
+      "count": 8
+    },
+    {
+      "filename": "tomllib/_parser.py",
+      "qualname": "skip_chars",
+      "reason": "UnhandledException",
+      "cause_offset": 4,
+      "resume_offset": 10,
+      "count": 1
+    },
+    {
+      "filename": "typing.py",
+      "qualname": "_BaseGenericAlias.__getattr__",
+      "reason": "Raise",
+      "cause_offset": 83,
+      "resume_offset": 166,
+      "count": 12
+    },
+    {
+      "filename": "weakref.py",
+      "qualname": "WeakKeyDictionary.popitem",
+      "reason": "UnhandledException",
+      "cause_offset": 28,
+      "resume_offset": 66,
+      "count": 1
+    }
+  ]
+}

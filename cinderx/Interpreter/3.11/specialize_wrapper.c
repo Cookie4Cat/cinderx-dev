@@ -25,8 +25,186 @@
 #define Py_BUILD_CORE
 #define NEED_OPCODE_TABLES
 
+#include "Python.h"
+#include "internal/pycore_ceval.h"
+#include "opcode.h"
+
 #include "cinderx/Interpreter/3.11/interpreter_dependencies.h"
 #include "cinderx/Interpreter/interpreter.h"
+
+#include <string.h>
+
+// CPython owns code_dealloc and its hidden _Py_QuickenedCount. Credit that
+// SAME counter when our evaluator quickens code. A private, fixed three-word
+// frame asks the stock RESUME handler to perform the increment; its credit
+// belongs to the real code object, whose eventual stock deallocator balances
+// it. The private code is reset to unquickened before releasing any reference.
+// No sys getter or code destructor is replaced, including cached aliases.
+#define CI_QUICKEN_CLOCK_KEY "_cinderx_quickening_clock_311"
+#define CI_QUICKEN_CLOCK_CAPSULE "cinderx.quickening_clock_311"
+
+extern void Ci_PyFrame_Clear_311(_PyInterpreterFrame* frame);
+
+static void Ci_QuickeningClockFree_311(PyObject* capsule) {
+  PyObject *type, *value, *tb;
+  PyErr_Fetch(&type, &value, &tb);
+  PyObject* function = PyCapsule_GetPointer(capsule, CI_QUICKEN_CLOCK_CAPSULE);
+  // func_dealloc uses the unchecked GC unlink macro on 3.11.
+  if (function != NULL && !PyObject_GC_IsTracked(function)) {
+    PyObject_GC_Track(function);
+  }
+  Py_XDECREF(function);
+  PyErr_Clear();
+  PyErr_Restore(type, value, tb);
+}
+
+int Ci_InitQuickening_311(void) {
+  PyObject* dict = PyInterpreterState_GetDict(PyInterpreterState_Get());
+  if (dict == NULL) {
+    if (!PyErr_Occurred()) {
+      PyErr_NoMemory();
+    }
+    return -1;
+  }
+  PyObject* existing = PyDict_GetItemString(dict, CI_QUICKEN_CLOCK_KEY);
+  if (existing != NULL) {
+    if (PyCapsule_IsValid(existing, CI_QUICKEN_CLOCK_CAPSULE)) {
+      return 0;
+    }
+    PyErr_SetString(PyExc_RuntimeError, "invalid quickening accounting state");
+    return -1;
+  }
+  if (PyErr_Occurred()) {
+    return -1;
+  }
+  // RESUME 2 skips the eval breaker: this bookkeeping must not execute user
+  // callbacks, service signals or dispatch through a foreign PEP 523 hook.
+  const char instructions[] = {RESUME, 2, LOAD_CONST, 0, RETURN_VALUE, 0};
+  PyObject* bytes =
+      PyBytes_FromStringAndSize(instructions, sizeof(instructions));
+  PyObject* empty_bytes = PyBytes_FromStringAndSize("", 0);
+  PyObject* empty = PyTuple_New(0);
+  PyObject* consts = PyTuple_Pack(1, Py_None);
+  PyObject* name = PyUnicode_FromString("<cinderx quickening accounting>");
+  PyObject* globals = PyDict_New();
+  PyObject* builtins = PyDict_New();
+  PyCodeObject* code = NULL;
+  PyObject* function = NULL;
+  PyObject* capsule = NULL;
+  int result = -1;
+  if (bytes == NULL || empty_bytes == NULL || empty == NULL || consts == NULL ||
+      name == NULL || globals == NULL || builtins == NULL) {
+    goto done;
+  }
+  if (PyDict_SetItemString(globals, "__builtins__", builtins) < 0) {
+    goto done;
+  }
+  code = PyCode_NewWithPosOnlyArgs(
+      0,
+      0,
+      0,
+      0,
+      1,
+      CO_OPTIMIZED | CO_NEWLOCALS,
+      bytes,
+      consts,
+      empty,
+      empty,
+      empty,
+      empty,
+      name,
+      name,
+      name,
+      1,
+      empty_bytes,
+      empty_bytes);
+  if (code == NULL) {
+    goto done;
+  }
+  function = PyFunction_New((PyObject*)code, globals);
+  if (function == NULL) {
+    goto done;
+  }
+  // This private function has no closure/defaults and its two private
+  // dictionaries contain no back-reference. Keep it opaque to Python GC
+  // introspection; the capsule owns its acyclic graph until teardown.
+  capsule = PyCapsule_New(
+      function, CI_QUICKEN_CLOCK_CAPSULE, Ci_QuickeningClockFree_311);
+  if (capsule == NULL) {
+    goto done;
+  }
+  PyObject_GC_UnTrack(function);
+  function = NULL; // Capsule owns it through interpreter teardown.
+  result = PyDict_SetItemString(dict, CI_QUICKEN_CLOCK_KEY, capsule);
+done:
+  Py_XDECREF(capsule);
+  Py_XDECREF(function);
+  Py_XDECREF(code);
+  Py_XDECREF(builtins);
+  Py_XDECREF(globals);
+  Py_XDECREF(name);
+  Py_XDECREF(consts);
+  Py_XDECREF(empty);
+  Py_XDECREF(empty_bytes);
+  Py_XDECREF(bytes);
+  return result;
+}
+
+static int Ci_CreditQuickening_311(void) {
+  PyThreadState* tstate = PyThreadState_Get();
+  PyObject *type, *value, *tb;
+  PyErr_Fetch(&type, &value, &tb);
+  int credited = 0;
+  PyObject* dict = PyInterpreterState_GetDict(tstate->interp);
+  PyObject* capsule =
+      dict == NULL ? NULL : PyDict_GetItemString(dict, CI_QUICKEN_CLOCK_KEY);
+  if (capsule == NULL ||
+      !PyCapsule_IsValid(capsule, CI_QUICKEN_CLOCK_CAPSULE)) {
+    goto done;
+  }
+  PyFunctionObject* function =
+      PyCapsule_GetPointer(capsule, CI_QUICKEN_CLOCK_CAPSULE);
+  PyCodeObject* code = (PyCodeObject*)function->func_code;
+  // Fail closed if another native component has modified this private state.
+  if (code->co_warmup == 0 || code->co_nlocalsplus != 0 ||
+      code->co_stacksize != 1 || Py_SIZE(code) != 3 ||
+      code->co_flags != (CO_OPTIMIZED | CO_NEWLOCALS) ||
+      PyTuple_GET_SIZE(code->co_consts) != 1 ||
+      PyTuple_GET_ITEM(code->co_consts, 0) != Py_None ||
+      _Py_OPCODE(_PyCode_CODE(code)[1]) != LOAD_CONST ||
+      _Py_OPARG(_PyCode_CODE(code)[1]) != 0 ||
+      _Py_OPCODE(_PyCode_CODE(code)[2]) != RETURN_VALUE ||
+      PyDict_GET_SIZE(function->func_globals) != 1) {
+    goto done;
+  }
+  struct {
+    _PyInterpreterFrame frame;
+    PyObject* spare_stack_slot;
+  } storage;
+  memset(&storage, 0, sizeof(storage));
+  _PyFrame_InitializeSpecials(
+      &storage.frame, (PyFunctionObject*)Py_NewRef(function), NULL, 0);
+  _PyCode_CODE(code)[0] = _Py_MAKECODEUNIT(RESUME, 2);
+  code->co_warmup = -1;
+  PyThreadState_EnterTracing(tstate);
+  // This is an internal accounting operation, not another logical Python
+  // call. Restore both tracing and recursion state before touching real code.
+  tstate->recursion_remaining++;
+  PyObject* result = _PyEval_EvalFrameDefault(tstate, &storage.frame, 0);
+  tstate->recursion_remaining--;
+  PyThreadState_LeaveTracing(tstate);
+  credited = code->co_warmup == 0;
+  code->co_warmup = QUICKENING_INITIAL_WARMUP_VALUE;
+  _PyCode_CODE(code)[0] = _Py_MAKECODEUNIT(RESUME, 2);
+  Py_XDECREF(result);
+  Ci_PyFrame_Clear_311(&storage.frame);
+done:
+  // Quickening is optional. If bookkeeping cannot complete, the caller
+  // leaves the real code unquickened rather than publishing an unowned count.
+  PyErr_Clear();
+  PyErr_Restore(type, value, tb);
+  return credited;
+}
 
 #define CI_VERSION_RANGE_BASE (UINT32_C(1) << 31)
 
@@ -82,7 +260,24 @@ static uint32_t Ci_GetFunctionVersion_311(PyFunctionObject* function) {
 #define _Py_Specialize_Call Ci_SpecializeCallInner_311
 #define _Py_Specialize_BinarySubscr Ci_SpecializeBinarySubscrInner_311
 
+#define _PyCode_Quicken Ci_QuickenBytecode_311
+#define _Py_QuickenedCount ci_quickening_scratch_311
+
 #include "upstream/specialize.c"
+
+#undef _PyCode_Quicken
+#undef _Py_QuickenedCount
+
+void _PyCode_Quicken(PyCodeObject* code) {
+  if (!Ci_CreditQuickening_311()) {
+    code->co_warmup = -1;
+    return;
+  }
+  Ci_QuickenBytecode_311(code);
+  // Keep the pristine source's increment local and bounded; ownership is
+  // recorded by CPython's real counter above, never by a shadow counter.
+  ci_quickening_scratch_311 = 0;
+}
 
 #undef _Py_Specialize_Call
 #undef _Py_Specialize_BinarySubscr
