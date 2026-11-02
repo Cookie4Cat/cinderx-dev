@@ -257,6 +257,16 @@ struct Config {
   // repeatedly deopts. Enabled by default; disable with
   // CINDERX_AUTOJIT_ROI_BACKOFF=0 when isolating A/B or rolling back.
   bool roi_backoff_enabled{true};
+  // CPython 3.11 automatic compilation waits for startup to settle. Explicit
+  // compilation is unaffected; zero makes threshold-based tests deterministic.
+  size_t auto_jit_startup_grace_ms{100};
+  bool auto_jit_fork_grace{true};
+  // Permit one generic retry for an exhausted round of guard failures.
+  bool auto_jit_despecialize{true};
+  // Keep the existing diagnostic API usable unless explicitly disabled.
+  bool emit_force_deopt_checks{true};
+  // Size-scaled thresholds remain opt-in until their ROI is established.
+  bool auto_jit_size_scaling{false};
   // Canonicalize exec-generated namespace-free content-twin code objects
   // (factory helpers recreated per instantiation) onto the first-seen
   // identity at compile time, so twins attach to the existing compiled
@@ -274,6 +284,8 @@ struct Config {
   // with CINDERX_AUTOJIT_LOWROI_WARM_CALLS.
   size_t auto_classify_low_roi_warm_calls{4096};
   size_t roi_deopt_budget_base{32};
+  // Ordinary backoff rounds, clamped to the control word's capacity. On
+  // 3.11 an eligible guard-only code can get at most one extra generic retry.
   size_t roi_backoff_max_rounds{1};
   size_t roi_rewarm_factor{64};
   // Halve unfrozen deopt history once per elapsed interval. Zero disables

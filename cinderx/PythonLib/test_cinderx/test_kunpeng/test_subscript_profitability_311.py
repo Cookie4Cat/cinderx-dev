@@ -243,6 +243,9 @@ class SubscriptProfitability311Tests(unittest.TestCase):
                         timestamp += 1.0
                     return timestamp
 
+            # Admission is checked after MR8's startup grace period.
+            import time
+            time.sleep(0.2)
             for _ in range(40):
                 assert lookup({'x': 3}, 'x') == 3
                 assert numeric([1.0], 2.0) == 3.0

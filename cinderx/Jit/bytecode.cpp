@@ -168,8 +168,19 @@ int BytecodeInstruction::uninstrumentedOpcode() const {
   return uninstrument(code_, opcodeIndex().value());
 }
 
+extern "C" int Ci_SpikeDespec311_IsMarked(PyCodeObject* code);
+
 int BytecodeInstruction::specializedOpcode() const {
   int opcode = uninstrumentedOpcode();
+
+#if PY_VERSION_HEX < 0x030C0000
+  // A code granted a generic retry compiles as if never quickened; every
+  // guard-bearing specialized consumption collapses to the generic form in
+  // this single chokepoint.
+  if (Ci_SpikeDespec311_IsMarked(code_)) {
+    return unspecialize(opcode);
+  }
+#endif
 
   switch (opcode) {
     case BINARY_OP_ADD_FLOAT:

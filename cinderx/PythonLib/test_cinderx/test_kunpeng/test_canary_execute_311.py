@@ -15,6 +15,7 @@ import subprocess
 import sys
 import textwrap
 import unittest
+from unittest.mock import patch
 
 
 def _child_env(**overrides):
@@ -49,12 +50,14 @@ def _capability_clean_env():
     arm against itself.  Mirrors the prefix scrub the jit311 runners apply
     to their children.
     """
-    return {
+    env = {
         key: value
         for key, value in os.environ.items()
         if key in _OBSERVABILITY_FLAGS
         or not key.startswith(("PYTHONJIT", "CINDERX_", "PARALLEL_GC_"))
     }
+    env["CINDERX_JIT_STARTUP_GRACE_MS"] = "0"
+    return env
 
 
 # Observability knobs, not capabilities: a probe that opts back into the
@@ -98,6 +101,12 @@ CHILD = textwrap.dedent(
     "the canary execute surface targets the vendored CPython 3.11.6",
 )
 class CanaryExecute311Test(unittest.TestCase):
+    def setUp(self):
+        # Execution/deopt tests should not depend on how long startup took.
+        policy = patch.dict(os.environ, {"CINDERX_JIT_STARTUP_GRACE_MS": "0"})
+        policy.start()
+        self.addCleanup(policy.stop)
+
     def test_suspended_generator_pins_its_artifact(self):
         # A suspended JIT generator is a paused invocation: its resume jumps
         # into the artifact's machine code and its GC traversal reads the

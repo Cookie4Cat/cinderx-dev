@@ -231,6 +231,38 @@ with the target Python's static `libpython`, including Python builds that embed
 GCC LTO bytecode. If you override `CC` or `CXX`, make sure that compiler can
 link the target Python library.
 
+## CPython 3.11 Scheduling Policy
+
+These options are read during compiler initialization. `-X` takes precedence over
+the environment. They do not change the Python 3.14 defaults.
+
+| Environment variable | `-X` option | Default and behavior |
+|---|---|---|
+| `CINDERX_JIT_STARTUP_GRACE_MS` | `jit-startup-grace-ms` | `100`; delay automatic compilation during startup, in milliseconds; accepts `0..4294967295`, with `0` disabling the delay; invalid values fail initialization |
+| `CINDERX_JIT_FORK_GRACE` | `jit-fork-grace` | `1`; re-arm grace in a fork child while keeping inherited compiled artifacts usable |
+| `CINDERX_JIT_DESPECIALIZE` | `jit-despecialize` | `1`; allow at most one generic retry after a guard-only round exhausts ordinary ROI backoff; exception/mixed rounds still retire |
+| `CINDERX_JIT_FORCE_DEOPT_CHECKS` | `jit-force-deopt-checks` | `1`; preserve the `force_deopt` diagnostic API; explicitly setting `0` omits polls and makes the API reject trigger requests |
+| `CINDERX_JIT_AUTO_SIZE_SCALING` | `jit-auto-size-scaling` | `0`; opt into higher thresholds for large straight-line code, retaining loop thresholds and saturating multiplication |
+
+Grace defers automatic scheduling without spending the code object's attempt or
+budget. Explicit `force_compile` remains available. Initialization and fork reset
+the timer. Exact-threshold regressions explicitly select zero grace; separate
+policy regressions exercise the production default, fork, and explicit compilation.
+The scheduled refcount matrix and lifecycle census also explicitly select zero
+grace while retaining compilation floors, entry evidence, and reclamation checks.
+
+Despecialization state lives in `CodeExtra` and is reclaimed with its code object.
+On 3.11, zero configured backoff rounds retires at the first exhausted deopt budget. Positive limits
+are capped at 15 ordinary rounds, followed by at most one guard-only generic retry.
+The 3.11 observer owns rewarm counting across scheduling and attachment doors.
+A subsequent exhausted round freezes the code. Exception deopts cannot create an
+unbounded retry loop; forced/instrumentation deopts keep their budget exemption.
+
+The Python and native regressions are `test_scheduling_policy_311.py` and
+`scheduling_policy_311_test.cpp`. Python cases run in Release and Py_DEBUG gates.
+The old `SPIKE_DESPEC`, `SPIKE_GRACEMS`, `SPIKE_FORKGRACE`, `SPIKE_NOFDC`, and
+`SPIKE_ROIGATE` names no longer control these settings.
+
 ## Dependency Cache And Pip Offline Mode
 
 `run_gate` does not hard-code a dependency cache path. Set `CINDERX_LOCAL_DEPS`

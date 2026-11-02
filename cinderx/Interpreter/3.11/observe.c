@@ -79,6 +79,9 @@ typedef struct {
   // opportunity, even if the artifact was retired in the meantime.
   int published;
   uint64_t post_publication_interpreted_frames;
+  // Cached size multiplier, not a threshold: live threshold changes must
+  // still take effect before the code's first automatic attempt.
+  uint64_t roi_scale;
   Py_ssize_t event_index; // -1 when the bounded event ledger dropped it
   // The keyed code object has been destroyed.  The key stays so probe
   // chains through this slot survive; the state does not.
@@ -372,6 +375,7 @@ void Ci_Observe311_OnCodeDeath(PyCodeObject* code) {
       // through this slot.  A keyed slot with no state is recycled in
       // place by the next tenant and swept when the table grows.
       slot->count = 0;
+      slot->roi_scale = 0;
       slot->dispatched = 0;
       slot->attachable = 0;
       slot->published = 0;
@@ -515,6 +519,7 @@ static Ci_ObserveSlot* observe_slot_for(PyCodeObject* code) {
         return NULL;
       }
       slot->count = 0;
+      slot->roi_scale = 0;
       slot->dispatched = 0;
       slot->attachable = 0;
       slot->published = 0;
@@ -531,6 +536,7 @@ static Ci_ObserveSlot* observe_slot_for(PyCodeObject* code) {
       }
       slot->key = key;
       slot->count = 0;
+      slot->roi_scale = 0;
       slot->dispatched = 0;
       slot->attachable = 0;
       slot->published = 0;
@@ -686,6 +692,11 @@ void Ci_Observe311_ReopenSlotForCode(PyCodeObject* code) {
   slot->count = 0;
 }
 
+uint64_t Ci_Observe311_CallCount(PyCodeObject* code) {
+  Ci_ObserveSlot* slot = observe_slot_find(code);
+  return slot == NULL ? 0 : slot->count;
+}
+
 void Ci_Observe311_OnFrame(
     PyFunctionObject* func,
     PyCodeObject* code,
@@ -817,6 +828,25 @@ static void observe_on_frame_locked(
       // function that only ever runs under one (a workload living entirely
       // inside a coverage tracer) stays interpreted, as it should.
       if (Ci_JitShell311_DispatchDeferred()) {
+        return;
+      }
+      int backoff = Ci_JitShell311_CodeBackoffHold(code, slot->count);
+      if (backoff != 0) {
+        if (backoff < 0) {
+          // Final retirement is not another failed compilation attempt.
+          slot->dispatched = 1;
+          slot->attachable = 0;
+        }
+        return;
+      }
+      if (slot->roi_scale == 0) {
+        slot->roi_scale = Ci_JitShell311_RoiGateNeed(code, 1);
+      }
+      uint64_t base = ci_observe_threshold == 0 ? 1 : ci_observe_threshold;
+      uint64_t need = base > UINT64_MAX / slot->roi_scale
+          ? UINT64_MAX
+          : base * slot->roi_scale;
+      if (slot->count < need) {
         return;
       }
       // The scheduling entry point checks the disable bit too; this is

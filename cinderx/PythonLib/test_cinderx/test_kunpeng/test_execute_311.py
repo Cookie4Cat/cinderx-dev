@@ -33,6 +33,8 @@ def _clean_env():
 
 def run_program(name, *, mode="execute", threshold=THRESHOLD, timeout=120, **env):
     child_env = _clean_env()
+    # State-machine cases use an explicit steady-state scheduling policy.
+    child_env["CINDERX_JIT_STARTUP_GRACE_MS"] = "0"
     if mode is not None:
         child_env["CINDERX_JIT_MODE"] = mode
     if threshold is not None:

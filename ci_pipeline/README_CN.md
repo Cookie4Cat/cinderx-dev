@@ -208,6 +208,33 @@ native `RuntimeTests` 默认从目标 `CINDERX_TEST_PYTHON` 的 `sysconfig` 读�
 bytecode 的 Python 构建。如果手动覆盖 `CC` 或 `CXX`，调用方必须保证该编译器能链接目标
 Python 库。
 
+## CPython 3.11 调度策略
+
+这些配置在编译器初始化时读取，`-X` 选项优先于环境变量。它们不改变 3.14 的默认行为。
+
+| 环境变量 | 对应 `-X` 选项 | 默认值与语义 |
+|---|---|---|
+| `CINDERX_JIT_STARTUP_GRACE_MS` | `jit-startup-grace-ms` | `100`；自动编译的启动宽限期，毫秒，允许 `0..4294967295`，`0` 禁用延迟，非法值使初始化失败 |
+| `CINDERX_JIT_FORK_GRACE` | `jit-fork-grace` | `1`；fork 子进程重新开始宽限期，已继承的编译产物继续可用 |
+| `CINDERX_JIT_DESPECIALIZE` | `jit-despecialize` | `1`；守卫失败耗尽普通退避轮次后，最多允许一次去特化重试；异常或混合失败轮次仍会退役 |
+| `CINDERX_JIT_FORCE_DEOPT_CHECKS` | `jit-force-deopt-checks` | `1`；保留 `force_deopt` 诊断能力，显式置 `0` 后不发出轮询，API 会明确拒绝触发请求 |
+| `CINDERX_JIT_AUTO_SIZE_SCALING` | `jit-auto-size-scaling` | `0`；显式启用后提高大段直线代码的自动编译阈值，循环保持原阈值，乘法饱和而不溢出 |
+
+宽限期只延后自动调度，不消耗一次性编译机会或预算，`force_compile` 在宽限期内仍可用。
+初始化和 fork 分别重置计时。精确测试调用阈值的旧回归显式使用宽限期 `0`，生产默认
+`100ms`、fork 和显式编译行为由独立策略回归验证。引用计数矩阵的自动调度臂和
+生命周期 census 也显式选择零宽限，保留其编译数量、机器码进入和回收断言。
+
+去特化状态存放在代码对象的 `CodeExtra`，随对象回收，不保留进程级裸指针集合。
+`CINDERX_AUTOJIT_ROI_BACKOFF_MAX_ROUNDS=0` 会在首次耗尽去优化预算时退役；其他值在 3.11 按控制字段容量
+限制到最多 15 个普通轮次，随后至多再有一次守卫专用的泛化重试。3.11 的重新预热由同一个 observer 计数并检查，冻结后不会从其他自动调度入口绕过。
+再次耗尽预算仍会冻结，
+异常 deopt 不会借此无限重编译。强制/插桩 deopt 保持原有的预算豁免语义。
+
+策略回归位于 `test_scheduling_policy_311.py` 和 `scheduling_policy_311_test.cpp`，
+Python 回归同时接入 Release/Py_DEBUG 门禁。原型中的 `SPIKE_DESPEC`、`SPIKE_GRACEMS`、
+`SPIKE_FORKGRACE`、`SPIKE_NOFDC`、`SPIKE_ROIGATE` 不再控制这组正式配置。
+
 ## 依赖缓存与 pip 离线模式
 
 `run_gate` 不硬编码依赖缓存路径。需要离线构建或复用预置依赖时，显式设置
