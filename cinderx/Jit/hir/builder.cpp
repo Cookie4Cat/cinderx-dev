@@ -52,6 +52,8 @@ extern "C" {
 #include <utility>
 #include <vector>
 
+extern "C" int Ci_SpikeDespec311_IsMarked(PyCodeObject* code);
+
 // Variant of JIT_THROW() that will log the name of the code object and the
 // current offset.
 #define BUILDER_THROW(MSG, ...)                         \
@@ -6316,14 +6318,16 @@ bool HIRBuilder::tryEmitLoadGlobal311(
   // new value; a code object that keeps deopting here is retired by the ROI
   // backoff like any other.
   bool pin = false;
-  if (PyFunction_Check(value)) {
+  // The generic retry also drops speculative global-function pins.
+  if (PyFunction_Check(value) && !Ci_SpikeDespec311_IsMarked(code_)) {
     LoadGlobalCallShape311 shape = scanLoadGlobalCallShape311(code_, bc_instr);
     if (shape.found) {
       pin = shape.kw ? kwStaticPinnable311(value)
                      : defaultPinnable311(value, shape.nargs);
     }
   }
-  if (PyFunction_Check(value) && (getConfig().hir_opts.inliner || pin)) {
+  if (PyFunction_Check(value) && !Ci_SpikeDespec311_IsMarked(code_) &&
+      (getConfig().hir_opts.inliner || pin)) {
     auto is_guard = tc.emit<GuardIs>(result, value, result);
     is_guard->setDescr(
         fmt::format("LOAD_GLOBAL_MODULE func: {}", PyUnicode_AsUTF8(name)));

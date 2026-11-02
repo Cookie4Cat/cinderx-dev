@@ -24,6 +24,7 @@
 #include "cinderx/Common/py-portability.h"
 #include "cinderx/Common/ref.h"
 #include "cinderx/Common/util.h"
+#include "cinderx/Interpreter/3.11/cinder_opcode.h"
 #include "cinderx/Interpreter/3.11/observe.h"
 #include "cinderx/Jit/autojit_import.h"
 #include "cinderx/Jit/bytecode.h"
@@ -40,9 +41,11 @@
 #include "cinderx/module_c_state.h"
 #include "cinderx/module_state.h"
 
+#include <chrono>
 #include <cstdint>
 #include <cstring>
 #include <exception>
+#include <limits>
 #include <string_view>
 #include <utility>
 #include <vector>
@@ -795,6 +798,10 @@ int attachFreshImpl311(PyFunctionObject* raw_func);
 const char* requestExecute311(
     BorrowedRef<PyFunctionObject> func,
     BorrowedRef<PyCodeObject> code) {
+  if (Ci_JitShell311_CodeBackoffHold(code, Ci_Observe311_CallCount(code)) !=
+      0) {
+    return CI_JIT_RESULT_311_DEFERRED;
+  }
   if (codeAutoJitDisabled311(code)) {
     return "REFUSE_SHAPE_AUTO_JIT_DISABLED";
   }
@@ -828,6 +835,7 @@ const char* requestExecute311(
     // as CODE_MOVED rather than as a refusal about this code object.
     jit::Result result = jit::compileFunction(func, code);
     if (result == jit::Result::OK) {
+      jit::roiBackoffDidPublish311(code);
       return CI_JIT_RESULT_311_INSTALLED;
     }
     PyErr_Clear();
@@ -977,18 +985,86 @@ extern "C" int Ci_JitShell311_CodeAutoJitDisabled(PyCodeObject* code) {
   return code != nullptr && codeAutoJitDisabled311(code);
 }
 
+extern "C" int Ci_JitShell311_CodeBackoffHold(
+    PyCodeObject* code,
+    uint64_t calls) {
+  if (!jit::getConfig().roi_backoff_enabled || code == nullptr) {
+    return 0;
+  }
+  CodeExtra* extra = codeExtraIfExists(code);
+  if (extra != nullptr &&
+      (Ci_code_extra_load_roi_ctl_relaxed(extra) &
+       CI_CODE_EXTRA_ROI_FROZEN_BIT)) {
+    return -1;
+  }
+  return jit::roiBackoffAllowsCompile311(code, calls) ? 0 : 1;
+}
+
 // The transient conditions shared by every scheduling door: under a trace
 // or profile function a publication would immediately fall back and be
 // reported as a failed attempt, and inside an import/setup scope nothing
 // says the code is hot.  Neither says anything about the code object, so
 // neither may spend an attempt or a budget.
+// Startup grace is a transient scheduling condition, never a failed
+// compilation attempt. Explicit compilation remains available during it.
+static std::chrono::steady_clock::time_point s_startup_grace_start;
+static bool s_startup_grace_expired = false;
+
+extern "C" void Ci_JitShell311_ResetStartupGrace(void) {
+  s_startup_grace_start = std::chrono::steady_clock::now();
+  s_startup_grace_expired = false;
+}
+
+static bool autoJitStartupGraceHold311(void) {
+  const size_t grace_ms = jit::getConfig().auto_jit_startup_grace_ms;
+  if (grace_ms == 0 || s_startup_grace_expired) {
+    return false;
+  }
+  const auto elapsed =
+      std::chrono::duration_cast<std::chrono::milliseconds>(
+          std::chrono::steady_clock::now() - s_startup_grace_start)
+          .count();
+  if (elapsed >= 0 && static_cast<uint64_t>(elapsed) >= grace_ms) {
+    s_startup_grace_expired = true;
+    return false;
+  }
+  return true;
+}
+
 static bool autoJitTransientHold311(void) {
   PyThreadState* tstate = PyThreadState_Get();
   if (tstate == nullptr || tstate->c_tracefunc != nullptr ||
       tstate->c_profilefunc != nullptr) {
     return true;
   }
+  if (autoJitStartupGraceHold311()) {
+    return true;
+  }
   return jit::autoJitImportDepth() > 0 || jit::autoJitSetupDepth() > 0;
+}
+
+// Optional size scaling for straight-line code. Iterate instructions, not
+// inline-cache words, and saturate rather than wrapping a large threshold.
+extern "C" uint64_t Ci_JitShell311_RoiGateNeed(
+    PyCodeObject* raw_code,
+    uint64_t threshold) {
+  const uint64_t base = threshold == 0 ? 1 : threshold;
+  if (!jit::getConfig().auto_jit_size_scaling || raw_code == nullptr) {
+    return base;
+  }
+  const Py_ssize_t units = Py_SIZE(raw_code);
+  if (units < 200) {
+    return base;
+  }
+  for (const auto& instr : jit::BytecodeInstructionBlock{raw_code}) {
+    if (instr.opcode() == JUMP_BACKWARD ||
+        instr.opcode() == JUMP_BACKWARD_NO_INTERRUPT) {
+      return base;
+    }
+  }
+  const uint64_t factor = units >= 1000 ? 16 : 4;
+  const uint64_t limit = std::numeric_limits<uint64_t>::max();
+  return base > limit / factor ? limit : base * factor;
 }
 
 extern "C" int Ci_JitShell311_DispatchDeferred(void) {
@@ -1283,6 +1359,11 @@ int attachFreshImpl311(PyFunctionObject* raw_func) {
   if (Ci_code_extra_jit311_auto_disabled(extra)) {
     return -1;
   }
+  int backoff =
+      Ci_JitShell311_CodeBackoffHold(code, Ci_Observe311_CallCount(code));
+  if (backoff != 0) {
+    return backoff < 0 ? -1 : 0;
+  }
   auto* compiled = reinterpret_cast<jit::CompiledFunction*>(
       _Py_atomic_load_ptr_acquire(&extra->jit_compiled));
   if (compiled == nullptr) {
@@ -1368,6 +1449,7 @@ int attachFreshImpl311(PyFunctionObject* raw_func) {
     return 0;
   }
   Ci_code_extra_jit311_note_attach(extra);
+  jit::roiBackoffDidPublish311(code);
   return 1;
 }
 
@@ -1434,6 +1516,12 @@ jit::CompiledFunction* codeArtifactFor311(
   if (Ci_code_extra_jit311_auto_disabled(extra) ||
       extra->jit_globals != func->func_globals ||
       extra->jit_builtins != func->func_builtins) {
+    return nullptr;
+  }
+  if (jit::getConfig().roi_backoff_enabled &&
+      ((Ci_code_extra_load_roi_ctl_relaxed(extra) &
+        (CI_CODE_EXTRA_ROI_FROZEN_BIT | CI_CODE_EXTRA_ROI_PENDING_BIT)) != 0 ||
+       Ci_code_extra_load_roi_recompile_floor_relaxed(extra) != 0)) {
     return nullptr;
   }
   if ((code->co_flags & CO_GENERATOR) != 0 &&

@@ -573,6 +573,13 @@ def outer(tag):
 # inner), and the fresh function objects that follow attach to the new
 # artifact.  24 x 16 raises pass the deopt budget many times over: without
 # the edge the code would be withdrawn and the last inner not compiled.
+# MR8 gives automatic compilation a 100 ms startup grace period.  This
+# probe checks attachment and exception edges after startup, so let that
+# period expire without forcing compilation or disabling the policy.
+if JIT:
+    import time
+    time.sleep(0.2)
+
 for r in range(24):
     inner, out = outer(r)
     LOG.append(out)

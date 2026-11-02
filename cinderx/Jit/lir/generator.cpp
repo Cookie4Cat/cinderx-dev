@@ -1711,6 +1711,9 @@ void LIRGenerator::appendForcedDeoptCheck(
   if (!isForceableDeoptInstr(hir_instr)) {
     return;
   }
+  if (!getConfig().emit_force_deopt_checks) {
+    return;
+  }
   forced_deopt_check_for_ = &hir_instr;
   auto deopt_id = bbb.makeDeoptMetadata();
 

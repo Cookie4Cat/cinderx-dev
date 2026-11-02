@@ -639,7 +639,9 @@ bool roiBackoffCtlPending(uint32_t ctl) {
   return (ctl & CI_CODE_EXTRA_ROI_PENDING_BIT) != 0;
 }
 
-bool roiBackoffStateAllowsCompile(CodeExtra* extra) {
+bool roiBackoffStateAllowsCompile(
+    CodeExtra* extra,
+    std::optional<uint64_t> observed_calls = std::nullopt) {
   if (!getConfig().roi_backoff_enabled || extra == nullptr) {
     return true;
   }
@@ -654,7 +656,7 @@ bool roiBackoffStateAllowsCompile(CodeExtra* extra) {
     return true;
   }
 
-  uint64_t calls = Ci_code_extra_get_calls(extra);
+  uint64_t calls = observed_calls.value_or(Ci_code_extra_get_calls(extra));
   if (calls < floor) {
     return false;
   }
@@ -1022,6 +1024,7 @@ bool parseAutoJitOption(const std::string& value) {
 }
 
 bool g_auto_jit_option_valid = true;
+bool g_startup_grace_option_valid = true;
 
 FlagProcessor initFlagProcessor() {
   FlagProcessor flag_processor;
@@ -1051,6 +1054,41 @@ FlagProcessor initFlagProcessor() {
       "threshold");
 
 #if PY_VERSION_HEX < 0x030C0000
+  flag_processor
+      .addOption(
+          "jit-startup-grace-ms",
+          "CINDERX_JIT_STARTUP_GRACE_MS",
+          [](const std::string& value) {
+            uint32_t ms;
+            g_startup_grace_option_valid = parse_uint32_arg(value, &ms);
+            if (g_startup_grace_option_valid) {
+              getMutableConfig().auto_jit_startup_grace_ms = ms;
+            }
+          },
+          "Delay CPython 3.11 automatic compilation during startup "
+          "(default 100 milliseconds; 0 disables the delay)")
+      .withFlagParamName("MS");
+  flag_processor.addOption(
+      "jit-fork-grace",
+      "CINDERX_JIT_FORK_GRACE",
+      getMutableConfig().auto_jit_fork_grace,
+      "Restart the CPython 3.11 startup grace period after fork");
+  flag_processor.addOption(
+      "jit-despecialize",
+      "CINDERX_JIT_DESPECIALIZE",
+      getMutableConfig().auto_jit_despecialize,
+      "Allow one generic retry after a CPython 3.11 guard-failure round");
+  flag_processor.addOption(
+      "jit-force-deopt-checks",
+      "CINDERX_JIT_FORCE_DEOPT_CHECKS",
+      getMutableConfig().emit_force_deopt_checks,
+      "Emit CPython 3.11 forced-deoptimization checks (enabled by default)");
+  flag_processor.addOption(
+      "jit-auto-size-scaling",
+      "CINDERX_JIT_AUTO_SIZE_SCALING",
+      getMutableConfig().auto_jit_size_scaling,
+      "Scale automatic compile thresholds for large straight-line "
+      "CPython 3.11 code (disabled by default)");
   flag_processor.addOption(
       "jit-generator",
       "PYTHONJITGENERATOR",
@@ -3759,6 +3797,13 @@ PyObject* force_deopt(PyObject* /* self */, PyObject* args, PyObject* kwargs) {
     PyErr_SetString(PyExc_ValueError, "force_deopt n must be >= 1");
     return nullptr;
   }
+  if (!jit::getConfig().emit_force_deopt_checks) {
+    PyErr_SetString(
+        PyExc_RuntimeError,
+        "force_deopt unavailable: forced-deopt checks are not emitted "
+        "(CINDERX_JIT_FORCE_DEOPT_CHECKS=0)");
+    return nullptr;
+  }
   Ref<jit::CompiledFunction> compiled = compiledArtifactFor311(func);
   jit::CodeRuntime* rt = compiled == nullptr ? nullptr : compiled->runtime();
   if (rt == nullptr) {
@@ -4893,6 +4938,11 @@ PyObject* after_fork_child(PyObject*, PyObject*) {
 #ifndef WIN32
   perf::afterForkChild();
 #endif
+#if PY_VERSION_HEX < 0x030C0000
+  if (jit::getConfig().auto_jit_fork_grace) {
+    Ci_JitShell311_ResetStartupGrace();
+  }
+#endif
   Py_RETURN_NONE;
 }
 
@@ -5382,6 +5432,18 @@ PyModuleDef_Slot jit_slots[] = {
 // caller picked.  Canary therefore publishes only what its own evidence
 // needs, and each later milestone adds back what its acceptance covers.
 PyMethodDef jit_methods_311_canary[] = {
+    {"after_fork_child",
+     after_fork_child,
+     METH_NOARGS,
+     PyDoc_STR("Reset child-process JIT state after fork().")},
+    {"_autojit_gate_stats",
+     autojit_gate_stats,
+     METH_NOARGS,
+     PyDoc_STR("Return scheduling and ROI backoff counters.")},
+    {"_clear_autojit_gate_stats",
+     clear_autojit_gate_stats,
+     METH_NOARGS,
+     PyDoc_STR("Clear scheduling and ROI backoff counters.")},
     {"is_enabled",
      is_enabled,
      METH_NOARGS,
@@ -5999,6 +6061,18 @@ void unregisterFunctionCodes(BorrowedRef<PyFunctionObject> func) {
 extern "C" int Ci_QuickenWarmupStep_311;
 #endif
 
+#if PY_VERSION_HEX < 0x030C0000
+// Keep the retry decision with the code object so destruction/reuse cannot
+// transfer a stale mark, and parallel compilation can read it safely.
+extern "C" int Ci_SpikeDespec311_IsMarked(PyCodeObject* code) {
+  if (code == nullptr) {
+    return 0;
+  }
+  CodeExtra* extra = codeExtraIfExists(code);
+  return extra != nullptr && Ci_code_extra_jit311_despecialized(extra);
+}
+#endif
+
 namespace jit {
 
 #if defined(CINDERX_RUNTIME_TESTS_CMAKE) && PY_VERSION_HEX >= 0x030C0000
@@ -6046,6 +6120,40 @@ bool roiBackoffAllowsCompile(BorrowedRef<PyCodeObject> code) {
   CodeExtra* extra = codeExtraIfExists(code);
   return roiBackoffStateAllowsCompile(extra);
 }
+
+#if PY_VERSION_HEX < 0x030C0000
+bool roiBackoffAllowsCompile311(
+    BorrowedRef<PyCodeObject> code,
+    uint64_t interpreted_calls) {
+  if (!getConfig().roi_backoff_enabled) {
+    return true;
+  }
+  CodeExtra* extra = codeExtraIfExists(code);
+  if (extra == nullptr) {
+    return true;
+  }
+  uint32_t ctl = Ci_code_extra_load_roi_ctl_relaxed(extra);
+  if (roiBackoffCtlFrozen(ctl) || roiBackoffCtlPending(ctl)) {
+    return false;
+  }
+  return interpreted_calls >=
+      Ci_code_extra_load_roi_recompile_floor_relaxed(extra);
+}
+
+void roiBackoffDidPublish311(BorrowedRef<PyCodeObject> code) {
+  if (!getConfig().roi_backoff_enabled) {
+    return;
+  }
+  CodeExtra* extra = codeExtraIfExists(code);
+  if (extra != nullptr &&
+      Ci_code_extra_load_roi_recompile_floor_relaxed(extra) != 0) {
+    // Queries do not spend a retry. Only a successful automatic publication
+    // releases the floor, including reuse of an explicitly rebuilt artifact.
+    Ci_code_extra_store_roi_recompile_floor_release(extra, 0);
+    incAutoJitGateStat(g_auto_jit_gate_stats.roi_recompile);
+  }
+}
+#endif
 
 namespace {
 
@@ -6144,8 +6252,23 @@ void triggerRoiBackoff(
 
   uint32_t round = roiBackoffRound(ctl);
   uint32_t next_round = round + 1;
-  bool frozen = getConfig().roi_backoff_max_rounds == 0 ||
-      next_round >= getConfig().roi_backoff_max_rounds;
+  size_t max_rounds = getConfig().roi_backoff_max_rounds;
+#if PY_VERSION_HEX < 0x030C0000
+  constexpr uint32_t kMaxRound =
+      CI_CODE_EXTRA_ROI_ROUND_MASK >> CI_CODE_EXTRA_ROI_ROUND_SHIFT;
+  max_rounds = std::min<size_t>(max_rounds, kMaxRound);
+#endif
+  bool frozen = max_rounds == 0 || next_round >= max_rounds;
+#if PY_VERSION_HEX < 0x030C0000
+  // A guard-only round may earn one generic retry. Exception/mixed rounds
+  // and a second exhausted round retain the final retirement protection.
+  if (frozen && getConfig().auto_jit_despecialize &&
+      getConfig().roi_backoff_max_rounds != 0 &&
+      !Ci_code_extra_jit311_has_non_guard_deopt(extra) &&
+      Ci_code_extra_jit311_try_despecialize(extra)) {
+    frozen = false;
+  }
+#endif
 
   for (auto& func : funcs) {
     ::uncompileImpl(func);
@@ -6157,6 +6280,9 @@ void triggerRoiBackoff(
 #endif
 
   Ci_code_extra_store_roi_deopt_count_relaxed(extra, 0);
+#if PY_VERSION_HEX < 0x030C0000
+  Ci_code_extra_jit311_clear_non_guard_deopt(extra);
+#endif
   extra->roi_aging_epoch_ms = 0;
   if (frozen) {
     Ci_code_extra_store_roi_recompile_floor_release(extra, 0);
@@ -6168,20 +6294,24 @@ void triggerRoiBackoff(
     return;
   }
 
+  // 3.11 counts the retry's interpreted calls in its observer slot. The
+  // legacy vectorcall scheduler uses a different counter and must not be
+  // installed as a competing scheduling door on this version.
+#if PY_VERSION_HEX < 0x030C0000
+  uint64_t calls = 0;
+#else
   uint64_t calls = Ci_code_extra_get_calls(extra);
+#endif
   Ci_code_extra_store_roi_recompile_floor_release(
       extra, roiBackoffRecompileFloor(calls, round));
   Ci_code_extra_store_roi_ctl_release(extra, roiBackoffCtlForRound(next_round));
   incAutoJitGateStat(g_auto_jit_gate_stats.roi_uncompile);
 
+#if PY_VERSION_HEX < 0x030C0000
+  Ci_Observe311_ReopenSlotForCode(code.get());
+#else
   for (auto& func : funcs) {
     scheduleJitCompile(func);
-  }
-#if PY_VERSION_HEX < 0x030C0000
-  // No function object to reschedule; the observer's slot re-dispatches the
-  // code once its frames re-earn the threshold.
-  if (by_code != nullptr) {
-    Ci_Observe311_ReopenSlotForCode(code.get());
   }
 #endif
 }
@@ -6356,6 +6486,11 @@ void recordDeoptForRoiBackoff(
     recordAutoJitAgingStats(update.count_reduced);
     count = update.count;
   }
+#if PY_VERSION_HEX < 0x030C0000
+  if (reason != DeoptReason::kGuardFailure) {
+    Ci_code_extra_jit311_note_non_guard_deopt(extra);
+  }
+#endif
   if (count < budget) {
     return;
   }
@@ -6405,6 +6540,7 @@ int initialize() {
   getMutableConfig().use_stable_pointers = use_stable_pointers;
 
   g_auto_jit_option_valid = true;
+  g_startup_grace_option_valid = true;
   FlagProcessor flag_processor = initFlagProcessor();
   if (flag_processor.hasHandled("jit-help")) {
     std::cout << flag_processor.jitXOptionHelpMessage() << '\n';
@@ -6412,6 +6548,15 @@ int initialize() {
     return -2;
   }
 #if PY_VERSION_HEX < 0x030C0000
+  if (!g_startup_grace_option_valid) {
+    Ci_Observe311_SetResolvedAutoJitConfig(0, 0, 0, 0);
+    PyErr_SetString(
+        PyExc_RuntimeError,
+        "invalid CINDERX_JIT_STARTUP_GRACE_MS/-X jit-startup-grace-ms: "
+        "expected an integer from 0 to 4294967295");
+    return -1;
+  }
+  Ci_JitShell311_ResetStartupGrace();
   if (!g_auto_jit_option_valid) {
     Ci_Observe311_SetResolvedAutoJitConfig(0, 0, 0, 0);
     PyErr_Format(
@@ -6595,6 +6740,9 @@ int initialize() {
       return -1;
     }
     jitCtx()->setCinderJitModule(Ref<>::steal(canary_mod));
+    if (register_fork_callback(canary_mod) < 0) {
+      return -1;
+    }
     patchSysSetProfileAndSetTrace(canary_mod);
   }
   // Sync generators now compile to machine code; copy stock gen/coro

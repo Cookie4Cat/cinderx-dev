@@ -3,6 +3,7 @@
 #include <gtest/gtest.h>
 
 #include "cinderx/Common/ref.h"
+#include "cinderx/Common/util.h"
 #include "cinderx/Jit/code_runtime.h"
 #include "cinderx/Jit/codegen/arch.h"
 #include "cinderx/Jit/codegen/environ.h"
@@ -293,6 +294,87 @@ static size_t countOpcode(
     }
   }
   return count;
+}
+
+TEST_F(LIRGeneratorTest, Python311ForcedDeoptOptOutKeepsOrganicChecks) {
+  const auto saved = getConfig();
+  SCOPE_EXIT(getMutableConfig() = saved);
+  Ref<PyFunctionObject> owner(compileAndGet(
+      "def policy_lowering(value, result): return value\n", "policy_lowering"));
+  ASSERT_NE(owner, nullptr);
+  const char* source = R"(fun policy_lowering {
+  bb 0 {
+    v0 = LoadArg<0>
+    v1 = LoadArg<1>
+    Snapshot { CurInstrOffset 0 Locals<2> v0 v1 }
+    v2 = GuardType<LongExact> v0
+    v3 = CheckExc v1 {
+      FrameState { CurInstrOffset 0 Locals<2> v0 v1 }
+    }
+    Return v2
+  }
+}
+)";
+
+  for (bool emit_checks : {true, false}) {
+    SCOPED_TRACE(emit_checks);
+    getMutableConfig().emit_force_deopt_checks = emit_checks;
+    auto irfunc = hir::HIRParser{}.ParseHIR(source);
+    ASSERT_NE(irfunc, nullptr);
+    irfunc->setCode(BorrowedRef<PyCodeObject>{owner->func_code});
+    irfunc->builtins.reset(owner->func_builtins);
+    irfunc->globals.reset(owner->func_globals);
+    // Resolve snapshots and reference state without folding away the two
+    // independent organic checks whose lowering this test protects.
+    Compiler::runPasses(*irfunc, static_cast<PassConfig>(0));
+    CodeRuntime runtime{irfunc->code, irfunc->builtins, irfunc->globals};
+    codegen::Environ env;
+    env.ctx = getContext();
+    env.code_rt = &runtime;
+    LIRGenerator generator(irfunc.get(), &env);
+    auto lir = generator.TranslateFunction();
+    ASSERT_NE(lir, nullptr);
+
+    size_t polls = 0;
+    size_t type_guards = 0;
+    size_t exception_guards = 0;
+    for (const auto* block : lir->basicblocks()) {
+      for (const auto& instr : block->instructions()) {
+        if (instr->isCall() && instr->getNumInputs() > 0 &&
+            instr->getInput(0)->isImm() &&
+            instr->getInput(0)->getConstant() ==
+                reinterpret_cast<uint64_t>(JITRT_ConsumeForcedDeopt)) {
+          ++polls;
+        }
+        if (instr->opcode() != Instruction::kGuard) {
+          continue;
+        }
+        const auto kind =
+            static_cast<InstrGuardKind>(instr->getInput(0)->getConstant());
+        const auto deopt_id = instr->getInput(1)->getConstant();
+        ASSERT_LT(deopt_id, runtime.deoptMetadatas().size());
+        const auto& meta = runtime.deoptMetadatas()[deopt_id];
+        if (kind == InstrGuardKind::kHasType) {
+          ++type_guards;
+          EXPECT_EQ(meta.reason, DeoptReason::kGuardFailure);
+          EXPECT_TRUE(meta.forceable);
+          EXPECT_FALSE(meta.frame_meta.empty());
+        } else if (kind == InstrGuardKind::kNotZero) {
+          ++exception_guards;
+          EXPECT_EQ(meta.reason, DeoptReason::kUnhandledException);
+          EXPECT_FALSE(meta.forceable);
+          EXPECT_FALSE(meta.frame_meta.empty());
+        }
+      }
+    }
+    // GuardType is forceable; CheckExc must retain its natural exception
+    // guard without becoming a diagnostic forced-deopt site in either arm.
+    EXPECT_EQ(polls, emit_checks ? 1u : 0u) << *lir;
+    EXPECT_EQ(type_guards, 1u) << *lir;
+    EXPECT_EQ(exception_guards, 1u) << *lir;
+    EXPECT_EQ(countOpcode(*lir, Instruction::kGuard), emit_checks ? 3u : 2u)
+        << *lir;
+  }
 }
 
 TEST_F(LIRGeneratorTest, Python311VectorCallSelectsFastAndSlowTargets) {

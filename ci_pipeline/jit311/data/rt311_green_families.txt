@@ -27,6 +27,8 @@ LIRTypeTest
 LinearScanAllocatorTest
 RemoveTrampolineBlocksTest
 RemoveUnreachableBlocks
+SchedulingPolicyBuildTest
+SchedulingPolicyStateTest
 ShadowCompileTest
 SlabArenaTest
 SortedVecMapTest

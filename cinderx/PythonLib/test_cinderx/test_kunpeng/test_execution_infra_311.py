@@ -119,6 +119,9 @@ class ExecutionInfra311Test(unittest.TestCase):
             def hot(value, step):
                 return value + step
 
+            # Exercise post-startup scheduling with MR8's 100 ms grace intact.
+            import time
+            time.sleep(0.2)
             entries = after["machine_code_entries"]
             for i in range(40):
                 assert hot(i, 1) == i + 1
@@ -162,6 +165,8 @@ class ExecutionInfra311Test(unittest.TestCase):
             def after_failure(value, step):
                 return value + step
 
+            import time
+            time.sleep(0.2)
             before = _cinderx._get_trigger_stats()["machine_code_entries"]
             for i in range(40):
                 assert after_failure(i, 1) == i + 1

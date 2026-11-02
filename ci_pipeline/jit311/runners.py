@@ -801,13 +801,18 @@ def canary_force_warm_runner(*, judges: list[Judge] | None = None) -> RunnerSpec
     )
 
 
+# These drivers verify steady-state automatic scheduling. Keep MR8's
+# 100 ms startup grace enabled and let it expire before exercising the target.
+_AUTO_SCHEDULING_READY = "import time\ntime.sleep(0.2)\n"
+
+
 def canary_execute_runner(
     *, threshold: int = 8, judges: list[Judge] | None = None
 ) -> RunnerSpec:
     """Organic canary dispatch: crossing the observe threshold compiles
     and installs without force_compile; the ledger records the request
     with the "installed" result."""
-    payload = CANARY_DEF + CANARY_ATTEST + (
+    payload = CANARY_DEF + CANARY_ATTEST + _AUTO_SCHEDULING_READY + (
         "for i in range(40):\n"
         "    hot(i, 5, 1)\n"
         "assert cinderjit.is_jit_compiled(hot), 'threshold must install'\n"
@@ -857,7 +862,7 @@ def execute_auto_runner(
     compilation.  The fresh-attach CONTRACT (budget, flags, event ledger)
     is owned by test_execute_311.py; re-proving it here would track that
     suite, not the product."""
-    payload = EXECUTE_FRESH_DEF + CANARY_ATTEST + (
+    payload = EXECUTE_FRESH_DEF + CANARY_ATTEST + _AUTO_SCHEDULING_READY + (
         "_stats = _cinderx._get_observe_stats()\n"
         "assert _stats['mode'] == 'execute', _stats\n"
         "assert _stats['requested_mode'] == 'execute', _stats\n"

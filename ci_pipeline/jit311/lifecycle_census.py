@@ -40,6 +40,7 @@ import argparse
 import collections
 import gc
 import json
+import os
 import sys
 
 SRC = "\n".join(
@@ -206,6 +207,9 @@ def main() -> int:
     parser.add_argument("--out")
     args = parser.parse_args()
 
+    # Each round has a bounded call-count warmup. Startup timing is tested
+    # separately; it must not turn a residency census into an interpreter run.
+    os.environ.setdefault("CINDERX_JIT_STARTUP_GRACE_MS", "0")
     import _cinderx
     import cinderx
 

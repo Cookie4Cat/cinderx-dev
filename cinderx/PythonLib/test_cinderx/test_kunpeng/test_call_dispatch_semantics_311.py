@@ -1388,6 +1388,7 @@ class CallDispatchSemantics311Test(unittest.TestCase):
             CINDERX_JIT_MODE="execute",
             PYTHONJITAUTO="1000000",
             PYTHONJITLIGHTWEIGHTFRAME="0",
+            CINDERX_JIT_STARTUP_GRACE_MS="0",
         )
         env.update(extra_env or {})
         proc = subprocess.run(
