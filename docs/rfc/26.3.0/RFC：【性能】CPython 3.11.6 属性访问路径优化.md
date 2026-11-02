@@ -1,12 +1,12 @@
 # 【性能】CPython 3.11.6 属性访问路径优化技术方案（RFC）
 
-**状态 (Status):** Draft v0.11
+**状态 (Status):** Draft v0.12
 
 **作者 (Authors):** @qq_16646553
 
 **创建日期 (Created):** 2026-10-26
 
-**更新日期 (Updated):** 2026-10-27
+**更新日期 (Updated):** 2026-11-02
 
 **相关 Issue/PR:** 待关联
 
@@ -479,7 +479,7 @@ ATTR_PATH_MODE=cinderx "$PY" -c 'import _cinderx_auto; print(_cinderx_auto._veri
 | 执行模式 | eval/no_grad、纯 eager；compile、graph、JIT关闭；前向入口按各模型配置 |
 | Batch与随机种子 | 默认Batch128、seed=2025；HLLM使用seed=2020，GR使用Batch1、seed=42；同一模型A/B使用相同权重和输入 |
 | 输入与资产 | 按模型使用原生成器或已有数据资产，固定输入规模；每次A/B重放同一份权重、输入及所需缓存 |
-| 精度 | 默认FP32权重、HF32开启；HLLM采用BF16 mixed，GR采用FP32 Embedding＋BF16主体 |
+| 精度 | 默认FP32权重、HF32开启；HLLM当前已验证配置为FP32、HF32开启、autocast关闭；GR采用FP32 Embedding＋BF16主体及预测头 |
 | 其他设置 | Q1；pymalloc；GC开启；静态TLS可选配额512字节；绑核按现场site配置 |
 | 性能采集 | 三块ABBA→BAAB→ABBA；每进程50+50次预热，两段各400次CLEAN，独立Card取20个有效step |
 | 指标与质量策略 | FREE=本进程CLEAN E2E均值−独立Card；默认 `WINDOW_COMPARABLE`，逐step差异单独标注 |
@@ -582,10 +582,10 @@ Embedding与MLP结合的特征交互模型，将稀疏特征分组聚合后与�
 
 - **入口**：RecSDK的`HLLM/`适配；依赖源码中调用`TrainerNPU._full_sort_batch_eval`，stage=2，经`model(..., mode="predict")`执行原预测路径。
 - **规模**：Batch128，用户历史长度10，物品文本长度上限256，seed=2020；数据配置的物品数为686624。
-- **结构与精度**：item/user LLM均为22层，hidden=2048，intermediate=5632，32个attention heads、4个KV heads，vocab=32000；采用原BF16 mixed配置，`use_ft_flash_attn=False`。
+- **结构与精度**：item/user LLM均为22层，hidden=2048，intermediate=5632，32个attention heads、4个KV heads，vocab=32000；当前已验证配置为FP32、HF32开启、autocast关闭，`use_ft_flash_attn=False`。
 - **资产与计时**：使用匹配的HLLM checkpoint、item/user预训练资产、数据集及item_feature缓存；权重和缓存准备在计时外完成，保留原前向内的搬运与屏蔽处理。
-- **输入**：用户物品ID与时间序列各`[128,10] int64`，附带历史及正样本索引；item_feature为`[N,2048]`，N和缓存实际dtype随所选资产记录。
-- **输出**：`scores [128,N]`及正样本索引，得分dtype沿用原混合精度路径；保留padding和历史物品位置的`-inf`屏蔽值。
+- **输入**：用户物品ID为`[128,10] int64`；时间特征为`[128,10,6] int64`，最后一维依次为年、月、日、时、分、秒；附带历史及正样本索引；item_feature为`[686624,2048] FP32`。
+- **输出**：`scores [128,N]`及正样本索引，当前已验证得分dtype为FP32；保留padding和历史物品位置的`-inf`屏蔽值。
 
 ### A.2.10 GR 2B
 
@@ -593,7 +593,7 @@ Embedding与MLP结合的特征交互模型，将稀疏特征分组聚合后与�
 
 - **入口**：HSTU依赖源码中的`benchmark/inference_benchmark_2b_random.py`，调用`InferenceRankingGR.forward(batch, uids)`；验收名称为`gr_2b`。
 - **规模**：Batch1，24层，hidden=4096，16头、head_dim=256，实际tokens=2048，候选数100；`full_mode=True`，MoE/FFN/RAB关闭。
-- **结构与精度**：item Embedding为`[1000000,4096] FP32`，action Embedding为`[512,4096] FP32`；HSTU及预测头为BF16，保留原类的精度转换与真实`hstu_jagged`算子。
+- **结构与精度**：item Embedding为`[1000000,4096] FP32`，action Embedding为`[512,4096] FP32`；HSTU及预测头为BF16。模型结构和输入生成参考原benchmark，实际验收使用固定适配源码，将HSTU调用绑定到`torch.ops.mxrec.hstu_jagged.equal`；OFF/ON共用同一适配基线。
 - **权重来源**：`USE_RANDOM_PARM=1`，seed=42，按`uniform[-0.5,0.5]`初始化；生成后冻结，供OFF/ON共同回放。
 - **输入**：原Batch/JT/KJT结构，包含974个历史item、974个action和100个候选；video_id values为`[1074] int64`，action_weights values为`[974] int64`，uids为`[1] int64`；长度与offset等元数据由原生成器产生。
 - **输出**：候选得分Tensor，shape为`[100,1]`，dtype为BF16。
