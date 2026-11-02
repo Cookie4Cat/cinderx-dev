@@ -3201,6 +3201,8 @@ PyObject* jit311_lifecycle_snapshot(PyObject* /* self */, PyObject* /* arg */) {
       jit_state, "code_runtimes_live", census.code_runtimes_live);
   rc |=
       lifecycleSetSize(jit_state, "subscript_caches", census.subscript_caches);
+  rc |=
+      lifecycleSetSize(jit_state, "predicate_caches", census.predicate_caches);
   rc |= lifecycleSetSize(
       module,
       "registered_compilation_units",

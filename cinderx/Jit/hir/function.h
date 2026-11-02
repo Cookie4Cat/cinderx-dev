@@ -73,6 +73,22 @@ class Function {
   }
 #endif
 
+  // Cells belong to this compilation, never to a process-wide code-address map.
+  // LIR retains their storage in CodeRuntime before HIR is destroyed.
+#if PY_VERSION_HEX < 0x030C0000
+  mutable std::unordered_map<int64_t, std::shared_ptr<void>>
+      predicate_caches_311;
+
+  template <typename T>
+  T* predicateCache311(int64_t offset, int kind) const {
+    auto& cell = predicate_caches_311[offset * 3 + kind];
+    if (!cell) {
+      cell = std::make_shared<T>();
+    }
+    return static_cast<T*>(cell.get());
+  }
+#endif
+
   CFG cfg;
 
   Environment env;

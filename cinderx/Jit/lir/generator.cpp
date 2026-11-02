@@ -289,6 +289,11 @@ LIRGenerator::LIRGenerator(
       is_gen_(
           func->code != nullptr &&
           (func->code->co_flags & kCoFlagsAnyGenerator)) {
+#if PY_VERSION_HEX < 0x030C0000
+  for (const auto& [key, cell] : func_->predicate_caches_311) {
+    env_->code_rt->retainPredicateCache311(cell);
+  }
+#endif
   JIT_CHECK(env_->ctx != nullptr, "LIR generation requires a cache context");
   for (int i = 0, n = func->env.numLoadTypeAttrCaches(); i < n; i++) {
     load_type_attr_caches_.emplace_back(env_->ctx->allocateLoadTypeAttrCache());
@@ -3783,9 +3788,40 @@ LIRGenerator::TranslatedBlock LIRGenerator::TranslateOneBasicBlock(
       }
       case Opcode::kIsInstance: {
         auto instr = static_cast<const IsInstance*>(&i);
+#if PY_VERSION_HEX < 0x030C0000
+        // SPIKE(ISINSTFAST): the inline `ob_type == cls` arm already took
+        // the exact hit; this slow arm is mostly the negative answer, which
+        // stock PyObject_IsInstance resolves through a __class__ attribute
+        // lookup (scimark_lu: 19% in _PyType_Lookup / GenericGetAttr).
+        static const bool spike_isinstfast =
+            Ci_SpikeGetenv("SPIKE_ISINSTFAST") != nullptr;
+        auto isinstance_fn =
+            spike_isinstfast ? JITRT_IsInstanceFast311 : PyObject_IsInstance;
+        // SPIKE(ISINSTCACHE): replay the (receiver type, class) answer from a
+        // per-site cache; the slow helper only runs on a type-version miss.
+        static const bool spike_isinstcache =
+            Ci_SpikeGetenv("SPIKE_ISINSTCACHE") != nullptr;
+        if (spike_isinstcache && spike_isinstfast && func_->code != nullptr) {
+          auto offset = static_cast<int64_t>(instr->bytecodeOffset().value());
+          auto* cache =
+              func_->predicateCache311<JITRT_IsInstanceSiteCache311>(offset, 0);
+          env_->code_rt->retainPredicateCache311(
+              func_->predicate_caches_311.at(offset * 3));
+          Instruction* cached_instr = bbb.appendCallInstruction(
+              instr->output(),
+              JITRT_IsInstanceCached311,
+              cache,
+              instr->GetOperand(0),
+              instr->GetOperand(1));
+          appendGuard(bbb, InstrGuardKind::kNotNegative, *instr, cached_instr);
+          break;
+        }
+#else
+        auto isinstance_fn = PyObject_IsInstance;
+#endif
         Instruction* call_instr = bbb.appendCallInstruction(
             instr->output(),
-            PyObject_IsInstance,
+            isinstance_fn,
             instr->GetOperand(0),
             instr->GetOperand(1));
         appendGuard(bbb, InstrGuardKind::kNotNegative, *instr, call_instr);
@@ -3794,6 +3830,18 @@ LIRGenerator::TranslatedBlock LIRGenerator::TranslateOneBasicBlock(
       case Opcode::kCompare: {
         auto instr = static_cast<const Compare*>(&i);
         if (instr->op() == CompareOp::kIn) {
+#if PY_VERSION_HEX < 0x030C0000
+          static const bool spike_ueq_in =
+              Ci_SpikeGetenv("SPIKE_UEQ") != nullptr;
+          if (spike_ueq_in && instr->right()->type() <= TUnicodeExact) {
+            bbb.appendCallInstruction(
+                instr->output(),
+                JITRT_UnicodeContainsBoxed311,
+                instr->right(),
+                instr->left());
+            break;
+          }
+#endif
           bbb.appendCallInstruction(
               instr->output(),
               JITRT_SequenceContains,
@@ -3844,7 +3892,20 @@ LIRGenerator::TranslatedBlock LIRGenerator::TranslateOneBasicBlock(
       }
       case Opcode::kUnicodeCompare: {
         auto instr = static_cast<const UnicodeCompare*>(&i);
-
+#if PY_VERSION_HEX < 0x030C0000
+        static const bool spike_ueq = Ci_SpikeGetenv("SPIKE_UEQ") != nullptr;
+        if (spike_ueq &&
+            (instr->op() == CompareOp::kEqual ||
+             instr->op() == CompareOp::kNotEqual)) {
+          bbb.appendCallInstruction(
+              instr->output(),
+              JITRT_UnicodeEqualsBoxed311,
+              instr->left(),
+              instr->right(),
+              static_cast<int>(instr->op()));
+          break;
+        }
+#endif
         bbb.appendCallInstruction(
             instr->output(),
             PyUnicode_Type.tp_richcompare,

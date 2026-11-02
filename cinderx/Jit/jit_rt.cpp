@@ -5,6 +5,9 @@
 #include "internal/pycore_call.h"
 #include "internal/pycore_ceval.h"
 #include "internal/pycore_object.h"
+#if PY_VERSION_HEX < 0x030C0000
+#include "structmember.h"
+#endif
 #include "internal/pycore_pyerrors.h"
 #include "internal/pycore_pystate.h"
 
@@ -2787,6 +2790,339 @@ PyObject* JITRT_GetItem311(PyObject* container, PyObject* index) {
     }
   }
   return PyObject_GetItem(container, index);
+}
+#endif
+
+#if PY_VERSION_HEX < 0x030C0000
+// SPIKE(UEQ): boxed form of JITRT_UnicodeEquals for UnicodeCompare<Eq/Ne>.
+// The generic tp_richcompare re-checks both operand types, readies both
+// strings and compares without the cached-hash shortcut; the equality
+// helper above is what the bool-fused form already uses.
+PyObject* JITRT_UnicodeEqualsBoxed311(PyObject* s1, PyObject* s2, int op) {
+  int r = JITRT_UnicodeEquals(s1, s2, op);
+  if (r < 0) {
+    return nullptr;
+  }
+  PyObject* res = r ? Py_True : Py_False;
+  Py_INCREF(res);
+  return res;
+}
+
+// SPIKE(UEQ): `needle in haystack` with an exact-str haystack, boxed form.
+// PySequence_Contains only dispatches to unicode_contains; call it directly.
+PyObject* JITRT_UnicodeContainsBoxed311(PyObject* haystack, PyObject* needle) {
+  int r = PyUnicode_Contains(haystack, needle);
+  if (r < 0) {
+    return nullptr;
+  }
+  PyObject* res = r ? Py_True : Py_False;
+  Py_INCREF(res);
+  return res;
+}
+
+namespace {
+// Answers isinstance(obj, cls) for an exact-`type` class from the receiver
+// type alone: 1 when cls is in the MRO; 0 when the type's __class__ resolves
+// to object's own descriptor through the generic getattr, so that
+// object_isinstance() could only re-derive Py_TYPE(obj); -1 when the answer
+// may depend on the instance (a __class__ override, a custom getattr).
+int spikeIsInstanceByType311(PyTypeObject* type, PyTypeObject* cls) {
+  // The exact type is the common case; answer it without the MRO walk.
+  if (type == cls || PyType_IsSubtype(type, cls)) {
+    return 1;
+  }
+  PyObject* object_class_descr =
+      _PyType_Lookup(&PyBaseObject_Type, &_Py_ID(__class__));
+  if (type->tp_getattro == PyObject_GenericGetAttr &&
+      object_class_descr != nullptr &&
+      _PyType_Lookup(type, &_Py_ID(__class__)) == object_class_descr) {
+    return 0;
+  }
+  return -1;
+}
+} // namespace
+
+int JITRT_IsInstanceFast311(PyObject* obj, PyObject* cls) {
+  if (Py_IS_TYPE(cls, &PyType_Type)) {
+    int result = spikeIsInstanceByType311(
+        Py_TYPE(obj), reinterpret_cast<PyTypeObject*>(cls));
+    if (result >= 0) {
+      return result;
+    }
+  }
+  return PyObject_IsInstance(obj, cls);
+}
+
+namespace {
+bool spikeTypeVersionValid311(PyTypeObject* type) {
+  return (type->tp_flags & Py_TPFLAGS_VALID_VERSION_TAG) != 0 &&
+      type->tp_version_tag != 0;
+}
+} // namespace
+
+int JITRT_IsInstanceCached311(
+    JITRT_IsInstanceSiteCache311* cache,
+    PyObject* obj,
+    PyObject* cls) {
+  PyTypeObject* type = Py_TYPE(obj);
+  if (type == cache->type && cls == cache->cls &&
+      Py_IS_TYPE(cls, &PyType_Type) &&
+      reinterpret_cast<PyTypeObject*>(cls)->tp_version_tag ==
+          cache->cls_version &&
+      (reinterpret_cast<PyTypeObject*>(cls)->tp_flags &
+       Py_TPFLAGS_VALID_VERSION_TAG) &&
+      type->tp_version_tag == cache->version &&
+      (type->tp_flags & Py_TPFLAGS_VALID_VERSION_TAG)) {
+    return cache->result;
+  }
+  if (!Py_IS_TYPE(cls, &PyType_Type)) {
+    return PyObject_IsInstance(obj, cls);
+  }
+  int result =
+      spikeIsInstanceByType311(type, reinterpret_cast<PyTypeObject*>(cls));
+  if (result < 0) {
+    // The answer may depend on the instance; never cache it.
+    return PyObject_IsInstance(obj, cls);
+  }
+  // A pure function of (type, cls) as long as the type's MRO and its
+  // __class__ resolution stay put, both covered by the type's version tag.
+  // The MRO hit above never assigned one; the lookup does when it can.
+  if (!spikeTypeVersionValid311(type)) {
+    _PyType_Lookup(type, &_Py_ID(__class__));
+  }
+  if (!spikeTypeVersionValid311(reinterpret_cast<PyTypeObject*>(cls))) {
+    _PyType_Lookup(reinterpret_cast<PyTypeObject*>(cls), &_Py_ID(__class__));
+  }
+  if (spikeTypeVersionValid311(type) &&
+      spikeTypeVersionValid311(reinterpret_cast<PyTypeObject*>(cls))) {
+    cache->cls_version = reinterpret_cast<PyTypeObject*>(cls)->tp_version_tag;
+    cache->type = type;
+    cache->cls = cls;
+    cache->version = type->tp_version_tag;
+    cache->result = result;
+  }
+  return result;
+}
+
+namespace {
+// The version tag of cls's metatype when the metatype resolves
+// __instancecheck__ to type.__instancecheck__ (0 for `type` itself, whose
+// attributes cannot change), or -1 when the check may run other code.
+int64_t spikeDefaultInstanceCheckMeta311(PyObject* cls) {
+  PyTypeObject* meta = Py_TYPE(cls);
+  if (meta == &PyType_Type) {
+    return 0;
+  }
+  PyObject* type_instancecheck =
+      _PyType_Lookup(&PyType_Type, &_Py_ID(__instancecheck__));
+  if (type_instancecheck == nullptr) {
+    return -1;
+  }
+  if (_PyType_Lookup(meta, &_Py_ID(__instancecheck__)) != type_instancecheck ||
+      !spikeTypeVersionValid311(meta)) {
+    return -1;
+  }
+  return meta->tp_version_tag;
+}
+
+bool spikeIsInstanceGenHit311(
+    const JITRT_IsInstanceGenCache311* cache,
+    PyTypeObject* type,
+    PyObject* cls) {
+  if (cache->nkeys == 0 || type != cache->type ||
+      type->tp_version_tag != cache->version ||
+      !(type->tp_flags & Py_TPFLAGS_VALID_VERSION_TAG)) {
+    return false;
+  }
+  if (cache->is_tuple) {
+    if (!PyTuple_CheckExact(cls) || PyTuple_GET_SIZE(cls) != cache->nkeys) {
+      return false;
+    }
+    for (int i = 0; i < cache->nkeys; i++) {
+      if (PyTuple_GET_ITEM(cls, i) != cache->keys[i]) {
+        return false;
+      }
+    }
+  } else if (cls != cache->keys[0]) {
+    return false;
+  }
+  for (int i = 0; i < cache->nkeys; i++) {
+    if (!PyType_Check(cache->keys[i])) {
+      return false;
+    }
+    auto* key = reinterpret_cast<PyTypeObject*>(cache->keys[i]);
+    if (!spikeTypeVersionValid311(key) ||
+        key->tp_version_tag != cache->key_version[i]) {
+      return false;
+    }
+    uint32_t meta_version = cache->meta_version[i];
+    if (meta_version != 0) {
+      PyTypeObject* meta = Py_TYPE(cache->keys[i]);
+      if (meta->tp_version_tag != meta_version ||
+          !(meta->tp_flags & Py_TPFLAGS_VALID_VERSION_TAG)) {
+        return false;
+      }
+    }
+  }
+  return true;
+}
+} // namespace
+
+PyObject* JITRT_IsInstanceGen311(
+    JITRT_IsInstanceGenCache311* cache,
+    PyObject* obj,
+    PyObject* cls) {
+  PyTypeObject* type = Py_TYPE(obj);
+  if (spikeIsInstanceGenHit311(cache, type, cls)) {
+    return Py_NewRef(cache->result ? Py_True : Py_False);
+  }
+  // Collect the classes; a nested tuple, a non-type element, a union or an
+  // oversized tuple is answered by the generic path and never cached.
+  PyObject* keys[kIsInstanceGenMaxKeys311];
+  uint32_t meta_version[kIsInstanceGenMaxKeys311];
+  int nkeys = 0;
+  bool is_tuple = PyTuple_CheckExact(cls);
+  bool cacheable = true;
+  if (is_tuple) {
+    Py_ssize_t n = PyTuple_GET_SIZE(cls);
+    if (n < 1 || n > kIsInstanceGenMaxKeys311) {
+      cacheable = false;
+    } else {
+      nkeys = static_cast<int>(n);
+      for (int i = 0; i < nkeys; i++) {
+        keys[i] = PyTuple_GET_ITEM(cls, i);
+      }
+    }
+  } else {
+    nkeys = 1;
+    keys[0] = cls;
+  }
+  int result = 0;
+  for (int i = 0; cacheable && i < nkeys; i++) {
+    if (!PyType_Check(keys[i])) {
+      cacheable = false;
+      break;
+    }
+    int64_t meta = spikeDefaultInstanceCheckMeta311(keys[i]);
+    if (meta < 0) {
+      cacheable = false;
+      break;
+    }
+    meta_version[i] = static_cast<uint32_t>(meta);
+    auto* key = reinterpret_cast<PyTypeObject*>(keys[i]);
+    if (!spikeTypeVersionValid311(key)) {
+      _PyType_Lookup(key, &_Py_ID(__class__));
+    }
+    if (!spikeTypeVersionValid311(key)) {
+      cacheable = false;
+      break;
+    }
+    if (result == 0) {
+      // Same order as object_recursive_isinstance: the first class that
+      // answers True ends the scan.
+      int r = spikeIsInstanceByType311(
+          type, reinterpret_cast<PyTypeObject*>(keys[i]));
+      if (r < 0) {
+        // The answer may depend on the instance; never cache it.
+        cacheable = false;
+        break;
+      }
+      result = r;
+    }
+  }
+  if (!cacheable) {
+    int r = PyObject_IsInstance(obj, cls);
+    if (r < 0) {
+      return nullptr;
+    }
+    return Py_NewRef(r ? Py_True : Py_False);
+  }
+  if (!spikeTypeVersionValid311(type)) {
+    _PyType_Lookup(type, &_Py_ID(__class__));
+  }
+  if (spikeTypeVersionValid311(type)) {
+    // Keys borrow live operands. Identity plus non-reused type version tags
+    // prevents an address-reused class from matching a retired key.
+    for (int i = 0; i < nkeys; i++) {
+      cache->keys[i] = keys[i];
+      cache->key_version[i] =
+          reinterpret_cast<PyTypeObject*>(keys[i])->tp_version_tag;
+      cache->meta_version[i] = meta_version[i];
+    }
+    cache->type = type;
+    cache->version = type->tp_version_tag;
+    cache->result = result;
+    cache->nkeys = nkeys;
+    cache->is_tuple = is_tuple;
+  }
+  return Py_NewRef(result ? Py_True : Py_False);
+}
+
+namespace {
+PyObject*
+spikeGetAttrDefaultGeneric311(PyObject* obj, PyObject* name, PyObject* dflt) {
+  PyObject* result = nullptr;
+  int found = _PyObject_LookupAttr(obj, name, &result);
+  if (found < 0) {
+    return nullptr;
+  }
+  return found == 0 ? Py_NewRef(dflt) : result;
+}
+} // namespace
+
+PyObject* JITRT_GetAttrDefault311(
+    JITRT_GetAttrDefaultCache311* cache,
+    PyObject* obj,
+    PyObject* name,
+    PyObject* dflt) {
+  PyTypeObject* tp = Py_TYPE(obj);
+  if (tp == cache->type && name == cache->name &&
+      tp->tp_version_tag == cache->version &&
+      (tp->tp_flags & Py_TPFLAGS_VALID_VERSION_TAG)) {
+    if (!cache->slot) {
+      return spikeGetAttrDefaultGeneric311(obj, name, dflt);
+    }
+    PyObject* value = *reinterpret_cast<PyObject**>(
+        reinterpret_cast<char*>(obj) + cache->offset);
+    return Py_NewRef(value != nullptr ? value : dflt);
+  }
+  // The type's version tag covers its MRO dicts (so the descriptor found for
+  // the name) and its getattro slot (reassigned together with __getattr__
+  // and __getattribute__), hence both outcomes are a function of the type.
+  bool slot = false;
+  Py_ssize_t offset = 0;
+  if (tp->tp_getattro == PyObject_GenericGetAttr &&
+      PyUnicode_CheckExact(name)) {
+    // A member descriptor is a data descriptor, so the generic getattr
+    // calls it before looking at an instance dict; member_get reads the
+    // slot after the same type check and audit test as below.
+    PyObject* descr = _PyType_Lookup(tp, name);
+    if (descr != nullptr && Py_IS_TYPE(descr, &PyMemberDescr_Type)) {
+      PyMemberDef* member =
+          reinterpret_cast<PyMemberDescrObject*>(descr)->d_member;
+      if (member->type == T_OBJECT_EX && !(member->flags & PY_AUDIT_READ) &&
+          PyType_IsSubtype(tp, PyDescr_TYPE(descr))) {
+        slot = true;
+        offset = member->offset;
+      }
+    }
+  }
+  if (!spikeTypeVersionValid311(tp)) {
+    _PyType_Lookup(tp, name);
+  }
+  if (spikeTypeVersionValid311(tp)) {
+    cache->type = tp;
+    cache->version = tp->tp_version_tag;
+    cache->name = name;
+    cache->slot = slot;
+    cache->offset = offset;
+  }
+  if (!slot) {
+    return spikeGetAttrDefaultGeneric311(obj, name, dflt);
+  }
+  PyObject* value =
+      *reinterpret_cast<PyObject**>(reinterpret_cast<char*>(obj) + offset);
+  return Py_NewRef(value != nullptr ? value : dflt);
 }
 #endif
 

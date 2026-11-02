@@ -271,6 +271,83 @@ int JITRT_StoreSubscrCached311(
     PyObject* container,
     PyObject* key,
     PyObject* value);
+
+// SPIKE(ISINSTCACHE): per-site isinstance cache.  The answer for a receiver
+// type and a class depends only on the receiver type's MRO and its __class__
+// resolution (both covered by the type's version tag) as long as the class's
+// metatype is exactly `type` (no __instancecheck__ override), so one entry
+// keyed by (receiver type, version tag, class) replays it.
+struct JITRT_IsInstanceSiteCache311 {
+  PyTypeObject* type;
+  uint32_t version;
+  int32_t result;
+  PyObject* cls;
+  uint32_t cls_version;
+};
+int JITRT_IsInstanceCached311(
+    JITRT_IsInstanceSiteCache311* cache,
+    PyObject* obj,
+    PyObject* cls);
+
+// SPIKE(ISINSTGEN): per-site cache for the isinstance calls the inline type
+// test does not take: a class tuple, or a class operand whose type is not
+// known at compile time (a module attribute, a class with a custom
+// metatype).  The answer is replayed for the receiver type while that type's
+// version tag holds, provided every class is a type whose metatype resolves
+// __instancecheck__ to type.__instancecheck__ (checked on fill; a heap
+// metatype's version tag is replayed on every hit) and the receiver's
+// __class__ resolves to object's descriptor.  Class keys are borrowed and
+// checked against non-reused class version tags before their metadata is read.
+constexpr int kIsInstanceGenMaxKeys311 = 4;
+struct JITRT_IsInstanceGenCache311 {
+  PyTypeObject* type;
+  uint32_t version;
+  int32_t result;
+  int32_t nkeys;
+  // The keys came from a tuple operand (compared element-wise) rather than
+  // a single class operand (compared by identity).
+  int32_t is_tuple;
+  PyObject* keys[kIsInstanceGenMaxKeys311];
+  // Version tag of each key's metatype, or 0 when the metatype is `type`.
+  uint32_t meta_version[kIsInstanceGenMaxKeys311];
+  uint32_t key_version[kIsInstanceGenMaxKeys311];
+};
+// Returns a new reference to Py_True or Py_False, or NULL with an exception.
+PyObject* JITRT_IsInstanceGen311(
+    JITRT_IsInstanceGenCache311* cache,
+    PyObject* obj,
+    PyObject* cls);
+
+// SPIKE(GETATTRDFL): getattr(obj, name, default) for a constant name.  When
+// the name resolves on a generic-getattro type to an object slot member
+// (T_OBJECT_EX) of the receiver's class, an empty slot answers the default
+// without creating the AttributeError that the member getter raises and
+// _PyObject_LookupAttr then clears.  Every other case goes through
+// _PyObject_LookupAttr, the path builtin getattr takes for the default form.
+// The per-site entry records, for one receiver type and version tag, either
+// the slot offset or that the generic path applies, so a hit repeats no
+// type lookup.
+struct JITRT_GetAttrDefaultCache311 {
+  PyTypeObject* type;
+  PyObject* name;
+  uint32_t version;
+  // 1: `offset` is an object slot member; 0: use _PyObject_LookupAttr.
+  int32_t slot;
+  Py_ssize_t offset;
+};
+PyObject* JITRT_GetAttrDefault311(
+    JITRT_GetAttrDefaultCache311* cache,
+    PyObject* obj,
+    PyObject* name,
+    PyObject* dflt);
+
+// SPIKE(ISINSTFAST): PyObject_IsInstance with a cheap negative answer.  When
+// `cls` is an exact type (no metaclass __instancecheck__) and the object's
+// type resolves __class__ to object's own descriptor through the generic
+// getattr, a failed PyType_IsSubtype is the final answer; stock CPython
+// still performs a full __class__ attribute lookup (generic getattr +
+// descriptor call) on every False result.
+int JITRT_IsInstanceFast311(PyObject* obj, PyObject* cls);
 #endif
 // SPIKE(SLICEFAST): container[start:stop:step] / container[start:stop:step] =
 // value without materialising a slice object.  Exact list / tuple / str with a
@@ -292,6 +369,8 @@ PyThreadState* JITRT_AllocateAndLinkInterpreterFrameNoRef311(
     PyFunctionObject* func);
 void JITRT_UnlinkFrameNoRef311(PyThreadState* tstate);
 PyObject* JITRT_GetItem311(PyObject* container, PyObject* index);
+PyObject* JITRT_UnicodeEqualsBoxed311(PyObject* s1, PyObject* s2, int op);
+PyObject* JITRT_UnicodeContainsBoxed311(PyObject* haystack, PyObject* needle);
 #endif
 
 /*

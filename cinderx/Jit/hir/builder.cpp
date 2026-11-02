@@ -6291,15 +6291,32 @@ bool HIRBuilder::tryEmitLoadGlobal311(
   // from the snapshot preceding them in this block.
   tc.emitSnapshot();
 
+  // SPIKE(ISINSTFAST): pin static builtin types used as values so the
+  // simplifier can open isinstance(x, T). A LOAD_GLOBAL with the NULL-call
+  // bit set is a direct constructor call: pinning int there also narrows
+  // its result and introduces compact-long comparison guards for big ints.
+  static const bool spike_isinstfast =
+      Ci_SpikeGetenv("SPIKE_ISINSTFAST") != nullptr;
   if (from_builtins) {
     bool pin = false;
     if (value == reinterpret_cast<PyObject*>(&PyType_Type)) {
       pin = true;
+    } else if (
+        spike_isinstfast && !(bc_instr.oparg() & 1) &&
+        PyType_CheckExact(value) &&
+        !(reinterpret_cast<PyTypeObject*>(value)->tp_flags &
+          Py_TPFLAGS_HEAPTYPE)) {
+      pin = true;
     } else if (Py_IS_TYPE(value, &PyCFunction_Type)) {
       const char* mname =
           reinterpret_cast<PyCFunctionObject*>(value)->m_ml->ml_name;
+      // SPIKE(GETATTRDFL): getattr joins the pinned builtins so that the
+      // simplifier can open its default form.
+      static const bool spike_getattrdfl =
+          Ci_SpikeGetenv("SPIKE_GETATTRDFL") != nullptr;
       pin = mname != nullptr &&
-          (strcmp(mname, "len") == 0 || strcmp(mname, "isinstance") == 0);
+          (strcmp(mname, "len") == 0 || strcmp(mname, "isinstance") == 0 ||
+           (spike_getattrdfl && strcmp(mname, "getattr") == 0));
     }
     if (pin) {
       auto is_guard = tc.emit<GuardIs>(result, value, result);

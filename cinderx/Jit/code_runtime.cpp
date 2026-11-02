@@ -95,6 +95,7 @@ void CodeRuntime::releaseReferences() {
   std::unordered_set<ThreadedRef<>> refs;
 #if PY_VERSION_HEX < 0x030C0000
   std::vector<std::unique_ptr<JITRT_SubscrSiteCache311>> caches;
+  std::vector<std::shared_ptr<void>> predicate_caches;
 #endif
 #if PY_VERSION_HEX >= 0x030E0000 && defined(ENABLE_LIGHTWEIGHT_FRAMES)
   ThreadedRef<> tmp;
@@ -106,6 +107,7 @@ void CodeRuntime::releaseReferences() {
     // Release the cells and backing storage even when this cleared runtime
     // remains as an arena husk. Do this before dropping Python references.
     caches.swap(subscr_caches_311_);
+    predicate_caches.swap(predicate_caches_311_);
 #endif
 #if PY_VERSION_HEX >= 0x030E0000 && defined(ENABLE_LIGHTWEIGHT_FRAMES)
     tmp = std::move(reifier_);

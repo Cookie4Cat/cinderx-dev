@@ -74,6 +74,12 @@ class alignas(16) CodeRuntime {
   // Each lowering owns a separate cell. Its address remains stable until
   // the artifact's runtime references are released, including active frames.
   JITRT_SubscrSiteCache311* allocateSubscrCache311();
+  void retainPredicateCache311(const std::shared_ptr<void>& cell) {
+    predicate_caches_311_.push_back(cell);
+  }
+  size_t predicateCacheCount311() const {
+    return predicate_caches_311_.size();
+  }
   size_t subscrCacheCount311() const {
     return subscr_caches_311_.size();
   }
@@ -237,6 +243,7 @@ class alignas(16) CodeRuntime {
   BorrowedRef<PyDictObject> globals_;
 
 #if PY_VERSION_HEX < 0x030C0000
+  std::vector<std::shared_ptr<void>> predicate_caches_311_;
   CompiledFunction* compiled_function_{nullptr};
   std::vector<std::unique_ptr<JITRT_SubscrSiteCache311>> subscr_caches_311_;
 #endif

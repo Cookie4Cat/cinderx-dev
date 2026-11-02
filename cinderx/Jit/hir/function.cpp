@@ -14,7 +14,7 @@ namespace jit::hir {
 // implementations.
 #if !defined(_LIBCPP_VERSION) && !defined(WIN32)
 #if PY_VERSION_HEX < 0x030C0000
-static_assert(sizeof(Function) == 65 * kPointerSize);
+static_assert(sizeof(Function) == 72 * kPointerSize);
 #else
 static_assert(sizeof(Function) == 60 * kPointerSize);
 #endif
