@@ -2,6 +2,7 @@
 """Child programs for test_speculation_feedback_311 (CPython 3.11, execute
 mode).  Each case prints ``CASE_OK <case>`` when every assertion held."""
 
+import array
 import gc
 import math
 import sys
@@ -375,6 +376,353 @@ def case_lifetime():
         assert count() == baseline, (count(), baseline)
 
 
+INT_ARITHMETIC = """
+def add(a, b):
+    return a + b
+
+def sub(a, b):
+    return a - b
+
+def mul(a, b):
+    return a * b
+
+def iadd(a, b):
+    a += b
+    return a
+
+def isub(a, b):
+    a -= b
+    return a
+
+def imul(a, b):
+    a *= b
+    return a
+
+def floordiv_pow2(a, b):
+    return a // 2, a // 1024
+
+def mod_pow2(a, b):
+    return a % 8, a % 1024
+
+def band(a, b):
+    return a & b
+
+def bor(a, b):
+    return a | b
+
+def bxor(a, b):
+    return a ^ b
+
+def iand(a, b):
+    a &= b
+    return a
+
+def ior(a, b):
+    a |= b
+    return a
+
+def ixor(a, b):
+    a ^= b
+    return a
+
+def masked(a, b):
+    return ((a >> 3) & 0xFF) ^ b
+
+def truthy(a, b):
+    if a & b:
+        return 1
+    return 2
+
+def band_box(a, b):
+    return (a + 1) & (b - 1)
+
+def bor_box(a, b):
+    return (a * 3) | b
+
+def bxor_const(a, b):
+    return (a ^ 0x2AAAAAAA) ^ b
+
+def iand_box(a, b):
+    a += 1
+    a &= b
+    return a
+
+def truthy_const(a, b):
+    if a & 0x40:
+        return 1
+    return 2
+"""
+
+INT_SHIFTS = """
+def lshift(a, n):
+    return a << n
+
+def rshift(a, n):
+    return a >> n
+
+def ilshift(a, n):
+    a <<= n
+    return a
+
+def irshift(a, n):
+    a >>= n
+    return a
+
+def lshift_const(a, n):
+    return a << 5, a << 63
+
+def rshift_const(a, n):
+    return a >> 5, a >> 63
+
+def guarded_shift(a, n):
+    try:
+        return a << n
+    except ValueError:
+        return "negative"
+
+def lshift_box(a, n):
+    return (a + 1) << n
+
+def rshift_box(a, n):
+    return (a - 1) >> n
+"""
+
+
+class IntSub(int):
+    """An int subclass whose operators must never take an int fast path."""
+
+    def __and__(self, other):
+        return ("sub-and", int(self), other)
+
+    __rand__ = __and__
+
+    def __lshift__(self, other):
+        return ("sub-lshift", int(self), other)
+
+    def __add__(self, other):
+        return ("sub-add", int(self), other)
+
+    __radd__ = __add__
+
+
+class AndProtocol:
+    """A user type reached through the generic number protocol."""
+
+    def __and__(self, other):
+        return "and-protocol"
+
+    __rand__ = __and__
+
+
+# Digit boundaries of the 30-bit representation and of int64.
+INT_OPERANDS = [
+    0,
+    1,
+    -1,
+    7,
+    -7,
+    2**29,
+    2**30 - 1,
+    -(2**30 - 1),
+    2**30,
+    -(2**30),
+    2**59,
+    -(2**59),
+    2**60 - 1,
+    -(2**60 - 1),
+    2**60,
+    -(2**60),
+    2**63 - 1,
+    -(2**63),
+    2**64,
+    -(2**100),
+    True,
+    False,
+    IntSub(6),
+    1.5,
+    frozenset({1, 2}),
+    AndProtocol(),
+]
+
+SHIFT_COUNTS = [0, 1, 5, 29, 30, 31, 59, 60, 62, 63, 64, 65, 100, -1, -64,
+                True, IntSub(3), 1.5]
+
+
+def check_against_oracle(source, tag, warmups, second_operands):
+    oracle = build(source, f"{tag}-oracle")
+    names = [n for n in oracle if not n.startswith("__")]
+    entries = machine_code_entries()
+    for warm_name, warm_args in warmups.items():
+        compiled = build(source, f"{tag}-jit-{warm_name}")
+        for name in names:
+            func = compiled[name]
+            for i in range(WARMUP_CALLS):
+                # Mixed warm-up operands raise for the bitwise operators.
+                outcome(func, *warm_args[i % len(warm_args)])
+            compile_now(func)
+        for name in names:
+            func = compiled[name]
+            for a in INT_OPERANDS:
+                for b in second_operands:
+                    if not cinderjit.is_jit_compiled(func):
+                        # A blown fuse uncompiles; keep testing machine code.
+                        compile_now(func)
+                    expected = outcome(oracle[name], a, b)
+                    actual = outcome(func, a, b)
+                    assert same(expected, actual), (
+                        warm_name, name, a, b, expected, actual)
+    assert machine_code_entries() > entries
+
+
+def case_int_semantics():
+    """Unboxed int arithmetic, floor division and modulo by powers of two,
+    bitwise operators and shifts match the interpreter across digit and int64
+    boundaries, negatives, overflow into arbitrary precision, bools, int
+    subclasses, the user number protocol and raising operands."""
+    warmups = {
+        "int": [(3, 5), (7, 2), (-4, 9)],
+        "mixed": [(3, 5), (1.5, 2), (2**70, 3), (True, 1)],
+    }
+    check_against_oracle(INT_ARITHMETIC, "int", warmups, INT_OPERANDS)
+    warmups = {"int": [(3, 2), (-5, 7), (255, 1)]}
+    check_against_oracle(INT_SHIFTS, "shift", warmups, SHIFT_COUNTS)
+
+
+def case_int_fuse():
+    """An unboxed int operation deopts on an operand it cannot handle, and a
+    site that keeps doing so is recompiled with the generic operation."""
+    for source, good, good_result, bad, result in (
+        ("def op(a, b):\n    return a & 0xFF\n",
+         (6, 3), 6, (2**70 + 5, 0), 5),
+        ("def op(a, b):\n    return a + b\n",
+         (6, 3), 9, (2**40, 1), 2**40 + 1),
+    ):
+        op = build(source, "int-fuse")["op"]
+        for _ in range(WARMUP_CALLS):
+            op(*good)
+        compile_now(op)
+        before = organic_deopts()
+        for _ in range(8):
+            assert op(*bad) == result
+        assert organic_deopts() - before == 8, (source, organic_deopts() - before)
+        if not cinderjit.is_jit_compiled(op):
+            compile_now(op)
+        after_fuse = organic_deopts()
+        entries = machine_code_entries()
+        for _ in range(100):
+            assert op(*bad) == result
+            assert op(*good) == good_result
+        assert organic_deopts() == after_fuse, (source, organic_deopts() - after_fuse)
+        assert machine_code_entries() - entries >= 100
+
+    # A constant that does not fit in int64 leaves the operation generic: an
+    # operand of any type runs without deoptimizing.
+    big = build("def big(a):\n    return a & 0x10000000000000000000\n", "int-big")["big"]
+    for _ in range(WARMUP_CALLS):
+        big(5)
+    compile_now(big)
+    before = organic_deopts()
+    for _ in range(20):
+        assert big(AndProtocol()) == "and-protocol"
+        assert big(2**70 + 1) == 2**70 & 0x10000000000000000000
+    assert organic_deopts() == before, organic_deopts() - before
+
+
+def case_int_wide_operands():
+    """Ints of unknown origin may be arbitrarily wide, so an operator with no
+    small-int operand stays generic: 128-bit masks never deoptimize."""
+    source = """
+def masked(address, mask):
+    packed = int(address)
+    return (packed & int(mask)) != packed
+
+class Net:
+    def __init__(self, ip):
+        self._ip = ip
+
+    def within(self, mask):
+        return self._ip & mask, self._ip ^ mask
+"""
+    ns = build(source, "int-wide")
+    masked, net = ns["masked"], ns["Net"](2**100 + 7)
+    for _ in range(WARMUP_CALLS):
+        masked(3, 1)
+        net.within(1)
+    compile_now(masked)
+    compile_now(ns["Net"].within)
+    before = organic_deopts()
+    entries = machine_code_entries()
+    ip = net._ip
+    for address, mask in ((2**100, 2**128 - 1), (2**100 + 1, 2**100),
+                          (-2**100, -1), (2**32 - 1, 2**32 - 1), (5, 4)):
+        assert masked(address, mask) == ((address & mask) != address)
+        assert net.within(mask) == (ip & mask, ip ^ mask), mask
+    assert organic_deopts() == before, organic_deopts() - before
+    assert machine_code_entries() - entries == 10
+
+
+def case_int_slow_arm_identity():
+    """An int kept on registers that also reaches the generic arm of an
+    array.array store is passed there as the same object a later deopt
+    rebuilds the local from: `is` keeps its interpreter result."""
+    source = """
+def store(c, i, n, z):
+    j = i * n + 1
+    c[j] = 0
+    return j + z
+"""
+
+    class Rec:
+        key = None
+
+        def __setitem__(self, key, value):
+            Rec.key = key
+
+    class Probe:
+        def __radd__(self, other):
+            return other is Rec.key
+
+    store = build(source, "int-identity")["store"]
+    arr = array.array("l", [0] * 4000)
+    for _ in range(WARMUP_CALLS):
+        store(arr, 30, 30, 1)
+    compile_now(store)
+    entries = machine_code_entries()
+    assert store(Rec(), 30, 30, Probe()) is True
+    assert machine_code_entries() - entries == 1
+
+
+def case_int_deopt_values():
+    """A deopt after unboxed intermediates rebuilds them exactly: the boxes
+    the JIT never allocated are recreated from the register values."""
+    source = """
+def chain(a, b, c):
+    x = (a << 4) | b
+    y = x ^ c
+    return x, y
+
+def index(i, n, c):
+    j = i * n + 1
+    return j, j + c
+"""
+    oracle = build(source, "remat-oracle")
+    compiled = build(source, "remat-jit")
+    for name, warm in (("chain", (3, 1, 2)), ("index", (3, 4, 5))):
+        func = compiled[name]
+        for _ in range(WARMUP_CALLS):
+            func(*warm)
+        compile_now(func)
+        for args in ((3, 1, 2**100), (3, 1, IntSub(2)), (3, 1, 1.5),
+                     (2**58, 3, 2**100), (2**59, 3, 1), (-(2**58), -1, 2**100),
+                     (2**29, 2**29, 2**100), (-(2**29), 2**29, 1.5),
+                     (2**30, 2, 1)):
+            if not cinderjit.is_jit_compiled(func):
+                compile_now(func)
+            expected = outcome(oracle[name], *args)
+            actual = outcome(func, *args)
+            assert same(expected, actual), (name, args, expected, actual)
+
+
 CASES = {
     "forced": case_forced,
     "semantics": case_semantics,
@@ -383,6 +731,11 @@ CASES = {
     "exc_edge": case_exc_edge,
     "identity": case_identity,
     "lifetime": case_lifetime,
+    "int_semantics": case_int_semantics,
+    "int_fuse": case_int_fuse,
+    "int_deopt_values": case_int_deopt_values,
+    "int_wide_operands": case_int_wide_operands,
+    "int_slow_arm_identity": case_int_slow_arm_identity,
 }
 
 

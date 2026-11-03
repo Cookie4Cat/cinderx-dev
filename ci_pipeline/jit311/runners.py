@@ -625,9 +625,15 @@ def stdlib_canary_runner(*, judges: list[Judge] | None = None) -> RunnerSpec:
     # site (3 deopts at cause 3) instead of the later one (1 at cause 19).
     # Every one of them is a per-site numeric speculation guard, so each site
     # stops at its fuse; the retry opt-out total becomes 223.
+    # The compact-int and bitwise speculation adds 2 GuardFailure deopts at
+    # enum _simple_enum convert_class, bounded by its fuse, and re/_parser.py
+    # SubPattern.getwidth's three sites move from 3/2/27 to 5/8/19 (same
+    # total).  Bitwise operators on two ints of unknown origin stay generic,
+    # so ipaddress's 128-bit masks do not deopt.  The retry opt-out total
+    # becomes 225.
     # Preserve the exact total AND the independently attributed site/reason
     # fingerprint; equal totals must not hide a different failure path.
-    default = execute_holds(expected_organic_deopts=287) + [
+    default = execute_holds(expected_organic_deopts=289) + [
         expect("compile_requests", ">", 0),
         expect("target_modules_attempted", "==", 72),
     ]

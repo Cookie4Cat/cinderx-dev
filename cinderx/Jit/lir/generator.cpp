@@ -2703,7 +2703,15 @@ LIRGenerator::TranslatedBlock LIRGenerator::TranslateOneBasicBlock(
                 helper = reinterpret_cast<uint64_t>(JITRT_ShiftLeft32);
                 break;
               case 4:
-                helper = reinterpret_cast<uint64_t>(JITRT_ShiftLeft64);
+                // SPIKE(INTBITSPEC): aarch64 shifts take the count in a
+                // register (its low six bits); the helper only exists for
+                // the x86-64 %cl constraint.
+                if (codegen::arch::kBuildArch ==
+                    codegen::arch::Arch::kAarch64) {
+                  op = Instruction::kLShift;
+                } else {
+                  helper = reinterpret_cast<uint64_t>(JITRT_ShiftLeft64);
+                }
                 break;
             }
             break;
@@ -2727,7 +2735,12 @@ LIRGenerator::TranslatedBlock LIRGenerator::TranslateOneBasicBlock(
                 helper = reinterpret_cast<uint64_t>(JITRT_ShiftRight32);
                 break;
               case 4:
-                helper = reinterpret_cast<uint64_t>(JITRT_ShiftRight64);
+                if (codegen::arch::kBuildArch ==
+                    codegen::arch::Arch::kAarch64) {
+                  op = Instruction::kRShift;
+                } else {
+                  helper = reinterpret_cast<uint64_t>(JITRT_ShiftRight64);
+                }
                 break;
             }
             break;

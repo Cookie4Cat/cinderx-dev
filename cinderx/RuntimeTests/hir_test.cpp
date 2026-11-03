@@ -17,6 +17,7 @@
 #include "cinderx/Jit/hir/inliner.h"
 #include "cinderx/Jit/hir/parser.h"
 #include "cinderx/Jit/hir/phi_elimination.h"
+#include "cinderx/Jit/hir/primitive_box_remat.h"
 #include "cinderx/Jit/hir/printer.h"
 #include "cinderx/Jit/hir/refcount_insertion.h"
 #include "cinderx/Jit/hir/simplify.h"
@@ -27,6 +28,7 @@
 
 #include <cwchar>
 #include <initializer_list>
+#include <sstream>
 #include <string>
 #include <utility>
 #include <vector>
@@ -752,6 +754,57 @@ fun foo {
 }
 )";
   EXPECT_EQ(HIRPrinter{}.ToString(*func), expected);
+}
+
+TEST(RemoveUnreachableInstructions, RefinedTypeOnlyReachesBlocksItDominates) {
+  // bb 4 is unreachable, so the type check in bb 1 becomes a branch to bb 3
+  // behind a RefineType placed in bb 1.  bb 3 is also entered from bb 2,
+  // where nothing refined v0: its use must keep v0, not the RefineType that
+  // does not dominate it.
+  const char* hir = R"(fun test {
+  bb 0 {
+    v0 = LoadArg<0>
+    v1 = LoadArg<1>
+    CondBranch<1, 2> v1
+  }
+
+  bb 1 (preds 0) {
+    CondBranchCheckType<3, 4, LongExact> v0
+  }
+
+  bb 2 (preds 0) {
+    Branch<3>
+  }
+
+  bb 3 (preds 1, 2) {
+    Return v0
+  }
+
+  bb 4 (preds 1) {
+    v2:Bottom = LoadConst<Bottom>
+    Return v2
+  }
+}
+)";
+
+  std::unique_ptr<Function> func = HIRParser{}.ParseHIR(hir);
+  ASSERT_NE(func, nullptr);
+
+  reflowTypes(*func);
+  ASSERT_TRUE(removeUnreachableInstructions(*func));
+  auto hir_text = HIRPrinter{}.ToString(*func);
+  ASSERT_EQ(countOpcode(*func, Opcode::kCondBranchCheckType), 0) << hir_text;
+  ASSERT_EQ(countOpcode(*func, Opcode::kReturn), 1) << hir_text;
+
+  std::ostringstream err;
+  EXPECT_TRUE(checkFunc(*func, err)) << err.str() << hir_text;
+  for (const auto& block : func->cfg.blocks) {
+    for (const auto& instr : block) {
+      if (instr.IsReturn()) {
+        EXPECT_TRUE(instr.GetOperand(0)->instr()->IsLoadArg()) << hir_text;
+      }
+    }
+  }
 }
 
 template <class T>
@@ -1624,7 +1677,16 @@ def test(a, b, c):
   EXPECT_FALSE(Ci_SpikeNoFloatGuard311(code, ops[0]));
   Ci_SpikeFloatGuardFail311(code, ops[0]);
   EXPECT_TRUE(Ci_SpikeNoFloatGuard311(code, ops[0]));
-  // The other site in the same code is untouched.
+  // The other site in the same code, and the compact-long fuse of the same
+  // site, are untouched.
+  EXPECT_FALSE(Ci_SpikeNoFloatGuard311(code, ops[1]));
+  EXPECT_FALSE(Ci_SpikeNoLongSpec311(code, ops[0]));
+
+  Ci_SpikeLongSpecRegister311(code, ops[1]);
+  for (int i = 0; i < 8; ++i) {
+    Ci_SpikeLongSpecGuardFail311(code, ops[1]);
+  }
+  EXPECT_TRUE(Ci_SpikeNoLongSpec311(code, ops[1]));
   EXPECT_FALSE(Ci_SpikeNoFloatGuard311(code, ops[1]));
 }
 
@@ -1671,6 +1733,128 @@ def test(zero):
       }
     }
   }
+}
+
+namespace {
+
+// The operators still lowered to the generic BinaryOp.  (Counting
+// IntBinaryOp kinds says nothing: unboxing an int is itself a sequence of
+// and/or/xor/shift register operations.)
+std::vector<BinaryOpKind> genericBinaryOps(const Function& func) {
+  std::vector<BinaryOpKind> ops;
+  for (const auto& block : func.cfg.blocks) {
+    for (const auto& instr : block) {
+      if (instr.IsBinaryOp()) {
+        ops.push_back(static_cast<const BinaryOp&>(instr).op());
+      }
+    }
+  }
+  return ops;
+}
+
+std::unique_ptr<Function> simplified(std::unique_ptr<Function> irfunc) {
+  if (irfunc != nullptr) {
+    SSAify{}.Run(*irfunc);
+    reflowTypes(*irfunc);
+    Simplify{}.Run(*irfunc);
+  }
+  return irfunc;
+}
+
+} // namespace
+
+TEST_F(HIRBuildTest, IntBitwiseChainRunsOnRegisters311) {
+  const char* src = R"(
+def test(a, b):
+    return ((a >> 3) & 255) ^ b
+)";
+  Ref<PyFunctionObject> func(compileAndGet(src, "test"));
+  ASSERT_NE(func, nullptr);
+  auto irfunc = simplified(buildHIR(func));
+  ASSERT_NE(irfunc, nullptr);
+  auto hir = fullPrinter().ToString(*irfunc);
+  // No generic operation is left: the three operators run on registers
+  // behind exact-int guards on the two unknown operands.
+  EXPECT_TRUE(genericBinaryOps(*irfunc).empty()) << hir;
+  EXPECT_EQ(countOpcode(*irfunc, Opcode::kGuardType), 2) << hir;
+
+  // The intermediate boxes only feed frame states; deopt re-creates them,
+  // so only the returned value is allocated.
+  PrimitiveBoxRemat{}.Run(*irfunc);
+  hir = fullPrinter().ToString(*irfunc);
+  EXPECT_EQ(countOpcode(*irfunc, Opcode::kPrimitiveBox), 1) << hir;
+}
+
+TEST_F(HIRBuildTest, IntBitwiseStaysGenericOutsideInt64311) {
+  // A constant operand that does not fit in int64 keeps the generic path.
+  const char* src = R"(
+def test(a):
+    return a & 0x10000000000000000000
+)";
+  Ref<PyFunctionObject> func(compileAndGet(src, "test"));
+  ASSERT_NE(func, nullptr);
+  auto irfunc = simplified(buildHIR(func));
+  ASSERT_NE(irfunc, nullptr);
+  auto hir = fullPrinter().ToString(*irfunc);
+  EXPECT_EQ(genericBinaryOps(*irfunc), std::vector{BinaryOpKind::kAnd}) << hir;
+  EXPECT_EQ(countOpcode(*irfunc, Opcode::kGuardType), 0) << hir;
+}
+
+TEST_F(HIRBuildTest, IntBitwiseStaysGenericWithoutSmallIntEvidence311) {
+  // Neither operand is a constant or the result of an int operation, so
+  // either may be arbitrarily wide (`int(a) & int(b)`): no guard is emitted.
+  const char* src = R"(
+def test(a, b):
+    return (a & b, a << b, a ^ b)
+)";
+  Ref<PyFunctionObject> func(compileAndGet(src, "test"));
+  ASSERT_NE(func, nullptr);
+  auto irfunc = simplified(buildHIR(func));
+  ASSERT_NE(irfunc, nullptr);
+  auto hir = fullPrinter().ToString(*irfunc);
+  EXPECT_EQ(
+      genericBinaryOps(*irfunc),
+      (std::vector{
+          BinaryOpKind::kAnd, BinaryOpKind::kLShift, BinaryOpKind::kXor}))
+      << hir;
+  EXPECT_EQ(countOpcode(*irfunc, Opcode::kGuardType), 0) << hir;
+  EXPECT_EQ(countOpcode(*irfunc, Opcode::kGuard), 0) << hir;
+}
+
+TEST_F(HIRBuildTest, IntBitwiseSiteFuseRestoresGenericOperation311) {
+  const char* src = R"(
+def test(a, b):
+    return (a & 15) | (b >> 2)
+)";
+  Ref<PyFunctionObject> func(compileAndGet(src, "test"));
+  ASSERT_NE(func, nullptr);
+  auto code = BorrowedRef<PyCodeObject>{func->func_code};
+  ASSERT_NE(codeExtra(code), nullptr);
+  std::vector<int64_t> ops;
+  for (const auto& instr : BytecodeInstructionBlock{code}) {
+    if (instr.opcode() == BINARY_OP) {
+      ops.push_back(instr.baseOffset().value());
+    }
+  }
+  ASSERT_EQ(ops.size(), 3);
+
+  auto before = simplified(buildHIR(func));
+  ASSERT_NE(before, nullptr);
+  EXPECT_TRUE(genericBinaryOps(*before).empty())
+      << fullPrinter().ToString(*before);
+
+  // Blow the fuse of the `&` site only: that operator goes back to the
+  // generic operation, the other two stay on registers (`|` still has the
+  // unboxed `b >> 2` as its small-int evidence).
+  Ci_SpikeLongSpecRegister311(code, ops[0]);
+  for (int i = 0; i < 8; ++i) {
+    Ci_SpikeLongSpecGuardFail311(code, ops[0]);
+  }
+  ASSERT_TRUE(Ci_SpikeNoLongSpec311(code, ops[0]));
+  auto after = simplified(buildHIR(func));
+  ASSERT_NE(after, nullptr);
+  auto hir = fullPrinter().ToString(*after);
+  EXPECT_EQ(genericBinaryOps(*after), std::vector{BinaryOpKind::kAnd}) << hir;
 }
 
 TEST_F(HIRBuildTest, NoArgSuperMethodCall311LowersToLoadMethodSuper) {

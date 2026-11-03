@@ -6379,6 +6379,7 @@ struct NumericSpecSiteFuse311 {
 };
 struct NumericSpecCodeState311 {
   NumericSpecSiteFuse311 float_guard;
+  NumericSpecSiteFuse311 long_guard;
   // {hits, misses} per float diamond site (SPIKE_FLOATSPEC=all).  Compiled
   // code bumps hits through the cell's address: map nodes do not move on
   // rehash, and the cells die only with the code object, after its last
@@ -7791,7 +7792,7 @@ void Ci_ExcEdgeDeopt311(
   jit::recompileCodeForExcEdge311(code, BorrowedRef<PyFunctionObject>{func});
 }
 
-// SPIKE(FLOATSPEC, BINTYPED): the per-site numeric speculation
+// SPIKE(FLOATSPEC, LONGSPEC, BINTYPED): the per-site numeric speculation
 // fuses declared in jit_rt.h; the state lives in jit::s_numeric_spec_311.
 namespace {
 // A guard that has failed this often at one site is recompiled away there.
@@ -7969,6 +7970,30 @@ extern "C" void Ci_SpikeFloatSpecMiss311(
   jit::s_numeric_spec_recompiling_311 = true;
   SCOPE_EXIT(jit::s_numeric_spec_recompiling_311 = false);
   recompileCodeForNumericSpec311(code, "float-spec-miss", bc_offset, misses);
+}
+
+// SPIKE(LONGSPEC): a compact-long guard that keeps failing at one site
+// (pyflate's `(1 << n) - 1`: the shift result is never compact) is recompiled
+// without the speculation at that site only.  The per-code despec fuse would
+// instead drop every specialisation in the function and land below the
+// unspeculated baseline.
+extern "C" void Ci_SpikeLongSpecRegister311(
+    PyCodeObject* code,
+    int64_t bc_offset) {
+  registerGuardSite311(
+      &jit::NumericSpecCodeState311::long_guard, code, bc_offset);
+}
+
+extern "C" int Ci_SpikeNoLongSpec311(PyCodeObject* code, int64_t bc_offset) {
+  return guardSiteTakenDown311(
+      &jit::NumericSpecCodeState311::long_guard, code, bc_offset);
+}
+
+extern "C" void Ci_SpikeLongSpecGuardFail311(
+    PyCodeObject* code,
+    int64_t bc_offset) {
+  guardFailed311(
+      &jit::NumericSpecCodeState311::long_guard, "long-guard", code, bc_offset);
 }
 
 // SPIKE(BINTYPED): a per-site fuse for the *_FLOAT binary-op guards.  A

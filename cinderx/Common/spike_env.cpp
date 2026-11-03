@@ -73,6 +73,8 @@ static const char* const kSimDefaults[] = {
     "SPIKE_BINTYPED=1",
     "SPIKE_FLOATFL=1",
     "SPIKE_FLOATFLASM=1",
+    "SPIKE_LONGSPEC=1",
+    "SPIKE_INTBITSPEC=1",
 #endif
     nullptr,
 };

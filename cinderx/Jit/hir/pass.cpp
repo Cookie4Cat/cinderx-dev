@@ -875,8 +875,21 @@ bool removeUnreachableInstructions(Function& func) {
             std::unordered_set<Instr*>& instrs_using_reg = uses->second;
             const std::unordered_set<const BasicBlock*>& dom_set =
                 dom.getBlocksDominatedBy(target);
+            // The RefineType sits in the branch's block, so it only reaches
+            // uses in blocks that block dominates as well.  `target` may
+            // have other predecessors (a subscript diamond's shared generic
+            // arm, reached from several failed checks): a use there that is
+            // dominated by `target` but not by this block would otherwise be
+            // rewritten to a definition that does not dominate it -- and
+            // once this block is itself found unreachable and deleted, the
+            // use dangles (test_range.test_slice compiled `list(r)[slice]`
+            // into a list fast path keyed on the dangling, Bottom-typed
+            // register and crashed in CopyPropagation).
+            const std::unordered_set<const BasicBlock*>& branch_dom_set =
+                dom.getBlocksDominatedBy(cond_branch->block());
             for (Instr* instr : instrs_using_reg) {
-              if (dom_set.contains(instr->block())) {
+              if (dom_set.contains(instr->block()) &&
+                  branch_dom_set.contains(instr->block())) {
                 instr->ReplaceUsesOf(operand, refined_value);
               }
             }

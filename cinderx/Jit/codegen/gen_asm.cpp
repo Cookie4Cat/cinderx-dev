@@ -16,6 +16,7 @@
 #include "cinderx/Common/extra-py-flags.h"
 #include "cinderx/Common/log.h"
 #include "cinderx/Common/py-portability.h"
+#include "cinderx/Common/spike_env.h"
 #include "cinderx/Common/util.h"
 #include "cinderx/Interpreter/interpreter.h"
 #include "cinderx/Jit/bytecode.h"
@@ -489,9 +490,19 @@ DeoptResult prepareForDeopt(
   // Feed only organic guard failures to the per-site speculation fuses.
   // The forced flag is consumed in this function and is no longer available
   // when resumeInInterpreter runs.
+  // SPIKE(INTBITSPEC) registers its bitwise sites with the same fuse.
   if (deopt_meta.reason == DeoptReason::kGuardFailure &&
       !is_instrumentation_deopt && !is_forced_deopt) {
-    // SPIKE(BINTYPED): the *_FLOAT binary-op guard sites.
+    static const bool longspec = Ci_SpikeGetenv("SPIKE_LONGSPEC") != nullptr ||
+        Ci_SpikeGetenv("SPIKE_INTBITSPEC") != nullptr;
+    if (longspec) {
+      const DeoptFrameMetadata& fm = deopt_meta.innermostFrame();
+      if (fm.code != nullptr) {
+        Ci_SpikeLongSpecGuardFail311(
+            fm.code, BCOffset(fm.cause_instr_idx).value());
+      }
+    }
+    // SPIKE(BINTYPED): same for the *_FLOAT binary-op guard sites.
     static const bool bintyped = Ci_SpikeGetenv("SPIKE_BINTYPED") != nullptr;
     if (bintyped) {
       const DeoptFrameMetadata& fm = deopt_meta.innermostFrame();

@@ -2,7 +2,7 @@
   "format": "cp311-stdlib-canary-deopts-v1",
   "python": "3.11.6",
   "baseline_source": "3e26a6961966feef946cfda39a784cbdcf296c08",
-  "total": 287,
+  "total": 289,
   "sites": [
     {
       "filename": "<frozen _collections_abc>",
@@ -117,6 +117,14 @@
       "count": 3
     },
     {
+      "filename": "enum.py",
+      "qualname": "_simple_enum.<locals>.convert_class",
+      "reason": "GuardFailure",
+      "cause_offset": 1051,
+      "resume_offset": 2102,
+      "count": 2
+    },
+    {
       "filename": "functools.py",
       "qualname": "update_wrapper",
       "reason": "UnhandledException",
@@ -162,7 +170,7 @@
       "reason": "GuardFailure",
       "cause_offset": 126,
       "resume_offset": 252,
-      "count": 3
+      "count": 5
     },
     {
       "filename": "re/_parser.py",
@@ -170,7 +178,7 @@
       "reason": "GuardFailure",
       "cause_offset": 218,
       "resume_offset": 436,
-      "count": 2
+      "count": 8
     },
     {
       "filename": "re/_parser.py",
@@ -178,7 +186,7 @@
       "reason": "GuardFailure",
       "cause_offset": 283,
       "resume_offset": 566,
-      "count": 27
+      "count": 19
     },
     {
       "filename": "re/_parser.py",

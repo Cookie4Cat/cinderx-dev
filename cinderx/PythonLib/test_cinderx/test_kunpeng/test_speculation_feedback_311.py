@@ -1,5 +1,5 @@
 # Copyright (c) Meta Platforms, Inc. and affiliates.
-"""CPython 3.11 numeric speculation: float fast paths, per-site fuses."""
+"""CPython 3.11 numeric speculation: float and int fast paths, per-site fuses."""
 
 import os
 import sys
@@ -61,6 +61,21 @@ class SpeculationFeedback311Tests(unittest.TestCase):
                     PYTHONJITMULTITHREADEDCOMPILETEST="1",
                     PYTHONJITBATCHCOMPILEWORKERS=str(workers),
                 )
+
+    def test_int_operations_match_interpreter(self):
+        self._run("int_semantics")
+
+    def test_failing_int_site_recompiles_generic(self):
+        self._run("int_fuse")
+
+    def test_deopt_rebuilds_unboxed_int_values(self):
+        self._run("int_deopt_values")
+
+    def test_wide_int_operands_stay_generic(self):
+        self._run("int_wide_operands")
+
+    def test_slow_arm_keeps_int_operand_identity(self):
+        self._run("int_slow_arm_identity")
 
 
 if __name__ == "__main__":
