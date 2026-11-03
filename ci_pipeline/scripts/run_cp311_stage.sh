@@ -262,6 +262,7 @@ test_kunpeng() {
     test_cinderx.test_kunpeng.test_scheduling_policy_311 \
     test_cinderx.test_kunpeng.test_generator_close_semantics_311 \
     test_cinderx.test_kunpeng.test_subscript_cache_lifetime_311 \
+    test_cinderx.test_kunpeng.test_quickened_count_311 \
     test_cinderx.test_kunpeng.test_exception_handler_semantics_311 \
     test_cinderx.test_kunpeng.test_execute_surface_coverage_311 \
     test_cinderx.test_kunpeng.test_instrumentation_polls_311 \
@@ -333,7 +334,7 @@ driver_selftests() {
     ci_pipeline/test_execution_report.py \
     ci_pipeline/test_jit311_report_reasons.py \
     ci_pipeline/test_lifecycle_acceptance.py \
-    ci_pipeline/test_quickened_artifact.py \
+    ci_pipeline/test_refleak_verdict.py \
     ci_pipeline/test_runtime_transition_report.py \
     ci_pipeline/test_semantic_naming.py \
     ci_pipeline/test_shutdown_stability.py \

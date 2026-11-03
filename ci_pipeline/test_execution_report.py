@@ -38,14 +38,18 @@ class ExecutionReportTest(unittest.TestCase):
                 {
                     "PYTHONPATH": "/untrusted",
                     "CINDERX_JIT_MODE": "shadow",
+                    "CINDERX_JIT_STARTUP_GRACE_MS": "60000",
                 },
                 clear=False,
             ):
                 base = runner._base_env()
                 staged = runner._stage_env()
+                product = runner._product_env()
 
         self.assertNotIn("PYTHONPATH", base)
         self.assertNotIn("CINDERX_JIT_MODE", base)
+        self.assertNotIn("CINDERX_JIT_STARTUP_GRACE_MS", staged)
+        self.assertEqual(product["CINDERX_JIT_STARTUP_GRACE_MS"], "0")
         self.assertEqual(
             staged["PYTHONPATH"].split(os.pathsep),
             [str(runner.stage)],

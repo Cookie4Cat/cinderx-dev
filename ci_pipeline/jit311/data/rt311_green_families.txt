@@ -25,6 +25,7 @@ LIRTargetSelectOperandTest
 LIRTest
 LIRTypeTest
 LinearScanAllocatorTest
+QuickenedCount311Test
 RemoveTrampolineBlocksTest
 RemoveUnreachableBlocks
 SchedulingPolicyBuildTest

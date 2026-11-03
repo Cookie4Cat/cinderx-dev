@@ -5,6 +5,21 @@
 这里维护 ARM64 Linux CPython 3.11 和 3.14 CinderX JIT 的本地门禁流程。入口脚本是
 `ci_pipeline/run_gate.py`，suite 配置位于 `ci_pipeline/suites/*.toml`。
 
+## CPython 3.11 的严格 quickening 检查
+
+CinderX 快速化现在记入 CPython 原生 quickened 计数，由原生代码对象析构配对扣减。
+缓存的 `sys._getquickenedcount` 引用也看到同一计数。正式回归覆盖两种 evaluator、
+循环引用和保留 code、生成器、JIT 退役、tracing、递归及分配失败。
+
+Daily 要求每个模块原始 Py_DEBUG `-R 10:3` 直接成功。任何 reference、memory-block
+或 FD 泄漏报告都失败，不再有计数伪差豁免或成功复跑替代原始失败。
+标准库导入 canary 同时核对 253 次自然去优化及完整站点/原因指纹。
+该导入覆盖测试关闭启动宽限期，保留默认的有界泛化重试；关闭重试的对照回归要求
+精确恢复原有 189 次事件及其指纹。产品调度测试仍验证正常启动宽限期。
+编译执行及生命周期探针同样关闭宽限期，以验证目标路径立即执行；refleak 的构建
+自检显式编译探针，原始 `-R` worker 继续提供独立的实际执行证明。
+`-R` worker 关闭宽限期，使编译从十轮预热开始即可收敛；采样轮数和泄漏判定不变。
+
 ## 软件依赖
 
 运行 `run_gate.py` 前，需要先准备目标 Python、编译工具链、CMake 和测试工具。`pr

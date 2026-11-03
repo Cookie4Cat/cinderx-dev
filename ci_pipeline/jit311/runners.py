@@ -130,6 +130,7 @@ class RunnerSpec:
     expect_stderr_contains: str | None = None
     timeout: int = 300
     target_modules_attempted: int = 0
+    deopt_manifest: Path | None = None
 
 
 def _env_assertions(asserted_env: dict[str, str]) -> str:
@@ -158,7 +159,23 @@ def run(spec: RunnerSpec, python: str | None = None) -> RunResult:
         env.update(spec.env)
         env["JIT311_REPORT_PATH"] = report_path
         env["JIT311_REPO_ROOT"] = str(REPO_ROOT)
-        source = CHILD_PREAMBLE + _env_assertions(spec.asserted_env)
+        env.pop("JIT311_DEOPT_PATH", None)
+        deopt_path = Path(tmp) / "deopts.json"
+        if spec.deopt_manifest is not None:
+            env["JIT311_DEOPT_PATH"] = str(deopt_path)
+        preamble = CHILD_PREAMBLE
+        if spec.deopt_manifest is not None:
+            # Construct this in the parent: extra os.environ lookups after
+            # native initialization would themselves change the import canary.
+            preamble = preamble.replace(
+                "import _cinderx\n", "import _cinderx\nimport cinderjit\n"
+                "cinderjit._jit311_reset_transition_ledger()\n", 1)
+            preamble = preamble.replace(
+                '    with open(os.environ["JIT311_REPORT_PATH"], "w") as fp:',
+                '    with open(os.environ["JIT311_DEOPT_PATH"], "w") as fp:\n'
+                '        json.dump(_cinderjit_module._jit311_transition_ledger(), fp)\n'
+                '    with open(os.environ["JIT311_REPORT_PATH"], "w") as fp:', 1)
+        source = preamble + _env_assertions(spec.asserted_env)
         source += spec.payload
         try:
             proc = subprocess.run(
@@ -204,6 +221,14 @@ def run(spec: RunnerSpec, python: str | None = None) -> RunResult:
             f"report schema: {error}"
             for error in _validate_report_schema(snap)
         )
+        if spec.deopt_manifest is not None:
+            from ci_pipeline.jit311.deopt_fingerprint import check
+            try:
+                ledger = json.loads(deopt_path.read_text())
+                manifest = json.loads(spec.deopt_manifest.read_text())
+                errors.extend(check(ledger, manifest, snap.get("organic_deopt_hits")))
+            except (OSError, ValueError, TypeError) as exc:
+                errors.append(f"deopt fingerprint unavailable: {exc}")
         for judge in spec.judges:
             errors.extend(judge(snap))
         return RunResult(spec.name, not errors, errors, snap, returncode)
@@ -589,14 +614,20 @@ def stdlib_canary_runner(*, judges: list[Judge] | None = None) -> RunnerSpec:
     # os.path.exists and _GeneratorContextManager.__exit__ try blocks stop
     # deopting after their eighth raise, when the site's exception edge is
     # granted (three fewer).  Attributed with the transition ledger.
-    # Verified deterministic across reruns; the exact pin keeps the
-    # fail-closed drift guard.
-    default = execute_holds(expected_organic_deopts=36) + [
+    # MR7 broad subscript admission adds 153 deopts in 11 newly compiled
+    # functions: 64 GuardFailure, 65 UnhandledException and 24 Raise.
+    # MR8's bounded generic retry adds 64 UnhandledException deopts at
+    # SubPattern.__getitem__ (cause 61, resume 124). Disabling that retry
+    # restores all 189 earlier events with the exact original fingerprint.
+    # Preserve the exact total AND the independently attributed site/reason
+    # fingerprint; equal totals must not hide a different failure path.
+    default = execute_holds(expected_organic_deopts=253) + [
         expect("compile_requests", ">", 0),
         expect("target_modules_attempted", "==", 72),
     ]
     return RunnerSpec(
         name="canary_stdlib_72",
+        deopt_manifest=REPO_ROOT / "ci_pipeline/jit311/data/stdlib_canary_deopts.json",
         payload=payload,
         env={
             "CINDERX_JIT_MODE": "canary",
@@ -605,8 +636,14 @@ def stdlib_canary_runner(*, judges: list[Judge] | None = None) -> RunnerSpec:
             # See above: this sweep is about import-time breadth.
             "CINDERX_AUTOJIT_IMPORT_PROVIDER": "off",
             "CINDERX_AUTOJIT_SETUP_PROVIDER": "off",
+            # MR8's product startup grace must not suppress this compiler
+            # coverage sweep or make its exact fingerprint depend on timing.
+            "CINDERX_JIT_STARTUP_GRACE_MS": "0",
         },
-        asserted_env={"CINDERX_JIT_MODE": "canary"},
+        asserted_env={
+            "CINDERX_JIT_MODE": "canary",
+            "CINDERX_JIT_STARTUP_GRACE_MS": "0",
+        },
         judges=judges if judges is not None else default,
         target_modules_attempted=len(STDLIB_SHADOW_MODULES),
         timeout=1800,
