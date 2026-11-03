@@ -27,6 +27,7 @@
 
 #include <cfloat>
 #include <optional>
+#include <unordered_map>
 #include <unordered_set>
 
 namespace jit::hir {
@@ -102,6 +103,9 @@ struct Env {
   // edge; the replacement's generic (raising) arm then carries the mark
   // instead of a deopt, so its NULL result reaches the edge.
   bool exc_edge{false};
+  // SPIKE(INT64ARITH): |v| < 2^bits known for CInt64 registers produced by
+  // the int64 lowerings (64 = unknown); see int64Bits311.
+  std::unordered_map<const Register*, int> int64_bits;
 
   // Create and insert the specified instruction. If the instruction has an
   // output, a new Register* will be created and returned.
@@ -541,9 +545,99 @@ bool stillLowering311(Register* reg, Type exact) {
   return false;
 }
 
+// True when a frame of `fs` (the frame itself or a caller it was inlined
+// into) names `box` in a local or a stack slot.
+bool frameStateNamesBox311(const FrameState* fs, const Instr* box) {
+  for (const FrameState* frame = fs; frame != nullptr; frame = frame->parent) {
+    for (Register* reg : frame->localsplus) {
+      if (reg != nullptr && definingInstr311(reg) == box) {
+        return true;
+      }
+    }
+    for (Register* reg : frame->stack) {
+      if (reg != nullptr && definingInstr311(reg) == box) {
+        return true;
+      }
+    }
+  }
+  return false;
+}
+
+// True when an instruction that can run after `user` keeps `box` in its
+// FrameState.  Once the slow arm has handed a re-boxed object to the generic
+// operation (a reflected method may keep it), a later traceback or deopt
+// rebuilt from such a FrameState would show the original box, or a fresh
+// one rematerialised from the primitive, instead of that object.  Only the
+// user's own FrameState is retargeted (slowArmFrameState311).
+bool boxNamedAfter311(const Instr* box, const Instr* user) {
+  BasicBlock* start = user->block();
+  if (start == nullptr) {
+    return true;
+  }
+  std::unordered_set<const BasicBlock*> seen;
+  std::vector<BasicBlock*> work;
+  auto push_succs = [&](const BasicBlock* block) {
+    const Instr* term = block->GetTerminator();
+    for (std::size_t i = 0; term != nullptr && i < term->numEdges(); ++i) {
+      BasicBlock* succ = term->successor(i);
+      if (succ != nullptr && seen.insert(succ).second) {
+        work.push_back(succ);
+      }
+    }
+  };
+  auto names_box = [&](const Instr& instr) {
+    const FrameState* fs = nullptr;
+    if (const DeoptBase* deopt = instr.asDeoptBase()) {
+      fs = deopt->frameState();
+    } else if (instr.IsSnapshot()) {
+      fs = static_cast<const Snapshot&>(instr).frameState();
+    }
+    return frameStateNamesBox311(fs, box);
+  };
+  bool after_user = false;
+  for (const Instr& instr : *start) {
+    if (after_user && names_box(instr)) {
+      return true;
+    }
+    after_user = after_user || &instr == user;
+  }
+  push_succs(start);
+  while (!work.empty()) {
+    BasicBlock* block = work.back();
+    work.pop_back();
+    for (const Instr& instr : *block) {
+      if (&instr != user && names_box(instr)) {
+        return true;
+      }
+    }
+    push_succs(block);
+  }
+  return false;
+}
+
 // True when an instruction other than `user` reads `box`, directly or through
-// an Assign copy.
+// an Assign copy, or the box stays observable after `user` through a
+// FrameState (boxNamedAfter311).
 bool boxHasOtherReader311(Env& env, const Instr* box, const Instr* user) {
+  if (boxNamedAfter311(box, user)) {
+    return true;
+  }
+  // A caller frame the user was inlined into is reified from its own
+  // FrameState, which the slow arm cannot retarget (slowArmFrameState311
+  // rewrites only the innermost frame): a local there holding the box keeps
+  // the original object.
+  if (const DeoptBase* deopt = user->asDeoptBase()) {
+    const FrameState* fs = deopt->frameState();
+    for (const FrameState* frame = fs != nullptr ? fs->parent : nullptr;
+         frame != nullptr;
+         frame = frame->parent) {
+      for (Register* reg : frame->localsplus) {
+        if (reg != nullptr && definingInstr311(reg) == box) {
+          return true;
+        }
+      }
+    }
+  }
   for (auto& block : env.func.cfg.blocks) {
     for (const Instr& other : block) {
       if (&other == user || other.IsAssign()) {
@@ -586,6 +680,52 @@ Register* slowArmOperand311(
   }
   return env.emit<PrimitiveBox>(rebox->value(), rebox->type(), fs);
 }
+
+// The generic operation's FrameState in a slow arm that re-boxed operands:
+// a local or stack slot of the frame that holds a re-boxed box names the new
+// object instead, so a traceback or sys._getframe() taken during the generic
+// operation (a reflected method that raises or inspects its caller) sees the
+// very object the operation received.  Caller frames are not rewritten; a
+// box one of them holds is never re-boxed (boxHasOtherReader311).
+FrameState slowArmFrameState311(
+    const FrameState& fs,
+    const PrimitiveBox* l_rebox,
+    Register* l_slow,
+    const PrimitiveBox* r_rebox,
+    Register* r_slow) {
+  FrameState slow_fs = fs;
+  auto retarget = [&](Register*& reg) {
+    if (reg == nullptr) {
+      return;
+    }
+    const Instr* def = definingInstr311(reg);
+    if (l_rebox != nullptr && def == l_rebox) {
+      reg = l_slow;
+    } else if (r_rebox != nullptr && def == r_rebox) {
+      reg = r_slow;
+    }
+  };
+  for (Register*& reg : slow_fs.localsplus) {
+    retarget(reg);
+  }
+  for (Register*& reg : slow_fs.stack) {
+    retarget(reg);
+  }
+  return slow_fs;
+}
+
+namespace {
+// SPIKE(INT64ARITH): defined with the int64 lowerings below simplifySubscript.
+bool int64WideOperand311(Env& env, Register* reg);
+bool int64OperandPair311(
+    Env& env,
+    Register* lhs,
+    Register* rhs,
+    const FrameState* fs,
+    bool& guarded,
+    Register*& a,
+    Register*& b);
+} // namespace
 
 // SPIKE(CMPTYPED, FLOATSPEC): pin every operand not already known to be
 // `exact` with a CondBranchCheckType; the innermost fast arm runs `fast(l, r)`
@@ -891,6 +1031,19 @@ Register* simplifyCompareBool(Env& env, const CompareBool* instr) {
   if (!prim_op.has_value() || dominating_fs == nullptr) {
     return nullptr;
   }
+  // SPIKE(INT64ARITH): a site whose inline guards kept failing (operands of
+  // three or more digits) stays on the generic helper.  The fuse is keyed by
+  // the frame the guards bind to, which is what a deopt reports: for a
+  // compare fused with its jump that is the COMPARE_OP, while the CompareBool
+  // itself carries the offset of the POP_JUMP.
+  static const bool spike_int64arith_fuse =
+      Ci_SpikeGetenv("SPIKE_INT64ARITH") != nullptr;
+  PyCodeObject* fuse_code = dominating_fs->code.get();
+  int64_t fuse_site = dominating_fs->cur_instr_offs.value();
+  if (spike_int64arith_fuse && fuse_code != nullptr &&
+      Ci_SpikeNoLongSpec311(fuse_code, fuse_site)) {
+    return nullptr;
+  }
   return emitSpecializedCompareDiamond(
       env,
       exact,
@@ -901,6 +1054,25 @@ Register* simplifyCompareBool(Env& env, const CompareBool* instr) {
         // Inline compact-long comparison; the Guard binds to this Snapshot
         // (operands still on the stack) so a deopt re-executes the compare.
         env.emit<Snapshot>(*dominating_fs);
+        // SPIKE(INT64ARITH): two-digit operands compare exactly in int64.
+        static const bool spike_int64arith =
+            Ci_SpikeGetenv("SPIKE_INT64ARITH") != nullptr;
+        if (spike_int64arith && l->isA(TLongExact) && r->isA(TLongExact) &&
+            (int64WideOperand311(env, l) || int64WideOperand311(env, r))) {
+          bool guarded = false;
+          Register* a = nullptr;
+          Register* b = nullptr;
+          if (int64OperandPair311(env, l, r, dominating_fs, guarded, a, b)) {
+            if (guarded && fuse_code != nullptr) {
+              Ci_SpikeLongSpecRegister311(fuse_code, fuse_site);
+            }
+            return env.emit<PrimitiveCompare>(*prim_op, a, b);
+          }
+        }
+        if (spike_int64arith && fuse_code != nullptr) {
+          // The compact form keeps its shape; it joins the per-site fuse.
+          Ci_SpikeLongSpecRegister311(fuse_code, fuse_site);
+        }
         Register* l_compact = env.emit<IsCompactLong>(l);
         Register* r_compact = env.emit<IsCompactLong>(r);
         Register* both =
@@ -927,6 +1099,45 @@ Register* simplifyLongCompare(Env& env, const LongCompare* instr) {
   if (!prim_op.has_value()) {
     return nullptr;
   }
+
+#if PY_VERSION_HEX < 0x030C0000
+  // SPIKE(INT64ARITH): a comparison is exact for any int64, so the operands
+  // take the two-digit unbox (boxes looked through, constants folded) and
+  // the site joins the per-site fuse; the guards bind to the dominating
+  // Snapshot as the compact form's did.
+  static const bool spike_int64arith =
+      Ci_SpikeGetenv("SPIKE_INT64ARITH") != nullptr;
+  if (spike_int64arith) {
+    // Keyed by the frame the guards bind to, as in simplifyCompareBool.
+    const FrameState* dominating_fs = instr->getDominatingFrameState();
+    PyCodeObject* code = dominating_fs != nullptr ? dominating_fs->code.get()
+                                                  : env.func.code.get();
+    int64_t site = dominating_fs != nullptr
+        ? dominating_fs->cur_instr_offs.value()
+        : instr->bytecodeOffset().value();
+    if (code != nullptr && Ci_SpikeNoLongSpec311(code, site)) {
+      // Fused site: the generic LongCompare stays.
+      return nullptr;
+    }
+    if (code != nullptr && dominating_fs != nullptr &&
+        (int64WideOperand311(env, left) || int64WideOperand311(env, right))) {
+      bool guarded = false;
+      Register* a = nullptr;
+      Register* b = nullptr;
+      if (int64OperandPair311(env, left, right, dominating_fs, guarded, a, b)) {
+        if (guarded) {
+          Ci_SpikeLongSpecRegister311(code, site);
+        }
+        Register* unboxed_result = env.emit<PrimitiveCompare>(*prim_op, a, b);
+        return env.emit<PrimitiveBoxBool>(unboxed_result);
+      }
+    }
+    if (code != nullptr) {
+      // The compact form below keeps its shape; it joins the per-site fuse.
+      Ci_SpikeLongSpecRegister311(code, site);
+    }
+  }
+#endif
 
   // Guard that both sides are compact longs.
   Register* is_left_compact = env.emit<IsCompactLong>(left);
@@ -1497,6 +1708,96 @@ Register* emitUnicodeCharFetch(
 }
 #endif
 
+#if PY_VERSION_HEX < 0x030C0000
+// SPIKE(ARRTC): the interpreter's record says this site has only seen exact
+// array.array containers of one typecode.  Speculate exactly that, as a
+// straight line of guards bound to the dominating (pre-pop) frame state -- a
+// failing guard re-executes the subscript in the interpreter -- so that the
+// element comes out as a box of a primitive with no join: the diamond's Phi
+// would keep the arithmetic downstream from seeing through the box (the
+// lesson recorded at the BINTYPED fuse).  The container type is tested by an
+// ob_type compare rather than GuardType, which guard removal would drop since
+// only raw field reads follow.  A site whose guards keep failing is
+// recompiled with the diamond (Ci_SpikeNoArrTc311).  Returns nullptr, having
+// emitted nothing, when the site does not qualify.
+Register* trySpeculateArrayTypecode311(
+    Env& env,
+    const BinaryOp* instr,
+    Register* container,
+    Register* sub,
+    PyTypeObject* array_type,
+    const FrameState* dominating_fs,
+    const FrameState& frame) {
+  static const bool spike_arrtc = Ci_SpikeGetenv("SPIKE_ARRTC") != nullptr;
+  char tc = instr->subscrArrayTypecode();
+  if (!spike_arrtc || (tc != 'd' && tc != 'i') || dominating_fs == nullptr ||
+      dominating_fs->parent != nullptr || env.exc_edge || !spikeArrIdx()) {
+    return nullptr;
+  }
+  PyCodeObject* code = dominating_fs->code;
+  int64_t site = dominating_fs->cur_instr_offs.value();
+  if (code == nullptr || Ci_SpikeNoArrTc311(code, site)) {
+    return nullptr;
+  }
+  auto guard = [&](Register* cond) {
+    auto* g = env.emitInstr<Guard>(cond);
+    g->setFrameState(*dominating_fs);
+  };
+
+  Register* ob_type = env.emit<LoadField>(
+      container, "ob_type", offsetof(PyObject, ob_type), TType);
+  Register* want_type = env.emit<LoadConst>(
+      Type::fromObject(reinterpret_cast<PyObject*>(array_type)));
+  guard(env.emit<PrimitiveCompare>(
+      PrimitiveCompareOp::kEqual, ob_type, want_type));
+  Register* arr =
+      env.emit<RefineType>(Type::fromTypeExact(array_type), container);
+  Register* descr = env.emit<LoadField>(
+      arr, "ob_descr", offsetof(StdlibArrayObject, ob_descr), TCPtr);
+  Register* typecode = env.emit<LoadField>(
+      descr, "typecode", offsetof(StdlibArrayDescr, typecode), TCInt8);
+  Register* want_tc = env.emit<LoadConst>(Type::fromCInt(tc, TCInt8));
+  guard(env.emit<PrimitiveCompare>(
+      PrimitiveCompareOp::kEqual, typecode, want_tc));
+
+  // The index: an exact int with a single digit (a box of an int64 folds to
+  // the int64 itself).
+  Register* idx = sub;
+  if (!sub->isA(TLongExact)) {
+    Register* sub_type =
+        env.emit<LoadField>(sub, "ob_type", offsetof(PyObject, ob_type), TType);
+    Register* long_type = env.emit<LoadConst>(
+        Type::fromObject(reinterpret_cast<PyObject*>(&PyLong_Type)));
+    guard(env.emit<PrimitiveCompare>(
+        PrimitiveCompareOp::kEqual, sub_type, long_type));
+    idx = env.emit<RefineType>(TLongExact, sub);
+  }
+  guard(env.emit<IsCompactLong>(idx));
+  Register* unboxed_idx = env.emit<CompactLongUnbox>(idx);
+  Register* adjusted_idx =
+      tryEmitInlineBoundsCheck(env, dominating_fs, arr, unboxed_idx);
+  JIT_CHECK(
+      adjusted_idx != nullptr,
+      "an exact array.array always has an inline length");
+
+  Register* ob_item = env.emit<LoadField>(
+      arr, "ob_item", offsetof(StdlibArrayObject, ob_item), TCPtr);
+  Register* result = nullptr;
+  if (tc == 'd') {
+    Register* raw = env.emit<LoadArrayItem>(
+        ob_item, adjusted_idx, arr, static_cast<intptr_t>(0), TCDouble);
+    result = env.emit<PrimitiveBox>(raw, TCDouble, frame);
+  } else {
+    Register* raw = env.emit<LoadArrayItem>(
+        ob_item, adjusted_idx, arr, static_cast<intptr_t>(0), TCInt32);
+    Register* widened = env.emit<PrimitiveConvert>(raw, TCInt64);
+    result = env.emit<PrimitiveBox>(widened, TCInt64, frame);
+  }
+  Ci_SpikeArrTcRegister311(code, site);
+  return result;
+}
+#endif
+
 Register* trySimplifyArraySubscr(Env& env, const BinaryOp* instr) {
   if (!getConfig().specialized_opcodes) {
     return nullptr;
@@ -1534,6 +1835,13 @@ Register* trySimplifyArraySubscr(Env& env, const BinaryOp* instr) {
   // preceding Snapshot to find.
   const FrameState* dominating_fs = instr->getDominatingFrameState();
   CFG& cfg = env.func.cfg;
+
+#if PY_VERSION_HEX < 0x030C0000
+  if (Register* result = trySpeculateArrayTypecode311(
+          env, instr, container, sub, array_type, dominating_fs, frame)) {
+    return result;
+  }
+#endif
 
   BasicBlock* arr_ok = cfg.AllocateBlock();
   BasicBlock* idx_ok = cfg.AllocateBlock();
@@ -1879,6 +2187,106 @@ std::optional<int64_t> intBitConstant311(Register* reg) {
   return static_cast<int64_t>(value);
 }
 
+// SPIKE(INT64ARITH): |v| < 2^bits for a CInt64 register, from its
+// definition (64 = unknown).  A two-digit unbox yields 60, a compact unbox 30,
+// a constant its own width; the int64 operations propagate bounds so that an
+// add/subtract of bounded operands needs no overflow guard.
+int int64Bits311(Env& env, Register* reg, int depth = 0) {
+  auto it = env.int64_bits.find(reg);
+  if (it != env.int64_bits.end()) {
+    return it->second;
+  }
+  Type ty = reg->type();
+  if (ty.hasIntSpec()) {
+    int64_t v = static_cast<int64_t>(ty.intSpec());
+    if (v == INT64_MIN) {
+      return 64;
+    }
+    uint64_t mag = v < 0 ? static_cast<uint64_t>(-v) : static_cast<uint64_t>(v);
+    int bits = 0;
+    while (mag != 0) {
+      ++bits;
+      mag >>= 1;
+    }
+    return bits;
+  }
+  if (depth > 12) {
+    return 64;
+  }
+  const Instr* def = intBitDefiningInstr311(reg);
+  if (def == nullptr) {
+    return 64;
+  }
+  if (def->IsCompactLongUnbox()) {
+    return PyLong_SHIFT;
+  }
+  if (def->IsPrimitiveConvert()) {
+    Type src = def->GetOperand(0)->type();
+    if (src <= TCBool || src <= TCUInt8 || src <= TCInt8) {
+      return 8;
+    }
+    if (src <= TCUInt16 || src <= TCInt16) {
+      return 16;
+    }
+    if (src <= TCUInt32 || src <= TCInt32) {
+      return 32;
+    }
+    return 64;
+  }
+  if (!def->IsIntBinaryOp()) {
+    return 64;
+  }
+  auto* bin = static_cast<const IntBinaryOp*>(def);
+  Register* l = bin->left();
+  Register* r = bin->right();
+  int lb = int64Bits311(env, l, depth + 1);
+  int rb = int64Bits311(env, r, depth + 1);
+  auto clamp = [](int b) { return b > 64 ? 64 : b; };
+  auto non_negative_const = [](Register* x) {
+    return x->type().hasIntSpec() &&
+        static_cast<int64_t>(x->type().intSpec()) >= 0;
+  };
+  switch (bin->op()) {
+    // The bitwise operations act on the two's-complement form: operands with
+    // |v| < 2^n are (n+1)-bit signed values, and so is the result, which can
+    // reach -2^n (-3 & -2 == -4, 3 ^ -1 == -4).  A non-negative mask bounds
+    // the result by itself whatever the sign of the other operand
+    // (-4 & INT64_MAX == INT64_MAX - 3); the other operand's width does not.
+    case BinaryOpKind::kAnd:
+      if (non_negative_const(r)) {
+        return rb;
+      }
+      if (non_negative_const(l)) {
+        return lb;
+      }
+      return clamp(std::max(lb, rb) + 1);
+    case BinaryOpKind::kOr:
+    case BinaryOpKind::kXor:
+      return clamp(std::max(lb, rb) + 1);
+    case BinaryOpKind::kAdd:
+    case BinaryOpKind::kSubtract:
+      return clamp(std::max(lb, rb) + 1);
+    case BinaryOpKind::kMultiply:
+      return clamp(lb + rb);
+    case BinaryOpKind::kRShift:
+      // An arithmetic shift rounds toward -inf, so a negative value can keep
+      // one more bit than |v| >> k (-7 >> 1 == -4).
+      if (non_negative_const(r)) {
+        int k = static_cast<int>(std::min<int64_t>(r->type().intSpec(), 64));
+        return std::min(lb, std::max(lb - k + 1, 1));
+      }
+      return lb;
+    case BinaryOpKind::kLShift:
+      if (non_negative_const(r)) {
+        int k = static_cast<int>(std::min<int64_t>(r->type().intSpec(), 64));
+        return clamp(lb + k);
+      }
+      return 64;
+    default:
+      return 64;
+  }
+}
+
 // The unboxed int64 value of an operand.  A constant folds and a
 // PrimitiveBox of a CInt64 is looked through; anything else is guarded exact
 // int of at most two digits and unboxed without a branch:
@@ -1889,28 +2297,16 @@ std::optional<int64_t> intBitConstant311(Register* reg) {
 //                                          digit 0 and masks it away)
 //   mag  = (ob_digit[0] | hi << 30) & -(size != 0)
 //   v    = (mag ^ (size >> 63)) - (size >> 63)
-// `guarded` is set when a deopting guard was emitted.
-Register*
-intBitOperand311(Env& env, Register* reg, const FrameState& fs, bool& guarded) {
-  if (auto value = intBitConstant311(reg)) {
-    env.emit<UseType>(reg, reg->type());
-    return env.emit<LoadConst>(Type::fromCInt(*value, TCInt64));
-  }
-  const Instr* def = intBitDefiningInstr311(reg);
-  if (def != nullptr && def->IsPrimitiveBox()) {
-    auto* box = static_cast<const PrimitiveBox*>(def);
-    if (box->type() <= TCInt64) {
-      return box->value();
-    }
-  }
-  Register* obj = reg;
-  if (!obj->isA(TLongExact)) {
-    obj = env.emit<GuardType>(TLongExact, obj, fs);
-    guarded = true;
-  }
-  // The raw field loads below accept any object, so the exact-int requirement
-  // has to be pinned here or GuardTypeRemoval drops the guard as unused.
-  env.emit<UseType>(obj, TLongExact);
+// `guarded` is set when a deopting guard was emitted.  With `fs` null the
+// guards bind to the dominating Snapshot (the compare lowerings); an operand
+// that would then need a GuardType is refused (nullptr).
+// Branch-free unbox of an exact int of at most two digits (the guard deopts
+// on more); `obj` is TLongExact.
+Register* emitTwoDigitUnbox311(
+    Env& env,
+    Register* obj,
+    const FrameState* fs,
+    bool& guarded) {
   Register* size = env.emit<LoadField>(
       obj, "ob_size", offsetof(PyVarObject, ob_size), TCInt64);
   Register* two = env.emit<LoadConst>(Type::fromCInt(2, TCInt64));
@@ -1919,7 +2315,9 @@ intBitOperand311(Env& env, Register* reg, const FrameState& fs, bool& guarded) {
   Register* small = env.emit<PrimitiveCompare>(
       PrimitiveCompareOp::kLessThanUnsigned, biased, five);
   auto guard = env.emitInstr<Guard>(small);
-  guard->setFrameState(fs);
+  if (fs != nullptr) {
+    guard->setFrameState(*fs);
+  }
   guarded = true;
   // size in [-2, 2]: size*size is 4 for two digits, 1 for one, 0 for zero.
   Register* sq = env.emit<IntBinaryOp>(BinaryOpKind::kMultiply, size, size);
@@ -1950,7 +2348,204 @@ intBitOperand311(Env& env, Register* reg, const FrameState& fs, bool& guarded) {
   Register* sign =
       env.emit<IntBinaryOp>(BinaryOpKind::kRShift, size, sixty_three);
   Register* flipped = env.emit<IntBinaryOp>(BinaryOpKind::kXor, mag, sign);
-  return env.emit<IntBinaryOp>(BinaryOpKind::kSubtract, flipped, sign);
+  Register* value =
+      env.emit<IntBinaryOp>(BinaryOpKind::kSubtract, flipped, sign);
+  env.int64_bits[value] = 2 * PyLong_SHIFT;
+  return value;
+}
+
+// A constant folds to a CInt64 and a PrimitiveBox of a CInt64 is looked
+// through (the box is then left with frame-state uses and rematerialised on
+// deopt); nullptr for any other operand.
+Register* int64Direct311(Env& env, Register* reg) {
+  if (auto value = intBitConstant311(reg)) {
+    env.emit<UseType>(reg, reg->type());
+    return env.emit<LoadConst>(Type::fromCInt(*value, TCInt64));
+  }
+  const Instr* def = intBitDefiningInstr311(reg);
+  if (def != nullptr && def->IsPrimitiveBox()) {
+    auto* box = static_cast<const PrimitiveBox*>(def);
+    if (box->type() <= TCInt64) {
+      return box->value();
+    }
+  }
+  return nullptr;
+}
+
+// The unboxed int64 value of an operand.  A constant folds and a CInt64 box
+// is looked through.  A boxed object is guarded exact int and unboxed: `wide`
+// takes the branch-free two-digit sequence (the bitwise sites, whose values
+// are 32-bit words); otherwise the compact form (SPIKE(INT64ARITH): the
+// add/subtract/compare sites are dominated by small ints, where a cold
+// two-digit arm only costs code size -- the int64 semantics are for the
+// values already in registers).  `guarded` is set
+// when a deopting guard was emitted; with `fs` null the guards bind to the
+// dominating Snapshot and an operand needing a GuardType is refused.
+Register* int64Operand311(
+    Env& env,
+    Register* reg,
+    const FrameState* fs,
+    bool& guarded,
+    bool wide) {
+  if (Register* direct = int64Direct311(env, reg)) {
+    return direct;
+  }
+  Register* obj = reg;
+  if (!obj->isA(TLongExact)) {
+    if (fs == nullptr) {
+      return nullptr;
+    }
+    obj = env.emit<GuardType>(TLongExact, obj, *fs);
+    guarded = true;
+  }
+  // The raw field loads accept any object, so the exact-int requirement has
+  // to be pinned here or GuardTypeRemoval drops the guard as unused.
+  env.emit<UseType>(obj, TLongExact);
+  if (wide) {
+    return emitTwoDigitUnbox311(env, obj, fs, guarded);
+  }
+  Register* compact = env.emit<IsCompactLong>(obj);
+  auto guard = env.emitInstr<Guard>(compact);
+  if (fs != nullptr) {
+    guard->setFrameState(*fs);
+  }
+  guarded = true;
+  return env.emit<CompactLongUnbox>(obj);
+}
+
+// SPIKE(INT64ARITH) applies only where the compact-long form would have
+// deopted: a CInt64 box whose bound exceeds 61 bits (a shift or a two-digit
+// unbox feeding the operation) or a constant outside the compact range.  A
+// site whose register values are provably narrow keeps the compact form
+// untouched, instruction for instruction: its HIR, register allocation and
+// frame layout stay what they were.
+bool int64WideOperand311(Env& env, Register* reg) {
+  if (auto value = intBitConstant311(reg)) {
+    return *value >= (int64_t{1} << PyLong_SHIFT) ||
+        *value <= -(int64_t{1} << PyLong_SHIFT);
+  }
+  const Instr* def = intBitDefiningInstr311(reg);
+  if (def != nullptr && def->IsPrimitiveBox()) {
+    auto* box = static_cast<const PrimitiveBox*>(def);
+    if (box->type() <= TCInt64) {
+      return int64Bits311(env, box->value()) > 61;
+    }
+  }
+  return false;
+}
+
+// Both operands of an add/subtract/compare on exact ints: constants and
+// CInt64 boxes are taken directly, the boxed objects share one compactness
+// guard (the shape of the compact-long form this extends).  False when an
+// operand is not an exact int.
+bool int64OperandPair311(
+    Env& env,
+    Register* lhs,
+    Register* rhs,
+    const FrameState* fs,
+    bool& guarded,
+    Register*& a,
+    Register*& b) {
+  a = int64Direct311(env, lhs);
+  b = lhs == rhs ? a : int64Direct311(env, rhs);
+  Register* objs[2] = {nullptr, nullptr};
+  int n = 0;
+  if (a == nullptr) {
+    if (!lhs->isA(TLongExact)) {
+      return false;
+    }
+    objs[n++] = lhs;
+  }
+  if (b == nullptr && lhs != rhs) {
+    if (!rhs->isA(TLongExact)) {
+      return false;
+    }
+    objs[n++] = rhs;
+  }
+  for (int i = 0; i < n; ++i) {
+    env.emit<UseType>(objs[i], TLongExact);
+  }
+  if (n > 0) {
+    Register* cond = env.emit<IsCompactLong>(objs[0]);
+    if (n == 2) {
+      Register* second = env.emit<IsCompactLong>(objs[1]);
+      cond = env.emit<IntBinaryOp>(BinaryOpKind::kAnd, cond, second);
+    }
+    auto guard = env.emitInstr<Guard>(cond);
+    if (fs != nullptr) {
+      guard->setFrameState(*fs);
+    }
+    guarded = true;
+    if (a == nullptr) {
+      a = env.emit<CompactLongUnbox>(lhs);
+    }
+    if (b == nullptr) {
+      b = lhs == rhs ? a : env.emit<CompactLongUnbox>(rhs);
+    }
+  }
+  return true;
+}
+
+Register*
+intBitOperand311(Env& env, Register* reg, const FrameState& fs, bool& guarded) {
+  return int64Operand311(env, reg, &fs, guarded, true);
+}
+
+// SPIKE(INT64ARITH): `lhs +/- rhs` on exact ints in int64 registers.  The
+// operands are unboxed as above (constants fold, CInt64 boxes are looked
+// through, objects of at most two digits are unboxed), so a two-digit sum
+// cannot overflow; an operand of unknown magnitude (a shift result, a
+// loop-carried value) gets a signed-overflow guard instead: for a + b the
+// sum overflowed iff (a ^ s) & (b ^ s) < 0, for a - b iff (a ^ b) & (a ^ d) <
+// 0. The compact-long form this replaces deopted on every two-digit operand
+// ((1 << n) - 1, (x << 24) + y, a 32-bit accumulator), which then took the
+// site to the generic helper through the fuse.
+//
+// `guard_fs` is the dominating frame state (the builder's Snapshot before the
+// operation, operands still on the stack): a deopt from a guard re-executes
+// the operation.  An operation's own frame state is the post-pop exception
+// state and is only right for the box (`box_fs`); the guards sit in the
+// operation's own block, where bindGuards rebinds them to that Snapshot.
+Register* emitInt64AddSub311(
+    Env& env,
+    BinaryOpKind op,
+    Register* lhs,
+    Register* rhs,
+    const FrameState& guard_fs,
+    const FrameState& box_fs,
+    PyCodeObject* code,
+    int64_t site) {
+  if (!int64WideOperand311(env, lhs) && !int64WideOperand311(env, rhs)) {
+    return nullptr;
+  }
+  bool guarded = false;
+  Register* a = nullptr;
+  Register* b = nullptr;
+  if (!int64OperandPair311(env, lhs, rhs, &guard_fs, guarded, a, b)) {
+    return nullptr;
+  }
+  int bits = std::max(int64Bits311(env, a), int64Bits311(env, b));
+  Register* result = env.emit<IntBinaryOp>(op, a, b);
+  if (bits >= 63) {
+    Register* x1 = env.emit<IntBinaryOp>(BinaryOpKind::kXor, a, result);
+    Register* x2 = op == BinaryOpKind::kAdd
+        ? env.emit<IntBinaryOp>(BinaryOpKind::kXor, b, result)
+        : env.emit<IntBinaryOp>(BinaryOpKind::kXor, a, b);
+    Register* m = env.emit<IntBinaryOp>(BinaryOpKind::kAnd, x1, x2);
+    Register* zero = env.emit<LoadConst>(Type::fromCInt(0, TCInt64));
+    Register* ok = env.emit<PrimitiveCompare>(
+        PrimitiveCompareOp::kGreaterThanEqual, m, zero);
+    auto guard = env.emitInstr<Guard>(ok);
+    guard->setFrameState(guard_fs);
+    guarded = true;
+    env.int64_bits[result] = 64;
+  } else {
+    env.int64_bits[result] = bits + 1;
+  }
+  if (guarded) {
+    Ci_SpikeLongSpecRegister311(code, site);
+  }
+  return env.emit<PrimitiveBox>(result, TCInt64, box_fs);
 }
 
 // True when `reg` is known to hold a small int: an int64 constant, or the
@@ -2030,6 +2625,198 @@ Register* emitIntBitwise311(
 }
 
 } // namespace
+#endif
+
+#if PY_VERSION_HEX < 0x030C0000
+// SPIKE(MIXEDNUM): the float speculation diamond as a numeric dispatch.
+// The float/float arm is the caller's (FloatBinaryOp, lowered on the next
+// iteration).  A compact exact int paired with an exact float is converted
+// to double in place -- a compact int is one 30-bit digit, so the conversion
+// is exact and the result equals float_<op>'s CONVERT_TO_DOUBLE path -- and
+// computed with the same DoubleBinaryOp lowering (true division keeps its
+// divide-by-zero Guard).  Two compact exact ints take the int64 form of the
+// LONGSPEC lowering behind a branch rather than its deopting Guard: two
+// 30-bit digits cannot overflow a 64-bit add, subtract or multiply, so the
+// arm carries no guard at all (int/int true division stays generic).
+// Every other pair takes the caller's slow arm.  A partner that is statically
+// an exact int (an int literal) needs one check on the other side; its
+// IsCompactLong folds.  Vector arithmetic with int-seeded components mixes
+// ints and floats at the same sites, which otherwise all take binary_op1.
+template <typename FastFF, typename SlowFn, typename OnFast>
+Register* emitMixedNumericDiamond311(
+    Env& env,
+    BinaryOpKind op,
+    Register* lhs,
+    Register* rhs,
+    const FrameState& dominating_fs,
+    const FrameState& fs,
+    FastFF fast_ff,
+    SlowFn slow,
+    OnFast on_fast) {
+  auto check_type = [&](Register* reg, Type ty) {
+    return [&env, reg, ty](BasicBlock* t, BasicBlock* f) {
+      env.emit<CondBranchCheckType>(reg, ty, t, f);
+    };
+  };
+  auto slow_arm = [&]() -> Register* { return slow(lhs, rhs); };
+  auto mixed =
+      [&](Register* f_reg, Register* i_reg, bool float_left) -> Register* {
+    on_fast();
+    env.emit<Snapshot>(dominating_fs);
+    Register* fd = env.emit<PrimitiveUnbox>(f_reg, TCDouble);
+    Register* iv = env.emit<CompactLongUnbox>(i_reg);
+    Register* id = env.emit<PrimitiveConvert>(iv, TCDouble);
+    Register* l = float_left ? fd : id;
+    Register* r = float_left ? id : fd;
+    if (op == BinaryOpKind::kTrueDivide) {
+      Register* zero = env.emit<LoadConst>(Type::fromCDouble(0.0));
+      Register* is_nonzero =
+          env.emit<PrimitiveCompare>(PrimitiveCompareOp::kNotEqual, r, zero);
+      env.emitInstr<Guard>(is_nonzero);
+    }
+    Register* result = env.emit<DoubleBinaryOp>(op, l, r);
+    return env.emit<PrimitiveBox>(result, TCDouble, fs);
+  };
+  // `i_reg` is an exact int: compact ones take the mixed arm.
+  auto compact_arm =
+      [&](Register* f_reg, Register* i_reg, bool float_left) -> Register* {
+    return env.emitCond(
+        [&](BasicBlock* t, BasicBlock* f) {
+          Register* compact = env.emit<IsCompactLong>(i_reg);
+          env.emit<CondBranch>(compact, t, f);
+        },
+        [&] { return mixed(f_reg, i_reg, float_left); },
+        slow_arm);
+  };
+  // `other` is not an exact float: an exact int takes the compact arm.
+  auto int_arm =
+      [&](Register* f_reg, Register* other, bool float_left) -> Register* {
+    if (other->isA(TLongExact)) {
+      return compact_arm(f_reg, other, float_left);
+    }
+    return env.emitCond(
+        check_type(other, TLongExact),
+        [&] {
+          Register* ri = env.emit<RefineType>(TLongExact, other);
+          return compact_arm(f_reg, ri, float_left);
+        },
+        slow_arm);
+  };
+  // Both exact ints: the compact pair computes in int64.
+  auto fast_ii = [&](Register* li, Register* ri) -> Register* {
+    if (op == BinaryOpKind::kTrueDivide) {
+      return slow_arm();
+    }
+    return env.emitCond(
+        [&](BasicBlock* t, BasicBlock* f) {
+          Register* l_compact = env.emit<IsCompactLong>(li);
+          Register* r_compact = env.emit<IsCompactLong>(ri);
+          Register* both =
+              env.emit<IntBinaryOp>(BinaryOpKind::kAnd, l_compact, r_compact);
+          env.emit<CondBranch>(both, t, f);
+        },
+        [&] {
+          Register* lv = env.emit<CompactLongUnbox>(li);
+          Register* rv = env.emit<CompactLongUnbox>(ri);
+          Register* result = env.emit<IntBinaryOp>(op, lv, rv);
+          return env.emit<PrimitiveBox>(result, TCInt64, fs);
+        },
+        slow_arm);
+  };
+  // One side is an exact int and the other is not an exact float: exact
+  // int on the other side too takes the int/int arm.
+  auto ii_arm = [&](Register* l, Register* r) -> Register* {
+    Register* unknown = l->isA(TLongExact) ? r : l;
+    if (unknown->isA(TLongExact)) {
+      return fast_ii(l, r);
+    }
+    return env.emitCond(
+        check_type(unknown, TLongExact),
+        [&] {
+          Register* ri = env.emit<RefineType>(TLongExact, unknown);
+          return unknown == l ? fast_ii(ri, r) : fast_ii(l, ri);
+        },
+        slow_arm);
+  };
+  bool l_known = lhs->isA(TFloatExact);
+  bool r_known = rhs->isA(TFloatExact);
+  bool l_int = lhs->isA(TLongExact);
+  bool r_int = rhs->isA(TLongExact);
+  if (l_known) {
+    if (r_int) {
+      return compact_arm(lhs, rhs, true);
+    }
+    return env.emitCond(
+        check_type(rhs, TFloatExact),
+        [&] {
+          Register* r = env.emit<RefineType>(TFloatExact, rhs);
+          return fast_ff(lhs, r);
+        },
+        [&] { return int_arm(lhs, rhs, true); });
+  }
+  if (r_known) {
+    if (l_int) {
+      return compact_arm(rhs, lhs, false);
+    }
+    return env.emitCond(
+        check_type(lhs, TFloatExact),
+        [&] {
+          Register* l = env.emit<RefineType>(TFloatExact, lhs);
+          return fast_ff(l, rhs);
+        },
+        [&] { return int_arm(rhs, lhs, false); });
+  }
+  if (l_int) {
+    return env.emitCond(
+        check_type(rhs, TFloatExact),
+        [&] {
+          Register* r = env.emit<RefineType>(TFloatExact, rhs);
+          return compact_arm(r, lhs, false);
+        },
+        [&] { return ii_arm(lhs, rhs); });
+  }
+  if (r_int) {
+    return env.emitCond(
+        check_type(lhs, TFloatExact),
+        [&] {
+          Register* l = env.emit<RefineType>(TFloatExact, lhs);
+          return compact_arm(l, rhs, true);
+        },
+        [&] { return ii_arm(lhs, rhs); });
+  }
+  return env.emitCond(
+      check_type(lhs, TFloatExact),
+      [&] {
+        Register* l = env.emit<RefineType>(TFloatExact, lhs);
+        return env.emitCond(
+            check_type(rhs, TFloatExact),
+            [&] {
+              Register* r = env.emit<RefineType>(TFloatExact, rhs);
+              return fast_ff(l, r);
+            },
+            [&] { return int_arm(l, rhs, true); });
+      },
+      [&] {
+        return env.emitCond(
+            check_type(lhs, TLongExact),
+            [&] {
+              Register* li = env.emit<RefineType>(TLongExact, lhs);
+              return env.emitCond(
+                  check_type(rhs, TFloatExact),
+                  [&] {
+                    Register* r = env.emit<RefineType>(TFloatExact, rhs);
+                    return compact_arm(r, li, false);
+                  },
+                  [&] { return ii_arm(li, rhs); });
+            },
+            slow_arm);
+      });
+}
+
+bool spikeMixedNum311() {
+  static const bool on = Ci_SpikeGetenv("SPIKE_MIXEDNUM") != nullptr;
+  return on;
+}
 #endif
 
 Register* simplifyBinaryOp(Env& env, const BinaryOp* instr) {
@@ -2275,48 +3062,64 @@ Register* simplifyBinaryOp(Env& env, const BinaryOp* instr) {
       // the sites the specialiser proved int / str).
       eligible = instr->speculateFloat() && lhs->type().couldBe(TFloatExact) &&
           rhs->type().couldBe(TFloatExact);
+      // SPIKE(MIXEDNUM): a statically exact-int partner (an int literal)
+      // with an unknown other side: the other side is checked for exact
+      // float, int/int is re-emitted with both types pinned.
+      if (!eligible && spikeMixedNum311() && instr->speculateFloat()) {
+        eligible = (lhs->isA(TLongExact) && rhs->type().couldBe(TFloatExact)) ||
+            (rhs->isA(TLongExact) && lhs->type().couldBe(TFloatExact));
+      }
     }
     if (eligible) {
       const FrameState* dominating_fs = instr->getDominatingFrameState();
       if (dominating_fs != nullptr &&
           !((l_known && stillLowering311(lhs, TFloatExact)) ||
-            (r_known && stillLowering311(rhs, TFloatExact)))) {
+            (r_known && stillLowering311(rhs, TFloatExact)) ||
+            (lhs->isA(TLongExact) && stillLowering311(lhs, TFloatExact)) ||
+            (rhs->isA(TLongExact) && stillLowering311(rhs, TFloatExact)))) {
         const FrameState fs = *instr->frameState();
         const PrimitiveBox* l_rebox = reboxableForSlowArm311(env, lhs, instr);
         const PrimitiveBox* r_rebox = reboxableForSlowArm311(env, rhs, instr);
+        auto fast_ff = [&](Register* l, Register* r) -> Register* {
+          // Side effects first: bindGuards treats a non-replayable
+          // instruction as ending the Snapshot's reach.  The Snapshot is
+          // what a true division's zero Guard binds to.
+          if (!l_known && !r_known && spikeFloatSpecFeedback311()) {
+            emitFloatSpecHit311(env, instr);
+          }
+          env.emit<Snapshot>(*dominating_fs);
+          return env.emit<FloatBinaryOp>(op, l, r, fs);
+        };
+        auto slow_fn = [&](Register*, Register*) -> Register* {
+          // Always the ORIGINAL operands: a refined operand would let
+          // the guard-based mixed float/int paths fire on the generic
+          // arm (logging's `ct - int(ct)`: non-compact int -> a deopt
+          // per call, 2.3x slower).
+          if (!l_known && !r_known && spikeFloatSpecFeedback311()) {
+            emitFloatSpecMiss311(env, instr);
+          }
+          env.emit<Snapshot>(*dominating_fs);
+          Register* l_slow = slowArmOperand311(env, lhs, l_rebox, fs);
+          Register* r_slow = slowArmOperand311(env, rhs, r_rebox, fs);
+          auto* slow_op = env.emitInstr<BinaryOp>(
+              op,
+              l_slow,
+              r_slow,
+              slowArmFrameState311(fs, l_rebox, l_slow, r_rebox, r_slow));
+          slow_op->setNoSpeculation(true);
+          return slow_op->output();
+        };
+        if (spikeMixedNum311()) {
+          auto on_fast = [&]() {
+            if (!l_known && !r_known && spikeFloatSpecFeedback311()) {
+              emitFloatSpecHit311(env, instr);
+            }
+          };
+          return emitMixedNumericDiamond311(
+              env, op, lhs, rhs, *dominating_fs, fs, fast_ff, slow_fn, on_fast);
+        }
         return emitSpecializedCompareDiamond(
-            env,
-            TFloatExact,
-            lhs,
-            rhs,
-            fs,
-            [&](Register* l, Register* r) -> Register* {
-              // Side effects first: bindGuards treats a non-replayable
-              // instruction as ending the Snapshot's reach.  The Snapshot is
-              // what a true division's zero Guard binds to.
-              if (!l_known && !r_known && spikeFloatSpecFeedback311()) {
-                emitFloatSpecHit311(env, instr);
-              }
-              env.emit<Snapshot>(*dominating_fs);
-              return env.emit<FloatBinaryOp>(op, l, r, fs);
-            },
-            [&](Register*, Register*) -> Register* {
-              // Always the ORIGINAL operands: a refined operand would let
-              // the guard-based mixed float/int paths fire on the generic
-              // arm (logging's `ct - int(ct)`: non-compact int -> a deopt
-              // per call, 2.3x slower).
-              if (!l_known && !r_known && spikeFloatSpecFeedback311()) {
-                emitFloatSpecMiss311(env, instr);
-              }
-              env.emit<Snapshot>(*dominating_fs);
-              auto* slow_op = env.emitInstr<BinaryOp>(
-                  op,
-                  slowArmOperand311(env, lhs, l_rebox, fs),
-                  slowArmOperand311(env, rhs, r_rebox, fs),
-                  fs);
-              slow_op->setNoSpeculation(true);
-              return slow_op->output();
-            });
+            env, TFloatExact, lhs, rhs, fs, fast_ff, slow_fn);
       }
     }
   }
@@ -2429,7 +3232,38 @@ Register* simplifyInPlaceOp(Env& env, const InPlaceOp* instr) {
 
     auto frame_state_size = instr->frameState()->localsplus.size() +
         instr->frameState()->stack.size();
-    if (compact_op.has_value() && frame_state_size <= 8) {
+    PyCodeObject* code = env.func.code.get();
+    int64_t site = instr->bytecodeOffset().value();
+    // A site the per-site fuse took down keeps the generic LongInPlaceOp
+    // below, as simplifyLongBinaryOp does: the compactness guard would keep
+    // failing on the operands that failed the int64 bounds.
+    bool site_fused = code != nullptr && Ci_SpikeNoLongSpec311(code, site);
+    if (!site_fused && compact_op.has_value() && frame_state_size <= 8) {
+      // SPIKE(INT64ARITH): same int64 form as simplifyLongBinaryOp, with the
+      // per-site fuse this in-place path did not have.
+      static const bool spike_int64arith =
+          Ci_SpikeGetenv("SPIKE_INT64ARITH") != nullptr;
+      const FrameState* dominating_fs = instr->getDominatingFrameState();
+      if (spike_int64arith && code != nullptr && dominating_fs != nullptr &&
+          !(lhs->type().hasObjectSpec() && rhs->type().hasObjectSpec())) {
+        if (Register* result = emitInt64AddSub311(
+                env,
+                *compact_op,
+                lhs,
+                rhs,
+                *dominating_fs,
+                *instr->frameState(),
+                code,
+                site)) {
+          return result;
+        }
+      }
+      // The compact form joins the same per-site fuse, as in
+      // simplifyLongBinaryOp: operands of two or more digits fail its
+      // guard every time.
+      if (code != nullptr) {
+        Ci_SpikeLongSpecRegister311(code, site);
+      }
       env.emit<UseType>(lhs, TLongExact);
       env.emit<UseType>(rhs, TLongExact);
       Register* is_lhs_compact = env.emit<IsCompactLong>(lhs);
@@ -2537,6 +3371,15 @@ Register* simplifyInPlaceOp(Env& env, const InPlaceOp* instr) {
          rhs->type().couldBe(TFloatExact))) {
       exact = TFloatExact;
     }
+    // SPIKE(MIXEDNUM): see simplifyBinaryOp -- an exact-int partner with a
+    // float or unknown other side.
+    if (exact == TBottom && spikeMixedNum311() &&
+        ((lhs->isA(TLongExact) && rhs->type().couldBe(TFloatExact) &&
+          (r_float || instr->speculateFloat())) ||
+         (rhs->isA(TLongExact) && lhs->type().couldBe(TFloatExact) &&
+          (l_float || instr->speculateFloat())))) {
+      exact = TFloatExact;
+    }
   }
   if (exact != TBottom) {
     std::optional<BinaryOpKind> binop;
@@ -2560,13 +3403,21 @@ Register* simplifyInPlaceOp(Env& env, const InPlaceOp* instr) {
     }
     bool lhs_known = lhs->isA(exact);
     bool rhs_known = rhs->isA(exact);
-    if (!binop.has_value() || (lhs_known && rhs_known) ||
-        !lhs->type().couldBe(exact) || !rhs->type().couldBe(exact)) {
+    // SPIKE(MIXEDNUM): an exact-int side of a float diamond is a partner,
+    // not a disqualifier.
+    auto side_ok = [&](Register* reg) {
+      return reg->type().couldBe(exact) ||
+          (exact == TFloatExact && spikeMixedNum311() && reg->isA(TLongExact));
+    };
+    if (!binop.has_value() || (lhs_known && rhs_known) || !side_ok(lhs) ||
+        !side_ok(rhs)) {
       return trySimplifyFloatInPlace(env, instr);
     }
     // Defer while a known operand is still being lowered (stillLowering311).
     if ((lhs_known && stillLowering311(lhs, exact)) ||
-        (rhs_known && stillLowering311(rhs, exact))) {
+        (rhs_known && stillLowering311(rhs, exact)) ||
+        (lhs->isA(TLongExact) && stillLowering311(lhs, exact)) ||
+        (rhs->isA(TLongExact) && stillLowering311(rhs, exact))) {
       return trySimplifyFloatInPlace(env, instr);
     }
     // The compact-long fast arm carries a deopting Guard.  Its FrameState
@@ -2610,14 +3461,37 @@ Register* simplifyInPlaceOp(Env& env, const InPlaceOp* instr) {
         emitFloatSpecMiss311(env, instr);
       }
       env.emit<Snapshot>(*dominating_fs);
+      Register* l_slow = slowArmOperand311(env, lhs, l_rebox, fs);
+      Register* r_slow = slowArmOperand311(env, rhs, r_rebox, fs);
       auto* slow_op = env.emitInstr<InPlaceOp>(
           instr->op(),
-          slowArmOperand311(env, lhs, l_rebox, fs),
-          slowArmOperand311(env, rhs, r_rebox, fs),
-          fs);
+          l_slow,
+          r_slow,
+          slowArmFrameState311(fs, l_rebox, l_slow, r_rebox, r_slow));
       slow_op->setNoSpeculation(true);
       return slow_op->output();
     };
+    if (exact == TFloatExact && spikeMixedNum311()) {
+      auto on_fast = [&]() {
+        if (instr->speculateFloat() && !lhs_known && !rhs_known &&
+            spikeFloatSpecFeedback311()) {
+          emitFloatSpecHit311(env, instr);
+        }
+      };
+      auto slow_fn = [&](Register*, Register*) -> Register* {
+        return emit_slow();
+      };
+      return emitMixedNumericDiamond311(
+          env,
+          *binop,
+          lhs,
+          rhs,
+          *dominating_fs,
+          fs,
+          emit_fast,
+          slow_fn,
+          on_fast);
+    }
     if (lhs_known || rhs_known) {
       Register* unknown = lhs_known ? rhs : lhs;
       return env.emitCond(
@@ -2689,6 +3563,26 @@ Register* simplifyLongBinaryOp(Env& env, const LongBinaryOp* instr) {
         rhs->isA(TLongExact) &&
         !(lhs->type().hasObjectSpec() && rhs->type().hasObjectSpec())) {
       Ci_SpikeLongSpecRegister311(code, site);
+      // SPIKE(INT64ARITH): add/subtract in int64 with bounds instead of the
+      // compactness guard; multiply keeps the compact form (a two-digit
+      // product does not fit).
+      static const bool spike_int64arith =
+          Ci_SpikeGetenv("SPIKE_INT64ARITH") != nullptr;
+      const FrameState* dominating_fs = instr->getDominatingFrameState();
+      if (spike_int64arith && *compact_op != BinaryOpKind::kMultiply &&
+          dominating_fs != nullptr) {
+        if (Register* result = emitInt64AddSub311(
+                env,
+                *compact_op,
+                lhs,
+                rhs,
+                *dominating_fs,
+                *instr->frameState(),
+                code,
+                site)) {
+          return result;
+        }
+      }
       env.emit<UseType>(lhs, TLongExact);
       env.emit<UseType>(rhs, TLongExact);
       Register* is_lhs_compact = env.emit<IsCompactLong>(lhs);
@@ -2722,12 +3616,24 @@ Register* simplifyLongBinaryOp(Env& env, const LongBinaryOp* instr) {
       if (overflow == 0 && divisor > 0 && divisor <= (1LL << 30) &&
           (divisor & (divisor - 1)) == 0) {
         Ci_SpikeLongSpecRegister311(code, site);
-        env.emit<UseType>(lhs, TLongExact);
         env.emit<UseType>(rhs, rhs->type());
-        Register* is_compact = env.emit<IsCompactLong>(lhs);
-        auto guard = env.emitInstr<Guard>(is_compact);
-        guard->setFrameState(*instr->frameState());
-        Register* unboxed = env.emit<CompactLongUnbox>(lhs);
+        // SPIKE(INT64ARITH): a shift / mask is exact for any int64, so the
+        // dividend only needs the two-digit unbox.
+        static const bool spike_int64arith_div =
+            Ci_SpikeGetenv("SPIKE_INT64ARITH") != nullptr;
+        Register* unboxed = nullptr;
+        if (spike_int64arith_div && int64WideOperand311(env, lhs)) {
+          bool guarded = false;
+          unboxed = int64Operand311(
+              env, lhs, instr->getDominatingFrameState(), guarded, false);
+        }
+        if (unboxed == nullptr) {
+          env.emit<UseType>(lhs, TLongExact);
+          Register* is_compact = env.emit<IsCompactLong>(lhs);
+          auto guard = env.emitInstr<Guard>(is_compact);
+          guard->setFrameState(*instr->frameState());
+          unboxed = env.emit<CompactLongUnbox>(lhs);
+        }
         Register* result;
         if (instr->op() == BinaryOpKind::kFloorDivide) {
           int shift = 0;

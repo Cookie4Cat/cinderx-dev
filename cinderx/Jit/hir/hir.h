@@ -611,6 +611,15 @@ class INSTR_CLASS(
     return subscr_adaptive_stuck_;
   }
 
+  // SPIKE(ARRTC): the only array.array typecode the site's interpreter
+  // record has seen (BytecodeInstruction::subscrArrayTypecode), or 0.
+  char subscrArrayTypecode() const {
+    return subscr_array_typecode_;
+  }
+  void setSubscrArrayTypecode(char tc) {
+    subscr_array_typecode_ = tc;
+  }
+
   // SPIKE(FLOATSPEC): arithmetic site whose interpreter specialisation was
   // attempted and failed; Simplify may speculate float operands behind a
   // type-check diamond.
@@ -634,6 +643,7 @@ class INSTR_CLASS(
   BinaryOpKind op_;
   bool array_subscr_slow_path_;
   bool subscr_adaptive_stuck_;
+  char subscr_array_typecode_{0};
   bool speculate_float_{false};
   bool no_speculation_{false};
 };

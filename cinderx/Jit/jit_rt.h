@@ -369,6 +369,13 @@ extern "C" int Ci_SpikeNoLongSpec311(PyCodeObject* code, int64_t bc_offset);
 extern "C" void Ci_SpikeLongSpecGuardFail311(
     PyCodeObject* code,
     int64_t bc_offset);
+// SPIKE(ARRTC): per-site fuse for the array.array typecode speculation of
+// subscript sites (see pyjit.cpp); same protocol as the LONGSPEC fuse.
+extern "C" void Ci_SpikeArrTcRegister311(PyCodeObject* code, int64_t bc_offset);
+extern "C" int Ci_SpikeNoArrTc311(PyCodeObject* code, int64_t bc_offset);
+extern "C" void Ci_SpikeArrTcGuardFail311(
+    PyCodeObject* code,
+    int64_t bc_offset);
 // SPIKE(BINTYPED): per-site fuse for the *_FLOAT specialisation guards of
 // binary ops.  The builder registers each guarded site; the deopt path
 // reports guard failures; after a few failures the site is marked and the

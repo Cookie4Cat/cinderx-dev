@@ -29,6 +29,8 @@
 #include "internal/pycore_ceval.h"
 #include "opcode.h"
 
+#include "cinderx/Common/spike_env.h"
+#include "cinderx/Interpreter/3.11/interpreter_contract.h"
 #include "cinderx/Interpreter/3.11/interpreter_dependencies.h"
 #include "cinderx/Interpreter/interpreter.h"
 
@@ -309,6 +311,67 @@ int _Py_Specialize_Call(
   return result;
 }
 
+// SPIKE(ARRTC): record what a BINARY_SUBSCR site whose specialization failed
+// subscripts (the CI_SUBSCR_ARRTC_* record in interpreter_contract.h).  The
+// JIT reads the record at compile time and speculates the element type of a
+// site that has only seen one array.array typecode.  Retries come at
+// exponentially spaced executions (the adaptive backoff saturates at 4096 and
+// keeps retrying), so the record is a sample rather than a census; a wrong
+// speculation costs a deopt, and a site that keeps deopting is recompiled
+// without it.
+//
+// arraymodule.c's arrayobject is private.  This mirror matches the JIT's
+// StdlibArrayObject (Jit/hir/array_specialize.h), which the JIT validates
+// against a probe instance.  ob_descr is read only when the container's type
+// IS that validated type object: a type's name and instance size say nothing
+// about its layout.  Before the JIT has resolved the type nothing is
+// recorded.
+typedef struct {
+  char typecode;
+  int itemsize;
+} Ci_ArrayDescrMirror_311;
+
+typedef struct {
+  PyObject_VAR_HEAD char* ob_item;
+  Py_ssize_t allocated;
+  const Ci_ArrayDescrMirror_311* ob_descr;
+  PyObject* weakreflist;
+  Py_ssize_t ob_exports;
+} Ci_ArrayObjectMirror_311;
+
+static void Ci_RecordSubscrContainer_311(
+    PyObject* container,
+    _Py_CODEUNIT* instr) {
+  if (_Py_OPCODE(*instr) != BINARY_SUBSCR_ADAPTIVE) {
+    // Specialized: only a failed site's record means anything.
+    return;
+  }
+  PyTypeObject* array_type = Ci_StdlibArrayTypeIfResolved();
+  if (array_type == NULL) {
+    return;
+  }
+  uint16_t mark = CI_SUBSCR_ARRTC_OTHER;
+  if (Py_TYPE(container) == array_type) {
+    const Ci_ArrayDescrMirror_311* descr =
+        ((Ci_ArrayObjectMirror_311*)container)->ob_descr;
+    unsigned char tc = descr != NULL ? (unsigned char)descr->typecode : 0;
+    if (tc != 0 && tc < 0x7F) {
+      mark = (uint16_t)(CI_SUBSCR_ARRTC_TAG | tc);
+    }
+  }
+  _PyBinarySubscrCache* cache = (_PyBinarySubscrCache*)(instr + 1);
+  uint16_t prev = cache->func_version;
+  if ((prev & CI_SUBSCR_ARRTC_TAG_MASK) != CI_SUBSCR_ARRTC_TAG) {
+    // Empty, or a function version BINARY_SUBSCR_GETITEM left behind.
+    prev = 0;
+  }
+  if (prev == 0) {
+    cache->func_version = mark;
+  } else if (prev != mark) {
+    cache->func_version = CI_SUBSCR_ARRTC_MIXED;
+  }
+}
+
 int _Py_Specialize_BinarySubscr(
     PyObject* container,
     PyObject* sub,
@@ -317,5 +380,12 @@ int _Py_Specialize_BinarySubscr(
   _PyFrameEvalFunction saved = Ci_HideTrustedEvaluator_311(interp);
   int result = Ci_SpecializeBinarySubscrInner_311(container, sub, instr);
   interp->eval_frame = saved;
+  static int record = -1;
+  if (record < 0) {
+    record = Ci_SpikeGetenv("SPIKE_ARRTC") != NULL;
+  }
+  if (record && result == 0) {
+    Ci_RecordSubscrContainer_311(container, instr);
+  }
   return result;
 }

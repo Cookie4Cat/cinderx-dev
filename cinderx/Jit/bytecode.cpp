@@ -2,6 +2,10 @@
 
 #include "cinderx/Jit/bytecode.h"
 
+#if PY_VERSION_HEX < 0x030C0000
+#include "cinderx/Interpreter/3.11/interpreter_contract.h"
+#endif
+
 extern "C" {
 #include "internal/pycore_code.h"
 }
@@ -252,6 +256,26 @@ bool BytecodeInstruction::isSubscrAdaptiveStuck() const {
   return (counter & ((1 << ADAPTIVE_BACKOFF_BITS) - 1)) != 0;
 #else
   return false;
+#endif
+}
+
+char BytecodeInstruction::subscrArrayTypecode() const {
+#if PY_VERSION_HEX < 0x030C0000
+  int raw = _Py_OPCODE(codeUnit(code_)[opcodeIndex().value()]);
+  if (raw != BINARY_SUBSCR_ADAPTIVE) {
+    return 0;
+  }
+  constexpr int kFuncVersionUnit = static_cast<int>(
+      offsetof(_PyBinarySubscrCache, func_version) / sizeof(_Py_CODEUNIT));
+  uint16_t mark =
+      cacheU16(kInlineCacheStartInstructionOffset + kFuncVersionUnit);
+  if ((mark & CI_SUBSCR_ARRTC_TAG_MASK) != CI_SUBSCR_ARRTC_TAG ||
+      mark == CI_SUBSCR_ARRTC_OTHER || mark == CI_SUBSCR_ARRTC_MIXED) {
+    return 0;
+  }
+  return static_cast<char>(mark & 0xFFu);
+#else
+  return 0;
 #endif
 }
 

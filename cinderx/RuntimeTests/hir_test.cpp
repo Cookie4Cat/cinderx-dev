@@ -1857,6 +1857,178 @@ def test(a, b):
   EXPECT_EQ(genericBinaryOps(*after), std::vector{BinaryOpKind::kAnd}) << hir;
 }
 
+TEST_F(HIRBuildTest, WideIntAddRunsInInt64311) {
+  // Both operands are ints in registers and the shifted one can exceed the
+  // compact range, so the add is done in int64 behind an overflow check
+  // instead of deoptimizing on two digits.
+  const char* src = R"(
+def test(a, b):
+    return (a << 24) + (b & 255)
+)";
+  Ref<PyFunctionObject> func(compileAndGet(src, "test"));
+  ASSERT_NE(func, nullptr);
+  auto irfunc = simplified(buildHIR(func));
+  ASSERT_NE(irfunc, nullptr);
+  auto hir = fullPrinter().ToString(*irfunc);
+  EXPECT_TRUE(genericBinaryOps(*irfunc).empty()) << hir;
+  // The compact-long form would test both operands for compactness.
+  EXPECT_EQ(countOpcode(*irfunc, Opcode::kIsCompactLong), 0) << hir;
+}
+
+TEST_F(HIRBuildTest, UntypedIntAddStaysGeneric311) {
+  // Without type evidence or a wide operand the add is not speculated.
+  const char* src = R"(
+def test(a, b):
+    return a + b
+)";
+  Ref<PyFunctionObject> func(compileAndGet(src, "test"));
+  ASSERT_NE(func, nullptr);
+  auto irfunc = simplified(buildHIR(func));
+  ASSERT_NE(irfunc, nullptr);
+  auto hir = fullPrinter().ToString(*irfunc);
+  EXPECT_EQ(genericBinaryOps(*irfunc), std::vector{BinaryOpKind::kAdd}) << hir;
+  EXPECT_EQ(countOpcode(*irfunc, Opcode::kPrimitiveConvert), 0) << hir;
+}
+
+TEST_F(HIRBuildTest, FloatDiamondConvertsCompactIntPartner311) {
+  // A float constant against an unknown operand: the diamond's int arm
+  // converts a compact int to double instead of taking the generic path.
+  const char* src = R"(
+def test(a):
+    return a * 2.5
+)";
+  Ref<PyFunctionObject> func(compileAndGet(src, "test"));
+  ASSERT_NE(func, nullptr);
+  auto irfunc = simplified(buildHIR(func));
+  ASSERT_NE(irfunc, nullptr);
+  auto hir = fullPrinter().ToString(*irfunc);
+  EXPECT_GE(countOpcode(*irfunc, Opcode::kCompactLongUnbox), 1) << hir;
+  EXPECT_GE(countOpcode(*irfunc, Opcode::kPrimitiveConvert), 1) << hir;
+  // A non-compact int and any other operand still reach the generic
+  // operation.
+  for (BinaryOpKind op : genericBinaryOps(*irfunc)) {
+    EXPECT_EQ(op, BinaryOpKind::kMultiply) << hir;
+  }
+}
+
+TEST_F(HIRBuildTest, NonNegativeMaskBoundsAndOfNegativeValue311) {
+  // `x & mask` with a non-negative mask lies in [0, mask] whatever the sign
+  // of x: a negative x << 2 masked by INT64_MAX needs 63 bits, so the add
+  // keeps its overflow guard; a 62-bit mask bounds the add without one.
+  auto guards = [&](const char* src) {
+    Ref<PyFunctionObject> func(compileAndGet(src, "test"));
+    EXPECT_NE(func, nullptr);
+    if (func == nullptr) {
+      return size_t{0};
+    }
+    auto irfunc = simplified(buildHIR(func));
+    EXPECT_NE(irfunc, nullptr);
+    if (irfunc == nullptr) {
+      return size_t{0};
+    }
+    EXPECT_TRUE(genericBinaryOps(*irfunc).empty())
+        << fullPrinter().ToString(*irfunc);
+    return countOpcode(*irfunc, Opcode::kGuard);
+  };
+  size_t wide = guards(R"(
+def test(x):
+    return ((x << 2) & 0x7fffffffffffffff) + 4
+)");
+  size_t narrow = guards(R"(
+def test(x):
+    return ((x << 2) & 0x3fffffffffffffff) + 4
+)");
+  EXPECT_EQ(wide, narrow + 1);
+}
+
+TEST_F(HIRBuildTest, SlowArmKeepsBoxNamedByLaterFrameState311) {
+  // The slow arm of the float diamond re-boxes a known float operand only
+  // while no later FrameState names the box: once the generic operation has
+  // handed a fresh object to a reflected method, a traceback taken at the
+  // call after it must show that same object for the local holding it.
+  auto build = [](const std::string& call_locals) {
+    std::string hir = R"(
+fun test {
+  bb 0 {
+    v0 = LoadArg<0>
+    v1 = LoadArg<1>
+    v2 = LoadArg<2>
+    v3 = RefineType<FloatExact> v1
+    v4 = PrimitiveUnbox<CDouble> v3
+    v5 = PrimitiveBox<CDouble> v4
+    Snapshot {
+      CurInstrOffset 2
+      Locals<4> v0 v1 v2 v1
+      Stack<2> v5 v0
+    }
+    v6 = BinaryOp<Add> v5 v0 {
+      FrameState {
+        CurInstrOffset 4
+        Locals<4> v0 v1 v2 v1
+      }
+    }
+    v7 = VectorCall<0> v2 {
+      FrameState {
+        CurInstrOffset 6
+        )" +
+        call_locals +
+        R"(
+      }
+    }
+    Return v6
+  }
+}
+)";
+    auto irfunc = HIRParser{}.ParseHIR(hir.c_str());
+    if (irfunc != nullptr) {
+      reflowTypes(*irfunc);
+      Simplify{}.Run(*irfunc);
+    }
+    return irfunc;
+  };
+  // Whether every generic add the diamond left behind received the original
+  // box (true), or every one received a fresh box (false).
+  auto slow_left_is_original = [](Function& irfunc) -> std::optional<bool> {
+    const Instr* original = nullptr;
+    for (const auto& instr : *irfunc.cfg.entry_block) {
+      if (instr.IsPrimitiveBox()) {
+        original = &instr;
+        break;
+      }
+    }
+    std::optional<bool> result;
+    for (const auto& block : irfunc.cfg.blocks) {
+      for (const auto& instr : block) {
+        if (!instr.IsBinaryOp()) {
+          continue;
+        }
+        const Instr* def = static_cast<const BinaryOp&>(instr).left()->instr();
+        while (def != nullptr && def->IsAssign()) {
+          def = def->GetOperand(0)->instr();
+        }
+        bool same = def == original;
+        if (result.has_value() && *result != same) {
+          return std::nullopt;
+        }
+        result = same;
+      }
+    }
+    return result;
+  };
+
+  // A temporary: the call's FrameState holds the sum, not the box.
+  auto temporary = build("Locals<4> v0 v1 v2 v6");
+  ASSERT_NE(temporary, nullptr);
+  EXPECT_EQ(slow_left_is_original(*temporary), std::optional<bool>{false})
+      << fullPrinter().ToString(*temporary);
+
+  // A local still live at the call: the slow arm passes the original box.
+  auto local = build("Locals<4> v0 v1 v2 v5");
+  ASSERT_NE(local, nullptr);
+  EXPECT_EQ(slow_left_is_original(*local), std::optional<bool>{true})
+      << fullPrinter().ToString(*local);
+}
+
 TEST_F(HIRBuildTest, NoArgSuperMethodCall311LowersToLoadMethodSuper) {
   const char* src = R"(
 class A:
