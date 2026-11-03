@@ -466,6 +466,180 @@ Register* simplifyPrimitiveConvert(Env& env, const PrimitiveConvert* instr) {
   return nullptr;
 }
 
+#if PY_VERSION_HEX < 0x030C0000
+// SPIKE(FLOATSPEC feedback): only the evidence-free `all` mode carries the
+// hit/miss counters and the takedown.  In the evidence mode a stuck site
+// that turns out int-only would otherwise be recompiled during the run
+// (raytrace: 8 takedowns, +3.7% in a short benchmark) for no gain.
+bool spikeFloatSpecFeedback311() {
+  static const bool on = [] {
+    const char* v = Ci_SpikeGetenv("SPIKE_FLOATSPEC");
+    return v != nullptr && strcmp(v, "all") == 0;
+  }();
+  return on;
+}
+
+// Bump the per-site hit counter in a speculative fast arm (load / add /
+// store through the counter cell's fixed address).
+void emitFloatSpecHit311(Env& env, const DeoptBase* instr) {
+  uint64_t* cell = Ci_SpikeFloatSpecSiteCounters311(
+      env.func.code.get(),
+      static_cast<int64_t>(instr->bytecodeOffset().value()));
+  Register* code_reg = env.emit<LoadConst>(
+      Type::fromObject(reinterpret_cast<PyObject*>(env.func.code.get())));
+  Register* cell_reg = env.emit<LoadConst>(Type::fromCPtr(cell));
+  Register* zero = env.emit<LoadConst>(Type::fromCInt(0, TCInt64));
+  Register* hits = env.emit<LoadArrayItem>(
+      cell_reg, zero, code_reg, static_cast<intptr_t>(0), TCInt64);
+  Register* one = env.emit<LoadConst>(Type::fromCInt(1, TCInt64));
+  Register* bumped = env.emit<IntBinaryOp>(BinaryOpKind::kAdd, hits, one);
+  env.emit<StoreArrayItem>(cell_reg, zero, bumped, code_reg, TCInt64);
+}
+
+// Report a miss of an evidence-free float diamond to its per-site counter,
+// which eventually recompiles the site without the speculation.  Emitted
+// before the arm's Snapshot: bindGuards treats a non-replayable instruction
+// as ending the Snapshot's reach.
+void emitFloatSpecMiss311(Env& env, const DeoptBase* instr) {
+  Register* code_reg = env.emit<LoadConst>(
+      Type::fromObject(reinterpret_cast<PyObject*>(env.func.code.get())));
+  Register* off_reg = env.emit<LoadConst>(Type::fromCInt(
+      static_cast<int64_t>(instr->bytecodeOffset().value()), TCInt64));
+  auto* miss = env.emitRawInstr<CallStaticRetVoid>(
+      2, reinterpret_cast<void*>(Ci_SpikeFloatSpecMiss311));
+  miss->SetOperand(0, code_reg);
+  miss->SetOperand(1, off_reg);
+}
+
+// The instruction defining `reg`.  The simplifier driver rewrites a replaced
+// instruction's output as an Assign of the new value, so look through Assign
+// chains to the real definition.
+const Instr* definingInstr311(Register* reg) {
+  const Instr* def = reg->instr();
+  while (def != nullptr && def->IsAssign()) {
+    def = def->GetOperand(0)->instr();
+  }
+  return def;
+}
+
+// True while `reg` is still an intermediate arithmetic form (FloatBinaryOp /
+// LongBinaryOp, or a BinaryOp / InPlaceOp whose operands are both `exact`).
+// The next simplifier iteration lowers it to an unboxed op plus PrimitiveBox,
+// which is what a diamond's slow-arm re-boxing needs to see, so a diamond
+// over such an operand waits for that iteration.
+bool stillLowering311(Register* reg, Type exact) {
+  const Instr* def = definingInstr311(reg);
+  if (def == nullptr) {
+    return false;
+  }
+  if (def->IsFloatBinaryOp() || def->IsLongBinaryOp()) {
+    return true;
+  }
+  if (def->IsBinaryOp() || def->IsInPlaceOp()) {
+    return def->GetOperand(0)->isA(exact) && def->GetOperand(1)->isA(exact);
+  }
+  return false;
+}
+
+// True when an instruction other than `user` reads `box`, directly or through
+// an Assign copy.
+bool boxHasOtherReader311(Env& env, const Instr* box, const Instr* user) {
+  for (auto& block : env.func.cfg.blocks) {
+    for (const Instr& other : block) {
+      if (&other == user || other.IsAssign()) {
+        continue;
+      }
+      for (size_t i = 0; i < other.NumOperands(); ++i) {
+        if (definingInstr311(other.GetOperand(i)) == box) {
+          return true;
+        }
+      }
+    }
+  }
+  return false;
+}
+
+// A diamond operand that is a PrimitiveBox read only by `user` is re-boxed
+// inside the slow arm, so the main-path box can die once the fast arm's
+// unbox(box(x)) folds; otherwise every execution would materialise an object
+// only the rare generic path needs.  If anything else reads the box, the slow
+// arm must pass that same object: a user-defined __radd__ etc. can return or
+// keep it, and a fresh equal float would break `is`.  Call this before
+// emitting the diamond, whose fast arm also reads the box.
+const PrimitiveBox*
+reboxableForSlowArm311(Env& env, Register* reg, const Instr* user) {
+  const Instr* def = definingInstr311(reg);
+  if (def == nullptr || !def->IsPrimitiveBox() ||
+      boxHasOtherReader311(env, def, user)) {
+    return nullptr;
+  }
+  return static_cast<const PrimitiveBox*>(def);
+}
+
+Register* slowArmOperand311(
+    Env& env,
+    Register* reg,
+    const PrimitiveBox* rebox,
+    const FrameState& fs) {
+  if (rebox == nullptr) {
+    return reg;
+  }
+  return env.emit<PrimitiveBox>(rebox->value(), rebox->type(), fs);
+}
+
+// SPIKE(CMPTYPED, FLOATSPEC): pin every operand not already known to be
+// `exact` with a CondBranchCheckType; the innermost fast arm runs `fast(l, r)`
+// on the refined registers, every miss runs `slow(l, r)` on the registers as
+// they are at that point.  Returns nullptr when a pin is impossible (an
+// operand provably not `exact`) or unnecessary (both already exact).  Serves
+// the typed compares and the float arithmetic diamonds.
+template <typename FastFn, typename SlowFn>
+Register* emitSpecializedCompareDiamond(
+    Env& env,
+    Type exact,
+    Register* left,
+    Register* right,
+    const FrameState& /* dominating_fs */,
+    FastFn fast,
+    SlowFn slow) {
+  bool l_known = left->isA(exact);
+  bool r_known = right->isA(exact);
+  if ((l_known && r_known) || !left->type().couldBe(exact) ||
+      !right->type().couldBe(exact)) {
+    return nullptr;
+  }
+  if (l_known || r_known) {
+    Register* unknown = l_known ? right : left;
+    return env.emitCond(
+        [&](BasicBlock* t, BasicBlock* f) {
+          env.emit<CondBranchCheckType>(unknown, exact, t, f);
+        },
+        [&] {
+          Register* refined = env.emit<RefineType>(exact, unknown);
+          return l_known ? fast(left, refined) : fast(refined, right);
+        },
+        [&] { return slow(left, right); });
+  }
+  return env.emitCond(
+      [&](BasicBlock* t, BasicBlock* f) {
+        env.emit<CondBranchCheckType>(left, exact, t, f);
+      },
+      [&] {
+        Register* l = env.emit<RefineType>(exact, left);
+        return env.emitCond(
+            [&](BasicBlock* t, BasicBlock* f) {
+              env.emit<CondBranchCheckType>(right, exact, t, f);
+            },
+            [&] {
+              Register* r = env.emit<RefineType>(exact, right);
+              return fast(l, r);
+            },
+            [&] { return slow(l, right); });
+      },
+      [&] { return slow(left, right); });
+}
+#endif
+
 Register* simplifyCompare(Env& env, const Compare* instr) {
   Register* left = instr->GetOperand(0);
   Register* right = instr->GetOperand(1);
@@ -514,6 +688,44 @@ Register* simplifyCompare(Env& env, const Compare* instr) {
         op == CompareOp::kExcMatch)) {
     return env.emit<UnicodeCompare>(instr->op(), left, right);
   }
+
+#if PY_VERSION_HEX < 0x030C0000
+  // SPIKE(CMPTYPED): the builder tagged this site with the exact type the
+  // 3.11 specialiser observed but withheld the deopting guards.  If the
+  // result feeds an IsTruthy in this block, leave it to
+  // DynamicComparisonElimination (the diamond is then built around the fused
+  // CompareBool and yields a CBool directly); otherwise pin the unknown
+  // operand(s) with a type-check diamond whose fast arm is a typed Compare
+  // (lowered to the compact-long path on the next iteration).
+  if (instr->specializedExact() != TBottom &&
+      toPrimitiveCompareOp(op).has_value()) {
+    Type exact = instr->specializedExact();
+    auto next = std::next(env.cursor);
+    while (next != env.block->end() && next->IsSnapshot()) {
+      ++next;
+    }
+    bool feeds_truthy = next != env.block->end() && next->IsIsTruthy() &&
+        next->GetOperand(0) == instr->output();
+    const FrameState* dominating_fs = instr->getDominatingFrameState();
+    // Not under an exception edge: the diamond's result is a Phi, which
+    // cannot inherit the edge (see simplifyInPlaceOp).
+    if (!feeds_truthy && dominating_fs != nullptr && !env.exc_edge) {
+      return emitSpecializedCompareDiamond(
+          env,
+          exact,
+          left,
+          right,
+          *dominating_fs,
+          [&](Register* l, Register* r) -> Register* {
+            env.emit<Snapshot>(*dominating_fs);
+            return env.emit<Compare>(op, l, r, *instr->frameState());
+          },
+          [&](Register* l, Register* r) -> Register* {
+            return env.emit<Compare>(op, l, r, *instr->frameState());
+          });
+    }
+  }
+#endif
 
   return nullptr;
 }
@@ -664,9 +876,44 @@ Register* trySimplifyStrLiteralCompare(Env& env, const CompareBool* instr) {
 }
 
 Register* simplifyCompareBool(Env& env, const CompareBool* instr) {
-  return trySimplifyStrLiteralCompare(env, instr);
+  if (Register* literal = trySimplifyStrLiteralCompare(env, instr)) {
+    return literal;
+  }
+  Type exact = instr->specializedExact();
+  // Under an exception edge the generic form keeps it (see simplifyCompare).
+  if (exact == TBottom || env.exc_edge) {
+    return nullptr;
+  }
+  Register* left = instr->GetOperand(0);
+  Register* right = instr->GetOperand(1);
+  auto prim_op = toPrimitiveCompareOp(instr->op());
+  const FrameState* dominating_fs = instr->getDominatingFrameState();
+  if (!prim_op.has_value() || dominating_fs == nullptr) {
+    return nullptr;
+  }
+  return emitSpecializedCompareDiamond(
+      env,
+      exact,
+      left,
+      right,
+      *dominating_fs,
+      [&](Register* l, Register* r) -> Register* {
+        // Inline compact-long comparison; the Guard binds to this Snapshot
+        // (operands still on the stack) so a deopt re-executes the compare.
+        env.emit<Snapshot>(*dominating_fs);
+        Register* l_compact = env.emit<IsCompactLong>(l);
+        Register* r_compact = env.emit<IsCompactLong>(r);
+        Register* both =
+            env.emit<IntBinaryOp>(BinaryOpKind::kAnd, l_compact, r_compact);
+        env.emitInstr<Guard>(both);
+        Register* l_val = env.emit<CompactLongUnbox>(l);
+        Register* r_val = env.emit<CompactLongUnbox>(r);
+        return env.emit<PrimitiveCompare>(*prim_op, l_val, r_val);
+      },
+      [&](Register* l, Register* r) -> Register* {
+        return env.emit<CompareBool>(instr->op(), l, r, *instr->frameState());
+      });
 }
-
 #endif
 
 Register* simplifyLongCompare(Env& env, const LongCompare* instr) {
@@ -1725,6 +1972,83 @@ Register* simplifyBinaryOp(Env& env, const BinaryOp* instr) {
   }
 
   // Unsupported case.
+#if PY_VERSION_HEX < 0x030C0000
+  // SPIKE(FLOATSPEC): speculate float/float behind a type-check diamond --
+  // one operand already exact float (single check), or a stuck adaptive
+  // site with both operands unknown (double check).  The fast arm is the
+  // FloatBinaryOp lowering, the slow arm the generic BinaryOp; a known
+  // operand that is a PrimitiveBox read only by this site is re-boxed inside
+  // the slow arm so the main-path box can fold away (same discipline as
+  // IPTYPED; see reboxableForSlowArm311).
+  static const bool spike_floatspec =
+      Ci_SpikeGetenv("SPIKE_FLOATSPEC") != nullptr;
+  // Not under an exception edge: the diamond's result is a Phi, which cannot
+  // inherit the edge, so a raising generic arm would deopt every time
+  // instead of reaching the compiled handler (see simplifyInPlaceOp).
+  if (spike_floatspec && !instr->noSpeculation() && !env.exc_edge &&
+      (op == BinaryOpKind::kAdd || op == BinaryOpKind::kSubtract ||
+       op == BinaryOpKind::kMultiply || op == BinaryOpKind::kTrueDivide)) {
+    bool l_known = lhs->isA(TFloatExact);
+    bool r_known = rhs->isA(TFloatExact);
+    bool eligible = false;
+    if (l_known != r_known) {
+      eligible =
+          lhs->type().couldBe(TFloatExact) && rhs->type().couldBe(TFloatExact);
+    } else if (!l_known && !r_known) {
+      // SPIKE_FLOATSPEC=all speculates on every unknown/unknown site: the
+      // adaptive counter is still zero when a function compiles at its 4th
+      // call (quickened at the same call, the adaptive instruction has not
+      // executed yet), so stuck-site evidence is mostly unavailable.
+      // The builder decides per site (stuck evidence, or `all` mode minus
+      // the sites the specialiser proved int / str).
+      eligible = instr->speculateFloat() && lhs->type().couldBe(TFloatExact) &&
+          rhs->type().couldBe(TFloatExact);
+    }
+    if (eligible) {
+      const FrameState* dominating_fs = instr->getDominatingFrameState();
+      if (dominating_fs != nullptr &&
+          !((l_known && stillLowering311(lhs, TFloatExact)) ||
+            (r_known && stillLowering311(rhs, TFloatExact)))) {
+        const FrameState fs = *instr->frameState();
+        const PrimitiveBox* l_rebox = reboxableForSlowArm311(env, lhs, instr);
+        const PrimitiveBox* r_rebox = reboxableForSlowArm311(env, rhs, instr);
+        return emitSpecializedCompareDiamond(
+            env,
+            TFloatExact,
+            lhs,
+            rhs,
+            fs,
+            [&](Register* l, Register* r) -> Register* {
+              // Side effects first: bindGuards treats a non-replayable
+              // instruction as ending the Snapshot's reach.  The Snapshot is
+              // what a true division's zero Guard binds to.
+              if (!l_known && !r_known && spikeFloatSpecFeedback311()) {
+                emitFloatSpecHit311(env, instr);
+              }
+              env.emit<Snapshot>(*dominating_fs);
+              return env.emit<FloatBinaryOp>(op, l, r, fs);
+            },
+            [&](Register*, Register*) -> Register* {
+              // Always the ORIGINAL operands: a refined operand would let
+              // the guard-based mixed float/int paths fire on the generic
+              // arm (logging's `ct - int(ct)`: non-compact int -> a deopt
+              // per call, 2.3x slower).
+              if (!l_known && !r_known && spikeFloatSpecFeedback311()) {
+                emitFloatSpecMiss311(env, instr);
+              }
+              env.emit<Snapshot>(*dominating_fs);
+              auto* slow_op = env.emitInstr<BinaryOp>(
+                  op,
+                  slowArmOperand311(env, lhs, l_rebox, fs),
+                  slowArmOperand311(env, rhs, r_rebox, fs),
+                  fs);
+              slow_op->setNoSpeculation(true);
+              return slow_op->output();
+            });
+      }
+    }
+  }
+#endif
   return nullptr;
 }
 
@@ -1888,6 +2212,151 @@ Register* simplifyInPlaceOp(Env& env, const InPlaceOp* instr) {
       return env.emit<FloatBinaryOp>(*binop, lhs, rhs, *instr->frameState());
     }
   }
+
+#if PY_VERSION_HEX < 0x030C0000
+  // SPIKE(IPTYPED): the builder tagged this site with the exact type the
+  // 3.11 specialiser observed for both operands.  Pin the still-unknown
+  // operand(s) with a type-check diamond: the fast arm carries the refined
+  // types and lowers to the unboxed paths above, the slow arm is the generic
+  // in-place op.  A known-exact operand that is itself a PrimitiveBox is
+  // re-boxed inside the slow arm so the main-path box can die once the fast
+  // arm's unbox(box(x)) folds -- otherwise every site would materialise a
+  // float object it only needs on the rare generic path.
+  Type exact = instr->specializedExact();
+  // SPIKE(FLOATSPEC): speculate float/float when one operand is already an
+  // exact float (a float operand makes a float partner overwhelmingly
+  // likely), or when the site is a stuck adaptive one (mixed types seen).
+  // Both cases go through the same type-check diamond as IPTYPED: no deopt,
+  // the generic op stays as the slow arm.
+  static const bool spike_floatspec =
+      Ci_SpikeGetenv("SPIKE_FLOATSPEC") != nullptr;
+  if (exact == TBottom && spike_floatspec && !instr->noSpeculation() &&
+      (instr->op() == InPlaceOpKind::kAdd ||
+       instr->op() == InPlaceOpKind::kSubtract ||
+       instr->op() == InPlaceOpKind::kMultiply ||
+       instr->op() == InPlaceOpKind::kTrueDivide)) {
+    bool l_float = lhs->isA(TFloatExact);
+    bool r_float = rhs->isA(TFloatExact);
+    if ((l_float != r_float && lhs->type().couldBe(TFloatExact) &&
+         rhs->type().couldBe(TFloatExact)) ||
+        (!l_float && !r_float && instr->speculateFloat() &&
+         lhs->type().couldBe(TFloatExact) &&
+         rhs->type().couldBe(TFloatExact))) {
+      exact = TFloatExact;
+    }
+  }
+  if (exact != TBottom) {
+    std::optional<BinaryOpKind> binop;
+    switch (instr->op()) {
+      case InPlaceOpKind::kAdd:
+        binop = BinaryOpKind::kAdd;
+        break;
+      case InPlaceOpKind::kSubtract:
+        binop = BinaryOpKind::kSubtract;
+        break;
+      case InPlaceOpKind::kMultiply:
+        binop = BinaryOpKind::kMultiply;
+        break;
+      case InPlaceOpKind::kTrueDivide:
+        binop = exact == TFloatExact
+            ? std::optional<BinaryOpKind>(BinaryOpKind::kTrueDivide)
+            : std::nullopt;
+        break;
+      default:
+        break;
+    }
+    bool lhs_known = lhs->isA(exact);
+    bool rhs_known = rhs->isA(exact);
+    if (!binop.has_value() || (lhs_known && rhs_known) ||
+        !lhs->type().couldBe(exact) || !rhs->type().couldBe(exact)) {
+      return trySimplifyFloatInPlace(env, instr);
+    }
+    // Defer while a known operand is still being lowered (stillLowering311).
+    if ((lhs_known && stillLowering311(lhs, exact)) ||
+        (rhs_known && stillLowering311(rhs, exact))) {
+      return trySimplifyFloatInPlace(env, instr);
+    }
+    // The compact-long fast arm carries a deopting Guard.  Its FrameState
+    // must be the one *before* the in-place op (operands still on the
+    // stack) so the interpreter re-executes the instruction after a deopt;
+    // the op's own FrameState has them popped.  Without a dominating
+    // Snapshot the int diamond is skipped.
+    const FrameState* dominating_fs = instr->getDominatingFrameState();
+    if (dominating_fs == nullptr) {
+      return trySimplifyFloatInPlace(env, instr);
+    }
+    const FrameState fs = *instr->frameState();
+    const PrimitiveBox* l_rebox = reboxableForSlowArm311(env, lhs, instr);
+    const PrimitiveBox* r_rebox = reboxableForSlowArm311(env, rhs, instr);
+    const bool evidence_free = instr->speculateFloat() && !lhs_known &&
+        !rhs_known && spikeFloatSpecFeedback311();
+    auto emit_fast = [&](Register* l, Register* r) -> Register* {
+      if (exact == TFloatExact) {
+        // The FloatBinaryOp lowering of a true division carries a
+        // divide-by-zero Guard, which binds to the nearest preceding
+        // Snapshot in its block; give the new arm one.
+        if (evidence_free) {
+          emitFloatSpecHit311(env, instr);
+        }
+        env.emit<Snapshot>(*dominating_fs);
+        return env.emit<FloatBinaryOp>(*binop, l, r, fs);
+      }
+      // Exact ints: re-emitted with both types pinned, the compact-long
+      // lowering above picks it up on the next simplifier iteration.  Its
+      // Guard is bound to the nearest preceding Snapshot in the block
+      // (bindGuards), so the new arm needs one.
+      env.emit<Snapshot>(*dominating_fs);
+      return env.emit<InPlaceOp>(instr->op(), l, r, fs);
+    };
+    auto emit_slow = [&]() -> Register* {
+      // Either arm may be lowered further on a later simplifier iteration
+      // (e.g. to the compact-long path with its Guard), so every arm starts
+      // with a Snapshot for bindGuards to find.  Original operands only (see
+      // the BinaryOp diamond).
+      if (evidence_free) {
+        emitFloatSpecMiss311(env, instr);
+      }
+      env.emit<Snapshot>(*dominating_fs);
+      auto* slow_op = env.emitInstr<InPlaceOp>(
+          instr->op(),
+          slowArmOperand311(env, lhs, l_rebox, fs),
+          slowArmOperand311(env, rhs, r_rebox, fs),
+          fs);
+      slow_op->setNoSpeculation(true);
+      return slow_op->output();
+    };
+    if (lhs_known || rhs_known) {
+      Register* unknown = lhs_known ? rhs : lhs;
+      return env.emitCond(
+          [&](BasicBlock* fast, BasicBlock* slow) {
+            env.emit<CondBranchCheckType>(unknown, exact, fast, slow);
+          },
+          [&] {
+            Register* refined = env.emit<RefineType>(exact, unknown);
+            return lhs_known ? emit_fast(lhs, refined)
+                             : emit_fast(refined, rhs);
+          },
+          emit_slow);
+    }
+    return env.emitCond(
+        [&](BasicBlock* fast, BasicBlock* slow) {
+          env.emit<CondBranchCheckType>(lhs, exact, fast, slow);
+        },
+        [&] {
+          Register* l = env.emit<RefineType>(exact, lhs);
+          return env.emitCond(
+              [&](BasicBlock* fast, BasicBlock* slow) {
+                env.emit<CondBranchCheckType>(rhs, exact, fast, slow);
+              },
+              [&] {
+                Register* r = env.emit<RefineType>(exact, rhs);
+                return emit_fast(l, r);
+              },
+              emit_slow);
+        },
+        emit_slow);
+  }
+#endif
   return trySimplifyFloatInPlace(env, instr);
 }
 

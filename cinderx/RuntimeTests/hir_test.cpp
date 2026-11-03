@@ -1591,6 +1591,43 @@ def test(callback):
       getConfig().state == State::kRunning);
 }
 
+TEST_F(HIRBuildTest, NumericGuardFuseTakesDownOnlyTheFailingSite311) {
+  const char* src = R"(
+def test(a, b, c):
+    return a * b + c
+)";
+  Ref<PyFunctionObject> func(compileAndGet(src, "test"));
+  ASSERT_NE(func, nullptr);
+  auto code = BorrowedRef<PyCodeObject>{func->func_code};
+  // Keep the code-death hook that drops the fuse state active, as on the
+  // real deopt path.
+  ASSERT_NE(codeExtra(code), nullptr);
+  std::vector<int64_t> ops;
+  for (const auto& instr : BytecodeInstructionBlock{code}) {
+    if (instr.opcode() == BINARY_OP) {
+      ops.push_back(instr.baseOffset().value());
+    }
+  }
+  ASSERT_EQ(ops.size(), 2);
+
+  // A site whose guard no artifact emitted is not counted.
+  for (int i = 0; i < 64; ++i) {
+    Ci_SpikeFloatGuardFail311(code, ops[0]);
+  }
+  EXPECT_FALSE(Ci_SpikeNoFloatGuard311(code, ops[0]));
+
+  Ci_SpikeFloatGuardRegister311(code, ops[0]);
+  Ci_SpikeFloatGuardRegister311(code, ops[1]);
+  for (int i = 0; i < 7; ++i) {
+    Ci_SpikeFloatGuardFail311(code, ops[0]);
+  }
+  EXPECT_FALSE(Ci_SpikeNoFloatGuard311(code, ops[0]));
+  Ci_SpikeFloatGuardFail311(code, ops[0]);
+  EXPECT_TRUE(Ci_SpikeNoFloatGuard311(code, ops[0]));
+  // The other site in the same code is untouched.
+  EXPECT_FALSE(Ci_SpikeNoFloatGuard311(code, ops[1]));
+}
+
 TEST_F(HIRBuildTest, FloatDivideUsesBuilderExceptionEligibility311) {
   const char* src = R"(
 def test(zero):

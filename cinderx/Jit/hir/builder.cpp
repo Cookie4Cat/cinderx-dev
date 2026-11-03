@@ -3784,6 +3784,45 @@ void HIRBuilder::emitKwNames(
       kwnames_, Type::fromObject(PyTuple_GET_ITEM(code_->co_consts, index)));
 }
 
+#if PY_VERSION_HEX < 0x030C0000
+// SPIKE(FLOATSPEC): may Simplify speculate float/float operands at this
+// arithmetic site when both are statically unknown?  SPIKE_FLOATSPEC=1: only
+// sites whose adaptive specialisation was attempted and failed (mixed types
+// seen).  SPIKE_FLOATSPEC=all: every site except those the specialiser has
+// already proven int or str -- the adaptive counter is still zero when a
+// function compiles at its 4th call, so the stuck evidence is rare, while an
+// *_INT / *_UNICODE form is positive evidence against floats (scimark_mc's
+// integer RNG paid +5% for the wasted float checks).
+static bool spikeFloatSpecSite311(
+    PyCodeObject* code,
+    const jit::BytecodeInstruction& bc_instr) {
+  static const int mode = [] {
+    const char* v = Ci_SpikeGetenv("SPIKE_FLOATSPEC");
+    return v == nullptr ? 0 : (strcmp(v, "all") == 0 ? 2 : 1);
+  }();
+  if (mode == 0 ||
+      Ci_SpikeNoFloatSpec311(code, bc_instr.baseOffset().value())) {
+    return false;
+  }
+  if (bc_instr.isBinaryOpAdaptiveStuck()) {
+    return true;
+  }
+  if (mode != 2) {
+    return false;
+  }
+  switch (bc_instr.specializedOpcode()) {
+    case BINARY_OP_ADD_INT:
+    case BINARY_OP_SUBTRACT_INT:
+    case BINARY_OP_MULTIPLY_INT:
+    case BINARY_OP_ADD_UNICODE:
+    case BINARY_OP_INPLACE_ADD_UNICODE:
+      return false;
+    default:
+      return true;
+  }
+}
+#endif
+
 void HIRBuilder::emitBinaryOp(
     TranslationContext& tc,
     const jit::BytecodeInstruction& bc_instr) {
@@ -3809,6 +3848,48 @@ void HIRBuilder::emitBinaryOp(
   // to deopt: a non-float input must retain the generic in-place operation.
   bool use_binary_op_type_guards =
       opcode != BINARY_OP || getBinaryOpKindFromOparg(oparg).has_value();
+  // SPIKE(IPTYPED): the in-place forms of the exact float / exact int
+  // specialisations have identical semantics to the binary forms (neither
+  // float nor int defines an nb_inplace_* slot, so PyNumber_InPlace* falls
+  // through to the binary slot).  The specialiser only quickens a site once
+  // both operands were observed as the exact type, so the evidence is worth
+  // carrying: the InPlaceOp is tagged with the exact type and Simplify turns
+  // it into a type-check diamond whose fast arm is the unboxed
+  // DoubleBinaryOp / compact-long lowering.  A diamond rather than a
+  // deopting guard because accumulators are routinely initialised with an
+  // int 0 and only become float after the first iteration; a guard would
+  // deopt the whole invocation once per call (spectral_norm +2.2%).
+  static const bool spike_iptyped = Ci_SpikeGetenv("SPIKE_IPTYPED") != nullptr;
+  Type inplace_specialized_exact = TBottom;
+  if (spike_iptyped && opcode == BINARY_OP && !use_binary_op_type_guards &&
+      getConfig().specialized_opcodes) {
+    auto inplace_kind = getInPlaceOpKindFromOparg(oparg);
+    switch (bc_instr.specializedOpcode()) {
+      case BINARY_OP_ADD_FLOAT:
+      case BINARY_OP_MULTIPLY_FLOAT:
+      case BINARY_OP_SUBTRACT_FLOAT:
+        if (inplace_kind == InPlaceOpKind::kAdd ||
+            inplace_kind == InPlaceOpKind::kSubtract ||
+            inplace_kind == InPlaceOpKind::kMultiply) {
+          inplace_specialized_exact = TFloatExact;
+        }
+        break;
+      case BINARY_OP_ADD_INT:
+      case BINARY_OP_SUBTRACT_INT: {
+        // Mirror the frame-size limit of the compact-long lowering in
+        // simplifyInPlaceOp; past it both arms would be generic.
+        size_t frame_size = tc.frame.localsplus.size() + tc.frame.stack.size();
+        if ((inplace_kind == InPlaceOpKind::kAdd ||
+             inplace_kind == InPlaceOpKind::kSubtract) &&
+            frame_size <= 8) {
+          inplace_specialized_exact = TLongExact;
+        }
+        break;
+      }
+      default:
+        break;
+    }
+  }
 #else
   constexpr bool use_binary_op_type_guards = true;
 #endif
@@ -3824,6 +3905,9 @@ void HIRBuilder::emitBinaryOp(
 #else
   bool speculate_types = getConfig().specialized_opcodes;
 #endif
+  static const bool spike_bintyped_float =
+      Ci_SpikeGetenv("SPIKE_BINTYPED") != nullptr;
+  bool bintyped_float_site = false;
   if (speculate_types) {
     switch (bc_instr.specializedOpcode()) {
       case BINARY_OP_ADD_INT:
@@ -3850,8 +3934,20 @@ void HIRBuilder::emitBinaryOp(
               oparg == NB_INPLACE_SUBTRACT));
 #endif
         if (use_binary_op_type_guards) {
+#if PY_VERSION_HEX < 0x030C0000
+          int64_t site = bc_instr.baseOffset().value();
+          if (spike_bintyped_float && Ci_SpikeNoFloatGuard311(code_, site)) {
+            bintyped_float_site = true;
+            break;
+          }
+#endif
           tc.emit<GuardType>(left, TFloatExact, left, tc.frame);
           tc.emit<GuardType>(right, TFloatExact, right, tc.frame);
+#if PY_VERSION_HEX < 0x030C0000
+          if (spike_bintyped_float) {
+            Ci_SpikeFloatGuardRegister311(code_, site);
+          }
+#endif
         }
         break;
       }
@@ -3900,6 +3996,21 @@ void HIRBuilder::emitBinaryOp(
           right,
           tc.frame,
           float_inplace_fast_path);
+#if PY_VERSION_HEX < 0x030C0000
+      inplace->setSpecializedExact(inplace_specialized_exact);
+      // SPIKE(FLOATSPEC): a stuck adaptive site saw operand types the
+      // specialiser could not handle (e.g. int mixed with float); let
+      // Simplify speculate float/float behind a type-check diamond.
+      if (spikeFloatSpecSite311(code_, bc_instr) &&
+          (inplace_op_kind == InPlaceOpKind::kAdd ||
+           inplace_op_kind == InPlaceOpKind::kSubtract ||
+           inplace_op_kind == InPlaceOpKind::kMultiply ||
+           inplace_op_kind == InPlaceOpKind::kTrueDivide)) {
+        inplace->setSpeculateFloat(true);
+      }
+#else
+      (void)inplace;
+#endif
       stack.push(result);
 #if PY_VERSION_HEX < 0x030C0000
       emitExcEdge311(tc, bc_instr, inplace, result);
@@ -3930,6 +4041,19 @@ void HIRBuilder::emitBinaryOp(
       tc.frame,
       /* array_subscr_slow_path= */ false,
       subscr_stuck);
+#if PY_VERSION_HEX < 0x030C0000
+  // SPIKE(FLOATSPEC): see the in-place counterpart above.  SPIKE(BINTYPED)
+  // feeds the *_FLOAT specialisation evidence into the same diamond.
+  if (bintyped_float_site ||
+      (opcode == BINARY_OP && spikeFloatSpecSite311(code_, bc_instr) &&
+       (op_kind == BinaryOpKind::kAdd || op_kind == BinaryOpKind::kSubtract ||
+        op_kind == BinaryOpKind::kMultiply ||
+        op_kind == BinaryOpKind::kTrueDivide))) {
+    binop->setSpeculateFloat(true);
+  }
+#else
+  (void)binop;
+#endif
   stack.push(result);
 #if PY_VERSION_HEX < 0x030C0000
   emitExcEdge311(tc, bc_instr, binop, result);
@@ -4522,8 +4646,35 @@ void HIRBuilder::emitCompareOp(
   CompareOp op = static_cast<CompareOp>(compare_op);
   bool specialize_int_guards = !getConfig().backedge_gated_int_guards ||
       code_has_backedge_ || code_is_simple_numeric_leaf_;
+  [[maybe_unused]] int compare_spec_for_tag = 0;
   if (getConfig().specialized_opcodes) {
-    switch (bc_instr.specializedOpcode()) {
+    int compare_spec = bc_instr.specializedOpcode();
+#if PY_VERSION_HEX < 0x030C0000
+    // SPIKE(CMPJUMP): 3.11 fuses the compare with the following POP_JUMP
+    // and names the specializations COMPARE_OP_{FLOAT,INT,STR}_JUMP; the
+    // type facts they carry are the same as the 3.12 unfused forms, so
+    // consume them under the same guards.  The jump itself is still built
+    // from the POP_JUMP bytecode that follows.
+    static const bool spike_cmpjump =
+        Ci_SpikeGetenv("SPIKE_CMPJUMP") != nullptr;
+    if (spike_cmpjump) {
+      switch (compare_spec) {
+        case COMPARE_OP_FLOAT_JUMP:
+          compare_spec = COMPARE_OP_FLOAT;
+          break;
+        case COMPARE_OP_INT_JUMP:
+          compare_spec = COMPARE_OP_INT;
+          break;
+        case COMPARE_OP_STR_JUMP:
+          compare_spec = COMPARE_OP_STR;
+          break;
+        default:
+          break;
+      }
+    }
+#endif
+    compare_spec_for_tag = compare_spec;
+    switch (compare_spec) {
       case COMPARE_OP_FLOAT:
         tc.emit<GuardType>(left, TFloatExact, left, tc.frame);
         tc.emit<GuardType>(right, TFloatExact, right, tc.frame);
@@ -4543,7 +4694,21 @@ void HIRBuilder::emitCompareOp(
     }
   }
 
-  tc.emit<Compare>(result, op, left, right, tc.frame);
+  auto* compare = tc.emit<Compare>(result, op, left, right, tc.frame);
+#if PY_VERSION_HEX < 0x030C0000
+  // SPIKE(CMPTYPED): when the int guards are withheld (no backedge, not a
+  // numeric leaf) the specialiser's COMPARE_OP_INT evidence is still worth
+  // carrying: Simplify pins the operands with a type-check diamond instead of
+  // a deopting guard, so mixed-type leaf helpers only pay a type test.
+  static const bool spike_cmptyped =
+      Ci_SpikeGetenv("SPIKE_CMPTYPED") != nullptr;
+  if (spike_cmptyped && getConfig().specialized_opcodes &&
+      !specialize_int_guards && compare_spec_for_tag == COMPARE_OP_INT) {
+    compare->setSpecializedExact(TLongExact);
+  }
+#else
+  (void)compare;
+#endif
   stack.push(result);
   if (PY_VERSION_HEX >= 0x030E0000 && bc_instr.oparg() & 0x10) {
     emitToBool(tc);

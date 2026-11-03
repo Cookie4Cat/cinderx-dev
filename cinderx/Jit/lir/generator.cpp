@@ -51,6 +51,10 @@ extern "C" {
 #include "cinderx/Jit/lir/interpframe.h"
 #include "cinderx/Jit/threaded_compile.h"
 #include "cinderx/Jit/trigger_stats.h"
+#if PY_VERSION_HEX < 0x030C0000
+#include "internal/pycore_floatobject.h"
+#include "internal/pycore_pymem.h"
+#endif
 #include "cinderx/StaticPython/checked_dict.h"
 #include "cinderx/StaticPython/checked_list.h"
 #include "cinderx/UpstreamBorrow/borrowed.h"
@@ -1470,8 +1474,188 @@ void LIRGenerator::AnalyzeCopies() {
   }
 }
 
+#if PY_VERSION_HEX < 0x030C0000
+namespace {
+struct _Py_float_state* spikeFloatState311() {
+  return &ThreadedCompileContext::interpreter()->float_state;
+}
+} // namespace
+
+// SPIKE(FLOATFLASM): inline PyFloat_FromDouble fast path.  Mirrors
+// JITRT_BoxDoubleFast311: head = state->free_list; if head != NULL and
+// tracemalloc is not tracing: free_list = head->ob_type (the link), numfree--,
+// ob_type = &PyFloat_Type, ob_refcnt = 1, ob_fval = value.  Otherwise the
+// helper (freelist refill / tracemalloc bookkeeping).
+void LIRGenerator::emitInlineFloatBox311(
+    BasicBlockBuilder& bbb,
+    const hir::PrimitiveBox* instr,
+    Instruction* src) {
+  struct _Py_float_state* state = spikeFloatState311();
+  constexpr int32_t kFreeListOff =
+      static_cast<int32_t>(offsetof(struct _Py_float_state, free_list));
+  constexpr int32_t kNumFreeOff =
+      static_cast<int32_t>(offsetof(struct _Py_float_state, numfree));
+
+  auto fast_block = bbb.allocateBlock();
+  auto fast2_block = bbb.allocateBlock();
+  auto slow_block = bbb.allocateBlock();
+  auto done_block = bbb.allocateBlock();
+
+  Instruction* state_reg = bbb.appendInstr(
+      OutVReg{DataType::k64bit},
+      Instruction::kMove,
+      Imm{reinterpret_cast<uint64_t>(state)});
+  Instruction* head = bbb.appendInstr(
+      OutVReg{DataType::kObject},
+      Instruction::kMove,
+      Ind{state_reg, kFreeListOff});
+  bbb.appendBranch(Instruction::kCondBranch, head, fast_block, slow_block);
+
+  bbb.switchBlock(fast_block);
+  Instruction* tracing_reg = bbb.appendInstr(
+      OutVReg{DataType::k64bit},
+      Instruction::kMove,
+      Imm{reinterpret_cast<uint64_t>(&_Py_tracemalloc_config.tracing)});
+  Instruction* tracing = bbb.appendInstr(
+      OutVReg{DataType::k32bit},
+      Instruction::kMove,
+      Ind{tracing_reg, 0, DataType::k32bit});
+  bbb.appendBranch(Instruction::kCondBranch, tracing, slow_block, fast2_block);
+
+  bbb.switchBlock(fast2_block);
+  Instruction* next = bbb.appendInstr(
+      OutVReg{DataType::k64bit},
+      Instruction::kMove,
+      Ind{head, static_cast<int32_t>(offsetof(PyObject, ob_type))});
+  bbb.appendInstr(OutInd{state_reg, kFreeListOff}, Instruction::kMove, next);
+  Instruction* numfree = bbb.appendInstr(
+      OutVReg{DataType::k32bit},
+      Instruction::kMove,
+      Ind{state_reg, kNumFreeOff, DataType::k32bit});
+  bbb.appendInstr(Instruction::kDec, numfree);
+  bbb.appendInstr(
+      OutInd{state_reg, kNumFreeOff, DataType::k32bit},
+      Instruction::kMove,
+      numfree);
+  Instruction* float_type = bbb.appendInstr(
+      OutVReg{DataType::k64bit},
+      Instruction::kMove,
+      Imm{reinterpret_cast<uint64_t>(&PyFloat_Type)});
+  bbb.appendInstr(
+      OutInd{head, static_cast<int32_t>(offsetof(PyObject, ob_type))},
+      Instruction::kMove,
+      float_type);
+  Instruction* one =
+      bbb.appendInstr(OutVReg{DataType::k64bit}, Instruction::kMove, Imm{1});
+  bbb.appendInstr(
+      OutInd{head, static_cast<int32_t>(offsetof(PyObject, ob_refcnt))},
+      Instruction::kMove,
+      one);
+  bbb.appendInstr(
+      OutInd{
+          head,
+          static_cast<int32_t>(offsetof(PyFloatObject, ob_fval)),
+          hirTypeToDataType(TCDouble)},
+      Instruction::kMove,
+      src);
+  BasicBlock* fast_pred = bbb.curBlock();
+  bbb.appendBranch(Instruction::kBranch, done_block);
+
+  bbb.switchBlock(slow_block);
+  if (getConfig().multiple_code_sections) {
+    slow_block->setSection(codegen::CodeSection::kCold);
+  }
+  Instruction* boxed = bbb.appendCallInstruction(
+      OutVReg{DataType::kObject}, JITRT_BoxDoubleFast311, src);
+  BasicBlock* slow_pred = bbb.curBlock();
+  bbb.appendBranch(Instruction::kBranch, done_block);
+
+  bbb.switchBlock(done_block);
+  Instruction* phi = bbb.appendInstr(instr->output(), Instruction::kPhi);
+  phi->allocateLabelInput(fast_pred);
+  phi->allocateLinkedInput(head);
+  phi->allocateLabelInput(slow_pred);
+  phi->allocateLinkedInput(boxed);
+}
+
+// SPIKE(FLOATFLASM): inline float_dealloc fast path for an exact float whose
+// refcount just reached zero: numfree < PyFloat_MAXFREELIST -> numfree++,
+// ob_type = free_list (the link), free_list = obj; otherwise the helper
+// (PyObject_Free).  Falls through to `end` in both arms.
+void LIRGenerator::emitInlineFloatDealloc311(
+    BasicBlockBuilder& bbb,
+    Instruction* obj,
+    BasicBlock* end) {
+  struct _Py_float_state* state = spikeFloatState311();
+  constexpr int32_t kFreeListOff =
+      static_cast<int32_t>(offsetof(struct _Py_float_state, free_list));
+  constexpr int32_t kNumFreeOff =
+      static_cast<int32_t>(offsetof(struct _Py_float_state, numfree));
+
+  auto push_block = bbb.allocateBlock();
+  auto full_block = bbb.allocateBlock();
+
+  Instruction* state_reg = bbb.appendInstr(
+      OutVReg{DataType::k64bit},
+      Instruction::kMove,
+      Imm{reinterpret_cast<uint64_t>(state)});
+  Instruction* numfree = bbb.appendInstr(
+      OutVReg{DataType::k32bit},
+      Instruction::kMove,
+      Ind{state_reg, kNumFreeOff, DataType::k32bit});
+  Instruction* limit = bbb.appendInstr(
+      OutVReg{DataType::k32bit},
+      Instruction::kMove,
+      Imm{static_cast<uint64_t>(PyFloat_MAXFREELIST), DataType::k32bit});
+  bbb.appendInstr(Instruction::kCmp, numfree, limit);
+  bbb.appendBranch(Instruction::kBranchGE, full_block);
+
+  bbb.appendBlock(push_block);
+  bbb.appendInstr(Instruction::kInc, numfree);
+  bbb.appendInstr(
+      OutInd{state_reg, kNumFreeOff, DataType::k32bit},
+      Instruction::kMove,
+      numfree);
+  Instruction* head = bbb.appendInstr(
+      OutVReg{DataType::k64bit},
+      Instruction::kMove,
+      Ind{state_reg, kFreeListOff});
+  bbb.appendInstr(
+      OutInd{obj, static_cast<int32_t>(offsetof(PyObject, ob_type))},
+      Instruction::kMove,
+      head);
+  bbb.appendInstr(OutInd{state_reg, kFreeListOff}, Instruction::kMove, obj);
+  bbb.appendBranch(Instruction::kBranch, end);
+
+  bbb.switchBlock(full_block);
+  if (getConfig().multiple_code_sections) {
+    full_block->setSection(codegen::CodeSection::kCold);
+  }
+  bbb.appendInvokeInstruction(PyObject_Free, obj);
+  bbb.appendBranch(Instruction::kBranch, end);
+}
+#endif
+
 std::unique_ptr<jit::lir::Function> LIRGenerator::TranslateFunction() {
   AnalyzeCopies();
+
+#if PY_VERSION_HEX < 0x030C0000
+  for (const auto& block : GetHIRFunction()->cfg.blocks) {
+    for (const auto& instr : block) {
+      // Only genuine double arithmetic counts: the speculative
+      // array.array('d') subscript path also boxes a CDouble in functions
+      // that never touch floats (yaml's Reader.forward), and flagging those
+      // grew every unknown-type dealloc block for nothing (yaml +2.5%).
+      if (instr.IsDoubleBinaryOp()) {
+        code_has_float_ops_ = true;
+        break;
+      }
+    }
+    if (code_has_float_ops_) {
+      break;
+    }
+  }
+#endif
 
   auto function = std::make_unique<jit::lir::Function>(func_);
   lir_func_ = function.get();
@@ -1720,7 +1904,15 @@ void LIRGenerator::appendForcedDeoptCheck(
     return;
   }
   forced_deopt_check_for_ = &hir_instr;
-  auto deopt_id = bbb.makeDeoptMetadata();
+  // The site row is shared with the instruction's ordinary guards.  The slow
+  // path below gets its own row: its live values sit in different locations
+  // (e.g. right after a generator resume, before they are reloaded into
+  // registers), and fillLiveValueLocations records locations per row.
+  auto site_row = bbb.makeDeoptMetadata();
+  DeoptMetadata slow_meta = DeoptMetadata::fromInstr(hir_instr);
+  slow_meta.forceable = false;
+  slow_meta.forced_site_row = static_cast<int64_t>(site_row);
+  auto deopt_id = env_->code_rt->addDeoptMetadata(std::move(slow_meta));
 
   Instruction* armed = bbb.appendInstr(
       OutVReg{DataType::k64bit},
@@ -2154,6 +2346,46 @@ void LIRGenerator::makeDecrefGILEnabled(
     bbb.appendInvokeInstruction(_Py_ForgetReference, instr);
 #endif
 
+#if PY_VERSION_HEX < 0x030C0000
+    static const bool spike_floatflasm =
+        Ci_SpikeGetenv("SPIKE_FLOATFLASM") != nullptr;
+    if (spike_floatflasm && destructor.value() == JITRT_FloatDeallocExact311) {
+      emitInlineFloatDealloc311(bbb, instr, end_decref);
+      return;
+    }
+    if (destructor.value() == JITRT_DeallocMaybeFloat311) {
+      // SPIKE(FLOATFL): unknown static type.  Test ob_type against
+      // PyFloat_Type inline and dispatch straight to the freelist push or to
+      // _Py_Dealloc; routing every dealloc through a helper that performed
+      // this test cost go +3.0% / yaml +2.3% (helper frame per dealloc).
+      auto generic = bbb.allocateBlock();
+      Instruction* ob_type = bbb.appendInstr(
+          OutVReg{DataType::k64bit},
+          Instruction::kMove,
+          Ind{instr, static_cast<int>(offsetof(PyObject, ob_type))});
+      Instruction* float_type = bbb.appendInstr(
+          OutVReg{DataType::k64bit},
+          Instruction::kMove,
+          Imm{reinterpret_cast<uint64_t>(&PyFloat_Type)});
+      bbb.appendInstr(Instruction::kCmp, ob_type, float_type);
+      bbb.appendBranch(Instruction::kBranchNE, generic);
+      auto float_dealloc = bbb.allocateBlock();
+      bbb.appendBlock(float_dealloc);
+      if (getConfig().multiple_code_sections) {
+        float_dealloc->setSection(codegen::CodeSection::kCold);
+        generic->setSection(codegen::CodeSection::kCold);
+      }
+      if (spike_floatflasm) {
+        emitInlineFloatDealloc311(bbb, instr, end_decref);
+      } else {
+        bbb.appendInvokeInstruction(JITRT_FloatDeallocExact311, instr);
+        bbb.appendBranch(Instruction::kBranch, end_decref);
+      }
+      bbb.switchBlock(generic);
+      bbb.appendInvokeInstruction(_Py_Dealloc, instr);
+      return;
+    }
+#endif
     bbb.appendInvokeInstruction(destructor.value(), instr);
   } else {
     bbb.appendInvokeInstruction(_Py_Dealloc, instr);
@@ -2173,6 +2405,22 @@ void LIRGenerator::makeDecref(
   }
 
   std::optional<destructor> dtor = obj->type().runtimePyTypeDestructor();
+#if PY_VERSION_HEX < 0x030C0000
+  // SPIKE(FLOATFL): exact floats push the freelist directly; values of
+  // unknown type (e.g. a container's previous element) test for float before
+  // falling back to _Py_Dealloc, saving the tp_dealloc double indirection on
+  // the float-heavy store paths.
+  static const bool spike_floatfl = Ci_SpikeGetenv("SPIKE_FLOATFL") != nullptr;
+  if (spike_floatfl) {
+    if (obj->type() <= TFloatExact) {
+      dtor = JITRT_FloatDeallocExact311;
+    } else if (
+        code_has_float_ops_ && !dtor.has_value() &&
+        obj->type().couldBe(TFloatExact)) {
+      dtor = JITRT_DeallocMaybeFloat311;
+    }
+  }
+#endif
   const bool possible_immortal =
       possibleImmortal311(obj->type().couldBe(TImmortalObject));
   makeDecref(bbb, bbb.getDefInstr(obj), dtor, xdecref, possible_immortal);
@@ -2874,6 +3122,26 @@ LIRGenerator::TranslatedBlock LIRGenerator::TranslateOneBasicBlock(
           phi->allocateLabelInput(slow_pred);
           phi->allocateLinkedInput(boxed);
           break;
+#elif PY_VERSION_HEX < 0x030C0000 && !defined(Py_DEBUG) && \
+    !defined(Py_REF_DEBUG) && !defined(Py_TRACE_REFS) && !defined(Py_STATS)
+          // SPIKE(FLOATFL): pop the float freelist in the helper itself
+          // instead of PyFloat_FromDouble via PLT.  Debug/statistics builds
+          // keep PyFloat_FromDouble, whose _Py_NewReference does their
+          // bookkeeping.
+          static const bool spike_floatfl =
+              Ci_SpikeGetenv("SPIKE_FLOATFL") != nullptr;
+          // SPIKE(FLOATFLASM): pop it inline -- freelist non-empty and
+          // tracemalloc not tracing -> take the head, unlink, set type /
+          // refcount / value; anything else calls the helper.  The helper
+          // call and its frame were ~30% of the box cost on nbody.
+          static const bool spike_floatflasm =
+              Ci_SpikeGetenv("SPIKE_FLOATFLASM") != nullptr;
+          if (spike_floatfl && spike_floatflasm) {
+            emitInlineFloatBox311(bbb, instr, src);
+            break;
+          }
+          func = reinterpret_cast<uint64_t>(
+              spike_floatfl ? JITRT_BoxDoubleFast311 : JITRT_BoxDouble);
 #else
           func = reinterpret_cast<uint64_t>(JITRT_BoxDouble);
 #endif

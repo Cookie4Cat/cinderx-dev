@@ -122,10 +122,12 @@ GenYieldPoint* CodeRuntime::addGenYieldPoint(GenYieldPoint&& gen_yield_point) {
 }
 
 std::size_t CodeRuntime::addDeoptMetadata(DeoptMetadata&& deopt_meta) {
-  if (!deopt_meta.frame_meta.empty()) {
+  if (deopt_meta.forced_site_row >= 0) {
+    deopt_meta.site_id = deopt_metadatas_[deopt_meta.forced_site_row].site_id;
+  } else if (!deopt_meta.frame_meta.empty()) {
     uint32_t seq = 0;
     for (const DeoptMetadata& existing : deopt_metadatas_) {
-      if (existing.frame_meta.empty()) {
+      if (existing.frame_meta.empty() || existing.forced_site_row >= 0) {
         continue;
       }
       if (existing.code() == deopt_meta.code() &&
@@ -186,18 +188,22 @@ bool CodeRuntime::consumeForcedDeopt(std::size_t deopt_id) {
   if (deopt_id >= deopt_metadatas_.size()) {
     return false;
   }
+  // The slow-path guard deopts through its own row; the arming state is on
+  // the site row.
   DeoptMetadata& meta = deopt_metadatas_[deopt_id];
-  if (meta.force_mode == 0) {
+  DeoptMetadata& site =
+      meta.forced_site_row >= 0 ? deopt_metadatas_[meta.forced_site_row] : meta;
+  if (site.force_mode == 0) {
     return false;
   }
-  if (meta.force_countdown > 0) {
-    --meta.force_countdown;
+  if (site.force_countdown > 0) {
+    --site.force_countdown;
   }
-  if (meta.force_countdown > 0) {
+  if (site.force_countdown > 0) {
     return false;
   }
-  if (meta.force_mode == 1) {
-    meta.force_mode = 0;
+  if (site.force_mode == 1) {
+    site.force_mode = 0;
     forced_deopt_armed_ = 0;
     for (const DeoptMetadata& other : deopt_metadatas_) {
       if (other.force_mode != 0) {

@@ -349,6 +349,31 @@ PyObject* JITRT_GetAttrDefault311(
 // descriptor call) on every False result.
 int JITRT_IsInstanceFast311(PyObject* obj, PyObject* cls);
 #endif
+// SPIKE(FLOATSPEC feedback): an evidence-free float diamond
+// (SPIKE_FLOATSPEC=all) took its generic arm at `bc_offset`; past a per-site
+// threshold the site is marked "no float speculation" and the code's
+// functions are uncompiled and rescheduled so the recompile drops the
+// speculation there.  Ci_SpikeNoFloatSpec311 is the builder's query for that
+// mark.  All of this per-site state is dropped with the code object and is
+// safe to use from concurrent compile workers.
+extern "C" void Ci_SpikeFloatSpecMiss311(PyCodeObject* code, int64_t bc_offset);
+extern "C" int Ci_SpikeNoFloatSpec311(PyCodeObject* code, int64_t bc_offset);
+// SPIKE(BINTYPED): per-site fuse for the *_FLOAT specialisation guards of
+// binary ops.  The builder registers each guarded site; the deopt path
+// reports guard failures; after a few failures the site is marked and the
+// code recompiled with a type-check diamond at that site only.
+extern "C" void Ci_SpikeFloatGuardRegister311(
+    PyCodeObject* code,
+    int64_t bc_offset);
+extern "C" int Ci_SpikeNoFloatGuard311(PyCodeObject* code, int64_t bc_offset);
+extern "C" void Ci_SpikeFloatGuardFail311(
+    PyCodeObject* code,
+    int64_t bc_offset);
+// Stable per-site counter pair {hits, misses}; the compiled fast arm bumps
+// hits inline, the slow arm reports misses through Ci_SpikeFloatSpecMiss311.
+extern "C" uint64_t* Ci_SpikeFloatSpecSiteCounters311(
+    PyCodeObject* code,
+    int64_t bc_offset);
 // SPIKE(SLICEFAST): container[start:stop:step] / container[start:stop:step] =
 // value without materialising a slice object.  Exact list / tuple / str with a
 // None step take PyList_GetSlice / PyTuple_GetSlice / PyUnicode_Substring
@@ -696,6 +721,16 @@ PyObject* JITRT_GenDelegateFinish311(
     PyThreadState* tstate);
 void JITRT_GenUnwindDelegators311(PyObject* from, PyThreadState* tstate);
 PyObject* JITRT_GenIterNext311(PyObject* gen);
+// SPIKE(FLOATFL): float freelist fast paths for the CPython 3.11 delivery.
+// JITRT_BoxDoubleFast311 pops the interpreter's float freelist directly
+// (falling back to PyFloat_FromDouble when it is empty or tracemalloc is
+// tracing); JITRT_FloatDeallocExact311 is the tp_dealloc-equivalent for an
+// object statically known to be an exact float; JITRT_DeallocMaybeFloat311
+// replaces _Py_Dealloc for objects of unknown type, taking the float freelist
+// push inline and deferring everything else to _Py_Dealloc.
+PyObject* JITRT_BoxDoubleFast311(double_t d);
+void JITRT_FloatDeallocExact311(PyObject* op);
+void JITRT_DeallocMaybeFloat311(PyObject* op);
 #endif
 
 PyObject* JITRT_LongFloatTrueDivide(PyObject* left, PyObject* right);

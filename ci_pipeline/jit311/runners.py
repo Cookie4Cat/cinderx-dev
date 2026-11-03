@@ -618,10 +618,16 @@ def stdlib_canary_runner(*, judges: list[Judge] | None = None) -> RunnerSpec:
     # functions: 64 GuardFailure, 65 UnhandledException and 24 Raise.
     # MR8's bounded generic retry adds 64 UnhandledException deopts at
     # SubPattern.__getitem__ (cause 61, resume 124). Disabling that retry
-    # restores all 189 earlier events with the exact original fingerprint.
+    # restores all earlier events with the exact original fingerprint.
+    # The CPython 3.11 float speculation adds 34 GuardFailure deopts: 32 at
+    # re/_parser.py Tokenizer.match (cause 8, resume 16), and in
+    # enum._is_single_bit the typed in-place operation now fails at its first
+    # site (3 deopts at cause 3) instead of the later one (1 at cause 19).
+    # Every one of them is a per-site numeric speculation guard, so each site
+    # stops at its fuse; the retry opt-out total becomes 223.
     # Preserve the exact total AND the independently attributed site/reason
     # fingerprint; equal totals must not hide a different failure path.
-    default = execute_holds(expected_organic_deopts=253) + [
+    default = execute_holds(expected_organic_deopts=287) + [
         expect("compile_requests", ">", 0),
         expect("target_modules_attempted", "==", 72),
     ]
