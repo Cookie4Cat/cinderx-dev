@@ -262,6 +262,7 @@ test_kunpeng() {
     test_cinderx.test_kunpeng.test_scheduling_policy_311 \
     test_cinderx.test_kunpeng.test_generator_close_semantics_311 \
     test_cinderx.test_kunpeng.test_subscript_cache_lifetime_311 \
+    test_cinderx.test_kunpeng.test_predicates_311 \
     test_cinderx.test_kunpeng.test_quickened_count_311 \
     test_cinderx.test_kunpeng.test_exception_handler_semantics_311 \
     test_cinderx.test_kunpeng.test_execute_surface_coverage_311 \

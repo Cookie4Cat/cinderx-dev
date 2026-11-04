@@ -25,6 +25,7 @@
 #include "cinderx/Jit/pyjit.h"
 #include "cinderx/RuntimeTests/fixtures.h"
 
+#include <cwchar>
 #include <initializer_list>
 #include <string>
 #include <utility>
@@ -5121,3 +5122,270 @@ def multi_ret(x):
   auto irfunc = buildHIR(func);
   ASSERT_NE(irfunc, nullptr);
 }
+
+#if PY_VERSION_HEX < 0x030C0000
+TEST_F(HIRBuildTest, StringLiteralCompareHIRAndLegacyHelperFallback) {
+  // Build the local pass input explicitly: the branch form quickens to
+  // COMPARE_OP_STR_JUMP, which does not establish exact-string types here.
+  auto irfunc = HIRParser{}.ParseHIR(R"(
+fun test {
+  bb 0 {
+    v0 = LoadArg<0>
+    Return v0
+  }
+}
+)");
+  ASSERT_NE(irfunc, nullptr);
+  auto* block = irfunc->cfg.entry_block;
+  auto* old_return = block->GetTerminator();
+  auto* arg = old_return->GetOperand(0);
+  old_return->unlink();
+  delete old_return;
+  FrameState frame;
+  auto* exact = irfunc->env.AllocateRegister();
+  block->append<GuardType>(exact, TUnicodeExact, arg, frame);
+  auto literal = Ref<>::steal(PyUnicode_FromString("needle"));
+  ASSERT_NE(literal, nullptr);
+  auto* constant = irfunc->env.AllocateRegister();
+  block->append<LoadConst>(constant, Type::fromObject(literal));
+  auto* result = irfunc->env.AllocateRegister();
+  block->append<CompareBool>(result, CompareOp::kEqual, exact, constant, frame);
+  block->append<Return>(result, TCBool);
+  reflowTypes(*irfunc);
+  Simplify{}.Run(*irfunc);
+  std::string hir = fullPrinter().ToString(*irfunc);
+  // Check the inline literal loads and the helper-form fallback directly.
+  EXPECT_GE(countSubstring(hir, "state"), 1) << hir;
+  EXPECT_GE(countSubstring(hir, "data"), 1) << hir;
+  EXPECT_GE(countOpcode(*irfunc, Opcode::kCompareBool), 1) << hir;
+
+  // Exercise the fallback helper separately with genuinely non-ready input.
+  // This checks helper semantics, not execution of the parsed HIR above.
+  for (const wchar_t* text : {L"needle", L"different", L"n\u00e9edle"}) {
+    Py_ssize_t length = static_cast<Py_ssize_t>(std::wcslen(text));
+    auto legacy = Ref<>::steal(PyUnicode_FromUnicode(nullptr, length));
+    ASSERT_NE(legacy, nullptr);
+    ASSERT_FALSE(PyUnicode_IS_READY(legacy.get()));
+    // Access the original wide buffer without making the string ready.
+    std::wmemcpy(
+        reinterpret_cast<PyASCIIObject*>(legacy.get())->wstr, text, length);
+    int result = JITRT_UnicodeEquals(legacy, literal, Py_EQ);
+    EXPECT_EQ(result, std::wcscmp(text, L"needle") == 0 ? 1 : 0);
+    ASSERT_FALSE(PyErr_Occurred());
+  }
+}
+#endif
+
+#if PY_VERSION_HEX < 0x030C0000
+TEST_F(HIRBuildTest, PredicateBuiltinCallsUseSpecializedHelpers) {
+  const char* src = R"(
+def inst(value, cls):
+    return isinstance(value, cls)
+
+def attr(value, default):
+    return getattr(value, "field", default)
+
+for _ in range(128):
+    inst(1, (int, str))
+    attr(object(), None)
+)";
+  Ref<PyFunctionObject> inst(compileAndGet(src, "inst"));
+  ASSERT_NE(inst, nullptr);
+  auto inst_hir = buildHIR(inst);
+  ASSERT_NE(inst_hir, nullptr);
+  Compiler::runPasses(*inst_hir, PassConfig::kSimplify);
+  EXPECT_EQ(
+      countStaticCallsTo(
+          *inst_hir, reinterpret_cast<void*>(JITRT_IsInstanceGen311)),
+      1)
+      << fullPrinter().ToString(*inst_hir);
+  Ref<PyFunctionObject> attr(getGlobal("attr"));
+  ASSERT_NE(attr, nullptr);
+  auto attr_hir = buildHIR(attr);
+  ASSERT_NE(attr_hir, nullptr);
+  Compiler::runPasses(*attr_hir, PassConfig::kSimplify);
+  EXPECT_EQ(
+      countStaticCallsTo(
+          *attr_hir, reinterpret_cast<void*>(JITRT_GetAttrDefault311)),
+      1)
+      << fullPrinter().ToString(*attr_hir);
+}
+
+TEST_F(HIRBuildTest, PredicateBuiltinTypeArgumentsRemainPinned) {
+  Ref<PyFunctionObject> func(compileAndGet(
+      R"(
+def check(value):
+    return isinstance(value, int)
+)",
+      "check"));
+  ASSERT_NE(func, nullptr);
+  auto irfunc = buildHIR(func);
+  ASSERT_NE(irfunc, nullptr);
+  EXPECT_EQ(countOpcode(*irfunc, Opcode::kGuardIs), 2)
+      << fullPrinter().ToString(*irfunc);
+  Compiler::runPasses(*irfunc, PassConfig::kSimplify);
+  EXPECT_EQ(countOpcode(*irfunc, Opcode::kIsInstance), 1)
+      << fullPrinter().ToString(*irfunc);
+}
+
+TEST_F(HIRBuildTest, PredicateTypePinsKeepDirectConstructorsGeneric) {
+  Ref<PyFunctionObject> func(compileAndGet(
+      R"(
+def masked(address, mask):
+    packed = int(address)
+    return (packed & int(mask)) != packed
+)",
+      "masked"));
+  ASSERT_NE(func, nullptr);
+  auto irfunc = buildHIR(func);
+  ASSERT_NE(irfunc, nullptr);
+  EXPECT_EQ(countOpcode(*irfunc, Opcode::kGuardIs), 0)
+      << fullPrinter().ToString(*irfunc);
+  Compiler::runPasses(*irfunc, PassConfig::kSimplify);
+  EXPECT_EQ(countOpcode(*irfunc, Opcode::kIsCompactLong), 0)
+      << fullPrinter().ToString(*irfunc);
+}
+
+TEST_F(HIRBuildTest, PredicateBuiltinCallsKeepUnsupportedCallsGeneric) {
+  const char* src = R"(
+def dynamic_name(value, name, default):
+    return getattr(value, name, default)
+
+def keyword_default(value, default):
+    return getattr(value, "field", default=default)
+
+def shadowed(isinstance, value, cls):
+    return isinstance(value, cls)
+
+for _ in range(128):
+    dynamic_name(object(), "field", None)
+)";
+  Ref<PyFunctionObject> dynamic(compileAndGet(src, "dynamic_name"));
+  ASSERT_NE(dynamic, nullptr);
+  auto dynamic_hir = buildHIR(dynamic);
+  ASSERT_NE(dynamic_hir, nullptr);
+  Compiler::runPasses(*dynamic_hir, PassConfig::kSimplify);
+  EXPECT_EQ(
+      countStaticCallsTo(
+          *dynamic_hir, reinterpret_cast<void*>(JITRT_GetAttrDefault311)),
+      0)
+      << fullPrinter().ToString(*dynamic_hir);
+  Ref<PyFunctionObject> keyword(getGlobal("keyword_default"));
+  ASSERT_NE(keyword, nullptr);
+  auto keyword_hir = buildHIR(keyword);
+  ASSERT_NE(keyword_hir, nullptr);
+  Compiler::runPasses(*keyword_hir, PassConfig::kSimplify);
+  EXPECT_EQ(
+      countStaticCallsTo(
+          *keyword_hir, reinterpret_cast<void*>(JITRT_GetAttrDefault311)),
+      0)
+      << fullPrinter().ToString(*keyword_hir);
+  Ref<PyFunctionObject> shadowed(getGlobal("shadowed"));
+  ASSERT_NE(shadowed, nullptr);
+  auto shadowed_hir = buildHIR(shadowed);
+  ASSERT_NE(shadowed_hir, nullptr);
+  Compiler::runPasses(*shadowed_hir, PassConfig::kSimplify);
+  EXPECT_EQ(
+      countStaticCallsTo(
+          *shadowed_hir, reinterpret_cast<void*>(JITRT_IsInstanceGen311)),
+      0)
+      << fullPrinter().ToString(*shadowed_hir);
+  EXPECT_EQ(countOpcode(*shadowed_hir, Opcode::kIsInstance), 0);
+}
+
+TEST_F(HIRBuildTest, IsInstanceCacheInvalidatesClassResolution) {
+  runCode(R"(
+class Receiver:
+    pass
+class Other:
+    pass
+obj = Receiver()
+)");
+  Ref<> obj(getGlobal("obj"));
+  Ref<> other(getGlobal("Other"));
+  JITRT_IsInstanceSiteCache311 site{};
+  EXPECT_EQ(JITRT_IsInstanceCached311(&site, obj, other), 0);
+  EXPECT_NE(site.version, 0);
+  EXPECT_EQ(JITRT_IsInstanceCached311(&site, obj, other), 0);
+  runCode(R"(
+Receiver.__getattribute__ = lambda self, name: (
+    Other if name == "__class__" else object.__getattribute__(self, name)
+)
+)");
+  EXPECT_EQ(JITRT_IsInstanceCached311(&site, obj, other), 1);
+  ASSERT_FALSE(PyErr_Occurred());
+}
+
+TEST_F(HIRBuildTest, IsInstanceGenericCacheInvalidatesMetaclass) {
+  runCode(R"(
+class Meta(type):
+    pass
+class Target(metaclass=Meta):
+    pass
+obj = object()
+)");
+  Ref<> obj(getGlobal("obj"));
+  Ref<> target(getGlobal("Target"));
+  JITRT_IsInstanceGenCache311 site{};
+  auto miss = Ref<>::steal(JITRT_IsInstanceGen311(&site, obj, target));
+  ASSERT_NE(miss, nullptr);
+  EXPECT_EQ(miss.get(), Py_False);
+  EXPECT_EQ(site.nkeys, 1);
+  auto hit = Ref<>::steal(JITRT_IsInstanceGen311(&site, obj, target));
+  ASSERT_NE(hit, nullptr);
+  EXPECT_EQ(hit.get(), Py_False);
+  runCode("Meta.__instancecheck__ = lambda cls, value: True");
+  auto changed = Ref<>::steal(JITRT_IsInstanceGen311(&site, obj, target));
+  ASSERT_NE(changed, nullptr);
+  EXPECT_EQ(changed.get(), Py_True);
+}
+
+TEST_F(HIRBuildTest, GetAttrDefaultCacheKeysNameAndInvalidatesDescriptor) {
+  runCode(R"(
+class Slots:
+    __slots__ = ("first", "second")
+obj = Slots()
+first = object()
+second = object()
+obj.first = first
+obj.second = second
+)");
+  Ref<> obj(getGlobal("obj"));
+  Ref<> first(getGlobal("first"));
+  Ref<> second(getGlobal("second"));
+  auto first_name = Ref<>::steal(PyUnicode_FromString("first"));
+  auto second_name = Ref<>::steal(PyUnicode_FromString("second"));
+  ASSERT_NE(first_name, nullptr);
+  ASSERT_NE(second_name, nullptr);
+  JITRT_GetAttrDefaultCache311 site{};
+  auto first_result =
+      Ref<>::steal(JITRT_GetAttrDefault311(&site, obj, first_name, Py_None));
+  ASSERT_NE(first_result, nullptr);
+  EXPECT_EQ(first_result.get(), first.get());
+  EXPECT_EQ(site.slot, 1);
+  auto second_result =
+      Ref<>::steal(JITRT_GetAttrDefault311(&site, obj, second_name, Py_None));
+  ASSERT_NE(second_result, nullptr);
+  EXPECT_EQ(second_result.get(), second.get());
+  runCode(R"(
+def missing(self):
+    raise AttributeError("absent")
+Slots.second = property(missing)
+)");
+  auto missing =
+      Ref<>::steal(JITRT_GetAttrDefault311(&site, obj, second_name, Py_None));
+  ASSERT_NE(missing, nullptr);
+  EXPECT_EQ(missing.get(), Py_None);
+  EXPECT_EQ(site.slot, 0);
+  runCode(R"(
+def failing(self):
+    raise ValueError("failure")
+Slots.second = property(failing)
+)");
+  auto error =
+      Ref<>::steal(JITRT_GetAttrDefault311(&site, obj, second_name, Py_None));
+  EXPECT_EQ(error.get(), nullptr);
+  EXPECT_TRUE(PyErr_ExceptionMatches(PyExc_ValueError));
+  PyErr_Clear();
+}
+#endif

@@ -1491,6 +1491,7 @@ LifecycleSnapshot311 Context::lifecycleSnapshot311() {
     snapshot.code_runtimes_live += !runtime.isCleared();
 #if PY_VERSION_HEX < 0x030C0000
     snapshot.subscript_caches += runtime.subscrCacheCount311();
+    snapshot.predicate_caches += runtime.predicateCacheCount311();
 #endif
   }
   return snapshot;

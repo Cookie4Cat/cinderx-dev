@@ -236,13 +236,15 @@ struct Env {
     block = slow_path;
     cursor = slow_path->begin();
     auto slow_path_value = do_slow_path();
+    // do_slow_path() might have created more blocks, use the final one.
+    BasicBlock* slow_path_end = block;
     emit<Branch>(fast_path);
 
     block = fast_path;
     cursor = fast_path->begin();
     std::unordered_map<BasicBlock*, Register*> args{
         {previous_path, previous_path_value},
-        {slow_path, slow_path_value},
+        {slow_path_end, slow_path_value},
     };
 
     return emitRawInstr<Phi>(output, args);
@@ -516,6 +518,157 @@ Register* simplifyCompare(Env& env, const Compare* instr) {
   return nullptr;
 }
 
+#if PY_VERSION_HEX < 0x030C0000
+// SPIKE(STRLITEQ): `x == "lit"` / `x != "lit"` with an exact-str x and a
+// short compact-ASCII literal.  Pointer identity answers the interned hit;
+// otherwise the length and the compact+ascii state bits are checked and the
+// character bytes are compared in at most two chunk loads (the NUL terminator
+// pads the last chunk, so every load stays inside the object).  A string
+// that is not compact ASCII goes to the helper before its length is used,
+// since legacy storage can still need PyUnicode_READY.
+Register* trySimplifyStrLiteralCompare(Env& env, const CompareBool* instr) {
+  static const bool enabled = Ci_SpikeGetenv("SPIKE_STRLITEQ") != nullptr;
+  if (!enabled || instr->inlineLiteralDone()) {
+    return nullptr;
+  }
+  CompareOp op = instr->op();
+  if (op != CompareOp::kEqual && op != CompareOp::kNotEqual) {
+    return nullptr;
+  }
+  auto literal_of = [](Register* r) -> PyObject* {
+    Type t = r->type();
+    if (!t.hasObjectSpec()) {
+      return nullptr;
+    }
+    PyObject* o = t.objectSpec();
+    return PyUnicode_CheckExact(o) ? o : nullptr;
+  };
+  Register* x = instr->left();
+  Register* c = instr->right();
+  PyObject* lit = literal_of(c);
+  if (lit == nullptr) {
+    lit = literal_of(x);
+    if (lit == nullptr) {
+      return nullptr;
+    }
+    std::swap(x, c);
+  }
+  if (!x->isA(TUnicodeExact)) {
+    return nullptr;
+  }
+  if (PyObject* xl = literal_of(x)) {
+    int r = PyObject_RichCompareBool(
+        xl, lit, op == CompareOp::kEqual ? Py_EQ : Py_NE);
+    if (r < 0) {
+      PyErr_Clear();
+      return nullptr;
+    }
+    env.emit<UseType>(x, x->type());
+    env.emit<UseType>(c, c->type());
+    return env.emit<LoadConst>(Type::fromCBool(r != 0));
+  }
+  if (!PyUnicode_IS_COMPACT_ASCII(lit)) {
+    return nullptr;
+  }
+  Py_ssize_t len = PyUnicode_GET_LENGTH(lit);
+  if (len < 1 || len > 8) {
+    return nullptr;
+  }
+  // len + 1 bytes are valid: the compact ASCII data is NUL terminated.
+  const auto* bytes = static_cast<const unsigned char*>(PyUnicode_DATA(lit));
+  struct Chunk {
+    Py_ssize_t off;
+    int size;
+    uint64_t value;
+    Type type;
+  };
+  std::vector<Chunk> chunks;
+  for (Py_ssize_t off = 0; off < len;) {
+    int size = 1;
+    Type type = TCUInt8;
+    if (off + 8 <= len + 1) {
+      size = 8;
+      type = TCUInt64;
+    } else if (off + 4 <= len + 1) {
+      size = 4;
+      type = TCUInt32;
+    } else if (off + 2 <= len + 1) {
+      size = 2;
+      type = TCUInt16;
+    }
+    uint64_t value = 0;
+    for (int i = 0; i < size; ++i) {
+      value |= static_cast<uint64_t>(bytes[off + i]) << (8 * i);
+    }
+    chunks.push_back(Chunk{off, size, value, type});
+    off += size;
+  }
+  env.emit<UseType>(x, TUnicodeExact);
+  Register* same = env.emit<PrimitiveCompare>(PrimitiveCompareOp::kEqual, x, c);
+  Register* eq = env.emitCond(
+      [&](BasicBlock* t, BasicBlock* f) { env.emit<CondBranch>(same, t, f); },
+      [&] { return env.emit<LoadConst>(Type::fromCBool(true)); },
+      [&] {
+        Register* state = env.emit<LoadField>(
+            x, "state", offsetof(PyASCIIObject, state), TCUInt8);
+        Register* mask = env.emit<LoadConst>(Type::fromCUInt(0x60, TCUInt8));
+        Register* bits = env.emit<IntBinaryOp>(BinaryOpKind::kAnd, state, mask);
+        Register* compact_ascii =
+            env.emit<PrimitiveCompare>(PrimitiveCompareOp::kEqual, bits, mask);
+        return env.emitCond(
+            [&](BasicBlock* t, BasicBlock* f) {
+              env.emit<CondBranch>(compact_ascii, t, f);
+            },
+            [&] {
+              // A legacy, non-ready string has no valid length yet. Only
+              // compact ASCII permits reading length without PyUnicode_READY.
+              Register* length = env.emit<LoadField>(
+                  x, "length", offsetof(PyASCIIObject, length), TCInt64);
+              Register* want =
+                  env.emit<LoadConst>(Type::fromCInt(len, TCInt64));
+              Register* len_ok = env.emit<PrimitiveCompare>(
+                  PrimitiveCompareOp::kEqual, length, want);
+              return env.emitCond(
+                  [&](BasicBlock* t, BasicBlock* f) {
+                    env.emit<CondBranch>(len_ok, t, f);
+                  },
+                  [&] {
+                    Register* acc = nullptr;
+                    for (const Chunk& ch : chunks) {
+                      Register* v = env.emit<LoadField>(
+                          x, "data", sizeof(PyASCIIObject) + ch.off, ch.type);
+                      Register* k = env.emit<LoadConst>(
+                          Type::fromCUInt(ch.value, ch.type));
+                      Register* e = env.emit<PrimitiveCompare>(
+                          PrimitiveCompareOp::kEqual, v, k);
+                      acc = acc == nullptr
+                          ? e
+                          : env.emit<IntBinaryOp>(BinaryOpKind::kAnd, acc, e);
+                    }
+                    return acc;
+                  },
+                  [&] { return env.emit<LoadConst>(Type::fromCBool(false)); });
+            },
+            [&] {
+              auto* helper = env.emitInstr<CompareBool>(
+                  CompareOp::kEqual, x, c, *instr->frameState());
+              helper->setInlineLiteralDone();
+              return helper->output();
+            });
+      });
+  if (op == CompareOp::kNotEqual) {
+    Register* no = env.emit<LoadConst>(Type::fromCBool(false));
+    return env.emit<PrimitiveCompare>(PrimitiveCompareOp::kEqual, eq, no);
+  }
+  return eq;
+}
+
+Register* simplifyCompareBool(Env& env, const CompareBool* instr) {
+  return trySimplifyStrLiteralCompare(env, instr);
+}
+
+#endif
+
 Register* simplifyLongCompare(Env& env, const LongCompare* instr) {
   Register* left = instr->GetOperand(0);
   Register* right = instr->GetOperand(1);
@@ -613,6 +766,29 @@ Register* simplifyIsTruthy(Env& env, const IsTruthy* instr) {
       return env.emit<LoadConst>(Type::fromCBool(res));
     }
   }
+#if PY_VERSION_HEX < 0x030C0000
+  // SPIKE(CMPFUSE): an exact-str compare whose boxed bool feeds this truth
+  // test.  CompareBool keeps the typed lowering (JITRT_UnicodeEquals) and
+  // yields the CBool directly, so the answer is never boxed, incref'd and
+  // unboxed again.  The UnicodeCompare is pure and stays behind; it dies
+  // with its last use.  LongCompare is deliberately left alone: this
+  // IsTruthy is visited in the same pass that created the LongCompare, and
+  // fusing here would pre-empt simplifyLongCompare's unboxed
+  // PrimitiveCompare on compact operands with a helper call.
+  {
+    // Simplify keeps the replaced compare's output alive through an Assign
+    // until copy propagation, so look through those.
+    const Instr* def = instr->GetOperand(0)->instr();
+    while (def != nullptr && def->IsAssign()) {
+      def = def->GetOperand(0)->instr();
+    }
+    if (def != nullptr && def->IsUnicodeCompare()) {
+      auto* cmp = static_cast<const UnicodeCompare*>(def);
+      return env.emit<CompareBool>(
+          cmp->op(), cmp->left(), cmp->right(), *instr->frameState());
+    }
+  }
+#endif
   if (ty <= TBool) {
     Register* left = instr->GetOperand(0);
     env.emit<UseType>(left, TBool);
@@ -3312,6 +3488,101 @@ Register* trySimplifyStaticKwCall311(Env& env, const VectorCall* instr) {
   call->output()->set_type(instr->output()->type());
   return call->output();
 }
+
+// SPIKE(ISINSTINLINE): the per-site cache probe of JITRT_IsInstanceCached311
+// in HIR -- receiver type, class, type version tag and the valid-tag flag
+// against the site's entry -- so a hit costs loads and compares instead of a
+// helper call.  The miss arm keeps the helper, which also fills the entry.
+Register* emitIsInstanceSlowArm(
+    Env& env,
+    Register* obj,
+    Register* obj_type,
+    Register* cls,
+    const FrameState& frame) {
+  static const bool inline_probe =
+      Ci_SpikeGetenv("SPIKE_ISINSTINLINE") != nullptr &&
+      Ci_SpikeGetenv("SPIKE_ISINSTCACHE") != nullptr &&
+      Ci_SpikeGetenv("SPIKE_ISINSTFAST") != nullptr;
+  PyCodeObject* code = env.func.code.get();
+  if (!inline_probe || code == nullptr) {
+    return env.emit<IsInstance>(obj, cls, frame);
+  }
+  JITRT_IsInstanceSiteCache311* cache =
+      env.func.predicateCache311<JITRT_IsInstanceSiteCache311>(
+          static_cast<int64_t>(env.bc_off.value()), 0);
+  Register* entry = env.emit<LoadConst>(Type::fromCPtr(cache));
+  Register* cached_type = env.emit<LoadField>(
+      entry, "type", offsetof(JITRT_IsInstanceSiteCache311, type), TOptObject);
+  Register* type_ok = env.emit<PrimitiveCompare>(
+      PrimitiveCompareOp::kEqual, obj_type, cached_type);
+  Register* cached_cls = env.emit<LoadField>(
+      entry, "cls", offsetof(JITRT_IsInstanceSiteCache311, cls), TOptObject);
+  Register* cls_ok =
+      env.emit<PrimitiveCompare>(PrimitiveCompareOp::kEqual, cls, cached_cls);
+  Register* version = env.emit<LoadField>(
+      obj_type,
+      "tp_version_tag",
+      offsetof(PyTypeObject, tp_version_tag),
+      TCUInt32);
+  Register* cached_version = env.emit<LoadField>(
+      entry,
+      "version",
+      offsetof(JITRT_IsInstanceSiteCache311, version),
+      TCUInt32);
+  Register* version_ok = env.emit<PrimitiveCompare>(
+      PrimitiveCompareOp::kEqual, version, cached_version);
+  Register* flags = env.emit<LoadField>(
+      obj_type, "tp_flags", offsetof(PyTypeObject, tp_flags), TCUInt64);
+  Register* valid_bit = env.emit<LoadConst>(
+      Type::fromCUInt(Py_TPFLAGS_VALID_VERSION_TAG, TCUInt64));
+  Register* valid_bits =
+      env.emit<IntBinaryOp>(BinaryOpKind::kAnd, flags, valid_bit);
+  Register* zero64 = env.emit<LoadConst>(Type::fromCUInt(0, TCUInt64));
+  Register* valid = env.emit<PrimitiveCompare>(
+      PrimitiveCompareOp::kNotEqual, valid_bits, zero64);
+  Register* cls_version = env.emit<LoadField>(
+      cls, "tp_version_tag", offsetof(PyTypeObject, tp_version_tag), TCUInt32);
+  Register* cached_cls_version = env.emit<LoadField>(
+      entry,
+      "cls_version",
+      offsetof(JITRT_IsInstanceSiteCache311, cls_version),
+      TCUInt32);
+  Register* cls_version_ok = env.emit<PrimitiveCompare>(
+      PrimitiveCompareOp::kEqual, cls_version, cached_cls_version);
+  Register* cls_flags = env.emit<LoadField>(
+      cls, "tp_flags", offsetof(PyTypeObject, tp_flags), TCUInt64);
+  Register* cls_valid_bits =
+      env.emit<IntBinaryOp>(BinaryOpKind::kAnd, cls_flags, valid_bit);
+  Register* cls_valid = env.emit<PrimitiveCompare>(
+      PrimitiveCompareOp::kNotEqual, cls_valid_bits, zero64);
+  Register* hit = env.emit<IntBinaryOp>(BinaryOpKind::kAnd, type_ok, cls_ok);
+  hit = env.emit<IntBinaryOp>(BinaryOpKind::kAnd, hit, cls_version_ok);
+  hit = env.emit<IntBinaryOp>(BinaryOpKind::kAnd, hit, cls_valid);
+  hit = env.emit<IntBinaryOp>(BinaryOpKind::kAnd, hit, version_ok);
+  hit = env.emit<IntBinaryOp>(BinaryOpKind::kAnd, hit, valid);
+  return env.emitCond(
+      [&](BasicBlock* t, BasicBlock* f) { env.emit<CondBranch>(hit, t, f); },
+      [&] {
+        Register* result = env.emit<LoadField>(
+            entry,
+            "result",
+            offsetof(JITRT_IsInstanceSiteCache311, result),
+            TCInt32);
+        Register* zero32 = env.emit<LoadConst>(Type::fromCInt(0, TCInt32));
+        return env.emit<PrimitiveCompare>(
+            PrimitiveCompareOp::kNotEqual, result, zero32);
+      },
+      [&] { return env.emit<IsInstance>(obj, cls, frame); });
+}
+#else
+Register* emitIsInstanceSlowArm(
+    Env& env,
+    Register* obj,
+    Register* /* obj_type */,
+    Register* cls,
+    const FrameState& frame) {
+  return env.emit<IsInstance>(obj, cls, frame);
+}
 #endif
 
 Register* simplifyVectorCall(Env& env, const VectorCall* instr) {
@@ -3340,6 +3611,55 @@ Register* simplifyVectorCall(Env& env, const VectorCall* instr) {
     env.emit<UseType>(target, target->type());
     return env.emit<GetLength>(instr->arg(0), *instr->frameState());
   }
+#if PY_VERSION_HEX < 0x030C0000
+  // SPIKE(ISINSTGEN): the isinstance calls the inline type test below does
+  // not take -- a class tuple, or a class operand of unknown type -- replay
+  // the answer from a per-site cache instead of calling the builtin.
+  static const bool spike_isinstgen =
+      Ci_SpikeGetenv("SPIKE_ISINSTGEN") != nullptr;
+  if (spike_isinstgen && isBuiltin(target, "isinstance") &&
+      instr->numArgs() == 2 && env.func.code.get() != nullptr &&
+      !(instr->GetOperand(2)->type() <= TType &&
+        !(instr->GetOperand(2)->type() <= TTuple))) {
+    JITRT_IsInstanceGenCache311* cache =
+        env.func.predicateCache311<JITRT_IsInstanceGenCache311>(
+            static_cast<int64_t>(env.bc_off.value()), 1);
+    env.emit<UseType>(target, target->type());
+    Register* entry = env.emit<LoadConst>(Type::fromCPtr(cache));
+    Register* result = env.emitVariadic<CallStatic>(
+        3,
+        reinterpret_cast<void*>(JITRT_IsInstanceGen311),
+        TBool | TNullptr,
+        entry,
+        instr->GetOperand(1),
+        instr->GetOperand(2));
+    return env.emit<CheckExc>(result, *instr->frameState());
+  }
+  // SPIKE(GETATTRDFL): getattr(obj, "name", default) with a constant name.
+  static const bool spike_getattrdfl =
+      Ci_SpikeGetenv("SPIKE_GETATTRDFL") != nullptr;
+  if (spike_getattrdfl && isBuiltin(target, "getattr") &&
+      instr->numArgs() == 3 && env.func.code.get() != nullptr) {
+    Type name_type = instr->GetOperand(2)->type();
+    if (name_type.hasObjectSpec() &&
+        PyUnicode_CheckExact(name_type.objectSpec())) {
+      JITRT_GetAttrDefaultCache311* cache =
+          env.func.predicateCache311<JITRT_GetAttrDefaultCache311>(
+              static_cast<int64_t>(env.bc_off.value()), 2);
+      env.emit<UseType>(target, target->type());
+      Register* entry = env.emit<LoadConst>(Type::fromCPtr(cache));
+      Register* result = env.emitVariadic<CallStatic>(
+          4,
+          reinterpret_cast<void*>(JITRT_GetAttrDefault311),
+          TObject | TNullptr,
+          entry,
+          instr->GetOperand(1),
+          instr->GetOperand(2),
+          instr->GetOperand(3));
+      return env.emit<CheckExc>(result, *instr->frameState());
+    }
+  }
+#endif
   if (isBuiltin(target, "isinstance") && instr->numArgs() == 2 &&
       instr->GetOperand(2)->type() <= TType &&
       !(instr->GetOperand(2)->type() <= TTuple)) {
@@ -3386,7 +3706,8 @@ Register* simplifyVectorCall(Env& env, const VectorCall* instr) {
             return env.emitInstr<CondBranch>(compare_type, nullptr, slow_path);
           },
           [&] {
-            return env.emit<IsInstance>(obj_op, type_op, *instr->frameState());
+            return emitIsInstanceSlowArm(
+                env, obj_op, obj_type, type_op, *instr->frameState());
           });
 
       // The output of the VectorCall instruction was previously a TBool, but we
@@ -3407,7 +3728,8 @@ Register* simplifyVectorCall(Env& env, const VectorCall* instr) {
           return compare_type;
         },
         [&] { // Slow path
-          return env.emit<IsInstance>(obj_op, type_op, *instr->frameState());
+          return emitIsInstanceSlowArm(
+              env, obj_op, obj_type, type_op, *instr->frameState());
         });
     return env.emit<PrimitiveBoxBool>(cbool_res);
   }
@@ -3517,6 +3839,10 @@ Register* simplifyInstr(Env& env, const Instr* instr) {
 
     case Opcode::kCompare:
       return simplifyCompare(env, static_cast<const Compare*>(instr));
+#if PY_VERSION_HEX < 0x030C0000
+    case Opcode::kCompareBool:
+      return simplifyCompareBool(env, static_cast<const CompareBool*>(instr));
+#endif
     case Opcode::kLongCompare:
       return simplifyLongCompare(env, static_cast<const LongCompare*>(instr));
 

@@ -2093,8 +2093,22 @@ class INSTR_CLASS(
     return GetOperand(1);
   }
 
+#if PY_VERSION_HEX < 0x030C0000
+  // SPIKE(STRLITEQ): set on the helper-form fallback that the inline literal
+  // compare emits, so Simplify does not expand that instruction again.
+  bool inlineLiteralDone() const {
+    return inline_literal_done_;
+  }
+  void setInlineLiteralDone() {
+    inline_literal_done_ = true;
+  }
+#endif
+
  private:
   CompareOp op_;
+#if PY_VERSION_HEX < 0x030C0000
+  bool inline_literal_done_{false};
+#endif
 };
 
 class INSTR_CLASS(PrimitiveConvert, (TPrimitive), HasOutput, Operands<1>) {
