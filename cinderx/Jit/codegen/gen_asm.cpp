@@ -2,6 +2,8 @@
 
 #include "cinderx/Jit/codegen/gen_asm.h"
 
+#include "cinderx/Common/spike_env.h"
+
 #include <structmember.h>
 #if PY_VERSION_HEX < 0x030C0000
 #include "cinderx/Interpreter/3.11/interpreter_contract.h"
@@ -483,6 +485,23 @@ DeoptResult prepareForDeopt(
     }
 #endif
   }
+#if PY_VERSION_HEX < 0x030C0000
+  // Feed only organic guard failures to the per-site speculation fuses.
+  // The forced flag is consumed in this function and is no longer available
+  // when resumeInInterpreter runs.
+  if (deopt_meta.reason == DeoptReason::kGuardFailure &&
+      !is_instrumentation_deopt && !is_forced_deopt) {
+    // SPIKE(BINTYPED): the *_FLOAT binary-op guard sites.
+    static const bool bintyped = Ci_SpikeGetenv("SPIKE_BINTYPED") != nullptr;
+    if (bintyped) {
+      const DeoptFrameMetadata& fm = deopt_meta.innermostFrame();
+      if (fm.code != nullptr) {
+        Ci_SpikeFloatGuardFail311(
+            fm.code, BCOffset(fm.cause_instr_idx).value());
+      }
+    }
+  }
+#endif
   return {frame, is_instrumentation_deopt};
 }
 

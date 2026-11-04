@@ -2,7 +2,7 @@
   "format": "cp311-stdlib-canary-deopts-v1",
   "python": "3.11.6",
   "baseline_source": "3e26a6961966feef946cfda39a784cbdcf296c08",
-  "total": 253,
+  "total": 287,
   "sites": [
     {
       "filename": "<frozen _collections_abc>",
@@ -112,9 +112,9 @@
       "filename": "enum.py",
       "qualname": "_is_single_bit",
       "reason": "GuardFailure",
-      "cause_offset": 19,
-      "resume_offset": 38,
-      "count": 1
+      "cause_offset": 3,
+      "resume_offset": 6,
+      "count": 3
     },
     {
       "filename": "functools.py",
@@ -187,6 +187,14 @@
       "cause_offset": 16,
       "resume_offset": 34,
       "count": 8
+    },
+    {
+      "filename": "re/_parser.py",
+      "qualname": "Tokenizer.match",
+      "reason": "GuardFailure",
+      "cause_offset": 8,
+      "resume_offset": 16,
+      "count": 32
     },
     {
       "filename": "tomllib/_parser.py",

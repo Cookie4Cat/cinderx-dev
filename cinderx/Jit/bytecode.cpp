@@ -255,6 +255,19 @@ bool BytecodeInstruction::isSubscrAdaptiveStuck() const {
 #endif
 }
 
+bool BytecodeInstruction::isBinaryOpAdaptiveStuck() const {
+#if PY_VERSION_HEX < 0x030C0000
+  int raw = _Py_OPCODE(codeUnit(code_)[opcodeIndex().value()]);
+  if (raw != BINARY_OP_ADAPTIVE) {
+    return false;
+  }
+  uint16_t counter = cacheU16(kInlineCacheStartInstructionOffset);
+  return (counter & ((1 << ADAPTIVE_BACKOFF_BITS) - 1)) != 0;
+#else
+  return false;
+#endif
+}
+
 int BytecodeInstruction::oparg() const {
   calcOpcodeOffsetAndOparg();
   return extendedOparg_;

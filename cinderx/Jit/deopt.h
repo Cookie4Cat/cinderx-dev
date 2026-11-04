@@ -179,6 +179,14 @@ struct DeoptMetadata {
   int32_t force_countdown{0};
   bool consumed_forced{false};
 
+  // If not -1, this row belongs to the slow-path guard of a forced-deopt
+  // check and the value is the index of the site row it forces.  The slow
+  // path is a separate guard with its own register assignment, and live
+  // value locations are recorded per row, so it cannot deopt through the
+  // row shared by the site's ordinary guards.  Arming state lives on the
+  // site row; this row is never listed as a site of its own.
+  int64_t forced_site_row{-1};
+
   BorrowedRef<PyCodeObject> code() const {
     return innermostFrame().code;
   }

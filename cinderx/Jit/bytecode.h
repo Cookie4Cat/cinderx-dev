@@ -60,6 +60,9 @@ class BytecodeInstruction {
   // failed (array.array receivers, the scimark shape), so the site will
   // never carry a *_LIST_INT verdict for the builder to consume.
   bool isSubscrAdaptiveStuck() const;
+  // SPIKE(FLOATSPEC): BINARY_OP whose 3.11 adaptive specialisation was
+  // attempted and failed (mixed operand types), same detection as above.
+  bool isBinaryOpAdaptiveStuck() const;
   uint16_t attrCacheIndex() const;
 
   // Check if this instruction is a branch, a return, or a general basic block

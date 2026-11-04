@@ -6,6 +6,8 @@
 #include "internal/pycore_ceval.h"
 #include "internal/pycore_object.h"
 #if PY_VERSION_HEX < 0x030C0000
+#include "internal/pycore_floatobject.h"
+#include "internal/pycore_pymem.h"
 #include "structmember.h"
 #endif
 #include "internal/pycore_pyerrors.h"
@@ -4075,6 +4077,94 @@ PyObject* JITRT_BoxU64(uint64_t i) {
 PyObject* JITRT_BoxDouble(double_t d) {
   return PyFloat_FromDouble(d);
 }
+
+#if PY_VERSION_HEX < 0x030C0000
+namespace {
+// Process constants for the single main interpreter, cached in a plain
+// global on first use.  A function-local static would cost an acquire load
+// plus guard test on every call, and its potential __cxa_guard_acquire call
+// forces a stack frame onto what should be leaf code; the GOT-indirect
+// loads of PyFloat_Type / _Py_tracemalloc_config are cached for the same
+// reason.  Every fallback below is a tail call so the fast paths compile to
+// frameless leaf functions.
+struct SpikeFloatFl311 {
+  struct _Py_float_state* state;
+  const int* tracing;
+  const PyTypeObject* float_type;
+};
+SpikeFloatFl311 g_spike_floatfl311{nullptr, nullptr, nullptr};
+
+__attribute__((noinline)) SpikeFloatFl311* spikeFloatFlInit311() {
+  g_spike_floatfl311.tracing = &_Py_tracemalloc_config.tracing;
+  g_spike_floatfl311.float_type = &PyFloat_Type;
+  g_spike_floatfl311.state = &_PyInterpreterState_Main()->float_state;
+  return &g_spike_floatfl311;
+}
+
+inline SpikeFloatFl311* spikeFloatFl311() {
+  if (__builtin_expect(g_spike_floatfl311.state == nullptr, 0)) {
+    return spikeFloatFlInit311();
+  }
+  return &g_spike_floatfl311;
+}
+
+inline void spikeFloatFreelistPush311(
+    struct _Py_float_state* state,
+    PyObject* op) {
+  state->numfree++;
+  Py_SET_TYPE(op, reinterpret_cast<PyTypeObject*>(state->free_list));
+  state->free_list = reinterpret_cast<PyFloatObject*>(op);
+}
+} // namespace
+
+PyObject* JITRT_BoxDoubleFast311(double_t d) {
+#if defined(Py_DEBUG) || defined(Py_REF_DEBUG) || defined(Py_TRACE_REFS) || \
+    defined(Py_STATS)
+  // _Py_NewReference does the debug/statistics bookkeeping; the LIR
+  // generator does not select this helper in those builds either.
+  return PyFloat_FromDouble(d);
+#else
+  SpikeFloatFl311* g = spikeFloatFl311();
+  struct _Py_float_state* state = g->state;
+  PyFloatObject* op = state->free_list;
+  if (__builtin_expect(op == nullptr || *g->tracing != 0, 0)) {
+    return PyFloat_FromDouble(d);
+  }
+  // Mirrors PyFloat_FromDouble + _PyObject_Init for the static float type:
+  // pop, set type, fresh reference (no _Py_RefTotal in release builds),
+  // store the value.
+  state->free_list = reinterpret_cast<PyFloatObject*>(Py_TYPE(op));
+  state->numfree--;
+  Py_SET_TYPE(op, &PyFloat_Type);
+  Py_SET_REFCNT(op, 1);
+  op->ob_fval = d;
+  return reinterpret_cast<PyObject*>(op);
+#endif
+}
+
+void JITRT_FloatDeallocExact311(PyObject* op) {
+  struct _Py_float_state* state = spikeFloatFl311()->state;
+  if (__builtin_expect(state->numfree >= PyFloat_MAXFREELIST, 0)) {
+    PyObject_Free(op);
+    return;
+  }
+  spikeFloatFreelistPush311(state, op);
+}
+
+void JITRT_DeallocMaybeFloat311(PyObject* op) {
+  SpikeFloatFl311* g = spikeFloatFl311();
+  if (Py_TYPE(op) != g->float_type) {
+    _Py_Dealloc(op);
+    return;
+  }
+  struct _Py_float_state* state = g->state;
+  if (__builtin_expect(state->numfree >= PyFloat_MAXFREELIST, 0)) {
+    PyObject_Free(op);
+    return;
+  }
+  spikeFloatFreelistPush311(state, op);
+}
+#endif
 
 PyObject* JITRT_LongFloatTrueDivide(PyObject* left, PyObject* right) {
   JIT_DCHECK(PyLong_CheckExact(left), "left operand must be exact int");

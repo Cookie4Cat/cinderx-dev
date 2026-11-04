@@ -611,10 +611,31 @@ class INSTR_CLASS(
     return subscr_adaptive_stuck_;
   }
 
+  // SPIKE(FLOATSPEC): arithmetic site whose interpreter specialisation was
+  // attempted and failed; Simplify may speculate float operands behind a
+  // type-check diamond.
+  bool speculateFloat() const {
+    return speculate_float_;
+  }
+  void setSpeculateFloat(bool v) {
+    speculate_float_ = v;
+  }
+  // The generic arm of a speculation diamond: never speculate on it again
+  // (the one-known-float rule would otherwise re-fire on every simplifier
+  // iteration and nest diamonds until the block limit).
+  bool noSpeculation() const {
+    return no_speculation_;
+  }
+  void setNoSpeculation(bool v) {
+    no_speculation_ = v;
+  }
+
  private:
   BinaryOpKind op_;
   bool array_subscr_slow_path_;
   bool subscr_adaptive_stuck_;
+  bool speculate_float_{false};
+  bool no_speculation_{false};
 };
 
 #define FOREACH_UNARY_OP_KIND(V) \
@@ -727,9 +748,37 @@ class INSTR_CLASS(
     float_fast_path_ = enabled;
   }
 
+  // SPIKE(IPTYPED): exact operand type observed by the CPython 3.11
+  // specialiser at this site (TFloatExact / TLongExact), or TBottom when the
+  // site carries no such evidence.  Consumed by simplifyInPlaceOp.
+  Type specializedExact() const {
+    return specialized_exact_;
+  }
+
+  void setSpecializedExact(Type type) {
+    specialized_exact_ = type;
+  }
+
+  // SPIKE(FLOATSPEC): see BinaryOp::speculateFloat / noSpeculation.
+  bool speculateFloat() const {
+    return speculate_float_;
+  }
+  void setSpeculateFloat(bool v) {
+    speculate_float_ = v;
+  }
+  bool noSpeculation() const {
+    return no_speculation_;
+  }
+  void setNoSpeculation(bool v) {
+    no_speculation_ = v;
+  }
+
  private:
   InPlaceOpKind op_;
   bool float_fast_path_;
+  Type specialized_exact_{TBottom};
+  bool speculate_float_{false};
+  bool no_speculation_{false};
 };
 
 // Builds a slice object, with 2 or 3 operands from the stack
@@ -1766,8 +1815,20 @@ class INSTR_CLASS(
     return GetOperand(1);
   }
 
+  // SPIKE(CMPTYPED): exact operand type observed by the CPython 3.11
+  // specialiser at this site (TLongExact), or TBottom when the builder emitted
+  // guards or has no such evidence.  Consumed by Simplify.
+  Type specializedExact() const {
+    return specialized_exact_;
+  }
+
+  void setSpecializedExact(Type type) {
+    specialized_exact_ = type;
+  }
+
  private:
   CompareOp op_;
+  Type specialized_exact_{TBottom};
 };
 
 // Perform the comparison indicated by op between two floats
@@ -2093,6 +2154,17 @@ class INSTR_CLASS(
     return GetOperand(1);
   }
 
+  // SPIKE(CMPTYPED): exact operand type observed by the CPython 3.11
+  // specialiser at this site (TLongExact), or TBottom when the builder emitted
+  // guards or has no such evidence.  Consumed by Simplify.
+  Type specializedExact() const {
+    return specialized_exact_;
+  }
+
+  void setSpecializedExact(Type type) {
+    specialized_exact_ = type;
+  }
+
 #if PY_VERSION_HEX < 0x030C0000
   // SPIKE(STRLITEQ): set on the helper-form fallback that the inline literal
   // compare emits, so Simplify does not expand that instruction again.
@@ -2106,6 +2178,7 @@ class INSTR_CLASS(
 
  private:
   CompareOp op_;
+  Type specialized_exact_{TBottom};
 #if PY_VERSION_HEX < 0x030C0000
   bool inline_literal_done_{false};
 #endif

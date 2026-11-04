@@ -260,6 +260,7 @@ test_kunpeng() {
     test_cinderx.test_kunpeng.test_canary_execute_311 \
     test_cinderx.test_kunpeng.test_execute_311 \
     test_cinderx.test_kunpeng.test_scheduling_policy_311 \
+    test_cinderx.test_kunpeng.test_speculation_feedback_311 \
     test_cinderx.test_kunpeng.test_generator_close_semantics_311 \
     test_cinderx.test_kunpeng.test_subscript_cache_lifetime_311 \
     test_cinderx.test_kunpeng.test_predicates_311 \

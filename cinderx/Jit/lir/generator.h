@@ -81,6 +81,10 @@ class LIRGenerator {
   jit::codegen::Environ* env_{nullptr};
 
   bool is_gen_{false};
+  // SPIKE(FLOATFL): the HIR contains unboxed double arithmetic, so values
+  // of unknown static type being released are plausibly floats.  Gates the
+  // inline float dealloc dispatch.
+  bool code_has_float_ops_{false};
 
   BasicBlock* entry_block_{nullptr};
   BasicBlock* frame_setup_block_{nullptr};
@@ -190,6 +194,16 @@ class LIRGenerator {
 #if PY_VERSION_HEX < 0x030C0000
   // 3.11 normal-frame inline link/unlink.
   bool canInlineNormalFrame() const;
+#if PY_VERSION_HEX < 0x030C0000
+  void emitInlineFloatBox311(
+      BasicBlockBuilder& bbb,
+      const hir::PrimitiveBox* instr,
+      lir::Instruction* src);
+  void emitInlineFloatDealloc311(
+      BasicBlockBuilder& bbb,
+      lir::Instruction* obj,
+      lir::BasicBlock* end);
+#endif
   void emitActiveFrameCountIn(BasicBlockBuilder& bbb);
   // Inline InitFrameCellVars for the inline-linked frame.
   void emitInlineInitFrameFreeVars(

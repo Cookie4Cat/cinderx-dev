@@ -57,6 +57,7 @@
 #endif
 #include <fmt/std.h>
 
+#include <array>
 #include <atomic>
 #include <charconv>
 #include <chrono>
@@ -69,6 +70,7 @@
 #include <iterator>
 #include <limits>
 #include <memory>
+#include <mutex>
 #include <optional>
 #include <string>
 #include <string_view>
@@ -104,6 +106,13 @@ static inline void ciSetJitState(jit::State state) {
 }
 
 using namespace jit;
+
+#if PY_VERSION_HEX < 0x030C0000
+namespace jit {
+// Code objects carrying numeric speculation fuse state (defined below).
+size_t numericSpecCodeCount311();
+} // namespace jit
+#endif
 
 namespace {
 
@@ -3204,6 +3213,8 @@ PyObject* jit311_lifecycle_snapshot(PyObject* /* self */, PyObject* /* arg */) {
   rc |=
       lifecycleSetSize(jit_state, "predicate_caches", census.predicate_caches);
   rc |= lifecycleSetSize(
+      jit_state, "numeric_spec_codes", jit::numericSpecCodeCount311());
+  rc |= lifecycleSetSize(
       module,
       "registered_compilation_units",
       module_state->registered_compilation_units.size());
@@ -3746,7 +3757,7 @@ PyObject* deopt_sites(PyObject* /* self */, PyObject* arg) {
     return nullptr;
   }
   for (const jit::DeoptMetadata& meta : rt->deoptMetadatas()) {
-    if (meta.frame_meta.empty()) {
+    if (meta.frame_meta.empty() || meta.forced_site_row >= 0) {
       continue;
     }
     auto site = Ref<>::steal(Py_BuildValue(
@@ -6350,6 +6361,45 @@ void excEdgeCodeDestroyed311(PyCodeObject* code) {
   s_exc_edge_311.erase(code);
 }
 
+// Per-site numeric speculation fuses: the *_FLOAT binary-op guards, the
+// compact-long guards and the evidence-free float diamonds of
+// SPIKE_FLOATSPEC=all.  Same lifetime as the exception-edge state above:
+// keyed by code object and dropped with it, so a reused address never
+// inherits a fuse.  Unlike that state, the builder and Simplify write here
+// (site registration, hit counters), and a batch compile runs them on several
+// worker threads at once, so every access holds s_numeric_spec_mutex_311.
+// The mutex is never held across a recompile, which re-enters the builder.
+struct NumericSpecSiteFuse311 {
+  // Sites whose speculation guard some artifact of the code has emitted.
+  std::unordered_set<int64_t> registered;
+  // Guard failures per registered site that is not yet taken down.
+  std::unordered_map<int64_t, uint64_t> fails;
+  // Sites a recompile must leave unspeculated.
+  std::unordered_set<int64_t> taken_down;
+};
+struct NumericSpecCodeState311 {
+  NumericSpecSiteFuse311 float_guard;
+  // {hits, misses} per float diamond site (SPIKE_FLOATSPEC=all).  Compiled
+  // code bumps hits through the cell's address: map nodes do not move on
+  // rehash, and the cells die only with the code object, after its last
+  // artifact.
+  std::unordered_map<int64_t, std::array<uint64_t, 2>> float_spec_counters;
+  std::unordered_set<int64_t> float_spec_taken_down;
+};
+std::mutex s_numeric_spec_mutex_311;
+std::unordered_map<PyCodeObject*, NumericSpecCodeState311> s_numeric_spec_311;
+bool s_numeric_spec_recompiling_311 = false;
+
+void numericSpecCodeDestroyed311(PyCodeObject* code) {
+  std::lock_guard<std::mutex> lock{s_numeric_spec_mutex_311};
+  s_numeric_spec_311.erase(code);
+}
+
+void numericSpecClear311() {
+  std::lock_guard<std::mutex> lock{s_numeric_spec_mutex_311};
+  s_numeric_spec_311.clear();
+}
+
 // Recompile every artifact of `code` with the granted sites: uncompile and
 // compile again synchronously.  Reached from prepareForDeopt with the
 // retiring artifact's machine code still live on the C stack (the artifact
@@ -6435,6 +6485,11 @@ void recompileCodeForExcEdge311(
   }
 }
 } // namespace
+
+size_t numericSpecCodeCount311() {
+  std::lock_guard<std::mutex> lock{s_numeric_spec_mutex_311};
+  return s_numeric_spec_311.size();
+}
 #endif
 
 void recordDeoptForRoiBackoff(
@@ -6607,6 +6662,7 @@ int initialize() {
     try {
       codeDestroyed(code);
       excEdgeCodeDestroyed311(code);
+      numericSpecCodeDestroyed311(code);
       // The bookkeeping above is no-throw by construction; the injection
       // models a fault at the boundary's edge, after cleanup has run.
       throwIfJitPublishStepArmedForTest(11);
@@ -6908,6 +6964,7 @@ void finalize() {
     setCodeDestroyedHook(nullptr);
 #if PY_VERSION_HEX < 0x030C0000
     s_exc_edge_311.clear();
+    numericSpecClear311();
     Ci_QuickenWarmupStep_311 = 1;
 #endif
     ciSetJitState(State::kNotInitialized);
@@ -7003,6 +7060,7 @@ void finalize() {
 
 #if PY_VERSION_HEX < 0x030C0000
   s_exc_edge_311.clear();
+  numericSpecClear311();
   Ci_QuickenWarmupStep_311 = 1;
 #endif
   ciSetJitState(State::kNotInitialized);
@@ -7731,5 +7789,213 @@ void Ci_ExcEdgeDeopt311(
   jit::s_exc_edge_recompiling_311 = true;
   SCOPE_EXIT(jit::s_exc_edge_recompiling_311 = false);
   jit::recompileCodeForExcEdge311(code, BorrowedRef<PyFunctionObject>{func});
+}
+
+// SPIKE(FLOATSPEC, BINTYPED): the per-site numeric speculation
+// fuses declared in jit_rt.h; the state lives in jit::s_numeric_spec_311.
+namespace {
+// A guard that has failed this often at one site is recompiled away there.
+constexpr uint64_t kNumericGuardFailMax311 = 8;
+// An evidence-free float diamond (SPIKE_FLOATSPEC=all) is taken down only
+// when it is (nearly) never float: at least this many misses, and at least
+// kFloatSpecMissPerHit311 misses per hit.  An absolute count alone took
+// raytrace down (int coordinates on every site, but only a few percent of
+// executions); at a 60% miss rate the diamond still beat the generic op.
+constexpr uint64_t kFloatSpecMissMin311 = 256;
+constexpr uint64_t kFloatSpecMissPerHit311 = 4;
+
+using NumericSpecFuseOf311 =
+    jit::NumericSpecSiteFuse311 jit::NumericSpecCodeState311::*;
+
+// True when `compiled` inlined `code`, so its machine code also holds that
+// code's guard sites.
+bool artifactInlines311(
+    BorrowedRef<CompiledFunction> compiled,
+    PyCodeObject* code) {
+  CodeRuntime* runtime = compiled->runtime();
+  if (runtime == nullptr) {
+    return false;
+  }
+  for (const DeoptMetadata& meta : runtime->deoptMetadatas()) {
+    for (size_t i = 1; i < meta.frame_meta.size(); ++i) {
+      if (meta.frame_meta[i].code == code) {
+        return true;
+      }
+    }
+  }
+  return false;
+}
+
+// Uncompile every artifact holding a site of `code` and compile it again; the
+// recompile consults the taken-down sites.  That is every function of `code`,
+// every function whose artifact inlined `code`, and a by-code artifact of
+// `code` (fresh function objects dispatched by code, no member to recompile
+// through), which is retired and re-earned through the observer's slot as the
+// exception-edge grant does.  Reached from a deopt or a diamond's generic arm
+// with the retiring artifact still on the C stack, which then defers itself
+// onto the graveyard.
+void recompileCodeForNumericSpec311(
+    PyCodeObject* code,
+    const char* fuse,
+    int64_t bc_offset,
+    uint64_t count) {
+  if (jitCtx() == nullptr) {
+    return;
+  }
+  FreeThreadedJITEntrypointGuard guard;
+  CodeExtra* extra = codeExtraIfExists(code);
+  if (extra != nullptr) {
+    uint32_t ctl = Ci_code_extra_load_roi_ctl_relaxed(extra);
+    if (roiBackoffCtlFrozen(ctl) || roiBackoffCtlPending(ctl)) {
+      // Being withdrawn by the ROI backoff; nothing to recompile.
+      return;
+    }
+  }
+  std::vector<Ref<PyFunctionObject>> funcs;
+  for (auto& entry : jitCtx()->compiledFuncs()) {
+    BorrowedRef<PyFunctionObject> func = entry.first;
+    if (reinterpret_cast<PyCodeObject*>(func->func_code) == code ||
+        artifactInlines311(entry.second, code)) {
+      funcs.emplace_back(Ref<PyFunctionObject>::create(func.get()));
+    }
+  }
+  BorrowedRef<CompiledFunction> by_code;
+  if (extra != nullptr) {
+    by_code = jit::roiByCodeArtifact311(code, extra);
+  }
+  JIT_DLOG(
+      "numeric speculation fuse {} blew at {}+{} after {}; recompiling {} "
+      "function(s), by-code artifact {}",
+      fuse,
+      codeQualname(code),
+      bc_offset,
+      count,
+      funcs.size(),
+      by_code != nullptr);
+  for (auto& func : funcs) {
+    ::uncompileImpl(func);
+  }
+  if (by_code != nullptr) {
+    jit::retireByCodeArtifact311(by_code);
+  }
+  Ci_Observe311_ReopenSlotForCode(code);
+  for (auto& func : funcs) {
+    scheduleJitCompile(func);
+  }
+}
+
+void registerGuardSite311(
+    NumericSpecFuseOf311 fuse_of,
+    PyCodeObject* code,
+    int64_t bc_offset) {
+  std::lock_guard<std::mutex> lock{jit::s_numeric_spec_mutex_311};
+  (jit::s_numeric_spec_311[code].*fuse_of).registered.insert(bc_offset);
+}
+
+bool guardSiteTakenDown311(
+    NumericSpecFuseOf311 fuse_of,
+    PyCodeObject* code,
+    int64_t bc_offset) {
+  std::lock_guard<std::mutex> lock{jit::s_numeric_spec_mutex_311};
+  auto it = jit::s_numeric_spec_311.find(code);
+  return it != jit::s_numeric_spec_311.end() &&
+      (it->second.*fuse_of).taken_down.count(bc_offset) != 0;
+}
+
+void guardFailed311(
+    NumericSpecFuseOf311 fuse_of,
+    const char* fuse_name,
+    PyCodeObject* code,
+    int64_t bc_offset) {
+  if (jit::s_numeric_spec_recompiling_311) {
+    return;
+  }
+  uint64_t fails = 0;
+  {
+    std::lock_guard<std::mutex> lock{jit::s_numeric_spec_mutex_311};
+    auto it = jit::s_numeric_spec_311.find(code);
+    if (it == jit::s_numeric_spec_311.end()) {
+      return;
+    }
+    jit::NumericSpecSiteFuse311& fuse = it->second.*fuse_of;
+    if (fuse.registered.count(bc_offset) == 0 ||
+        fuse.taken_down.count(bc_offset) != 0) {
+      return;
+    }
+    fails = ++fuse.fails[bc_offset];
+    if (fails < kNumericGuardFailMax311) {
+      return;
+    }
+    fuse.fails.erase(bc_offset);
+    fuse.taken_down.insert(bc_offset);
+  }
+  jit::s_numeric_spec_recompiling_311 = true;
+  SCOPE_EXIT(jit::s_numeric_spec_recompiling_311 = false);
+  recompileCodeForNumericSpec311(code, fuse_name, bc_offset, fails);
+}
+} // namespace
+
+extern "C" uint64_t* Ci_SpikeFloatSpecSiteCounters311(
+    PyCodeObject* code,
+    int64_t bc_offset) {
+  std::lock_guard<std::mutex> lock{jit::s_numeric_spec_mutex_311};
+  return jit::s_numeric_spec_311[code].float_spec_counters[bc_offset].data();
+}
+
+extern "C" int Ci_SpikeNoFloatSpec311(PyCodeObject* code, int64_t bc_offset) {
+  std::lock_guard<std::mutex> lock{jit::s_numeric_spec_mutex_311};
+  auto it = jit::s_numeric_spec_311.find(code);
+  return it != jit::s_numeric_spec_311.end() &&
+      it->second.float_spec_taken_down.count(bc_offset) != 0;
+}
+
+extern "C" void Ci_SpikeFloatSpecMiss311(
+    PyCodeObject* code,
+    int64_t bc_offset) {
+  uint64_t misses = 0;
+  {
+    std::lock_guard<std::mutex> lock{jit::s_numeric_spec_mutex_311};
+    jit::NumericSpecCodeState311& state = jit::s_numeric_spec_311[code];
+    std::array<uint64_t, 2>& cell = state.float_spec_counters[bc_offset];
+    uint64_t hits = cell[0];
+    misses = ++cell[1];
+    if (misses < kFloatSpecMissMin311 ||
+        misses < hits * kFloatSpecMissPerHit311 ||
+        jit::s_numeric_spec_recompiling_311 ||
+        !state.float_spec_taken_down.insert(bc_offset).second) {
+      return;
+    }
+  }
+  jit::s_numeric_spec_recompiling_311 = true;
+  SCOPE_EXIT(jit::s_numeric_spec_recompiling_311 = false);
+  recompileCodeForNumericSpec311(code, "float-spec-miss", bc_offset, misses);
+}
+
+// SPIKE(BINTYPED): a per-site fuse for the *_FLOAT binary-op guards.  A
+// blanket diamond at every float site doubled nbody (the Phi at the join
+// blocks the unbox/box folding that keeps float expression chains in
+// registers), so the diamond is applied only where a guard has actually kept
+// failing (spectral_norm's `eval_A(i, j) * u_j` with an int-seeded `u`,
+// raytrace's mixed leaf arithmetic).
+extern "C" void Ci_SpikeFloatGuardRegister311(
+    PyCodeObject* code,
+    int64_t bc_offset) {
+  registerGuardSite311(
+      &jit::NumericSpecCodeState311::float_guard, code, bc_offset);
+}
+
+extern "C" int Ci_SpikeNoFloatGuard311(PyCodeObject* code, int64_t bc_offset) {
+  return guardSiteTakenDown311(
+      &jit::NumericSpecCodeState311::float_guard, code, bc_offset);
+}
+
+extern "C" void Ci_SpikeFloatGuardFail311(
+    PyCodeObject* code,
+    int64_t bc_offset) {
+  guardFailed311(
+      &jit::NumericSpecCodeState311::float_guard,
+      "float-guard",
+      code,
+      bc_offset);
 }
 #endif
