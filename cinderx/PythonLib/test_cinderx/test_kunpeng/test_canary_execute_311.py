@@ -1608,6 +1608,7 @@ class CanaryExecute311Test(unittest.TestCase):
         probe = textwrap.dedent(
             """
             import gc
+            import dis
             import weakref
             import _cinderx, cinderx
             cinderx.init()
@@ -1628,15 +1629,19 @@ class CanaryExecute311Test(unittest.TestCase):
                     global destroyed
                     destroyed += 1
 
+            def integer_answer(a, b, one):
+                return 15
+
+            def float_answer(a, b, one):
+                return 15.0
+
+            selected = integer_answer
+
             def hot(obj, a, b, one):
-                total = a - a
-                i = total
-                while i < b:
-                    total = total + a
-                    i = i + one
+                value = selected(a=a, b=b, one=one)
                 if obj is None:
                     return -1
-                return total
+                return value
 
             warm = Probe()
             for _ in range(200):
@@ -1649,7 +1654,11 @@ class CanaryExecute311Test(unittest.TestCase):
             forceable = [s for s in cinderjit.deopt_sites(hot)
                          if s["forceable"]]
             assert forceable, cinderjit.deopt_sites(hot)
-            site = max(forceable, key=lambda s: s["bc_offset"])
+            # A global identity guard remains meaningful even when numeric
+            # feedback removes redundant arithmetic guards during this test.
+            load = next(i.offset for i in dis.get_instructions(hot)
+                        if i.opname == "LOAD_GLOBAL" and i.argval == "selected")
+            site = next(s for s in forceable if s["bc_offset"] == load)
             refs = []
             before = _cinderx._get_trigger_stats()
             calls = 2000
@@ -1657,11 +1666,15 @@ class CanaryExecute311Test(unittest.TestCase):
                 obj = Probe()
                 refs.append(weakref.ref(obj))
                 if index % 2 == 0:
+                    selected = integer_answer
                     assert cinderjit.force_deopt(
                         hot, site["id"], n=1) is True
-                    assert hot(obj, 3, 5, 1) == 15
+                    value = hot(obj, 3, 5, 1)
+                    assert value == 15 and type(value) is int
                 else:
-                    assert hot(obj, 3.0, 5.0, 1.0) == 15.0
+                    selected = float_answer
+                    value = hot(obj, 3.0, 5.0, 1.0)
+                    assert value == 15.0 and type(value) is float
                 del obj
                 if index % 100 == 99:
                     gc.collect()

@@ -358,6 +358,17 @@ int JITRT_IsInstanceFast311(PyObject* obj, PyObject* cls);
 // safe to use from concurrent compile workers.
 extern "C" void Ci_SpikeFloatSpecMiss311(PyCodeObject* code, int64_t bc_offset);
 extern "C" int Ci_SpikeNoFloatSpec311(PyCodeObject* code, int64_t bc_offset);
+// SPIKE(LONGSPEC): per-site fuse for the compact-long speculation guards.
+// Simplify registers each speculated site; the deopt path reports guard
+// failures at registered sites; after a few failures the site is marked and
+// the code recompiled without the speculation at that site only.
+extern "C" void Ci_SpikeLongSpecRegister311(
+    PyCodeObject* code,
+    int64_t bc_offset);
+extern "C" int Ci_SpikeNoLongSpec311(PyCodeObject* code, int64_t bc_offset);
+extern "C" void Ci_SpikeLongSpecGuardFail311(
+    PyCodeObject* code,
+    int64_t bc_offset);
 // SPIKE(BINTYPED): per-site fuse for the *_FLOAT specialisation guards of
 // binary ops.  The builder registers each guarded site; the deopt path
 // reports guard failures; after a few failures the site is marked and the

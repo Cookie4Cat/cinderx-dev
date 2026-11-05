@@ -1034,6 +1034,13 @@ RewriteResult rewriteMemoryInputsToReg(instr_iter_t instr_iter) {
     case Instruction::kOr:
     case Instruction::kXor:
     case Instruction::kMul:
+    // SPIKE(INTBITSPEC): a register shift count (aarch64 lsl/asr/lsr take
+    // one) may be spilled; codegen reads a non-register count as an
+    // immediate, and a stack slot there is a bad_variant_access that
+    // silently fails the whole compile.
+    case Instruction::kLShift:
+    case Instruction::kRShift:
+    case Instruction::kRShiftUn:
     case Instruction::kDiv:
     case Instruction::kDivUn:
     case Instruction::kNegate:
@@ -1089,9 +1096,6 @@ RewriteResult rewriteMemoryInputsToReg(instr_iter_t instr_iter) {
     case Instruction::kSext:
     case Instruction::kZext:
     case Instruction::kInt64ToDouble:
-    case Instruction::kLShift:
-    case Instruction::kRShift:
-    case Instruction::kRShiftUn:
     case Instruction::kLea:
     case Instruction::kLoadArg:
     case Instruction::kLoadSecondCallResult:

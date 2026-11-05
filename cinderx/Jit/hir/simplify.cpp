@@ -1049,6 +1049,24 @@ Register* simplifyIsTruthy(Env& env, const IsTruthy* instr) {
   }
   if (ty <= TLongExact) {
     Register* left = instr->GetOperand(0);
+#if PY_VERSION_HEX < 0x030C0000
+    // SPIKE(INTBITSPEC): the truth of a boxed CInt64 is the value itself;
+    // `if cells & mask:` then never allocates the int it only tests.  The
+    // box is left with frame-state uses only and is rematerialised on deopt.
+    static const bool spike_intbitspec =
+        Ci_SpikeGetenv("SPIKE_INTBITSPEC") != nullptr;
+    if (spike_intbitspec) {
+      const Instr* def = left->instr();
+      while (def != nullptr && def->IsAssign()) {
+        def = def->GetOperand(0)->instr();
+      }
+      if (def != nullptr && def->IsPrimitiveBox() &&
+          static_cast<const PrimitiveBox*>(def)->type() <= TCInt64) {
+        return env.emit<CIntToCBool>(
+            static_cast<const PrimitiveBox*>(def)->value());
+      }
+    }
+#endif
     env.emit<UseType>(left, ty);
     Register* right = env.emit<LoadConst>(Type::fromObject(_PyLong_GetZero()));
     Register* result =
@@ -1500,6 +1518,12 @@ Register* trySimplifyArraySubscr(Env& env, const BinaryOp* instr) {
   if (!container->type().couldBe(array_guard)) {
     return nullptr;
   }
+  // Likewise skip an index whose type already rules out int (a Slice from a
+  // pinned `slice(...)` constructor call, for instance): the diamond's
+  // CondBranchCheckType<LongExact> could only fold to the slow arm.
+  if (!sub->type().couldBe(TLongExact)) {
+    return nullptr;
+  }
   if (!hasArraySubscrFastPathEvidence(container, sub, array_guard)) {
     return nullptr;
   }
@@ -1778,10 +1802,258 @@ Register* simplifySubscript(
   return nullptr;
 }
 
+#if PY_VERSION_HEX < 0x030C0000
+// SPIKE(INTBITSPEC): `& | ^ << >>` on exact ints of at most two digits
+// (|v| < 2^60) lowered to register operations behind deopting guards.
+//
+// The 3.11 specialiser has no quickened family for these operators, so a
+// site carries no static type evidence: an operand of unknown type is
+// speculated exact int and the site is registered with the LONGSPEC per-site
+// fuse (eight guard failures recompile the function with this site generic).
+// Unlike the compact-long add/subtract forms no operand has to be compact:
+// any int64 is exact under and/or/xor and arithmetic right shift, and a left
+// shift is checked for overflow by shifting back.  Chained expressions fold
+// through the result box -- an operand that is itself a PrimitiveBox is used
+// unboxed, and the box, left with frame-state uses only, is rematerialised
+// on deopt -- so `T1[(t >> 24) & 0xFF] ^ T2[...] ^ ...` runs on registers
+// with one allocation at the end.  Cipher state words are commonly 32-bit,
+// which is why two digits rather than one are unboxed here.
+namespace {
+
+bool isIntBitwiseOp311(BinaryOpKind op) {
+  switch (op) {
+    case BinaryOpKind::kAnd:
+    case BinaryOpKind::kOr:
+    case BinaryOpKind::kXor:
+    case BinaryOpKind::kLShift:
+    case BinaryOpKind::kRShift:
+      return true;
+    default:
+      return false;
+  }
+}
+
+std::optional<BinaryOpKind> intBitwiseOpOfInPlace311(InPlaceOpKind op) {
+  switch (op) {
+    case InPlaceOpKind::kAnd:
+      return BinaryOpKind::kAnd;
+    case InPlaceOpKind::kOr:
+      return BinaryOpKind::kOr;
+    case InPlaceOpKind::kXor:
+      return BinaryOpKind::kXor;
+    case InPlaceOpKind::kLShift:
+      return BinaryOpKind::kLShift;
+    case InPlaceOpKind::kRShift:
+      return BinaryOpKind::kRShift;
+    default:
+      return std::nullopt;
+  }
+}
+
+// The instruction defining `reg`, looking through the Assign chains the
+// simplifier driver leaves behind for replaced instructions.
+const Instr* intBitDefiningInstr311(Register* reg) {
+  const Instr* def = reg->instr();
+  while (def != nullptr && def->IsAssign()) {
+    def = def->GetOperand(0)->instr();
+  }
+  return def;
+}
+
+// The int64 value of an exact-int constant operand, when it has one that
+// fits.
+std::optional<int64_t> intBitConstant311(Register* reg) {
+  Type ty = reg->type();
+  if (!ty.hasObjectSpec() || !PyLong_CheckExact(ty.objectSpec())) {
+    return std::nullopt;
+  }
+  int overflow = 0;
+  long long value = PyLong_AsLongLongAndOverflow(ty.objectSpec(), &overflow);
+  if (overflow != 0) {
+    return std::nullopt;
+  }
+  if (value == -1 && PyErr_Occurred()) {
+    PyErr_Clear();
+    return std::nullopt;
+  }
+  return static_cast<int64_t>(value);
+}
+
+// The unboxed int64 value of an operand.  A constant folds and a
+// PrimitiveBox of a CInt64 is looked through; anything else is guarded exact
+// int of at most two digits and unboxed without a branch:
+//   size = ob_size;                       guard (size + 2) <u 5
+//   two  = |size| == 2  (size * size >> 2)
+//   hi   = ob_digit[two] & -two           (digit 1 is read only when it
+//                                          exists; a one-digit int re-reads
+//                                          digit 0 and masks it away)
+//   mag  = (ob_digit[0] | hi << 30) & -(size != 0)
+//   v    = (mag ^ (size >> 63)) - (size >> 63)
+// `guarded` is set when a deopting guard was emitted.
+Register*
+intBitOperand311(Env& env, Register* reg, const FrameState& fs, bool& guarded) {
+  if (auto value = intBitConstant311(reg)) {
+    env.emit<UseType>(reg, reg->type());
+    return env.emit<LoadConst>(Type::fromCInt(*value, TCInt64));
+  }
+  const Instr* def = intBitDefiningInstr311(reg);
+  if (def != nullptr && def->IsPrimitiveBox()) {
+    auto* box = static_cast<const PrimitiveBox*>(def);
+    if (box->type() <= TCInt64) {
+      return box->value();
+    }
+  }
+  Register* obj = reg;
+  if (!obj->isA(TLongExact)) {
+    obj = env.emit<GuardType>(TLongExact, obj, fs);
+    guarded = true;
+  }
+  // The raw field loads below accept any object, so the exact-int requirement
+  // has to be pinned here or GuardTypeRemoval drops the guard as unused.
+  env.emit<UseType>(obj, TLongExact);
+  Register* size = env.emit<LoadField>(
+      obj, "ob_size", offsetof(PyVarObject, ob_size), TCInt64);
+  Register* two = env.emit<LoadConst>(Type::fromCInt(2, TCInt64));
+  Register* biased = env.emit<IntBinaryOp>(BinaryOpKind::kAdd, size, two);
+  Register* five = env.emit<LoadConst>(Type::fromCInt(5, TCInt64));
+  Register* small = env.emit<PrimitiveCompare>(
+      PrimitiveCompareOp::kLessThanUnsigned, biased, five);
+  auto guard = env.emitInstr<Guard>(small);
+  guard->setFrameState(fs);
+  guarded = true;
+  // size in [-2, 2]: size*size is 4 for two digits, 1 for one, 0 for zero.
+  Register* sq = env.emit<IntBinaryOp>(BinaryOpKind::kMultiply, size, size);
+  Register* hi_idx = env.emit<IntBinaryOp>(BinaryOpKind::kRShift, sq, two);
+  Register* three = env.emit<LoadConst>(Type::fromCInt(3, TCInt64));
+  Register* sq3 = env.emit<IntBinaryOp>(BinaryOpKind::kAdd, sq, three);
+  Register* nonzero = env.emit<IntBinaryOp>(BinaryOpKind::kRShift, sq3, two);
+  Register* zero = env.emit<LoadConst>(Type::fromCInt(0, TCInt64));
+  Register* nonzero_mask =
+      env.emit<IntBinaryOp>(BinaryOpKind::kSubtract, zero, nonzero);
+  Register* digits_off = env.emit<LoadConst>(
+      Type::fromCInt(offsetof(PyLongObject, ob_digit), TCInt64));
+  Register* digits = env.emit<LoadFieldAddress>(obj, digits_off);
+  Register* d0 = env.emit<LoadArrayItem>(
+      digits, zero, obj, static_cast<intptr_t>(0), TCUInt32);
+  Register* d1 = env.emit<LoadArrayItem>(
+      digits, hi_idx, obj, static_cast<intptr_t>(0), TCUInt32);
+  Register* d0w = env.emit<PrimitiveConvert>(d0, TCInt64);
+  Register* d1w = env.emit<PrimitiveConvert>(d1, TCInt64);
+  Register* hi_mask =
+      env.emit<IntBinaryOp>(BinaryOpKind::kSubtract, zero, hi_idx);
+  d1w = env.emit<IntBinaryOp>(BinaryOpKind::kAnd, d1w, hi_mask);
+  Register* shift = env.emit<LoadConst>(Type::fromCInt(PyLong_SHIFT, TCInt64));
+  Register* hi = env.emit<IntBinaryOp>(BinaryOpKind::kLShift, d1w, shift);
+  Register* mag = env.emit<IntBinaryOp>(BinaryOpKind::kOr, d0w, hi);
+  mag = env.emit<IntBinaryOp>(BinaryOpKind::kAnd, mag, nonzero_mask);
+  Register* sixty_three = env.emit<LoadConst>(Type::fromCInt(63, TCInt64));
+  Register* sign =
+      env.emit<IntBinaryOp>(BinaryOpKind::kRShift, size, sixty_three);
+  Register* flipped = env.emit<IntBinaryOp>(BinaryOpKind::kXor, mag, sign);
+  return env.emit<IntBinaryOp>(BinaryOpKind::kSubtract, flipped, sign);
+}
+
+// True when `reg` is known to hold a small int: an int64 constant, or the
+// unboxed result of an earlier int operation.
+bool hasSmallIntEvidence311(Register* reg) {
+  if (intBitConstant311(reg).has_value()) {
+    return true;
+  }
+  const Instr* def = intBitDefiningInstr311(reg);
+  return def != nullptr && def->IsPrimitiveBox() &&
+      static_cast<const PrimitiveBox*>(def)->type() <= TCInt64;
+}
+
+// Lower `lhs op rhs` at bytecode `site` of `code`; nullptr leaves the generic
+// operation in place.  At least one operand must be known small: two ints of
+// unknown origin (`int(a) & int(b)`, `self._ip & mask`) may be arbitrarily
+// wide, and a guard on them would deopt on every wide value until the fuse
+// blows.
+Register* emitIntBitwise311(
+    Env& env,
+    BinaryOpKind op,
+    Register* lhs,
+    Register* rhs,
+    const FrameState& fs,
+    PyCodeObject* code,
+    int64_t site) {
+  if (code == nullptr || Ci_SpikeNoLongSpec311(code, site)) {
+    return nullptr;
+  }
+  if (!lhs->type().couldBe(TLongExact) || !rhs->type().couldBe(TLongExact)) {
+    return nullptr;
+  }
+  std::optional<int64_t> lhs_const = intBitConstant311(lhs);
+  std::optional<int64_t> rhs_const = intBitConstant311(rhs);
+  // Two constants fold through LongBinaryOp; a known object that is not an
+  // int64 constant (a three-digit mask) stays generic.
+  if ((lhs_const.has_value() && rhs_const.has_value()) ||
+      (lhs->type().hasObjectSpec() && !lhs_const.has_value()) ||
+      (rhs->type().hasObjectSpec() && !rhs_const.has_value())) {
+    return nullptr;
+  }
+  if (!hasSmallIntEvidence311(lhs) && !hasSmallIntEvidence311(rhs)) {
+    return nullptr;
+  }
+  bool is_shift = op == BinaryOpKind::kLShift || op == BinaryOpKind::kRShift;
+  if (is_shift && rhs_const.has_value() &&
+      (*rhs_const < 0 || *rhs_const > 63)) {
+    // A negative count raises; a larger one needs the arbitrary-precision
+    // result.
+    return nullptr;
+  }
+  bool guarded = false;
+  Register* l = intBitOperand311(env, lhs, fs, guarded);
+  Register* r = lhs == rhs ? l : intBitOperand311(env, rhs, fs, guarded);
+  if (is_shift && !rhs_const.has_value()) {
+    Register* limit = env.emit<LoadConst>(Type::fromCInt(64, TCInt64));
+    Register* in_range = env.emit<PrimitiveCompare>(
+        PrimitiveCompareOp::kLessThanUnsigned, r, limit);
+    auto guard = env.emitInstr<Guard>(in_range);
+    guard->setFrameState(fs);
+    guarded = true;
+  }
+  Register* result = env.emit<IntBinaryOp>(op, l, r);
+  if (op == BinaryOpKind::kLShift) {
+    // Shifting back recovers the operand exactly when nothing overflowed.
+    Register* back = env.emit<IntBinaryOp>(BinaryOpKind::kRShift, result, r);
+    Register* exact =
+        env.emit<PrimitiveCompare>(PrimitiveCompareOp::kEqual, back, l);
+    auto guard = env.emitInstr<Guard>(exact);
+    guard->setFrameState(fs);
+    guarded = true;
+  }
+  if (guarded) {
+    Ci_SpikeLongSpecRegister311(code, site);
+  }
+  return env.emit<PrimitiveBox>(result, TCInt64, fs);
+}
+
+} // namespace
+#endif
+
 Register* simplifyBinaryOp(Env& env, const BinaryOp* instr) {
   BinaryOpKind op = instr->op();
   Register* lhs = instr->left();
   Register* rhs = instr->right();
+
+#if PY_VERSION_HEX < 0x030C0000
+  // SPIKE(INTBITSPEC): see emitIntBitwise311.
+  static const bool spike_intbitspec =
+      Ci_SpikeGetenv("SPIKE_INTBITSPEC") != nullptr;
+  if (spike_intbitspec && isIntBitwiseOp311(op) && !instr->noSpeculation()) {
+    if (Register* result = emitIntBitwise311(
+            env,
+            op,
+            lhs,
+            rhs,
+            *instr->frameState(),
+            env.func.code.get(),
+            instr->bytecodeOffset().value())) {
+      return result;
+    }
+  }
+#endif
 
   if (op == BinaryOpKind::kSubscript) {
     return simplifySubscript(env, lhs, rhs, instr->frameState(), instr);
@@ -2117,6 +2389,27 @@ Register* simplifyInPlaceOp(Env& env, const InPlaceOp* instr) {
 #endif
   Register* lhs = instr->left();
   Register* rhs = instr->right();
+#if PY_VERSION_HEX < 0x030C0000
+  // SPIKE(INTBITSPEC): the in-place forms of `& | ^ << >>` have the binary
+  // semantics for exact ints (no nb_inplace_* slot), and any other operand
+  // type deopts to the interpreter's in-place operation.
+  static const bool spike_intbitspec =
+      Ci_SpikeGetenv("SPIKE_INTBITSPEC") != nullptr;
+  if (spike_intbitspec && !instr->noSpeculation()) {
+    if (auto bit_op = intBitwiseOpOfInPlace311(instr->op())) {
+      if (Register* result = emitIntBitwise311(
+              env,
+              *bit_op,
+              lhs,
+              rhs,
+              *instr->frameState(),
+              env.func.code.get(),
+              instr->bytecodeOffset().value())) {
+        return result;
+      }
+    }
+  }
+#endif
   if (lhs->isA(TLongExact) && rhs->isA(TLongExact)) {
 #if PY_VERSION_HEX < 0x030C0000
     // The compact-long fast path for in-place add/subtract is part of the
@@ -2361,6 +2654,98 @@ Register* simplifyInPlaceOp(Env& env, const InPlaceOp* instr) {
 }
 
 Register* simplifyLongBinaryOp(Env& env, const LongBinaryOp* instr) {
+#if PY_VERSION_HEX < 0x030C0000
+  // SPIKE(LONGSPEC): compact-long add/subtract/multiply behind a compactness
+  // guard, mirroring the in-place form in simplifyInPlaceOp.  Two compact
+  // longs are single 30-bit digits, so their sum/difference (< 2^31) and
+  // product (< 2^60) always fit in int64: no overflow check is needed, only
+  // the compactness guard (non-compact operands deopt; the despec fuse
+  // covers a site that keeps deopting).  The payoff is not the operation
+  // itself but the boxes it removes: a result consumed by another compact
+  // op, an array/list index or an int-float conversion folds through
+  // IsCompactLong(box(n)) -> IsCompactLong(n) and CompactLongUnbox(box(n))
+  // -> n, and a box left with only frame-state uses is removed by
+  // PrimitiveBoxRemat (deopt re-boxes the CInt64 value).  Index arithmetic
+  // otherwise allocates a PyLong per operation.
+  static const bool spike_longspec =
+      Ci_SpikeGetenv("SPIKE_LONGSPEC") != nullptr;
+  if (spike_longspec) {
+    std::optional<BinaryOpKind> compact_op;
+    switch (instr->op()) {
+      case BinaryOpKind::kAdd:
+      case BinaryOpKind::kSubtract:
+      case BinaryOpKind::kMultiply:
+        compact_op = instr->op();
+        break;
+      default:
+        break;
+    }
+    Register* lhs = instr->left();
+    Register* rhs = instr->right();
+    PyCodeObject* code = env.func.code.get();
+    int64_t site = instr->bytecodeOffset().value();
+    bool site_open = code != nullptr && !Ci_SpikeNoLongSpec311(code, site);
+    if (site_open && compact_op.has_value() && lhs->isA(TLongExact) &&
+        rhs->isA(TLongExact) &&
+        !(lhs->type().hasObjectSpec() && rhs->type().hasObjectSpec())) {
+      Ci_SpikeLongSpecRegister311(code, site);
+      env.emit<UseType>(lhs, TLongExact);
+      env.emit<UseType>(rhs, TLongExact);
+      Register* is_lhs_compact = env.emit<IsCompactLong>(lhs);
+      Register* is_rhs_compact = env.emit<IsCompactLong>(rhs);
+      Register* both_compact = env.emit<IntBinaryOp>(
+          BinaryOpKind::kAnd, is_lhs_compact, is_rhs_compact);
+      auto guard = env.emitInstr<Guard>(both_compact);
+      guard->setFrameState(*instr->frameState());
+      Register* unboxed_lhs = env.emit<CompactLongUnbox>(lhs);
+      Register* unboxed_rhs = env.emit<CompactLongUnbox>(rhs);
+      Register* result =
+          env.emit<IntBinaryOp>(*compact_op, unboxed_lhs, unboxed_rhs);
+      return env.emit<PrimitiveBox>(result, TCInt64, *instr->frameState());
+    }
+    // Floor division / modulo by a constant positive power of two: an
+    // arithmetic shift right / a mask give Python's floor semantics for
+    // negative dividends too (asr rounds toward -inf; `n & (c - 1)` is the
+    // non-negative residue).  Covers spectral_norm's `... // 2`.
+    if (site_open &&
+        (instr->op() == BinaryOpKind::kFloorDivide ||
+         instr->op() == BinaryOpKind::kModulo) &&
+        lhs->isA(TLongExact) && !lhs->type().hasObjectSpec() &&
+        rhs->type().hasObjectSpec() &&
+        PyLong_CheckExact(rhs->type().objectSpec())) {
+      int overflow = 0;
+      long long divisor =
+          PyLong_AsLongLongAndOverflow(rhs->type().objectSpec(), &overflow);
+      if (overflow != 0) {
+        PyErr_Clear();
+      }
+      if (overflow == 0 && divisor > 0 && divisor <= (1LL << 30) &&
+          (divisor & (divisor - 1)) == 0) {
+        Ci_SpikeLongSpecRegister311(code, site);
+        env.emit<UseType>(lhs, TLongExact);
+        env.emit<UseType>(rhs, rhs->type());
+        Register* is_compact = env.emit<IsCompactLong>(lhs);
+        auto guard = env.emitInstr<Guard>(is_compact);
+        guard->setFrameState(*instr->frameState());
+        Register* unboxed = env.emit<CompactLongUnbox>(lhs);
+        Register* result;
+        if (instr->op() == BinaryOpKind::kFloorDivide) {
+          int shift = 0;
+          while ((1LL << shift) < divisor) {
+            ++shift;
+          }
+          Register* k = env.emit<LoadConst>(Type::fromCInt(shift, TCInt64));
+          result = env.emit<IntBinaryOp>(BinaryOpKind::kRShift, unboxed, k);
+        } else {
+          Register* mask =
+              env.emit<LoadConst>(Type::fromCInt(divisor - 1, TCInt64));
+          result = env.emit<IntBinaryOp>(BinaryOpKind::kAnd, unboxed, mask);
+        }
+        return env.emit<PrimitiveBox>(result, TCInt64, *instr->frameState());
+      }
+    }
+  }
+#endif
   // This isn't safe in the multi-threaded compilation on 3.12 because
   // we don't hold the GIL which is required for allocation.
   RETURN_MULTITHREADED_COMPILE(nullptr);
