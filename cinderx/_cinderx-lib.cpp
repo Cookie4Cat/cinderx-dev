@@ -1275,9 +1275,6 @@ PyMethodDef _cinderx_methods[] = {
     {nullptr, nullptr, 0, nullptr}};
 
 int _cinderx_exec_impl(PyObject* m) {
-#if PY_VERSION_HEX < 0x030C0000
-  Ci_AttrPathConfigSnapshot311();
-#endif
   // The state will be destroyed in module_free(), which gets called even if
   // this function exits early with an error. Construct it first so that
   // module_free always has a valid object to work with.
@@ -1310,6 +1307,8 @@ int _cinderx_exec_impl(PyObject* m) {
         running_version);
     return -1;
   }
+  // Only an admitted main-interpreter import may capture process settings.
+  Ci_AttrPathConfigSnapshot311();
 #endif
 
   cinderx::initStaticObjects();

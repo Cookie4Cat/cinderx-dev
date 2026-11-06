@@ -1,3 +1,11 @@
+# execute_process runs at configure time. Patch edits must trigger a new
+# configure even when the caller only invokes cmake --build.
+set_property(DIRECTORY APPEND PROPERTY CMAKE_CONFIGURE_DEPENDS
+  "${CMAKE_CURRENT_LIST_DIR}/0001-specialize-getattr-only-types.patch"
+  "${CMAKE_CURRENT_LIST_DIR}/0002-load-attr-with-hint-split-dict.patch"
+  "${CMAKE_CURRENT_LIST_DIR}/0003-global-name-cache.patch"
+  "${CMAKE_CURRENT_LIST_DIR}/0004-jit-off-inline-call.patch")
+
 find_package(Git REQUIRED)
 set(ATTR311_DIR "${CMAKE_CURRENT_BINARY_DIR}/ci311-attr")
 file(MAKE_DIRECTORY "${ATTR311_DIR}")

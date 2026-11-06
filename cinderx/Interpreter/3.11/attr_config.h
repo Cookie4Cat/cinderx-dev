@@ -1,4 +1,4 @@
-// Attribute-path settings are captured once when the native module loads.
+// Attribute-path settings are captured once after native import admission.
 // Later environment changes must not alter install/remove behavior.
 #pragma once
 #include <stdlib.h>
