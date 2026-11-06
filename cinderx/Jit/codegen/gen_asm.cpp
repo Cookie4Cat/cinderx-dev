@@ -416,13 +416,37 @@ DeoptResult prepareForDeopt(
   // Clear our references now that we've transferred them to the frame
   MemoryView mem{regs};
   Ref<> deopt_obj;
-  if (!is_instrumentation_deopt) {
+#if PY_VERSION_HEX < 0x030C0000
+  // Primitive reconstruction can fail while preparing an ordinary guard
+  // exit. Preserve that first exception across optional profiling and ref
+  // cleanup; profiling must not allocate another guilty-value box over it.
+  PyObject *saved_type = nullptr, *saved_value = nullptr, *saved_tb = nullptr;
+  const bool had_exception = PyErr_Occurred() != nullptr;
+  if (had_exception) {
+    PyErr_Fetch(&saved_type, &saved_value, &saved_tb);
+  }
+  auto restore_exception = [&]() {
+    if (saved_type != nullptr) {
+      PyErr_Restore(saved_type, saved_value, saved_tb);
+      saved_type = saved_value = saved_tb = nullptr;
+    }
+  };
+  SCOPE_EXIT(restore_exception());
+#endif
+  if (!is_instrumentation_deopt
+#if PY_VERSION_HEX < 0x030C0000
+      && !had_exception
+#endif
+  ) {
     // TODO(T262342844): Add USDT support for instrumentation-related deopts.
     deopt_obj = profileDeopt(deopt_meta, mem);
   }
   auto ctx = getContext();
   ctx->recordDeopt(code_runtime, deopt_idx, deopt_obj);
   releaseRefs(deopt_meta, mem);
+#if PY_VERSION_HEX < 0x030C0000
+  restore_exception();
+#endif
   if (_PyFrame_GetCode(frame)->co_flags & kCoFlagsAnyGenerator) {
     BorrowedRef<PyGenObject> base_gen = _PyGen_GetGeneratorFromFrame(frame);
     JitGenObject* gen = JitGenObject::cast(base_gen.get());
@@ -601,6 +625,21 @@ PyObject* resumeInInterpreter(
   } else {
     err_occurred = shouldResumeInterpreterInErrorHandler(deopt_meta.reason);
   }
+
+#if PY_VERSION_HEX < 0x030C0000
+  if (err_occurred == 0 && PyErr_Occurred()) {
+    // A guard normally resumes its PRE-instruction state. If reification
+    // itself failed, do not execute that opcode with a live MemoryError.
+    // The evaluator's error entry needs the faulting opcode's cursor, not
+    // the preceding cursor used for normal re-execution. Leave the original
+    // exception/CALL resume protocol and shared site metadata unchanged.
+    const auto& inner = deopt_meta.innermostFrame();
+    BytecodeInstruction cause{inner.code, inner.cause_instr_idx};
+    frame->prev_instr =
+        _PyCode_CODE(frameCode(frame)) + cause.opcodeIndex().value();
+    err_occurred = 1;
+  }
+#endif
 
   PyObject* result = nullptr;
 #if PY_VERSION_HEX < 0x030C0000
@@ -3406,8 +3445,7 @@ void NativeGenerator::emitAarch64LoadAttrInvokeStub(
   auto emit_load_attr_entry = [&](uint32_t entry_index, Label next_entry) {
     const int entry_offset = static_cast<int>(entry_index) * kEntrySize;
     as_->ldr(
-        a64::x12,
-        arch::ptr_offset(a64::x0, kEntryTypeOffset + entry_offset));
+        a64::x12, arch::ptr_offset(a64::x0, kEntryTypeOffset + entry_offset));
     as_->cbz(a64::x12, next_entry);
 
     as_->mov(a64::x13, ~kKindMask);
@@ -3428,8 +3466,7 @@ void NativeGenerator::emitAarch64LoadAttrInvokeStub(
     as_->cbz(a64::w14, slow_path);
 
     as_->ldr(
-        a64::x14,
-        arch::ptr_offset(a64::x0, kValOffsetOffset + entry_offset));
+        a64::x14, arch::ptr_offset(a64::x0, kValOffsetOffset + entry_offset));
     arch::add_immediate(as_, a64::x15, a64::x15, kInlineValuesValuesOffset);
     as_->add(a64::x15, a64::x15, a64::x14, a64::lsl(3));
     as_->ldr(a64::x9, a64::ptr(a64::x15));
@@ -4047,13 +4084,11 @@ void NativeGenerator::generateCode(
 #if defined(CINDER_X86_64)
     if (GetFunction()->returnsPrimitive()) {
       if (GetFunction()->returnsPrimitiveDouble()) {
-        as_->call(
-            reinterpret_cast<uint64_t>(
-                JITRT_ReportStaticArgTypecheckErrorsWithDoubleReturn));
+        as_->call(reinterpret_cast<uint64_t>(
+            JITRT_ReportStaticArgTypecheckErrorsWithDoubleReturn));
       } else {
-        as_->call(
-            reinterpret_cast<uint64_t>(
-                JITRT_ReportStaticArgTypecheckErrorsWithPrimitiveReturn));
+        as_->call(reinterpret_cast<uint64_t>(
+            JITRT_ReportStaticArgTypecheckErrorsWithPrimitiveReturn));
       }
     } else {
       as_->call(

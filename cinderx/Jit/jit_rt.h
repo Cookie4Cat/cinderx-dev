@@ -348,6 +348,14 @@ PyObject* JITRT_GetAttrDefault311(
 // still performs a full __class__ attribute lookup (generic getattr +
 // descriptor call) on every False result.
 int JITRT_IsInstanceFast311(PyObject* obj, PyObject* cls);
+
+// SPIKE(RANGEITER): iter(range(*args)) for 1 <= nargs <= 3 positional
+// arguments (the unused ones NULL).  Exact ints that fit in a C long, with
+// the length and the last value representable, give the rangeiterobject
+// range_iter would build; everything else calls range(...) and then iter(),
+// so errors and the arbitrary-precision iterator are the interpreter's.
+PyObject*
+JITRT_RangeIter311(int64_t nargs, PyObject* a0, PyObject* a1, PyObject* a2);
 #endif
 // SPIKE(FLOATSPEC feedback): an evidence-free float diamond
 // (SPIKE_FLOATSPEC=all) took its generic arm at `bc_offset`; past a per-site

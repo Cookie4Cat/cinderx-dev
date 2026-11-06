@@ -3038,8 +3038,20 @@ LIRGenerator::TranslatedBlock LIRGenerator::TranslateOneBasicBlock(
           bbb.appendBranch(Instruction::kBranch, done_block);
 
           bbb.switchBlock(slow_block);
-          Instruction* boxed = bbb.appendCallInstruction(
-              OutVReg{DataType::kObject}, JITRT_BoxI64, src);
+          // SPIKE(BOXDIRECT): call PyLong_FromLong itself rather than the
+          // JITRT_BoxI64 wrapper: the wrapper's call into libpython goes
+          // through the PLT, and the PyLong_FromSsize_t it calls has no
+          // medium-value path in 3.11 (every value takes _PyLong_New), while
+          // PyLong_FromLong allocates |v| < 2**30 through _PyLong_FromMedium.
+          // long is int64_t on this target.
+          static_assert(sizeof(long) == sizeof(int64_t));
+          static const bool spike_boxdirect =
+              Ci_SpikeGetenv("SPIKE_BOXDIRECT") != nullptr;
+          Instruction* boxed = spike_boxdirect
+              ? bbb.appendCallInstruction(
+                    OutVReg{DataType::kObject}, PyLong_FromLong, src)
+              : bbb.appendCallInstruction(
+                    OutVReg{DataType::kObject}, JITRT_BoxI64, src);
           appendGuard(bbb, InstrGuardKind::kNotZero, *instr, boxed);
           BasicBlock* slow_pred = bbb.curBlock();
           bbb.appendBranch(Instruction::kBranch, done_block);
@@ -3984,8 +3996,16 @@ LIRGenerator::TranslatedBlock LIRGenerator::TranslateOneBasicBlock(
           bbb.appendBranch(Instruction::kBranch, done_block);
 
           bbb.switchBlock(slow_box_block);
-          Instruction* boxed = bbb.appendCallInstruction(
-              OutVReg{DataType::kObject}, JITRT_BoxI64, primitive_result);
+          // SPIKE(BOXDIRECT): as in PrimitiveBox<CInt64> above.
+          static const bool spike_boxdirect_result =
+              Ci_SpikeGetenv("SPIKE_BOXDIRECT") != nullptr;
+          Instruction* boxed = spike_boxdirect_result
+              ? bbb.appendCallInstruction(
+                    OutVReg{DataType::kObject},
+                    PyLong_FromLong,
+                    primitive_result)
+              : bbb.appendCallInstruction(
+                    OutVReg{DataType::kObject}, JITRT_BoxI64, primitive_result);
           appendGuard(bbb, InstrGuardKind::kNotZero, *instr, boxed);
           BasicBlock* slow_box_pred = bbb.curBlock();
           bbb.appendBranch(Instruction::kBranch, done_block);

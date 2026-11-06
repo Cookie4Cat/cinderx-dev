@@ -35,3 +35,6 @@ SlabArenaTest
 SortedVecMapTest
 SplitCriticalEdgesTest
 UtilTestNoFixture
+LoopPhiUnboxTest
+LoopBoxing311Test
+LoopAllocationFailure311Test

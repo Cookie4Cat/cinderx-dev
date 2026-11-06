@@ -296,6 +296,83 @@ static size_t countOpcode(
   return count;
 }
 
+class LoopBoxing311Test : public LIRGeneratorTest {};
+
+TEST_F(LoopBoxing311Test, DirectIntegerBoxingKeepsCacheAndAllocationGuards) {
+  Ref<PyFunctionObject> owner(compileAndGet(
+      "def boxing_owner(left, right): return left\n", "boxing_owner"));
+  ASSERT_NE(owner, nullptr);
+  const char* primitive = R"(fun boxing_owner {
+  bb 0 {
+    v0 = LoadArg<0>
+    v1 = LoadArg<1>
+    v2 = RefineType<LongExact> v0
+    v3 = PrimitiveUnbox<CInt64> v2
+    v4 = PrimitiveBox<CInt64> v3 {
+      FrameState { CurInstrOffset 0 Locals<2> v0 v1 }
+    }
+    Return v4
+  }
+}
+)";
+  for (const std::string operation : {"PrimitiveBox", "Add", "Subtract"}) {
+    SCOPED_TRACE(operation);
+    std::string source = primitive;
+    if (operation != "PrimitiveBox") {
+      source =
+          "fun boxing_owner {\n  bb 0 {\n"
+          "    v0 = LoadArg<0>\n    v1 = LoadArg<1>\n"
+          "    v2 = RefineType<LongExact> v0\n"
+          "    v3 = RefineType<LongExact> v1\n"
+          "    v4 = LongInPlaceOp<" +
+          operation +
+          "> v2 v3 {\n"
+          "      FrameState { CurInstrOffset 0 Locals<2> v0 v1 }\n"
+          "    }\n    Return v4\n  }\n}\n";
+    }
+    auto irfunc = hir::HIRParser{}.ParseHIR(source.c_str());
+    ASSERT_NE(irfunc, nullptr);
+    irfunc->setCode(BorrowedRef<PyCodeObject>{owner->func_code});
+    irfunc->builtins.reset(owner->func_builtins);
+    irfunc->globals.reset(owner->func_globals);
+    // Keep these HIR operations intact while resolving their deopt metadata.
+    Compiler::runPasses(*irfunc, static_cast<PassConfig>(0));
+    CodeRuntime runtime{irfunc->code, irfunc->builtins, irfunc->globals};
+    codegen::Environ env;
+    env.ctx = getContext();
+    env.code_rt = &runtime;
+    LIRGenerator generator(irfunc.get(), &env);
+    auto lir = generator.TranslateFunction();
+    ASSERT_NE(lir, nullptr);
+    EXPECT_TRUE(hasImmediate(*lir, reinterpret_cast<uint64_t>(PyLong_FromLong)))
+        << *lir;
+    EXPECT_FALSE(hasImmediate(*lir, reinterpret_cast<uint64_t>(JITRT_BoxI64)))
+        << *lir;
+    EXPECT_GE(countOpcode(*lir, Instruction::kLessThanUnsigned), 1u) << *lir;
+    bool allocation_guard = false;
+    for (const auto* block : lir->basicblocks()) {
+      for (const auto& instr : block->instructions()) {
+        if (instr->opcode() != Instruction::kGuard ||
+            static_cast<InstrGuardKind>(instr->getInput(0)->getConstant()) !=
+                InstrGuardKind::kNotZero ||
+            !instr->getInput(2)->isLinked()) {
+          continue;
+        }
+        const auto* boxed =
+            static_cast<const LinkedOperand*>(instr->getInput(2))
+                ->getLinkedInstr();
+        if (boxed->isCall() && boxed->getNumInputs() > 0 &&
+            boxed->getInput(0)->isImm() &&
+            boxed->getInput(0)->getConstant() ==
+                reinterpret_cast<uint64_t>(PyLong_FromLong)) {
+          allocation_guard = true;
+        }
+      }
+    }
+    EXPECT_TRUE(allocation_guard) << *lir;
+  }
+}
+
 TEST_F(LIRGeneratorTest, Python311ForcedDeoptOptOutKeepsOrganicChecks) {
   const auto saved = getConfig();
   SCOPE_EXIT(getMutableConfig() = saved);

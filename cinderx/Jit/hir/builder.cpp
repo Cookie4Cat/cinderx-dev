@@ -2935,7 +2935,7 @@ void HIRBuilder::translate(
           break;
         }
         case FOR_ITER: {
-          emitForIter(tc, bc_instr);
+          emitForIter(irfunc.cfg, tc, bc_instr);
           break;
         }
         case LOAD_FIELD: {
@@ -3301,6 +3301,21 @@ void HIRBuilder::translate(
     // untouched along the other. Thus, they must be special cased.
     switch (prev_bc_instr.opcode()) {
       case FOR_ITER: {
+#if PY_VERSION_HEX < 0x030C0000
+        if (spike_range_body_ != nullptr) {
+          // SPIKE(RANGEITER): the range form ends in CondBranch(in range,
+          // value block, footer); the value block already pushed the loop
+          // value and branches to the body.  On exhaustion only the
+          // iterator is on the stack to pop.
+          auto* condbr = static_cast<CondBranch*>(last_instr);
+          auto exit_frame = tc.frame;
+          exit_frame.stack.discard(1);
+          queue.emplace_back(spike_range_body_, spike_range_body_frame_);
+          queue.emplace_back(condbr->false_bb(), exit_frame);
+          spike_range_body_ = nullptr;
+          break;
+        }
+#endif
         auto condbr = static_cast<CondBranchIterNotDone*>(last_instr);
         auto new_frame = tc.frame;
         if constexpr (PY_VERSION_HEX >= 0x030E0000) {
@@ -3683,6 +3698,11 @@ void HIRBuilder::emitAnyCall(
     case CALL:
     case CALL_KW:
     case CALL_METHOD: {
+#if PY_VERSION_HEX < 0x030C0000
+      if (opcode == CALL && tryEmitRangeIter311(tc, bc_instr)) {
+        break;
+      }
+#endif
       auto num_operands = static_cast<std::size_t>(bc_instr.oparg()) + 2;
       auto num_stack_inputs = num_operands;
       bool is_call_kw = opcode == CALL_KW;
@@ -6215,6 +6235,194 @@ void HIRBuilder::emitSequenceSet(
 }
 
 #if PY_VERSION_HEX < 0x030C0000
+// SPIKE(RANGEITER): `for x in range(...)` is CALL of the pinned builtin range
+// type, GET_ITER and FOR_ITER back to back.  The range object is consumed by
+// the GET_ITER and never observable, so the fused call builds the iterator
+// that range_iter would return straight from the arguments
+// (JITRT_RangeIter311: exact ints that fit in a C long give the same
+// rangeiterobject; anything else runs range(...) and iter() in order), and
+// the FOR_ITER at the recorded offset iterates it in HIR.
+bool HIRBuilder::tryEmitRangeIter311(
+    TranslationContext& tc,
+    const jit::BytecodeInstruction& bc_instr) {
+  static const bool spike_rangeiter =
+      Ci_SpikeGetenv("SPIKE_RANGEITER") != nullptr;
+  if (!spike_rangeiter || kwnames_ != nullptr) {
+    return false;
+  }
+  // A CALL site granted a compiled exception edge (SPIKE(EXCHANDLER)) keeps
+  // the generic call and its edge; the fused call only has the deopt.
+  if (Ci_ExcEdgeSiteGranted311(code_, bc_instr.baseOffset().value())) {
+    return false;
+  }
+  int nargs = bc_instr.oparg();
+  if (nargs < 1 || nargs > 3) {
+    return false;
+  }
+  auto code_size =
+      static_cast<Py_ssize_t>(countIndices(code_) * sizeof(_Py_CODEUNIT));
+  BCOffset get_iter_off = bc_instr.nextInstrOffset();
+  if (get_iter_off.value() >= code_size ||
+      block_map_.blocks.contains(get_iter_off)) {
+    return false;
+  }
+  BytecodeInstruction get_iter{code_, get_iter_off};
+  if (get_iter.opcode() != GET_ITER) {
+    return false;
+  }
+  BCOffset for_iter_off = get_iter.nextInstrOffset();
+  if (for_iter_off.value() >= code_size) {
+    return false;
+  }
+  BytecodeInstruction for_iter{code_, for_iter_off};
+  if (for_iter.opcode() != FOR_ITER) {
+    return false;
+  }
+  auto& stack = tc.frame.stack;
+  if (stack.size() < static_cast<std::size_t>(nargs) + 2) {
+    return false;
+  }
+  Register* callable = stack.top(nargs);
+  Register* self_slot = stack.top(nargs + 1);
+  Instr* callable_def = callable->instr();
+  if (callable_def == nullptr || !callable_def->IsGuardIs() ||
+      static_cast<const GuardIs*>(callable_def)->target() !=
+          reinterpret_cast<PyObject*>(&PyRange_Type)) {
+    return false;
+  }
+  Instr* self_def = self_slot->instr();
+  if (self_def == nullptr || !self_def->IsLoadConst() ||
+      !(static_cast<const LoadConst*>(self_def)->type() <= TNullptr)) {
+    return false;
+  }
+
+  Register* args[3] = {nullptr, nullptr, nullptr};
+  for (int i = nargs - 1; i >= 0; i--) {
+    args[i] = stack.pop();
+  }
+  stack.pop(); // the pinned range type; its GuardIs stays in the IR
+  stack.pop(); // NULL
+  Register* nargs_reg = temps_.AllocateNonStack();
+  tc.emit<LoadConst>(nargs_reg, Type::fromCInt(nargs, TCInt64));
+  Register* absent = nullptr;
+  for (auto& arg : args) {
+    if (arg == nullptr) {
+      if (absent == nullptr) {
+        absent = temps_.AllocateNonStack();
+        tc.emit<LoadConst>(absent, TNullptr);
+      }
+      arg = absent;
+    }
+  }
+  Register* raw = temps_.AllocateNonStack();
+  auto call = tc.emit<CallStatic>(
+      4, raw, reinterpret_cast<void*>(JITRT_RangeIter311), TObject | TNullptr);
+  call->SetOperand(0, nargs_reg);
+  call->SetOperand(1, args[0]);
+  call->SetOperand(2, args[1]);
+  call->SetOperand(3, args[2]);
+  // An exception (range() argument errors) is raised at the CALL, as the
+  // interpreter would.
+  Register* iter = temps_.AllocateStack();
+  tc.emit<CheckExc>(iter, raw, tc.frame);
+  stack.push(iter);
+  spike_range_for_iter_[for_iter_off.value()] = nargs;
+  // Shared with SPIKE(SLICEFAST); the translate loop consumes it at the very
+  // next instruction, so the two fusions can never overlap.
+  spike_skip_bc_offset_ = get_iter_off.value();
+  return true;
+}
+
+// SPIKE(RANGEITER): FOR_ITER over the iterator of a fused range(...) call:
+// rangeiter_next in HIR.  The loop value is produced as an int64 and boxed
+// by PrimitiveBox, which the arithmetic and subscript lowerings look through
+// and which box rematerialisation drops when only frame states use it.  The
+// index is written back every iteration, so the iterator stays exact for a
+// deopt anywhere in the body.  An iterator of another type (the
+// arbitrary-precision range iterator) re-executes FOR_ITER in the
+// interpreter.
+bool HIRBuilder::tryEmitRangeForIter311(
+    CFG& cfg,
+    TranslationContext& tc,
+    const jit::BytecodeInstruction& bc_instr) {
+  auto found = spike_range_for_iter_.find(bc_instr.baseOffset().value());
+  if (found == spike_range_for_iter_.end()) {
+    return false;
+  }
+  int nargs = found->second;
+  // rangeiterobject (Objects/rangeobject.c, 3.11):
+  // {PyObject_HEAD; long index; long start; long step; long len;}
+  constexpr std::size_t kIndex = sizeof(PyObject);
+  constexpr std::size_t kStart = kIndex + sizeof(long);
+  constexpr std::size_t kStep = kStart + sizeof(long);
+  constexpr std::size_t kLen = kStep + sizeof(long);
+  auto& stack = tc.frame.stack;
+  Register* it = stack.top();
+  // A type test on ob_type rather than a GuardType: the fields below are raw
+  // loads that place no type requirement on the iterator, so a GuardType
+  // would count as unused and be removed by guard removal.
+  Register* it_type = temps_.AllocateNonStack();
+  tc.emit<LoadField>(
+      it_type, it, "ob_type", offsetof(PyObject, ob_type), TType);
+  Register* range_iter_type = temps_.AllocateNonStack();
+  tc.emit<LoadConst>(
+      range_iter_type,
+      Type::fromObject(reinterpret_cast<PyObject*>(&PyRangeIter_Type)));
+  Register* is_range_iter = temps_.AllocateNonStack();
+  tc.emit<PrimitiveCompare>(
+      is_range_iter, PrimitiveCompareOp::kEqual, it_type, range_iter_type);
+  tc.emit<Guard>(is_range_iter, tc.frame);
+  Register* idx = temps_.AllocateNonStack();
+  tc.emit<LoadField>(idx, it, "index", kIndex, TCInt64);
+  Register* len = temps_.AllocateNonStack();
+  tc.emit<LoadField>(len, it, "len", kLen, TCInt64);
+  Register* in_range = temps_.AllocateNonStack();
+  tc.emit<PrimitiveCompare>(in_range, PrimitiveCompareOp::kLessThan, idx, len);
+  BasicBlock* header = tc.block;
+  BasicBlock* take = cfg.AllocateBlock();
+  BasicBlock* footer = getBlockAtOff(bc_instr.getJumpTarget());
+  BasicBlock* body = getBlockAtOff(bc_instr.nextInstrOffset());
+  tc.emit<CondBranch>(in_range, take, footer);
+
+  tc.block = take;
+  // value = start + index * step, in unsigned arithmetic as rangeiter_next
+  // computes it; range(stop) has start 0 and step 1, range(a, b) step 1.
+  Register* value = idx;
+  if (nargs >= 2) {
+    Register* offset = idx;
+    if (nargs == 3) {
+      Register* step = temps_.AllocateNonStack();
+      tc.emit<LoadField>(step, it, "step", kStep, TCInt64);
+      offset = temps_.AllocateNonStack();
+      tc.emit<IntBinaryOp>(offset, BinaryOpKind::kMultiply, idx, step);
+    }
+    Register* start = temps_.AllocateNonStack();
+    tc.emit<LoadField>(start, it, "start", kStart, TCInt64);
+    value = temps_.AllocateNonStack();
+    tc.emit<IntBinaryOp>(value, BinaryOpKind::kAdd, start, offset);
+  }
+  Register* one = temps_.AllocateNonStack();
+  tc.emit<LoadConst>(one, Type::fromCInt(1, TCInt64));
+  Register* next_idx = temps_.AllocateNonStack();
+  tc.emit<IntBinaryOp>(next_idx, BinaryOpKind::kAdd, idx, one);
+  // StoreField's previous operand is an optional object reference, even
+  // when the stored field is primitive. There is no object to decref here.
+  Register* previous = temps_.AllocateNonStack();
+  tc.emit<LoadConst>(previous, TNullptr);
+  tc.emit<StoreField>(it, "index", kIndex, next_idx, TCInt64, previous);
+  Register* boxed = temps_.AllocateStack();
+  tc.emit<PrimitiveBox>(boxed, value, TCInt64, tc.frame);
+  stack.push(boxed);
+  tc.emit<Branch>(body);
+  BlockCanonicalizer canonicalizer;
+  canonicalizer.Run(take, temps_, stack);
+  spike_range_body_ = body;
+  spike_range_body_frame_ = tc.frame;
+  stack.pop();
+  tc.block = header;
+  return true;
+}
+
 // Admissibility of a function-valued global as a static keyword-binding
 // target: the signature envelope the simplify-time rewrite
 // (trySimplifyStaticKwCall311) accepts.  Anything outside it would only earn
@@ -6507,6 +6715,12 @@ bool HIRBuilder::tryEmitLoadGlobal311(
         PyType_CheckExact(value) &&
         !(reinterpret_cast<PyTypeObject*>(value)->tp_flags &
           Py_TPFLAGS_HEAPTYPE)) {
+      pin = true;
+    } else if (
+        value == reinterpret_cast<PyObject*>(&PyRange_Type) &&
+        Ci_SpikeGetenv("SPIKE_RANGEITER") != nullptr) {
+      // Range fusion owns its builtin pin and does not depend on the
+      // independent isinstance/predicate specialization pass.
       pin = true;
     } else if (Py_IS_TYPE(value, &PyCFunction_Type)) {
       const char* mname =
@@ -7640,8 +7854,14 @@ void HIRBuilder::emitGetIter(TranslationContext& tc) {
 }
 
 void HIRBuilder::emitForIter(
+    CFG& cfg,
     TranslationContext& tc,
     const jit::BytecodeInstruction& bc_instr) {
+#if PY_VERSION_HEX < 0x030C0000
+  if (tryEmitRangeForIter311(cfg, tc, bc_instr)) {
+    return;
+  }
+#endif
   Register* iterator;
   if constexpr (PY_VERSION_HEX >= 0x030F0000) {
     iterator = tc.frame.stack.top(1);

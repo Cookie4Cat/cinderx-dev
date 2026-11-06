@@ -416,6 +416,7 @@ class HIRBuilder {
       const jit::BytecodeInstruction& bc_instr);
   void emitListToTuple(TranslationContext& tc);
   void emitForIter(
+      CFG& cfg,
       TranslationContext& tc,
       const jit::BytecodeInstruction& bc_instr);
   void emitInvokeMethodVectorCall(
@@ -600,6 +601,16 @@ class HIRBuilder {
       const jit::BytecodeInstruction& bc_instr,
       int name_idx,
       Register* result);
+  // SPIKE(RANGEITER): `for x in range(...)` -- the CALL of the pinned builtin
+  // range fused with the GET_ITER that follows it, and the FOR_ITER that
+  // consumes the iterator.
+  bool tryEmitRangeIter311(
+      TranslationContext& tc,
+      const jit::BytecodeInstruction& bc_instr);
+  bool tryEmitRangeForIter311(
+      CFG& cfg,
+      TranslationContext& tc,
+      const jit::BytecodeInstruction& bc_instr);
 #endif
 
   void emitBuildInterpolation(
@@ -709,6 +720,13 @@ class HIRBuilder {
   // SPIKE(SLICEFAST): bytecode offset of a BINARY_SUBSCR / STORE_SUBSCR that
   // was fused into the preceding BUILD_SLICE and must not be translated.
   int spike_skip_bc_offset_{-1};
+  // SPIKE(RANGEITER): FOR_ITER offsets whose iterator was built by a fused
+  // range(...) call, with the number of range arguments.
+  std::unordered_map<int, int> spike_range_for_iter_;
+  // SPIKE(RANGEITER): the loop body of the FOR_ITER just translated in range
+  // form and its entry frame (the translate loop queues it).
+  BasicBlock* spike_range_body_{nullptr};
+  FrameState spike_range_body_frame_;
 
   // True for small no-loop helpers that contain at least two specialized
   // numeric binary operations. These are often inlined into loop-heavy
