@@ -82,6 +82,10 @@ static const char* const kSimDefaults[] = {
     "SPIKE_BOXDIRECT=1",
     "SPIKE_PHIUNBOX=1",
     "SPIKE_PHIUNBOXF=1",
+    "SPIKE_TUPLEFL=1",
+    "SPIKE_HIRCSE=1",
+    "SPIKE_COLDSINK=1",
+    "SPIKE_DEOPTSINK=1",
 #endif
     nullptr,
 };

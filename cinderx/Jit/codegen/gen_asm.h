@@ -29,6 +29,14 @@ struct OSRMetadata;
 
 namespace jit::codegen {
 
+// Emit the final LIR block order and its near-deopt stubs. Optional code
+// section metadata is used by JIT functions and omitted by trampolines.
+void emitLIRBlocks(
+    Environ* env,
+    lir::Function* lir_func,
+    const asmjit::CodeHolder* code = nullptr,
+    CodeHolderMetadata* metadata = nullptr);
+
 class NativeGeneratorFactory;
 class NativeGenerator {
  public:

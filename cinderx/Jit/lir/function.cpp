@@ -283,6 +283,13 @@ void Function::sortBasicBlocks() {
   basic_blocks_ = sorter.getSortedBlocks();
 }
 
+void Function::sinkColdBlocks() {
+  std::stable_partition(
+      basic_blocks_.begin(), basic_blocks_.end(), [](BasicBlock* block) {
+        return block->section() == codegen::CodeSection::kHot;
+      });
+}
+
 const hir::Function* Function::hirFunc() const {
   return hir_func_;
 }

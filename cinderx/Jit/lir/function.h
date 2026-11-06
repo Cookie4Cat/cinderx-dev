@@ -63,6 +63,12 @@ class Function {
 
   void sortBasicBlocks();
 
+  // SPIKE(COLDSINK): stable-partition the block list so every hot block
+  // precedes every cold block.  Run after register allocation (intervals are
+  // unchanged) and before the post-allocation rewrite, which derives
+  // fallthroughs and inserts branches from the final order.
+  void sinkColdBlocks();
+
   // Set/get the exit block — the final block containing the epilogue.
   // For non-generators this is the single exit block; for generators it is
   // exit_epilogue_ (the shared epilogue after the return/yield merge).

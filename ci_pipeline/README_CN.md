@@ -5,6 +5,32 @@
 这里维护 ARM64 Linux CPython 3.11 和 3.14 CinderX JIT 的本地门禁流程。入口脚本是
 `ci_pipeline/run_gate.py`，suite 配置位于 `ci_pipeline/suites/*.toml`。
 
+## CPython 3.14 参考线的测试增量合同
+
+`ref314` 使用 `rt314_differential.sh` 分别构建并完整运行 baseline/head。
+`jit311/data/rt314_test_additions.json` 只声明经过检视的新增 golden SHA256、
+精确测试身份及预期状态；`ref314_contract.py` 校验实际增量与声明一致。
+已有 golden 的内容和路径、已有注册身份继续受到严格保护；新增测试必须实际
+运行一次并得到声明结果，不能通过缺失、过滤、禁用或意外 skip 放行。
+声明已进入 baseline 时不再计为增量，支持后续基线前进。
+
+每侧仍须运行完整 enabled 集合。仅在旧测试比较视图中移除声明新增项的日志标记，
+随后继续比较旧测试失败集合、skip 集合和规范化诊断；环境失败 allowlist 的
+约束保持不变。CP314 默认关闭 near-deopt sinking，相关边界测试的唯一预期 skip
+及原因在合同中显式记录；CP311 AArch64 的同一测试实际执行。
+新增、删除、哈希漂移、注册替换、执行状态及日志拼接的回归通过公共
+`runner_selftests` 在两个 Python 版本下运行。
+
+CP311 tuple 生命周期的验证分两层：`TupleLayout311Test` 检查 LIR 快/慢路径形态，
+`TupleRuntime311Test` 对实际 Python 目标的最终 HIR/LIR、freelist 地址/数量、
+定向 OBJ 分配失败、析构重入、tracemalloc 和强制 deopt 后的引用与对象身份作断言。
+执行用例必须使用 canary 模式。CP311 仅支持 normal frames；请求 LWF 时须
+验证回退到 normal，不能记为 LWF 执行覆盖。CP314 的公共 CSE/layout 检查另行
+覆盖两种受支持的帧模式。
+Release/ASAN 验证启用内联的快路径；Py_DEBUG/引用跟踪/统计构建验证标准 API 回退，
+不能用后者的成功替代前者。测试直接使用现有解释器状态和 allocator 包装，
+不新增产品测试 hook。
+
 ## CPython 3.11 的严格 quickening 检查
 
 CinderX 快速化现在记入 CPython 原生 quickened 计数，由原生代码对象析构配对扣减。

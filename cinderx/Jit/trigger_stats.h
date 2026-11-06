@@ -64,6 +64,12 @@ uint64_t* triggerStatsMachineCodeEntriesAddress();
 // Live counted machine-code frames of the CPython 3.11 direct entry; laid
 // out 8 bytes after the entry counter (see triggerStatsActiveFramesAddress).
 uint64_t* triggerStatsActiveFramesAddress();
+// SPIKE(COLDSINK): mark cold LIR blocks regardless of code sections and lay
+// them out after all hot blocks (after register allocation).
+extern const bool g_spike_coldsink;
+// SPIKE(DEOPTSINK): AArch64 near-deopt branch stubs are emitted once at the
+// end of the function instead of after every block.
+extern const bool g_spike_deoptsink;
 #if PY_VERSION_HEX < 0x030C0000
 const uint8_t* triggerStatsEntryLedgerEnabledAddress();
 // Ledger half of triggerStatsOnMachineCodeEntry() for entries the machine

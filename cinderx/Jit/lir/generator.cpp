@@ -166,6 +166,12 @@ extern "C" PyObject* __Invoke_PyList_Extend(
   return Py_None;
 }
 
+// SPIKE(COLDSINK): cold-block marks are layout hints too; with multiple code
+// sections off they are honoured by sinkColdBlocks().
+bool coldBlocksEnabled() {
+  return getConfig().multiple_code_sections || g_spike_coldsink;
+}
+
 void finishYield(
     BasicBlockBuilder& bbb,
     Instruction* instr,
@@ -1562,7 +1568,7 @@ void LIRGenerator::emitInlineFloatBox311(
   bbb.appendBranch(Instruction::kBranch, done_block);
 
   bbb.switchBlock(slow_block);
-  if (getConfig().multiple_code_sections) {
+  if (coldBlocksEnabled()) {
     slow_block->setSection(codegen::CodeSection::kCold);
   }
   Instruction* boxed = bbb.appendCallInstruction(
@@ -1628,10 +1634,322 @@ void LIRGenerator::emitInlineFloatDealloc311(
   bbb.appendBranch(Instruction::kBranch, end);
 
   bbb.switchBlock(full_block);
-  if (getConfig().multiple_code_sections) {
+  if (coldBlocksEnabled()) {
     full_block->setSection(codegen::CodeSection::kCold);
   }
   bbb.appendInvokeInstruction(PyObject_Free, obj);
+  bbb.appendBranch(Instruction::kBranch, end);
+}
+
+static bool possibleImmortal311(bool lattice_says);
+
+namespace {
+struct _Py_tuple_state* spikeTupleState311() {
+  return &ThreadedCompileContext::interpreter()->tuple;
+}
+PyGC_Head* spikeGcGeneration0_311() {
+  return ThreadedCompileContext::interpreter()->gc.generation0;
+}
+constexpr int32_t kGcNextOff = -static_cast<int32_t>(sizeof(PyGC_Head)) +
+    static_cast<int32_t>(offsetof(PyGC_Head, _gc_next));
+constexpr int32_t kGcPrevOff = -static_cast<int32_t>(sizeof(PyGC_Head)) +
+    static_cast<int32_t>(offsetof(PyGC_Head, _gc_prev));
+constexpr int32_t kTupleItemOff =
+    static_cast<int32_t>(offsetof(PyTupleObject, ob_item));
+// The largest tuple whose dealloc is expanded inline: every element costs
+// a load, a null test and a decref sequence.
+constexpr size_t kSpikeTupleDeallocInlineMax = 4;
+
+// The size of the tuple every definition of `reg` builds (1..kMax), or 0
+// when any definition is something else or the sizes disagree.  Walks
+// Assigns and Phis; a Phi's own output feeding it (the loop) and Nullptr
+// constants (the XDecref'd empty slot) are skipped.
+size_t spikeTupleSizeOfDefsImpl311(
+    const hir::Register* reg,
+    std::unordered_set<const hir::Register*>& seen) {
+  if (!seen.insert(reg).second) {
+    return SIZE_MAX; // already on the walk: imposes nothing
+  }
+  const hir::Instr* def = reg->instr();
+  if (def == nullptr) {
+    return 0;
+  }
+  if (def->IsMakeTuple()) {
+    size_t n = static_cast<const hir::MakeTuple*>(def)->nvalues();
+    return (n >= 1 && n <= kSpikeTupleDeallocInlineMax) ? n : 0;
+  }
+  if (def->IsAssign()) {
+    return spikeTupleSizeOfDefsImpl311(def->GetOperand(0), seen);
+  }
+  if (def->IsLoadConst() && reg->type() <= TNullptr) {
+    return SIZE_MAX;
+  }
+  if (def->IsPhi()) {
+    size_t n = SIZE_MAX;
+    for (size_t i = 0; i < def->NumOperands(); i++) {
+      size_t m = spikeTupleSizeOfDefsImpl311(def->GetOperand(i), seen);
+      if (m == 0) {
+        return 0;
+      }
+      if (m == SIZE_MAX) {
+        continue;
+      }
+      if (n != SIZE_MAX && n != m) {
+        return 0;
+      }
+      n = m;
+    }
+    return n;
+  }
+  return 0;
+}
+
+size_t spikeTupleSizeOfDefs311(const hir::Register* reg) {
+  std::unordered_set<const hir::Register*> seen;
+  size_t n = spikeTupleSizeOfDefsImpl311(reg, seen);
+  return n == SIZE_MAX ? 0 : n;
+}
+} // namespace
+
+// SPIKE(TUPLEFL): inline PyTuple_New fast path for a tuple of n (1..20)
+// elements whose InitTupleElements follows at once.  Mirrors
+// maybe_freelist_pop + _Py_NewReference + tuple_gc_track: head =
+// state->free_list[n-1]; if head != NULL and tracemalloc is not tracing:
+// free_list[n-1] = head->ob_item[0] (the link), numfree[n-1]--, ob_refcnt =
+// 1 (ob_type and ob_size are already right), then link the object at the
+// tail of generation 0.  A popped tuple still holds its previous, already
+// released element pointers; nothing between this pop and the element
+// stores can run a collection.  Otherwise PyTuple_New (allocation / refill
+// / tracemalloc bookkeeping).  scimark's Array2D indexing builds and frees
+// one (i, j) tuple per element access: tupledealloc + tuple_alloc were
+// 8.9% of scimark_sor.
+void LIRGenerator::emitInlineTupleNew311(
+    BasicBlockBuilder& bbb,
+    const hir::MakeTuple* instr) {
+  const size_t n = instr->nvalues();
+  struct _Py_tuple_state* state = spikeTupleState311();
+  const int32_t free_list_off = static_cast<int32_t>(
+      offsetof(struct _Py_tuple_state, free_list) +
+      sizeof(PyTupleObject*) * (n - 1));
+  const int32_t numfree_off = static_cast<int32_t>(
+      offsetof(struct _Py_tuple_state, numfree) + sizeof(int) * (n - 1));
+  PyGC_Head* gen0 = spikeGcGeneration0_311();
+
+  auto fast_block = bbb.allocateBlock();
+  auto fast2_block = bbb.allocateBlock();
+  auto slow_block = bbb.allocateBlock();
+  auto done_block = bbb.allocateBlock();
+
+  Instruction* state_reg = bbb.appendInstr(
+      OutVReg{DataType::k64bit},
+      Instruction::kMove,
+      Imm{reinterpret_cast<uint64_t>(state)});
+  Instruction* head = bbb.appendInstr(
+      OutVReg{DataType::kObject},
+      Instruction::kMove,
+      Ind{state_reg, free_list_off});
+  bbb.appendBranch(Instruction::kCondBranch, head, fast_block, slow_block);
+
+  bbb.switchBlock(fast_block);
+  Instruction* tracing_reg = bbb.appendInstr(
+      OutVReg{DataType::k64bit},
+      Instruction::kMove,
+      Imm{reinterpret_cast<uint64_t>(&_Py_tracemalloc_config.tracing)});
+  Instruction* tracing = bbb.appendInstr(
+      OutVReg{DataType::k32bit},
+      Instruction::kMove,
+      Ind{tracing_reg, 0, DataType::k32bit});
+  bbb.appendBranch(Instruction::kCondBranch, tracing, slow_block, fast2_block);
+
+  bbb.switchBlock(fast2_block);
+  // Pop.
+  Instruction* next = bbb.appendInstr(
+      OutVReg{DataType::k64bit}, Instruction::kMove, Ind{head, kTupleItemOff});
+  bbb.appendInstr(OutInd{state_reg, free_list_off}, Instruction::kMove, next);
+  Instruction* numfree = bbb.appendInstr(
+      OutVReg{DataType::k32bit},
+      Instruction::kMove,
+      Ind{state_reg, numfree_off, DataType::k32bit});
+  bbb.appendInstr(Instruction::kDec, numfree);
+  bbb.appendInstr(
+      OutInd{state_reg, numfree_off, DataType::k32bit},
+      Instruction::kMove,
+      numfree);
+  Instruction* one =
+      bbb.appendInstr(OutVReg{DataType::k64bit}, Instruction::kMove, Imm{1});
+  bbb.appendInstr(
+      OutInd{head, static_cast<int32_t>(offsetof(PyObject, ob_refcnt))},
+      Instruction::kMove,
+      one);
+  // Track: append the GC head to generation 0 (_PyObject_GC_TRACK).
+  Instruction* gc = bbb.appendInstr(
+      OutVReg{DataType::k64bit},
+      Instruction::kLea,
+      Ind{head, -static_cast<int32_t>(sizeof(PyGC_Head))});
+  Instruction* gen0_reg = bbb.appendInstr(
+      OutVReg{DataType::k64bit},
+      Instruction::kMove,
+      Imm{reinterpret_cast<uint64_t>(gen0)});
+  Instruction* last = bbb.appendInstr(
+      OutVReg{DataType::k64bit},
+      Instruction::kMove,
+      Ind{gen0_reg, static_cast<int32_t>(offsetof(PyGC_Head, _gc_prev))});
+  bbb.appendInstr(
+      OutInd{last, static_cast<int32_t>(offsetof(PyGC_Head, _gc_next))},
+      Instruction::kMove,
+      gc);
+  Instruction* prev_bits = bbb.appendInstr(
+      OutVReg{DataType::k64bit}, Instruction::kMove, Ind{head, kGcPrevOff});
+  Instruction* flags = bbb.appendInstr(
+      OutVReg{DataType::k64bit},
+      Instruction::kAnd,
+      prev_bits,
+      Imm{static_cast<uint64_t>(~_PyGC_PREV_MASK)});
+  Instruction* new_prev =
+      bbb.appendInstr(OutVReg{DataType::k64bit}, Instruction::kOr, flags, last);
+  bbb.appendInstr(OutInd{head, kGcPrevOff}, Instruction::kMove, new_prev);
+  bbb.appendInstr(OutInd{head, kGcNextOff}, Instruction::kMove, gen0_reg);
+  bbb.appendInstr(
+      OutInd{gen0_reg, static_cast<int32_t>(offsetof(PyGC_Head, _gc_prev))},
+      Instruction::kMove,
+      gc);
+  BasicBlock* fast_pred = bbb.curBlock();
+  bbb.appendBranch(Instruction::kBranch, done_block);
+
+  bbb.switchBlock(slow_block);
+  if (coldBlocksEnabled()) {
+    slow_block->setSection(codegen::CodeSection::kCold);
+  }
+  Instruction* fresh = bbb.appendCallInstruction(
+      OutVReg{DataType::kObject}, PyTuple_New, static_cast<Py_ssize_t>(n));
+  BasicBlock* slow_pred = bbb.curBlock();
+  bbb.appendBranch(Instruction::kBranch, done_block);
+
+  bbb.switchBlock(done_block);
+  Instruction* phi = bbb.appendInstr(instr->output(), Instruction::kPhi);
+  phi->allocateLabelInput(fast_pred);
+  phi->allocateLinkedInput(head);
+  phi->allocateLabelInput(slow_pred);
+  phi->allocateLinkedInput(fresh);
+}
+
+// SPIKE(TUPLEFL): inline tupledealloc for an exact tuple of statically known
+// size n (the MakeTuple that produced it is visible) whose refcount just
+// reached zero.  Mirrors tupledealloc without the trashcan (this is the
+// outermost deallocation, the element deallocations below run at the depth
+// a direct Py_DECREF would give them): unlink from its GC list when still
+// tracked (a collection may have untracked it), release the n elements,
+// then push to free_list[n-1] when numfree[n-1] < PyTuple_MAXFREELIST, else
+// PyObject_GC_Del.  Falls through to `end` in every arm.
+void LIRGenerator::emitInlineTupleDealloc311(
+    BasicBlockBuilder& bbb,
+    Instruction* obj,
+    size_t n,
+    BasicBlock* end) {
+  struct _Py_tuple_state* state = spikeTupleState311();
+  const int32_t free_list_off = static_cast<int32_t>(
+      offsetof(struct _Py_tuple_state, free_list) +
+      sizeof(PyTupleObject*) * (n - 1));
+  const int32_t numfree_off = static_cast<int32_t>(
+      offsetof(struct _Py_tuple_state, numfree) + sizeof(int) * (n - 1));
+
+  auto untrack_block = bbb.allocateBlock();
+  auto items_block = bbb.allocateBlock();
+  Instruction* gc_next = bbb.appendInstr(
+      OutVReg{DataType::k64bit}, Instruction::kMove, Ind{obj, kGcNextOff});
+  bbb.appendBranch(
+      Instruction::kCondBranch, gc_next, untrack_block, items_block);
+
+  bbb.switchBlock(untrack_block);
+  Instruction* prev_raw = bbb.appendInstr(
+      OutVReg{DataType::k64bit}, Instruction::kMove, Ind{obj, kGcPrevOff});
+  Instruction* prev = bbb.appendInstr(
+      OutVReg{DataType::k64bit},
+      Instruction::kAnd,
+      prev_raw,
+      Imm{static_cast<uint64_t>(_PyGC_PREV_MASK)});
+  bbb.appendInstr(
+      OutInd{prev, static_cast<int32_t>(offsetof(PyGC_Head, _gc_next))},
+      Instruction::kMove,
+      gc_next);
+  Instruction* next_prev = bbb.appendInstr(
+      OutVReg{DataType::k64bit},
+      Instruction::kMove,
+      Ind{gc_next, static_cast<int32_t>(offsetof(PyGC_Head, _gc_prev))});
+  Instruction* next_flags = bbb.appendInstr(
+      OutVReg{DataType::k64bit},
+      Instruction::kAnd,
+      next_prev,
+      Imm{static_cast<uint64_t>(~_PyGC_PREV_MASK)});
+  Instruction* next_new = bbb.appendInstr(
+      OutVReg{DataType::k64bit}, Instruction::kOr, next_flags, prev);
+  bbb.appendInstr(
+      OutInd{gc_next, static_cast<int32_t>(offsetof(PyGC_Head, _gc_prev))},
+      Instruction::kMove,
+      next_new);
+  Instruction* zero =
+      bbb.appendInstr(OutVReg{DataType::k64bit}, Instruction::kMove, Imm{0});
+  bbb.appendInstr(OutInd{obj, kGcNextOff}, Instruction::kMove, zero);
+  Instruction* finalized = bbb.appendInstr(
+      OutVReg{DataType::k64bit},
+      Instruction::kAnd,
+      prev_raw,
+      Imm{static_cast<uint64_t>(_PyGC_PREV_MASK_FINALIZED)});
+  bbb.appendInstr(OutInd{obj, kGcPrevOff}, Instruction::kMove, finalized);
+  bbb.appendBranch(Instruction::kBranch, items_block);
+
+  bbb.switchBlock(items_block);
+  // Last to first, as tupledealloc does (observable through __del__).
+  for (size_t k = n; k > 0; k--) {
+    const size_t i = k - 1;
+    Instruction* item = bbb.appendInstr(
+        OutVReg{DataType::kObject},
+        Instruction::kMove,
+        Ind{obj, static_cast<int32_t>(kTupleItemOff + sizeof(PyObject*) * i)});
+    makeDecref(
+        bbb,
+        item,
+        std::nullopt,
+        /*xdecref=*/true,
+        possibleImmortal311(true));
+  }
+
+  auto push_block = bbb.allocateBlock();
+  auto full_block = bbb.allocateBlock();
+  Instruction* state_reg = bbb.appendInstr(
+      OutVReg{DataType::k64bit},
+      Instruction::kMove,
+      Imm{reinterpret_cast<uint64_t>(state)});
+  Instruction* numfree = bbb.appendInstr(
+      OutVReg{DataType::k32bit},
+      Instruction::kMove,
+      Ind{state_reg, numfree_off, DataType::k32bit});
+  Instruction* limit = bbb.appendInstr(
+      OutVReg{DataType::k32bit},
+      Instruction::kMove,
+      Imm{static_cast<uint64_t>(PyTuple_MAXFREELIST), DataType::k32bit});
+  bbb.appendInstr(Instruction::kCmp, numfree, limit);
+  bbb.appendBranch(Instruction::kBranchGE, full_block);
+
+  bbb.appendBlock(push_block);
+  bbb.appendInstr(Instruction::kInc, numfree);
+  bbb.appendInstr(
+      OutInd{state_reg, numfree_off, DataType::k32bit},
+      Instruction::kMove,
+      numfree);
+  Instruction* head = bbb.appendInstr(
+      OutVReg{DataType::k64bit},
+      Instruction::kMove,
+      Ind{state_reg, free_list_off});
+  bbb.appendInstr(OutInd{obj, kTupleItemOff}, Instruction::kMove, head);
+  bbb.appendInstr(OutInd{state_reg, free_list_off}, Instruction::kMove, obj);
+  bbb.appendBranch(Instruction::kBranch, end);
+
+  bbb.switchBlock(full_block);
+  if (coldBlocksEnabled()) {
+    full_block->setSection(codegen::CodeSection::kCold);
+  }
+  bbb.appendInvokeInstruction(PyObject_GC_Del, obj);
   bbb.appendBranch(Instruction::kBranch, end);
 }
 #endif
@@ -1653,6 +1971,46 @@ std::unique_ptr<jit::lir::Function> LIRGenerator::TranslateFunction() {
     }
     if (code_has_float_ops_) {
       break;
+    }
+  }
+  // SPIKE(TUPLEFL): a MakeTuple is popped from the freelist inline only
+  // when the InitTupleElements that fills every element follows with
+  // nothing in between that can run Python code or a collection: the
+  // elements' Increfs (refcount insertion places them there), constants
+  // and type uses.  A popped tuple is tracked and still holds its stale
+  // element pointers until the stores land.
+#if defined(Py_DEBUG) || defined(Py_REF_DEBUG) || defined(Py_TRACE_REFS) || \
+    defined(Py_STATS)
+  // Freelist reuse must go through CPython reference bookkeeping in these
+  // builds, including _Py_NewReference and _Py_ForgetReference.
+  static constexpr bool spike_tuplefl = false;
+#else
+  static const bool spike_tuplefl = Ci_SpikeGetenv("SPIKE_TUPLEFL") != nullptr;
+#endif
+  if (spike_tuplefl) {
+    for (const auto& block : GetHIRFunction()->cfg.blocks) {
+      const hir::Instr* pending = nullptr;
+      for (const auto& instr : block) {
+        if (instr.IsMakeTuple()) {
+          pending = &instr;
+          continue;
+        }
+        if (pending == nullptr) {
+          continue;
+        }
+        if (instr.IsIncref() || instr.IsLoadConst() || instr.IsUseType()) {
+          continue;
+        }
+        if (instr.IsInitTupleElements()) {
+          auto mk = static_cast<const hir::MakeTuple*>(pending);
+          const auto& fill = static_cast<const hir::InitTupleElements&>(instr);
+          if (fill.tuple() == mk->output() && fill.nvalues() == mk->nvalues() &&
+              mk->nvalues() >= 1 && mk->nvalues() <= PyTuple_MAXSAVESIZE) {
+            inline_tuple_news_.insert(pending);
+          }
+        }
+        pending = nullptr;
+      }
     }
   }
 #endif
@@ -2126,7 +2484,7 @@ void LIRGenerator::makeIncrefFreeThreaded(
   // Use switchBlock (not appendBlock) because fast_store's unconditional
   // branch means slow_incref is not its fallthrough successor.
   bbb.switchBlock(slow_incref);
-  if (getConfig().multiple_code_sections) {
+  if (coldBlocksEnabled()) {
     slow_incref->setSection(codegen::CodeSection::kCold);
   }
   bbb.appendInvokeInstruction(Py_IncRef, instr);
@@ -2215,7 +2573,8 @@ void LIRGenerator::makeDecref(
     lir::Instruction* instr,
     [[maybe_unused]] std::optional<destructor> destructor,
     bool xdecref,
-    [[maybe_unused]] bool possible_immortal) {
+    [[maybe_unused]] bool possible_immortal,
+    [[maybe_unused]] size_t inline_tuple_n) {
   auto end_decref = bbb.allocateBlock();
   if (xdecref) {
     auto cont = bbb.allocateBlock();
@@ -2226,7 +2585,8 @@ void LIRGenerator::makeDecref(
   if constexpr (kFreeThreadedBuild) {
     makeDecrefFreeThreaded(bbb, instr, end_decref);
   } else {
-    makeDecrefGILEnabled(bbb, instr, end_decref, destructor, possible_immortal);
+    makeDecrefGILEnabled(
+        bbb, instr, end_decref, destructor, possible_immortal, inline_tuple_n);
   }
 
   bbb.appendBlock(end_decref);
@@ -2291,7 +2651,7 @@ void LIRGenerator::makeDecrefFreeThreaded(
   // Local refcount reached zero — merge with shared refcount. This may
   // deallocate the object if the shared refcount is also zero.
   bbb.appendBlock(merge_refcount);
-  if (getConfig().multiple_code_sections) {
+  if (coldBlocksEnabled()) {
     merge_refcount->setSection(codegen::CodeSection::kCold);
   }
   bbb.appendInvokeInstruction(_Py_MergeZeroLocalRefcount, instr);
@@ -2302,7 +2662,7 @@ void LIRGenerator::makeDecrefFreeThreaded(
   // Use switchBlock (not appendBlock) because merge_refcount's
   // unconditional branch means slow_decref is not its fallthrough.
   bbb.switchBlock(slow_decref);
-  if (getConfig().multiple_code_sections) {
+  if (coldBlocksEnabled()) {
     slow_decref->setSection(codegen::CodeSection::kCold);
   }
   bbb.appendInvokeInstruction(Py_DecRef, instr);
@@ -2314,7 +2674,8 @@ void LIRGenerator::makeDecrefGILEnabled(
     lir::Instruction* instr,
     BasicBlock* end_decref,
     std::optional<destructor> destructor,
-    bool possible_immortal) {
+    bool possible_immortal,
+    [[maybe_unused]] size_t inline_tuple_n) {
   Instruction* r1 = bbb.appendInstr(
       OutVReg{DataType::k64bit},
       Instruction::kMove,
@@ -2335,7 +2696,7 @@ void LIRGenerator::makeDecrefGILEnabled(
   bbb.appendInstr(OutInd{instr, kRefcountOffset}, Instruction::kMove, r1);
   bbb.appendBranch(Instruction::kBranchNZ, end_decref);
   bbb.appendBlock(dealloc);
-  if (getConfig().multiple_code_sections) {
+  if (coldBlocksEnabled()) {
     dealloc->setSection(codegen::CodeSection::kCold);
   }
 
@@ -2351,6 +2712,10 @@ void LIRGenerator::makeDecrefGILEnabled(
         Ci_SpikeGetenv("SPIKE_FLOATFLASM") != nullptr;
     if (spike_floatflasm && destructor.value() == JITRT_FloatDeallocExact311) {
       emitInlineFloatDealloc311(bbb, instr, end_decref);
+      return;
+    }
+    if (inline_tuple_n != 0 && destructor.value() == PyTuple_Type.tp_dealloc) {
+      emitInlineTupleDealloc311(bbb, instr, inline_tuple_n, end_decref);
       return;
     }
     if (destructor.value() == JITRT_DeallocMaybeFloat311) {
@@ -2371,7 +2736,7 @@ void LIRGenerator::makeDecrefGILEnabled(
       bbb.appendBranch(Instruction::kBranchNE, generic);
       auto float_dealloc = bbb.allocateBlock();
       bbb.appendBlock(float_dealloc);
-      if (getConfig().multiple_code_sections) {
+      if (coldBlocksEnabled()) {
         float_dealloc->setSection(codegen::CodeSection::kCold);
         generic->setSection(codegen::CodeSection::kCold);
       }
@@ -2423,7 +2788,38 @@ void LIRGenerator::makeDecref(
 #endif
   const bool possible_immortal =
       possibleImmortal311(obj->type().couldBe(TImmortalObject));
-  makeDecref(bbb, bbb.getDefInstr(obj), dtor, xdecref, possible_immortal);
+  size_t inline_tuple_n = 0;
+#if PY_VERSION_HEX < 0x030C0000
+  // SPIKE(TUPLEFL): an exact tuple whose every definition is a visible
+  // MakeTuple of one size (directly, or through Phis -- the loop-carried
+  // `pair = (a, b)` rebound each iteration -- and null-initialised slots
+  // under XDecref) has a known size; its dealloc expands inline (elements,
+  // GC unlink, freelist push).
+#if defined(Py_DEBUG) || defined(Py_REF_DEBUG) || defined(Py_TRACE_REFS) || \
+    defined(Py_STATS)
+  // Freelist reuse must go through CPython reference bookkeeping in these
+  // builds, including _Py_NewReference and _Py_ForgetReference.
+  static constexpr bool spike_tuplefl = false;
+#else
+  static const bool spike_tuplefl = Ci_SpikeGetenv("SPIKE_TUPLEFL") != nullptr;
+#endif
+  if (spike_tuplefl && obj->type() <= (TTupleExact | TNullptr) &&
+      (xdecref || !obj->type().couldBe(TNullptr))) {
+    inline_tuple_n = spikeTupleSizeOfDefs311(obj);
+    if (inline_tuple_n != 0 && !dtor.has_value()) {
+      // A nullable tuple (the loop-carried slot) has no lattice destructor;
+      // the walk proved every non-null definition is an exact tuple.
+      dtor = PyTuple_Type.tp_dealloc;
+    }
+  }
+#endif
+  makeDecref(
+      bbb,
+      bbb.getDefInstr(obj),
+      dtor,
+      xdecref,
+      possible_immortal,
+      inline_tuple_n);
 }
 
 LIRGenerator::TranslatedBlock LIRGenerator::TranslateOneBasicBlock(
@@ -5213,6 +5609,12 @@ LIRGenerator::TranslatedBlock LIRGenerator::TranslateOneBasicBlock(
       }
       case Opcode::kMakeTuple: {
         auto instr = static_cast<const MakeTuple*>(&i);
+#if PY_VERSION_HEX < 0x030C0000
+        if (inline_tuple_news_.count(&i) != 0) {
+          emitInlineTupleNew311(bbb, instr);
+          break;
+        }
+#endif
         bbb.appendCallInstruction(
             instr->output(),
             PyTuple_New,
@@ -5838,7 +6240,7 @@ LIRGenerator::TranslatedBlock LIRGenerator::TranslateOneBasicBlock(
         direct_value = direct_call;
         bbb.appendBranch(Instruction::kBranch, done_block);
         bbb.switchBlock(finish);
-        if (getConfig().multiple_code_sections) {
+        if (coldBlocksEnabled()) {
           finish->setSection(codegen::CodeSection::kCold);
         }
         Instruction* finished = bbb.appendCallInstruction(
@@ -5869,7 +6271,7 @@ LIRGenerator::TranslatedBlock LIRGenerator::TranslateOneBasicBlock(
         bbb.appendBranch(Instruction::kBranch, done_block);
 
         bbb.switchBlock(exhausted);
-        if (getConfig().multiple_code_sections) {
+        if (coldBlocksEnabled()) {
           exhausted->setSection(codegen::CodeSection::kCold);
         }
         Instruction* sentinel = bbb.appendCallInstruction(
@@ -5878,7 +6280,7 @@ LIRGenerator::TranslatedBlock LIRGenerator::TranslateOneBasicBlock(
         bbb.appendBranch(Instruction::kBranch, done_block);
 
         bbb.switchBlock(no_slot);
-        if (getConfig().multiple_code_sections) {
+        if (coldBlocksEnabled()) {
           no_slot->setSection(codegen::CodeSection::kCold);
         }
         Instruction* generic = bbb.appendCallInstruction(
@@ -7536,7 +7938,7 @@ Instruction* LIRGenerator::emitInlineLinkNormalFrame(BasicBlockBuilder& bbb) {
     bbb.appendBranch(
         Instruction::kCondBranch, ledger_on, ledger_block, count_block);
     bbb.switchBlock(ledger_block);
-    if (getConfig().multiple_code_sections) {
+    if (coldBlocksEnabled()) {
       ledger_block->setSection(codegen::CodeSection::kCold);
     }
     bbb.appendInvokeInstruction(triggerStatsOnMachineCodeEntry, code.get());
@@ -7559,7 +7961,7 @@ Instruction* LIRGenerator::emitInlineLinkNormalFrame(BasicBlockBuilder& bbb) {
   // slow_block 仅为分支目标（fast 块已以无条件跳转终结，不可再挂
   // fallthrough 后继）——switchBlock 而非 appendBlock。
   bbb.switchBlock(slow_block);
-  if (getConfig().multiple_code_sections) {
+  if (coldBlocksEnabled()) {
     slow_block->setSection(codegen::CodeSection::kCold);
   }
   // 数据栈溢出：C 全路径重做分配+初始化+链接（返回值即 tstate，与
@@ -7758,7 +8160,7 @@ void LIRGenerator::emitInlineUnlinkNormalFrame(BasicBlockBuilder& bbb) {
   bbb.appendBranch(Instruction::kBranch, done_block);
 
   bbb.switchBlock(slow_block);
-  if (getConfig().multiple_code_sections) {
+  if (coldBlocksEnabled()) {
     slow_block->setSection(codegen::CodeSection::kCold);
   }
   bbb.appendInvokeInstruction(
@@ -7920,7 +8322,7 @@ void LIRGenerator::emitInlineUnlinkFastFrame(
 
   {
     bbb.appendBlock(materialized_block);
-    if (getConfig().multiple_code_sections) {
+    if (coldBlocksEnabled()) {
       materialized_block->setSection(codegen::CodeSection::kCold);
     }
     bbb.appendInvokeInstruction(JITRT_UnlinkFrame, env_->asm_tstate);

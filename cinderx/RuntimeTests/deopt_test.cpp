@@ -434,6 +434,15 @@ class DeoptStressTest : public RuntimeTest {
         ThreadedRef<>::create(makeFrameReifier(funcobj->func_code).get());
     auto guards = insertDeopts(*irfunc);
     jit::Compiler::runPasses(*irfunc, PassConfig::kAllExceptInliner);
+    size_t remaining_stress_guards = 0;
+    for (auto& block : irfunc->cfg.blocks) {
+      for (auto& instr : block) {
+        if (instr.IsGuard() && instr.asDeoptBase()->nonce() >= 0) {
+          ++remaining_stress_guards;
+        }
+      }
+    }
+    ASSERT_EQ(remaining_stress_guards, guards.size());
     auto delete_one_deopt = [&](const DeoptMetadata& deopt_meta) {
       auto it = guards.find(deopt_meta.nonce);
       JIT_CHECK(it != guards.end(), "No guard for nonce {}", deopt_meta.nonce);

@@ -1470,6 +1470,8 @@ FlagProcessor initFlagProcessor() {
       "jit-primitive-unbox-cse",
       "PYTHONJITPRIMITIVEUNBOXCSE");
   HIR_OPTIMIZATION_OPTION(
+      "HIR pure-instruction CSE", hir_cse, "jit-hir-cse", "PYTHONJITHIRCSE");
+  HIR_OPTIMIZATION_OPTION(
       "simplify", simplify, "jit-simplify", "PYTHONJITSIMPLIFY");
 
   flag_processor.addOption(

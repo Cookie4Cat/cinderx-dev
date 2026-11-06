@@ -6,6 +6,35 @@ This directory maintains the local gate flow for ARM64 Linux CPython 3.11 and
 3.14 CinderX JIT work. The entry point is `ci_pipeline/run_gate.py`; suite
 configuration lives in `ci_pipeline/suites/*.toml`.
 
+## CPython 3.14 reference-line test additions
+
+`ref314` builds and fully executes baseline and head through
+`rt314_differential.sh`. `jit311/data/rt314_test_additions.json` records reviewed
+new golden SHA256 hashes, exact test identities and expected outcomes.
+`ref314_contract.py` reconciles only these additions. Existing goldens and test
+identities remain protected against changes or removal. Every added test must
+run exactly once with its declared outcome; missing, filtered, disabled or
+unexpectedly skipped additions fail. Declarations already present at the base
+are inert, so the baseline can advance.
+
+Each side still executes its full enabled population. Only declared additions
+are removed from the legacy log view before the existing failure/skip/diagnostic
+differential; environment-allowlist restrictions remain unchanged. The contract
+explicitly records the one near-deopt boundary skip caused by the CP314 default
+configuration. CP311 AArch64 executes that boundary test. Shared runner self-tests
+cover golden/identity changes, execution outcomes and the legacy-log comparison.
+
+For CP311 tuple lifecycle validation, `TupleLayout311Test` checks fast/fallback
+LIR shape. `TupleRuntime311Test` checks final HIR/LIR for the actual Python
+functions, freelist addresses/counts, targeted OBJ allocation failure, destructor
+reentry, tracemalloc and live-object identity/references across forced deopt.
+Executable cases run in canary mode. CP311 supports normal frames only; a
+lightweight-frame request is validated as a fallback to normal frames, not as
+lightweight execution. CP314 shared CSE/layout checks cover both supported modes.
+Release/ASAN must exercise inline paths; Py_DEBUG/reference/statistics builds
+exercise standard-API fallback and cannot substitute for fast-path validation.
+Tests use existing interpreter state and allocator wrapping, without product hooks.
+
 ## CPython 3.11 strict quickening checks
 
 CinderX quickening now credits CPython's native quickened count, paired with
