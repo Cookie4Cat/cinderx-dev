@@ -1,4 +1,4 @@
-# Experimental attribute-path mode, resolved before native initialization.
+# Attribute-path mode, resolved before native initialization.
 import os
 import sys
 _attr_mode = os.environ.get('ATTR_PATH_MODE')
@@ -6,12 +6,12 @@ if _attr_mode is not None:
     if _attr_mode not in ('off', 'cinderx', 'cinderx_control'):
         raise SystemExit('Invalid ATTR_PATH_MODE')
     if sys.version_info[:3] != (3, 11, 6):
-        raise SystemExit('Attribute spike requires CPython 3.11.6')
+        raise SystemExit('Attribute-path optimization requires CPython 3.11.6')
     os.environ.update(CINDERX_PLUGIN_ENABLE='0' if _attr_mode == 'off' else '1',
                       CINDERX_EVAL_MODE='cinder', CINDERX_JIT_MODE='off',
                       CINDERX_JIT_DISABLE='1', PYTHONJITDISABLE='1',
-                      SPIKE_INTERP_GETATTR_NOEXC='1' if _attr_mode == 'cinderx' else '0',
-                      SPIKE_INTERP_GETATTR_STATS=os.environ.get('ATTR_PATH_DIAGNOSTICS','0'))
+                      ATTR_PATH_NOEXC='1' if _attr_mode == 'cinderx' else '0',
+                      ATTR_PATH_DIAGNOSTICS=os.environ.get('ATTR_PATH_DIAGNOSTICS','0'))
     os.environ.setdefault('ATTR_PATH_GLOBAL_CACHE','1')
     os.environ.setdefault('ATTR_PATH_GLOBAL_ROUTE','compact')
     os.environ.setdefault('ATTR_PATH_INLINE_CALL','1')
@@ -22,10 +22,11 @@ else:
 def _verify():
     import _cinderx
     result = dict(evaluator=_cinderx.is_frame_evaluator_installed(),
-                  attribute=_cinderx._interp_getattr_stats311(),
+                  attribute=_cinderx._attr_path_status(),
+                  counters=_cinderx._attr_path_counters(),
                   jit=_cinderx._get_trigger_stats(), native_path=_cinderx.__file__)
     if not result['evaluator'] or any(result['jit'].values()):
-        raise RuntimeError('Attribute spike requires active evaluator and zero JIT counters')
+        raise RuntimeError('Attribute-path optimization requires active evaluator and zero JIT counters')
     return result
 
 import os

@@ -1,8 +1,7 @@
 // Copyright (c) Meta Platforms, Inc. and affiliates.
-// CPython 3.11 interpreter-only experiment. No framework-specific lookup.
+// CPython 3.11 interpreter attribute adaptation. No framework-specific lookup.
 // Included once by ceval_wrapper.c, before its evaluator-local API mappings.
 
-#include "cinderx/Common/spike_env.h"
 #include "cinderx/UpstreamBorrow/borrowed.h"
 
 static int ci_interp_getattr_enabled;
@@ -17,10 +16,9 @@ static unsigned long long ci_interp_getattr_fallbacks;
 static unsigned long long ci_interp_getattr_methods;
 
 int Ci_InterpGetattr311_Init(void) {
-  const char* mode = Ci_SpikeGetenv("SPIKE_INTERP_GETATTR_NOEXC");
-  const char* stats = Ci_SpikeGetenv("SPIKE_INTERP_GETATTR_STATS");
-  ci_interp_getattr_enabled = mode != NULL && strcmp(mode, "1") == 0;
-  ci_interp_getattr_counting = stats != NULL && strcmp(stats, "1") == 0;
+  Ci_AttrPathConfigSnapshot311();
+  ci_interp_getattr_enabled = ci_attr_noexc_config_311;
+  ci_interp_getattr_counting = ci_attr_diagnostics_config_311;
   if (ci_interp_getattr_enabled && Ci_tp_getattr_hook == NULL) {
     PyErr_SetString(PyExc_RuntimeError, "CPython getattr hook is not initialized");
     return -1;
@@ -36,29 +34,26 @@ int Ci_InterpGetattr311_Init(void) {
   return 0;
 }
 
-PyObject* Ci_InterpGetattr311_Stats(void) {
-  return Py_BuildValue(
-      "{s:i,s:i,s:i,s:i,s:i,s:i,s:i,s:i,s:K,s:K,s:K,s:K,s:K,s:K,s:K,s:K,s:K,s:K,s:K,s:K}",
-      "specialize_enabled", Ci_SpecGaEnabled_311,
-      "split_hint_enabled", Ci_SplitHintEnabled_311,
-      "enabled", ci_interp_getattr_enabled,
-      "counting", ci_interp_getattr_counting,
-      "inline_entry_ready", ci_inline_enabled_311,
-      "global_cache_enabled", ci_global_cache_enabled_311,
-      "global_cache_capacity", CI_GLOBAL_CACHE_CAPACITY_311,
-      "global_cache_route", ci_global_cache_route_311,
-      "global_cache_early_hits", ci_global_cache_early_hits_311,
-      "global_cache_early_misses", ci_global_cache_early_misses_311,
-      "global_cache_hashes", ci_global_cache_hashes_311,
-      "global_cache_hits", ci_global_cache_hits_311,
-      "global_cache_misses", ci_global_cache_misses_311,
-      "global_cache_fallbacks", ci_global_cache_fallbacks_311,
-      "eligible", ci_interp_getattr_eligible,
-      "generic_hits", ci_interp_getattr_hits,
-      "generic_misses", ci_interp_getattr_misses,
-      "propagated_errors", ci_interp_getattr_errors,
-      "guard_fallbacks", ci_interp_getattr_fallbacks,
-      "load_method_routes", ci_interp_getattr_methods);
+// Configuration is separate from optional diagnostic counters.
+PyObject* Ci_AttrPathStatus311(void) {
+  return Py_BuildValue("{s:i,s:i,s:i,s:i,s:i,s:i}",
+      "no_exception", ci_interp_getattr_enabled,
+      "specialization", Ci_SpecGaEnabled_311,
+      "split_dict", Ci_SplitHintEnabled_311,
+      "global_cache", ci_global_cache_enabled_311,
+      "inline_call", ci_inline_enabled_311,
+      "diagnostics", ci_interp_getattr_counting);
+}
+
+PyObject* Ci_AttrPathCounters311(void) {
+  if (!ci_interp_getattr_counting) Py_RETURN_NONE;
+  return Py_BuildValue("{s:K,s:K,s:K,s:K,s:K,s:K}",
+      "attribute_hits", ci_interp_getattr_hits,
+      "attribute_misses", ci_interp_getattr_misses,
+      "attribute_fallbacks", ci_interp_getattr_fallbacks,
+      "attribute_errors", ci_interp_getattr_errors,
+      "global_hits", ci_global_cache_hits_311,
+      "global_misses", ci_global_cache_misses_311);
 }
 
 static PyObject* Ci_InterpGetattrHook311(PyObject* obj, PyObject* name) {

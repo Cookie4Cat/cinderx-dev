@@ -1,4 +1,4 @@
-# CPython 3.11.6 attribute path spike
+# CPython 3.11.6 attribute path optimization
 
 Base: openeuler/cinderx dev bdba8d75f49d441c929981ffed5fdbfb9545ed58.
 Port the V24 generic-miss suppression and getattr-only LOAD_ATTR/LOAD_METHOD specialization. This is a source transplant onto current dev, not an overwrite of the old evaluator. Current dev call routing, JIT machinery and key-version policies are preserved. Includes the V24 portable global-name cache and guarded JIT-off inline-call support. Inline calls are disabled in all observing/compiling/executing JIT modes, preserving current-dev heat accounting and compiled artifact dispatch.
@@ -20,3 +20,11 @@ Tests: test_specga.py covers warmed specialization and adversarial mutations; se
 
 Performance trials use actual model Python methods with mock compute. They are not real NPU FREE TIME. The supported candidate uses PGO+LTO; its training workload exercises interpreter calls, attribute hits/misses, JSON, pickle and deepcopy. Compare against a matching no-support arm in the same binary when attributing the support patches.
 Additional ablation controls: ATTR_PATH_GLOBAL_CACHE=0/1 and ATTR_PATH_INLINE_CALL=0/1 (default 1 in explicit attribute modes). Both remain optional; cache validation uses full 64-bit dictionary content versions, never a private keys-version allocator.
+
+## Runtime interfaces
+
+ATTR_PATH_NOEXC selects ordinary-miss suppression; ATTR_PATH_DIAGNOSTICS controls counting. These two settings are captured when the native module loads, so later environment changes do not alter reinstallation. ATTR_PATH_MODE remains the user-facing three-mode entry point.
+
+_attr_path_status() returns six configuration fields: no_exception, specialization, split_dict, global_cache, inline_call, diagnostics. inline_call is an enable flag, not evidence of a taken fast path. _attr_path_counters() returns None with diagnostics off; otherwise it returns attribute_hits, attribute_misses, attribute_fallbacks, attribute_errors, global_hits, global_misses. Internal counting and lookup branches are unchanged. The old experimental environment names and combined _interp_getattr_stats311 interface are removed; consumers must use the new interfaces.
+
+Patch overview: ../../cinderx/Interpreter/3.11/attr-patches/README.md (from repository root, cinderx/Interpreter/3.11/attr-patches/README.md).

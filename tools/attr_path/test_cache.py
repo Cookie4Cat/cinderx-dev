@@ -33,19 +33,19 @@ def warm(fn):
 
 
 if cx:
-    s = cx._interp_getattr_stats311()
+    s = cx._attr_path_status()
     check("jit_off", not any(cx._get_trigger_stats().values()))
     if arm in ("legacy", "fixed"):
-        check("requested_mode", s["global_cache_enabled"] == (arm == "fixed"))
+        check("requested_mode", s["global_cache"] == (arm == "fixed"))
 
 b = {"token": 7, "len": len, "range": range}
 g = {"__builtins__": b}
 f = make("return token", g)
 check("builtin_initial", warm(f) == 7)
 if arm == "fixed":
-    before = cx._interp_getattr_stats311()["global_cache_hits"]
+    before = cx._attr_path_counters()["global_hits"]
     warm(f)
-    check("cache_hit_proven", cx._interp_getattr_stats311()["global_cache_hits"] >= before + 50)
+    check("cache_hit_proven", cx._attr_path_counters()["global_hits"] >= before + 50)
     check("high_keys_supported", probe.snapshot(b)["version"] >= 2**31)
 b["token"] = 9
 check("builtin_value_rebind", f() == 9)
@@ -230,7 +230,7 @@ if cx:
     check("jit_still_off", not any(cx._get_trigger_stats().values()))
 
 record = {"arm": arm, "passed": True, "checks": len(checks), "check_names": checks,
-          "python": sys.version, "runtime": cx._interp_getattr_stats311() if cx else None,
+          "python": sys.version, "runtime": cx._attr_path_status() if cx else None,
           "jit": cx._get_trigger_stats() if cx else None}
 path = Path(os.environ.get("CACHE_TEST_OUTPUT", f"/work/validation/cache-{arm}.json"))
 path.parent.mkdir(parents=True, exist_ok=True)

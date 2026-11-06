@@ -115,6 +115,7 @@ static inline void Ci_CodeWarmup_311(PyCodeObject* code) {
 #include "cinderx/Interpreter/3.11/specga.h"
 #include "cinderx/Interpreter/interpreter.h"
 #include "cinderx/Interpreter/3.11/interpreter_contract.h"
+#include "cinderx/Interpreter/3.11/attr_config.h"
 #include "cinderx/Interpreter/3.11/global_cache311.h"
 extern vectorcallfunc Ci_JitShell311_CodeArtifactEntry(PyFunctionObject*);
 extern uint8_t Ci_JitGraveyardPending311;

@@ -11,7 +11,7 @@ if a.mode!='stock':
     import _cinderx as cx
     cx.install_frame_evaluator()
     assert cx.is_frame_evaluator_installed()
-    assert bool(cx._interp_getattr_stats311()['enabled'])==(a.mode=='on')
+    assert bool(cx._attr_path_status()['no_exception'])==(a.mode=='on')
     before=cx._get_trigger_stats()
 
 def run_cases():
@@ -171,7 +171,7 @@ if cx:
         assert after[k]==before[k],(k,before,after)
     assert after['compiled_function_creations']==after['machine_code_entries']==0,after
     diagnostics=dict(interpreter=cx.is_frame_evaluator_installed(),jit_before=before,jit_after=after,
-        attr=cx._interp_getattr_stats311())
-    if a.mode=='on':assert diagnostics['attr']['generic_misses']>0
+        attr=cx._attr_path_status())
+    if a.mode=='on':assert cx._attr_path_counters()['attribute_misses']>0
 Path(a.output).write_text(json.dumps(dict(mode=a.mode,python=sys.version,cases=cases,diagnostics=diagnostics),ensure_ascii=False,indent=2),encoding='utf-8')
 print(json.dumps(dict(mode=a.mode,cases=len(cases),status='ok')))

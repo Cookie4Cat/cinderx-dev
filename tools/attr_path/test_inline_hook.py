@@ -4,7 +4,7 @@ cx=None
 if sys.argv[1]!='stock':
     import _cinderx as cx
     cx.install_frame_evaluator()
-    assert cx._interp_getattr_stats311()['inline_entry_ready']
+    assert cx._attr_path_status()['inline_call']
 def child(x):return x+1
 def parent():
     # The current CinderX frame must respect a subsequently installed hook.

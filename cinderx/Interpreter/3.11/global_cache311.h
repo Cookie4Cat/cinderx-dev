@@ -2,7 +2,6 @@
 // version allocation. Only the stock-compatible generic LOAD_GLOBAL is wrapped.
 #include "cinderx/UpstreamBorrow/borrowed.h"
 #include "cinderx/Interpreter/3.11/observe.h"
-#include "cinderx/Common/spike_env.h"
 #include <stdint.h>
 #include <stddef.h>
 #include <stdlib.h>
@@ -91,8 +90,7 @@ int Ci_GlobalCacheInit311(void) {
   Ci_GlobalCacheClear311();
   ci_global_cache_route_311 = selected_route;
   ci_global_cache_enabled_311 = use_cache;
-  const char* stats = Ci_SpikeGetenv("SPIKE_INTERP_GETATTR_STATS");
-  ci_global_cache_counting_311 = stats != NULL && strcmp(stats, "1") == 0;
+  ci_global_cache_counting_311 = ci_attr_diagnostics_config_311;
   return 0;
 }
 
