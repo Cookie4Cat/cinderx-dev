@@ -1,0 +1,30 @@
+{
+  "native_commit": "9d1aaf7b40187a2f9bde416dc11d8ebd7f0b8ddf",
+  "source_archive_sha256": "2cc26afaaacade72ea60c0d20c54fd0a7e30647bd34b218c1c791a1554451a1e",
+  "wheel_name": "cinderx-2026.11.6.110612-cp311-cp311-linux_aarch64.whl",
+  "wheel_sha256": "1aff0d8940f8150d2154dcbe59322a2102ccb50297982e526334c4cc5c74ff78",
+  "native_sha256": "464def41fd2a8fab83fde713668c7f0a2048892860d06bbfb0feeb39ea99ea11",
+  "python": "3.11.6",
+  "torch": "2.10.0+cpu",
+  "build": "PGO+LTO gcc14.2",
+  "benchmarks": [
+    "dlrm",
+    "mmoe",
+    "esmm",
+    "gr_2b"
+  ],
+  "blocks": 12,
+  "model_jit_counters_all_zero": true,
+  "diagnostics_during_timing": false,
+  "guard_errors": null,
+  "tests": {
+    "specga": 29,
+    "semantic": 43,
+    "type_reentry": 24,
+    "instance_dict": 4,
+    "mro_probe": 9,
+    "stdlib_run": 624,
+    "stdlib_skipped": 1
+  },
+  "scope": "NPU mock; not FREE TIME; JIT-off only"
+}
