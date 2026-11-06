@@ -19,3 +19,7 @@ execute_process(COMMAND "${GIT_EXECUTABLE}" apply --unsafe-paths "${PROJECT_SOUR
 if(NOT PATCH_RESULT EQUAL 0)
   message(FATAL_ERROR "Attribute patch failed: 0002-load-attr-with-hint-split-dict.patch")
 endif()
+execute_process(COMMAND "${GIT_EXECUTABLE}" apply --unsafe-paths "${PROJECT_SOURCE_DIR}/Interpreter/3.11/attr-patches/0003-global-cache-inline.patch" WORKING_DIRECTORY "${ATTR311_DIR}" RESULT_VARIABLE PATCH_RESULT)
+if(NOT PATCH_RESULT EQUAL 0)
+ message(FATAL_ERROR "Global-cache/inline patch failed")
+endif()

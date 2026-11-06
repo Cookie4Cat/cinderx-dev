@@ -1,0 +1,70 @@
+--- a/ceval.c
++++ b/ceval.c
+@@ -3037,6 +3037,30 @@
+         TARGET(LOAD_GLOBAL_ADAPTIVE) {
+             assert(cframe.use_tracing == 0);
+             _PyLoadGlobalCache *cache = (_PyLoadGlobalCache *)next_instr;
++            // Portable early cache. Let the first specialization attempt run;
++            // module/global sites can therefore retain their native fast opcode.
++            if (ci_global_cache_enabled_311 && ci_global_cache_route_311 != 0 &&
++                !(ADAPTIVE_COUNTER_IS_ZERO(cache)) &&
++                PyDict_CheckExact(GLOBALS()) && PyDict_CheckExact(BUILTINS())) {
++                PyObject *ci_name = GETITEM(names, oparg >> 1);
++                PyObject *ci_result = Ci_TryEarlyGlobal311(
++                    (PyDictObject*)GLOBALS(), (PyDictObject*)BUILTINS(),
++                    ci_name, frame->prev_instr);
++                if (ci_result != NULL) {
++                    // Preserve adaptive progress so a formerly failing module
++                    // lookup may re-specialize after its namespace settles.
++                    if (ci_global_cache_route_311 >= 3) {
++                        DECREMENT_ADAPTIVE_COUNTER(cache);
++                    }
++                    int ci_push_null = oparg & 1;
++                    PEEK(0) = NULL;
++                    JUMPBY(INLINE_CACHE_ENTRIES_LOAD_GLOBAL);
++                    STACK_GROW(ci_push_null + 1);
++                    Py_INCREF(ci_result);
++                    SET_TOP(ci_result);
++                    DISPATCH();
++                }
++            }
+             if (ADAPTIVE_COUNTER_IS_ZERO(cache)) {
+                 PyObject *name = GETITEM(names, oparg>>1);
+                 next_instr--;
+@@ -4726,7 +4750,7 @@
+             PyObject *function = PEEK(total_args + 1);
+             int positional_args = total_args - KWNAMES_LEN();
+             // Check if the call can be inlined or not
+-            if (Py_TYPE(function) == &PyFunction_Type && tstate->interp->eval_frame == NULL) {
++            if (Py_TYPE(function) == &PyFunction_Type && (tstate->interp->eval_frame == NULL || Ci_CallInlineOK311(function))) {
+                 int code_flags = ((PyCodeObject*)PyFunction_GET_CODE(function))->co_flags;
+                 PyObject *locals = code_flags & CO_OPTIMIZED ? NULL : PyFunction_GET_GLOBALS(function);
+                 STACK_SHRINK(total_args);
+@@ -4826,12 +4850,12 @@
+ 
+         TARGET(CALL_PY_EXACT_ARGS) {
+             assert(call_shape.kwnames == NULL);
+-            DEOPT_IF(tstate->interp->eval_frame, CALL);
+             _PyCallCache *cache = (_PyCallCache *)next_instr;
+             int is_meth = is_method(stack_pointer, oparg);
+             int argcount = oparg + is_meth;
+             PyObject *callable = PEEK(argcount + 1);
+             DEOPT_IF(!PyFunction_Check(callable), CALL);
++            DEOPT_IF(tstate->interp->eval_frame && !Ci_CallInlineOK311(callable), CALL);
+             PyFunctionObject *func = (PyFunctionObject *)callable;
+             DEOPT_IF(func->func_version != read_u32(cache->func_version), CALL);
+             PyCodeObject *code = (PyCodeObject *)func->func_code;
+@@ -4860,12 +4884,12 @@
+ 
+         TARGET(CALL_PY_WITH_DEFAULTS) {
+             assert(call_shape.kwnames == NULL);
+-            DEOPT_IF(tstate->interp->eval_frame, CALL);
+             _PyCallCache *cache = (_PyCallCache *)next_instr;
+             int is_meth = is_method(stack_pointer, oparg);
+             int argcount = oparg + is_meth;
+             PyObject *callable = PEEK(argcount + 1);
+             DEOPT_IF(!PyFunction_Check(callable), CALL);
++            DEOPT_IF(tstate->interp->eval_frame && !Ci_CallInlineOK311(callable), CALL);
+             PyFunctionObject *func = (PyFunctionObject *)callable;
+             DEOPT_IF(func->func_version != read_u32(cache->func_version), CALL);
+             PyCodeObject *code = (PyCodeObject *)func->func_code;

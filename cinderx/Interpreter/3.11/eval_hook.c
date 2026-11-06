@@ -90,6 +90,8 @@ int Ci_EvalHook311_Install(void) {
     return -1;
   }
 
+  extern int Ci_PerfSupportInit311(void);
+  if (Ci_PerfSupportInit311() < 0) { return -1; }
   _PyInterpreterState_SetEvalFrameFunc(interp, Ci_EvalFrame);
 
   // Read back rather than trusting the write: ownership is only real if the
@@ -109,6 +111,8 @@ int Ci_EvalHook311_Install(void) {
 }
 
 Ci_EvalHook311_RemoveResult Ci_EvalHook311_Remove(void) {
+  extern void Ci_GlobalCacheClear311(void);
+  Ci_GlobalCacheClear311();
   if (!ci_eval_hook_state.installed) {
     // Never installed: removal is idempotent.
     return CI_EVAL_HOOK_REMOVED;

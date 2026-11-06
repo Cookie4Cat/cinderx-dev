@@ -12,6 +12,9 @@ if _attr_mode is not None:
                       CINDERX_JIT_DISABLE='1', PYTHONJITDISABLE='1',
                       SPIKE_INTERP_GETATTR_NOEXC='1' if _attr_mode == 'cinderx' else '0',
                       SPIKE_INTERP_GETATTR_STATS=os.environ.get('ATTR_PATH_DIAGNOSTICS','0'))
+    os.environ.setdefault('ATTR_PATH_GLOBAL_CACHE','1')
+    os.environ.setdefault('ATTR_PATH_GLOBAL_ROUTE','compact')
+    os.environ.setdefault('ATTR_PATH_INLINE_CALL','1')
     os.environ.setdefault('ATTR_PATH_SPECIALIZE','1' if _attr_mode == 'cinderx' else '0')
 else:
     os.environ.setdefault('ATTR_PATH_SPECIALIZE','0')

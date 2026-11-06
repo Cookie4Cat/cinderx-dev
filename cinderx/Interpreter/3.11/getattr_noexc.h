@@ -37,14 +37,28 @@ int Ci_InterpGetattr311_Init(void) {
 }
 
 PyObject* Ci_InterpGetattr311_Stats(void) {
-  return Py_BuildValue("{s:i,s:i,s:i,s:K,s:K,s:K,s:K}",
+  return Py_BuildValue(
+      "{s:i,s:i,s:i,s:i,s:i,s:i,s:i,s:i,s:K,s:K,s:K,s:K,s:K,s:K,s:K,s:K,s:K,s:K,s:K,s:K}",
+      "specialize_enabled", Ci_SpecGaEnabled_311,
+      "split_hint_enabled", Ci_SplitHintEnabled_311,
       "enabled", ci_interp_getattr_enabled,
       "counting", ci_interp_getattr_counting,
-      "specialize_enabled", Ci_SpecGaEnabled_311,
+      "inline_entry_ready", ci_inline_enabled_311,
+      "global_cache_enabled", ci_global_cache_enabled_311,
+      "global_cache_capacity", CI_GLOBAL_CACHE_CAPACITY_311,
+      "global_cache_route", ci_global_cache_route_311,
+      "global_cache_early_hits", ci_global_cache_early_hits_311,
+      "global_cache_early_misses", ci_global_cache_early_misses_311,
+      "global_cache_hashes", ci_global_cache_hashes_311,
+      "global_cache_hits", ci_global_cache_hits_311,
+      "global_cache_misses", ci_global_cache_misses_311,
+      "global_cache_fallbacks", ci_global_cache_fallbacks_311,
       "eligible", ci_interp_getattr_eligible,
       "generic_hits", ci_interp_getattr_hits,
       "generic_misses", ci_interp_getattr_misses,
-      "guard_fallbacks", ci_interp_getattr_fallbacks);
+      "propagated_errors", ci_interp_getattr_errors,
+      "guard_fallbacks", ci_interp_getattr_fallbacks,
+      "load_method_routes", ci_interp_getattr_methods);
 }
 
 static PyObject* Ci_InterpGetattrHook311(PyObject* obj, PyObject* name) {
