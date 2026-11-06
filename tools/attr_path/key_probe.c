@@ -20,7 +20,18 @@ static PyObject* call_n(PyObject* self, PyObject* args) {
     if (result == NULL) Py_RETURN_NONE;
     return result;
 }
+static PyObject* clear_type_cache(PyObject* self, PyObject* args) {
+    return PyLong_FromUnsignedLong(PyType_ClearCache());
+}
+static PyObject* type_info(PyObject* self, PyObject* type) {
+    if (!PyType_Check(type)) { PyErr_SetString(PyExc_TypeError, "type required"); return NULL; }
+    PyTypeObject* t = (PyTypeObject*)type;
+    return Py_BuildValue("{s:k,s:i}", "version", (unsigned long)t->tp_version_tag,
+        "valid", (t->tp_flags & Py_TPFLAGS_VALID_VERSION_TAG) != 0);
+}
 static PyMethodDef methods[] = {
+    {"clear_type_cache", clear_type_cache, METH_NOARGS, NULL},
+    {"type_info", type_info, METH_O, NULL},
     {"snapshot", snapshot, METH_O, NULL}, {"call_n", call_n, METH_VARARGS, NULL}, {NULL}
 };
 static struct PyModuleDef module = {PyModuleDef_HEAD_INIT, "_key_probe", NULL, -1, methods};
