@@ -1,0 +1,18 @@
+{
+  "source_commit": "613ee37f8",
+  "wheel": "cinderx-2026.11.6.110603-cp311-cp311-linux_aarch64.whl",
+  "wheel_sha256": "6838d74e16990a601664ebbf58aebf74f77f7cd5f6508f2b066a5598844706c5",
+  "native_sha256": "70684cf91f72d88319cf1bb2e996dcad03a4080e7c4a6d7757139b8a55d7084f",
+  "python": "3.11.6",
+  "architecture": "aarch64",
+  "pgo": true,
+  "lto": true,
+  "jit": "off",
+  "semantic_cases": 43,
+  "specialization_cases": 29,
+  "cache_checks": 31,
+  "stdlib_tests": 624,
+  "stdlib_skipped": 1,
+  "config_snapshot": "both off/on passed",
+  "scope": "NPU mock forward, not real FREE"
+}
