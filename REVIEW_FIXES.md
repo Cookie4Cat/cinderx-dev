@@ -4,7 +4,7 @@
 
 |意见|修复|验证|
 |---|---|---|
-|1 字典比较抛 AttributeError 后走错类属性|普通 suppress 查询之前检查实例存储。general-key managed dict、dict子类及非managed实例字典布局直接回到原属性API，不重跑已经发生副作用的查询。|旧110603实际返回class-value，回归失败；修复后普通字段/方法、managed/非managed四种情况均返回fallback:x，比较仅执行一次。|
+|1 字典比较抛 AttributeError 后走错类属性|普通 suppress 查询之前检查实例存储。general-key managed dict、dict子类及非managed实例字典布局直接回到原属性API，不重跑已经发生副作用的查询。|旧110603实际返回class-value，回归失败；修复后原四组均返回fallback:x，比较仅一次；原布局覆盖标注过宽，第三轮已纠正并加入实际布局断言。|
 |2 默认开关污染子进程|启动器不再写入派生环境变量。native按捕获的ATTR_PATH_MODE解析默认值，用户显式override仍生效。_verify核对全部六项实际/预期配置。|真实.pth路径的父/子模式矩阵、显式override及状态不一致检测通过。旧包在未请求优化的父进程中写出默认值，测试实际失败。|
 |3 显式启用失败仍执行应用|显式模式在统一try内安装、核验，普通Exception转SystemExit，越过site.py的异常吞掉逻辑。|旧包bad route后实际打印APP_STARTED；修复后非法route/inline/specialization、冲突disable均非零退出且没有APP_STARTED。|
 |4 非owner移除提前清缓存|先检查installed、线程及owner解释器；只有合法owner才能清缓存，保留第三方求值器所有权保护。|三次子解释器失败导入均不改变主解释器状态；既有第三方接管测试通过。|
@@ -38,3 +38,14 @@ MMOE、ESMM、GR的12组配对bootstrap参考区间未跨零，线程CPU时间�
 四份patch注册为CMAKE_CONFIGURE_DEPENDS。旧配置在只改补丁后直接cmake --build时生成文件不变，回归失败；修复后分别修改四份补丁，均自动重新配置并更新生成源码，且与干净configure逐字一致。测试仅修改临时fixture，不修改仓库真实补丁。
 
 新增test_first_import_order.py与test_patch_dependencies.py。29项特化、43项属性差分、4项字典异常、19项启动检查、31项缓存、第三方接管及624项调用相关测试（跳过1项）通过。验证构建为Release+LTO，未重跑本轮PGO性能；仅首次初始化execute探针实际启用了JIT，其余回归JIT-off。详情见review_evidence/REVIEW_ROUND2_VALIDATION.json。
+## 第三轮：handler生命周期与类型namespace重入
+
+代码提交2202166e6。新增共享的纯读取MRO资格检查，普通属性适配及特化资格判断都在额外类型查询之前拒绝general-key类型字典。取得非空handler后立即INCREF，再查询__getattribute__，并平衡所有提前返回的DECREF。
+
+旧110606实测得到eq→finalized→called，而原生为eq→called→finalized；测试通过析构时复活对象避免依赖UAF崩溃，因此证明的是危险的提前析构顺序，没有故意触发实际悬空指针崩溃。旧包还复现了一次读取发生两次eq；新包与原生均只发生一次。
+
+新增24种场景：本类/继承MRO、属性/方法读取、冷/预热、删除handler/比较抛AttributeError/比较抛ValueError。在原生、控制、仅免异常、完整优化四档下，结果及事件顺序一致。其余29项特化、43项属性语义、19项启动、31项缓存、所有权及624项相关调用测试（跳过1项）通过；上一轮首次初始化execute/control回归继续通过。
+
+测试覆盖纠正：此前object子类加__slots__=('__dict__',)仍是managed，旧报告不能视为已经测试两种布局。现在非managed用例使用Exception子类，并断言实际Py_TPFLAGS_MANAGED_DICT及字典偏移。本次ARM CPython3.11.6观测到managed偏移-48、非managed偏移16，四组都比较一次并返回fallback:x。
+
+构建/验证使用Release+LTO候选110607，未开启PGO；仅首次初始化execute回归运行了一个JIT函数，其余回归JIT-off。这轮MRO检查增加了资格判断工作，尚未测量其性能影响，不沿用110605性能作为本轮结果。详情见review_evidence/REVIEW_ROUND3_VALIDATION.json。

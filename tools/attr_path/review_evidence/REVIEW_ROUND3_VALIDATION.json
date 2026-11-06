@@ -1,0 +1,68 @@
+{
+  "code_commit": "2202166e693abe8092b2ab2aa15fbc181c6c1054",
+  "python": "3.11.6",
+  "architecture": "aarch64",
+  "build": "Release+LTO, no PGO",
+  "validation_wheel": "2026.11.6.110607",
+  "before_reference": "110606",
+  "before_observed": {
+    "lifetime": [
+      "eq",
+      "finalized",
+      "called"
+    ],
+    "reentry": [
+      "eq",
+      "eq",
+      "called"
+    ]
+  },
+  "after": {
+    "lifetime": [
+      "eq",
+      "called",
+      "finalized"
+    ],
+    "reentry": [
+      "eq",
+      "called"
+    ],
+    "scenarios": 24,
+    "arms": [
+      "stock",
+      "control",
+      "noexc-only",
+      "full"
+    ]
+  },
+  "crash_test": false,
+  "resurrection_used_to_observe_lifetime_safely": true,
+  "actual_layouts": {
+    "managed": {
+      "flag": true,
+      "dictoffset": -48
+    },
+    "non_managed_exception_subclass": {
+      "flag": false,
+      "dictoffset": 16
+    }
+  },
+  "previous_layout_coverage_was_overstated": true,
+  "regression": {
+    "specialization": 29,
+    "attribute_semantics": 43,
+    "dict_attributeerror": 4,
+    "startup": 19,
+    "cache": 31,
+    "owner_replacement": true,
+    "first_import_order": [
+      "execute",
+      "control"
+    ],
+    "stdlib_run": 624,
+    "stdlib_skipped": 1
+  },
+  "performance_rerun": false,
+  "real_npu": false,
+  "jit_scope": "one execute initialization probe, remaining checks JIT-off"
+}
