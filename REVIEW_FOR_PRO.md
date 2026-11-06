@@ -5,20 +5,21 @@
 **基线是 openEuler / Kunpeng CinderX 的 dev，不是本 GitHub 仓库的 main。**
 
 - 固定基线：`bdba8d75f49d441c929981ffed5fdbfb9545ed58`
-- 已构建、验证的代码头：`613ee37f803f01363d6f8cd398f6271af9688bfa`
+- 已构建、验证的代码头：`75cc87835b090e4912fc26c22c1be247b72f4352`
 - 本 review 分支随后只有本说明和结果摘要的新增，不修改已验证代码。
 - 原始来源：`https://gitcode.com/openeuler/cinderx` 的 dev。
-- 代码差异共 3 个提交、24 个文件，新增 1523 行、删除 2 行；包含测试、说明及 patch 文件上下文，不能当作纯实现行数。
+- 当前代码头已包含五条检视意见的修复；详见 REVIEW_FIXES.md。提交范围包含文档与测试，不应把所有新增行视为纯实现。
 
 ```bash
-git diff bdba8d75f49d441c929981ffed5fdbfb9545ed58 613ee37f803f01363d6f8cd398f6271af9688bfa -- CMakeLists.txt cinderx tools/attr_path
-git log --oneline bdba8d75f49d441c929981ffed5fdbfb9545ed58..613ee37f803f01363d6f8cd398f6271af9688bfa
+git diff bdba8d75f49d441c929981ffed5fdbfb9545ed58 75cc87835b090e4912fc26c22c1be247b72f4352 -- CMakeLists.txt cinderx tools/attr_path
+git log --oneline bdba8d75f49d441c929981ffed5fdbfb9545ed58..75cc87835b090e4912fc26c22c1be247b72f4352
 ```
 
-三个提交依次是：
+主要代码提交依次是：
 1. `910c9a53e`：移植两项属性优化。
 2. `b7e9d0a2f`：补齐可移植全局缓存、JIT-off帧内调用与PGO训练。
 3. `613ee37f8`：整理配置命名、拆分诊断接口、拆分patch并补说明。
+4. `75cc87835`：修复实例字典异常、启动继承/失败、缓存所有权及sdist打包。
 
 ## 目标与边界
 
@@ -58,7 +59,7 @@ ATTR_PATH_MODE=cinderx python -c "import _cinderx_auto; print(_cinderx_auto._ver
 
 配置及诊断接口已改变；旧wheel的混合 `_interp_getattr_stats311()` 接口不再保留。当前内部环境变量统一使用 ATTR_PATH_*，没有清理 dev 中其他功能既有的 SPIKE_* 配置。
 
-## 已有验证证据
+## 修复前验证与性能历史（不代表修复后性能）
 
 源码整理前后，两套patch生成的 ceval.c 和 specialize.c 字节一致；属性查询/全局缓存热点函数体及帧内调用逻辑不变。
 
@@ -84,3 +85,6 @@ ATTR_PATH_MODE=cinderx python -c "import _cinderx_auto; print(_cinderx_auto._ver
 重点关注：异常处理是否丢失可观察行为；类型/描述符/字典变异；缓存借用引用与版本契约；求值器所有权及重入；帧内调用是否漏掉原入口职责；新配置捕获时机；初始化/移除失败；patch和构建入口覆盖。测试通过不等于这些边界全部证明完毕。
 
 工程化待审项目包括：初始化/清理顺序、其他Python版本及独立构建入口、patch变更重配置、补丁后内容校验、消融接口是否应收敛。请按明确的支持范围定级，不把所有未测试平台自动视为已发生的缺陷。
+## 本轮修复验证
+
+请先阅读 REVIEW_FIXES.md 及 tools/attr_path/review_evidence/REVIEW_FIXES_VALIDATION.json。修复后通过真实 .pth 子进程矩阵和对应正确性回归，并从解包的 sdist 构建 wheel。当前修复验证使用 Release+LTO、未开启 PGO；没有新增性能收益结论。

@@ -1,0 +1,38 @@
+{
+  "code_commit": "75cc87835b090e4912fc26c22c1be247b72f4352",
+  "python": "3.11.6",
+  "architecture": "aarch64",
+  "build": "Release+LTO from extracted sdist; no PGO",
+  "wheel_version": "2026.11.6.110604",
+  "native_sha256": "baa36003d114f9b271dfcd48f8561ceb32ab10c767770bb45a8851ec582e5079",
+  "jit": "off, counters zero",
+  "before_reproduced": [
+    "AttributeError dictionary lookup returns class-value",
+    "startup exports derived defaults",
+    "invalid route still executes APP_STARTED"
+  ],
+  "after_passed": {
+    "dictionary_cases": 4,
+    "startup_checks": 19,
+    "subinterpreter_rejected_import_rounds": 3,
+    "specialization_cases": 29,
+    "semantic_cases": 43,
+    "cache_checks": 31,
+    "owner_replacement": true,
+    "stdlib_tests": 624,
+    "stdlib_skipped": 1,
+    "model_smoke": [
+      "dlrm",
+      "gr_2b"
+    ]
+  },
+  "performance_rerun": false,
+  "real_npu": false,
+  "sdist_required_inputs": [
+    "four patches",
+    "apply.cmake",
+    "_cinderx.version",
+    "cinderx.pth",
+    "_cinderx_auto.py"
+  ]
+}
