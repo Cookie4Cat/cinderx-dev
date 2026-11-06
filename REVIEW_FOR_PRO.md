@@ -87,4 +87,4 @@ ATTR_PATH_MODE=cinderx python -c "import _cinderx_auto; print(_cinderx_auto._ver
 工程化待审项目包括：初始化/清理顺序、其他Python版本及独立构建入口、patch变更重配置、补丁后内容校验、消融接口是否应收敛。请按明确的支持范围定级，不把所有未测试平台自动视为已发生的缺陷。
 ## 本轮修复验证
 
-请先阅读 REVIEW_FIXES.md 及 tools/attr_path/review_evidence/REVIEW_FIXES_VALIDATION.json。修复后通过真实 .pth 子进程矩阵和对应正确性回归，并从解包的 sdist 构建 wheel。当前修复验证使用 Release+LTO、未开启 PGO；没有新增性能收益结论。
+请先阅读 REVIEW_FIXES.md 及 tools/attr_path/review_evidence/REVIEW_FIXES_VALIDATION.json。修复后通过真实 .pth 子进程矩阵和对应正确性回归，并从解包的 sdist 构建 wheel。首轮修复验证使用 Release+LTO；后续110605已完成PGO+LTO对比，发现约0.5%–1.1%的小幅回退，详见REVIEW_FIXES.md后续章节。

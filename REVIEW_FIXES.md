@@ -17,3 +17,15 @@
 新用例位于 tools/attr_path/test_dict_attributeerror.py、test_startup.py、test_subinterpreter_owner.py。test_specga.py也改为使用核验后的实际状态决定特化证明。
 
 子进程只能继承调用者实际提供的设置。例如用户显式设置ATTR_PATH_SPECIALIZE=0时，子进程保留该消融；模式默认值不再伪装成用户override。显式属性模式在native模式解析中选择JIT-off，其他未选择属性模式的dev启动路径保持独立。
+## 后续 PGO+LTO 性能验证（110605）
+
+修复后PGO+LTO包110605已与修复前PGO+LTO包110603直接比较，JIT关闭。四模型均使用相同源码、输入、固定CPU，三档六种排列重复两遍，共12组。针对性回归及624项调用相关测试再次通过。
+
+|模型|修复前相对原生降幅|修复后相对原生降幅|修复后相对修复前|
+|---|---:|---:|---:|
+|DLRM|11.06%|11.13%|快0.09%，区间跨零|
+|MMOE|13.69%|13.23%|慢0.53%|
+|ESMM|13.42%|12.49%|慢1.08%|
+|GR 2B|0.11%|-0.84%|慢0.95%|
+
+MMOE、ESMM、GR的12组配对bootstrap参考区间未跨零，线程CPU时间也同方向。主要收益保留，但不能宣称正确性修复完全没有性能代价。这里是两个成品wheel的对比，未做逐项修复消融，不能把全部差异精确归因到字典检查。不是实机FREE。完整汇总与构建元数据见review_evidence/PGO_AFTER_FIXES*.json。
