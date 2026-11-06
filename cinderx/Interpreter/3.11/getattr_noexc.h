@@ -3,6 +3,7 @@
 // Included once by ceval_wrapper.c, before its evaluator-local API mappings.
 
 #include "cinderx/UpstreamBorrow/borrowed.h"
+#include "internal/pycore_object.h"
 
 static int ci_interp_getattr_enabled;
 static int ci_interp_getattr_counting;
@@ -66,6 +67,22 @@ static PyObject* Ci_InterpGetattrHook311(PyObject* obj, PyObject* name) {
     if (ci_interp_getattr_counting) {
       ci_interp_getattr_fallbacks++;
     }
+    return PyObject_GetAttr(obj, name);
+  }
+
+  // Inspect storage without materializing a dict or invoking user code.
+  // suppress=1 may continue to a class value after dict equality raises
+  // AttributeError. The original slot instead calls __getattr__ immediately.
+  if (tp->tp_flags & Py_TPFLAGS_MANAGED_DICT) {
+    PyObject* dict = *_PyObject_ManagedDictPointer(obj);
+    if (dict != NULL &&
+        (!PyDict_CheckExact(dict) || !DK_IS_UNICODE(((PyDictObject*)dict)->ma_keys))) {
+      if (ci_interp_getattr_counting) ci_interp_getattr_fallbacks++;
+      return PyObject_GetAttr(obj, name);
+    }
+  } else if (tp->tp_dictoffset != 0) {
+    // Conservatively retain the original protocol for other dict layouts.
+    if (ci_interp_getattr_counting) ci_interp_getattr_fallbacks++;
     return PyObject_GetAttr(obj, name);
   }
 

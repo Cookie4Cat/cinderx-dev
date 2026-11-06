@@ -298,7 +298,10 @@ int Ci_RegisterGetattrHook_311(getattrofunc hook) {
 
 static int Ci_SpecGaFlag_311(const char* name, int* result) {
   const char* value = getenv(name);
-  if (value == NULL || strcmp(value, "1") == 0) {
+  if (value == NULL) {
+    *result = strcmp(name, "ATTR_PATH_SPECIALIZE") == 0
+        ? Ci_AttrPathMode311() == 3 : 1;
+  } else if (strcmp(value, "1") == 0) {
     *result = 1;
   } else if (strcmp(value, "0") == 0) {
     *result = 0;

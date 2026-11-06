@@ -71,7 +71,7 @@ int Ci_GlobalCacheInit311(void) {
                     "ATTR_PATH_KEYS_VERSION is obsolete; use ATTR_PATH_GLOBAL_CACHE=0/1");
     return -1;
   }
-  int use_cache = enabled != NULL && strcmp(enabled, "1") == 0;
+  int use_cache = enabled == NULL ? Ci_AttrPathMode311() >= 2 : strcmp(enabled, "1") == 0;
   if (use_cache && Ci_Observe311_Mode() != CI_JIT_MODE_311_OFF) {
     PyErr_SetString(PyExc_RuntimeError, "Portable global cache requires JIT off");
     return -1;

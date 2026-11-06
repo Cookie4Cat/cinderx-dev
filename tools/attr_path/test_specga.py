@@ -226,7 +226,7 @@ for fn, value, expected in [
     warm(fn, value, 16)
     after = opcodes(fn)
     proof[fn.__name__] = {"before": before, "after": after, "expected": expected}
-    if os.environ.get("ATTR_PATH_MODE") == "cinderx" and os.environ.get("ATTR_PATH_SPECIALIZE", "1") == "1":
+    if os.environ.get("ATTR_PATH_MODE") == "cinderx" and __import__("_cinderx_auto")._verify()["attribute"]["specialization"]:
         if fn is split_read and os.environ.get("ATTR_PATH_SPLIT_HINT", "1") == "0":
             # Intentional ablation: a split dictionary cannot hit WITH_HINT
             # without the values-array fix and may already be adaptive again.

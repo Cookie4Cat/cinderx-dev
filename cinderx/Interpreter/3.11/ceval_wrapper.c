@@ -126,7 +126,7 @@ int Ci_PerfSupportInit311(void) {
     PyErr_SetString(PyExc_ValueError, "ATTR_PATH_INLINE_CALL must be 0 or 1");
     return -1;
   }
-  ci_inline_enabled_311 = flag && strcmp(flag, "1") == 0;
+  ci_inline_enabled_311 = flag == NULL ? Ci_AttrPathMode311() >= 2 : strcmp(flag, "1") == 0;
   return Ci_GlobalCacheInit311();
 }
 static inline int Ci_CallInlineOK311(PyObject* fn) {

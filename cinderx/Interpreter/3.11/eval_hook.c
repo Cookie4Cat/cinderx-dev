@@ -112,7 +112,6 @@ int Ci_EvalHook311_Install(void) {
 
 Ci_EvalHook311_RemoveResult Ci_EvalHook311_Remove(void) {
   extern void Ci_GlobalCacheClear311(void);
-  Ci_GlobalCacheClear311();
   if (!ci_eval_hook_state.installed) {
     // Never installed: removal is idempotent.
     return CI_EVAL_HOOK_REMOVED;
@@ -133,6 +132,7 @@ Ci_EvalHook311_RemoveResult Ci_EvalHook311_Remove(void) {
     return CI_EVAL_HOOK_ERROR;
   }
 
+  Ci_GlobalCacheClear311();
   if (_PyInterpreterState_GetEvalFrameFunc(interp) != Ci_EvalFrame) {
     // Someone replaced us while we were installed.  Restoring the pointer we
     // saved would silently undo their installation, so leave it in place and
