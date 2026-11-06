@@ -494,7 +494,8 @@ DeoptResult prepareForDeopt(
   if (deopt_meta.reason == DeoptReason::kGuardFailure &&
       !is_instrumentation_deopt && !is_forced_deopt) {
     static const bool longspec = Ci_SpikeGetenv("SPIKE_LONGSPEC") != nullptr ||
-        Ci_SpikeGetenv("SPIKE_INTBITSPEC") != nullptr;
+        Ci_SpikeGetenv("SPIKE_INTBITSPEC") != nullptr ||
+        Ci_SpikeGetenv("SPIKE_INT64ARITH") != nullptr;
     if (longspec) {
       const DeoptFrameMetadata& fm = deopt_meta.innermostFrame();
       if (fm.code != nullptr) {
@@ -508,6 +509,15 @@ DeoptResult prepareForDeopt(
       const DeoptFrameMetadata& fm = deopt_meta.innermostFrame();
       if (fm.code != nullptr) {
         Ci_SpikeFloatGuardFail311(
+            fm.code, BCOffset(fm.cause_instr_idx).value());
+      }
+    }
+    // SPIKE(ARRTC): and for the array.array typecode speculation sites.
+    static const bool arrtc = Ci_SpikeGetenv("SPIKE_ARRTC") != nullptr;
+    if (arrtc) {
+      const DeoptFrameMetadata& fm = deopt_meta.innermostFrame();
+      if (fm.code != nullptr) {
+        Ci_SpikeArrTcGuardFail311(
             fm.code, BCOffset(fm.cause_instr_idx).value());
       }
     }

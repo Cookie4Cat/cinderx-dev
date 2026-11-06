@@ -77,6 +77,42 @@ class SpeculationFeedback311Tests(unittest.TestCase):
     def test_slow_arm_keeps_int_operand_identity(self):
         self._run("int_slow_arm_identity")
 
+    def test_int64_operations_match_interpreter(self):
+        self._run("int64_semantics")
+
+    def test_mixed_int_float_operations_match_interpreter(self):
+        self._run("mixed_semantics")
+
+    def test_fused_float_site_dispatches_ints_without_deopt(self):
+        self._run("mixed_fuse")
+
+    def test_array_typecode_speculation(self):
+        self._run("array_typecode")
+
+    def test_array_record_reads_only_array_type(self):
+        self._run("array_record_identity", PYTHONJITLIGHTWEIGHTFRAME="0")
+
+    def test_array_record_ignores_leftover_function_version(self):
+        self._run("array_record_leftover_version")
+
+    def test_fused_inplace_int64_site_stays_generic(self):
+        self._run("int64_inplace_fuse", PYTHONJITLIGHTWEIGHTFRAME="0")
+
+    def test_int64_bounds_hold_for_negative_bitwise_operands(self):
+        self._run("int64_bitwise_bounds")
+
+    def test_slow_arm_operand_is_the_frame_local(self):
+        self._run("slow_arm_frame_identity", PYTHONJITLIGHTWEIGHTFRAME="0")
+
+    def test_slow_arm_operand_identity_survives_later_calls(self):
+        self._run("slow_arm_successor_identity", PYTHONJITLIGHTWEIGHTFRAME="0")
+
+    def test_compact_compare_and_inplace_sites_fuse(self):
+        self._run("compact_compare_inplace_fuse", PYTHONJITLIGHTWEIGHTFRAME="0")
+
+    def test_int64_boundaries_on_fresh_code(self):
+        self._run("int64_boundaries_unfused")
+
 
 if __name__ == "__main__":
     unittest.main()

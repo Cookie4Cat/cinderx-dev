@@ -780,8 +780,12 @@ BorrowedRef<PyTypeObject> resolveMethodOwnerType(
 // Pre-cached with runtime layout validation. The cached value is readable
 // by any thread once initialized; only the initialization path requires
 // the GIL (and is skipped on worker threads).
+namespace {
+PyTypeObject* g_stdlib_array_type = nullptr;
+} // namespace
+
 PyTypeObject* getStdlibArrayType() {
-  static PyTypeObject* cached_type = nullptr;
+  PyTypeObject*& cached_type = g_stdlib_array_type;
   if (cached_type != nullptr) {
     return cached_type;
   }
@@ -863,6 +867,19 @@ PyTypeObject* getStdlibArrayType() {
   cached_type = type;
   return cached_type;
 }
+
+} // namespace jit::hir
+
+// SPIKE(ARRTC): the validated array.array type object, or NULL while
+// getStdlibArrayType() has not resolved it.  Never initializes: the
+// interpreter's subscript record calls this from inside the specializer,
+// where importing the module or constructing a probe would re-enter the
+// interpreter.  Declared in Interpreter/3.11/interpreter_contract.h.
+extern "C" PyTypeObject* Ci_StdlibArrayTypeIfResolved(void) {
+  return jit::hir::g_stdlib_array_type;
+}
+
+namespace jit::hir {
 
 // Allocate a temp register that may be used for the stack. It should not be a
 // register that will be treated specially in the FrameState (e.g. tracked as
@@ -3807,6 +3824,18 @@ static bool spikeFloatSpecSite311(
   if (bc_instr.isBinaryOpAdaptiveStuck()) {
     return true;
   }
+  // SPIKE(MIXEDNUM): a site whose exact-float type guards blew their fuse
+  // keeps that evidence through a despecialised recompile, where
+  // specializedOpcode() reports the generic form and the BINTYPED path of
+  // the binary-op translation is not consulted.  The diamond carries no
+  // deopting type guard, so it cannot restart the churn the
+  // despecialisation was meant to stop.
+  static const bool spike_mixednum =
+      Ci_SpikeGetenv("SPIKE_MIXEDNUM") != nullptr;
+  if (spike_mixednum &&
+      Ci_SpikeNoFloatGuard311(code, bc_instr.baseOffset().value())) {
+    return true;
+  }
   if (mode != 2) {
     return false;
   }
@@ -4042,6 +4071,13 @@ void HIRBuilder::emitBinaryOp(
       /* array_subscr_slow_path= */ false,
       subscr_stuck);
 #if PY_VERSION_HEX < 0x030C0000
+  // SPIKE(ARRTC): and the interpreter's record of the one typecode it saw.
+  if (subscr_stuck) {
+    static const bool spike_arrtc = Ci_SpikeGetenv("SPIKE_ARRTC") != nullptr;
+    if (spike_arrtc) {
+      binop->setSubscrArrayTypecode(bc_instr.subscrArrayTypecode());
+    }
+  }
   // SPIKE(FLOATSPEC): see the in-place counterpart above.  SPIKE(BINTYPED)
   // feeds the *_FLOAT specialisation evidence into the same diamond.
   if (bintyped_float_site ||

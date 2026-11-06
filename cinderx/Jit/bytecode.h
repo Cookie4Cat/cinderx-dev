@@ -60,6 +60,9 @@ class BytecodeInstruction {
   // failed (array.array receivers, the scimark shape), so the site will
   // never carry a *_LIST_INT verdict for the builder to consume.
   bool isSubscrAdaptiveStuck() const;
+  // SPIKE(ARRTC): the array.array typecode a failed BINARY_SUBSCR site has
+  // recorded as the only container it saw (interpreter_contract.h), or 0.
+  char subscrArrayTypecode() const;
   // SPIKE(FLOATSPEC): BINARY_OP whose 3.11 adaptive specialisation was
   // attempted and failed (mixed operand types), same detection as above.
   bool isBinaryOpAdaptiveStuck() const;

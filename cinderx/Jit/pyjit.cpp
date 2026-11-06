@@ -15,6 +15,7 @@
 #include "cinderx/Common/import.h"
 #include "cinderx/Common/log.h"
 #include "cinderx/Common/ref.h"
+#include "cinderx/Common/spike_env.h"
 #include "cinderx/Common/string.h"
 #include "cinderx/Common/type.h"
 #include "cinderx/Common/util.h"
@@ -38,6 +39,7 @@
 #include "cinderx/Jit/frame.h"
 #include "cinderx/Jit/generators_rt.h"
 #include "cinderx/Jit/hir/annotation_index.h"
+#include "cinderx/Jit/hir/array_specialize.h"
 #include "cinderx/Jit/hir/builder.h"
 #include "cinderx/Jit/hir/preload.h"
 #include "cinderx/Jit/inline_cache.h"
@@ -6362,7 +6364,8 @@ void excEdgeCodeDestroyed311(PyCodeObject* code) {
 }
 
 // Per-site numeric speculation fuses: the *_FLOAT binary-op guards, the
-// compact-long guards and the evidence-free float diamonds of
+// compact-long guards, the array.array typecode guards of subscript sites and
+// the evidence-free float diamonds of
 // SPIKE_FLOATSPEC=all.  Same lifetime as the exception-edge state above:
 // keyed by code object and dropped with it, so a reused address never
 // inherits a fuse.  Unlike that state, the builder and Simplify write here
@@ -6380,6 +6383,7 @@ struct NumericSpecSiteFuse311 {
 struct NumericSpecCodeState311 {
   NumericSpecSiteFuse311 float_guard;
   NumericSpecSiteFuse311 long_guard;
+  NumericSpecSiteFuse311 array_typecode;
   // {hits, misses} per float diamond site (SPIKE_FLOATSPEC=all).  Compiled
   // code bumps hits through the cell's address: map nodes do not move on
   // rehash, and the cells die only with the code object, after its last
@@ -6836,6 +6840,15 @@ int initialize() {
         "the CPython 3.11 canary could not take the frame-evaluator entry "
         "point; another component holds it");
     return -1;
+  }
+  // SPIKE(ARRTC): the interpreter's subscript record reads an array's
+  // descriptor only for the validated array.array type object, and it runs
+  // inside the specializer, where resolving the type would re-enter the
+  // interpreter.  Resolve it here, before any site records; a failure leaves
+  // it unresolved and the record off.
+  static const bool spike_arrtc = Ci_SpikeGetenv("SPIKE_ARRTC") != nullptr;
+  if (spike_arrtc) {
+    jit::hir::getStdlibArrayType();
   }
   // Publish process-global quickening policy only after execute-mode
   // initialization can no longer fail. CPython starts co_warmup at -8;
@@ -7792,8 +7805,9 @@ void Ci_ExcEdgeDeopt311(
   jit::recompileCodeForExcEdge311(code, BorrowedRef<PyFunctionObject>{func});
 }
 
-// SPIKE(FLOATSPEC, LONGSPEC, BINTYPED): the per-site numeric speculation
-// fuses declared in jit_rt.h; the state lives in jit::s_numeric_spec_311.
+// SPIKE(FLOATSPEC, LONGSPEC, BINTYPED, ARRTC): the per-site numeric
+// speculation fuses declared in jit_rt.h; the state lives in
+// jit::s_numeric_spec_311.
 namespace {
 // A guard that has failed this often at one site is recompiled away there.
 constexpr uint64_t kNumericGuardFailMax311 = 8;
@@ -8020,6 +8034,31 @@ extern "C" void Ci_SpikeFloatGuardFail311(
   guardFailed311(
       &jit::NumericSpecCodeState311::float_guard,
       "float-guard",
+      code,
+      bc_offset);
+}
+
+// SPIKE(ARRTC): the same fuse for the array.array typecode speculation of
+// subscript sites.  Kept apart from the LONGSPEC fuse so that a site's index
+// arithmetic and its container speculation do not share a failure count.
+extern "C" void Ci_SpikeArrTcRegister311(
+    PyCodeObject* code,
+    int64_t bc_offset) {
+  registerGuardSite311(
+      &jit::NumericSpecCodeState311::array_typecode, code, bc_offset);
+}
+
+extern "C" int Ci_SpikeNoArrTc311(PyCodeObject* code, int64_t bc_offset) {
+  return guardSiteTakenDown311(
+      &jit::NumericSpecCodeState311::array_typecode, code, bc_offset);
+}
+
+extern "C" void Ci_SpikeArrTcGuardFail311(
+    PyCodeObject* code,
+    int64_t bc_offset) {
+  guardFailed311(
+      &jit::NumericSpecCodeState311::array_typecode,
+      "array-typecode",
       code,
       bc_offset);
 }
