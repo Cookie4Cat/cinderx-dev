@@ -19,6 +19,8 @@ C.marker=1;b=stats();assert read(o)=='old';warm(o)
 Base.__getattr__=lambda self,n:'new';assert read(o)=='new';warm(o)
 C.__getattribute__=lambda self,n:77 if n=='x' else object.__getattribute__(self,n)
 assert read(o)==77
+b=stats();warm(o);a=stats()
+if a['cache_enabled']:assert a['cached_fallbacks']>b['cached_fallbacks']
 del C.__getattribute__;assert read(o)=='new';warm(o)
 checks.append('leaf ancestor getter mutation')
 events=[];armed=False
