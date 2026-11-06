@@ -74,6 +74,11 @@ int Ci_EvalHook311_Install(void) {
   if (Ci_InitInterpreter_311() < 0) {
     return -1;
   }
+  extern int Ci_InitGetattrHooks_311(void);
+  extern int Ci_InterpGetattr311_Init(void);
+  if (Ci_InitGetattrHooks_311() < 0 || Ci_InterpGetattr311_Init() < 0) {
+    return -1;
+  }
   if (Ci_InitQuickening_311() < 0) {
     return -1;
   }

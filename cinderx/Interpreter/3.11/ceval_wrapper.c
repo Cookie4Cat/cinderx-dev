@@ -112,8 +112,14 @@ static inline void Ci_CodeWarmup_311(PyCodeObject* code) {
 }
 #define _PyCode_Warmup Ci_CodeWarmup_311
 
+#include "cinderx/Interpreter/3.11/specga.h"
+#include "getattr_noexc.h"
+#define PyObject_GetAttr Ci_InterpGetAttr311
+#define _PyObject_GetMethod Ci_InterpGetMethod311
 #define PyObject_Vectorcall Ci_PyObject_Vectorcall_311
-#include "upstream/ceval.c"
+#include "ci311-attr/ceval.c"
+#undef PyObject_GetAttr
+#undef _PyObject_GetMethod
 #undef PyObject_Vectorcall
 #undef _PyCode_Warmup
 

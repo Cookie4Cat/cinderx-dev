@@ -569,7 +569,11 @@ file(READ ${SOURCE_CINDER_OPCODE_H} FILE_CONTENTS)
 file(WRITE ${CINDER_OPCODE_H} "${FILE_CONTENTS}")
 endif()
 
+if (${PY_VERSION} EQUAL 3.11 AND ${ENABLE_INTERPRETER_LOOP})
+  include(${PROJECT_SOURCE_DIR}/Interpreter/3.11/attr-patches/apply.cmake)
+endif()
 add_library(interpreter ${INTERP_SOURCES})
+target_include_directories(interpreter PRIVATE ${CMAKE_CURRENT_BINARY_DIR} ${PROJECT_SOURCE_DIR}/Interpreter/3.11/upstream)
 if (NOT ${PY_VERSION} EQUAL 3.11)
 target_include_directories(
   interpreter

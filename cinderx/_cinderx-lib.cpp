@@ -683,6 +683,10 @@ PyDoc_STRVAR(
     install_frame_evaluator_doc,
     "Install the CinderX frame evaluator.  This is needed for the JIT "
     "and Static Python to function.");
+#if PY_VERSION_HEX < 0x030C0000
+extern "C" PyObject* Ci_InterpGetattr311_Stats(void);
+static PyObject* attr_path_stats(PyObject*, PyObject*) { return Ci_InterpGetattr311_Stats(); }
+#endif
 PyObject* install_frame_evaluator(PyObject* /* mod */, PyObject* /* args */) {
   if (Ci_InitFrameEvalFunc() < 0) {
     return nullptr;
@@ -1124,6 +1128,9 @@ PyMethodDef _cinderx_methods[] = {
      METH_NOARGS,
      PyDoc_STR("Monotonic trigger-proof counters: executable allocations, "
                "compiled-function creations and machine-code entries.")},
+#if PY_VERSION_HEX < 0x030C0000
+    {"_interp_getattr_stats311", attr_path_stats, METH_NOARGS, "Attribute spike counters."},
+#endif
     {"install_frame_evaluator",
      install_frame_evaluator,
      METH_NOARGS,
