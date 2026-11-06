@@ -26,7 +26,8 @@ static unsigned long long ci_mro_cached_fallbacks_311;
 
 // Mirrors CPython 3.11.6 _PyType_Lookup's cache-hit conditions. This reads
 // the current interpreter's cache; it neither fills it nor runs Python.
-static PyObject* Ci_AttrCachedHandler311(PyTypeObject* type, int* original) {
+static PyObject* Ci_AttrCachedHandler311(
+    PyTypeObject* type, PyObject* name, int* original) {
   unsigned int version = type->tp_version_tag;
   if (version == 0 || !(type->tp_flags & Py_TPFLAGS_VALID_VERSION_TAG)) return NULL;
   struct type_cache* cache = &_PyInterpreterState_GET()->type_cache;
@@ -43,6 +44,13 @@ static PyObject* Ci_AttrCachedHandler311(PyTypeObject* type, int* original) {
   }
   struct type_cache_entry* h = &cache->hashtable[(version ^ ((uintptr_t)hname >> 3)) & mask];
   if (h->version != version || h->name != hname || h->value == NULL) return NULL;
+  // GenericGetAttr looks up the target on the type before reading instance
+  // storage. A cold lookup in a general-key namespace could run __eq__ and
+  // replace a previously checked instance dict. Require this lookup to be a
+  // cache hit too; a cached NULL value proves a callback-free miss. No code
+  // between this probe and GenericGetAttr's type lookup may run Python.
+  struct type_cache_entry* target = &cache->hashtable[(version ^ ((uintptr_t)name >> 3)) & mask];
+  if (target->version != version || target->name != name) return NULL;
   PyObject* handler = h->value;
   Py_INCREF(handler);
   return handler;
@@ -107,7 +115,7 @@ static PyObject* Ci_InterpGetattrHook311(PyObject* obj, PyObject* name) {
   PyTypeObject* tp = Py_TYPE(obj);
   if (ci_interp_getattr_counting) ci_mro_calls_311++;
   int original = 0;
-  PyObject* handler = ci_mro_cache_enabled_311 ? Ci_AttrCachedHandler311(tp, &original) : NULL;
+  PyObject* handler = ci_mro_cache_enabled_311 ? Ci_AttrCachedHandler311(tp, name, &original) : NULL;
   if (original) {
     if (ci_interp_getattr_counting) {
       ci_mro_cached_fallbacks_311++;

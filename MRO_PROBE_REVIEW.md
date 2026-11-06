@@ -10,10 +10,12 @@ https://github.com/python/cpython/blob/v3.11.6/Objects/typeobject.c
 
 - No valid type tag or cached getter: use the reviewed full MRO qualification.
 - Cached getter differs from the default getter: delegate the entire request to the original API before any lookup or callback.
-- Cached default getter plus non-NULL cached handler: immediately own the handler and continue the existing attribute path.
+- Cached default getter plus non-NULL cached handler and a matching target-name cache entry: immediately own the handler and continue the existing attribute path. The target entry may contain NULL (a cached missing attribute).
 - Any unproven case retains the complete MRO scan before extra type lookups.
 
 The helper does not populate the host cache or own a persistent type/handler reference. It retains instance-dictionary guards, original descriptor binding, final exception handling, and handler lifetime protection. This is not an unchecked type-version memo: a cache miss is never used to infer namespace safety.
+
+The target-name condition closes the reentrancy gap reported against a1deb5d81 / wheel110612: warm qualification names alone do not rule out a cold target lookup running a type-dictionary __eq__ callback. Such a callback can replace the instance dictionary after its guard was checked. With all three entries validated under the GIL, no callback or cache-mutating operation occurs before GenericGetAttr's target type lookup. Data descriptors may subsequently run Python, but their result takes the direct descriptor exit; they do not continue into the guarded instance-dictionary lookup.
 
 It relies on the exact CPython 3.11.6 internal type-cache layout and the GIL, like the existing version-pinned interpreter. New code requires review before merging into the previously reviewed branch.
 
@@ -30,3 +32,5 @@ Time runs disable counters. Same-binary scan/shortcut comparisons measure combin
 Reuse type reentrancy, dictionary layout, startup, cache, ownership, and CPython call/trace suites. test_mro_cache.py also covers mutations, replacement with a general-key base, direct leaf/ancestor dictionary writes followed by host-cache clearing, custom MRO behavior, 300 temporary types with weakref collection, cached general namespaces versus builtin getattr, and reinstall. The negative-getter path checks both returned values and cached-fallback activity.
 
 Earlier private-cache experiments (per-dictionary equality and a monotonic-version bound) passed targeted regressions but did not produce convincing net gains. They remain separate research artifacts; this branch does not contain their persistent cache tables.
+
+test_target_reentrancy.py covers ten cases with qualification names warm and targets cold/warm, attribute/method forms, AttributeError/ValueError during instance key comparison, and cached NULL target entries. Read-only key_probe inspection verifies the intended target cache state. Counters require exactly one positive hit in the old buggy/warm-target paths and exactly one guarded rejection for corrected cold-target paths.
