@@ -4,6 +4,7 @@
 
 #include "cinderx/UpstreamBorrow/borrowed.h"
 #include "internal/pycore_object.h"
+#include "attr_type_guard.h"
 
 static int ci_interp_getattr_enabled;
 static int ci_interp_getattr_counting;
@@ -59,14 +60,23 @@ PyObject* Ci_AttrPathCounters311(void) {
 
 static PyObject* Ci_InterpGetattrHook311(PyObject* obj, PyObject* name) {
   PyTypeObject* tp = Py_TYPE(obj);
-  // _PyType_Lookup does not invoke descriptors. Do not cache a user type or its
-  // methods: mutations to the type, bases and __class__ remain observable.
+  // Type lookup can execute Python equality on general-key namespaces.
+  // Reject the whole request before doing any additional type lookup.
+  if (!Ci_AttrHasUnicodeMro311(tp)) {
+    if (ci_interp_getattr_counting) ci_interp_getattr_fallbacks++;
+    return PyObject_GetAttr(obj, name);
+  }
   PyObject* handler = _PyType_Lookup(tp, &_Py_ID(__getattr__));
+  if (handler == NULL) {
+    if (ci_interp_getattr_counting) ci_interp_getattr_fallbacks++;
+    return PyObject_GetAttr(obj, name);
+  }
+  // Match the slot's lifetime ordering: own handler before the next lookup.
+  Py_INCREF(handler);
   PyObject* access = _PyType_Lookup(tp, &_Py_ID(__getattribute__));
-  if (handler == NULL || access != ci_interp_default_getattribute) {
-    if (ci_interp_getattr_counting) {
-      ci_interp_getattr_fallbacks++;
-    }
+  if (access != ci_interp_default_getattribute) {
+    if (ci_interp_getattr_counting) ci_interp_getattr_fallbacks++;
+    Py_DECREF(handler);
     return PyObject_GetAttr(obj, name);
   }
 
@@ -78,17 +88,17 @@ static PyObject* Ci_InterpGetattrHook311(PyObject* obj, PyObject* name) {
     if (dict != NULL &&
         (!PyDict_CheckExact(dict) || !DK_IS_UNICODE(((PyDictObject*)dict)->ma_keys))) {
       if (ci_interp_getattr_counting) ci_interp_getattr_fallbacks++;
+      Py_DECREF(handler);
       return PyObject_GetAttr(obj, name);
     }
   } else if (tp->tp_dictoffset != 0) {
     // Conservatively retain the original protocol for other dict layouts.
     if (ci_interp_getattr_counting) ci_interp_getattr_fallbacks++;
+    Py_DECREF(handler);
     return PyObject_GetAttr(obj, name);
   }
 
-  // Match slot_tp_getattr_hook's snapshot semantics: a property may mutate
-  // the type or delete/replace __getattr__ while the generic lookup runs.
-  Py_INCREF(handler);
+  // The owned handler also survives mutations during the generic lookup.
   if (ci_interp_getattr_counting) {
     ci_interp_getattr_eligible++;
   }

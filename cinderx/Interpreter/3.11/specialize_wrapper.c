@@ -332,8 +332,10 @@ int Ci_InitGetattrHooks_311(void) {
   return Ci_RegisterGetattrHook_311(Ci_tp_getattr_hook);
 }
 
+#include "attr_type_guard.h"
+
 static int Ci_IsGetattrOnlyType_311(PyTypeObject* type) {
-  if (!Ci_SpecGaEnabled_311) {
+  if (!Ci_SpecGaEnabled_311 || !Ci_AttrHasUnicodeMro311(type)) {
     return 0;
   }
   int registered = 0;

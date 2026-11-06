@@ -11,10 +11,13 @@ for managed in (True,False):
   class Descriptor:
    def __get__(self,obj,tp):events.append('descriptor');return lambda:'class-method'
   ns={'__getattr__':lambda self,name:(lambda:'fallback:'+name) if method else 'fallback:'+name,'x':Descriptor() if method else 'class-value'}
-  if not managed:ns['__slots__']=('__dict__',)
-  C=type('C',(),ns);obj=C();obj.__dict__={Collision():0}
+  C=type('C',(object,) if managed else (Exception,),ns)
+  # Py_TPFLAGS_MANAGED_DICT is (1 << 4) in the pinned CPython 3.11.6 headers.
+  assert bool(C.__flags__ & (1 << 4)) == managed, (managed,C.__flags__)
+  assert C.__dictoffset__ != 0
+  obj=C();obj.__dict__={Collision():0}
   def read(obj):return obj.x() if method else obj.x
   result=read(obj);assert result=='fallback:x',result;assert events==['eq'],events
-  cases[f'{managed}-{method}']={'result':result,'events':events[:]}
+  cases[f'{managed}-{method}']={'result':result,'events':events[:],'managed':bool(C.__flags__ & (1 << 4)),'dictoffset':C.__dictoffset__}
 Path(os.environ['REVIEW_RESULT']).write_text(json.dumps(cases,sort_keys=True))
 print('DICT_ATTRIBUTEERROR_PASS',len(cases))
