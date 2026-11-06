@@ -94,3 +94,5 @@ ATTR_PATH_MODE=cinderx python -c "import _cinderx_auto; print(_cinderx_auto._ver
 第二轮验证见 REVIEW_FIXES.md 最后一节及 REVIEW_ROUND2_VALIDATION.json。属性查询热路径未改，本轮没有重跑模型性能。
 
 第三轮详情见REVIEW_FIXES.md及REVIEW_ROUND3_VALIDATION.json。新增MRO资格检查，尚未重跑PGO性能；先前非managed测试覆盖说明已纠正。
+
+最终PGO+LTO包110608已完成对比，完整保护后相对110605慢约1.6%–2.8%；前三个模型仍有约9%–11%的净收益，GR小幅退化。详见REVIEW_FIXES.md最后一节和PGO_FINAL_REVIEW*.json，勿将此成品包差异当作单项MRO成本。
