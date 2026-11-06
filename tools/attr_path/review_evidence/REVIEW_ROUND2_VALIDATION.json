@@ -1,0 +1,35 @@
+{
+  "code_commit": "8634716d48d3c5054c5d95eee76a6ee95fc6848e",
+  "python": "3.11.6",
+  "architecture": "aarch64",
+  "build": "Release+LTO incremental isolated copy; no PGO",
+  "validation_wheel": "2026.11.6.110606",
+  "before_first_import": {
+    "requested": "execute",
+    "observed": "off",
+    "reproduced": true
+  },
+  "after_first_import": [
+    "execute mode plus forced compilation and machine-code entry",
+    "control mode with own flags"
+  ],
+  "patch_incremental": {
+    "generator": "Unix Makefiles",
+    "before": "patch-only edit ignored, assertion failed",
+    "after_each_patch": 4,
+    "clean_outputs_match": true
+  },
+  "regression": {
+    "specialization": 29,
+    "attribute_semantics": 43,
+    "dict_attributeerror": 4,
+    "startup": 19,
+    "cache": 31,
+    "owner_replacement": true,
+    "stdlib_run": 624,
+    "stdlib_skipped": 1
+  },
+  "performance_rerun": false,
+  "real_npu": false,
+  "jit_scope": "one explicit execute correctness probe; remaining regressions JIT-off"
+}

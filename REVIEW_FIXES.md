@@ -29,3 +29,12 @@
 |GR 2B|0.11%|-0.84%|慢0.95%|
 
 MMOE、ESMM、GR的12组配对bootstrap参考区间未跨零，线程CPU时间也同方向。主要收益保留，但不能宣称正确性修复完全没有性能代价。这里是两个成品wheel的对比，未做逐项修复消融，不能把全部差异精确归因到字典检查。不是实机FREE。完整汇总与构建元数据见review_evidence/PGO_AFTER_FIXES*.json。
+## 第二轮：首次初始化与补丁增量依赖
+
+代码提交8634716d4。保留ModuleState的必要构造，将属性配置快照移到主解释器检查、CPython版本检查通过之后；被拒绝的子解释器首次导入不再锁定主解释器设置。
+
+实际复现：旧110605在“子解释器先失败 → 主解释器首次请求execute”时观察到off；修复后观察到execute，强制编译并执行了一个小函数。主解释器首次选择control也使用了自己的默认值。原有“主解释器已安装 → 子解释器失败”回归继续通过。
+
+四份patch注册为CMAKE_CONFIGURE_DEPENDS。旧配置在只改补丁后直接cmake --build时生成文件不变，回归失败；修复后分别修改四份补丁，均自动重新配置并更新生成源码，且与干净configure逐字一致。测试仅修改临时fixture，不修改仓库真实补丁。
+
+新增test_first_import_order.py与test_patch_dependencies.py。29项特化、43项属性差分、4项字典异常、19项启动检查、31项缓存、第三方接管及624项调用相关测试（跳过1项）通过。验证构建为Release+LTO，未重跑本轮PGO性能；仅首次初始化execute探针实际启用了JIT，其余回归JIT-off。详情见review_evidence/REVIEW_ROUND2_VALIDATION.json。
