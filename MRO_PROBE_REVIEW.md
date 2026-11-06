@@ -34,3 +34,5 @@ Reuse type reentrancy, dictionary layout, startup, cache, ownership, and CPython
 Earlier private-cache experiments (per-dictionary equality and a monotonic-version bound) passed targeted regressions but did not produce convincing net gains. They remain separate research artifacts; this branch does not contain their persistent cache tables.
 
 test_target_reentrancy.py covers ten cases with qualification names warm and targets cold/warm, attribute/method forms, AttributeError/ValueError during instance key comparison, and cached NULL target entries. Read-only key_probe inspection verifies the intended target cache state. Counters require exactly one positive hit in the old buggy/warm-target paths and exactly one guarded rejection for corrected cold-target paths.
+
+The old-wheel reproduction, fixed-wheel regression and PGO+LTO four-model results are recorded in [MRO_TARGET_REVIEW_FIX.md](MRO_TARGET_REVIEW_FIX.md). Native implementation commit: d8b475d3a; fixed wheel suffix: 110701.

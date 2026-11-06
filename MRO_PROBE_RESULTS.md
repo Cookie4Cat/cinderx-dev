@@ -2,6 +2,8 @@
 
 > 历史记录：以下性能属于110612。后续检视发现其正向缓存路径缺少目标属性缓存条件，已在该旧wheel上复现语义偏差。这些数值保留作历史对照，不代表修复后实现的性能，也不能据此把110612作为正确性通过的交付候选。修复机制见MRO_PROBE_REVIEW.md。
 
+修复后的110701运行证据和性能见 [MRO_TARGET_REVIEW_FIX.md](MRO_TARGET_REVIEW_FIX.md)。
+
 日期：2026-11-06。范围：blue-server-204、Linux ARM、CPython 3.11.6、Torch 2.10.0+cpu、主解释器、JIT-off。
 
 本轮针对已通过白盒检视的属性优化继续做性能优化。保留真实模型的 Python forward，计算使用 mock；这里的微秒和降幅均为 **mock forward 耗时，不是 NPU FREE TIME**。

@@ -1,0 +1,20 @@
+{
+  "source_commit": "d8b475d3a303634611d4b24b1796eaf0d111d944",
+  "wheel": "cinderx-2026.11.6.110701-cp311-cp311-linux_aarch64.whl",
+  "wheel_sha256": "cac7cda76e27410f7005c5d20e2ebe72e252acb78f3327d0d19b95fd38da2cbd",
+  "native_sha256": "55bf61684b7c8b21f5f29f3383c371380f7403720ef782c3fbedc13463906fe9",
+  "scope": "ARM CPython3.11.6 main-interpreter JIT-off",
+  "old110612_bug_reproduced": true,
+  "target_cases": 10,
+  "semantic_cases": 43,
+  "specialization_cases": 29,
+  "type_reentry_cases": 24,
+  "mro_cases": 9,
+  "stdlib_run": 624,
+  "stdlib_skipped": 1,
+  "compiler": "GCC14.2 PGO+LTO",
+  "jit_counters_zero": true,
+  "performance_rerun": true,
+  "performance_blocks": 12,
+  "guard_errors": null
+}

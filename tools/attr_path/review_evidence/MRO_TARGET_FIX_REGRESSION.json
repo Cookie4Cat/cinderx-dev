@@ -1,0 +1,930 @@
+{
+  "stock": [
+    {
+      "form": "attribute",
+      "exception": "AttributeError",
+      "target_warm": false,
+      "class_present": true,
+      "outcome": [
+        "value",
+        "fallback:x"
+      ],
+      "events": [
+        "type-eq",
+        "instance-eq",
+        "fallback:target_reentrant_attribute"
+      ],
+      "target_cache": {
+        "hit": 0,
+        "has_value": 0
+      },
+      "delta": null
+    },
+    {
+      "form": "attribute",
+      "exception": "AttributeError",
+      "target_warm": true,
+      "class_present": true,
+      "outcome": [
+        "value",
+        "class-value"
+      ],
+      "events": [],
+      "target_cache": {
+        "hit": 1,
+        "has_value": 1
+      },
+      "delta": null
+    },
+    {
+      "form": "attribute",
+      "exception": "ValueError",
+      "target_warm": false,
+      "class_present": true,
+      "outcome": [
+        "ValueError",
+        "instance compare"
+      ],
+      "events": [
+        "type-eq",
+        "instance-eq"
+      ],
+      "target_cache": {
+        "hit": 0,
+        "has_value": 0
+      },
+      "delta": null
+    },
+    {
+      "form": "attribute",
+      "exception": "ValueError",
+      "target_warm": true,
+      "class_present": true,
+      "outcome": [
+        "value",
+        "class-value"
+      ],
+      "events": [],
+      "target_cache": {
+        "hit": 1,
+        "has_value": 1
+      },
+      "delta": null
+    },
+    {
+      "form": "method",
+      "exception": "AttributeError",
+      "target_warm": false,
+      "class_present": true,
+      "outcome": [
+        "value",
+        "fallback:x"
+      ],
+      "events": [
+        "type-eq",
+        "instance-eq",
+        "fallback:target_reentrant_attribute"
+      ],
+      "target_cache": {
+        "hit": 0,
+        "has_value": 0
+      },
+      "delta": null
+    },
+    {
+      "form": "method",
+      "exception": "AttributeError",
+      "target_warm": true,
+      "class_present": true,
+      "outcome": [
+        "value",
+        "class-value"
+      ],
+      "events": [],
+      "target_cache": {
+        "hit": 1,
+        "has_value": 1
+      },
+      "delta": null
+    },
+    {
+      "form": "method",
+      "exception": "ValueError",
+      "target_warm": false,
+      "class_present": true,
+      "outcome": [
+        "ValueError",
+        "instance compare"
+      ],
+      "events": [
+        "type-eq",
+        "instance-eq"
+      ],
+      "target_cache": {
+        "hit": 0,
+        "has_value": 0
+      },
+      "delta": null
+    },
+    {
+      "form": "method",
+      "exception": "ValueError",
+      "target_warm": true,
+      "class_present": true,
+      "outcome": [
+        "value",
+        "class-value"
+      ],
+      "events": [],
+      "target_cache": {
+        "hit": 1,
+        "has_value": 1
+      },
+      "delta": null
+    },
+    {
+      "form": "attribute",
+      "exception": "AttributeError",
+      "target_warm": true,
+      "class_present": false,
+      "outcome": [
+        "value",
+        "fallback:x"
+      ],
+      "events": [
+        "fallback:target_reentrant_attribute"
+      ],
+      "target_cache": {
+        "hit": 1,
+        "has_value": 0
+      },
+      "delta": null
+    },
+    {
+      "form": "method",
+      "exception": "AttributeError",
+      "target_warm": true,
+      "class_present": false,
+      "outcome": [
+        "value",
+        "fallback:x"
+      ],
+      "events": [
+        "fallback:target_reentrant_attribute"
+      ],
+      "target_cache": {
+        "hit": 1,
+        "has_value": 0
+      },
+      "delta": null
+    }
+  ],
+  "old": [
+    {
+      "form": "attribute",
+      "exception": "AttributeError",
+      "target_warm": false,
+      "class_present": true,
+      "outcome": [
+        "value",
+        "class-value"
+      ],
+      "events": [
+        "type-eq",
+        "instance-eq"
+      ],
+      "target_cache": {
+        "hit": 0,
+        "has_value": 0
+      },
+      "delta": {
+        "calls": 1,
+        "hits": 1,
+        "scans": 0,
+        "rejects": 0,
+        "accepted_base_visits": 0,
+        "cached_fallbacks": 0
+      }
+    },
+    {
+      "form": "attribute",
+      "exception": "AttributeError",
+      "target_warm": true,
+      "class_present": true,
+      "outcome": [
+        "value",
+        "class-value"
+      ],
+      "events": [],
+      "target_cache": {
+        "hit": 1,
+        "has_value": 1
+      },
+      "delta": {
+        "calls": 1,
+        "hits": 1,
+        "scans": 0,
+        "rejects": 0,
+        "accepted_base_visits": 0,
+        "cached_fallbacks": 0
+      }
+    },
+    {
+      "form": "attribute",
+      "exception": "ValueError",
+      "target_warm": false,
+      "class_present": true,
+      "outcome": [
+        "ValueError",
+        "instance compare"
+      ],
+      "events": [
+        "type-eq",
+        "instance-eq"
+      ],
+      "target_cache": {
+        "hit": 0,
+        "has_value": 0
+      },
+      "delta": {
+        "calls": 1,
+        "hits": 1,
+        "scans": 0,
+        "rejects": 0,
+        "accepted_base_visits": 0,
+        "cached_fallbacks": 0
+      }
+    },
+    {
+      "form": "attribute",
+      "exception": "ValueError",
+      "target_warm": true,
+      "class_present": true,
+      "outcome": [
+        "value",
+        "class-value"
+      ],
+      "events": [],
+      "target_cache": {
+        "hit": 1,
+        "has_value": 1
+      },
+      "delta": {
+        "calls": 1,
+        "hits": 1,
+        "scans": 0,
+        "rejects": 0,
+        "accepted_base_visits": 0,
+        "cached_fallbacks": 0
+      }
+    },
+    {
+      "form": "method",
+      "exception": "AttributeError",
+      "target_warm": false,
+      "class_present": true,
+      "outcome": [
+        "value",
+        "class-value"
+      ],
+      "events": [
+        "type-eq",
+        "instance-eq"
+      ],
+      "target_cache": {
+        "hit": 0,
+        "has_value": 0
+      },
+      "delta": {
+        "calls": 1,
+        "hits": 1,
+        "scans": 0,
+        "rejects": 0,
+        "accepted_base_visits": 0,
+        "cached_fallbacks": 0
+      }
+    },
+    {
+      "form": "method",
+      "exception": "AttributeError",
+      "target_warm": true,
+      "class_present": true,
+      "outcome": [
+        "value",
+        "class-value"
+      ],
+      "events": [],
+      "target_cache": {
+        "hit": 1,
+        "has_value": 1
+      },
+      "delta": {
+        "calls": 1,
+        "hits": 1,
+        "scans": 0,
+        "rejects": 0,
+        "accepted_base_visits": 0,
+        "cached_fallbacks": 0
+      }
+    },
+    {
+      "form": "method",
+      "exception": "ValueError",
+      "target_warm": false,
+      "class_present": true,
+      "outcome": [
+        "ValueError",
+        "instance compare"
+      ],
+      "events": [
+        "type-eq",
+        "instance-eq"
+      ],
+      "target_cache": {
+        "hit": 0,
+        "has_value": 0
+      },
+      "delta": {
+        "calls": 1,
+        "hits": 1,
+        "scans": 0,
+        "rejects": 0,
+        "accepted_base_visits": 0,
+        "cached_fallbacks": 0
+      }
+    },
+    {
+      "form": "method",
+      "exception": "ValueError",
+      "target_warm": true,
+      "class_present": true,
+      "outcome": [
+        "value",
+        "class-value"
+      ],
+      "events": [],
+      "target_cache": {
+        "hit": 1,
+        "has_value": 1
+      },
+      "delta": {
+        "calls": 1,
+        "hits": 1,
+        "scans": 0,
+        "rejects": 0,
+        "accepted_base_visits": 0,
+        "cached_fallbacks": 0
+      }
+    },
+    {
+      "form": "attribute",
+      "exception": "AttributeError",
+      "target_warm": true,
+      "class_present": false,
+      "outcome": [
+        "value",
+        "fallback:x"
+      ],
+      "events": [
+        "fallback:target_reentrant_attribute"
+      ],
+      "target_cache": {
+        "hit": 1,
+        "has_value": 0
+      },
+      "delta": {
+        "calls": 1,
+        "hits": 1,
+        "scans": 0,
+        "rejects": 0,
+        "accepted_base_visits": 0,
+        "cached_fallbacks": 0
+      }
+    },
+    {
+      "form": "method",
+      "exception": "AttributeError",
+      "target_warm": true,
+      "class_present": false,
+      "outcome": [
+        "value",
+        "fallback:x"
+      ],
+      "events": [
+        "fallback:target_reentrant_attribute"
+      ],
+      "target_cache": {
+        "hit": 1,
+        "has_value": 0
+      },
+      "delta": {
+        "calls": 1,
+        "hits": 1,
+        "scans": 0,
+        "rejects": 0,
+        "accepted_base_visits": 0,
+        "cached_fallbacks": 0
+      }
+    }
+  ],
+  "scan": [
+    {
+      "form": "attribute",
+      "exception": "AttributeError",
+      "target_warm": false,
+      "class_present": true,
+      "outcome": [
+        "value",
+        "fallback:x"
+      ],
+      "events": [
+        "type-eq",
+        "instance-eq",
+        "fallback:target_reentrant_attribute"
+      ],
+      "target_cache": {
+        "hit": 0,
+        "has_value": 0
+      },
+      "delta": {
+        "calls": 1,
+        "hits": 0,
+        "scans": 1,
+        "rejects": 1,
+        "accepted_base_visits": 0,
+        "cached_fallbacks": 0
+      }
+    },
+    {
+      "form": "attribute",
+      "exception": "AttributeError",
+      "target_warm": true,
+      "class_present": true,
+      "outcome": [
+        "value",
+        "class-value"
+      ],
+      "events": [],
+      "target_cache": {
+        "hit": 1,
+        "has_value": 1
+      },
+      "delta": {
+        "calls": 1,
+        "hits": 0,
+        "scans": 1,
+        "rejects": 1,
+        "accepted_base_visits": 0,
+        "cached_fallbacks": 0
+      }
+    },
+    {
+      "form": "attribute",
+      "exception": "ValueError",
+      "target_warm": false,
+      "class_present": true,
+      "outcome": [
+        "ValueError",
+        "instance compare"
+      ],
+      "events": [
+        "type-eq",
+        "instance-eq"
+      ],
+      "target_cache": {
+        "hit": 0,
+        "has_value": 0
+      },
+      "delta": {
+        "calls": 1,
+        "hits": 0,
+        "scans": 1,
+        "rejects": 1,
+        "accepted_base_visits": 0,
+        "cached_fallbacks": 0
+      }
+    },
+    {
+      "form": "attribute",
+      "exception": "ValueError",
+      "target_warm": true,
+      "class_present": true,
+      "outcome": [
+        "value",
+        "class-value"
+      ],
+      "events": [],
+      "target_cache": {
+        "hit": 1,
+        "has_value": 1
+      },
+      "delta": {
+        "calls": 1,
+        "hits": 0,
+        "scans": 1,
+        "rejects": 1,
+        "accepted_base_visits": 0,
+        "cached_fallbacks": 0
+      }
+    },
+    {
+      "form": "method",
+      "exception": "AttributeError",
+      "target_warm": false,
+      "class_present": true,
+      "outcome": [
+        "value",
+        "fallback:x"
+      ],
+      "events": [
+        "type-eq",
+        "instance-eq",
+        "fallback:target_reentrant_attribute"
+      ],
+      "target_cache": {
+        "hit": 0,
+        "has_value": 0
+      },
+      "delta": {
+        "calls": 1,
+        "hits": 0,
+        "scans": 1,
+        "rejects": 1,
+        "accepted_base_visits": 0,
+        "cached_fallbacks": 0
+      }
+    },
+    {
+      "form": "method",
+      "exception": "AttributeError",
+      "target_warm": true,
+      "class_present": true,
+      "outcome": [
+        "value",
+        "class-value"
+      ],
+      "events": [],
+      "target_cache": {
+        "hit": 1,
+        "has_value": 1
+      },
+      "delta": {
+        "calls": 1,
+        "hits": 0,
+        "scans": 1,
+        "rejects": 1,
+        "accepted_base_visits": 0,
+        "cached_fallbacks": 0
+      }
+    },
+    {
+      "form": "method",
+      "exception": "ValueError",
+      "target_warm": false,
+      "class_present": true,
+      "outcome": [
+        "ValueError",
+        "instance compare"
+      ],
+      "events": [
+        "type-eq",
+        "instance-eq"
+      ],
+      "target_cache": {
+        "hit": 0,
+        "has_value": 0
+      },
+      "delta": {
+        "calls": 1,
+        "hits": 0,
+        "scans": 1,
+        "rejects": 1,
+        "accepted_base_visits": 0,
+        "cached_fallbacks": 0
+      }
+    },
+    {
+      "form": "method",
+      "exception": "ValueError",
+      "target_warm": true,
+      "class_present": true,
+      "outcome": [
+        "value",
+        "class-value"
+      ],
+      "events": [],
+      "target_cache": {
+        "hit": 1,
+        "has_value": 1
+      },
+      "delta": {
+        "calls": 1,
+        "hits": 0,
+        "scans": 1,
+        "rejects": 1,
+        "accepted_base_visits": 0,
+        "cached_fallbacks": 0
+      }
+    },
+    {
+      "form": "attribute",
+      "exception": "AttributeError",
+      "target_warm": true,
+      "class_present": false,
+      "outcome": [
+        "value",
+        "fallback:x"
+      ],
+      "events": [
+        "fallback:target_reentrant_attribute"
+      ],
+      "target_cache": {
+        "hit": 1,
+        "has_value": 0
+      },
+      "delta": {
+        "calls": 1,
+        "hits": 0,
+        "scans": 1,
+        "rejects": 1,
+        "accepted_base_visits": 0,
+        "cached_fallbacks": 0
+      }
+    },
+    {
+      "form": "method",
+      "exception": "AttributeError",
+      "target_warm": true,
+      "class_present": false,
+      "outcome": [
+        "value",
+        "fallback:x"
+      ],
+      "events": [
+        "fallback:target_reentrant_attribute"
+      ],
+      "target_cache": {
+        "hit": 1,
+        "has_value": 0
+      },
+      "delta": {
+        "calls": 1,
+        "hits": 0,
+        "scans": 1,
+        "rejects": 1,
+        "accepted_base_visits": 0,
+        "cached_fallbacks": 0
+      }
+    }
+  ],
+  "new": [
+    {
+      "form": "attribute",
+      "exception": "AttributeError",
+      "target_warm": false,
+      "class_present": true,
+      "outcome": [
+        "value",
+        "fallback:x"
+      ],
+      "events": [
+        "type-eq",
+        "instance-eq",
+        "fallback:target_reentrant_attribute"
+      ],
+      "target_cache": {
+        "hit": 0,
+        "has_value": 0
+      },
+      "delta": {
+        "calls": 1,
+        "hits": 0,
+        "scans": 1,
+        "rejects": 1,
+        "accepted_base_visits": 0,
+        "cached_fallbacks": 0
+      }
+    },
+    {
+      "form": "attribute",
+      "exception": "AttributeError",
+      "target_warm": true,
+      "class_present": true,
+      "outcome": [
+        "value",
+        "class-value"
+      ],
+      "events": [],
+      "target_cache": {
+        "hit": 1,
+        "has_value": 1
+      },
+      "delta": {
+        "calls": 1,
+        "hits": 1,
+        "scans": 0,
+        "rejects": 0,
+        "accepted_base_visits": 0,
+        "cached_fallbacks": 0
+      }
+    },
+    {
+      "form": "attribute",
+      "exception": "ValueError",
+      "target_warm": false,
+      "class_present": true,
+      "outcome": [
+        "ValueError",
+        "instance compare"
+      ],
+      "events": [
+        "type-eq",
+        "instance-eq"
+      ],
+      "target_cache": {
+        "hit": 0,
+        "has_value": 0
+      },
+      "delta": {
+        "calls": 1,
+        "hits": 0,
+        "scans": 1,
+        "rejects": 1,
+        "accepted_base_visits": 0,
+        "cached_fallbacks": 0
+      }
+    },
+    {
+      "form": "attribute",
+      "exception": "ValueError",
+      "target_warm": true,
+      "class_present": true,
+      "outcome": [
+        "value",
+        "class-value"
+      ],
+      "events": [],
+      "target_cache": {
+        "hit": 1,
+        "has_value": 1
+      },
+      "delta": {
+        "calls": 1,
+        "hits": 1,
+        "scans": 0,
+        "rejects": 0,
+        "accepted_base_visits": 0,
+        "cached_fallbacks": 0
+      }
+    },
+    {
+      "form": "method",
+      "exception": "AttributeError",
+      "target_warm": false,
+      "class_present": true,
+      "outcome": [
+        "value",
+        "fallback:x"
+      ],
+      "events": [
+        "type-eq",
+        "instance-eq",
+        "fallback:target_reentrant_attribute"
+      ],
+      "target_cache": {
+        "hit": 0,
+        "has_value": 0
+      },
+      "delta": {
+        "calls": 1,
+        "hits": 0,
+        "scans": 1,
+        "rejects": 1,
+        "accepted_base_visits": 0,
+        "cached_fallbacks": 0
+      }
+    },
+    {
+      "form": "method",
+      "exception": "AttributeError",
+      "target_warm": true,
+      "class_present": true,
+      "outcome": [
+        "value",
+        "class-value"
+      ],
+      "events": [],
+      "target_cache": {
+        "hit": 1,
+        "has_value": 1
+      },
+      "delta": {
+        "calls": 1,
+        "hits": 1,
+        "scans": 0,
+        "rejects": 0,
+        "accepted_base_visits": 0,
+        "cached_fallbacks": 0
+      }
+    },
+    {
+      "form": "method",
+      "exception": "ValueError",
+      "target_warm": false,
+      "class_present": true,
+      "outcome": [
+        "ValueError",
+        "instance compare"
+      ],
+      "events": [
+        "type-eq",
+        "instance-eq"
+      ],
+      "target_cache": {
+        "hit": 0,
+        "has_value": 0
+      },
+      "delta": {
+        "calls": 1,
+        "hits": 0,
+        "scans": 1,
+        "rejects": 1,
+        "accepted_base_visits": 0,
+        "cached_fallbacks": 0
+      }
+    },
+    {
+      "form": "method",
+      "exception": "ValueError",
+      "target_warm": true,
+      "class_present": true,
+      "outcome": [
+        "value",
+        "class-value"
+      ],
+      "events": [],
+      "target_cache": {
+        "hit": 1,
+        "has_value": 1
+      },
+      "delta": {
+        "calls": 1,
+        "hits": 1,
+        "scans": 0,
+        "rejects": 0,
+        "accepted_base_visits": 0,
+        "cached_fallbacks": 0
+      }
+    },
+    {
+      "form": "attribute",
+      "exception": "AttributeError",
+      "target_warm": true,
+      "class_present": false,
+      "outcome": [
+        "value",
+        "fallback:x"
+      ],
+      "events": [
+        "fallback:target_reentrant_attribute"
+      ],
+      "target_cache": {
+        "hit": 1,
+        "has_value": 0
+      },
+      "delta": {
+        "calls": 1,
+        "hits": 1,
+        "scans": 0,
+        "rejects": 0,
+        "accepted_base_visits": 0,
+        "cached_fallbacks": 0
+      }
+    },
+    {
+      "form": "method",
+      "exception": "AttributeError",
+      "target_warm": true,
+      "class_present": false,
+      "outcome": [
+        "value",
+        "fallback:x"
+      ],
+      "events": [
+        "fallback:target_reentrant_attribute"
+      ],
+      "target_cache": {
+        "hit": 1,
+        "has_value": 0
+      },
+      "delta": {
+        "calls": 1,
+        "hits": 1,
+        "scans": 0,
+        "rejects": 0,
+        "accepted_base_visits": 0,
+        "cached_fallbacks": 0
+      }
+    }
+  ]
+}
