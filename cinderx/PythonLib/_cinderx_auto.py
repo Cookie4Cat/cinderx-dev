@@ -27,17 +27,6 @@ else:
 def _env_flag_enabled(name):
     return _getenv(name, "0").lower() in ("1", "true", "yes", "on")
 
-def _cinderx_plugin_enabled():
-    return _getenv("CINDERX_PLUGIN_ENABLE", "0") == "1"
-
-def _cinderx_force_disabled():
-    return _env_flag_enabled("CINDERX_DISABLE")
-
-def _cinderx_jit_disabled():
-    return _env_flag_enabled("CINDERX_JIT_DISABLE") or _env_flag_enabled(
-        "PYTHONJITDISABLE"
-    )
-
 def _cinderx_311_execute_mode():
     # On CPython 3.11 the JIT runs only in the explicit execute mode
     # (CINDERX_JIT_MODE=execute, or its test-only spelling "canary"); off,
@@ -45,10 +34,14 @@ def _cinderx_311_execute_mode():
     # applies the same rule (observe.c), disable switches included.
     return _getenv("CINDERX_JIT_MODE", "off") in ("execute", "canary")
 
-if _cinderx_plugin_enabled() and not _cinderx_force_disabled():
+if _getenv("CINDERX_PLUGIN_ENABLE", "0") == "1" and not _env_flag_enabled(
+    "CINDERX_DISABLE"
+):
     import _cinderx  # noqa: F401
 
-    if _cinderx_jit_disabled():
+    if _env_flag_enabled("CINDERX_JIT_DISABLE") or _env_flag_enabled(
+        "PYTHONJITDISABLE"
+    ):
         cinderjit = None
     elif sys.version_info[:2] < (3, 12):
         if _cinderx_311_execute_mode():
@@ -109,12 +102,6 @@ if _cinderx_plugin_enabled() and not _cinderx_force_disabled():
         if _autojit_scheduling_is_configured():
             return "lib2to3_main,multiprocessing_pool"
         return "off"
-
-    def _maybe_enable_autojit_gate_stats():
-        if cinderjit is None or not _env_flag_enabled("CINDERX_AUTOJIT_GATE_STATS"):
-            return
-        import _cinderx_auto_helpers
-        _cinderx_auto_helpers._maybe_enable_autojit_gate_stats()
 
     def _maybe_install_autojit_setup_provider_for_module(fullname, provider=None):
         if fullname not in ("lib2to3.main", "multiprocessing.pool"):
@@ -199,15 +186,12 @@ if _cinderx_plugin_enabled() and not _cinderx_force_disabled():
 
         setattr(target, attr, _make_autojit_import_wrapper(current, provider))
 
-    def _maybe_enable_parallel_gc():
-        if _getenv("PARALLEL_GC_ENABLED", "0") != "1":
-            return
+    if _getenv("PARALLEL_GC_ENABLED", "0") == "1":
         import _cinderx_auto_helpers
-        _cinderx_auto_helpers._maybe_enable_parallel_gc()
-
-    _maybe_enable_parallel_gc()
-    if cinderjit is not None:
-        _maybe_enable_autojit_gate_stats()
+        _cinderx_auto_helpers._enable_parallel_gc()
+    if cinderjit is not None and _env_flag_enabled("CINDERX_AUTOJIT_GATE_STATS"):
+        import _cinderx_auto_helpers
+        _cinderx_auto_helpers._enable_autojit_gate_stats()
     if cinderjit is not None or (
         sys.version_info[:2] == (3, 11) and _eval_mode == "cinder"
     ):

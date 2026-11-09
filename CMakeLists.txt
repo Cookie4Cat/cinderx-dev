@@ -714,6 +714,9 @@ if (DEFINED PY_VERSION AND ${PY_VERSION} EQUAL 3.11 AND ${CMAKE_SYSTEM_NAME} MAT
   # process. Keep the shared unwinder for exceptions across DSO boundaries.
   # Toolchains without the static C++ runtime retain the existing link mode.
   if(CMAKE_CXX_COMPILER_ID STREQUAL "GNU")
+    # All supported Linux runtimes understand GNU hashing; avoid mapping an
+    # additional, unused SysV symbol hash table during extension loading.
+    target_link_options(${PROJECT_NAME} PRIVATE -Wl,--hash-style=gnu)
     execute_process(
       COMMAND ${CMAKE_CXX_COMPILER} -print-file-name=libstdc++.a
       OUTPUT_VARIABLE CINDERX_STATIC_LIBSTDCXX_ARCHIVE

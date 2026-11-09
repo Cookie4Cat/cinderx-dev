@@ -2,7 +2,7 @@
 # Optional bootstrap providers; core JIT/evaluator activation stays in _cinderx_auto.
 import sys
 from _cinderx_auto import (
-    _cinderx, cinderjit, _getenv, _env_flag_enabled,
+    _cinderx, cinderjit, _getenv,
     _autojit_setup_provider, _AUTOJIT_SETUP_PROVIDER_MARKER,
     _AUTOJIT_GATE_STATS_PREFIX,
 )
@@ -19,11 +19,7 @@ def _autojit_setup_provider_tokens(provider=None):
     )
 
 
-def _maybe_enable_autojit_gate_stats():
-    if cinderjit is None:
-        return
-    if not _env_flag_enabled("CINDERX_AUTOJIT_GATE_STATS"):
-        return
+def _enable_autojit_gate_stats():
     clear_stats = getattr(cinderjit, "_clear_autojit_gate_stats", None)
     read_stats = getattr(cinderjit, "_autojit_gate_stats", None)
     if clear_stats is None or read_stats is None:
@@ -194,9 +190,7 @@ def _maybe_install_autojit_setup_provider_for_module(fullname, provider=None):
             _install_autojit_multiprocessing_pool_provider(module)
 
 
-def _maybe_enable_parallel_gc():
-    if _getenv("PARALLEL_GC_ENABLED", "0") != "1":
-        return
+def _enable_parallel_gc():
     if not _cinderx.has_parallel_gc():
         return
 
