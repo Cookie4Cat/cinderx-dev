@@ -5,7 +5,24 @@
 #include "cinderx/Common/ref.h"
 
 PyObject* _Ci_CreateBuiltinModule(PyModuleDef* def, const char* name) {
-  Ref<> machinery = Ref<>::steal(PyImport_ImportModule("importlib.machinery"));
+  Ref<> machinery;
+#if PY_VERSION_HEX < 0x030C0000
+  // ModuleSpec already exists in the bootstrapped import machinery. Respect
+  // an already-imported public alias, but avoid importing Python modules just
+  // to create an internal builtin during a no-site startup.
+  PyObject* bootstrap_modules = PyImport_GetModuleDict();
+  PyObject* existing =
+      PyDict_GetItemString(bootstrap_modules, "importlib.machinery");
+  if (existing == nullptr) {
+    existing = PyDict_GetItemString(bootstrap_modules, "_frozen_importlib");
+  }
+  if (existing != nullptr) {
+    machinery = Ref<>::create(existing);
+  }
+#endif
+  if (machinery == nullptr) {
+    machinery = Ref<>::steal(PyImport_ImportModule("importlib.machinery"));
+  }
   if (machinery == nullptr) {
     return nullptr;
   }

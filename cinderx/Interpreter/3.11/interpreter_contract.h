@@ -71,6 +71,9 @@ uint32_t Ci_GetDictKeysVersion_311(struct _dictkeysobject* keys);
 // that.  Does not initialize it; the JIT resolves it when the execute mode
 // starts.  The record reads an array's descriptor only for this exact type.
 PyTypeObject* Ci_StdlibArrayTypeIfResolved(void);
+// May resolve from an already-live exact array through its native buffer slot;
+// never imports a module, constructs a probe, or runs Python callbacks.
+PyTypeObject* Ci_StdlibArrayTypeForContainer311(PyObject* container);
 
 #ifdef __cplusplus
 }
