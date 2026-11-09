@@ -912,6 +912,12 @@ void HIRPrinter::Print(std::ostream& os, const FrameState& state) {
         os << " <null>";
       } else {
         os << " " << reg->name();
+        // SPIKE(PHIUNBOX): `value?flag` for a local whose binding is
+        // carried by a separate flag register.
+        if (static_cast<size_t>(i) < state.local_bound.size() &&
+            state.local_bound[i] != nullptr) {
+          os << "?" << state.local_bound[i]->name();
+        }
       }
     }
     os << '\n';

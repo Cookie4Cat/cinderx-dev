@@ -51,6 +51,13 @@ std::unordered_set<hir::Register*> collectFrameStateRegs(hir::FrameState* fs) {
         regs.insert(local);
       }
     }
+    // SPIKE(PHIUNBOX): the bound flags are read by reification, so they must
+    // stay live values of every deopt point whose frame state names them.
+    for (hir::Register* flag : fs->local_bound) {
+      if (flag != nullptr) {
+        regs.insert(flag);
+      }
+    }
     for (hir::Register* stack : fs->stack) {
       if (stack != nullptr) {
         regs.insert(stack);
@@ -166,6 +173,11 @@ static void reifyLocalsplus(
   for (std::size_t i = 0; i < free_offset && i < frame_meta.localsplus.size();
        i++) {
     const LiveValue* value = meta.getLocalValue(i, frame_meta);
+    // SPIKE(PHIUNBOX): a local whose bound flag reads 0 is unbound.
+    const LiveValue* bound = meta.getLocalBoundFlag(i, frame_meta);
+    if (bound != nullptr && !mem.readBoundFlag(*bound)) {
+      value = nullptr;
+    }
     PyObject* prev = *localsplus;
     if (value == nullptr) {
       // Value is dead
@@ -181,6 +193,10 @@ static void reifyLocalsplus(
   for (std::size_t i = 0; i < free_offset && i < frame_meta.localsplus.size();
        i++) {
     const LiveValue* value = meta.getLocalValue(i, frame_meta);
+    const LiveValue* bound = meta.getLocalBoundFlag(i, frame_meta);
+    if (bound != nullptr && !mem.readBoundFlag(*bound)) {
+      value = nullptr;
+    }
     if (value == nullptr) {
       // Value is dead
       *localsplus = Ci_STACK_NULL;
@@ -574,6 +590,15 @@ DeoptMetadata DeoptMetadata::fromInstr(const jit::hir::DeoptBase& instr) {
         meta.localsplus.resize(nlocalsplus);
         for (size_t j = 0; j < nlocalsplus; ++j) {
           meta.localsplus[j] = get_reg_idx(fs->localsplus[j]);
+        }
+        if (!fs->local_bound.empty()) {
+          JIT_CHECK(
+              fs->local_bound.size() == nlocalsplus,
+              "bound flags must be parallel to localsplus");
+          meta.localsplus_bound.resize(nlocalsplus);
+          for (size_t j = 0; j < nlocalsplus; ++j) {
+            meta.localsplus_bound[j] = get_reg_idx(fs->local_bound[j]);
+          }
         }
       };
 

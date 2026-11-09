@@ -1857,6 +1857,107 @@ def test(a, b):
   EXPECT_EQ(genericBinaryOps(*after), std::vector{BinaryOpKind::kAnd}) << hir;
 }
 
+TEST_F(HIRBuildTest, RangeIterationFusionUsesPrimitiveIndexStores311) {
+  for (const char* arguments : {"n", "1, n", "1, n, 2"}) {
+    SCOPED_TRACE(arguments);
+    std::string source =
+        "def test(n):\n    total = 0\n    for value in range(" +
+        std::string(arguments) +
+        "):\n        total += value\n    return total\n"
+        "for _ in range(100):\n    test(7)\n";
+    Ref<PyFunctionObject> func(compileAndGet(source.c_str(), "test"));
+    ASSERT_NE(func, nullptr);
+    auto irfunc = simplified(buildHIR(func));
+    ASSERT_NE(irfunc, nullptr);
+    const auto hir = fullPrinter().ToString(*irfunc);
+    EXPECT_EQ(
+        countStaticCallsTo(
+            *irfunc, reinterpret_cast<void*>(JITRT_RangeIter311)),
+        1u)
+        << hir;
+    size_t index_stores = 0;
+    for (auto& block : irfunc->cfg.blocks) {
+      for (auto& instr : block) {
+        if (!instr.IsStoreField()) {
+          continue;
+        }
+        const auto& store = static_cast<const StoreField&>(instr);
+        if (store.name() == "index") {
+          ++index_stores;
+          EXPECT_EQ(store.type(), TCInt64) << hir;
+          EXPECT_TRUE(store.value()->type() <= TCInt64) << hir;
+          EXPECT_TRUE(store.GetOperand(2)->type() <= TNullptr) << hir;
+        }
+      }
+    }
+    EXPECT_EQ(index_stores, 1u) << hir;
+    EXPECT_TRUE(checkFunc(*irfunc, std::cerr)) << hir;
+  }
+}
+
+TEST_F(HIRBuildTest, RangeFusionKeepsUnsupportedCallsGeneric311) {
+  for (const char* source :
+       {"def test(n, range):\n    for value in range(n):\n        pass\n",
+        "def test(n):\n    for value in range(stop=n):\n        pass\n"}) {
+    SCOPED_TRACE(source);
+    Ref<PyFunctionObject> func(compileAndGet(source, "test"));
+    ASSERT_NE(func, nullptr);
+    auto irfunc = simplified(buildHIR(func));
+    ASSERT_NE(irfunc, nullptr);
+    EXPECT_EQ(
+        countStaticCallsTo(
+            *irfunc, reinterpret_cast<void*>(JITRT_RangeIter311)),
+        0u)
+        << fullPrinter().ToString(*irfunc);
+    EXPECT_GE(countOpcode(*irfunc, Opcode::kVectorCall), 1u)
+        << fullPrinter().ToString(*irfunc);
+  }
+}
+
+TEST_F(HIRBuildTest, RangeFusionKeepsGrantedExceptionEdgeGeneric311) {
+  Ref<PyFunctionObject> func(compileAndGet(
+      R"(
+def test(n):
+    try:
+        for value in range(n):
+            pass
+    except TypeError:
+        return -1
+    return 1
+for _ in range(100):
+    test(3)
+)",
+      "test"));
+  ASSERT_NE(func, nullptr);
+  auto code = BorrowedRef<PyCodeObject>{func->func_code};
+  ASSERT_NE(codeExtra(code), nullptr);
+  std::vector<int64_t> calls;
+  for (const auto& instr : BytecodeInstructionBlock{code}) {
+    if (instr.opcode() == CALL) {
+      calls.push_back(instr.baseOffset().value());
+    }
+  }
+  ASSERT_EQ(calls.size(), 1u);
+  ASSERT_TRUE(excEdgeCapable311(code, calls[0]));
+  auto before = simplified(buildHIR(func));
+  ASSERT_NE(before, nullptr);
+  ASSERT_EQ(
+      countStaticCallsTo(*before, reinterpret_cast<void*>(JITRT_RangeIter311)),
+      1u);
+  for (int i = 0; i < 8; ++i) {
+    Ci_ExcEdgeDeopt311(code, calls[0], 0, nullptr);
+  }
+  ASSERT_TRUE(Ci_ExcEdgeSiteGranted311(code, calls[0]));
+  auto after = simplified(buildHIR(func));
+  ASSERT_NE(after, nullptr);
+  EXPECT_EQ(
+      countStaticCallsTo(*after, reinterpret_cast<void*>(JITRT_RangeIter311)),
+      0u)
+      << fullPrinter().ToString(*after);
+  EXPECT_GE(countOpcode(*after, Opcode::kVectorCall), 1u)
+      << fullPrinter().ToString(*after);
+}
+
 TEST_F(HIRBuildTest, WideIntAddRunsInInt64311) {
   // Both operands are ints in registers and the shifted one can exceed the
   // compact range, so the add is done in int64 behind an overflow check

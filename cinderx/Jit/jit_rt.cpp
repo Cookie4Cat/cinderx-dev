@@ -3128,6 +3128,91 @@ PyObject* JITRT_GetAttrDefault311(
 }
 #endif
 
+namespace {
+// rangeiterobject, Objects/rangeobject.c (3.11); allocated with
+// PyRangeIter_Type so that rangeiter_next, __length_hint__, pickling and the
+// interpreter's FOR_ITER keep working on it.
+struct SpikeRangeIter311 {
+  PyObject_HEAD long index;
+  long start;
+  long step;
+  long len;
+};
+
+bool spikeRangeArg311(PyObject* arg, long* out) {
+  if (!PyLong_CheckExact(arg)) {
+    return false;
+  }
+  int overflow = 0;
+  long value = PyLong_AsLongAndOverflow(arg, &overflow);
+  if (overflow != 0 || (value == -1 && PyErr_Occurred())) {
+    PyErr_Clear();
+    return false;
+  }
+  *out = value;
+  return true;
+}
+
+// get_len_of_range, Objects/rangeobject.c.
+unsigned long spikeRangeLength311(long lo, long hi, long step) {
+  if (step > 0 && lo < hi) {
+    return 1UL + (hi - 1UL - lo) / step;
+  }
+  if (step < 0 && lo > hi) {
+    return 1UL + (lo - 1UL - hi) / (0UL - step);
+  }
+  return 0UL;
+}
+} // namespace
+
+PyObject*
+JITRT_RangeIter311(int64_t nargs, PyObject* a0, PyObject* a1, PyObject* a2) {
+  long start = 0;
+  long stop = 0;
+  long step = 1;
+  bool simple = nargs == 1
+      ? spikeRangeArg311(a0, &stop)
+      : spikeRangeArg311(a0, &start) && spikeRangeArg311(a1, &stop) &&
+          (nargs == 2 || spikeRangeArg311(a2, &step));
+  if (simple && step != 0) {
+    // range_iter's test for the C-long iterator: the length, and the value
+    // one step past the last, must be representable.
+    unsigned long ulen = spikeRangeLength311(start, stop, step);
+    bool fits = ulen <= static_cast<unsigned long>(LONG_MAX);
+    if (fits && ulen != 0) {
+      if (step > 0) {
+        fits = !(stop > LONG_MAX - (step - 1));
+      } else {
+        fits = !(stop < LONG_MIN + (-1 - step));
+      }
+    }
+    if (fits) {
+      SpikeRangeIter311* it =
+          PyObject_New(SpikeRangeIter311, &PyRangeIter_Type);
+      if (it == nullptr) {
+        return nullptr;
+      }
+      it->index = 0;
+      it->start = start;
+      it->step = step;
+      it->len = static_cast<long>(ulen);
+      return reinterpret_cast<PyObject*>(it);
+    }
+  }
+  PyObject* args[3] = {a0, a1, a2};
+  PyObject* range = PyObject_Vectorcall(
+      reinterpret_cast<PyObject*>(&PyRange_Type),
+      args,
+      static_cast<size_t>(nargs),
+      nullptr);
+  if (range == nullptr) {
+    return nullptr;
+  }
+  PyObject* iter = PyObject_GetIter(range);
+  Py_DECREF(range);
+  return iter;
+}
+
 PyObject* JITRT_VectorcallTstate(
     PyThreadState* tstate,
     PyObject* callable,

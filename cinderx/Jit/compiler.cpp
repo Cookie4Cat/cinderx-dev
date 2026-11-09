@@ -20,6 +20,7 @@
 #include "cinderx/Jit/hir/hir_stats.h"
 #include "cinderx/Jit/hir/inliner.h"
 #include "cinderx/Jit/hir/insert_update_prev_instr.h"
+#include "cinderx/Jit/hir/loop_phi_unbox.h"
 #include "cinderx/Jit/hir/phi_elimination.h"
 #include "cinderx/Jit/hir/primitive_box_remat.h"
 #include "cinderx/Jit/hir/primitive_unbox_cse.h"
@@ -183,6 +184,9 @@ void Compiler::runPasses(
   // Deopt correctness also requires the backend trampoline to save FP
   // registers in regs[]; that support is currently implemented for AArch64.
 #if defined(CINDER_AARCH64)
+  // SPIKE(PHIUNBOX): unbox loop-carried int Phis so that the boxes feeding
+  // their back edges become frame-state-only and the remat below drops them.
+  runPassIf(hir::LoopPhiUnbox{}, PassConfig::kPrimitiveBoxRemat);
   runPassIf(hir::PrimitiveBoxRemat{}, PassConfig::kPrimitiveBoxRemat);
 #endif
   runPassIf(hir::CleanCFG{}, PassConfig::kCleanCFG);
