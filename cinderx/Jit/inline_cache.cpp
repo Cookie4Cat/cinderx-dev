@@ -1247,10 +1247,6 @@ PyObject* DescrOrClassVarMutator::getAttr(PyObject* obj, PyObject* name) {
   return descr_guard.release();
 }
 
-AttributeMutator::AttributeMutator() {
-  reset();
-}
-
 void AttributeMutator::reset() {
   type_ = 0;
 }
@@ -1586,8 +1582,10 @@ inline void megaSetName311(PyObject*& slot, PyObject* name) {
   slot = name == nullptr ? nullptr : megaRegisteredName311(name);
 }
 constexpr size_t kMegaEntries311 = 2048;
-MegaEntry311 s_mega_load_311[kMegaEntries311];
-MegaEntry311 s_mega_store_311[kMegaEntries311];
+// Empty tables are ready at load time, without constructor loops dirtying
+// hundreds of KiB of pages in processes that never fill an overflow entry.
+constinit MegaEntry311 s_mega_load_311[kMegaEntries311];
+constinit MegaEntry311 s_mega_store_311[kMegaEntries311];
 
 inline size_t megaIndex311(PyTypeObject* type, PyObject* name) {
   uint64_t h = (reinterpret_cast<uintptr_t>(type) >> 4) * 0x9E3779B97F4A7C15ull;
@@ -1629,7 +1627,7 @@ struct MegaMethodEntry311 {
   LoadMethodCache::Entry entry;
   PyObject* name{nullptr};
 };
-MegaMethodEntry311 s_mega_method_311[kMegaEntries311];
+constinit MegaMethodEntry311 s_mega_method_311[kMegaEntries311];
 uint8_t s_mega_method_rr_311 = 0;
 
 inline MegaMethodEntry311& megaMethodEntry311(
