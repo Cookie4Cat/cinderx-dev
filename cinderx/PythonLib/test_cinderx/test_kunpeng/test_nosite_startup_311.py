@@ -194,6 +194,42 @@ class NoSiteStartup311Tests(unittest.TestCase):
             assert cinderx.is_initialized()
         """, extra_env={"CINDERX_JIT_MODE": "off"})
 
+    def test_disable_aliases_keep_their_behavior(self):
+        self.run_child("""
+            assert '_cinderx' not in sys.modules
+        """, extra_env={"CINDERX_DISABLE": "yes"})
+        for name in ("CINDERX_JIT_DISABLE", "PYTHONJITDISABLE"):
+            with self.subTest(name=name):
+                self.run_child("""
+                    import _cinderx
+                    assert _cinderx.is_frame_evaluator_installed()
+                    assert 'cinderjit' not in sys.modules
+                """, extra_env={name: "true"})
+
+    def test_requested_gate_statistics_are_not_deferred(self):
+        result = self.run_child("""
+            import _cinderx, cinderjit
+            assert '_cinderx_auto_helpers' in sys.modules
+            assert _cinderx.is_frame_evaluator_installed()
+            assert cinderjit.is_enabled()
+        """, extra_env={"CINDERX_AUTOJIT_GATE_STATS": "1"})
+        self.assertIn("CINDERX_AUTOJIT_GATE_STATS: ", result.stderr)
+        self.assertNotIn("Exception ignored in atexit callback", result.stderr)
+
+    def test_unavailable_parallel_gc_does_not_change_gc_settings(self):
+        self.run_child("""
+            import _cinderx
+            assert not _cinderx.has_parallel_gc()
+            assert '_cinderx_auto_helpers' in sys.modules
+            assert gc.get_threshold() == original_thresholds
+        """, before="""
+            import gc
+            original_thresholds = gc.get_threshold()
+        """, extra_env={
+            "PARALLEL_GC_ENABLED": "1",
+            "PARALLEL_GC_THRESHOLD_GEN0": "1234",
+        })
+
     def test_shutdown_callback_uses_the_standard_registry(self):
         self.run_child("""
             import _cinderx
