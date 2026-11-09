@@ -47,7 +47,10 @@ class JitGenFreeList : public IJitGenFreeList {
   };
 
   std::array<Entry, kGenFreeListEntries> entries_;
-  Entry* head_;
+  // Link only recycled entries. Untouched entries are handed out in the
+  // same descending order without dirtying the entire arena at startup.
+  Entry* head_{nullptr};
+  size_t unused_{kGenFreeListEntries};
 };
 
 class JITGenFreeThreadedFreeList : public IJitGenFreeList {
