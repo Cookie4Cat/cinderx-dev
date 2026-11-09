@@ -16,8 +16,9 @@
 #include "cinderx/module_state.h"
 #if PY_VERSION_HEX < 0x030C0000
 // The MR-04 execute surface predicates the lifecycle cases assert on.
-#include "cinderx/Interpreter/3.11/observe.h"
 #include "internal/pycore_pystate.h"
+
+#include "cinderx/Interpreter/3.11/observe.h"
 #endif
 
 #include <chrono>
@@ -70,15 +71,15 @@ class JITContextTest : public RuntimeTest {
 #if PY_VERSION_HEX < 0x030C0000
 TEST_F(JITContextTest, SuppressedTraceEventsDoNotEnterArgumentBinder311) {
   SKIP_311_EXECUTABLE_COMPILE();
-  for (const char* source : {
-           "def func(value, *, strict=False):\n"
-           "    return -value if strict else value\n",
-           "def func(value, *args, **kwargs):\n"
-           "    return value + len(args) + len(kwargs)\n"}) {
+  for (const char* source :
+       {"def func(value, *, strict=False):\n"
+        "    return -value if strict else value\n",
+        "def func(value, *args, **kwargs):\n"
+        "    return value + len(args) + len(kwargs)\n"}) {
     Ref<PyFunctionObject> func(compileAndGet(source, "func"));
     ASSERT_NE(func, nullptr);
-    auto preloader = jit::hir::Preloader::make(
-        func, jit::makeFrameReifier(func->func_code));
+    auto preloader =
+        jit::hir::Preloader::make(func, jit::makeFrameReifier(func->func_code));
     ASSERT_NE(preloader, nullptr);
     ASSERT_EQ(
         jit::compilePreloaderImpl(jit_ctx_.get(), *preloader, func),
@@ -93,9 +94,8 @@ TEST_F(JITContextTest, SuppressedTraceEventsDoNotEnterArgumentBinder311) {
     EXPECT_EQ(PyLong_AsLong(ordinary_result), 7);
     EXPECT_GT(jit::triggerStatsSnapshot().machine_code_entries, entry_before);
     for (bool profile : {false, true}) {
-      auto callback = +[](PyObject*, PyFrameObject*, int, PyObject*) {
-        return 0;
-      };
+      auto callback =
+          +[](PyObject*, PyFrameObject*, int, PyObject*) { return 0; };
       PyThreadState* tstate = PyThreadState_Get();
       ASSERT_EQ(tstate->c_tracefunc, nullptr);
       ASSERT_EQ(tstate->c_profilefunc, nullptr);

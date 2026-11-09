@@ -3869,9 +3869,9 @@ void NativeGenerator::generateCode(
     // CPython suppresses recursive events by clearing use_tracing while
     // c_tracefunc/c_profilefunc remain installed. Entering the binder there
     // would select an interpreted reentry for an already-bound argument array.
-    for (int32_t offset : {
-             static_cast<int32_t>(offsetof(PyThreadState, c_tracefunc)),
-             static_cast<int32_t>(offsetof(PyThreadState, c_profilefunc))}) {
+    for (int32_t offset :
+         {static_cast<int32_t>(offsetof(PyThreadState, c_tracefunc)),
+          static_cast<int32_t>(offsetof(PyThreadState, c_profilefunc))}) {
       as_->ldr(a64::x10, arch::ptr_offset(a64::x9, offset));
       as_->cbnz(a64::x10, entry_guard_divert);
     }
