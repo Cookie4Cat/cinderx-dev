@@ -51,6 +51,9 @@ extern "C" {
 #include <unordered_set>
 #include <utility>
 #include <vector>
+#if PY_VERSION_HEX < 0x030C0000
+#include <atomic>
+#endif
 
 extern "C" int Ci_SpikeDespec311_IsMarked(PyCodeObject* code);
 
@@ -781,11 +784,81 @@ BorrowedRef<PyTypeObject> resolveMethodOwnerType(
 // by any thread once initialized; only the initialization path requires
 // the GIL (and is skipped on worker threads).
 namespace {
+#if PY_VERSION_HEX < 0x030C0000
+std::atomic<PyTypeObject*> g_stdlib_array_type{nullptr};
+
+PyTypeObject* publishStdlibArrayType311(PyTypeObject* type) {
+  Py_INCREF(type);
+  PyTypeObject* expected = nullptr;
+  if (!g_stdlib_array_type.compare_exchange_strong(
+          expected,
+          type,
+          std::memory_order_acq_rel,
+          std::memory_order_acquire)) {
+    Py_DECREF(type);
+    return expected;
+  }
+  return type;
+}
+
+// Called from the specializer: no imports, Python attribute lookup or probe
+// construction here. Only the loaded module's exact immutable array type can
+// reach its native buffer slot; compare that buffer with the mirrored layout.
+PyTypeObject* resolveStdlibArrayContainer311(PyObject* container) {
+  if (auto* cached = g_stdlib_array_type.load(std::memory_order_acquire)) {
+    return cached;
+  }
+  PyTypeObject* type = Py_TYPE(container);
+  if (!(type->tp_flags & Py_TPFLAGS_IMMUTABLETYPE) ||
+      type->tp_basicsize !=
+          static_cast<Py_ssize_t>(sizeof(StdlibArrayObject)) ||
+      type->tp_itemsize != 0 ||
+      std::strcmp(type->tp_name, "array.array") != 0) {
+    return nullptr;
+  }
+  PyObject* module = PyDict_GetItemString(PyImport_GetModuleDict(), "array");
+  if (module == nullptr || !PyModule_CheckExact(module) ||
+      PyDict_GetItemString(PyModule_GetDict(module), "array") !=
+          reinterpret_cast<PyObject*>(type)) {
+    PyErr_Clear();
+    return nullptr;
+  }
+  Py_buffer view{};
+  if (PyObject_GetBuffer(container, &view, PyBUF_FORMAT) < 0) {
+    PyErr_Clear();
+    return nullptr;
+  }
+  auto* array = reinterpret_cast<StdlibArrayObject*>(container);
+  bool valid = view.buf == array->ob_item && view.itemsize > 0 &&
+      array->ob_descr != nullptr &&
+      array->ob_descr->itemsize == view.itemsize && Py_SIZE(array) >= 0 &&
+      Py_SIZE(array) <= PY_SSIZE_T_MAX / view.itemsize &&
+      view.len == Py_SIZE(array) * view.itemsize &&
+      array->allocated >= Py_SIZE(array);
+  if (valid) {
+    char format = array->ob_descr->typecode;
+    if (format == 'u') {
+      format = 'w';
+    }
+    valid = view.format != nullptr && view.format[0] == format &&
+        view.format[1] == '\0';
+  }
+  PyTypeObject* result = valid ? publishStdlibArrayType311(type) : nullptr;
+  PyBuffer_Release(&view);
+  return result;
+}
+#else
 PyTypeObject* g_stdlib_array_type = nullptr;
+#endif
 } // namespace
 
 PyTypeObject* getStdlibArrayType() {
+#if PY_VERSION_HEX < 0x030C0000
+  PyTypeObject* cached_type =
+      g_stdlib_array_type.load(std::memory_order_acquire);
+#else
   PyTypeObject*& cached_type = g_stdlib_array_type;
+#endif
   if (cached_type != nullptr) {
     return cached_type;
   }
@@ -795,7 +868,16 @@ PyTypeObject* getStdlibArrayType() {
   // is only available for functions compiled on the main thread.
   RETURN_MULTITHREADED_COMPILE(nullptr);
 
+#if PY_VERSION_HEX < 0x030C0000
+  PyObject* loaded = PyDict_GetItemString(PyImport_GetModuleDict(), "array");
+  if (loaded == nullptr || !PyModule_CheckExact(loaded)) {
+    PyErr_Clear();
+    return nullptr;
+  }
+  auto module = Ref<>::create(loaded);
+#else
   auto module = Ref<>::steal(PyImport_ImportModule("array"));
+#endif
   if (module == nullptr) {
     PyErr_Clear();
     return nullptr;
@@ -812,6 +894,15 @@ PyTypeObject* getStdlibArrayType() {
   }
 
   auto* type = reinterpret_cast<PyTypeObject*>(array_type.get());
+#if PY_VERSION_HEX < 0x030C0000
+  if (!(type->tp_flags & Py_TPFLAGS_IMMUTABLETYPE) ||
+      type->tp_basicsize !=
+          static_cast<Py_ssize_t>(sizeof(StdlibArrayObject)) ||
+      type->tp_itemsize != 0 ||
+      std::strcmp(type->tp_name, "array.array") != 0) {
+    return nullptr;
+  }
+#endif
 
   // Runtime layout validation: create a probe instance and verify offsets.
   auto probe_list = Ref<>::steal(PyList_New(1));
@@ -863,21 +954,34 @@ PyTypeObject* getStdlibArrayType() {
 
   // Transfer ownership: array_type's Ref<> will decref on scope exit,
   // so we must incref to keep the type alive for the static cache.
+#if PY_VERSION_HEX < 0x030C0000
+  return publishStdlibArrayType311(type);
+#else
   Py_INCREF(type);
   cached_type = type;
   return cached_type;
+#endif
 }
 
 } // namespace jit::hir
 
-// SPIKE(ARRTC): the validated array.array type object, or NULL while
-// getStdlibArrayType() has not resolved it.  Never initializes: the
-// interpreter's subscript record calls this from inside the specializer,
-// where importing the module or constructing a probe would re-enter the
-// interpreter.  Declared in Interpreter/3.11/interpreter_contract.h.
+// SPIKE(ARRTC): acquire the validated array.array type, or NULL until either
+// the compiler or the specializer resolves it. This accessor never imports
+// modules or constructs probes. Declared in the interpreter contract.
 extern "C" PyTypeObject* Ci_StdlibArrayTypeIfResolved(void) {
+#if PY_VERSION_HEX < 0x030C0000
+  return jit::hir::g_stdlib_array_type.load(std::memory_order_acquire);
+#else
   return jit::hir::g_stdlib_array_type;
+#endif
 }
+
+#if PY_VERSION_HEX < 0x030C0000
+extern "C" PyTypeObject* Ci_StdlibArrayTypeForContainer311(
+    PyObject* container) {
+  return jit::hir::resolveStdlibArrayContainer311(container);
+}
+#endif
 
 namespace jit::hir {
 

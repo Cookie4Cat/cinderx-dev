@@ -389,7 +389,11 @@ PyObject* cinder_get_adaptive_delay(PyObject* mod, PyObject*) {
 
 // Capture the default vectorcall entrypoint for functions.
 int ensurePyFunctionVectorcall() {
-#if PY_VERSION_HEX < 0x030F0000
+#if PY_VERSION_HEX < 0x030C0000
+  // The pinned 3.11 runtime exports its default entry directly. Capturing it
+  // must not import site (and os) just to find an existing Python function.
+  Ci_PyFunction_Vectorcall = _PyFunction_Vectorcall;
+#elif PY_VERSION_HEX < 0x030F0000
   // Picking a function that has a high chance of being implemented in Python,
   // and is extremely likely to be loaded already.
   const char* mod_name = "site";
@@ -507,6 +511,17 @@ int object_visitor(PyObject* obj, [[maybe_unused]] void* arg) {
 
 // Visit every Python object on CinderX module initialization.
 void init_existing_objects() {
+#if PY_VERSION_HEX < 0x030C0000
+  // The 3.11 numeric AutoJIT gate observes every frame entry, including
+  // functions created before this module loaded. It creates code metadata
+  // and registers a compilation candidate on demand. Do not walk the whole
+  // GC heap to allocate metadata and death watches for unused functions.
+  // Keep the eager path for jit-all and explicit JIT-list scheduling.
+  if (jit::getConfig().compile_after_n_calls.value_or(0) > 0 &&
+      cinderx::getModuleState()->jit_list == nullptr) {
+    return;
+  }
+#endif
   PyUnstable_GC_VisitObjects(object_visitor, nullptr);
 }
 
