@@ -4897,8 +4897,7 @@ LIRGenerator::TranslatedBlock LIRGenerator::TranslateOneBasicBlock(
 #if PY_VERSION_HEX < 0x030C0000
         // One byte: cframe->use_tracing is the interpreter's own "tracing
         // possible" flag, set by either registration (sys.settrace or
-        // sys.setprofile), the same byte the entry guard reads.  It must be
-        // read as a byte -- a wider load drags in neighbouring padding.
+        // sys.setprofile). Read a byte to avoid loading neighbouring padding.
         static_assert(
             sizeof(reinterpret_cast<_PyCFrame*>(0)->use_tracing) == 1,
             "use_tracing width changed");

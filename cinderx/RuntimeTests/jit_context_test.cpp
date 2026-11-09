@@ -16,6 +16,8 @@
 #include "cinderx/module_state.h"
 #if PY_VERSION_HEX < 0x030C0000
 // The MR-04 execute surface predicates the lifecycle cases assert on.
+#include "internal/pycore_pystate.h"
+
 #include "cinderx/Interpreter/3.11/observe.h"
 #endif
 
@@ -65,6 +67,64 @@ class JITContextTest : public RuntimeTest {
 
   std::unique_ptr<jit::CompilerContext<jit::Compiler>> jit_ctx_;
 };
+
+#if PY_VERSION_HEX < 0x030C0000
+TEST_F(JITContextTest, SuppressedTraceEventsDoNotEnterArgumentBinder311) {
+  SKIP_311_EXECUTABLE_COMPILE();
+  for (const char* source :
+       {"def func(value, *, strict=False):\n"
+        "    return -value if strict else value\n",
+        "def func(value, *args, **kwargs):\n"
+        "    return value + len(args) + len(kwargs)\n"}) {
+    Ref<PyFunctionObject> func(compileAndGet(source, "func"));
+    ASSERT_NE(func, nullptr);
+    auto preloader =
+        jit::hir::Preloader::make(func, jit::makeFrameReifier(func->func_code));
+    ASSERT_NE(preloader, nullptr);
+    ASSERT_EQ(
+        jit::compilePreloaderImpl(jit_ctx_.get(), *preloader, func),
+        jit::Result::OK);
+    ASSERT_TRUE(jit_ctx_->didCompile(func));
+    auto argument = Ref<>::steal(PyLong_FromLong(7));
+    PyObject* args[] = {argument.get()};
+    const auto entry_before = jit::triggerStatsSnapshot().machine_code_entries;
+    Ref<> ordinary_result = Ref<>::steal(func->vectorcall(
+        reinterpret_cast<PyObject*>(func.get()), args, 1, nullptr));
+    ASSERT_NE(ordinary_result, nullptr);
+    EXPECT_EQ(PyLong_AsLong(ordinary_result), 7);
+    EXPECT_GT(jit::triggerStatsSnapshot().machine_code_entries, entry_before);
+    for (bool profile : {false, true}) {
+      auto callback =
+          +[](PyObject*, PyFrameObject*, int, PyObject*) { return 0; };
+      PyThreadState* tstate = PyThreadState_Get();
+      ASSERT_EQ(tstate->c_tracefunc, nullptr);
+      ASSERT_EQ(tstate->c_profilefunc, nullptr);
+      if (profile) {
+        PyEval_SetProfile(callback, Py_None);
+      } else {
+        PyEval_SetTrace(callback, Py_None);
+      }
+      // Model execution inside the registered C callback: recursive events
+      // are suppressed, but the callback is still installed. Bound slots
+      // must never be passed to an interpreted raw-vectorcall entry.
+      PyThreadState_EnterTracing(tstate);
+      const auto before = jit::triggerStatsSnapshot().machine_code_entries;
+      Ref<> result = Ref<>::steal(func->vectorcall(
+          reinterpret_cast<PyObject*>(func.get()), args, 1, nullptr));
+      const auto after = jit::triggerStatsSnapshot().machine_code_entries;
+      PyThreadState_LeaveTracing(tstate);
+      if (profile) {
+        PyEval_SetProfile(nullptr, nullptr);
+      } else {
+        PyEval_SetTrace(nullptr, nullptr);
+      }
+      ASSERT_NE(result, nullptr) << PyErr_Occurred();
+      EXPECT_EQ(PyLong_AsLong(result), 7);
+      EXPECT_EQ(after, before);
+    }
+  }
+}
+#endif
 
 #if PY_VERSION_HEX < 0x030C0000
 TEST_F(JITContextTest, RejectsExecutableCompileInShadowMode) {
@@ -141,11 +201,11 @@ TEST_F(JITContextTest, CodeCompiledReportsPublicationRefusal) {
   // "the function is installed", and publication is fallible there: the
   // artifact allocation, the code-extra reservation, and the post-compile
   // install.  Its answer is what lets the compile entry stop reporting OK
-  // for a function that was never installed. BUILD_SLICE is still outside
-  // normal-flow admission after MR7 enables subscripts. An empty data block
-  // exercises the same early-return paths an allocation failure would take.
+  // for a function that was never installed. Async code remains outside
+  // execution admission. An empty data block proves rejection happens before
+  // artifact construction; slices are now admitted and cannot be this control.
   Ref<PyFunctionObject> func(
-      compileAndGet("def func(obj): return obj[1:]", "func"));
+      compileAndGet("async def func(obj): return obj", "func"));
   ASSERT_NE(func, nullptr);
 
   vectorcallfunc vectorcall_before = func->vectorcall;

@@ -291,7 +291,12 @@ test_kunpeng() {
     test_cinderx.test_kunpeng.test_lightweight_frames &&
     # This regression must execute JIT code; the parent PR suite defaults to off.
     CINDERX_JIT_MODE=execute CINDERX_OSR_ENABLED=0 "$PYTHON" -m unittest -v \
-      test_cinderx.test_kunpeng.test_jit_immortalize)
+      test_cinderx.test_kunpeng.test_jit_immortalize &&
+    # Admission assertions must not silently run in the parent's off mode.
+    CINDERX_PLUGIN_ENABLE=1 CINDERX_EVAL_MODE=cinder \
+    CINDERX_JIT_MODE=execute CINDERX_OSR_ENABLED=0 \
+    PYTHONJITAUTO=1000000 AUTO_JIT=1000000 "$PYTHON" -m unittest -v \
+      test_cinderx.test_kunpeng.test_admission_semantics_311)
 }
 
 generator_refcount_matrix() {

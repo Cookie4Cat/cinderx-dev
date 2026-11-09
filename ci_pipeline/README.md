@@ -45,9 +45,9 @@ generators, JIT retirement, tracing, recursion and allocation failure.
 Daily requires the original Py_DEBUG `-R 10:3` run to succeed for every module.
 All reported reference, memory-block or FD leaks fail; there is no counter
 artifact exemption or successful-rerun substitute. The stdlib import canary
-also checks 289 organic deopts and their complete site/reason fingerprint.
+also checks 358 organic deopts and their complete site/reason fingerprint.
 This import-coverage sweep disables startup grace while retaining the default
-bounded generic retry. Its retry opt-out regression restores the prior 225-event
+bounded generic retry. Its retry opt-out regression removes the same 64 retry events, retaining the 294-event
 fingerprint; product scheduling tests exercise the normal startup grace.
 Compiled-execution and lifetime probes also disable startup grace to prove
 their target paths immediately; the refleak build-sanity probe compiles
@@ -287,7 +287,7 @@ the environment. They do not change the Python 3.14 defaults.
 
 | Environment variable | `-X` option | Default and behavior |
 |---|---|---|
-| `CINDERX_JIT_STARTUP_GRACE_MS` | `jit-startup-grace-ms` | `100`; delay automatic compilation during startup, in milliseconds; accepts `0..4294967295`, with `0` disabling the delay; invalid values fail initialization |
+| `CINDERX_JIT_STARTUP_GRACE_MS` | `jit-startup-grace-ms` | `100`; delay automatic compilation during startup, in milliseconds; accepts `0..4294967294`, with `0` disabling the delay; invalid values fail initialization |
 | `CINDERX_JIT_FORK_GRACE` | `jit-fork-grace` | `1`; re-arm grace in a fork child while keeping inherited compiled artifacts usable |
 | `CINDERX_JIT_DESPECIALIZE` | `jit-despecialize` | `1`; allow at most one generic retry after a guard-only round exhausts ordinary ROI backoff; exception/mixed rounds still retire |
 | `CINDERX_JIT_FORCE_DEOPT_CHECKS` | `jit-force-deopt-checks` | `1`; preserve the `force_deopt` diagnostic API; explicitly setting `0` omits polls and makes the API reject trigger requests |

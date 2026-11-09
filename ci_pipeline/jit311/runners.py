@@ -631,9 +631,18 @@ def stdlib_canary_runner(*, judges: list[Judge] | None = None) -> RunnerSpec:
     # total).  Bitwise operators on two ints of unknown origin stay generic,
     # so ipaddress's 128-bit masks do not deopt.  The retry opt-out total
     # becomes 225.
+    # Formatting/slice/accumulator admission adds 69 events at seven new
+    # sites: io.__getattr__ (Raise, 5), zipimporter.__init__ (Raise, 15),
+    # enum._proto_member.__set_name__ (UnhandledException, 8; GuardFailure,
+    # 24), inspect._signature_from_callable (UnhandledException, 14),
+    # re._compiler._optimize_charset (UnhandledException, 2+1). Three
+    # baseline/head rounds and F/S/I ablations in the gate's isolated
+    # CPython 3.11.6 venv preserve every old site.
+    # Disabling generic retry still removes only its 64-event site, leaving
+    # 294 events, including all 69 admission events.
     # Preserve the exact total AND the independently attributed site/reason
     # fingerprint; equal totals must not hide a different failure path.
-    default = execute_holds(expected_organic_deopts=289) + [
+    default = execute_holds(expected_organic_deopts=358) + [
         expect("compile_requests", ">", 0),
         expect("target_modules_attempted", "==", 72),
     ]
