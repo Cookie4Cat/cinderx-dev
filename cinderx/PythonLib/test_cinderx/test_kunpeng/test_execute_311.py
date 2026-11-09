@@ -600,9 +600,9 @@ class Execute311Test(unittest.TestCase):
     # -- import/setup suppression -------------------------------------------
 
     def test_scheduling_is_suppressed_inside_import_and_setup_scopes(self):
-        # Inside import/setup scopes nothing dispatches and nothing is
-        # spent; counting continues and the first frame after the scope
-        # closes dispatches.
+        # Inside import/setup scopes nothing dispatches, nothing is spent
+        # and nothing is counted; after the scope closes the code needs the
+        # full threshold of its own calls before it dispatches.
         for scope in ("import", "setup"):
             with self.subTest(scope=scope):
                 payload = self.run_ok("suppress_scopes", SUPPRESS_SCOPE=scope)
@@ -610,6 +610,8 @@ class Execute311Test(unittest.TestCase):
                 self.assertEqual(payload["inside_events"], [])
                 self.assertFalse(payload["inside_compiled"])
                 self.assertEqual(payload["spent"], 0)
+                # Calls inside the scope did not count toward the threshold.
+                self.assertEqual(payload["below_events"], [])
                 # The attempt was still there when the scope closed.
                 self.assertEqual(payload["after_events"], ["installed"])
                 self.assertTrue(payload["compiled"])
