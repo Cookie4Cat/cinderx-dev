@@ -17,6 +17,25 @@
 
 class InlineCacheTest : public RuntimeTest {};
 
+TEST_F(InlineCacheTest, ConstantInitializedEntriesHaveEmptySentinels) {
+  static constinit jit::AttributeMutator mutator;
+  static constinit jit::LoadMethodCache::Entry method;
+  EXPECT_TRUE(mutator.isEmpty());
+  EXPECT_EQ(mutator.type(), nullptr);
+  EXPECT_EQ(method.type, nullptr);
+  EXPECT_EQ(method.value, nullptr);
+  EXPECT_EQ(method.keys_version, 0);
+#if PY_VERSION_HEX < 0x030C0000
+  EXPECT_EQ(method.type_version, 0);
+  EXPECT_EQ(method.peek_keys, nullptr);
+  EXPECT_EQ(method.peek_nentries, 0);
+  EXPECT_EQ(method.peek_hint, -1);
+  EXPECT_EQ(method.peek_keys_version, 0);
+  EXPECT_FALSE(method.peek_shadow);
+  EXPECT_FALSE(method.inst_attr);
+#endif
+}
+
 class TestLoadAttrCache : public jit::LoadAttrCache {
  public:
   std::span<jit::AttributeMutator> entriesForTest() {

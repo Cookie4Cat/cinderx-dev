@@ -8,6 +8,7 @@
 #include <memory>
 #include <string>
 #include <string_view>
+#include <utility>
 #include <vector>
 
 namespace jit {
@@ -30,27 +31,27 @@ struct Option {
   Option() = default;
 
   Option(
-      const std::string& cmdline_flag,
-      const std::string& environment_variable,
-      const std::function<void(const std::string&)>& callback_on_match,
-      const std::string& flag_description) {
+      std::string_view cmdline_flag,
+      std::string_view environment_variable,
+      std::function<void(const std::string&)> callback_on_match,
+      std::string_view flag_description) {
     this->cmdline_flag = cmdline_flag;
     this->environment_variable = environment_variable;
-    this->callback_on_match = callback_on_match;
+    this->callback_on_match = std::move(callback_on_match);
     this->flag_description = flag_description;
   }
 
   // Normally, when the relevant flag is set a debug log message
   // will be generated. By setting the debug message here, this
   // auto generated message will be overridden
-  Option& withDebugMessageOverride(const std::string& message) {
+  Option& withDebugMessageOverride(std::string_view message) {
     debug_message = message;
     return *this;
   }
 
   // Allows the definition of a flag parameter name which will
   // apear on the expanded help message for the Option
-  Option& withFlagParamName(const std::string& param_name) {
+  Option& withFlagParamName(std::string_view param_name) {
     flag_param_name = param_name;
     return *this;
   }
@@ -72,43 +73,43 @@ struct FlagProcessor {
   // Register a callback to run on an option.
 
   Option& addOption(
-      const std::string& cmdline_flag,
-      const std::string& environment_variable,
-      const std::function<void()>& callback_on_match,
-      const std::string& flag_description);
+      std::string_view cmdline_flag,
+      std::string_view environment_variable,
+      std::function<void()> callback_on_match,
+      std::string_view flag_description);
   Option& addOption(
-      const std::string& cmdline_flag,
-      const std::string& environment_variable,
-      const std::function<void(int)>& callback_on_match,
-      const std::string& flag_description);
+      std::string_view cmdline_flag,
+      std::string_view environment_variable,
+      std::function<void(int)> callback_on_match,
+      std::string_view flag_description);
   Option& addOption(
-      const std::string& cmdline_flag,
-      const std::string& environment_variable,
-      const std::function<void(const std::string&)>& callback_on_match,
-      const std::string& flag_description);
+      std::string_view cmdline_flag,
+      std::string_view environment_variable,
+      std::function<void(const std::string&)> callback_on_match,
+      std::string_view flag_description);
 
   // Bind an option to a specific variable.
 
   Option& addOption(
-      const std::string& cmdline_flag,
-      const std::string& environment_variable,
+      std::string_view cmdline_flag,
+      std::string_view environment_variable,
       bool& variable_to_bind_to,
-      const std::string& flag_description);
+      std::string_view flag_description);
   Option& addOption(
-      const std::string& cmdline_flag,
-      const std::string& environment_variable,
+      std::string_view cmdline_flag,
+      std::string_view environment_variable,
       int& variable_to_bind_to,
-      const std::string& flag_description);
+      std::string_view flag_description);
   Option& addOption(
-      const std::string& cmdline_flag,
-      const std::string& environment_variable,
+      std::string_view cmdline_flag,
+      std::string_view environment_variable,
       size_t& variable_to_bind_to,
-      const std::string& flag_description);
+      std::string_view flag_description);
   Option& addOption(
-      const std::string& cmdline_flag,
-      const std::string& environment_variable,
+      std::string_view cmdline_flag,
+      std::string_view environment_variable,
       std::string& variable_to_bind_to,
-      const std::string& flag_description);
+      std::string_view flag_description);
 
   // passing the xoptions dict from the command line will result in the
   // associated 'variable_to_bind_to' previously passed being assigned with the
