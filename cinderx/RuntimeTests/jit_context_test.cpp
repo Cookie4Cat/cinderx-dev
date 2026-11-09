@@ -201,11 +201,11 @@ TEST_F(JITContextTest, CodeCompiledReportsPublicationRefusal) {
   // "the function is installed", and publication is fallible there: the
   // artifact allocation, the code-extra reservation, and the post-compile
   // install.  Its answer is what lets the compile entry stop reporting OK
-  // for a function that was never installed. BUILD_SLICE is still outside
-  // normal-flow admission after MR7 enables subscripts. An empty data block
-  // exercises the same early-return paths an allocation failure would take.
+  // for a function that was never installed. Async code remains outside
+  // execution admission. An empty data block proves rejection happens before
+  // artifact construction; slices are now admitted and cannot be this control.
   Ref<PyFunctionObject> func(
-      compileAndGet("def func(obj): return obj[1:]", "func"));
+      compileAndGet("async def func(obj): return obj", "func"));
   ASSERT_NE(func, nullptr);
 
   vectorcallfunc vectorcall_before = func->vectorcall;

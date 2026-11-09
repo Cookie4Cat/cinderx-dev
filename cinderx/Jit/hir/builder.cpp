@@ -1270,67 +1270,6 @@ bool icStabilityInstanceValueCacheUsable(
 
 #if PY_VERSION_HEX < 0x030C0000
 static std::optional<InPlaceOpKind> getInPlaceOpKindFromOparg(int oparg);
-
-#if PY_VERSION_HEX >= 0x030B0000
-static bool hasIntConstLocalBinaryAccumulator311(
-    BorrowedRef<PyCodeObject> code) {
-  constexpr int kMaxCompactAccumulatorLocalsPlus = 8;
-  BytecodeInstructionBlock bc_instrs{code};
-  for (auto it = bc_instrs.begin(); it != bc_instrs.end(); ++it) {
-    BytecodeInstruction load = *it;
-    if (load.opcode() != LOAD_FAST) {
-      continue;
-    }
-
-    auto const_it = it;
-    ++const_it;
-    if (const_it == bc_instrs.end()) {
-      return false;
-    }
-    BytecodeInstruction load_const = *const_it;
-    if (load_const.opcode() != LOAD_CONST || load_const.oparg() < 0 ||
-        load_const.oparg() >= PyTuple_GET_SIZE(code->co_consts)) {
-      continue;
-    }
-    BorrowedRef<> const_value =
-        PyTuple_GET_ITEM(code->co_consts, load_const.oparg());
-    if (!PyLong_CheckExact(const_value)) {
-      continue;
-    }
-
-    auto binary_it = const_it;
-    ++binary_it;
-    if (binary_it == bc_instrs.end()) {
-      return false;
-    }
-    BytecodeInstruction binary = *binary_it;
-    if (binary.opcode() != BINARY_OP) {
-      continue;
-    }
-    auto inplace_op = getInPlaceOpKindFromOparg(binary.oparg());
-    if (!inplace_op.has_value()) {
-      continue;
-    }
-
-    auto store_it = binary_it;
-    ++store_it;
-    if (store_it == bc_instrs.end()) {
-      return false;
-    }
-    BytecodeInstruction store = *store_it;
-    if (store.opcode() == STORE_FAST && store.oparg() == load.oparg()) {
-      if ((*inplace_op == InPlaceOpKind::kAdd ||
-           *inplace_op == InPlaceOpKind::kSubtract) &&
-          numLocalsplus(code) <= kMaxCompactAccumulatorLocalsPlus) {
-        continue;
-      }
-      return true;
-    }
-  }
-  return false;
-}
-#endif
-
 #endif
 
 const char* unsupportedShapeReason311(BorrowedRef<PyCodeObject> code) {
@@ -1342,9 +1281,6 @@ const char* unsupportedShapeReason311(BorrowedRef<PyCodeObject> code) {
   constexpr Py_ssize_t kMaxShadowBytecodeBytes311 = 65536;
   if (_PyCode_NBYTES(code) > kMaxShadowBytecodeBytes311) {
     return "REFUSE_SHAPE_CODEGEN_SPAN";
-  }
-  if (hasIntConstLocalBinaryAccumulator311(code)) {
-    return "REFUSE_SHAPE_INT_ACCUMULATOR_POLICY";
   }
   PyObject* names = code->co_names;
   if (names == nullptr || !PyTuple_Check(names)) {
@@ -1488,6 +1424,9 @@ bool collectNormalFlowReachable311(
 bool isExecuteOpcodeSupported311(int opcode) {
 #if PY_VERSION_HEX < 0x030C0000
   switch (opcode) {
+    case BUILD_SLICE:
+    case BUILD_STRING:
+    case FORMAT_VALUE:
     case BEFORE_WITH:
     case BINARY_OP:
     case BINARY_SUBSCR:

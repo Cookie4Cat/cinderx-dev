@@ -119,6 +119,13 @@ PYTHONPATH="$REPO_ROOT/cinderx/PythonLib" "$VENV_PY" -m unittest -v \
   test_cinderx.test_kunpeng.test_loop_phi_identity_311 \
   > "$WORK/generator-close.log" 2>&1
 
+CINDERX_PLUGIN_ENABLE=1 CINDERX_EVAL_MODE=cinder \
+CINDERX_JIT_MODE=execute CINDERX_OSR_ENABLED=0 \
+PYTHONJITAUTO=1000000 AUTO_JIT=1000000 \
+PYTHONPATH="$REPO_ROOT/cinderx/PythonLib" "$VENV_PY" -m unittest -v \
+  test_cinderx.test_kunpeng.test_admission_semantics_311 \
+  > "$WORK/admission-semantics.log" 2>&1
+
 # Build sanity only: this shows the debug build CAN run the JIT.  The
 # trigger proof comes from the -R processes themselves, below.
 CINDERX_JIT_MODE=execute PYTHONJITAUTO="$THRESHOLD" \

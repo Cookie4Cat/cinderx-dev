@@ -2636,15 +2636,16 @@ TEST_F(HIRBuildTest, ExecuteSurfaceRefusalNamesExactOpcodeAndOffset311) {
   ASSERT_NE(subscr, nullptr);
   EXPECT_EQ(unsupportedExecuteDetail311(subscr->func_code).reason, nullptr);
 
-  // BUILD_SLICE remains outside normal-flow admission after MR7 enables
-  // ordinary subscripts. Keep the typed refusal/offset negative control.
+  EXPECT_TRUE(isExecuteOpcodeSupported311(BUILD_SLICE));
+  EXPECT_TRUE(isExecuteOpcodeSupported311(FORMAT_VALUE));
+  EXPECT_TRUE(isExecuteOpcodeSupported311(BUILD_STRING));
+  EXPECT_FALSE(isExecuteOpcodeSupported311(IMPORT_STAR));
   Ref<PyFunctionObject> func(
       compileAndGet("def test(values):\n    return values[1:]", "test"));
   ASSERT_NE(func, nullptr);
   ExecuteRefusal311 detail = unsupportedExecuteDetail311(func->func_code);
-  EXPECT_STREQ(detail.reason, "REFUSE_SHAPE_EXECUTE_SURFACE");
-  EXPECT_EQ(detail.opcode, BUILD_SLICE);
-  EXPECT_GE(detail.offset, 0);
+  EXPECT_EQ(detail.reason, nullptr);
+  EXPECT_NE(buildHIR(func), nullptr);
 #endif
 }
 
@@ -2738,7 +2739,7 @@ TEST_F(HIRBuildTest, OversizedBytecode311RefusesCodegenSpan) {
   EXPECT_THROW(buildHIR(func), std::runtime_error);
 }
 
-TEST_F(HIRBuildTest, IntAccumulator311HasStableShapeReason) {
+TEST_F(HIRBuildTest, IntAccumulator311UsesExistingArithmeticLowering) {
   const char* src = R"(
 def test(value):
     value *= 2
@@ -2747,10 +2748,8 @@ def test(value):
   Ref<PyFunctionObject> func(compileAndGet(src, "test"));
   ASSERT_NE(func, nullptr);
 
-  EXPECT_STREQ(
-      unsupportedShapeReason311(func->func_code),
-      "REFUSE_SHAPE_INT_ACCUMULATOR_POLICY");
-  EXPECT_THROW(buildHIR(func), std::runtime_error);
+  EXPECT_EQ(unsupportedShapeReason311(func->func_code), nullptr);
+  EXPECT_NE(buildHIR(func), nullptr);
 }
 #endif
 

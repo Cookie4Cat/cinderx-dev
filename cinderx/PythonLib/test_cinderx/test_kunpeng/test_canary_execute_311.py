@@ -241,7 +241,7 @@ class CanaryExecute311Test(unittest.TestCase):
         self.assertGreaterEqual(stats["machine_code_entries"], 32)
         self.assertEqual(stats["shadow_compile_success"], 0)
 
-    def test_canary_rejects_functions_outside_the_execute_surface(self):
+    def test_canary_admits_slice_construction(self):
         env = dict(os.environ)
         env["CINDERX_JIT_MODE"] = "canary"
         env["PYTHONJITAUTO"] = "1000000"
@@ -255,13 +255,9 @@ class CanaryExecute311Test(unittest.TestCase):
             def uses_slice(a):
                 return a[1:]
 
-            try:
-                cinderjit.force_compile(uses_slice)
-            except RuntimeError as exc:
-                assert "CANNOT_SPECIALIZE" in str(exc), exc
-            else:
-                raise SystemExit(
-                    "execute surface failed to refuse BUILD_SLICE")
+            assert cinderjit.force_compile(uses_slice)
+            assert cinderjit.is_jit_compiled(uses_slice)
+            assert uses_slice([1, 2, 3]) == [2, 3]
             """
         )
         proc = subprocess.run(
@@ -6456,8 +6452,8 @@ class CanaryExecute311Test(unittest.TestCase):
         self.assertIn("signal interrupted the compiled loop", proc.stdout)
 
     def test_handler_only_opcodes_do_not_refuse_the_function(self):
-        # BUILD_SLICE is translated but still outside the normal-flow
-        # execute whitelist. In a handler it can run in the interpreter
+        # Slice handlers and normal-flow slices both preserve semantics.
+        # In a handler slicing can run in the interpreter
         # after deopt without excluding the function's supported normal path.
         probe = self._DUAL_ARM_PREAMBLE + textwrap.dedent(
             """
@@ -6490,14 +6486,8 @@ class CanaryExecute311Test(unittest.TestCase):
                 def normal_flow_slice(d, k):
                     return d[k:]
 
-                try:
-                    cinderjit.force_compile(normal_flow_slice)
-                except RuntimeError as exc:
-                    assert "CANNOT_SPECIALIZE" in str(exc), exc
-                else:
-                    raise SystemExit(
-                        "a normal-flow slice compiled; the reachability "
-                        "scope leaks")
+                assert cinderjit.force_compile(normal_flow_slice)
+                assert normal_flow_slice([1, 2, 3], 1) == [2, 3]
             still_compiled(bump, pick)
             print("JOURNAL " + json.dumps(journal))
             """
@@ -8315,7 +8305,7 @@ class CanaryExecute311Test(unittest.TestCase):
         interp, jit = self._dual_arm(probe)
         self.assertEqual(interp, jit)
 
-    def test_generator_body_outside_the_execute_surface_is_refused(self):
+    def test_generator_body_slice_is_admitted(self):
         env = dict(os.environ)
         env["CINDERX_JIT_MODE"] = "canary"
         env["PYTHONJITAUTO"] = "1000000"
@@ -8329,14 +8319,9 @@ class CanaryExecute311Test(unittest.TestCase):
             def uses_slice(a):
                 yield a[1:]
 
-            try:
-                cinderjit.force_compile(uses_slice)
-            except RuntimeError as exc:
-                assert "CANNOT_SPECIALIZE" in str(exc), exc
-            else:
-                raise SystemExit(
-                    "execute surface compiled a generator with BUILD_SLICE")
-            print("generator slice refused")
+            assert cinderjit.force_compile(uses_slice)
+            assert list(uses_slice([1, 2, 3])) == [[2, 3]]
+            print("generator slice admitted")
             """
         )
         proc = subprocess.run(
@@ -8347,7 +8332,7 @@ class CanaryExecute311Test(unittest.TestCase):
             timeout=120,
         )
         self.assertEqual(proc.returncode, 0, proc.stderr[-2000:])
-        self.assertIn("generator slice refused", proc.stdout)
+        self.assertIn("generator slice admitted", proc.stdout)
 
 
 if __name__ == "__main__":
