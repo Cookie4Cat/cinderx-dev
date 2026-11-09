@@ -33,6 +33,8 @@
 #include <strings.h>
 
 int Ci_Observe311_Enabled;
+extern uint32_t Ci_AutoJit_OpenScopes;
+int Ci_AutoJit_ThreadInScope(void);
 
 static int ci_observe_configured;
 static Ci_JitMode311 ci_observe_mode;
@@ -710,6 +712,13 @@ void Ci_Observe311_OnFrame(
   // resume re-enters this hook at full price (a nested yield-from chain once
   // per level per item).  Synchronous generators are admitted and observed.
   if (code->co_flags & (CO_COROUTINE | CO_ASYNC_GENERATOR)) {
+    return;
+  }
+  // Inside an import/setup scope nothing is scheduled, so skip the frame
+  // entirely; code there starts counting once the scope closes.
+  if (ci_observe_execute &&
+      __atomic_load_n(&Ci_AutoJit_OpenScopes, __ATOMIC_RELAXED) != 0 &&
+      Ci_AutoJit_ThreadInScope()) {
     return;
   }
   // Observation stops where normal execution stops: nothing is counted
