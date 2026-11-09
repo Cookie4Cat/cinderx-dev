@@ -57,6 +57,7 @@ class NoSiteStartup311Tests(unittest.TestCase):
             assert cinderjit.is_enabled()
             assert cinderjit.jit_frame_mode() == 0
             assert not {'os', 'site', 'array', 'cinderx'}.intersection(sys.modules)
+            assert '_cinderx_auto_helpers' not in sys.modules
             bootstrap = sys.modules['_frozen_importlib']
             provider = bootstrap._find_and_load
             assert provider._cinderx_autojit_import_provider == 'find_and_load'
@@ -106,9 +107,22 @@ class NoSiteStartup311Tests(unittest.TestCase):
                 raise AssertionError('loader did not run')
             assert _cinderx._autojit_import_scope_depth() == 0
             import lib2to3.main, multiprocessing.pool
+            assert '_cinderx_auto_helpers' in sys.modules
             assert lib2to3.main.main._cinderx_autojit_setup_provider == 'lib2to3_main'
             assert multiprocessing.pool.Pool.map._cinderx_autojit_setup_provider == 'multiprocessing_pool'
             assert _cinderx._autojit_setup_depth() == 0
+        """)
+
+    def test_setup_hooks_cover_modules_loaded_before_bootstrap(self):
+        self.run_child("""
+            import _cinderx
+            assert '_cinderx_auto_helpers' in sys.modules
+            assert lib2to3.main.main._cinderx_autojit_setup_provider == 'lib2to3_main'
+            assert multiprocessing.pool.Pool.map._cinderx_autojit_setup_provider == 'multiprocessing_pool'
+            assert _cinderx._autojit_import_scope_depth() == 0
+            assert _cinderx._autojit_setup_depth() == 0
+        """, before="""
+            import lib2to3.main, multiprocessing.pool
         """)
 
     def test_import_warning_is_attributed_to_importer(self):
@@ -179,6 +193,77 @@ class NoSiteStartup311Tests(unittest.TestCase):
             import cinderx
             assert cinderx.is_initialized()
         """, extra_env={"CINDERX_JIT_MODE": "off"})
+
+    def test_shutdown_callback_uses_the_standard_registry(self):
+        self.run_child("""
+            import _cinderx
+            initially_loaded = 'atexit' in sys.modules
+            import sysconfig
+            if sys.platform.startswith('linux') and sysconfig.get_config_var('Py_ENABLE_SHARED'):
+                assert not initially_loaded
+            import atexit
+            assert atexit._ncallbacks() == 1
+            events = []
+            atexit.register(events.append, 'ordinary callback')
+            atexit._run_exitfuncs()
+            assert events == ['ordinary callback']
+            assert atexit._ncallbacks() == 0
+        """)
+
+    def test_shutdown_callback_can_be_unregistered(self):
+        self.run_child("""
+            import _cinderx, atexit, weakref, gc
+            callback = _cinderx._clear_strict_modules
+            reference = weakref.ref(callback)
+            del _cinderx._clear_strict_modules
+            del callback
+            gc.collect()
+            assert reference() is not None
+            atexit.unregister(reference())
+            gc.collect()
+            assert reference() is None
+            atexit._run_exitfuncs()
+        """)
+
+    def test_preloaded_atexit_registration_is_respected(self):
+        self.run_child("""
+            import _cinderx, atexit
+            assert registered == [_cinderx._clear_strict_modules]
+            assert atexit._ncallbacks() == 33
+            atexit._run_exitfuncs()
+            assert events == list(reversed(range(32)))
+        """, before="""
+            import atexit
+            events = []
+            for i in range(32):
+                atexit.register(lambda i=i: events.append(i))
+            registered = []
+            original_register = atexit.register
+            def register(callback):
+                registered.append(callback)
+                return original_register(callback)
+            atexit.register = register
+        """)
+
+    def test_shutdown_callback_pins_runtime_after_hooks_are_restored(self):
+        self.run_child("""
+            import gc, weakref
+            reference = weakref.ref(_cinderx_auto._cinderx)
+            sys._clear_type_cache = original_clear
+            sys.settrace, sys.setprofile = original_trace, original_profile
+            sys.modules.pop('cinderjit', None)
+            sys.modules.pop('_cinderx')
+            sys.modules.pop('_cinderx_auto')
+            del _cinderx_auto
+            gc.collect()
+            assert reference() is not None
+        """, before="""
+            original_clear = sys._clear_type_cache
+            original_trace, original_profile = sys.settrace, sys.setprofile
+        """, extra_env={
+            'CINDERX_AUTOJIT_IMPORT_PROVIDER': 'off',
+            'CINDERX_AUTOJIT_SETUP_PROVIDER': 'off',
+        })
 
 
 if __name__ == "__main__":

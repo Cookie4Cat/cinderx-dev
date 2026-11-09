@@ -400,6 +400,23 @@ if (${ENABLE_ZLIB})
         FIND_PACKAGE_ARGS NAMES ZLIB
     )
     find_package(ZLIB REQUIRED)
+    set(CINDERX_ZLIB_TARGET ZLIB::ZLIB)
+    if(${PY_VERSION} EQUAL 3.11 AND CMAKE_SYSTEM_NAME STREQUAL "Linux" AND
+       CMAKE_CXX_COMPILER_ID STREQUAL "GNU")
+      # Use only the archive accompanying the zlib selected by find_package,
+      # so headers and library stay from the same installation.
+      get_filename_component(CINDERX_ZLIB_DIRECTORY "${ZLIB_LIBRARY_RELEASE}" DIRECTORY)
+      if(EXISTS "${CINDERX_ZLIB_DIRECTORY}/libz.a")
+        option(ENABLE_STATIC_ZLIB "Use the matching static zlib for CPython 3.11" ON)
+        if(ENABLE_STATIC_ZLIB)
+          add_library(cinderx_static_zlib STATIC IMPORTED)
+          set_target_properties(cinderx_static_zlib PROPERTIES
+            IMPORTED_LOCATION "${CINDERX_ZLIB_DIRECTORY}/libz.a"
+            INTERFACE_INCLUDE_DIRECTORIES "${ZLIB_INCLUDE_DIRS}")
+          set(CINDERX_ZLIB_TARGET cinderx_static_zlib)
+        endif()
+      endif()
+    endif()
 endif()
 
 ########################################
@@ -475,7 +492,7 @@ if(ENABLE_RUNTIME_TESTS AND NOT ${PY_VERSION} EQUAL 3.11)
   )
 endif()
 if (${ENABLE_ZLIB})
-    target_link_libraries(common PRIVATE asmjit::asmjit fmt::fmt ZLIB::ZLIB)
+    target_link_libraries(common PRIVATE asmjit::asmjit fmt::fmt ${CINDERX_ZLIB_TARGET})
 else()
     target_link_libraries(common PRIVATE asmjit::asmjit fmt::fmt)
 endif()

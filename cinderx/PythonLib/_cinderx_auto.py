@@ -24,24 +24,19 @@ else:
     def _getenv(name, default=None):
         return os.environ.get(name, default)
 
-
 def _env_flag_enabled(name):
     return _getenv(name, "0").lower() in ("1", "true", "yes", "on")
-
 
 def _cinderx_plugin_enabled():
     return _getenv("CINDERX_PLUGIN_ENABLE", "0") == "1"
 
-
 def _cinderx_force_disabled():
     return _env_flag_enabled("CINDERX_DISABLE")
-
 
 def _cinderx_jit_disabled():
     return _env_flag_enabled("CINDERX_JIT_DISABLE") or _env_flag_enabled(
         "PYTHONJITDISABLE"
     )
-
 
 def _cinderx_311_execute_mode():
     # On CPython 3.11 the JIT runs only in the explicit execute mode
@@ -49,7 +44,6 @@ def _cinderx_311_execute_mode():
     # observe and shadow publish no cinderjit module.  The native side
     # applies the same rule (observe.c), disable switches included.
     return _getenv("CINDERX_JIT_MODE", "off") in ("execute", "canary")
-
 
 if _cinderx_plugin_enabled() and not _cinderx_force_disabled():
     import _cinderx  # noqa: F401
@@ -116,182 +110,21 @@ if _cinderx_plugin_enabled() and not _cinderx_force_disabled():
             return "lib2to3_main,multiprocessing_pool"
         return "off"
 
-    def _autojit_setup_provider_tokens(provider=None):
-        if provider is None:
-            provider = _autojit_setup_provider()
-        if provider in ("", "0", "off"):
-            return ()
-        return tuple(
-            token.strip()
-            for token in provider.replace("+", ",").split(",")
-            if token.strip() and token.strip() not in ("0", "off")
-        )
-
     def _maybe_enable_autojit_gate_stats():
-        if cinderjit is None:
+        if cinderjit is None or not _env_flag_enabled("CINDERX_AUTOJIT_GATE_STATS"):
             return
-        if not _env_flag_enabled("CINDERX_AUTOJIT_GATE_STATS"):
-            return
-        clear_stats = getattr(cinderjit, "_clear_autojit_gate_stats", None)
-        read_stats = getattr(cinderjit, "_autojit_gate_stats", None)
-        if clear_stats is None or read_stats is None:
-            return
-
-        clear_stats()
-
-        def dump_autojit_gate_stats():
-            import json
-            import os
-
-            payload = {
-                "argv": sys.argv,
-                "executable": sys.executable,
-                "pid": os.getpid(),
-                "stats": read_stats(),
-            }
-            line = json.dumps(payload, sort_keys=True)
-            stats_file = _getenv("CINDERX_AUTOJIT_GATE_STATS_FILE")
-            if stats_file:
-                with open(stats_file, "a", encoding="utf-8") as out:
-                    out.write(line)
-                    out.write("\n")
-            else:
-                print(_AUTOJIT_GATE_STATS_PREFIX + line, file=sys.stderr)
-
-        import atexit
-
-        atexit.register(dump_autojit_gate_stats)
-
-    def _autojit_setup_predicate_matches(predicate, args):
-        if predicate is None:
-            return True
-        if not args:
-            return False
-        return predicate(args[0])
-
-    def _make_autojit_setup_wrapper(original, provider, predicate=None):
-        def wrapper(*args, **kwargs):
-            if not _autojit_setup_predicate_matches(predicate, args):
-                return original(*args, **kwargs)
-            _cinderx._autojit_setup_enter()
-            try:
-                return original(*args, **kwargs)
-            finally:
-                _cinderx._autojit_setup_leave()
-
-        setattr(wrapper, _AUTOJIT_SETUP_PROVIDER_MARKER, provider)
-        setattr(wrapper, "__wrapped__", original)
-        return wrapper
-
-    def _make_autojit_setup_enter_wrapper(original, provider, predicate=None):
-        def wrapper(*args, **kwargs):
-            if not _autojit_setup_predicate_matches(predicate, args):
-                return original(*args, **kwargs)
-            _cinderx._autojit_setup_enter()
-            try:
-                return original(*args, **kwargs)
-            except BaseException:
-                _cinderx._autojit_setup_leave()
-                raise
-
-        setattr(wrapper, _AUTOJIT_SETUP_PROVIDER_MARKER, provider)
-        setattr(wrapper, "__wrapped__", original)
-        return wrapper
-
-    def _make_autojit_setup_leave_wrapper(original, provider, predicate=None):
-        def wrapper(*args, **kwargs):
-            if not _autojit_setup_predicate_matches(predicate, args):
-                return original(*args, **kwargs)
-            try:
-                return original(*args, **kwargs)
-            finally:
-                _cinderx._autojit_setup_leave()
-
-        setattr(wrapper, _AUTOJIT_SETUP_PROVIDER_MARKER, provider)
-        setattr(wrapper, "__wrapped__", original)
-        return wrapper
-
-    def _is_process_pool_instance(obj):
-        cls = type(obj)
-        return (
-            getattr(cls, "__module__", None) == "multiprocessing.pool"
-            and getattr(cls, "__name__", None) == "Pool"
-        )
-
-    def _wrap_autojit_setup_attr(target, attr, provider, make_wrapper, predicate=None):
-        current = getattr(target, attr, None)
-        if current is None:
-            return
-        if getattr(current, _AUTOJIT_SETUP_PROVIDER_MARKER, None) == provider:
-            return
-        setattr(target, attr, make_wrapper(current, provider, predicate))
-
-    def _install_autojit_multiprocessing_pool_provider(module):
-        pool = getattr(module, "Pool", None)
-        if pool is not None:
-            _wrap_autojit_setup_attr(
-                pool,
-                "__init__",
-                "multiprocessing_pool",
-                _make_autojit_setup_wrapper,
-                _is_process_pool_instance,
-            )
-            _wrap_autojit_setup_attr(
-                pool,
-                "__enter__",
-                "multiprocessing_pool",
-                _make_autojit_setup_enter_wrapper,
-                _is_process_pool_instance,
-            )
-            _wrap_autojit_setup_attr(
-                pool,
-                "__exit__",
-                "multiprocessing_pool",
-                _make_autojit_setup_leave_wrapper,
-                _is_process_pool_instance,
-            )
-            for attr in (
-                "map",
-                "imap",
-                "imap_unordered",
-                "starmap",
-                "map_async",
-                "starmap_async",
-            ):
-                _wrap_autojit_setup_attr(
-                    pool,
-                    attr,
-                    "multiprocessing_pool",
-                    _make_autojit_setup_wrapper,
-                    _is_process_pool_instance,
-                )
+        import _cinderx_auto_helpers
+        _cinderx_auto_helpers._maybe_enable_autojit_gate_stats()
 
     def _maybe_install_autojit_setup_provider_for_module(fullname, provider=None):
-        providers = _autojit_setup_provider_tokens(provider)
-        if not providers:
+        if fullname not in ("lib2to3.main", "multiprocessing.pool"):
             return
-        if "lib2to3_main" in providers and fullname == "lib2to3.main":
-            module = sys.modules.get("lib2to3.main")
-            if module is None:
-                return
-
-            current = getattr(module, "main", None)
-            if current is None:
-                return
-            if (
-                getattr(current, _AUTOJIT_SETUP_PROVIDER_MARKER, None)
-                != "lib2to3_main"
-            ):
-                setattr(
-                    module,
-                    "main",
-                    _make_autojit_setup_wrapper(current, "lib2to3_main"),
-                )
-
-        if "multiprocessing_pool" in providers and fullname == "multiprocessing.pool":
-            module = sys.modules.get("multiprocessing.pool")
-            if module is not None:
-                _install_autojit_multiprocessing_pool_provider(module)
+        if fullname not in sys.modules:
+            return
+        import _cinderx_auto_helpers
+        _cinderx_auto_helpers._maybe_install_autojit_setup_provider_for_module(
+            fullname, provider
+        )
 
     def _make_autojit_import_wrapper(original, provider):
         setup_provider = _autojit_setup_provider()
@@ -369,36 +202,8 @@ if _cinderx_plugin_enabled() and not _cinderx_force_disabled():
     def _maybe_enable_parallel_gc():
         if _getenv("PARALLEL_GC_ENABLED", "0") != "1":
             return
-        if not _cinderx.has_parallel_gc():
-            return
-
-        import gc
-
-        thresholds = gc.get_threshold()
-        parallel_gc_threshold_gen0 = int(
-            _getenv("PARALLEL_GC_THRESHOLD_GEN0", thresholds[0])
-        )
-        parallel_gc_threshold_gen1 = int(
-            _getenv("PARALLEL_GC_THRESHOLD_GEN1", thresholds[1])
-        )
-        parallel_gc_threshold_gen2 = int(
-            _getenv("PARALLEL_GC_THRESHOLD_GEN2", thresholds[2])
-        )
-        gc.set_threshold(
-            parallel_gc_threshold_gen0,
-            parallel_gc_threshold_gen1,
-            parallel_gc_threshold_gen2,
-        )
-
-        parallel_gc_num_threads = int(_getenv("PARALLEL_GC_NUM_THREADS", "0"))
-        parallel_gc_min_generation = int(
-            _getenv("PARALLEL_GC_MIN_GENERATION", "2")
-        )
-
-        _cinderx.enable_parallel_gc(
-            min_generation=parallel_gc_min_generation,
-            num_threads=parallel_gc_num_threads,
-        )
+        import _cinderx_auto_helpers
+        _cinderx_auto_helpers._maybe_enable_parallel_gc()
 
     _maybe_enable_parallel_gc()
     if cinderjit is not None:
