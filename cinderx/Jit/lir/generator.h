@@ -477,10 +477,12 @@ void GeneratePrimitiveArgsPrologueBlock(
 // Handles three paths: kwnames present (call keyword helper), wrong argcount
 // (call incorrect-argcount helper), correct argcount (branch to
 // correct_args_label). The blocks are appended to the block list; the caller
-// is responsible for positioning them.
+// is responsible for positioning them. CP311/AArch64 records local tail-stub
+// calls in env; the emitter keeps their front call slots at eight bytes.
 void GenerateArgcountCheckBlocks(
     Function* lir_func,
     const hir::Function* func,
+    [[maybe_unused]] codegen::Environ* env,
     asmjit::Label correct_args_label,
     asmjit::Label prologue_exit);
 
