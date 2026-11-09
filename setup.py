@@ -269,6 +269,20 @@ def is_env_flag_enabled(value: str | None) -> bool:
     return value not in (None, "", "0")
 
 
+def build_switch_enabled(name: str) -> bool:
+    """PGO/LTO switch: an explicit value wins; unset means on for CPython 3.11.
+
+    Coverage builds cannot use PGO or LTO (see CMakeLists.txt), so they
+    default to off.
+    """
+    value = os.environ.get(name)
+    if value is None:
+        if os.environ.get("CINDERX_ENABLE_COVERAGE") == "1":
+            return False
+        return compute_py_version() == "3.11"
+    return is_env_flag_enabled(value)
+
+
 def pgo_cmake_options(
     generate: bool,
     use: bool,
@@ -402,7 +416,7 @@ class BuildCommand(build):
         return build_ext_cmd
 
     def run(self) -> None:
-        enable_pgo = is_env_flag_enabled(os.environ.get("CINDERX_ENABLE_PGO"))
+        enable_pgo = build_switch_enabled("CINDERX_ENABLE_PGO")
         self._apply_local_to_build_ext()
 
         if enable_pgo:
@@ -817,7 +831,7 @@ class BuildExt(build_ext):
         )
 
         # LTO configuration
-        enable_lto = is_env_flag_enabled(os.environ.get("CINDERX_ENABLE_LTO"))
+        enable_lto = build_switch_enabled("CINDERX_ENABLE_LTO")
         if enable_lto:
             cmake_args.append("-DENABLE_LTO=ON")
             print("Building with LTO enabled (full LTO)")

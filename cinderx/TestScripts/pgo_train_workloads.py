@@ -129,8 +129,19 @@ def initialize_jit(build_lib: str):
         _cinderx.install_frame_evaluator()
     if not cinderjit.is_enabled():
         raise RuntimeError("CinderX JIT is not enabled during PGO training")
-    for _ in range(AUTO_JIT_THRESHOLD + 1):
-        _training_probe(1)
+    # Automatic compilation is held for a short startup grace period
+    # (CINDERX_JIT_STARTUP_GRACE_MS, default 100 ms); keep calling the probe
+    # until the grace period is over instead of checking only once.
+    grace_ms = int(os.environ.get("CINDERX_JIT_STARTUP_GRACE_MS", "100") or "0")
+    deadline = time.monotonic() + grace_ms / 1000 + 2.0
+    while True:
+        for _ in range(AUTO_JIT_THRESHOLD + 1):
+            _training_probe(1)
+        if cinderjit.is_jit_compiled(_training_probe):
+            break
+        if time.monotonic() > deadline:
+            break
+        time.sleep(0.01)
     if not cinderjit.is_jit_compiled(_training_probe):
         raise RuntimeError(
             "CinderX JIT did not compile the training probe with "
