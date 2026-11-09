@@ -41,6 +41,12 @@
 #include "cinderx/module_state.h"
 #include "cinderx/python_runtime.h"
 
+#if PY_VERSION_HEX < 0x030C0000 && defined(__linux__)
+// Optional on statically embedded Python builds.
+extern "C" PyObject* PyInit_atexit(void)
+    __attribute__((weak, visibility("default")));
+#endif
+
 #ifdef ENABLE_PARALLEL_GC
 #include "cinderx/ParallelGC/parallel_gc.h"
 #endif
@@ -1278,6 +1284,67 @@ PyMethodDef _cinderx_methods[] = {
 #endif
     {nullptr, nullptr, 0, nullptr}};
 
+#if PY_VERSION_HEX < 0x030C0000 && defined(__linux__)
+// CPython 3.11.6's atexit register method uses the interpreter's existing
+// callback registry and ignores its module argument. Call that original
+// implementation rather than importing a module just to wrap it.
+// Keep the callback itself: its bound module reference also pins the runtime
+// until shutdown, even when the StrictModule cleanup is a no-op on 3.11.
+// Return 1 for success, 0 to use the public API, and -1 on an exception.
+int tryRegisterShutdownCallback311(PyObject* m) {
+  if (PyInit_atexit == nullptr ||
+      PyDict_GetItemString(PyImport_GetModuleDict(), "atexit") != nullptr) {
+    return 0;
+  }
+  auto* entry = PyImport_Inittab;
+  for (; entry != nullptr && entry->name != nullptr; ++entry) {
+    if (strcmp(entry->name, "atexit") == 0) {
+      break;
+    }
+  }
+  // Preserve replacement initializers and already imported modules whose
+  // register attribute may have been replaced by the caller.
+  if (entry == nullptr || entry->name == nullptr ||
+      entry->initfunc != PyInit_atexit) {
+    return 0;
+  }
+  PyObject* definition = PyInit_atexit();
+  if (definition == nullptr) {
+    return -1;
+  }
+  if (!Py_IS_TYPE(definition, &PyModuleDef_Type)) {
+    Py_DECREF(definition);
+    return 0;
+  }
+  // PyModuleDef_Init returns a static definition without adding a reference.
+  auto* def = reinterpret_cast<PyModuleDef*>(definition);
+  if (def->m_size != 0 || def->m_slots != nullptr ||
+      def->m_methods == nullptr) {
+    return 0;
+  }
+  for (auto* method = def->m_methods; method->ml_name != nullptr; ++method) {
+    if (strcmp(method->ml_name, "register") != 0 ||
+        method->ml_flags != (METH_VARARGS | METH_KEYWORDS)) {
+      continue;
+    }
+    auto callback =
+        Ref<>::steal(PyObject_GetAttrString(m, "_clear_strict_modules"));
+    if (callback == nullptr) {
+      return -1;
+    }
+    auto args = Ref<>::steal(PyTuple_Pack(1, callback.get()));
+    if (args == nullptr) {
+      return -1;
+    }
+    auto register_callback =
+        reinterpret_cast<PyCFunctionWithKeywords>(method->ml_meth);
+    auto result = Ref<>::steal(register_callback(nullptr, args, nullptr));
+    return result == nullptr ? -1 : 1;
+  }
+  return 0;
+}
+#endif
+
 int _cinderx_exec_impl(PyObject* m) {
   // The state will be destroyed in module_free(), which gets called even if
   // this function exits early with an error. Construct it first so that
@@ -1491,9 +1558,12 @@ int _cinderx_exec_impl(PyObject* m) {
   if (PyType_Ready(&PyAsyncCachedClassProperty_Type) < 0) {
     return -1;
   }
+#if PY_VERSION_HEX < 0x030B0000 || PY_VERSION_HEX >= 0x030C0000
+  // The internal key type is unused by the 3.11 Static Python stub.
   if (PyType_Ready(&_Ci_ObjectKeyType) < 0) {
     return -1;
   }
+#endif
 #if PY_VERSION_HEX >= 0x030C0000
   // Wrapper type for JIT-compiled coroutines; 3.11 builds no JIT and never
   // produces one.
@@ -1536,23 +1606,33 @@ int _cinderx_exec_impl(PyObject* m) {
   // sys.modules has been cleared. Instead we want to be called before that
   // happens so we can clear out strict modules first, so we register
   // directly with the atexit library.
-  auto atexit = Ref<>::steal(PyImport_ImportModule("atexit"));
-  if (atexit == nullptr) {
+  int shutdown_callback_registered = 0;
+#if PY_VERSION_HEX < 0x030C0000 && defined(__linux__)
+  shutdown_callback_registered = tryRegisterShutdownCallback311(m);
+  if (shutdown_callback_registered < 0) {
     return -1;
   }
-  auto register_func = Ref<>::steal(PyObject_GetAttrString(atexit, "register"));
-  if (register_func == nullptr) {
-    return -1;
-  }
-  auto clear_strict_modules_func =
-      Ref<>::steal(PyObject_GetAttrString(m, "_clear_strict_modules"));
-  if (clear_strict_modules_func == nullptr) {
-    return -1;
-  }
-  auto res = Ref<>::steal(
-      PyObject_CallOneArg(register_func, clear_strict_modules_func));
-  if (res == nullptr) {
-    return -1;
+#endif
+  if (!shutdown_callback_registered) {
+    auto atexit = Ref<>::steal(PyImport_ImportModule("atexit"));
+    if (atexit == nullptr) {
+      return -1;
+    }
+    auto register_func =
+        Ref<>::steal(PyObject_GetAttrString(atexit, "register"));
+    if (register_func == nullptr) {
+      return -1;
+    }
+    auto clear_strict_modules_func =
+        Ref<>::steal(PyObject_GetAttrString(m, "_clear_strict_modules"));
+    if (clear_strict_modules_func == nullptr) {
+      return -1;
+    }
+    auto res = Ref<>::steal(
+        PyObject_CallOneArg(register_func, clear_strict_modules_func));
+    if (res == nullptr) {
+      return -1;
+    }
   }
 
   // Get the existing cache clear function so we can forward to it.

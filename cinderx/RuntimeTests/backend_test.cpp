@@ -29,6 +29,7 @@
 // NOLINTNEXTLINE(facebook-hte-BadInclude-regex)
 #include <regex>
 #include <sstream>
+#include <stdexcept>
 
 #ifdef BUCK_BUILD
 #include "tools/cxx/Resources.h"
@@ -382,6 +383,28 @@ class BackendTest : public RuntimeTest {
 };
 
 // This is a test harness for experimenting with backends
+TEST_F(BackendTest, StaticInstructionPropertiesKeepOperandRequirements) {
+  const auto& bind = InstrProperty::getProperties(Instruction::kBind);
+  EXPECT_EQ(bind.name, "Bind");
+  EXPECT_EQ(bind.input_phy_uses.size(), 0u);
+  const auto& add = InstrProperty::getProperties(Instruction::kAdd);
+  EXPECT_EQ(add.flag_effects, FlagEffects::kSet);
+  EXPECT_EQ(add.input_phy_uses.size(), 1u);
+  EXPECT_EQ(*add.input_phy_uses.begin(), 1);
+  const auto& mul_add = InstrProperty::getProperties(Instruction::kMulAdd);
+  EXPECT_EQ(mul_add.name, "MulAdd");
+  EXPECT_EQ(
+      std::vector<int>(
+          mul_add.input_phy_uses.begin(), mul_add.input_phy_uses.end()),
+      (std::vector<int>{1, 1, 1}));
+  EXPECT_THROW(
+      InstrProperty::getProperties(Instruction::kNone), std::out_of_range);
+  EXPECT_THROW(
+      InstrProperty::getProperties(
+          static_cast<Instruction::Opcode>(std::numeric_limits<int>::max())),
+      std::out_of_range);
+}
+
 TEST_F(BackendTest, SimpleLoadAttr) {
   const char* src = R"(
 class User:

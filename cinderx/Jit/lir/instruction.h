@@ -5,6 +5,8 @@
 #include "cinderx/Jit/codegen/arch/detection.h"
 #include "cinderx/Jit/lir/operand.h"
 
+#include <array>
+#include <initializer_list>
 #include <memory>
 #include <string_view>
 #include <vector>
@@ -538,13 +540,17 @@ enum InstrGuardKind {
 class InstrProperty {
  public:
   struct InstrInfo;
-  static InstrInfo& getProperties(Instruction::Opcode opcode);
-  static InstrInfo& getProperties(const Instruction* instr) {
+  static const InstrInfo& getProperties(Instruction::Opcode opcode);
+  static const InstrInfo& getProperties(const Instruction* instr) {
     return getProperties(instr->opcode());
   }
 
  private:
-  static std::vector<InstrInfo> prop_map_;
+#define COUNT_INSTR_PROPERTY(...) +1
+  static constexpr size_t kPropertyCount =
+      0 FOREACH_INSTR_TYPE(COUNT_INSTR_PROPERTY);
+#undef COUNT_INSTR_PROPERTY
+  static const std::array<InstrInfo, kPropertyCount> prop_map_;
 };
 
 // Initialize instruction properties
@@ -563,7 +569,7 @@ BEGIN_INSTR_PROPERTY_FIELD
   FIELD_DEFAULT(FlagEffects, flag_effects, FlagEffects::kNone)
   FIELD_DEFAULT(OperandSizeType, opnd_size_type, kDefault)
   FIELD_DEFAULT(bool, output_phy_use, true)
-  FIELD_DEFAULT(std::vector<int>, input_phy_uses, std::vector<int>{})
+  FIELD_NO_DEFAULT(std::initializer_list<int>, input_phy_uses)
   FIELD_DEFAULT(bool, is_essential, false)
 END_INSTR_PROPERTY_FIELD
 // clang-format on
