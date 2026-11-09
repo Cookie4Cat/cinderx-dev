@@ -3863,26 +3863,18 @@ void NativeGenerator::generateCode(
         reinterpret_cast<uint64_t>(&ThreadedCompileContext::interpreter()
                                         ->runtime->gilstate.tstate_current));
     as_->ldr(a64::x9, a64::ptr(a64::x9));
-    // Hand the thread state to the LIR entry bind (INITIAL_TSTATE_REG) so
-    // the frame link does not load it again.
+    // Preserve the thread state for the LIR entry bind.
     as_->mov(a64::x11, a64::x9);
-    as_->ldr(
-        a64::x10,
-        arch::ptr_offset(
-            a64::x9, static_cast<int32_t>(offsetof(PyThreadState, cframe))));
-    // use_tracing is a uint8_t on 3.11 -- must be read as a byte; a
-    // 32-bit load drags in neighboring padding and makes the divert
-    // unconditionally true.
-    static_assert(
-        sizeof(reinterpret_cast<_PyCFrame*>(0)->use_tracing) == 1,
-        "use_tracing width changed");
-    as_->ldrb(
-        a64::w10,
-        arch::ptr_offset(
-            a64::x10,
-            static_cast<int32_t>(offsetof(_PyCFrame, use_tracing)),
-            arch::AccessSize::k8));
-    as_->cbnz(a64::w10, entry_guard_divert);
+    // Match InstalledArtifact's tracing contract even inside a callback:
+    // CPython suppresses recursive events by clearing use_tracing while
+    // c_tracefunc/c_profilefunc remain installed. Entering the binder there
+    // would select an interpreted reentry for an already-bound argument array.
+    for (int32_t offset : {
+             static_cast<int32_t>(offsetof(PyThreadState, c_tracefunc)),
+             static_cast<int32_t>(offsetof(PyThreadState, c_profilefunc))}) {
+      as_->ldr(a64::x10, arch::ptr_offset(a64::x9, offset));
+      as_->cbnz(a64::x10, entry_guard_divert);
+    }
     // Fail closed when the JIT is paused or disabled (the usable byte
     // follows every JIT state transition) or when the frame evaluator is
     // not ours: another PEP 523 client can take the interpreter's slot
