@@ -21,27 +21,29 @@ bool FlagProcessor::hasOptions() {
 }
 
 Option& FlagProcessor::addOption(
-    const std::string& cmdline_flag,
-    const std::string& environment_variable,
-    const std::function<void()>& callback,
-    const std::string& flag_description) {
+    std::string_view cmdline_flag,
+    std::string_view environment_variable,
+    std::function<void()> callback,
+    std::string_view flag_description) {
   return addOption(
       cmdline_flag,
       environment_variable,
-      [=](const std::string&) { callback(); },
+      [callback = std::move(callback)](const std::string&) { callback(); },
       flag_description);
 }
 
 Option& FlagProcessor::addOption(
-    const std::string& cmdline_flag,
-    const std::string& environment_variable,
-    const std::function<void(int)>& callback,
-    const std::string& flag_description) {
+    std::string_view cmdline_flag,
+    std::string_view environment_variable,
+    std::function<void(int)> callback,
+    std::string_view flag_description) {
   assert(!cmdline_flag.empty());
   assert(!flag_description.empty());
 
   std::function<void(const std::string&)> int_callback =
-      [=](const std::string& flag_value) {
+      [cmdline_flag = std::string(cmdline_flag),
+       environment_variable = std::string(environment_variable),
+       callback = std::move(callback)](const std::string& flag_value) {
         try {
           // The callback only gets called for empty X-options, not empty
           // environment variables. This makes `-X foo` equivalent to `-X
@@ -57,19 +59,25 @@ Option& FlagProcessor::addOption(
       };
 
   return addOption(
-      cmdline_flag, environment_variable, int_callback, flag_description);
+      cmdline_flag,
+      environment_variable,
+      std::move(int_callback),
+      flag_description);
 }
 
 Option& FlagProcessor::addOption(
-    const std::string& cmdline_flag,
-    const std::string& environment_variable,
-    const std::function<void(const std::string&)>& callback,
-    const std::string& flag_description) {
+    std::string_view cmdline_flag,
+    std::string_view environment_variable,
+    std::function<void(const std::string&)> callback,
+    std::string_view flag_description) {
   assert(!cmdline_flag.empty());
   assert(!flag_description.empty());
 
   auto option = std::make_unique<Option>(
-      cmdline_flag, environment_variable, callback, flag_description);
+      cmdline_flag,
+      environment_variable,
+      std::move(callback),
+      flag_description);
   Option& optref = *option;
 
   options_.push_back(std::move(option));
@@ -78,49 +86,51 @@ Option& FlagProcessor::addOption(
 }
 
 Option& FlagProcessor::addOption(
-    const std::string& cmdline_flag,
-    const std::string& environment_variable,
+    std::string_view cmdline_flag,
+    std::string_view environment_variable,
     std::string& variable_to_bind_to,
-    const std::string& flag_description) {
+    std::string_view flag_description) {
   std::function<void(const std::string&)> setter =
       [&variable_to_bind_to](const std::string& flag_value) {
         variable_to_bind_to = flag_value;
       };
   return addOption(
-      cmdline_flag, environment_variable, setter, flag_description);
+      cmdline_flag, environment_variable, std::move(setter), flag_description);
 }
 
 Option& FlagProcessor::addOption(
-    const std::string& cmdline_flag,
-    const std::string& environment_variable,
+    std::string_view cmdline_flag,
+    std::string_view environment_variable,
     bool& variable_to_bind_to,
-    const std::string& flag_description) {
+    std::string_view flag_description) {
   std::function<void(int)> setter = [&variable_to_bind_to](int flag_value) {
     variable_to_bind_to = static_cast<bool>(flag_value);
   };
   return addOption(
-      cmdline_flag, environment_variable, setter, flag_description);
+      cmdline_flag, environment_variable, std::move(setter), flag_description);
 }
 
 Option& FlagProcessor::addOption(
-    const std::string& cmdline_flag,
-    const std::string& environment_variable,
+    std::string_view cmdline_flag,
+    std::string_view environment_variable,
     int& variable_to_bind_to,
-    const std::string& flag_description) {
+    std::string_view flag_description) {
   std::function<void(int)> setter = [&variable_to_bind_to](int flag_value) {
     variable_to_bind_to = flag_value;
   };
   return addOption(
-      cmdline_flag, environment_variable, setter, flag_description);
+      cmdline_flag, environment_variable, std::move(setter), flag_description);
 }
 
 Option& FlagProcessor::addOption(
-    const std::string& cmdline_flag,
-    const std::string& environment_variable,
+    std::string_view cmdline_flag,
+    std::string_view environment_variable,
     size_t& variable_to_bind_to,
-    const std::string& flag_description) {
+    std::string_view flag_description) {
   std::function<void(const std::string&)> setter =
-      [=, &variable_to_bind_to](const std::string& flag_value) {
+      [cmdline_flag = std::string(cmdline_flag),
+       environment_variable = std::string(environment_variable),
+       &variable_to_bind_to](const std::string& flag_value) {
         try {
           // The callback only gets called for empty X-options, not empty
           // environment variables. This makes `-X foo` equivalent to `-X
@@ -135,7 +145,7 @@ Option& FlagProcessor::addOption(
         }
       };
   return addOption(
-      cmdline_flag, environment_variable, setter, flag_description);
+      cmdline_flag, environment_variable, std::move(setter), flag_description);
 }
 
 bool FlagProcessor::canHandle(std::string_view option_name) {
@@ -162,11 +172,17 @@ void FlagProcessor::setFlags(PyObject* cmdline_args) {
   for (auto& option : options_) {
     option->handled = false;
 
-    PyObject* key = PyUnicode_FromString(option->cmdline_flag.c_str());
-    assert(key != nullptr);
-
-    PyObject* resolves_to = PyDict_GetItem(cmdline_args, key);
-    Py_DECREF(key);
+    PyObject* resolves_to = nullptr;
+    // The normal startup has no -X options. Avoid constructing a Python
+    // string for every registered flag in that case. Check on each iteration:
+    // a callback is allowed to populate the dictionary for a later flag.
+    if (!PyDict_CheckExact(cmdline_args) ||
+        PyDict_GET_SIZE(cmdline_args) != 0) {
+      PyObject* key = PyUnicode_FromString(option->cmdline_flag.c_str());
+      assert(key != nullptr);
+      resolves_to = PyDict_GetItem(cmdline_args, key);
+      Py_DECREF(key);
+    }
     std::string found;
 
     if (resolves_to != nullptr) {

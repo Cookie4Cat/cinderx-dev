@@ -16,6 +16,47 @@ using JITFlagProcessorTest = RuntimeTest;
 using namespace jit;
 using namespace std;
 
+TEST_F(JITFlagProcessorTest, TemporaryRegistrationMetadataRemainsOwned) {
+  FlagProcessor processor;
+  int value = 0;
+  const std::string name = "temporary-option-name-longer-than-inline-storage";
+  const std::string description =
+      "A description that must remain owned by the option";
+  auto& option = processor.addOption(
+      std::string(name),
+      std::string("CINDERX_TEMPORARY_TEST_OPTION"),
+      value,
+      std::string(description));
+  std::vector<std::string> overwrite(128, std::string(128, 'x'));
+  auto options = Ref<>::steal(PyDict_New());
+  auto setting = Ref<>::steal(PyUnicode_FromString("17"));
+  ASSERT_EQ(PyDict_SetItemString(options, name.c_str(), setting), 0);
+  processor.setFlags(options);
+  EXPECT_EQ(value, 17);
+  EXPECT_TRUE(processor.hasHandled(name));
+  EXPECT_EQ(option.flag_description, description);
+}
+
+TEST_F(JITFlagProcessorTest, EnvironmentCallbackCanPopulateEmptyXOptions) {
+  FlagProcessor processor;
+  auto options = Ref<>::steal(PyDict_New());
+  int value = 0;
+  processor.addOption(
+      "populate-options",
+      "CINDERX_FLAG_PROCESSOR_POPULATE_TEST",
+      [&] {
+        auto setting = Ref<>::steal(PyUnicode_FromString("23"));
+        EXPECT_EQ(PyDict_SetItemString(options, "later-option", setting), 0);
+      },
+      "Populate the later option from an environment callback");
+  processor.addOption("later-option", "", value, "The later option");
+  ASSERT_EQ(setenv("CINDERX_FLAG_PROCESSOR_POPULATE_TEST", "1", 1), 0);
+  processor.setFlags(options);
+  EXPECT_EQ(unsetenv("CINDERX_FLAG_PROCESSOR_POPULATE_TEST"), 0);
+  EXPECT_EQ(value, 23);
+  EXPECT_TRUE(processor.hasHandled("later-option"));
+}
+
 TEST_F(JITFlagProcessorTest, EmptyHelpMessage) {
   auto inst = FlagProcessor();
   ASSERT_EQ(
