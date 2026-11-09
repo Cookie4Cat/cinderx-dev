@@ -692,6 +692,29 @@ if (DEFINED PY_VERSION AND ${PY_VERSION} EQUAL 3.11 AND ${CMAKE_SYSTEM_NAME} MAT
     -Wl,--version-script=${PROJECT_SOURCE_DIR}/_cinderx.version)
   set_target_properties(${PROJECT_NAME} PROPERTIES
     LINK_DEPENDS ${PROJECT_SOURCE_DIR}/_cinderx.version)
+
+  # Avoid loading a second large runtime DSO for a short-lived CPython 3.11
+  # process. Keep the shared unwinder for exceptions across DSO boundaries.
+  # Toolchains without the static C++ runtime retain the existing link mode.
+  if(CMAKE_CXX_COMPILER_ID STREQUAL "GNU")
+    execute_process(
+      COMMAND ${CMAKE_CXX_COMPILER} -print-file-name=libstdc++.a
+      OUTPUT_VARIABLE CINDERX_STATIC_LIBSTDCXX_ARCHIVE
+      OUTPUT_STRIP_TRAILING_WHITESPACE
+      RESULT_VARIABLE CINDERX_STATIC_LIBSTDCXX_RESULT)
+    set(CINDERX_STATIC_LIBSTDCXX_DEFAULT OFF)
+    if(CINDERX_STATIC_LIBSTDCXX_RESULT EQUAL 0 AND
+       EXISTS "${CINDERX_STATIC_LIBSTDCXX_ARCHIVE}")
+      set(CINDERX_STATIC_LIBSTDCXX_DEFAULT ON)
+    endif()
+    option(ENABLE_STATIC_LIBSTDCXX
+      "Link CPython 3.11's C++ runtime statically when available"
+      ${CINDERX_STATIC_LIBSTDCXX_DEFAULT})
+    if(ENABLE_STATIC_LIBSTDCXX)
+      target_link_options(${PROJECT_NAME} PRIVATE
+        -static-libstdc++ -Wl,--gc-sections)
+    endif()
+  endif()
 endif()
 
 set_target_properties(${PROJECT_NAME} PROPERTIES PREFIX "")

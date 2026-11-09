@@ -234,7 +234,7 @@ class AttributeMutator {
       static_cast<uint8_t>(Kind::kMaxValue) <= 8,
       "Kind enum should fit in 3 bits");
 
-  AttributeMutator();
+  constexpr AttributeMutator() : type_(0), split_{} {}
   PyTypeObject* type() const {
     // clear tagged bits and return
     return reinterpret_cast<PyTypeObject*>(type_ & ~kindMask());
@@ -644,7 +644,7 @@ class LoadMethodCache {
   struct Entry {
     BorrowedRef<PyTypeObject> type;
     BorrowedRef<> value;
-    uint32_t keys_version;
+    uint32_t keys_version{0};
 #if PY_VERSION_HEX < 0x030C0000
     // Pull-based validity (see AttributeMutator::typeVersionMatches).
     uint32_t type_version{0};
