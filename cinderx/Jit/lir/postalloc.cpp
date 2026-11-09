@@ -570,7 +570,16 @@ RewriteResult rewriteBranchInstrs(Function* function) {
 
     auto& succs = block->successors();
 
-    if (succs.size() != 1) {
+    // A block whose successor edges all name the same block has a single
+    // control-flow successor even when the edge is recorded more than once
+    // (a conditional branch folded onto one target, or a builder that added
+    // the edge twice); it still needs a branch when it cannot fall through,
+    // which matters once the successor lives in another code section.
+    bool single_successor = !succs.empty() &&
+        std::all_of(succs.begin(), succs.end(), [&](BasicBlock* succ) {
+          return succ == succs[0];
+        });
+    if (!single_successor) {
       // skip conditional branches for now.
       continue;
     }

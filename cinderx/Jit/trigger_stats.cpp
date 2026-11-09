@@ -3,6 +3,7 @@
 #include "cinderx/Jit/trigger_stats.h"
 
 #include "cinderx/Common/ref.h"
+#include "cinderx/Common/spike_env.h"
 
 #include <atomic>
 #include <map>
@@ -12,6 +13,9 @@
 #include <vector>
 
 namespace jit {
+
+const bool g_spike_coldsink = Ci_SpikeGetenv("SPIKE_COLDSINK") != nullptr;
+const bool g_spike_deoptsink = Ci_SpikeGetenv("SPIKE_DEOPTSINK") != nullptr;
 
 namespace {
 

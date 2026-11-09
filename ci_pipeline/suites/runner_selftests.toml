@@ -8,3 +8,7 @@ command = '"$CINDERX_TEST_PYTHON" -m unittest -v ci_pipeline.test_runner_selftes
 [[jobs]]
 name = "runner_tempfiles"
 command = '"$CINDERX_TEST_PYTHON" -m unittest -v ci_pipeline.test_runner_tempfiles'
+
+[[jobs]]
+name = "ref314_contract"
+command = '"$CINDERX_TEST_PYTHON" -m unittest -v ci_pipeline.test_ref314_contract'

@@ -38,3 +38,6 @@ UtilTestNoFixture
 LoopPhiUnboxTest
 LoopBoxing311Test
 LoopAllocationFailure311Test
+TupleLayout311Test
+HirCSENonceTest
+CodeLayoutTest

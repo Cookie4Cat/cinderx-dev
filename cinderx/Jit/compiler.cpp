@@ -3,6 +3,7 @@
 #include "cinderx/Jit/compiler.h"
 
 #include "cinderx/Common/log.h"
+#include "cinderx/Common/spike_env.h"
 #include "cinderx/Jit/bytecode.h"
 #include "cinderx/Jit/codegen/arch/detection.h"
 #include "cinderx/Jit/compile_budget.h"
@@ -17,6 +18,7 @@
 #include "cinderx/Jit/hir/float_accumulator_promotion.h"
 #include "cinderx/Jit/hir/float_comparison_simplification.h"
 #include "cinderx/Jit/hir/guard_removal.h"
+#include "cinderx/Jit/hir/hir_cse.h"
 #include "cinderx/Jit/hir/hir_stats.h"
 #include "cinderx/Jit/hir/inliner.h"
 #include "cinderx/Jit/hir/insert_update_prev_instr.h"
@@ -175,6 +177,14 @@ void Compiler::runPasses(
   // PrimitiveUnboxCSE makes more of those boxes frame-state-only by merging
   // repeated unboxes before remat looks at direct uses.
   runPassIf(hir::PrimitiveUnboxCSE{}, PassConfig::kPrimitiveUnboxCSE);
+  // SPIKE(HIRCSE): dominance-based CSE of pure primitive instructions and
+  // dominated-guard elimination; enabled by the SPIKE_HIRCSE switch.
+  {
+    static const bool spike_hir_cse = Ci_SpikeGetenv("SPIKE_HIRCSE") != nullptr;
+    if (spike_hir_cse) {
+      runPassIf(hir::HirCSE{}, PassConfig::kHirCSE);
+    }
+  }
 #if defined(CINDER_AARCH64)
   // ARM-only: relies on fcmp + signed GT/GE for correct NaN semantics.
   runPassIf(
@@ -383,6 +393,7 @@ PassConfig createConfig() {
   set(hir_opts.phi_elim, PassConfig::kPhiElim);
   set(hir_opts.primitive_box_remat, PassConfig::kPrimitiveBoxRemat);
   set(hir_opts.primitive_unbox_cse, PassConfig::kPrimitiveUnboxCSE);
+  set(hir_opts.hir_cse, PassConfig::kHirCSE);
   set(hir_opts.float_comparison_simplification,
       PassConfig::kFloatComparisonSimplification);
   set(hir_opts.simplify, PassConfig::kSimplify);

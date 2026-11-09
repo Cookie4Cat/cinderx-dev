@@ -919,11 +919,13 @@ void flushAarch64NearDeoptBranches(Environ* env, bool has_fallthrough) {
 #endif
 }
 
+} // namespace
+
 void emitLIRBlocks(
     Environ* env,
     lir::Function* lir_func,
-    const asmjit::CodeHolder* code = nullptr,
-    CodeHolderMetadata* metadata = nullptr) {
+    const asmjit::CodeHolder* code,
+    CodeHolderMetadata* metadata) {
   auto* as = env->as;
   auto& blocks = lir_func->basicblocks();
 
@@ -933,6 +935,24 @@ void emitLIRBlocks(
 
   std::string pending_annotation;
   asmjit::BaseNode* annotation_cursor = nullptr;
+
+  // SPIKE(DEOPTSINK): the near-deopt stubs (b.cond/cbz to a `b deopt`
+  // stub) are flushed after every block, and a block that falls through
+  // pays a taken jump over its stubs.  Their branches reach +-1MB, so for
+  // any function whose LIR is far below that the stubs can be emitted once
+  // after the last block.  Offsets are unknown while building, hence the
+  // LIR instruction count bound (worst case tens of bytes per instruction).
+  bool defer_near_deopt = false;
+#if defined(CINDER_AARCH64)
+  if (g_spike_deoptsink && !getConfig().multiple_code_sections) {
+    constexpr size_t kDeferNearDeoptMaxLirInstrs = 8192;
+    size_t lir_instrs = 0;
+    for (lir::BasicBlock* block : blocks) {
+      lir_instrs += block->instructions().size();
+    }
+    defer_near_deopt = lir_instrs <= kDeferNearDeoptMaxLirInstrs;
+  }
+#endif
 
   for (size_t i = 0; i < blocks.size(); ++i) {
     lir::BasicBlock* basicblock = blocks[i];
@@ -984,9 +1004,17 @@ void emitLIRBlocks(
           std::find(successors.begin(), successors.end(), blocks[i + 1]) !=
           successors.end();
     }
-    flushAarch64NearDeoptBranches(env, has_fallthrough);
+    if (!defer_near_deopt) {
+      flushAarch64NearDeoptBranches(env, has_fallthrough);
+    }
+  }
+  if (defer_near_deopt) {
+    // Nothing falls through past the last block.
+    flushAarch64NearDeoptBranches(env, /*has_fallthrough=*/false);
   }
 }
+
+namespace {
 
 // Emit LIR blocks to machine code, finalize, register debug/perf symbols, and
 // return the entry address.  Shared by all standalone trampoline generators.
@@ -1532,6 +1560,10 @@ void* NativeGenerator::compile(bool shadow) {
       "LIR for {} after register allocation:\n{}",
       GetFunction()->fullname,
       *lir_func);
+
+  if (g_spike_coldsink) {
+    lir_func->sinkColdBlocks();
+  }
 
   PostRegAllocRewrite post_rewrite(lir_func.get(), &env_);
   COMPILE_TIMER(

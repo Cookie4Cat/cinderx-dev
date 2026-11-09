@@ -49,6 +49,7 @@ struct HIROptimizations {
   bool tree_iter_state_machine{true};
   bool primitive_box_remat{true};
   bool primitive_unbox_cse{true};
+  bool hir_cse{true};
   bool float_comparison_simplification{true};
   bool simplify{true};
 };
