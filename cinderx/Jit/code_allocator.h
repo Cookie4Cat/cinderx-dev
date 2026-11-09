@@ -53,7 +53,10 @@ class CodeAllocator : public ICodeAllocator {
   const asmjit::Environment& asmJitEnvironment() const override;
 
  protected:
-  asmjit::JitRuntime runtime_;
+  // CinderX passes only the environment to CodeHolder::init; the runtime's
+  // optional CPU-feature metadata is unused. Keep the allocator fully ready
+  // without probing CPU identification registers and online thread counts.
+  asmjit::JitRuntime runtime_{nullptr, asmjit::CpuFeatures{}};
   std::atomic<size_t> used_bytes_{0};
 };
 
