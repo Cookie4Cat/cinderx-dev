@@ -36,6 +36,8 @@ public:
 
   //! Creates a `JitRuntime` instance.
   ASMJIT_API explicit JitRuntime(const JitAllocator::CreateParams* params = nullptr) noexcept;
+  //! CinderX extension: use caller-supplied feature metadata without probing the host.
+  ASMJIT_API JitRuntime(const JitAllocator::CreateParams* params, const CpuFeatures& features) noexcept;
   //! Destroys the `JitRuntime` instance.
   ASMJIT_API ~JitRuntime() noexcept override;
 

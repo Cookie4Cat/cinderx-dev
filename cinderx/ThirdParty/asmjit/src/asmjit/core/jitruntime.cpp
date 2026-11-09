@@ -20,6 +20,13 @@ JitRuntime::JitRuntime(const JitAllocator::CreateParams* params) noexcept
 
 JitRuntime::~JitRuntime() noexcept {}
 
+JitRuntime::JitRuntime(const JitAllocator::CreateParams* params, const CpuFeatures& features) noexcept
+  : _allocator(params) {
+  _environment = Environment::host();
+  _environment.setObjectFormat(ObjectFormat::kJIT);
+  _cpuFeatures = features;
+}
+
 Error JitRuntime::_add(void** dst, CodeHolder* code) noexcept {
   *dst = nullptr;
 
