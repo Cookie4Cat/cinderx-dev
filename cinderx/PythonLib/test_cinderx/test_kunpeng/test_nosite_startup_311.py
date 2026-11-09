@@ -49,6 +49,37 @@ class NoSiteStartup311Tests(unittest.TestCase):
         self.assertEqual(result.returncode, expected, result.stdout + result.stderr)
         return result
 
+    def test_generator_pool_exhaustion_recycling_and_deopt(self):
+        self.run_child("""
+            import _cinderx, cinderjit, gc
+
+            def numbers():
+                yield 11
+                yield 23
+
+            assert cinderjit.force_compile(numbers)
+            # Exceed the 2048-slot arena, then mix untouched, recycled and
+            # ordinary GC allocations. Repeat to catch stale free-list links.
+            for cycle in range(3):
+                generators = [numbers() for _ in range(2065)]
+                assert all(next(g) == 11 for g in generators)
+                for i in range(0, len(generators), 2):
+                    generators[i].close()
+                    generators[i] = None
+                gc.collect()
+                replacements = [numbers() for _ in range(1100)]
+                assert all(next(g) == 11 for g in replacements)
+                survivors = [g for g in generators if g is not None]
+                # Materializing frames exercises arena-aware deoptimization.
+                assert all(g.gi_frame is not None for g in survivors)
+                assert all(next(g) == 23 for g in survivors)
+                for g in survivors + replacements:
+                    g.close()
+                del generators, replacements, survivors, g
+                gc.collect()
+            assert cinderjit.is_enabled()
+        """, extra_env={"PYTHONJITGENERATOR": "1"})
+
     def test_runtime_ready_before_public_api_import(self):
         self.run_child("""
             import _cinderx, cinderjit

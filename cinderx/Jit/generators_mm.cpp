@@ -46,19 +46,17 @@ std::pair<JitGenObject*, size_t> allocateNonFreeList(
 } // namespace
 
 JitGenFreeList:: // NOLINT(cppcoreguidelines-pro-type-member-init)
-    JitGenFreeList() {
-  Entry* next = nullptr;
-  for (size_t i = 0; i < kGenFreeListEntries; ++i) {
-    entries_[i].next = next;
-    next = &entries_[i];
-  }
-  head_ = next;
-}
+    JitGenFreeList() {}
 
 void* JitGenFreeList::rawAllocate() {
-  JIT_DCHECK(head_, "No free generator entries");
-  Entry* entry = head_;
-  head_ = entry->next;
+  JIT_DCHECK(head_ || unused_ != 0, "No free generator entries");
+  Entry* entry;
+  if (head_ != nullptr) {
+    entry = head_;
+    head_ = entry->next;
+  } else {
+    entry = &entries_[--unused_];
+  }
   // The memory for the free-list is backed by the module state, so bump the
   // reference count to prevent it being free'd before all free-listed
   // generators are.
@@ -112,11 +110,11 @@ std::pair<JitGenObject*, size_t> JitGenFreeList::allocate(
   // 3.11 deopt restores PyGen_Type, whose dealloc is patched to the
   // arena-aware path at type initialisation; a free-list entry must never be
   // handed to CPython's own destructor.
-  if (!head_ || total_size > kGenFreeListEntrySize) {
+  if ((!head_ && unused_ == 0) || total_size > kGenFreeListEntrySize) {
     return allocateNonFreeList(slots, is_coro);
   }
 #else
-  if (!head_ || total_size > kGenFreeListEntrySize) {
+  if ((!head_ && unused_ == 0) || total_size > kGenFreeListEntrySize) {
     return allocateNonFreeList(slots, is_coro);
   }
 #endif
