@@ -1045,6 +1045,13 @@ def case_array_record_identity():
     cache = subscr_cache(real)
     assert cache == ("BINARY_SUBSCR_ADAPTIVE", ARRTC_TAG | ord("d")), cache
 
+    # The earlier non-array observation must survive lazy type resolution.
+    # Reading the same site with a real array is mixed, not array-only.
+    for _ in range(100):
+        assert read(warm) == 0.5
+    cache = subscr_cache(read)
+    assert cache == ("BINARY_SUBSCR_ADAPTIVE", 0x80FF), cache
+
 
 def case_array_record_leftover_version():
     """A BINARY_SUBSCR_GETITEM site that deopts back to the adaptive form keeps

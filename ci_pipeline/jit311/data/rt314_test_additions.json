@@ -3,6 +3,8 @@
     "hir_cse_test.txt": "156c4ab4477a9835b9ae67d7e934e5b7ae8a4b989d42164b8238b7fa7b1cf29d"
   },
   "test_additions": {
+    "BackendTest.StaticInstructionPropertiesKeepOperandRequirements": "pass",
+    "CodeAllocatorTest.ExplicitAsmJitMetadataKeepsTheHostEnvironment": "pass",
     "CodeLayoutTest.AppendingKnownSuccessorDoesNotDuplicateItsEdge": "pass",
     "CodeLayoutTest.ColdSinkPreservesStableOrderAndControlFlow": "pass",
     "CodeLayoutTest.NearDeoptPlacementHonorsSizeAndSectionBoundaries": "skip",
@@ -14,7 +16,10 @@
     "HirCSENonceTest.PrimitiveKeysPreserveTypesOperatorsAndOperandOrder": "pass",
     "HirCSENonceTest.SiblingExpressionsAndGuardsDoNotEscapeTheirScope": "pass",
     "HirCSETest.MergesRepeatedCompactLongChecksAndUnboxesAndDropsDominatedGuard": "pass",
-    "HirCSETest.ReusesAcrossDominatedBlocksButNotAcrossSiblings": "pass"
+    "HirCSETest.ReusesAcrossDominatedBlocksButNotAcrossSiblings": "pass",
+    "InlineCacheTest.ConstantInitializedEntriesHaveEmptySentinels": "pass",
+    "JITFlagProcessorTest.EnvironmentCallbackCanPopulateEmptyXOptions": "pass",
+    "JITFlagProcessorTest.TemporaryRegistrationMetadataRemainsOwned": "pass"
   },
   "skip_reason": "CodeLayoutTest.NearDeoptPlacementHonorsSizeAndSectionBoundaries: CP314 default SPIKE_DEOPTSINK is disabled; CP311 AArch64 executes the boundary test."
 }
