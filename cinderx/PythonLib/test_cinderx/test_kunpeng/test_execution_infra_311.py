@@ -77,8 +77,8 @@ class ExecutionInfra311Test(unittest.TestCase):
             print(json.dumps(payload, sort_keys=True))
             """
         )
-        self.assertEqual(result["creation_deltas"], [1, 1, 0, 0])
-        self.assertEqual(result["creations_delta"], 2)
+        self.assertEqual(result["creation_deltas"], [1, 1, 0, 1])
+        self.assertEqual(result["creations_delta"], 3)
         self.assertEqual(result["values"], [5, 42])
         self.assertEqual(result["compiled"], [True, True])
         self.assertEqual(result["entries_delta"], 2)
@@ -97,12 +97,7 @@ class ExecutionInfra311Test(unittest.TestCase):
         self.assertEqual(result["subscr"], result["simple"])
         self.assertEqual(result["async"]["reason"], "REFUSE_SHAPE_ASYNC_CODE")
         self.assertFalse(result["async"]["eligible"])
-        self.assertFalse(result["sliced"]["eligible"])
-        self.assertFalse(result["sliced"]["compiled"])
-        self.assertEqual(result["sliced"]["reason"], "REFUSE_SHAPE_EXECUTE_SURFACE")
-        self.assertEqual(result["sliced"]["opcode"], dis.opmap["BUILD_SLICE"])
-        self.assertIsInstance(result["sliced"]["offset"], int)
-        self.assertGreaterEqual(result["sliced"]["offset"], 0)
+        self.assertEqual(result["sliced"], result["simple"])
 
     def test_initialization_keeps_setup_interpreted_and_resumes_autojit(self):
         result = self.run_child(

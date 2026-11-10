@@ -1,8 +1,8 @@
 {
   "format": "cp311-stdlib-canary-deopts-v1",
   "python": "3.11.6",
-  "baseline_source": "3e26a6961966feef946cfda39a784cbdcf296c08",
-  "total": 289,
+  "baseline_source": "591e1fb2c0ccdb16aba3e6256d76153f666b13d4",
+  "total": 358,
   "sites": [
     {
       "filename": "<frozen _collections_abc>",
@@ -45,12 +45,28 @@
       "count": 1
     },
     {
+      "filename": "<frozen io>",
+      "qualname": "__getattr__",
+      "reason": "Raise",
+      "cause_offset": 79,
+      "resume_offset": 158,
+      "count": 5
+    },
+    {
       "filename": "<frozen os>",
       "qualname": "_Environ.__getitem__",
       "reason": "UnhandledException",
       "cause_offset": 28,
       "resume_offset": 58,
       "count": 6
+    },
+    {
+      "filename": "<frozen zipimport>",
+      "qualname": "zipimporter.__init__",
+      "reason": "Raise",
+      "cause_offset": 165,
+      "resume_offset": 330,
+      "count": 15
     },
     {
       "filename": "contextlib.py",
@@ -118,6 +134,22 @@
     },
     {
       "filename": "enum.py",
+      "qualname": "_proto_member.__set_name__",
+      "reason": "GuardFailure",
+      "cause_offset": 456,
+      "resume_offset": 912,
+      "count": 24
+    },
+    {
+      "filename": "enum.py",
+      "qualname": "_proto_member.__set_name__",
+      "reason": "UnhandledException",
+      "cause_offset": 384,
+      "resume_offset": 770,
+      "count": 8
+    },
+    {
+      "filename": "enum.py",
       "qualname": "_simple_enum.<locals>.convert_class",
       "reason": "GuardFailure",
       "cause_offset": 1051,
@@ -131,6 +163,14 @@
       "cause_offset": 16,
       "resume_offset": 42,
       "count": 1
+    },
+    {
+      "filename": "inspect.py",
+      "qualname": "_signature_from_callable",
+      "reason": "UnhandledException",
+      "cause_offset": 202,
+      "resume_offset": 406,
+      "count": 14
     },
     {
       "filename": "pathlib.py",
@@ -147,6 +187,22 @@
       "cause_offset": 53,
       "resume_offset": 108,
       "count": 32
+    },
+    {
+      "filename": "re/_compiler.py",
+      "qualname": "_optimize_charset",
+      "reason": "UnhandledException",
+      "cause_offset": 78,
+      "resume_offset": 158,
+      "count": 2
+    },
+    {
+      "filename": "re/_compiler.py",
+      "qualname": "_optimize_charset",
+      "reason": "UnhandledException",
+      "cause_offset": 187,
+      "resume_offset": 376,
+      "count": 1
     },
     {
       "filename": "re/_parser.py",

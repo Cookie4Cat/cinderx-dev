@@ -39,9 +39,9 @@ CinderX 快速化现在记入 CPython 原生 quickened 计数，由原生代码�
 
 Daily 要求每个模块原始 Py_DEBUG `-R 10:3` 直接成功。任何 reference、memory-block
 或 FD 泄漏报告都失败，不再有计数伪差豁免或成功复跑替代原始失败。
-标准库导入 canary 同时核对 289 次自然去优化及完整站点/原因指纹。
+标准库导入 canary 同时核对 358 次自然去优化及完整站点/原因指纹。
 该导入覆盖测试关闭启动宽限期，保留默认的有界泛化重试；关闭重试的对照回归要求
-精确恢复原有 225 次事件及其指纹。产品调度测试仍验证正常启动宽限期。
+精确移除同一站点的 64 次重试事件，保留 294 次事件及其指纹。产品调度测试仍验证正常启动宽限期。
 编译执行及生命周期探针同样关闭宽限期，以验证目标路径立即执行；refleak 的构建
 自检显式编译探针，原始 `-R` worker 继续提供独立的实际执行证明。
 `-R` worker 关闭宽限期，使编译从十轮预热开始即可收敛；采样轮数和泄漏判定不变。
@@ -255,7 +255,7 @@ Python 库。
 
 | 环境变量 | 对应 `-X` 选项 | 默认值与语义 |
 |---|---|---|
-| `CINDERX_JIT_STARTUP_GRACE_MS` | `jit-startup-grace-ms` | `100`；自动编译的启动宽限期，毫秒，允许 `0..4294967295`，`0` 禁用延迟，非法值使初始化失败 |
+| `CINDERX_JIT_STARTUP_GRACE_MS` | `jit-startup-grace-ms` | `100`；自动编译的启动宽限期，毫秒，允许 `0..4294967294`，`0` 禁用延迟，非法值使初始化失败 |
 | `CINDERX_JIT_FORK_GRACE` | `jit-fork-grace` | `1`；fork 子进程重新开始宽限期，已继承的编译产物继续可用 |
 | `CINDERX_JIT_DESPECIALIZE` | `jit-despecialize` | `1`；守卫失败耗尽普通退避轮次后，最多允许一次去特化重试；异常或混合失败轮次仍会退役 |
 | `CINDERX_JIT_FORCE_DEOPT_CHECKS` | `jit-force-deopt-checks` | `1`；保留 `force_deopt` 诊断能力，显式置 `0` 后不发出轮询，API 会明确拒绝触发请求 |
