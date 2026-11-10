@@ -640,9 +640,13 @@ def stdlib_canary_runner(*, judges: list[Judge] | None = None) -> RunnerSpec:
     # CPython 3.11.6 venv preserve every old site.
     # Disabling generic retry still removes only its 64-event site, leaving
     # 294 events, including all 69 admission events.
+    # Lazy startup initialization adds one more event at the existing
+    # zipimporter.__init__ Raise site (15 -> 16). Same-interpreter comparison
+    # against the pre-startup-optimization tree preserves every other site;
+    # totals are now 359 with retry and 295 without its 64-event site.
     # Preserve the exact total AND the independently attributed site/reason
     # fingerprint; equal totals must not hide a different failure path.
-    default = execute_holds(expected_organic_deopts=358) + [
+    default = execute_holds(expected_organic_deopts=359) + [
         expect("compile_requests", ">", 0),
         expect("target_modules_attempted", "==", 72),
     ]

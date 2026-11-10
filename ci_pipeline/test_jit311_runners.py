@@ -868,13 +868,13 @@ def test_unexpected_organic_deopt_turns_red():
 
 
 def test_stdlib_organic_deopt_count_drift_turns_red():
-    for drift in (36, 225, 289, 294, 356, 357, 359):
+    for drift in (36, 225, 289, 294, 295, 356, 357, 358, 360):
         errors = [
             error
             for judge in runners.stdlib_canary_runner().judges
             for error in judge({"organic_deopt_hits": drift})
         ]
-        assert any("organic_deopt_hits == 358" in error for error in errors)
+        assert any("organic_deopt_hits == 359" in error for error in errors)
 
 
 def test_stdlib_canary_has_real_entries_and_exact_deopt_sites(monkeypatch):
@@ -883,13 +883,13 @@ def test_stdlib_canary_has_real_entries_and_exact_deopt_sites(monkeypatch):
     monkeypatch.setenv("CINDERX_JIT_STARTUP_GRACE_MS", "60000")
     result = runners.run(runners.stdlib_canary_runner())
     assert result.ok, result.summary()
-    assert result.report["organic_deopt_hits"] == 358
+    assert result.report["organic_deopt_hits"] == 359
     assert result.report["machine_code_entries"] > 0
 
 
 def test_stdlib_canary_retry_opt_out_restores_previous_fingerprint(tmp_path):
     spec = runners.stdlib_canary_runner(
-        judges=runners.execute_holds(expected_organic_deopts=294)
+        judges=runners.execute_holds(expected_organic_deopts=295)
         + [runners.expect("target_modules_attempted", "==", 72)]
     )
     spec.env["CINDERX_JIT_DESPECIALIZE"] = "0"
@@ -905,12 +905,12 @@ def test_stdlib_canary_retry_opt_out_restores_previous_fingerprint(tmp_path):
     }
     assert manifest["sites"].count(retry_site) == 1
     manifest["sites"].remove(retry_site)
-    manifest["total"] = 294
+    manifest["total"] = 295
     spec.deopt_manifest = tmp_path / "without-generic-retry.json"
     spec.deopt_manifest.write_text(json.dumps(manifest))
     result = runners.run(spec)
     assert result.ok, result.summary()
-    assert result.report["organic_deopt_hits"] == 294
+    assert result.report["organic_deopt_hits"] == 295
 
 
 def test_stdlib_deopt_fingerprint_rejects_equal_total_drift():
@@ -923,19 +923,19 @@ def test_stdlib_deopt_fingerprint_rejects_equal_total_drift():
                    forced=False, instrumentation=False)
         rows.extend(deepcopy(row) for _ in range(site["count"]))
     ledger = {"dropped": 0, "rows": rows}
-    assert check(ledger, manifest, 358) == []
+    assert check(ledger, manifest, 359) == []
     drift = deepcopy(ledger)
     drift["rows"][0]["deopt_reason"] = "UnexpectedReason"
-    assert check(drift, manifest, 358)
+    assert check(drift, manifest, 359)
     for field in ("filename", "qualname", "cause_offset", "resume_offset"):
         drift = deepcopy(ledger)
         drift["rows"][0][field] = 99999 if field.endswith("offset") else "unexpected"
-        assert check(drift, manifest, 358)
+        assert check(drift, manifest, 359)
     for bad in ({"dropped": 1, "rows": rows}, {"dropped": 0, "rows": rows[:-1]}, {}, None):
-        assert check(bad, manifest, 358)
+        assert check(bad, manifest, 359)
     drift = deepcopy(ledger)
     drift["rows"][0]["forced"] = True
-    assert check(drift, manifest, 358)
+    assert check(drift, manifest, 359)
 
 
 def test_green_gate_refuses_skips(tmp_path):
@@ -1184,7 +1184,11 @@ def test_canary_population_resolves_cp311_deferred_fixture(tmp_path):
 
 def test_recovered_execution_cases_are_in_canary_population():
     population = _canary_population()
-    assert len({node for node in population if node.startswith("ASMGeneratorTest.")}) == 46
+    assert len({node for node in population if node.startswith("ASMGeneratorTest.")}) == 48
+    assert {
+        "ASMGeneratorTest.BindingEntryTailStubsPreserveCallSlots311",
+        "ASMGeneratorTest.Aarch64PointerLiteralPoolUsesNaturalAlignment",
+    } <= population
     assert {"NewASMGeneratorTest.Linear", "NewASMGeneratorTest.DiamondControlBlock"} <= population
     assert {
         "HIRBuildDeferredTest." + name for name in (
