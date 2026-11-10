@@ -862,6 +862,39 @@ def _make(original, provider, setup_provider, enter, leave, install, marker):
 
 def _make_autojit_import_wrapper(original: object, provider: str) -> object:
     setup_provider = _autojit_setup_provider()
+    if sys.version_info[:2] == (3, 11):
+        enter = _autojit_import_enter
+        leave = _autojit_import_leave
+        install = _maybe_install_autojit_setup_provider_for_module
+
+        def wrapper(*args: object, **kwargs: object) -> object:
+            enter()
+            try:
+                # pyre-ignore[29]: The wrapped import callable is dynamic.
+                module = original(*args, **kwargs)
+            finally:
+                leave()
+            if setup_provider and args and isinstance(args[0], str):
+                install(args[0], setup_provider)
+            return module
+
+        # Preserve warnings' import-machinery filename filtering and the old
+        # isolated globals/closure contract, without parsing source at startup.
+        code = wrapper.__code__.replace(
+            co_filename=_AUTOJIT_IMPORT_WRAPPER_FILENAME,
+            co_firstlineno=3,
+            co_qualname="_make.<locals>.wrapper",
+        )
+        wrapper = type(wrapper)(
+            code,
+            {"__builtins__": wrapper.__builtins__},
+            "wrapper",
+            None,
+            wrapper.__closure__,
+        )
+        setattr(wrapper, _AUTOJIT_IMPORT_PROVIDER_MARKER, provider)
+        setattr(wrapper, "__wrapped__", original)
+        return wrapper
     namespace: dict[str, object] = {}
     exec(
         compile(
@@ -894,6 +927,8 @@ def _install_autojit_import_provider() -> None:
         attr = "__import__"
     elif provider == "find_and_load":
         target = sys.modules.get("importlib._bootstrap")
+        if target is None and sys.version_info[:2] == (3, 11):
+            target = sys.modules.get("_frozen_importlib")
         attr = "_find_and_load"
     else:
         return

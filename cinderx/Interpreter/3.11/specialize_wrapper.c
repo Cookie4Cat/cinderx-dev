@@ -346,7 +346,7 @@ static void Ci_RecordSubscrContainer_311(
     // Specialized: only a failed site's record means anything.
     return;
   }
-  PyTypeObject* array_type = Ci_StdlibArrayTypeIfResolved();
+  PyTypeObject* array_type = Ci_StdlibArrayTypeForContainer311(container);
   if (array_type == NULL) {
     return;
   }

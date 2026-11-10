@@ -400,6 +400,23 @@ if (${ENABLE_ZLIB})
         FIND_PACKAGE_ARGS NAMES ZLIB
     )
     find_package(ZLIB REQUIRED)
+    set(CINDERX_ZLIB_TARGET ZLIB::ZLIB)
+    if(${PY_VERSION} EQUAL 3.11 AND CMAKE_SYSTEM_NAME STREQUAL "Linux" AND
+       CMAKE_CXX_COMPILER_ID STREQUAL "GNU")
+      # Use only the archive accompanying the zlib selected by find_package,
+      # so headers and library stay from the same installation.
+      get_filename_component(CINDERX_ZLIB_DIRECTORY "${ZLIB_LIBRARY_RELEASE}" DIRECTORY)
+      if(EXISTS "${CINDERX_ZLIB_DIRECTORY}/libz.a")
+        option(ENABLE_STATIC_ZLIB "Use the matching static zlib for CPython 3.11" ON)
+        if(ENABLE_STATIC_ZLIB)
+          add_library(cinderx_static_zlib STATIC IMPORTED)
+          set_target_properties(cinderx_static_zlib PROPERTIES
+            IMPORTED_LOCATION "${CINDERX_ZLIB_DIRECTORY}/libz.a"
+            INTERFACE_INCLUDE_DIRECTORIES "${ZLIB_INCLUDE_DIRS}")
+          set(CINDERX_ZLIB_TARGET cinderx_static_zlib)
+        endif()
+      endif()
+    endif()
 endif()
 
 ########################################
@@ -475,7 +492,7 @@ if(ENABLE_RUNTIME_TESTS AND NOT ${PY_VERSION} EQUAL 3.11)
   )
 endif()
 if (${ENABLE_ZLIB})
-    target_link_libraries(common PRIVATE asmjit::asmjit fmt::fmt ZLIB::ZLIB)
+    target_link_libraries(common PRIVATE asmjit::asmjit fmt::fmt ${CINDERX_ZLIB_TARGET})
 else()
     target_link_libraries(common PRIVATE asmjit::asmjit fmt::fmt)
 endif()
@@ -512,6 +529,12 @@ if (${PY_VERSION} EQUAL 3.11)
     ${PROJECT_SOURCE_DIR}/Interpreter/3.11/cinder_opcode_tables.c
   )
   if (${ENABLE_INTERPRETER_LOOP})
+    include(${PROJECT_SOURCE_DIR}/Interpreter/3.11/coroutine_call.cmake)
+    cinderx_generate_coroutine_ceval_311("${GENERATED_HEADER_DIR}")
+    set_property(
+      SOURCE ${PROJECT_SOURCE_DIR}/Interpreter/3.11/ceval_wrapper.c
+      APPEND PROPERTY INCLUDE_DIRECTORIES
+      ${PROJECT_SOURCE_DIR}/Interpreter/3.11/upstream)
     set(INTERP_SOURCES
       ${INTERP_SOURCES}
       ${PROJECT_SOURCE_DIR}/Interpreter/3.11/borrowed-ceval.gen_cached.c
@@ -686,6 +709,32 @@ if (DEFINED PY_VERSION AND ${PY_VERSION} EQUAL 3.11 AND ${CMAKE_SYSTEM_NAME} MAT
     -Wl,--version-script=${PROJECT_SOURCE_DIR}/_cinderx.version)
   set_target_properties(${PROJECT_NAME} PROPERTIES
     LINK_DEPENDS ${PROJECT_SOURCE_DIR}/_cinderx.version)
+
+  # Avoid loading a second large runtime DSO for a short-lived CPython 3.11
+  # process. Keep the shared unwinder for exceptions across DSO boundaries.
+  # Toolchains without the static C++ runtime retain the existing link mode.
+  if(CMAKE_CXX_COMPILER_ID STREQUAL "GNU")
+    # All supported Linux runtimes understand GNU hashing; avoid mapping an
+    # additional, unused SysV symbol hash table during extension loading.
+    target_link_options(${PROJECT_NAME} PRIVATE -Wl,--hash-style=gnu)
+    execute_process(
+      COMMAND ${CMAKE_CXX_COMPILER} -print-file-name=libstdc++.a
+      OUTPUT_VARIABLE CINDERX_STATIC_LIBSTDCXX_ARCHIVE
+      OUTPUT_STRIP_TRAILING_WHITESPACE
+      RESULT_VARIABLE CINDERX_STATIC_LIBSTDCXX_RESULT)
+    set(CINDERX_STATIC_LIBSTDCXX_DEFAULT OFF)
+    if(CINDERX_STATIC_LIBSTDCXX_RESULT EQUAL 0 AND
+       EXISTS "${CINDERX_STATIC_LIBSTDCXX_ARCHIVE}")
+      set(CINDERX_STATIC_LIBSTDCXX_DEFAULT ON)
+    endif()
+    option(ENABLE_STATIC_LIBSTDCXX
+      "Link CPython 3.11's C++ runtime statically when available"
+      ${CINDERX_STATIC_LIBSTDCXX_DEFAULT})
+    if(ENABLE_STATIC_LIBSTDCXX)
+      target_link_options(${PROJECT_NAME} PRIVATE
+        -static-libstdc++ -Wl,--gc-sections)
+    endif()
+  endif()
 endif()
 
 set_target_properties(${PROJECT_NAME} PROPERTIES PREFIX "")

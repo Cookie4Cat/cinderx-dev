@@ -6843,15 +6843,10 @@ int initialize() {
         "point; another component holds it");
     return -1;
   }
-  // SPIKE(ARRTC): the interpreter's subscript record reads an array's
-  // descriptor only for the validated array.array type object, and it runs
-  // inside the specializer, where resolving the type would re-enter the
-  // interpreter.  Resolve it here, before any site records; a failure leaves
-  // it unresolved and the record off.
-  static const bool spike_arrtc = Ci_SpikeGetenv("SPIKE_ARRTC") != nullptr;
-  if (spike_arrtc) {
-    jit::hir::getStdlibArrayType();
-  }
+  // Array metadata is validated on the first live array container (without
+  // imports/callbacks in the specializer), or during ordinary compilation
+  // after the application imports array. A no-array process need not import
+  // array/collections.abc merely to enable the JIT.
   // Publish process-global quickening policy only after execute-mode
   // initialization can no longer fail. CPython starts co_warmup at -8;
   // advancing by eight quickens on the first interpreted entry, before the

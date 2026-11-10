@@ -224,7 +224,7 @@ bool Instruction::getInputPhyRegUse(size_t i) const {
     return false;
   }
 
-  return uses.at(i);
+  return uses.begin()[i];
 }
 
 bool Instruction::inputsLiveAcross() const {
@@ -405,14 +405,19 @@ Instruction::Opcode Instruction::compareToBranchCC(Opcode opcode) {
   }
 }
 
-InstrProperty::InstrInfo& InstrProperty::getProperties(
+const InstrProperty::InstrInfo& InstrProperty::getProperties(
     Instruction::Opcode opcode) {
   return prop_map_.at(opcode);
 }
 
-#define BEGIN_INSTR_PROPERTY \
-  std::vector<InstrProperty::InstrInfo> InstrProperty::prop_map_ = {
+// Aggregate initialization gives each operand list static storage duration.
+// Keep the metadata immutable and avoid constructing/copying vectors at load.
+#define BEGIN_INSTR_PROPERTY                                         \
+  constexpr std::                                                    \
+      array<InstrProperty::InstrInfo, InstrProperty::kPropertyCount> \
+          InstrProperty::prop_map_ = {{
 #define END_INSTR_PROPERTY \
+  }                        \
   }                        \
   ;
 

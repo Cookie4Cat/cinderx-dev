@@ -23,10 +23,10 @@ struct StdlibArrayObject {
   Py_ssize_t ob_exports;
 };
 
-// Get the array.array type object for fast path type guards. Pre-cached with
-// runtime layout validation; returns nullptr when the array module cannot be
-// imported, the layout cannot be validated, or compilation is running on a
-// worker thread (the cache is only initialized on the main thread).
+// Get array.array for fast guards after runtime layout validation. CPython
+// 3.11 only resolves an already-loaded module, or a live container through the
+// interpreter's no-callback buffer validation. Other versions retain eager
+// import on demand. Worker threads never initialize the cache.
 PyTypeObject* getStdlibArrayType();
 
 } // namespace jit::hir

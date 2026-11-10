@@ -42,6 +42,19 @@ const uint8_t* addressAtOffset(const void* base, uintptr_t offset) {
       reinterpret_cast<uintptr_t>(base) + offset);
 }
 
+TEST_F(CodeAllocatorTest, ExplicitAsmJitMetadataKeepsTheHostEnvironment) {
+  asmjit::CpuFeatures features;
+  asmjit::JitRuntime explicit_runtime(nullptr, features);
+  asmjit::JitRuntime automatic_runtime;
+  EXPECT_EQ(explicit_runtime.cpuFeatures(), features);
+  EXPECT_EQ(
+      explicit_runtime.environment(), automatic_runtime.environment());
+  EXPECT_EQ(
+      automatic_runtime.cpuFeatures(), asmjit::CpuInfo::host().features());
+  EXPECT_EQ(
+      code_allocator_->asmJitEnvironment(), automatic_runtime.environment());
+}
+
 TEST_F(CodeAllocatorTest, AddSplitCodeCopiesHotAndColdSections) {
   asmjit::CodeHolder code;
   code.init(code_allocator_->asmJitEnvironment());
