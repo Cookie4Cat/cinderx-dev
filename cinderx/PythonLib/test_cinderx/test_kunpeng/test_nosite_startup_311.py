@@ -3,6 +3,7 @@
 
 import importlib.util
 import os
+import platform
 from pathlib import Path
 import subprocess
 import sys
@@ -79,6 +80,76 @@ class NoSiteStartup311Tests(unittest.TestCase):
                 gc.collect()
             assert cinderjit.is_enabled()
         """, extra_env={"PYTHONJITGENERATOR": "1"})
+
+    @unittest.skipUnless(platform.libc_ver()[0] == "glibc", "glibc fork hook")
+    def test_fork_memory_reclaim_runs_only_after_new_compilation(self):
+        self.run_child("""
+            import cinderjit
+            # Consume any initialization-era compilation once.
+            cinderjit._before_fork_parent()
+            assert cinderjit._before_fork_parent() is False
+            def first(x): return x + 7
+            assert cinderjit.force_compile(first)
+            assert cinderjit._before_fork_parent() is True
+            assert cinderjit._before_fork_parent() is False
+            assert cinderjit.is_jit_compiled(first)
+            assert first(5) == 12
+            def second(x): return x * 3
+            assert cinderjit.force_compile(second)
+            assert cinderjit._before_fork_parent() is True
+            assert cinderjit._before_fork_parent() is False
+            assert second(5) == 15
+            assert cinderjit.is_enabled()
+        """, extra_env={"PYTHONJITAUTO": "1000000"})
+
+    @unittest.skipUnless(platform.libc_ver()[0] == "glibc", "glibc fork hook")
+    def test_fork_reclaim_preserves_parent_and_child_jit_execution(self):
+        self.run_child("""
+            import os, cinderjit, _cinderx
+            assert any(
+                kw.get('before') is cinderjit._before_fork_parent
+                and kw.get('after_in_child') is cinderjit.after_fork_child
+                for kw in registrations
+            )
+            cinderjit._before_fork_parent()
+            def live(x): return x + 7
+            assert cinderjit.force_compile(live)
+            rd, wr = os.pipe()
+            pid = os.fork()
+            if pid == 0:
+                os.close(rd)
+                try:
+                    assert _cinderx.is_frame_evaluator_installed()
+                    assert cinderjit.is_enabled()
+                    assert live(5) == 12
+                    def child_only(x): return x * 3
+                    assert cinderjit.force_compile(child_only)
+                    assert child_only(5) == 15
+                    assert cinderjit.is_jit_compiled(child_only)
+                    os.write(wr, b'ok')
+                except BaseException:
+                    os._exit(1)
+                os._exit(0)
+            os.close(wr)
+            message = os.read(rd, 2)
+            os.close(rd)
+            _, status = os.waitpid(pid, 0)
+            assert os.waitstatus_to_exitcode(status) == 0, status
+            assert message == b'ok', message
+            # The automatically registered before callback consumed this
+            # compilation; another direct call must not rescan the allocator.
+            assert cinderjit._before_fork_parent() is False
+            assert cinderjit.is_jit_compiled(live)
+            assert live(5) == 12
+        """, extra_env={"PYTHONJITAUTO": "1000000"}, before="""
+            import posix
+            registrations = []
+            original_register = posix.register_at_fork
+            def record_registration(**kw):
+                registrations.append(kw)
+                return original_register(**kw)
+            posix.register_at_fork = record_registration
+        """)
 
     def test_runtime_ready_before_public_api_import(self):
         self.run_child("""

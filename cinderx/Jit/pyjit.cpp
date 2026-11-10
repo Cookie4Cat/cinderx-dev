@@ -61,6 +61,7 @@
 
 #include <array>
 #include <atomic>
+#include <cerrno>
 #include <charconv>
 #include <chrono>
 #include <cstddef>
@@ -81,6 +82,10 @@
 #include <unordered_set>
 #include <utility>
 #include <vector>
+
+#if PY_VERSION_HEX < 0x030C0000 && defined(__GLIBC__)
+#include <malloc.h>
+#endif
 
 #if PY_VERSION_HEX < 0x030C0000
 // The MR-04 execute surface, defined in Jit/pyjit_311_gate.cpp.
@@ -4951,6 +4956,27 @@ int deopt_gen_visitor(PyObject* obj, void*) {
   return 1;
 }
 
+#if PY_VERSION_HEX < 0x030C0000 && defined(__GLIBC__)
+PyObject* before_fork_parent(PyObject*, PyObject*) {
+  // Compilation can leave large free blocks in glibc's per-thread arenas.
+  // Return those pages before fork duplicates their page tables. This runs
+  // in the parent, before libc acquires its own at-fork allocator locks;
+  // never trim in the child. Live code and runtime objects are unaffected.
+  // The GIL serializes this callback. Repeated forks without new compiled
+  // functions need only the counter check, not another allocator scan.
+  static uint64_t last_trimmed_compilation = 0;
+  const auto generation = triggerStatsSnapshot().compiled_function_creations;
+  if (generation == last_trimmed_compilation) {
+    Py_RETURN_FALSE;
+  }
+  last_trimmed_compilation = generation;
+  const int saved_errno = errno;
+  malloc_trim(0);
+  errno = saved_errno;
+  Py_RETURN_TRUE;
+}
+#endif
+
 PyObject* after_fork_child(PyObject*, PyObject*) {
 #ifndef WIN32
   perf::afterForkChild();
@@ -5449,6 +5475,12 @@ PyModuleDef_Slot jit_slots[] = {
 // caller picked.  Canary therefore publishes only what its own evidence
 // needs, and each later milestone adds back what its acceptance covers.
 PyMethodDef jit_methods_311_canary[] = {
+#ifdef __GLIBC__
+    {"_before_fork_parent",
+     before_fork_parent,
+     METH_NOARGS,
+     PyDoc_STR("Reclaim free compiler heap pages before fork; report an attempt.")},
+#endif
     {"after_fork_child",
      after_fork_child,
      METH_NOARGS,
@@ -5893,6 +5925,14 @@ int register_fork_callback(BorrowedRef<> cinderjit_module) {
     return -1;
   }
   auto kwargs = Ref<>::steal(PyDict_New());
+#if PY_VERSION_HEX < 0x030C0000 && defined(__GLIBC__)
+  auto before = Ref<>::steal(
+      PyObject_GetAttrString(cinderjit_module, "_before_fork_parent"));
+  if (kwargs == nullptr || before == nullptr ||
+      PyDict_SetItemString(kwargs, "before", before) < 0) {
+    return -1;
+  }
+#endif
   if (kwargs == nullptr ||
       PyDict_SetItemString(kwargs, "after_in_child", callback) < 0 ||
       PyObject_Call(register_at_fork, args, kwargs) == nullptr) {
