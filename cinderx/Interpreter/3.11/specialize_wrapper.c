@@ -347,11 +347,11 @@ static void Ci_RecordSubscrContainer_311(
     return;
   }
   PyTypeObject* array_type = Ci_StdlibArrayTypeForContainer311(container);
-  if (array_type == NULL) {
-    return;
-  }
+  // An unresolved array type must not discard earlier non-array feedback.
+  // Record conservatively without reading the container's mirrored layout;
+  // a later validated array at this site then produces a mixed record.
   uint16_t mark = CI_SUBSCR_ARRTC_OTHER;
-  if (Py_TYPE(container) == array_type) {
+  if (array_type != NULL && Py_TYPE(container) == array_type) {
     const Ci_ArrayDescrMirror_311* descr =
         ((Ci_ArrayObjectMirror_311*)container)->ob_descr;
     unsigned char tc = descr != NULL ? (unsigned char)descr->typecode : 0;
