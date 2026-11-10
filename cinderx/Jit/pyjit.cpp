@@ -5479,7 +5479,8 @@ PyMethodDef jit_methods_311_canary[] = {
     {"_before_fork_parent",
      before_fork_parent,
      METH_NOARGS,
-     PyDoc_STR("Reclaim free compiler heap pages before fork; report an attempt.")},
+     PyDoc_STR(
+         "Reclaim free compiler heap pages before fork; report an attempt.")},
 #endif
     {"after_fork_child",
      after_fork_child,
