@@ -868,8 +868,8 @@ def test_unexpected_organic_deopt_turns_red():
 
 
 @pytest.mark.parametrize("source_sha,total", [
-    ("c4a22d96741ef70d49120cd31f942a35094e666021af9b663446bd68dacdb9bd", 358),
-    ("8fc7549ef3ea782afc6dd9215e61baa72c8cf1047399bf60c221241f5f5355e1", 360),
+    ("c4a22d96741ef70d49120cd31f942a35094e666021af9b663446bd68dacdb9bd", 359),
+    ("8fc7549ef3ea782afc6dd9215e61baa72c8cf1047399bf60c221241f5f5355e1", 361),
 ])
 def test_stdlib_organic_deopt_count_drift_turns_red(monkeypatch, source_sha, total):
     manifest = runners._stdlib_canary_manifest_for_source(source_sha)

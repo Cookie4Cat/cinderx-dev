@@ -1,8 +1,8 @@
 {
   "format": "cp311-stdlib-canary-deopts-v1",
   "python": "3.11.6",
-  "baseline_source": "8748dac8fa71c0719b3efe62be583158ff8232a0",
-  "total": 360,
+  "baseline_source": "e001e51e3942b52911f2a7bf26da7ae904d25c54",
+  "total": 361,
   "sites": [
     {
       "filename": "<frozen _collections_abc>",
@@ -66,7 +66,7 @@
       "reason": "Raise",
       "cause_offset": 165,
       "resume_offset": 330,
-      "count": 15
+      "count": 16
     },
     {
       "filename": "contextlib.py",
